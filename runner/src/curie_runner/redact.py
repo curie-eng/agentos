@@ -152,15 +152,23 @@ def redact_text(text: str) -> str:
 def redact_span_attribute(value: object) -> object:
     """Redact a span attribute value, preserving its type.
 
-    Strings are scrubbed; every other value (int, float, bool) passes through
-    untouched, so the ``gen_ai.usage.*`` token counts stay ints. Only str and int
-    attributes are set today. OTel also permits sequence values, and a sequence
-    would pass through here unscrubbed, so a caller that starts setting one must
-    extend this function and add its frozen vector.
+    Strings are scrubbed and sequences are scrubbed ELEMENTWISE, preserving the
+    container type (OTel requires a homogeneous sequence, so scrubbed str elements
+    stay str). Every other value (int, float, bool) passes through untouched, so
+    the ``gen_ai.usage.*`` token counts stay ints.
+
+    Sequences are handled here rather than left to a future caller (#935): only str
+    and int attributes are set today, but OTel permits sequence values, and relying
+    on whoever adds the first one to remember to extend this function is exactly
+    the defense-in-depth gap that issue closed. ``otel.py``'s export validator
+    recurses the same way as the backstop.
     """
 
     if isinstance(value, str):
         return redact_text(value)
+    if isinstance(value, (list, tuple)):
+        scrubbed = [redact_span_attribute(item) for item in value]
+        return tuple(scrubbed) if isinstance(value, tuple) else scrubbed
     return value
 
 

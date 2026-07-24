@@ -131,6 +131,25 @@ def _set(span: Any, key: SpanAttributeKey, value: object) -> None:
     span.set_attribute(key.value, redact_span_attribute(value))
 
 
+def _still_leaks(value: object) -> bool:
+    """Whether an attribute value still carries an unscrubbed secret.
+
+    Type-agnostic on purpose (#935). ADR-0076 decision 3 frames the export
+    validator as a universal backstop, but it only inspected ``str``, so a
+    sequence-valued attribute on an ALLOWED key slipped a secret past BOTH the
+    scrub and this validator — the two layers failing together, which is exactly
+    what defense in depth is supposed to prevent. ``str`` is itself a Sequence, so
+    it is matched first; anything that is neither a str nor a list/tuple (int,
+    float, bool) cannot carry a pattern match and is clean by construction.
+    """
+
+    if isinstance(value, str):
+        return redact_text(value) != value
+    if isinstance(value, (list, tuple)):
+        return any(_still_leaks(item) for item in value)
+    return False
+
+
 class _SchemaValidatingSpanProcessor(SpanProcessor):
     """Fail-closed export-time backstop (ADR-0076 decision 3).
 
@@ -138,7 +157,8 @@ class _SchemaValidatingSpanProcessor(SpanProcessor):
     closed ``SpanAttributeKey`` enum and the ``redact.py`` scrub; this processor
     exists for the call site that bypasses both by calling ``span.set_attribute``
     directly. On each span ending, it strips (does not replace) any attribute
-    whose key is outside the closed schema, or whose string value still matches
+    whose key is outside the closed schema, or whose value — or any element of a
+    sequence value (#935) — still matches
     an unscrubbed-secret pattern after the existing redaction pass — dropping the
     offending attribute rather than the whole span, so one bad key costs a single
     field of trace data rather than the whole record.
@@ -168,7 +188,7 @@ class _SchemaValidatingSpanProcessor(SpanProcessor):
         try:
             for key in list(attributes.keys()):
                 value = attributes[key]
-                still_leaks = isinstance(value, str) and redact_text(value) != value
+                still_leaks = _still_leaks(value)
                 if key not in self._ALLOWED_KEYS or still_leaks:
                     del attributes[key]
         finally:
