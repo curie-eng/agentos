@@ -270,6 +270,35 @@ def test_validator_strips_value_still_matching_an_unscrubbed_secret() -> None:
     assert "langfuse.trace.name" not in finished.attributes
 
 
+def test_validator_strips_sequence_value_hiding_an_unscrubbed_secret() -> None:
+    # #935: the validator is framed as a type-agnostic backstop (ADR-0076 decision
+    # 3), but it only inspected `str` values -- so a SEQUENCE-valued attribute on
+    # an allowed key carried a secret straight to the exporter, past both the scrub
+    # and this validator. OTel permits sequence values, so the backstop must
+    # recurse rather than trust that no call site ever sets one.
+    provider, exporter = _validated_exporter()
+    tracer = provider.get_tracer("test")
+    with tracer.start_as_current_span("agent.run") as span:
+        span.set_attribute(
+            "langfuse.trace.name", ["sk-abcdefghijklmnopqrstuvwx", "clean"]
+        )
+
+    (finished,) = exporter.get_finished_spans()
+    assert "langfuse.trace.name" not in finished.attributes
+
+
+def test_validator_keeps_a_clean_sequence_value() -> None:
+    # The recursion must not become a blanket "drop all sequences": a clean
+    # sequence on an allowed key is legitimate telemetry and survives.
+    provider, exporter = _validated_exporter()
+    tracer = provider.get_tracer("test")
+    with tracer.start_as_current_span("agent.run") as span:
+        span.set_attribute("langfuse.trace.name", ["curie-run:test", "clean"])
+
+    (finished,) = exporter.get_finished_spans()
+    assert finished.attributes["langfuse.trace.name"] == ("curie-run:test", "clean")
+
+
 def test_validator_leaves_clean_allowed_attributes_untouched() -> None:
     provider, exporter = _validated_exporter()
     tracer = provider.get_tracer("test")

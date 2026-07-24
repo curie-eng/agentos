@@ -232,3 +232,26 @@ def test_ordinary_log_lines_are_untouched() -> None:
 def test_normal_prose_is_untouched() -> None:
     line = "The turn finished after two tool calls and the budget ceiling was not reached."
     assert redact_text(line) == line
+
+
+def test_redact_span_attribute_scrubs_inside_sequences() -> None:
+    # #935: sequences passed through the scrub untouched. OTel permits them, and a
+    # future sequence-valued attribute must not depend on someone remembering to
+    # extend this function -- so scrub elementwise, preserving the container type
+    # (OTel requires a homogeneous sequence, and str elements stay str).
+    scrubbed = redact_span_attribute(["sk-abcdefghijklmnopqrstuvwx", "clean"])
+    assert isinstance(scrubbed, list)
+    assert scrubbed[0] != "sk-abcdefghijklmnopqrstuvwx"
+    assert scrubbed[1] == "clean"
+
+    as_tuple = redact_span_attribute(("sk-abcdefghijklmnopqrstuvwx",))
+    assert isinstance(as_tuple, tuple)
+    assert as_tuple[0] != "sk-abcdefghijklmnopqrstuvwx"
+
+
+def test_redact_span_attribute_leaves_non_string_scalars_and_types_alone() -> None:
+    # Negative control: the token counts must stay ints, and a numeric sequence
+    # must not be stringified by the new recursion.
+    assert redact_span_attribute(12) == 12
+    assert redact_span_attribute(True) is True
+    assert redact_span_attribute([1, 2]) == [1, 2]
