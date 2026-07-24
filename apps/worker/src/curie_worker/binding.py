@@ -216,9 +216,12 @@ class BindingResolver:
         if not rows:
             return None
         # The ORDER BY still picks one deterministic winner (prod-first, then most
-        # recent), but if more than one *agent* is bound to this channel the others
-        # silently never respond. Surface that instead of dropping them invisibly
-        # (#38). One agent with both a dev and a prod deployment active is two rows
+        # recent). Since #38 the API enforces one agent per channel (a unique
+        # constraint on agents.slack_channel, migration 0017), so two agents on one
+        # channel is no longer reachable through the write paths -- this stays as
+        # defense in depth for rows predating the constraint or written out of band,
+        # and because silently shadowing an agent is the failure mode #38 existed to
+        # kill. One agent with both a dev and a prod deployment active is two rows
         # but one agent, so count distinct agents, not rows.
         distinct_agents = {r["agent_id"] for r in rows}
         if len(distinct_agents) > 1:

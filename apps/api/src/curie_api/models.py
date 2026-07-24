@@ -40,7 +40,10 @@ class Agent(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str] = mapped_column(unique=True)
-    slack_channel: Mapped[str]
+    # One agent per Slack channel (#38). The worker resolves a channel to an
+    # agent, so a second agent bound to the same channel could never respond --
+    # it would be silently shadowed. Enforced here so it fails at create time.
+    slack_channel: Mapped[str] = mapped_column(unique=True)
     # The GitHub repo (owner/name) whose pushes deploy this agent (J1).
     repo_full_name: Mapped[str | None] = mapped_column(
         default=None, unique=True, index=True

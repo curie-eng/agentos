@@ -31,12 +31,18 @@ router = APIRouter(
 # exception -- there is no psycopg-style `.diag` namespace.
 _UNIQUE_VIOLATION = "23505"
 
-# The two real unique constraints on `agents` (from the alembic migrations),
-# mapped to the human message for each. Any other unique violation falls back
-# to a generic message.
+# The real unique constraints on `agents` (from the alembic migrations), mapped
+# to the human message for each. Any other unique violation falls back to a
+# generic message.
 _UNIQUE_CONSTRAINT_MESSAGES = {
     "agents_name_key": "an agent with that name already exists",
     "ix_agents_repo_full_name": "an agent for that repository already exists",
+    # #38: one agent per channel. Without this the create succeeded and the
+    # second agent was silently shadowed by the worker's resolver at runtime.
+    "agents_slack_channel_key": (
+        "another agent is already bound to that Slack channel; one agent per "
+        "channel (move or delete the other agent, or pick another channel)"
+    ),
 }
 
 
@@ -123,7 +129,21 @@ async def update_agent(
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     if data.slack_channel is not None:
-        agent = await crud.update_agent_channel(session, agent, data.slack_channel)
+        # slack_channel is unique (one agent per channel, #38), so this is the one
+        # PATCHable field that can collide with another agent. Classify it the same
+        # way create does -- a caller conflict is a 409, not an opaque 500 -- so the
+        # constraint cannot be sidestepped by creating on a free channel and then
+        # moving onto a taken one. (Before #38 no PATCHable field was unique, which
+        # is why this path had no IntegrityError handler.)
+        try:
+            agent = await crud.update_agent_channel(session, agent, data.slack_channel)
+        except IntegrityError as exc:
+            await session.rollback()
+            classified = classify_integrity_error(exc)
+            if classified is None:
+                raise
+            status_code, message = classified
+            raise HTTPException(status_code, message) from exc
     if data.model is not None:
         agent = await crud.update_agent_model(session, agent, data.model)
     if data.approval_required_tools is not None:
