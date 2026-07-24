@@ -48,6 +48,42 @@ def test_duplicate_repo_is_409(
     assert dup.json()["detail"] == "an agent for that repository already exists"
 
 
+def test_duplicate_slack_channel_is_409(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#38: one agent per channel. A second agent on a taken channel is refused
+    at create time, rather than being accepted and then silently shadowed by the
+    worker's resolver (which routes a channel to exactly one agent)."""
+
+    first = _create(client, auth_headers, name="chan-agent-a", slack_channel="C0EEEEEE5")
+    assert first.status_code == 201, first.text
+
+    dup = _create(client, auth_headers, name="chan-agent-b", slack_channel="C0EEEEEE5")
+    assert dup.status_code == 409, dup.text
+    assert "already bound to that Slack channel" in dup.json()["detail"]
+
+
+def test_patch_onto_taken_slack_channel_is_409(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The update seam is fenced identically to create (#143's posture): the
+    constraint cannot be sidestepped by creating on a free channel and then
+    PATCHing onto a taken one."""
+
+    first = _create(client, auth_headers, name="patch-chan-a", slack_channel="C0FFFFFF6")
+    assert first.status_code == 201, first.text
+    second = _create(client, auth_headers, name="patch-chan-b", slack_channel="C0FFFFFF7")
+    assert second.status_code == 201, second.text
+
+    moved = client.patch(
+        f"/agents/{second.json()['id']}",
+        json={"slack_channel": "C0FFFFFF6"},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 409, moved.text
+    assert "already bound to that Slack channel" in moved.json()["detail"]
+
+
 def test_agent_approval_required_tools_round_trip(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
