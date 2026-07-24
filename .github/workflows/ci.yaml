@@ -39,6 +39,12 @@ jobs:
         run: uv run ruff check .
       - name: Mypy
         run: uv run mypy
+      # ADR-0062 (#844): the harness boundary is gated, not just documented. Two
+      # contracts today -- the platform never imports a harness SDK, and the
+      # harness PORT (contribution + registry) stays vendor-neutral. Transitive,
+      # so a leak arriving through an intermediate module is caught too.
+      - name: Import boundaries (harness SDK containment)
+        run: uv run lint-imports
       # Regenerate the interface-catalog seam table and per-doc headers from
       # each seam's front-matter, fail on drift, then lint every citation under
       # docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it runs
