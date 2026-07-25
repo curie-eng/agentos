@@ -1,0 +1,240 @@
+"""Source-derived counts embedded in seam-catalog prose (#938).
+
+ADR-0043's gate keeps the catalog's *citations*, *grades* and *generated
+regions* honest, but a seam doc also states bare counts of things in the tree
+-- "nine runner modules import ``claude_agent_sdk``", "32 committed schemas".
+Those were hand-written prose that nothing recomputed, so the count-drift class
+fired twice (#858, then #920's residual) before this module existed: a tenth
+importing module or a thirty-third schema left the doc asserting the opposite
+of reality while the gate stayed green.
+
+Each claim below pairs a **regex that locates the number in the prose** with a
+**counter that derives the truth from the tree**. There are two ways to fail,
+both loud:
+
+- the stated count disagrees with the tree -- the drift the class is named for;
+- the anchor phrase is gone, so the regex matches nothing.
+
+The second is what keeps the gate from going vacuous. A reworded sentence would
+otherwise silently stop being checked, leaving a green gate over unverified
+prose -- which is exactly the failure mode #938 was filed about, one level up.
+So rewording one of these sentences is a deliberate edit here too, and the
+finding says so.
+
+Counts are matched in either spelling: the prose writes small numbers as words
+("nine runner modules") and larger ones as digits ("32 committed schemas"), so
+both forms parse and either is accepted for the same value.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+from .finding import Finding
+
+# Number words the prose plausibly spells out. Past twenty the docs use digits,
+# and an unparseable token is reported rather than guessed at, so this map only
+# has to cover the range the house style actually writes as words.
+_NUMBER_WORDS: dict[str, int] = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+
+# A module counts as importing the SDK when it says so at import level, which
+# is the claim the prose makes ("imported across N runner modules"). A passing
+# mention in a comment or docstring is not an import and must not inflate it.
+_SDK_IMPORT_RE = re.compile(r"^\s*(?:from|import)\s+claude_agent_sdk", re.MULTILINE)
+
+# Rust's plain unit-test attribute. `json_contract.rs` uses only this form
+# today; an async variant (`#[tokio::test]`) would need adding here as well as
+# to whatever the prose then claims.
+_RUST_TEST_RE = re.compile(r"#\[test\]")
+
+# The index is a listing OF the schemas, not one of them, so the count the
+# prose states ("32 committed schemas ... with an index") excludes it.
+_SCHEMA_INDEX_NAME = "index.json"
+
+
+def parse_count(token: str) -> int | None:
+    """Read a count written as digits or as an English number word.
+
+    Args:
+        token: The matched prose token, e.g. ``"32"`` or ``"nine"``.
+
+    Returns:
+        The integer value, or ``None`` when the token is neither digits nor a
+        known number word -- which the caller reports rather than guessing.
+    """
+    if token.isdigit():
+        return int(token)
+    return _NUMBER_WORDS.get(token.lower())
+
+
+def _count_sdk_importing_runner_modules(repo_root: Path) -> int:
+    """Count runner modules that import ``claude_agent_sdk`` at import level.
+
+    This is the leakage the harness seam grades itself on: every module here is
+    one the SDK is not yet walled off from.
+
+    Args:
+        repo_root: The repository root to resolve ``runner/src`` against.
+
+    Returns:
+        The number of ``.py`` files under ``runner/src`` carrying an SDK import.
+    """
+    src = repo_root / "runner" / "src"
+    return sum(
+        1
+        for path in sorted(src.rglob("*.py"))
+        if _SDK_IMPORT_RE.search(path.read_text(encoding="utf-8"))
+    )
+
+
+def _count_committed_cli_schemas(repo_root: Path) -> int:
+    """Count the committed CLI result schemas, excluding their index.
+
+    Args:
+        repo_root: The repository root to resolve ``cli/schema`` against.
+
+    Returns:
+        The number of ``*.json`` schema files under ``cli/schema``, not
+        counting ``index.json``, which lists them rather than being one.
+    """
+    schema_dir = repo_root / "cli" / "schema"
+    return sum(1 for path in schema_dir.glob("*.json") if path.name != _SCHEMA_INDEX_NAME)
+
+
+def _count_json_contract_tests(repo_root: Path) -> int:
+    """Count the tests validating real ``to_json()`` output against the schemas.
+
+    Args:
+        repo_root: The repository root to resolve the test file against.
+
+    Returns:
+        The number of ``#[test]`` attributes in ``cli/tests/json_contract.rs``,
+        or ``0`` when that file is absent.
+    """
+    path = repo_root / "cli" / "tests" / "json_contract.rs"
+    if not path.is_file():
+        return 0
+    return len(_RUST_TEST_RE.findall(path.read_text(encoding="utf-8")))
+
+
+@dataclass(frozen=True)
+class CountClaim:
+    """One count a seam doc states in prose, tied to its source of truth.
+
+    ``pattern`` must capture the count token in group 1 and may match more than
+    once -- a doc that repeats a count (the harness seam states its module
+    count twice) has every occurrence checked, so the two cannot disagree.
+    """
+
+    doc: str
+    label: str
+    pattern: re.Pattern[str]
+    counter: Callable[[Path], int]
+    source: str
+
+
+# Every count claim the seam catalog makes. Patterns are anchored on enough
+# surrounding words to hit only the claim: `committed schemas under` excludes
+# the same file's later "enforced by committed schemas and a drift gate", which
+# is prose about the schemas rather than a count of them.
+CLAIMS: tuple[CountClaim, ...] = (
+    CountClaim(
+        doc="docs/interfaces/harness-modelsession/INTERFACE.md",
+        label="runner modules importing claude_agent_sdk",
+        pattern=re.compile(r"(\S+)\s+runner\s+modules"),
+        counter=_count_sdk_importing_runner_modules,
+        source="`from`/`import claude_agent_sdk` in runner/src/**/*.py",
+    ),
+    CountClaim(
+        doc="docs/interfaces/cli-output/INTERFACE.md",
+        label="committed CLI result schemas",
+        pattern=re.compile(r"(\S+)\s+committed schemas under"),
+        counter=_count_committed_cli_schemas,
+        source="cli/schema/*.json excluding index.json",
+    ),
+    CountClaim(
+        doc="docs/interfaces/cli-output/INTERFACE.md",
+        label="json_contract output-validation tests",
+        pattern=re.compile(r"across\s+(\S+)\s+tests\s+in\s+`cli/tests/json_contract\.rs`"),
+        counter=_count_json_contract_tests,
+        source="#[test] in cli/tests/json_contract.rs",
+    ),
+)
+
+
+def check_counts(repo_root: Path, claims: tuple[CountClaim, ...] = CLAIMS) -> list[Finding]:
+    """Assert every prose count in the seam catalog against the tree (#938).
+
+    Args:
+        repo_root: The repository root the docs and sources are resolved under.
+        claims: The claims to check; defaults to the catalog's own [`CLAIMS`].
+
+    Returns:
+        One finding per claim that drifted or whose anchor phrase vanished, and
+        an empty list when every stated count matches the tree.
+    """
+    findings: list[Finding] = []
+
+    for claim in claims:
+        doc = repo_root / claim.doc
+        # Not every repo root carries every seam doc -- the doclint fixtures
+        # are a miniature tree. Whether a seam doc should exist at all is the
+        # catalog's own concern, not a count claim's, so a missing doc is
+        # skipped rather than reported here twice over.
+        if not doc.is_file():
+            continue
+
+        stated = claim.pattern.findall(doc.read_text(encoding="utf-8"))
+        if not stated:
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    "no sentence states this count any more, so it is no longer "
+                    "verified. Restore the phrasing, or update this claim's pattern "
+                    "in tools/doclint/src/curie_doclint/counts.py "
+                    f"(source of truth: {claim.source}).",
+                )
+            )
+            continue
+
+        expected = claim.counter(repo_root)
+        # A set: a repeated count that is wrong the same way twice is one
+        # drift to fix, not two findings to read.
+        wrong = sorted({token for token in stated if parse_count(token) != expected})
+        if wrong:
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    f"prose states {', '.join(repr(token) for token in wrong)} but the "
+                    f"tree has {expected} ({claim.source}). Update the prose to match.",
+                )
+            )
+
+    return findings

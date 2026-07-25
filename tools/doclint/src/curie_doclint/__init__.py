@@ -1,10 +1,13 @@
 """The interface-catalog citation linter and index/header generator (#452).
 
-Two phases run over the linted root (``docs/`` excluding ``docs/adr/``):
+Three phases run over the linted root (``docs/`` excluding ``docs/adr/``):
 
 1. Generate: regenerate the seam table in ``docs/interfaces.md`` and each seam
    doc's header blockquote from front-matter, comparing to what is on disk.
-2. Lint: walk every citation, assert no line coordinates, every path exists,
+2. Counts: assert the bare counts a seam doc states about the tree ("nine
+   runner modules import ``claude_agent_sdk``") against the tree itself, so
+   prose numbers cannot silently re-drift (#938, see ``counts.py``).
+3. Lint: walk every citation, assert no line coordinates, every path exists,
    every Python symbol resolves.
 
 ``main`` is a pure check by default (drift is a finding, nothing is written);
@@ -30,6 +33,7 @@ from .citation import (
     path_exists,
     scan_raw_line_ban,
 )
+from .counts import check_counts
 from .finding import Finding
 from .frontmatter import SeamMeta, parse_and_validate
 from .generate import (
@@ -95,6 +99,10 @@ def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
     cache = SymbolCache()
     findings: list[Finding] = []
     findings.extend(_check_generation(repo_root))
+    # Prose counts the catalog states about the tree (#938). Not a generated
+    # region: the numbers sit mid-sentence, so they are asserted against source
+    # rather than rewritten, and `--write` leaves them alone.
+    findings.extend(check_counts(repo_root))
     doc_findings, ignored = _check_docs(repo_root, cache)
     findings.extend(doc_findings)
     return findings, ignored
