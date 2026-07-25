@@ -521,6 +521,26 @@ pub fn message_awaiting_approval_json(thread: &str, reply: Option<&str>) -> serd
     })
 }
 
+/// The machine-readable object for a turn handed to the **connected Slack
+/// transport** (#770/ADR-0078): the turn was enqueued and its reply lands in the
+/// workspace, so `status` is `enqueued` and the payload names the channel and
+/// thread to watch rather than carrying a reply.
+///
+/// A named builder rather than an inline `json!` literal because the `Enqueued`
+/// arm used to inline its payload, and an inlined arm is invisible to the
+/// builder-level contract gates -- nothing swept it against
+/// `cli/schema/message.schema.json`, so the payload shipped unschema'd (#955).
+/// Every arm of [`MessageOutcomeOutput::to_json`] routing through a pure builder
+/// is the property being restored; keep it uniform. Pure so it stays
+/// contract-testable against `cli/schema/message.schema.json`.
+pub fn message_enqueued_json(channel: &str, thread: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "enqueued",
+        "channel": channel,
+        "thread": thread,
+    })
+}
+
 /// The machine-readable descriptor for `local`/`cluster message --json --dry-run`
 /// (issue #354): what a real run would enqueue, without touching the network.
 /// `target` is `"local"` or `"cluster"`, `channel` is null when it would be
@@ -582,7 +602,10 @@ impl crate::ui::CliOutput for MessageDryRunOutput {
 /// The terminal outcome of a real `local`/`cluster message` turn. `to_json` is
 /// the matching schema-gated builder; `render` reproduces the exact human view
 /// (the stdout answer for a reply, the stderr warning/diagnostics otherwise).
-enum MessageOutcomeOutput {
+///
+/// `pub` so `cli/tests/json_contract.rs` can construct each variant directly
+/// and validate `to_json()` against the committed schema (issue #955).
+pub enum MessageOutcomeOutput {
     /// The worker finalized the turn with reply text.
     Replied { thread: String, reply: String },
     /// The worker finished the turn but never edited the placeholder.
@@ -628,11 +651,9 @@ impl crate::ui::CliOutput for MessageOutcomeOutput {
                 message_awaiting_approval_json(thread, reply.as_deref())
             }
             MessageOutcomeOutput::TimedOut { .. } => message_timeout_json(),
-            MessageOutcomeOutput::Enqueued { channel, thread } => serde_json::json!({
-                "status": "enqueued",
-                "channel": channel,
-                "thread": thread,
-            }),
+            MessageOutcomeOutput::Enqueued { channel, thread } => {
+                message_enqueued_json(channel, thread)
+            }
         }
     }
 

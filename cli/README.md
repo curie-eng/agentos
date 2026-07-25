@@ -532,27 +532,32 @@ control flow are machine-first.
 machine-readable JSON object on **stdout** instead of empty output: the
 read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
 lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
-and every verb's
-`--dry-run` plan (uniform shape `{"dry_run": true, "plan": [<lines>]}`) all
-route through one centralized emitter. The `message` verbs keep their own,
-more specific shapes: `curie local message` and `curie cluster message`
-emit one structured line per terminal state on stdout -- a completed turn
-emits `{"reply": ..., "thread": ..., "finalized": ...}` (the model's reply,
-which is null on a no-edit completion, plus the thread the turn ran under); a
-**timeout** emits `{"reply": null, "finalized": false, "timed_out": true}`
-before exiting 3 (transient); and `--json --dry-run` emits a planned-action
-descriptor `{"dry_run": true, "target": "local"|"cluster", "stream": ...,
-"channel": ..., "reply_endpoint": ...}` (`channel` is null when it would be
-resolved from the sole deployed agent). The three shapes are the `oneOf` in
-`cli/schema/message.schema.json`. Two verbs lag this contract on their
-real-path success output: `curie skill message`, and the operator verbs
-(`up`, `down`, `status`, `comms`) plus `deploy`, still print human text rather
-than JSON on success (tracked in #485). All human and log text (progress,
-notes, warnings) goes to **stderr**, so a plain `... --json | jq` yields clean
-data. On failure under `--json`, the error is emitted to stdout as
-`{"error": "<message>", "fix": "<hint>"|null}` instead of a prose message, so
-an agent can recover without parsing prose. `NO_COLOR`, `CLICOLOR`, and
-`--color=never` are honored on every command.
+and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
+[<lines>]}`) all route through one centralized emitter. The `message` verbs
+keep their own, more specific shapes: `curie local message` and `curie cluster
+message` emit one structured line per terminal state on stdout -- a completed
+turn emits `{"reply": ..., "thread": ..., "finalized": ...}` (the model's
+reply, which is null on a no-edit completion, plus the thread the turn ran
+under); a turn parked on a human approval gate emits `{"reply": ..., "thread":
+..., "finalized": false, "awaiting_approval": true}` (the worker posted an
+approval card rather than finalizing, and `reply` is the card's placeholder
+text if seen); a **timeout** emits `{"reply": null, "finalized": false,
+"timed_out": true}` before exiting 3 (transient); a turn **enqueued** onto the
+real Valkey stream in connected transport mode emits `{"status": "enqueued",
+"channel": ..., "thread": ...}` -- the CLI does not wait for the reply, so
+this is a terminal state of the command, not of the turn; and `--json
+--dry-run` emits a planned-action descriptor `{"dry_run": true, "target":
+"local"|"cluster", "stream": ..., "channel": ..., "reply_endpoint": ...}`
+(`channel` is null when it would be resolved from the sole deployed agent).
+The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
+lag this contract on their real-path success output: `curie skill message`,
+and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still
+print human text rather than JSON on success (tracked in #485). All human and
+log text (progress, notes, warnings) goes to **stderr**, so a plain `...
+--json | jq` yields clean data. On failure under `--json`, the error is
+emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
+a prose message, so an agent can recover without parsing prose. `NO_COLOR`,
+`CLICOLOR`, and `--color=never` are honored on every command.
 
 **Versioned result schemas.** Every agent-facing `--json` result maps to a
 committed JSON Schema under `cli/schema/` with an explicit version identity (the

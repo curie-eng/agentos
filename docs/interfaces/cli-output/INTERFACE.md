@@ -95,7 +95,18 @@ Nine, all in the CLI crate:
   longer schema-free: there are 32 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — all 32 are validated against real
-  `to_json()` output across 44 tests in `cli/tests/json_contract.rs`. An agent
+  `to_json()` output across 53 tests in `cli/tests/json_contract.rs`. Those tests
+  drive each output type's `to_json()` once per output variant rather than calling
+  the pure builder functions behind it, so a variant whose `to_json()` arm drifts
+  from the schema is caught even when the builder it delegates to still validates.
+  For the multi-variant `message` outcome the covered set is not hand-written: a
+  `syn` walk (`cli/tests/support/enum_variants.rs`) derives the variant names from
+  the enum declaration itself, so a sixth variant landing with no case turns the
+  gate red rather than passing vacuously (#955). Five of the added tests exercise
+  the walk's own rejection paths -- a source that fails to parse, a second
+  declaration of the same enum, a `#[cfg]`-gated variant, and an enum inside a
+  `#[cfg]`-gated module -- plus a positive control, so those rejections are now
+  proven by execution rather than asserted. An agent
   parsing this output is now coupled to shapes enforced by committed schemas and a
   drift gate, like the ACI (`packages/aci-protocol`, ADR-0017), not by tests alone.
 - **Not separately graded.** This is not one of the six swap-readiness Jobs in the
