@@ -7,19 +7,21 @@ by hand. These drive the real ``CLAIMS`` (real patterns, real counters) over
 miniature trees, so a pattern that stops matching the house phrasing fails here
 rather than in six months' review.
 
-Two failure modes matter equally and both are asserted: a count that disagrees
-with the tree, and an anchor phrase that vanished so nothing is checked at all.
-The second is the vacuity guard -- a silently-unchecked claim is the defect one
-level up from the one #938 reports.
+Three failure modes matter equally and all are asserted: a count that disagrees
+with the tree, an anchor phrase that vanished so nothing is checked at all, and
+(#956) a seam doc that moved out from under its claim so the claim was skipped
+entirely. The last two are the vacuity guards -- a silently-unchecked claim is
+the defect one level up from the one #938 reports.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from curie_doclint.counts import check_counts, parse_count
+from curie_doclint import counts
+from curie_doclint.counts import CLAIMS, _CATALOG_MARKER, check_counts, parse_count
 
-from .conftest import Regenerate, RunLint, write
+from .conftest import REPO_ROOT, Regenerate, RunLint, write
 
 _HARNESS_DOC = "docs/interfaces/harness-modelsession/INTERFACE.md"
 _CLI_OUTPUT_DOC = "docs/interfaces/cli-output/INTERFACE.md"
@@ -113,6 +115,10 @@ def test_reworded_sentence_fails_rather_than_going_vacuous(tmp_path: Path) -> No
     findings = check_counts(tmp_path)
     assert len(findings) == 1
     assert "no longer verified" in findings[0].reason
+    # The remedy has to name where the claim lives or it is not actionable,
+    # and that path is interpolated rather than spelled out -- so assert it,
+    # else a dropped interpolation would render a broken sentence in silence.
+    assert str(_CATALOG_MARKER) in findings[0].reason
 
 
 def test_absent_seam_doc_is_skipped(tmp_path: Path) -> None:
@@ -121,6 +127,101 @@ def test_absent_seam_doc_is_skipped(tmp_path: Path) -> None:
     # own concern, reported there, not duplicated as a count finding.
     write(tmp_path, *_sdk_module("a"))
     assert check_counts(tmp_path) == []
+
+
+# --- the seam doc moved: the catalog-root guard (#956) ---------------------
+
+
+def test_a_missing_seam_doc_is_reported_under_the_catalog_root(tmp_path: Path) -> None:
+    # THE #956 defect. `CLAIMS` are literals about THIS repository, so when the
+    # tree being linted IS that repository a claim whose doc does not resolve
+    # was moved or renamed away, not legitimately absent. Skipping it there is
+    # how renaming `docs/interfaces/cli-output/` left the gate green over prose
+    # counts of 999 and 777.
+    write(tmp_path, *_sdk_module("a"))
+    write(tmp_path, _HARNESS_DOC, _harness_prose("one"))
+    write(tmp_path, str(_CATALOG_MARKER), "")
+    findings = check_counts(tmp_path)
+    assert [(finding.doc, finding.citation) for finding in findings] == [
+        (_CLI_OUTPUT_DOC, "committed CLI result schemas"),
+        (_CLI_OUTPUT_DOC, "json_contract output-validation tests"),
+    ]
+    for finding in findings:
+        assert "moved" in finding.reason
+        assert "no longer verified" in finding.reason
+        # As above: the remedy names the claim's home by interpolation, so
+        # nothing but this assertion stands between a dropped `{}` and a
+        # remedy sentence that tells the reader nothing.
+        assert str(_CATALOG_MARKER) in finding.reason
+
+
+def test_the_same_tree_is_silent_as_a_fixture_and_loud_as_the_catalog(
+    tmp_path: Path,
+) -> None:
+    # The escape hatch and the guard are one decision, so they are asserted
+    # against one tree. A miniature tree carries none of the seam docs by
+    # design and must stay silent; the same tree once it carries the doclint
+    # source -- the marker that makes it the catalog -- must report. Losing
+    # either half rebuilds #956 or breaks every fixture test in this file.
+    write(tmp_path, *_sdk_module("a"))
+    write(tmp_path, _HARNESS_DOC, _harness_prose("one"))
+    assert check_counts(tmp_path) == []
+    write(tmp_path, str(_CATALOG_MARKER), "")
+    assert check_counts(tmp_path) != []
+
+
+def test_a_renamed_doc_cannot_launder_a_false_count(tmp_path: Path) -> None:
+    # #956's own reproduction: the cli-output seam doc renamed to a sibling
+    # path, carrying prose that claims 999 schemas and 777 tests over a tree
+    # holding one of each. The rename must not be a way to make a false count
+    # unreachable -- the gate reports the claim's declared path either way.
+    write(tmp_path, *_sdk_module("a"))
+    write(tmp_path, _HARNESS_DOC, _harness_prose("one"))
+    write(tmp_path, "cli/schema/kill.json", "{}\n")
+    write(tmp_path, "cli/tests/json_contract.rs", "#[test]\nfn a() {}\n")
+    write(
+        tmp_path,
+        "docs/interfaces/cli-output-renamed/INTERFACE.md",
+        _cli_output_prose(schemas="999", tests="777"),
+    )
+    write(tmp_path, str(_CATALOG_MARKER), "")
+    findings = check_counts(tmp_path)
+    assert [finding.doc for finding in findings] == [_CLI_OUTPUT_DOC, _CLI_OUTPUT_DOC]
+    # The point being pinned: the gate reports the claim at its declared path
+    # rather than silently validating the renamed doc's false prose. If either
+    # false count leaked into a reason, the rename would have laundered it.
+    for finding in findings:
+        assert "999" not in finding.reason
+        assert "777" not in finding.reason
+
+
+def test_the_catalog_marker_names_the_real_doclint_source() -> None:
+    # The guard on the guard. A tree counts as the catalog when it carries the
+    # doclint source at `_CATALOG_MARKER`, so relocating that source would
+    # leave the marker naming a path no tree holds, no tree would ever be
+    # recognized, and every claim would silently go back to being skipped --
+    # #956 again, this time with a passing test suite. Pinning the marker
+    # against the imported module's own on-disk file reds CI on the move
+    # instead.
+    #
+    # This equality holds because the uv workspace installs curie-doclint
+    # editable, so counts.__file__ resolves inside the checkout at
+    # _CATALOG_MARKER. Under a non-editable install counts.__file__ would
+    # resolve into the site-packages copy instead, and this test FAILS LOUDLY
+    # rather than passing vacuously -- the correct direction for a guard on
+    # the guard. The production predicate _is_catalog_root deliberately does
+    # not depend on the install layout: it asks the lint target whether it
+    # carries the doclint source, not the installed copy, which is precisely
+    # why it survives a wheel install.
+    assert (REPO_ROOT / _CATALOG_MARKER).resolve() == Path(counts.__file__).resolve()
+
+
+def test_every_claim_doc_resolves_in_the_real_repository() -> None:
+    # The gate that actually reds CI when someone moves a seam doc: every
+    # claim's declared path exists in the real tree, and every count it states
+    # matches. This is the assertion the skip was hiding.
+    assert [claim.doc for claim in CLAIMS if not (REPO_ROOT / claim.doc).is_file()] == []
+    assert check_counts(REPO_ROOT) == []
 
 
 # --- counter semantics -----------------------------------------------------
