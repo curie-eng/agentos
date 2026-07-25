@@ -28,6 +28,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
 
 use crate::api::{Agent, ApiClient};
@@ -90,6 +91,19 @@ fn resolve_api_key(raw: &str, env_value: Option<String>) -> String {
     env_value
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_API_KEY.to_string())
+}
+
+/// An empty `--thread` is not a thread (#540's "empty is unset", applied to the
+/// thread ts): passed on, it enqueues a nonsense `conversation_id: ""` and puts a
+/// literal `"thread_ts": ""` in an outbound chat.postMessage body.
+///
+/// Applied at the [`message`] entry point every tier and transport funnels
+/// through, and again at the connected-transport leaf
+/// ([`enqueue_over_connected_transport`]), which is `pub` for integration tests
+/// and so cannot assume its callers normalized. The filter is idempotent, so
+/// applying it twice costs nothing.
+fn normalize_thread(thread: Option<String>) -> Option<String> {
+    thread.filter(|ts| !ts.is_empty())
 }
 
 /// clap `value_parser` for the CLUSTER tier's `--api-key` / `--valkey-password`
@@ -269,6 +283,41 @@ pub struct MessageOpts {
     /// Local mode only: platform API base URL for the channel lookup. None uses
     /// the compose API default ([`DEFAULT_LOCAL_API_URL`]).
     pub api_url: Option<String>,
+}
+
+/// Hand-written rather than derived: this type is `pub` in a `pub` module, so
+/// `Default` is public API and its values have to be the ones the crate actually
+/// declares. A derive would zero them, and those zeros are not benign --
+/// `timeout_secs: 0` is an instant deadline, and `api_key: ""` defeats the
+/// sentinel comparison against [`DEFAULT_API_KEY`] in
+/// [`crate::state::apply_continue`] that issue #540 exists to protect.
+///
+/// The genuinely-empty fields (`text`, `channel`, `thread`, `listen_host`,
+/// `user`, `stream`, `dry_run`, `local`, `api_url`) have no crate-level default:
+/// they are per-invocation values a caller must supply.
+impl Default for MessageOpts {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            channel: None,
+            thread: None,
+            namespace: "curie".to_string(),
+            release: "curie".to_string(),
+            chart: "charts/curie".to_string(),
+            listen_host: None,
+            listen_port: DEFAULT_LISTEN_PORT,
+            valkey_local_port: DEFAULT_VALKEY_LOCAL_PORT,
+            valkey_password: DEFAULT_VALKEY_PASSWORD.to_string(),
+            api_local_port: DEFAULT_API_LOCAL_PORT,
+            api_key: DEFAULT_API_KEY.to_string(),
+            user: String::new(),
+            stream: String::new(),
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            dry_run: false,
+            local: false,
+            api_url: None,
+        }
+    }
 }
 
 /// The tier string for a [`TurnVerb`], as surfaced in the `--json` `tier` field
@@ -1405,7 +1454,13 @@ fn connected_transport_dry_run_note() -> String {
 /// and the requesting-channel approval card threads under it on the EXISTING
 /// kernel/sink paths -- no per-turn endpoint means the turn rides the worker's
 /// default (connected) transport, exactly like a real mention.
-async fn enqueue_over_connected_transport(
+///
+/// Public only so the connected-transport COMPOSITION can be pinned by an
+/// integration test (`cli/tests/chat_enqueue.rs`): #954 was a wiring defect
+/// between two individually-correct leaves, so the coverage that matters drives
+/// this whole function against a real Valkey and a real HTTP Slack stub and reads
+/// back the bytes that landed on the stream. No other caller outside this module.
+pub async fn enqueue_over_connected_transport(
     opts: &MessageOpts,
     conn: &mut MultiplexedConnection,
     verb: TurnVerb,
@@ -1413,21 +1468,36 @@ async fn enqueue_over_connected_transport(
     bot_token: &str,
 ) -> Result<()> {
     let ui = crate::ui::ui();
-    let (channel, thread_ts, _synthetic_placeholder) =
-        resolve_targets(Some(channel), opts.thread.as_deref());
+    // An empty `--thread` is normalized away at the [`message`] entry point, and
+    // re-applied HERE because this function is `pub` (an integration test drives
+    // it directly, bypassing `message`), so it cannot assume its callers
+    // normalized. See [`normalize_thread`]. Anything present past this line names
+    // a real thread.
+    let explicit_thread = opts.thread.as_deref().filter(|ts| !ts.is_empty());
 
-    let placeholder_ts = crate::slack::post_placeholder(bot_token, &channel, "\u{2026}")
-        .await
-        .context("posting the placeholder to the connected Slack workspace")?;
+    let placeholder_ts =
+        crate::slack::post_placeholder(bot_token, channel, "\u{2026}", explicit_thread)
+            .await
+            .with_context(|| {
+                let mut context =
+                    "posting the placeholder to the connected Slack workspace".to_string();
+                // Slack rejects a thread_ts naming no real message, so a thread ts
+                // carried over from a stub turn (always synthetic) or from a
+                // pre-#954 connected turn now fails the whole command here --
+                // including when it arrived via --continue reading
+                // .curie/last-turn.json rather than an explicit --thread. Name that
+                // as the cause and say what undoes it, per ADR-0021.
+                if let Some(thread) = explicit_thread {
+                    context.push_str(&format!(
+                        ": if Slack rejected the thread, --thread {thread} names no message in \
+                         {channel}. Drop --thread (or re-run without --continue, which reuses the \
+                         last turn's thread ts) to start a new thread."
+                    ));
+                }
+                context
+            })?;
 
-    let event = synthetic_turn(
-        &channel,
-        &opts.user,
-        &opts.text,
-        &thread_ts,
-        &placeholder_ts,
-        None,
-    );
+    let event = connected_turn(channel, opts, explicit_thread, &placeholder_ts);
     let stream_id = xadd(conn, &opts.stream, &event).await?;
     ui.note(&format!(
         "enqueued {} on {} as {stream_id}",
@@ -1435,12 +1505,44 @@ async fn enqueue_over_connected_transport(
     ));
 
     // The reply, approval card, and any resumed reply land in Slack, not here.
-    persist_and_hint(opts, verb, &channel, &thread_ts);
+    persist_and_hint(opts, verb, channel, &event.conversation_id);
     ui.emit(&MessageOutcomeOutput::Enqueued {
-        channel,
-        thread: thread_ts,
+        channel: channel.to_string(),
+        thread: event.conversation_id,
     });
     Ok(())
+}
+
+/// The exact turn a connected-transport enqueue puts on the stream: its
+/// `conversation_id` is an explicit `--thread` when one was named, else the ts of
+/// the placeholder we just posted (a top-level message's own ts IS its thread
+/// root), and the reply handle's placeholder is always that real ts.
+///
+/// Both must be REAL Slack timestamps and must agree with where the placeholder
+/// landed (issue #954): the worker threads its requesting-channel approval card on
+/// `conversation_id` best-effort, so Slack silently drops a card threaded under a
+/// ts that names no message.
+///
+/// Assumption when a `--thread` IS named: that ts is a thread ROOT. A `--thread`
+/// naming a threaded reply would be re-parented by Slack onto the true parent,
+/// leaving `conversation_id` at the reply while the placeholder landed under its
+/// parent; we take the named ts at its word, since #954's stated behavior is that
+/// `--thread <ts>` makes `<ts>` the conversation_id.
+fn connected_turn(
+    channel: &str,
+    opts: &MessageOpts,
+    explicit_thread: Option<&str>,
+    placeholder_ts: &str,
+) -> QueuedTurn {
+    let conversation_id = explicit_thread.unwrap_or(placeholder_ts);
+    synthetic_turn(
+        channel,
+        &opts.user,
+        &opts.text,
+        conversation_id,
+        placeholder_ts,
+        None,
+    )
 }
 
 /// Resolve the target channel (and the sole-agent hint for resolve messages) for
@@ -1526,7 +1628,16 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
         .await
 }
 
-pub async fn message(opts: MessageOpts) -> Result<()> {
+pub async fn message(mut opts: MessageOpts) -> Result<()> {
+    // An empty `--thread` is normalized to `None` for every tier and transport,
+    // rather than at one leaf: this is the single entry point they all funnel
+    // through. See [`normalize_thread`] for why an empty ts is not a thread.
+    //
+    // Known wrinkle: this runs AFTER `state::apply_continue`, which resolves
+    // `thread: cli.thread.or_else(|| persisted)`. `Some("")` is a `Some`, so it
+    // wins there and the persisted thread never loads. `--continue --thread ""`
+    // therefore starts a NEW thread instead of resuming the recorded one.
+    opts.thread = normalize_thread(opts.thread);
     if opts.local {
         return message_local(opts).await;
     }
@@ -2671,6 +2782,45 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An empty `--thread` must not survive as a thread: carried through, it
+    /// enqueues `conversation_id: ""` and puts a literal `"thread_ts": ""` in an
+    /// outbound chat.postMessage body. The rule is applied at two sites
+    /// ([`message`] and [`enqueue_over_connected_transport`]), both of which need
+    /// a live Valkey to drive, so this pins the rule itself where CI can run it.
+    #[test]
+    fn an_empty_thread_normalizes_to_no_thread() {
+        assert_eq!(normalize_thread(Some(String::new())), None);
+    }
+
+    /// The filter must not eat a real thread ts, and an already-absent thread
+    /// stays absent -- the two branches that make the guard safe to apply twice.
+    #[test]
+    fn a_named_thread_survives_normalization() {
+        assert_eq!(
+            normalize_thread(Some("1750000000.001900".to_string())),
+            Some("1750000000.001900".to_string())
+        );
+        assert_eq!(normalize_thread(None), None);
+    }
+
+    /// `Default` must hand back the crate's real defaults, not zeros: a caller
+    /// writing `MessageOpts { text, channel, ..Default::default() }` otherwise
+    /// gets an instant deadline and an empty api key that defeats the #540
+    /// sentinel comparison in `apply_continue`.
+    #[test]
+    fn default_message_opts_carry_the_crates_real_defaults() {
+        let opts = MessageOpts::default();
+        assert_eq!(opts.timeout_secs, DEFAULT_TIMEOUT_SECS);
+        assert_eq!(opts.api_key, DEFAULT_API_KEY);
+        assert_eq!(opts.listen_port, DEFAULT_LISTEN_PORT);
+        assert_eq!(opts.valkey_local_port, DEFAULT_VALKEY_LOCAL_PORT);
+        assert_eq!(opts.api_local_port, DEFAULT_API_LOCAL_PORT);
+        assert_eq!(opts.valkey_password, DEFAULT_VALKEY_PASSWORD);
+        assert_eq!(opts.namespace, "curie");
+        assert_eq!(opts.release, "curie");
+        assert_eq!(opts.chart, "charts/curie");
+    }
+
     /// The printed resolve hint must be runnable AS PRINTED. Every flag the
     /// server requires has to be on it: the mandatory `<AGENT>` positional,
     /// `--as`, and `--actor-channel` -- without the last one the default
@@ -3121,6 +3271,46 @@ mod tests {
             lines.iter().any(|l| l.contains("no stub is bound")),
             "cluster plan must note the connected branch: {lines:?}"
         );
+    }
+
+    #[test]
+    fn connected_turn_conversation_id_is_the_real_placeholder_ts() {
+        // Issue #954: with no --thread the connected path posts a TOP-LEVEL
+        // placeholder, and a top-level message's own ts is its thread root -- so
+        // the enqueued conversation_id must be exactly that placeholder ts. The
+        // pre-fix code fed a clock-derived synthetic thread here, which can never
+        // equal the ts Slack returned, so the card had nothing real to thread on.
+        // Asserting on the turn the enqueue actually builds is the point: the bug
+        // was the wiring, so wiring a synthetic thread back in must fail HERE.
+        let placeholder_ts = "1717171717.000900";
+        let turn = connected_turn("C-real", &opts(Some("C-real")), None, placeholder_ts);
+        assert_eq!(
+            turn.conversation_id, turn.reply_handle.placeholder,
+            "the connected turn must thread on the placeholder we actually posted"
+        );
+        assert_eq!(turn.conversation_id, placeholder_ts);
+        assert_eq!(turn.reply_handle.channel, "C-real");
+        // #770/ADR-0078: no per-turn endpoint, so the reply rides the connected
+        // transport.
+        assert!(turn.reply_handle.endpoint.is_none());
+    }
+
+    #[test]
+    fn connected_turn_conversation_id_is_the_explicit_thread() {
+        // With --thread <ts> the turn's conversation_id IS that thread, while the
+        // placeholder stays the distinct real message we posted into it. (The
+        // outbound post itself lives in slack::post_body, not here.)
+        let thread = "1717171717.000100";
+        let placeholder_ts = "1717171717.000900";
+        let turn = connected_turn(
+            "C-real",
+            &opts(Some("C-real")),
+            Some(thread),
+            placeholder_ts,
+        );
+        assert_eq!(turn.conversation_id, thread);
+        assert_eq!(turn.reply_handle.placeholder, placeholder_ts);
+        assert!(turn.reply_handle.endpoint.is_none());
     }
 
     #[test]
