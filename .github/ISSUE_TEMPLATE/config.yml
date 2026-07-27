@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or how-to help
+    url: https://github.com/curie-eng/curie/discussions/categories/q-a
+    about: >-
+      Ask in Discussions Q&A. Issues are for bugs and reproducible problems.
+      Answers there are searchable, so the next person finds them.
+  - name: Idea or proposal
+    url: https://github.com/curie-eng/curie/discussions/categories/ideas
+    about: >-
+      Talk a design through before it becomes an issue. Larger changes may
+      need an ADR under docs/adr/.
+  - name: Security vulnerability
+    url: https://github.com/curie-eng/curie/security/policy
+    about: >-
+      Do not open a public issue. Follow the private disclosure process in
+      SECURITY.md.

@@ -1,0 +1,44 @@
+name: Documentation problem
+description: Something in the docs is wrong, missing, or misleading.
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Docs that sent you down the wrong path are a bug. Small corrections are
+        very welcome as a pull request instead of an issue.
+
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: The file path or URL, and a heading or line number if you have one.
+      placeholder: "QUICKSTART.md, the 'First run' section"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong
+      description: >-
+        What does it say, what did you expect it to say, and what happened when
+        you followed it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested wording
+      description: Optional, but the fastest path to a fix.
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >-
+            I agree to follow this project's
+            [Code of Conduct](https://github.com/curie-eng/curie/blob/main/CODE_OF_CONDUCT.md).
+          required: true
