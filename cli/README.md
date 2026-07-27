@@ -469,6 +469,14 @@ same thread:
 curie cluster message --channel CSIM123 --thread 1720000000.000100 "follow up question"
 ```
 
+Against a **connected** Slack workspace the thread ts is not synthetic: the CLI
+posts a real placeholder message to the channel and the printed thread ts is
+that placeholder's real Slack ts, so you can reply to it in Slack. Passing
+`--thread <ts>` there posts the placeholder into that existing thread, which
+means the ts must name a real message in the channel -- a thread ts carried over
+from a stub run will be rejected by Slack, and the command tells you to drop
+`--thread` to start a new one.
+
 ## `curie local message`: the same roundtrip against the compose stack
 
 `local message` drives the local compose stack (`curie local up`) instead of a
