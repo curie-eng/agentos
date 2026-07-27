@@ -4,12 +4,12 @@
 //! exist yet, so this file will not compile / the schema loads fail at red; the
 //! implementer creates the schemas alongside the `--json` wiring.
 
+use std::collections::BTreeSet;
+
 use curie::commands::{eval_json, status_json};
 use curie::evals::CaseOutcome;
 use curie::exit;
-use curie::message::{
-    message_awaiting_approval_json, message_dry_run_json, message_reply_json, message_timeout_json,
-};
+use curie::message::{message_dry_run_json, MessageOutcomeOutput};
 use curie::observability::{local_endpoints, Endpoint, ObservabilityOutput};
 use curie::ui::{CliOutput, DryRunPlan};
 use curie_aci_protocol::SessionStatus;
@@ -146,26 +146,278 @@ fn error_json_validates_against_error_schema() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #955: the message-schema gate. THIS is the canonical statement of why the
+// section is shaped the way it is; everything below points back here instead of
+// restating it.
+//
+// These tests drive `MessageOutcomeOutput::to_json()` directly rather than the
+// underlying builder functions, so every enum variant is forced through the
+// committed `message.schema.json` gate regardless of whether its `to_json` arm
+// delegates to a schema-gated builder or inlines its own JSON literal.
+// `Enqueued` (#770/ADR-0078) is the proof case: its arm used to inline
+// `serde_json::json!({"status": "enqueued", ...})`, which the pre-#955
+// four-branch `oneOf` had no branch for and therefore REJECTED. It now
+// delegates to `message_enqueued_json` like its siblings (see that builder's
+// doc comment in `cli/src/message.rs`), but driving through `to_json()` here
+// still matters: it is what would catch a FUTURE arm that inlines the way
+// `Enqueued` once did. The schema carries an `enqueued` branch, and the tests
+// below are what pin that fix.
+//
+// Two mechanisms stop a future variant escaping the same way, and both are
+// deliberate. Compile-time exhaustiveness (the no-wildcard `match` in
+// `message_outcome_variant_name`) is the cheap trap: it fails the BUILD when a
+// variant is added with no arm. `message_outcome_samples_cover_every_declared_variant`
+// closes the other half at run time: a variant that gets an arm but no
+// constructed sample must fail too, so both additions are mandatory together.
+// That gate's expected set is DERIVED from the enum's own AST and must NOT be
+// replaced by a hand-written list of variant names -- such a list stays
+// trivially equal to whatever the test already covers, which is exactly how a
+// new inlined `to_json` arm would slip past the gate the way `Enqueued` did.
+
+// The `syn` walk that reads the enum's variants straight out of the source, in
+// the same `#[path = ...]` shape the sibling AST gates use
+// (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`).
+#[path = "support/enum_variants.rs"]
+mod enum_variants;
+
+/// The compiled `message.schema.json` validator. Every message-schema test
+/// below takes it from here rather than re-inlining the load + compile pair.
+fn message_validator() -> jsonschema::Validator {
+    validator(&load_schema("message.schema.json"))
+}
+
+/// The variant set of `MessageOutcomeOutput`, derived from the AST of
+/// `cli/src/message.rs` -- the enum definition itself, which is the only source
+/// of truth a developer adding a variant cannot forget to update. Deriving it
+/// rather than listing it by hand is deliberate; see the #955 section note
+/// above for why a hand-written list would defeat the gate.
+fn message_outcome_declared_variants() -> BTreeSet<String> {
+    let path = format!("{}/src/message.rs", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cli/src/message.rs must be readable at {path}: {e}"));
+    let names = enum_variants::variant_names(&src, "MessageOutcomeOutput");
+    assert!(
+        !names.is_empty(),
+        "no `enum MessageOutcomeOutput` found in {path}: the #955 coverage gate cannot derive \
+         its expected variant set, so it would pass vacuously"
+    );
+    names
+}
+
+/// The variant NAME (as spelled in the enum) of a constructed outcome, matched
+/// with **no wildcard arm** -- the compile-time half of the two-mechanism trap
+/// described in the #955 section note above. Do not add a wildcard arm.
+fn message_outcome_variant_name(value: &MessageOutcomeOutput) -> &'static str {
+    match value {
+        MessageOutcomeOutput::Replied { .. } => "Replied",
+        MessageOutcomeOutput::NoEdit { .. } => "NoEdit",
+        MessageOutcomeOutput::AwaitingApproval { .. } => "AwaitingApproval",
+        MessageOutcomeOutput::TimedOut { .. } => "TimedOut",
+        MessageOutcomeOutput::Enqueued { .. } => "Enqueued",
+    }
+}
+
+/// An awaiting-approval outcome, parameterized only by the reply text: `Some`
+/// models a parked worker that left placeholder text we could read, `None`
+/// models one that left nothing at all.
+fn awaiting_approval_outcome(reply: Option<&str>) -> MessageOutcomeOutput {
+    MessageOutcomeOutput::AwaitingApproval {
+        thread: "1700000000.000100".to_string(),
+        reply: reply.map(str::to_string),
+        tier: "workspace",
+        agent: None,
+        channel: "C123".to_string(),
+    }
+}
+
+/// One constructed instance of every `MessageOutcomeOutput` variant, reused
+/// by the schema-validation loop and the variant-coverage test below.
+fn message_outcome_samples() -> Vec<MessageOutcomeOutput> {
+    vec![
+        MessageOutcomeOutput::Replied {
+            thread: "1700000000.000100".to_string(),
+            reply: "the answer is 42".to_string(),
+        },
+        MessageOutcomeOutput::NoEdit {
+            thread: "1700000000.000100".to_string(),
+        },
+        awaiting_approval_outcome(Some("card text")),
+        MessageOutcomeOutput::TimedOut {
+            diagnostics: None,
+            resume_note: None,
+        },
+        MessageOutcomeOutput::Enqueued {
+            channel: "C123".to_string(),
+            thread: "1700000000.000100".to_string(),
+        },
+    ]
+}
+
 #[test]
-fn message_reply_json_validates_against_message_schema() {
-    let schema = load_schema("message.schema.json");
-    let v = validator(&schema);
+fn message_outcome_samples_cover_every_declared_variant() {
+    // The run-time half of the #955 two-mechanism trap; see the section note
+    // above. The expected set comes from the enum's own AST, never a list
+    // maintained here.
+    let declared = message_outcome_declared_variants();
+    let covered: BTreeSet<String> = message_outcome_samples()
+        .iter()
+        .map(|outcome| message_outcome_variant_name(outcome).to_string())
+        .collect();
+
+    let uncovered: Vec<&String> = declared.difference(&covered).collect();
+    assert!(
+        uncovered.is_empty(),
+        "MessageOutcomeOutput variant(s) {uncovered:?} are declared in \
+         cli/src/message.rs but have no sample in message_outcome_samples(), so \
+         their `to_json()` never reaches the message.schema.json gate (#955); \
+         add one constructed sample per variant"
+    );
+
+    let unknown: Vec<&String> = covered.difference(&declared).collect();
+    assert!(
+        unknown.is_empty(),
+        "message_outcome_variant_name() claims variant(s) {unknown:?} that \
+         cli/src/message.rs does not declare; each arm's name string must match \
+         its enum variant's spelling exactly, or the coverage check above is \
+         comparing against the wrong set"
+    );
+}
+
+// ─── The derived-variant walk's own teeth (#955) ─────────────────────────────
+// The gate above is only as honest as the set `variant_names` derives: a
+// silently-SHORT set makes the coverage comparison vacuously green, which is the
+// exact defect #955 exists to close. `enum_variants` therefore panics rather
+// than under-reporting, and the cases below prove each of those panics fires by
+// EXECUTION -- the same "guard rejects a violating input" convention the sibling
+// AST gates follow (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`),
+// over small inline source fixtures, since `variant_names` takes source text and
+// needs no file on disk. They live here, beside the `#[path]` include and the
+// real-tree assertion that consumes it, because that is where each sibling gate
+// keeps its own rejection cases.
+
+/// A well-formed declaration: the positive control. Without it the three
+/// rejection tests below would also pass against a walk that panicked
+/// unconditionally or derived garbage.
+const SAMPLE_ENUM_SRC: &str = r#"
+pub enum Sample {
+    Alpha { thread: String },
+    Beta,
+    Gamma(u8),
+}
+"#;
+
+#[test]
+fn variant_names_derives_every_variant_of_a_well_formed_enum() {
+    let expected: BTreeSet<String> = ["Alpha", "Beta", "Gamma"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        enum_variants::variant_names(SAMPLE_ENUM_SRC, "Sample"),
+        expected,
+        "the walk must enumerate every variant shape (struct, unit, tuple)"
+    );
+    // The absent-enum case is empty, NOT a panic: turning that into a failure is
+    // the caller's job (`message_outcome_declared_variants` asserts non-empty),
+    // and conflating the two would make the panics below unreadable.
+    assert!(
+        enum_variants::variant_names(SAMPLE_ENUM_SRC, "NotDeclared").is_empty(),
+        "an absent enum yields an empty set for the caller to reject"
+    );
+}
+
+#[test]
+#[should_panic(expected = "does not parse as Rust")]
+fn variant_names_panics_on_source_that_does_not_parse() {
+    // Silently returning nothing here is what the old walk did, and the caller
+    // then misreported it as "no enum found" -- an absent enum and an
+    // unparseable file must never look alike.
+    enum_variants::variant_names("pub enum Sample { Alpha,", "Sample");
+}
+
+#[test]
+#[should_panic(expected = "2 declarations of `enum Sample`")]
+fn variant_names_panics_on_a_second_declaration_of_the_same_enum() {
+    const TWO_DECLARATIONS_SRC: &str = r#"
+pub enum Sample {
+    Alpha,
+}
+
+mod fixtures {
+    pub enum Sample {
+        Beta,
+    }
+}
+"#;
+    // Unioned, these would describe neither enum, so the gate would compare the
+    // real `match` against a fiction.
+    enum_variants::variant_names(TWO_DECLARATIONS_SRC, "Sample");
+}
+
+#[test]
+#[should_panic(expected = "Sample::Beta")]
+fn variant_names_panics_on_a_cfg_gated_variant() {
+    const CFG_VARIANT_SRC: &str = r#"
+pub enum Sample {
+    Alpha,
+    #[cfg(unix)]
+    Beta,
+}
+"#;
+    // The walk reads text and cannot know whether `Beta` exists in the build the
+    // no-wildcard `match` is compiled into.
+    enum_variants::variant_names(CFG_VARIANT_SRC, "Sample");
+}
+
+#[test]
+#[should_panic(expected = "mod fixtures (enclosing enum Sample)")]
+fn variant_names_panics_on_an_enum_inside_a_cfg_gated_module() {
+    const CFG_MODULE_SRC: &str = r#"
+#[cfg(test)]
+mod fixtures {
+    pub enum Sample {
+        Alpha,
+    }
+}
+"#;
+    // An enclosing `#[cfg]` gates the declaration just as surely as one written
+    // on the enum itself; the expected message pins that it is the ENCLOSURE
+    // that was detected, not some other cfg position.
+    enum_variants::variant_names(CFG_MODULE_SRC, "Sample");
+}
+
+#[test]
+fn message_outcome_replied_validates_against_message_schema() {
+    let v = message_validator();
     // Replied case: a non-null reply and finalized true.
-    let replied = message_reply_json("1700000000.000100", Some("the answer is 42"));
+    let replied = MessageOutcomeOutput::Replied {
+        thread: "1700000000.000100".to_string(),
+        reply: "the answer is 42".to_string(),
+    }
+    .to_json();
     assert!(
         v.is_valid(&replied),
-        "message_reply_json (replied) must validate against message.schema.json: {replied}"
+        "MessageOutcomeOutput::Replied::to_json must validate against message.schema.json: {replied}"
     );
     // Pin the values, not just the types: the reply text must pass through, the
     // thread must echo the input, and finalized must track reply.is_some().
     assert_eq!(replied["reply"], serde_json::json!("the answer is 42"));
     assert_eq!(replied["thread"], serde_json::json!("1700000000.000100"));
     assert_eq!(replied["finalized"], serde_json::json!(true));
+}
+
+#[test]
+fn message_outcome_no_edit_validates_against_message_schema() {
+    let v = message_validator();
     // No-edit completion: reply null, finalized false, must also validate.
-    let no_edit = message_reply_json("1700000000.000100", None);
+    let no_edit = MessageOutcomeOutput::NoEdit {
+        thread: "1700000000.000100".to_string(),
+    }
+    .to_json();
     assert!(
         v.is_valid(&no_edit),
-        "message_reply_json (no edit) must validate against message.schema.json: {no_edit}"
+        "MessageOutcomeOutput::NoEdit::to_json must validate against message.schema.json: {no_edit}"
     );
     // Pin the no-edit values: null reply, thread passthrough, finalized false.
     assert!(
@@ -177,13 +429,16 @@ fn message_reply_json_validates_against_message_schema() {
 }
 
 #[test]
-fn message_timeout_json_validates_against_message_schema() {
-    let schema = load_schema("message.schema.json");
-    let v = validator(&schema);
-    let timed_out = message_timeout_json();
+fn message_outcome_timed_out_validates_against_message_schema() {
+    let v = message_validator();
+    let timed_out = MessageOutcomeOutput::TimedOut {
+        diagnostics: None,
+        resume_note: None,
+    }
+    .to_json();
     assert!(
         v.is_valid(&timed_out),
-        "message_timeout_json must validate against message.schema.json: {timed_out}"
+        "MessageOutcomeOutput::TimedOut::to_json must validate against message.schema.json: {timed_out}"
     );
     // Pin the timeout shape: null reply, finalized false, timed_out true.
     assert!(
@@ -195,9 +450,65 @@ fn message_timeout_json_validates_against_message_schema() {
 }
 
 #[test]
+fn message_outcome_awaiting_approval_validates_and_is_distinct() {
+    // #529: the awaiting-approval object is finalized:false + awaiting_approval:true,
+    // a distinct terminal state from a reply or a timeout.
+    let v = message_validator();
+    let awaiting = awaiting_approval_outcome(Some("card text")).to_json();
+    assert!(
+        v.is_valid(&awaiting),
+        "MessageOutcomeOutput::AwaitingApproval::to_json must validate against message.schema.json: {awaiting}"
+    );
+    assert_eq!(awaiting["finalized"], serde_json::json!(false));
+    assert_eq!(awaiting["awaiting_approval"], serde_json::json!(true));
+    assert_eq!(awaiting["reply"], serde_json::json!("card text"));
+    assert_eq!(awaiting["thread"], serde_json::json!("1700000000.000100"));
+}
+
+/// The no-reply approval card is a DISTINCT schema shape from the one above:
+/// the worker parked without any placeholder text we could read, so `reply` is
+/// JSON null (the branch allows both). Kept as its own test rather than a
+/// second entry in `message_outcome_samples()`, which must stay exactly one
+/// sample per variant for the AST-derived coverage gate to compare cleanly.
+#[test]
+fn message_outcome_awaiting_approval_with_no_reply_validates() {
+    let v = message_validator();
+    let awaiting = awaiting_approval_outcome(None).to_json();
+    assert!(
+        v.is_valid(&awaiting),
+        "an awaiting-approval payload with a null reply must validate against message.schema.json: {awaiting}"
+    );
+    assert!(
+        awaiting["reply"].is_null(),
+        "an unseen approval card carries a JSON null reply: {awaiting}"
+    );
+    assert_eq!(awaiting["finalized"], serde_json::json!(false));
+    assert_eq!(awaiting["awaiting_approval"], serde_json::json!(true));
+    assert_eq!(awaiting["thread"], serde_json::json!("1700000000.000100"));
+}
+
+#[test]
+fn message_outcome_enqueued_validates_against_message_schema() {
+    // The #955 proof case (see the section note above): this assertion fails
+    // again the moment the `enqueued` branch is dropped from the schema or
+    // `message_enqueued_json`'s output drifts away from it.
+    let v = message_validator();
+    let enqueued = MessageOutcomeOutput::Enqueued {
+        channel: "C123".to_string(),
+        thread: "1700000000.000100".to_string(),
+    }
+    .to_json();
+    assert!(
+        v.is_valid(&enqueued),
+        "MessageOutcomeOutput::Enqueued::to_json must validate against message.schema.json: {enqueued}"
+    );
+    assert_eq!(enqueued["channel"], serde_json::json!("C123"));
+    assert_eq!(enqueued["thread"], serde_json::json!("1700000000.000100"));
+}
+
+#[test]
 fn message_dry_run_json_validates_against_message_schema() {
-    let schema = load_schema("message.schema.json");
-    let v = validator(&schema);
+    let v = message_validator();
     // Explicit channel (local target).
     let with_channel = message_dry_run_json(
         "local",
@@ -226,54 +537,103 @@ fn message_dry_run_json_validates_against_message_schema() {
     assert_eq!(no_channel["target"], serde_json::json!("cluster"));
 }
 
+/// The direct statement of #955's acceptance criterion, carrying BOTH schema
+/// properties in a single pass over every emitted payload:
+///
+/// 1. **Every variant validates.** Each `MessageOutcomeOutput` variant's
+///    `to_json()`, plus the dry-run descriptor, clears the committed schema.
+/// 2. **Exactly one branch matches.** `message.schema.json`'s root schema is
+///    a BARE `oneOf` (no sibling keywords, no wrapping `allOf`/`$ref`), which
+///    is what makes `is_valid` and "matches exactly one branch" the same
+///    check here -- a payload satisfying two branches would fail validation,
+///    since it would make the emitted object ambiguous to an agent consumer
+///    discriminating on shape. That root shape is PINNED below rather than
+///    assumed: restructuring `message.schema.json` so the root is no longer a
+///    bare `oneOf` (wrapped in `allOf`, given sibling keywords, swapped for
+///    `anyOf`) turns this test red, instead of leaving `is_valid` quietly
+///    passing while the test's name overstates what it proves.
+///
+/// Driven off the SAME sample set the AST coverage gate checks, so coverage and
+/// validation cannot drift apart -- the coverage gate only proves a sample
+/// exists, and without this loop the per-variant tests that actually validate
+/// could be deleted one by one without the gate noticing. Those per-variant
+/// tests stay: they carry field-level assertions this loop does not.
 #[test]
-fn message_schema_variants_are_mutually_exclusive() {
-    // The schema is a oneOf; each builder's output must match exactly one variant.
+fn every_message_payload_matches_exactly_one_message_schema_branch() {
+    // Property 2's precondition, pinned: the root is a BARE `oneOf`, so
+    // "validates" and "matches exactly one branch" are the same check. Pure
+    // annotations may sit alongside it; any other keyword (`allOf`, `anyOf`,
+    // `type`, `$ref`, `not`) would change what `is_valid` means.
     let schema = load_schema("message.schema.json");
-    let v = validator(&schema);
-    for value in [
-        message_reply_json("1700000000.000100", Some("hi")),
-        message_reply_json("1700000000.000100", None),
-        message_awaiting_approval_json("1700000000.000100", Some("awaiting approval")),
-        message_awaiting_approval_json("1700000000.000100", None),
-        message_timeout_json(),
-        message_dry_run_json("local", "s", Some("C1"), "http://x/api/"),
-    ] {
+    let root = schema
+        .as_object()
+        .expect("message.schema.json's root must be a JSON object");
+    let branches = root
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("message.schema.json's root must carry a `oneOf` array");
+    assert!(
+        branches.len() > 1,
+        "a single-branch `oneOf` makes `exactly one branch` a vacuous claim: {branches:#?}"
+    );
+    const ANNOTATIONS: [&str; 6] = [
+        "$schema",
+        "$id",
+        "$comment",
+        "title",
+        "description",
+        "$defs",
+    ];
+    let siblings: Vec<&str> = root
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "oneOf" && !ANNOTATIONS.contains(k))
+        .collect();
+    assert!(
+        siblings.is_empty(),
+        "message.schema.json's root must stay a bare `oneOf`; keyword(s) {siblings:?} beside it \
+         would stop `is_valid` meaning `matches exactly one branch`, which is what this test's \
+         name claims"
+    );
+
+    let v = message_validator();
+    for (label, value) in message_outcome_samples()
+        .iter()
+        .map(|outcome| {
+            (
+                format!(
+                    "MessageOutcomeOutput::{}::to_json",
+                    message_outcome_variant_name(outcome)
+                ),
+                outcome.to_json(),
+            )
+        })
+        .chain([(
+            "message_dry_run_json".to_string(),
+            message_dry_run_json("local", "s", Some("C1"), "http://x/api/"),
+        )])
+    {
         assert!(
             v.is_valid(&value),
-            "each builder output must satisfy the oneOf: {value}"
+            "{label} must satisfy exactly one branch of the message.schema.json oneOf: {value}"
         );
     }
 }
 
 #[test]
-fn message_awaiting_approval_json_validates_and_is_distinct() {
-    // #529: the awaiting-approval object is finalized:false + awaiting_approval:true,
-    // a distinct terminal state from a reply or a timeout.
-    let schema = load_schema("message.schema.json");
-    let v = validator(&schema);
-    let awaiting = message_awaiting_approval_json("1700000000.000100", Some("card text"));
-    assert!(
-        v.is_valid(&awaiting),
-        "awaiting-approval must validate against message.schema.json: {awaiting}"
-    );
-    assert_eq!(awaiting["finalized"], serde_json::json!(false));
-    assert_eq!(awaiting["awaiting_approval"], serde_json::json!(true));
-    assert_eq!(awaiting["reply"], serde_json::json!("card text"));
-    assert_eq!(awaiting["thread"], serde_json::json!("1700000000.000100"));
-}
-
-#[test]
 fn message_schema_gate_has_teeth() {
     // negative control: proves the schema gate discriminates
-    let schema = load_schema("message.schema.json");
-    let mut value = message_reply_json("1700000000.000100", Some("hi"));
+    let v = message_validator();
+    let mut value = MessageOutcomeOutput::Replied {
+        thread: "1700000000.000100".to_string(),
+        reply: "hi".to_string(),
+    }
+    .to_json();
     // Strip a required key; a schema with real teeth must now reject.
     value
         .as_object_mut()
-        .expect("message_reply_json returns a JSON object")
+        .expect("MessageOutcomeOutput::Replied::to_json returns a JSON object")
         .remove("reply");
-    let v = validator(&schema);
     assert!(
         !v.is_valid(&value),
         "message schema must reject an object missing the required `reply` key"

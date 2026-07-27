@@ -226,6 +226,12 @@
       "version": 1
     },
     {
+      "result": "message_enqueued_json",
+      "kind": "builder",
+      "schema": "message.schema.json",
+      "version": 1
+    },
+    {
       "result": "error_json",
       "kind": "builder",
       "schema": "error.schema.json",
