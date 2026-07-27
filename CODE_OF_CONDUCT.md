@@ -61,14 +61,11 @@ representative at an online or offline event.
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported to the community leaders responsible for enforcement at:
 
-<!-- TODO(maintainer): Decision 2 (issue #635) - conduct escalation contact.
-     Provide the reporting address or channel and who receives escalations.
-     Do not ship the placeholder below. Common choices: a dedicated conduct
-     email alias (for example conduct@your-domain), or a private form. State
-     the expected acknowledgement time if the project commits to one. -->
+**[conduct@curietech.net](mailto:conduct@curietech.net)**
 
-**TODO(maintainer): conduct escalation contact** (reporting address or channel
-to be set before the public announcement).
+Reports go to the project maintainers. This applies to every community space the
+project runs, including the repository, GitHub Discussions, and the community
+chat server.
 
 All complaints will be reviewed and investigated promptly and fairly.
 
