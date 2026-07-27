@@ -502,6 +502,32 @@ jobs:
   # the generator's T1 substitutes for the build directive, both resolved
   # locally so `local up` never attempts a pull against a private GHCR ref.
   #
+  # AGENTS.md forbids naming an AI assistant in a commit message and forbids
+  # Co-Authored-By lines referencing AI. Nothing enforced it and it landed on main
+  # twice in one day (#952/#953, issue #962). Deliberately NOT path-gated: a commit
+  # message is wrong regardless of which files the PR touches. Scoped to the PR's
+  # OWN commits (base..head), so the ~29% of pre-gate history carrying the trailer
+  # is not retroactively enforced -- commits are immutable and a history rewrite is
+  # not worth it.
+  commit-messages:
+    name: Commit messages (no AI attribution)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # The range needs both endpoints present locally.
+          fetch-depth: 0
+      # Prove the matcher still distinguishes attribution from mention before
+      # trusting its verdict; a gate that cannot fail is not a gate.
+      - name: Gate self-test (negative control)
+        run: bash scripts/check-commit-messages.sh --self-test
+      - name: Check the PR's commit messages
+        run: |
+          bash scripts/check-commit-messages.sh \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
   # The three image builds here are GHA-layer-cached via a buildx builder that
   # is created but NOT made the default (`setup-buildx-action` with
   # `use: false`): two of the tags are consumed as Dockerfile FROM bases by a
