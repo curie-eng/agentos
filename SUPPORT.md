@@ -14,20 +14,16 @@ of help you need.
 
 ## Where to get help
 
-**Usage questions and how-to help.**
+**Usage questions and how-to help.** Ask in
+[GitHub Discussions](https://github.com/curie-eng/curie/discussions). Use the
+**Q&A** category for a question you want answered, and **Ideas** for a proposal
+you want to talk through before it becomes an issue. Include your version or
+commit, whether you are running local Docker or Kubernetes, and the exact
+command and output. Questions are answered on a best-effort basis by maintainers
+and other users; there is no response-time guarantee and no support contract.
 
-<!-- TODO(maintainer): Decision 2 (issue #635) - support channel. Name where
-     ordinary support questions should go and the expected response posture.
-     Do not ship the placeholder below. Options include GitHub Discussions
-     (enable it on the repo), a community chat (Slack/Discord), or directing
-     usage questions to GitHub issues with a "question" label. State response
-     expectations plainly (for example: best-effort, no SLA) so users know
-     what to expect. -->
-
-> TODO(maintainer): support channel to be decided before the public
-> announcement (for example, enable GitHub Discussions or link a community
-> chat). Until then, open a GitHub issue with a clear title and the "question"
-> label.
+Discussions is the durable record. If a question gets resolved somewhere else,
+post the answer back into Q&A so the next person finds it by search.
 
 **Bug reports and feature requests.** Open a
 [GitHub issue](https://github.com/curie-eng/curie/issues). For a bug, include
