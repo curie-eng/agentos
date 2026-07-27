@@ -52,6 +52,7 @@ uv sync                 # once, and after any dependency change
 uv run pytest -q        # all workspace tests
 uv run ruff check .     # lint (auto-fix: uv run ruff check --fix .)
 uv run mypy             # type-check (strict; targets the src dirs)
+uv run lint-imports     # import boundaries (harness SDK containment, #950/#961)
 ```
 
 **Rust CLI:**

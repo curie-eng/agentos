@@ -59,7 +59,7 @@ dev = [
 [tool.importlinter]
 # ADR-0062 (#844 Phase 2): harness conformance gets teeth. The full contract that
 # ADR-0062 asks for -- no `claude_agent_sdk` import ANYWHERE outside the Claude
-# harness package -- cannot pass yet: ten `curie_runner` modules still import the
+# harness package -- cannot pass yet: nine `curie_runner` modules still import the
 # SDK directly (adapter, approval, check, fake, hooks, plugin, session, state,
 # translate), and confining them is Phase 2's refactor. These two contracts gate
 # the boundaries that are ALREADY clean, so they cannot rot back before that
@@ -69,6 +69,12 @@ root_packages = [
     "curie_worker",
     "curie_dispatcher",
     "curie_runner",
+    # The frozen contract packages (#961). Outside the graph, no contract could
+    # ever fire on them, which left the worst possible place for an SDK import
+    # ungated. Clean today; the contract below keeps them that way.
+    "aci_protocol",
+    "channel_protocol",
+    "plugin_format",
 ]
 # Required for the contracts below: `claude_agent_sdk` is an EXTERNAL package, and
 # import-linter only tracks imports that leave the root packages when told to.
@@ -81,6 +87,18 @@ include_external_packages = true
 name = "The platform never imports a harness SDK"
 type = "forbidden"
 source_modules = ["curie_api", "curie_worker", "curie_dispatcher"]
+forbidden_modules = ["claude_agent_sdk"]
+
+[[tool.importlinter.contracts]]
+# The frozen tri-language contracts (ADR-0005/0017/0036) are generated from
+# Pydantic models and consumed by Python, Rust and TypeScript. A vendor SDK
+# import here would bind the wire itself to one harness -- the single worst place
+# for one, and ADR-0031's whole premise. Gated separately from the platform
+# contract so the failure message says which invariant broke (#961, following
+# #950).
+name = "The frozen contract packages never import a harness SDK"
+type = "forbidden"
+source_modules = ["aci_protocol", "channel_protocol", "plugin_format"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
