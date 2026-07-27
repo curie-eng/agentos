@@ -1,0 +1,77 @@
+name: Feature request
+description: Propose a change or a new capability.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        If you are still forming the idea, start in
+        [Discussions Ideas](https://github.com/curie-eng/curie/discussions/categories/ideas)
+        instead. Open an issue once there is a concrete change to track.
+        Proposals that change how components talk to each other usually need
+        an ADR under `docs/adr/` first; see
+        [CONTRIBUTING.md](https://github.com/curie-eng/curie/blob/main/CONTRIBUTING.md).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and discussions and did not find this one.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: >-
+        Describe the problem, not the solution. What are you unable to do
+        today, and what does that cost you?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What should exist instead? Include the command or interface you imagine.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI
+        - Runner
+        - Dispatcher
+        - Worker
+        - Platform API
+        - UI
+        - Helm chart and Kubernetes
+        - Skills and plugin bundles
+        - Model routing
+        - Evals
+        - Docs
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: >-
+        Including "do nothing." Knowing what you ruled out and why helps us
+        weigh the proposal.
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >-
+            I agree to follow this project's
+            [Code of Conduct](https://github.com/curie-eng/curie/blob/main/CODE_OF_CONDUCT.md).
+          required: true

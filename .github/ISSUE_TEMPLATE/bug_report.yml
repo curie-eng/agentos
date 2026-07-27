@@ -1,0 +1,98 @@
+name: Bug report
+description: Something is broken or behaves differently than documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for taking the time to file this. Issues are for bugs and
+        reproducible problems. If you are asking how to do something, please
+        use [Discussions Q&A](https://github.com/curie-eng/curie/discussions/categories/q-a)
+        instead, where the answer stays searchable.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched existing issues and did not find this one.
+          required: true
+        - label: This is a bug, not a usage question.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `curie --version`, or the commit SHA if you built from source.
+      placeholder: "0.4.3, or 66d17f5f"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Which tier were you running?
+      description: >-
+        `skill` is a local runner session for one bundle, `local` is the
+        Docker Compose stack, `cluster` is a deployed Kubernetes release.
+      options:
+        - skill
+        - local
+        - cluster
+        - Not sure
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86_64
+        - macOS arm64
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        The exact commands you ran, in order. A reproduction we can run
+        ourselves is the single most useful thing in this form.
+      placeholder: |
+        1. curie local up
+        2. curie local deploy --plugin-dir examples/...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or logs
+      description: >-
+        Paste command output, stack traces, or logs. This is rendered as a
+        code block, so no backticks are needed.
+      render: shell
+
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: >-
+            I agree to follow this project's
+            [Code of Conduct](https://github.com/curie-eng/curie/blob/main/CODE_OF_CONDUCT.md).
+          required: true
