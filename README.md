@@ -286,6 +286,8 @@ for attribution. "Curie" is a trademark of CurieTech AI. The code license
 does not grant trademark rights, and [`TRADEMARKS.md`](TRADEMARKS.md) explains
 what use of the name is fine without asking and what needs permission.
 
+See [Releases](https://github.com/curie-eng/curie/releases) for version history.
+
 If Curie is useful to you, especially if you build on it commercially, we'd
 love a link back to [github.com/curie-eng/curie](https://github.com/curie-eng/curie).
 It is a friendly request, not a license condition: nothing in the Apache License
