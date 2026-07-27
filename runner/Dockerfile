@@ -12,12 +12,27 @@
 # call), which is how the container smoke round-trips without a credential.
 # Python 3.13 is required by the frozen workspace packages; Node 22 is required
 # by the Claude Code CLI the SDK spawns. Base on python:3.13 and add Node.
+# Node comes from the official image rather than NodeSource's apt repo. That
+# repo's setup script (`deb.nodesource.com/setup_22.x`) started returning 403 to
+# everyone on 2026-07-27, which broke every runner-image build repo-wide: curl
+# failed, nodejs never installed, and the next line died with `npm: not found`.
+# Copying from the official image removes the third-party apt repo from the build
+# path entirely, pins the version by tag, and is architecture-correct by
+# construction (Docker resolves the matching platform, so an arm64 dev box and an
+# amd64 CI runner both work -- a hardcoded tarball URL would not).
+FROM node:22-bookworm-slim AS node
+
 FROM python:3.13-slim-bookworm
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
-    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
+# Only the Node bits, never all of /usr/local: the python base keeps its own
+# interpreter there, so a blanket copy would clobber it.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
+
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # The Claude Code CLI the SDK spawns for a real (non-fake) session.
