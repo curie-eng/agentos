@@ -301,6 +301,19 @@ commands.
 - Reference the relevant issue in the PR body (e.g. `Closes #123`).
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
+  CI enforces this on every PR (issue #962); check before pushing with:
+
+  ```bash
+  scripts/check-commit-messages.sh            # defaults to origin/main..HEAD
+  scripts/check-commit-messages.sh --self-test
+  ```
+
+  The gate flags *attribution*, not mention: a `Co-Authored-By` trailer naming an
+  assistant, the robot-emoji "Generated with" footer, or an attribution phrase next
+  to a bare assistant name. Technical references (`CLAUDE.md`, `claude_agent_sdk`,
+  `claude-sonnet-5`, `harness.claude`) are deliberately fine, and the script's
+  `--self-test` pins both halves so the distinction cannot silently rot. It checks
+  only the PR's own commits, so pre-gate history is not retroactively enforced.
 - No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Decisions: ADR vs. GitHub issue
