@@ -24,16 +24,17 @@ which shipped bare binaries.
 | `checksums.txt` | sha256 of every file above |
 | `checksums.txt.sigstore.json` | cosign signature over `checksums.txt` |
 
-Every asset also carries [SLSA build provenance](https://slsa.dev/), naming the
-repository, the workflow, and the commit it was built from.
+Every asset also carries [SLSA (Supply-chain Levels for Software Artifacts)
+build provenance](https://slsa.dev/), naming the repository, the workflow, and
+the commit it was built from.
 
 The trust chain is: provenance and the cosign signature establish that
 `checksums.txt` came from this repo's release workflow, and `checksums.txt`
 establishes that each file is the one that workflow produced. So verifying the
 manifest's signature and then checking a file against the manifest is enough --
 you do not need a separate signature per asset.
-[ADR-0052](adr/0052-release-asset-trust-model.md) records why the trust model is
-shaped this way.
+[ADR-0052](adr/0052-release-asset-trust-model.md) (Architecture Decision
+Record) records why the trust model is shaped this way.
 
 ## Verify the CLI before installing it
 
@@ -122,11 +123,11 @@ up` or `curie local up`, caching them under `~/.cache/curie/`. That fetch
 does not verify them today: it is protected by HTTPS to GitHub, not by the
 signature. Verify them by hand as above if you need the stronger guarantee.
 
-## SBOMs
+## SBOMs (Software Bill of Materials)
 
-Each asset ships an SPDX 2.3 SBOM at `<asset>.spdx.json`, covered by
-`checksums.txt` like any other file, so verify it the same way before trusting
-it:
+Each asset ships an SPDX (Software Package Data Exchange) 2.3 SBOM at
+`<asset>.spdx.json`, covered by `checksums.txt` like any other file, so verify
+it the same way before trusting it:
 
 - **CLI binaries** -- cataloged from `cli/Cargo.lock`, so the SBOM is the full
   crate dependency graph the build pinned. This is the one to feed to a
@@ -178,7 +179,8 @@ which is a reviewed edit rather than a side effect.
   `xattr -d com.apple.quarantine ./curie-aarch64-apple-darwin` (or right-click
   the binary in Finder and choose Open). Verify it with cosign or
   `gh attestation verify` as above -- that is the real check regardless.
-- **Container images.** GHCR image signing, provenance, and SBOMs are issue #62.
+- **Container images.** GHCR (GitHub Container Registry) image signing,
+  provenance, and SBOMs are issue #62.
 - **The SBOM generator's own supply chain.** `anchore/sbom-action` is pinned to a
   commit SHA, but on Linux and macOS it fetches `install.sh` from the `anchore/syft`
   `main` branch at run time, so the SBOM step still executes mutable upstream code

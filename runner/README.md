@@ -1,8 +1,9 @@
 # runner
 
 The runner image and SDK adapter: the productized prototype,
-a long-lived streaming session server that implements the full ACI
-v0.1 contract from `packages/aci-protocol`. Built on `claude-agent-sdk` (Python).
+a long-lived streaming session server that implements the full ACI (Agent
+Container Interface) v0.1 contract from `packages/aci-protocol`. Built on
+`claude-agent-sdk` (Python).
 Runs inside a claimed Agent Sandbox; the CLI (`curie skill up`) also runs it
 locally in Docker.
 
@@ -11,16 +12,19 @@ locally in Docker.
 - One long-lived `claude-agent-sdk` streaming-input session per process (one per
   sandbox) -- the source of prompt-cache affinity across turns.
 - Accepts inbound ACI frames (`event` of type message | job | eval_case, and
-  `interrupt`) and streams outbound NDJSON (`text_delta` | `tool_note` | `final`
-  | `error` | `side_effect_flag`) with protocol-version enforcement.
+  `interrupt`) and streams outbound NDJSON (newline-delimited JSON:
+  `text_delta` | `tool_note` | `final` | `error` | `side_effect_flag`) with
+  protocol-version enforcement.
 - Enforces `CURIE_BUDGET.max_output_tokens_per_run` (halts a run with a
   classified-failure final) and hands the daily USD cap to the SDK natively.
 - Emits `side_effect_flag` when a non-idempotent tool executes (read-only
   allowlist, deny-by-default; see `side_effects.py`).
 - Loads and validates the mounted plugin bundle via `plugin_format.validate_bundle`.
 - Exports gen_ai OTel spans (`agent.run` -> `llm.generation` -> `execute_tool`)
-  OTLP-HTTP to the collector, which forwards to Langfuse.
-- Rehydrates from a history ref on start (`resume`), stateless-first (ADR-0003).
+  via OTLP-HTTP (the OpenTelemetry Protocol over HTTP) to the collector, which
+  forwards to Langfuse.
+- Rehydrates from a history ref on start (`resume`), stateless-first
+  (ADR-0003, an Architecture Decision Record).
 
 ## HTTP surface (ACI channel)
 
@@ -39,7 +43,7 @@ proven steering pattern). The finish race (a steer arriving as a turn ends,
 
 The three POST routes (`/v1/event`, `/v1/steer`, `/v1/interrupt`) require an
 `Authorization: Bearer <token>` header matching `CURIE_RUNNER_TOKEN` when that
-env var is set, returning 401 otherwise; this is per-sandbox transport auth
+env var is set, returning 401 otherwise. This is per-sandbox transport auth
 (defense-in-depth on the ACI ingress alongside the NetworkPolicy), not part of
 the frozen ACI wire contract. Enforcement is only-when-configured: with the var
 unset the app is pass-through (CLI, fake-model CI, and pre-token sandboxes stay
@@ -48,17 +52,17 @@ readinessProbe hits `/healthz`).
 
 ## Environment
 
-ACI-frozen (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,
-`CURIE_SESSION_ID`, `CURIE_SANDBOX_ID`, `CURIE_BUDGET`, optional
-`CURIE_MEMORY_REF` / `CURIE_CREDENTIALS`, `OTEL_EXPORTER_OTLP_*`.
-Runner-local: `CURIE_MODEL`, `CURIE_MAX_TURNS`,
-`CURIE_HISTORY_REF` (rehydrate; falls back to `CURIE_MEMORY_REF`),
-`CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
-history preamble to a tail window; defaults 40 turns / 16000 bytes, a
-nonpositive value falls back to the default),
-`CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating the
-three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL` (offline
-smoke; no model call).
+- **ACI-frozen** (`aci-protocol.SessionConfig`): `CURIE_PLUGIN_DIR`,
+  `CURIE_SESSION_ID`, `CURIE_SANDBOX_ID`, `CURIE_BUDGET`, optional
+  `CURIE_MEMORY_REF` / `CURIE_CREDENTIALS`, `OTEL_EXPORTER_OTLP_*`.
+- **Runner-local**: `CURIE_MODEL`, `CURIE_MAX_TURNS`,
+  `CURIE_HISTORY_REF` (rehydrate; falls back to `CURIE_MEMORY_REF`),
+  `CURIE_HISTORY_MAX_TURNS` / `CURIE_HISTORY_MAX_BYTES` (bound the rehydrated
+  history preamble to a tail window; defaults 40 turns / 16000 bytes, a
+  nonpositive value falls back to the default),
+  `CURIE_RUNNER_PORT`, `CURIE_RUNNER_TOKEN` (per-sandbox bearer token gating
+  the three ACI POST routes; enforced only when set), `CURIE_FAKE_MODEL`
+  (offline smoke; no model call).
 
 ## Build and smoke
 
@@ -82,7 +86,8 @@ curl -sN -X POST http://localhost:18080/v1/event -H 'Content-Type: application/j
 ## MCP load check (offline, credential-free)
 
 `python -m curie_runner.check` is a separate, one-shot entrypoint (issue #337)
-that answers "do this bundle's MCP tools actually load?" without a model turn. It
+that answers "do this bundle's MCP (Model Context Protocol) tools actually
+load?" without a model turn. It
 validates the bundle via the frozen `load_plugins`, then builds a real
 `ClaudeSDKClient` and `connect()`s (no query), polls `get_mcp_status()` until the
 bundle's own servers settle, and compares the **declared** servers against the

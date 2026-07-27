@@ -1,6 +1,6 @@
 # apps/worker
 
-The worker is three parts: the concurrency kernel (routing rule, finish-race CAS, steer/interrupt, no-retry-after-side-effects, resume-rehydrate), the Agent Sandbox substrate module (warm pool, thread-to-sandbox affinity, claim/release), and the eval runner module. Reads Valkey Streams via redis-py consumer groups; drives claimed sandboxes running the runner image.
+The worker is three parts: the concurrency kernel (routing rule, finish-race CAS (compare-and-swap), steer/interrupt, no-retry-after-side-effects, resume-rehydrate), the Agent Sandbox substrate module (warm pool, thread-to-sandbox affinity, claim/release), and the eval runner module. Reads Valkey Streams via redis-py consumer groups; drives claimed sandboxes running the runner image.
 
 ## Deployment binding + kill switch (`curie_worker.binding` + `curie_worker.killswitch`)
 
@@ -10,7 +10,7 @@ behavior); present, it binds per-channel and gates killed agents.
 
 **Binding** (`binding.py`): on each event, resolve `channel -> agent -> active
 deployment -> version` with one read-only SELECT over the API, git-flow, and kill-switch Postgres tables
-(a thin query layer, not the API's ORM, to avoid pulling FastAPI into the worker).
+(a thin query layer, not the API's ORM (Object-Relational Mapper), to avoid pulling FastAPI into the worker).
 Prod wins over dev, then most recent. The kernel claims the sandbox with a boot
 env built from the resolution: `CURIE_BUDGET` (the agent's
 `max_usd_per_day`/`max_output_tokens_per_run`, platform defaults when NULL),
@@ -144,8 +144,9 @@ end-to-end (no `target_url`) that boots via the substrate and releases in a fina
 
 The kernel closes the loop: it consumes `QueuedTurn` entries the dispatcher
 puts on the `curie:runs` Valkey stream, routes each to a runner turn in a
-claimed sandbox, streams the NDJSON reply back into the Slack thread by editing
-the placeholder in place, and gets every failure mode right.
+claimed sandbox, streams the NDJSON (newline-delimited JSON) reply back into
+the Slack thread by editing the placeholder in place, and gets every failure
+mode right.
 
 ```
 XREADGROUP curie:runs        Consumer (consumer group; XAUTOCLAIM reclaims a
@@ -184,7 +185,8 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a redelivered or reclaimed entry that already finished is skipped.
   `XAUTOCLAIM` reclaims entries a dead consumer took but never acked and
   reprocesses them; the markers make that safe.
-- **Bounded delivery + a dead-letter graveyard** (ADR-0039, #505). Reclaim is
+- **Bounded delivery + a dead-letter graveyard** (ADR-0039, an Architecture
+  Decision Record; #505). Reclaim is
   capped, not infinite. An entry already delivered `max_delivery` times
   (`CURIE_MAX_DELIVERY`, default 5, floor 2) and still failing is moved to a
   dead-letter stream and acked off the group instead of re-dispatched, so it can
@@ -225,17 +227,21 @@ a second processing lane: it has no consumer group, and nothing reads it
 automatically. Replay, if an operator wants it, is `XRANGE` plus a re-`XADD` onto
 the main stream.
 
-**The graveyard is bounded, and its rows are best-effort.** Every `XADD` passes an
-approximate `MAXLEN` of `CURIE_DEAD_LETTER_MAXLEN` (default `10000`, minimum
-`1`), so under a flood the oldest rows are evicted and those failures are lost.
-That loss is deliberate: the unparseable path dead-letters per **inbound** entry,
-so a wire-format drift would otherwise grow the graveyard at full ingest rate on
-the same Valkey that holds the kernel's per-thread locks and side-effect markers,
-i.e. a platform-wide OOM. Bounded record loss is traded against that. Do not treat
-the graveyard as a durable audit log. Because the trim is approximate (Valkey trims
-on node boundaries), the stream is bounded at *at least* the configured length, not
-exactly it. Below the cap it holds every dead-lettered entry, and its length reads
-the system's poison rate, saturating rather than growing once the bound is hit.
+**The graveyard is bounded, and its rows are best-effort.**
+
+- Every `XADD` passes an approximate `MAXLEN` of `CURIE_DEAD_LETTER_MAXLEN`
+  (default `10000`, minimum `1`), so under a flood the oldest rows are
+  evicted and those failures are lost.
+- That loss is deliberate: the unparseable path dead-letters per **inbound**
+  entry, so a wire-format drift would otherwise grow the graveyard at full
+  ingest rate on the same Valkey that holds the kernel's per-thread locks and
+  side-effect markers, i.e. a platform-wide OOM. Bounded record loss is
+  traded against that. Do not treat the graveyard as a durable audit log.
+- Because the trim is approximate (Valkey trims on node boundaries), the
+  stream is bounded at *at least* the configured length, not exactly it.
+  Below the cap it holds every dead-lettered entry, and its length reads the
+  system's poison rate, saturating rather than growing once the bound is
+  hit.
 
 Each graveyard row carries the original entry's fields verbatim plus namespaced
 failure metadata, so a human or a replay tool can inspect exactly what died and
@@ -349,7 +355,7 @@ to the env above and drop the credential.
 ## The sandbox substrate (`curie_worker.sandbox`)
 
 The lifecycle seam between the worker kernel and kubernetes-sigs/agent-sandbox
-v0.5.0 (core `Sandbox` CRD + the extensions `SandboxClaim`/`SandboxWarmPool`/
+v0.5.0 (core `Sandbox` CRD (Custom Resource Definition) + the extensions `SandboxClaim`/`SandboxWarmPool`/
 `SandboxTemplate`). The kernel talks in `thread_key` (the Slack `thread_ts`) and
 `SandboxHandle`; everything Kubernetes-shaped stays behind this module.
 

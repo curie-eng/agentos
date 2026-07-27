@@ -13,8 +13,8 @@ never changes from a dependent lane and a needed change lands as its own
 reviewed change (see the frozen-interface rule below). Unlike `aci-protocol` it
 carries no `PROTOCOL_VERSION`: the format is the Claude Code plugin shape
 verbatim, and the models are lenient by design (`extra="allow"`) so real and
-future Claude Code bundles that carry keys this MVP does not model still
-validate. It is v0.x, so breaking changes to the validator remain possible, but
+future Claude Code bundles that carry keys this MVP (Minimum Viable Product)
+does not model still validate. It is v0.x, so breaking changes to the validator remain possible, but
 they must stay backward-compatible with existing valid bundles and land as their
 own reviewed change; the schema-compat gate (`tests/test_schema_compat.py`)
 fails on any drift between the models and the committed schema.

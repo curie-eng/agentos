@@ -2,9 +2,9 @@
 
 The `curie` CLI (Rust: clap + tokio + reqwest). It speaks
 only the frozen contracts (the generated `curie-aci-protocol` crate over
-HTTP/NDJSON, and the platform API's committed openapi.json) and orchestrates a
-local runner container via Docker, so a plugin runs on a dev laptop with zero
-Slack involved.
+HTTP/NDJSON (newline-delimited JSON), and the platform API's committed
+openapi.json) and orchestrates a local runner container via Docker, so a
+plugin runs on a dev laptop with zero Slack involved.
 
 ## Which target do I want?
 
@@ -28,9 +28,10 @@ all three: it runs the SAME `evals/cases.json` with the SAME grader at each tier
 per-tier parity gate), so a suite that passes at `skill` can be re-asserted verbatim at
 `local` and `cluster`. The distinction
 that matters: `skill` is the **runner-only** loop, talking straight to a runner
-container's ACI HTTP surface with no platform in front; `local` and `cluster`
-put the **full platform** (queue, worker, sandbox) in front of the identical
-runner and ACI, so a `message` walks the same path a real Slack mention would.
+container's ACI (Agent Container Interface) HTTP surface with no platform in
+front; `local` and `cluster` put the **full platform** (queue, worker,
+sandbox) in front of the identical runner and ACI, so a `message` walks the
+same path a real Slack mention would.
 
 ## `init` (top-level)
 
@@ -44,23 +45,29 @@ runner and ACI, so a `message` walks the same path a real Slack mention would.
 | `curie secrets list` | List saved Curie secret names. Values are never printed. |
 | `curie secrets unset <NAME>` | Remove a saved local secret. |
 | `curie guide` | Print a self-contained primer (ADR-0021) for a coding agent driving the harness: the parity ladder, when/which decision logic, the landmines, and verify-first, to stdout. `--json` emits the same content as a structured variant (data on stdout). |
-| `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
+| `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR (GitHub Container Registry) automatically and never needs to build. |
 | `curie list-agents` | List the plugin bundles under `agents/`, a personal, gitignored directory (sibling of `examples/`, source checkout only) for in-progress agent projects. Empty, not an error, when the directory doesn't exist. |
 | `curie deploy-local <folder>` | Deploy `agents/<folder>` to the local platform by name -- shorthand for `curie local deploy --plugin-dir agents/<folder>` (identical operation, same flags minus `--plugin-dir`). Local tier only; use `curie cluster deploy --plugin-dir agents/<folder>` for the cluster tier. The interactive "How to deploy to Slack" workflow offers the same `agents/` bundles as a picker. |
 
 ### `init --from-spec` spec shape
 
-The spec is a JSON object an agent writes after interviewing the human. `name`
-is the kebab-case bundle name; every `skills[].name` is kebab-case and unique;
-`connectors` (optional) is the raw `.mcp.json` `mcpServers` map (each server must
-define `command` or `url` as a string); `secrets` (optional) is a list of
-connector-secret NAMES (env-var-shaped, no values, per ADR-0009) written to the
-manifest's `secrets`; `approvalPolicy` (optional) declares approval `gates`
-(`{gate, route}`) where an `mcp__` gate must be a fully-namespaced live tool name
-`mcp__plugin_<bundle>_<server>__<tool>` for a declared connector (a built-in like
-`Bash` needs no prefix) — so a spec can express a gated, authed agent without
-hand-editing `plugin.json`; `evals` reuses the frozen eval-case shape
-so the scaffolded `evals/cases.json` loads unchanged through `curie skill eval`.
+The spec is a JSON object an agent writes after interviewing the human:
+
+- `name` is the kebab-case bundle name.
+- Every `skills[].name` is kebab-case and unique.
+- `connectors` (optional) is the raw `.mcp.json` `mcpServers` map (each
+  server must define `command` or `url` as a string).
+- `secrets` (optional) is a list of connector-secret NAMES (env-var-shaped,
+  no values, per ADR-0009, an Architecture Decision Record) written to the
+  manifest's `secrets`.
+- `approvalPolicy` (optional) declares approval `gates` (`{gate, route}`)
+  where an `mcp__` gate must be a fully-namespaced live tool name
+  `mcp__plugin_<bundle>_<server>__<tool>` for a declared connector (a
+  built-in like `Bash` needs no prefix) — so a spec can express a gated,
+  authed agent without hand-editing `plugin.json`.
+- `evals` reuses the frozen eval-case shape so the scaffolded
+  `evals/cases.json` loads unchanged through `curie skill eval`.
+
 An unknown TOP-LEVEL field is a hard error, so an authoring typo fails loud, but
 unknown keys INSIDE an eval case are ignored exactly as the platform's worker
 `EvalSuite` ignores them (pydantic `extra="ignore"`), which is intentional parity
@@ -104,8 +111,9 @@ curie init --from-spec agent-spec.json   # bundle name (deal-desk) comes from th
 ## `curie` / `curie interactive`
 
 The interactive terminal interface is a human-friendly command surface over the
-same `curie ...` subcommands documented here. It opens a full-screen TUI with
-target navigation, action selection, command previews, and guarded execution:
+same `curie ...` subcommands documented here. It opens a full-screen TUI
+(Terminal User Interface) with target navigation, action selection, command
+previews, and guarded execution:
 when an action needs values (for example message text or a channel id), the TUI
 temporarily leaves the alternate screen, prompts for the values, runs the exact
 previewed command, then returns to the interface. Some actions also require a
@@ -531,14 +539,12 @@ way as `local up` (live when a credential is present, fake otherwise).
 `--disconnect` stops the dispatcher and restores the local stub. `--dry-run`
 prints the compose command only.
 
-Use `--continue` to reuse the last successful `local message` context from
+`--continue` works the same way here as it does for
+[`cluster message`](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack):
+it reuses the last successful `local message` context from
 `.curie/last-turn.json` in the current working directory, so only the new text
-is required. Explicit flags override the saved channel, thread, and transport
-settings, the verb must match, and the API key is re-read from
-`$CURIE_API_KEY` because the value is never stored. Note that `--continue`
-does not replay `--stream`, `--listen-port`, `--valkey-local-port`,
-`--api-local-port`, or `--user`, so pass any of those again explicitly if the
-original turn used a non-default value.
+is required, explicit flags override the saved channel/thread/transport
+settings, and the same replay exclusions apply.
 
 ## Agent-facing output contract
 
@@ -550,22 +556,30 @@ machine-readable JSON object on **stdout** instead of empty output: the
 read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
 lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
 and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
-[<lines>]}`) all route through one centralized emitter. The `message` verbs
-keep their own, more specific shapes: `curie local message` and `curie cluster
-message` emit one structured line per terminal state on stdout -- a completed
-turn emits `{"reply": ..., "thread": ..., "finalized": ...}` (the model's
-reply, which is null on a no-edit completion, plus the thread the turn ran
-under); a turn parked on a human approval gate emits `{"reply": ..., "thread":
-..., "finalized": false, "awaiting_approval": true}` (the worker posted an
-approval card rather than finalizing, and `reply` is the card's placeholder
-text if seen); a **timeout** emits `{"reply": null, "finalized": false,
-"timed_out": true}` before exiting 3 (transient); a turn **enqueued** onto the
-real Valkey stream in connected transport mode emits `{"status": "enqueued",
-"channel": ..., "thread": ...}` -- the CLI does not wait for the reply, so
-this is a terminal state of the command, not of the turn; and `--json
---dry-run` emits a planned-action descriptor `{"dry_run": true, "target":
-"local"|"cluster", "stream": ..., "channel": ..., "reply_endpoint": ...}`
-(`channel` is null when it would be resolved from the sole deployed agent).
+[<lines>]}`) all route through one centralized emitter.
+
+The `message` verbs keep their own, more specific shapes: `curie local
+message` and `curie cluster message` emit one structured line per terminal
+state on stdout --
+
+- a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
+  (the model's reply, which is null on a no-edit completion, plus the thread
+  the turn ran under);
+- a turn parked on a human approval gate emits `{"reply": ..., "thread":
+  ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
+  approval card rather than finalizing, and `reply` is the card's placeholder
+  text if seen);
+- a **timeout** emits `{"reply": null, "finalized": false,
+  "timed_out": true}` before exiting 3 (transient);
+- a turn **enqueued** onto the real Valkey stream in connected transport mode
+  emits `{"status": "enqueued", "channel": ..., "thread": ...}` -- the CLI
+  does not wait for the reply, so this is a terminal state of the command,
+  not of the turn; and
+- `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
+  "target": "local"|"cluster", "stream": ..., "channel": ...,
+  "reply_endpoint": ...}` (`channel` is null when it would be resolved from
+  the sole deployed agent).
+
 The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
 lag this contract on their real-path success output: `curie skill message`,
 and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still

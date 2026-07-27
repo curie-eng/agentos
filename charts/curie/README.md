@@ -2,8 +2,8 @@
 
 The umbrella Helm chart that installs the whole Curie (Relay) stack on a
 single node. It installs the backing-store stack (Langfuse + Postgres + Valkey +
-ClickHouse + MinIO + OTel Collector, dev profile, BYO toggles, the two
-preflights) plus the security rails as chart defaults.
+ClickHouse + MinIO + OTel Collector, dev profile, BYO (bring-your-own)
+toggles, the two preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
 images, same tags, same `:24.8` ClickHouse pin, same headless-bootstrapped
@@ -16,7 +16,7 @@ every backing store is toggle-gated with a single-block bring-your-own surface.
 
 ## Install
 
-The defaults are the flagship path: GHCR images, the runner substrate and its
+The defaults are the flagship path: GHCR (GitHub Container Registry) images, the runner substrate and its
 controller on, a modest single-node footprint, and graceful degradation when the
 cluster lacks Slack tokens or runsc. So a fresh install is two commands.
 
@@ -57,7 +57,7 @@ Setting the two Slack tokens is what makes the dispatcher deploy. The runner
 NetworkPolicy is fail-closed (`security.networkPolicy.allowedEgress` is empty by
 default), so the `allowedEgress` flags are required to let real model calls reach
 the API -- here Anthropic's published range (`160.79.104.0/23`, TCP 443). Add
-further entries for any MCP endpoints the runner must reach. Because this upgrade
+further entries for any MCP (Model Context Protocol) endpoints the runner must reach. Because this upgrade
 flips to a real model, under the default `security.gvisor.mode=auto` it now fails
 closed on a cluster without the `gvisor` RuntimeClass (runsc) -- install runsc +
 the containerd handler on every node first, or add `--set security.gvisor.mode=off`
@@ -122,8 +122,8 @@ kubectl port-forward -n curie svc/curie-langfuse-web 3000:3000
 # http://localhost:3000  -- dev keys: pk-lf-curie-dev / sk-lf-curie-dev
 ```
 
-App services emit OTLP to the **collector**, never straight to Langfuse
-(Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
+App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
+straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
 `:4318` (HTTP). The collector forwards to Langfuse over HTTP.
 
 ## Components
@@ -146,17 +146,22 @@ All five first-party services build in the matrix: `curie-api`,
 `curie-dispatcher`, `curie-worker`, `curie-ui`, and `curie-runner`. The
 chart defaults every first-party image at its `ghcr.io/curie-eng/curie-*`
 `:latest`, so the bare install (above) pulls from GHCR with no image overrides.
-The four Deployment-managed services (api, dispatcher, worker, ui) use
-`imagePullPolicy: Always` -- they pull once per rollout, so `Always` just keeps a
-fresh install from serving a stale `latest` a node cached earlier. The **runner**
-image is the exception: it uses `imagePullPolicy: IfNotPresent` because a sandbox
-pod is cold-created per Slack thread, and an `Always` (re-)pull inside that boot
-window blew past the worker's claim timeout and killed runs. Its freshness comes
-instead from the `runner-prewarm` DaemonSet (`agentSandbox.runner.prewarm`,
-default on with the sandbox substrate), which pulls the runner image `Always` and
-keeps it pinned on every node; a Release-revision annotation rolls those pods on
-every `helm upgrade` so the pin refreshes a churned `latest`. Pin an immutable tag
-for reproducible deploys, where the pull policies are a cheap no-op.
+
+- **Pull policy for the four Deployment-managed services** (api, dispatcher,
+  worker, ui): `imagePullPolicy: Always` -- they pull once per rollout, so
+  `Always` just keeps a fresh install from serving a stale `latest` a node
+  cached earlier.
+- **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
+  because a sandbox pod is cold-created per Slack thread, and an `Always`
+  (re-)pull inside that boot window blew past the worker's claim timeout and
+  killed runs. Its freshness comes instead from the `runner-prewarm` DaemonSet
+  (`agentSandbox.runner.prewarm`, default on with the sandbox substrate),
+  which pulls the runner image `Always` and keeps it pinned on every node; a
+  Release-revision annotation rolls those pods on every `helm upgrade` so the
+  pin refreshes a churned `latest`.
+- **Pin an immutable tag** for reproducible deploys, where the pull policies
+  are a cheap no-op.
+
 A GHCR package inherits its repo's visibility, so on a **private** repo the image
 is not anonymously pullable and the node needs credentials. Two supported paths:
 
@@ -251,14 +256,17 @@ Both run as Helm hooks (blocking a broken install) and are re-runnable via
 `helm test <release> -n <ns>`.
 
 **(a) CPU-AVX / ClickHouse-pin check** (`preflights.avxCheck`). A pre-install /
-pre-upgrade hook Job. ClickHouse >= 25.x is compiled for AVX and SIGILLs with
-exit 132 on SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn
-that. The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
-the install unless the configured ClickHouse tag is in
-`clickhouse.sse42SafeTags` (`24.8`, `24.3`, `23.8`). Skipped when
-`clickhouse.deploy: false`. Test knob `preflights.avxCheck.forceNoAvx: true`
-exercises the SSE4.2 branch on an AVX-capable node. Read the verdict:
-`kubectl logs -n <ns> job/<release>-preflight-avx`.
+pre-upgrade hook Job.
+
+- ClickHouse >= 25.x is compiled for AVX and SIGILLs with exit 132 on
+  SSE4.2-only CPUs -- a crash-looping pod is a confusing way to learn that.
+- The Job reads the node's `/proc/cpuinfo`; if the node lacks AVX it FAILS
+  the install unless the configured ClickHouse tag is in
+  `clickhouse.sse42SafeTags` (`24.8`, `24.3`, `23.8`). Skipped when
+  `clickhouse.deploy: false`.
+- Test knob `preflights.avxCheck.forceNoAvx: true` exercises the SSE4.2
+  branch on an AVX-capable node.
+- Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-avx`.
 
 **(b) NetworkPolicy-enforcement probe** (`preflights.networkPolicyProbe`). A
 `helm test` Job. A CNI that silently ignores NetworkPolicy is a security
@@ -317,7 +325,8 @@ the availability half of the same "not sized for prod out of the box" story.
 
 ## Sandbox resource envelope (ADR-0059)
 
-[ADR-0059](../../docs/adr/0059-sandbox-is-a-bounded-resource-envelope.md) treats
+[ADR-0059](../../docs/adr/0059-sandbox-is-a-bounded-resource-envelope.md)
+(Architecture Decision Record) treats
 sandbox capacity as a security property, not a performance-tuning afterthought:
 disk is the one resource dimension a sandbox pod could otherwise consume without
 limit. Decision 2 bounds every writable `emptyDir` in the sandbox pod with an
@@ -345,7 +354,7 @@ bound a runaway, not ordinary work.
 ## Security rails
 
 The security-boundary rails ship **on by default** (ADR-0006). The runner-surface
-rails attach to the agent-sandbox, so their NetworkPolicy / RBAC / probe resources
+rails attach to the agent-sandbox, so their NetworkPolicy / RBAC (Role-Based Access Control) / probe resources
 render only when `agentSandbox.deploy: true` (there are no runner pods to protect
 otherwise). With the sandbox off, the rendered manifests are byte-identical to a
 chart without those rails. The data-tier ingress rail is independent of the
@@ -462,7 +471,7 @@ enforcement asserted separately by the preflight and proven live in the security
 ## Uninstalling and CRD lifecycle
 
 `helm uninstall <release> -n <ns>` removes everything the chart templated, but
-**not** the CRDs. The agent-sandbox CRDs (`sandboxes.agents.x-k8s.io` and the
+**not** the CRDs (Custom Resource Definitions). The agent-sandbox CRDs (`sandboxes.agents.x-k8s.io` and the
 related types) are vendored under `charts/curie/crds/`, which Helm installs
 before any template but never upgrades or deletes (this is Helm's documented
 `crds/` behavior, not a chart choice). A full teardown therefore needs a manual

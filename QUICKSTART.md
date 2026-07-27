@@ -67,8 +67,9 @@ restarted (`curie skill up --replace` if one is still running).
 
 A committed first-party example lives at `examples/weather/`: `cd
 examples/weather && curie skill up` runs it from a clean clone. For the
-"engine as an in-bundle stdio MCP server" shape — a bundle that ships its own
-tools as a stdio subprocess the harness spawns — see the template at
+"engine as an in-bundle stdio MCP (Model Context Protocol) server" shape — a
+bundle that ships its own tools as a stdio subprocess the harness spawns — see
+the template at
 [`examples/text-stats-engine/`](examples/text-stats-engine/README.md).
 
 ## Level up: a real model
@@ -90,9 +91,9 @@ curie skill down
 
 To use a different provider or model instead of the Anthropic default, bring
 your own model through OpenRouter on the same `skill` path. Set
-`CURIE_CREDENTIALS` to your OpenRouter key (it must arrive on that variable,
-not `ANTHROPIC_API_KEY`, and here it selects OpenRouter specifically because
-it's paired with `--image`/`--model`) and name a model slug:
+`CURIE_CREDENTIALS` to your OpenRouter key and name a model slug. It must
+arrive on that variable, not `ANTHROPIC_API_KEY`; here it selects OpenRouter
+specifically because it's paired with `--image`/`--model`:
 
 ```bash
 CURIE_CREDENTIALS="$OPENROUTER_TOKEN" curie skill up \
