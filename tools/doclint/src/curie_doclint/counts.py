@@ -9,17 +9,20 @@ importing module or a thirty-third schema left the doc asserting the opposite
 of reality while the gate stayed green.
 
 Each claim below pairs a **regex that locates the number in the prose** with a
-**counter that derives the truth from the tree**. There are two ways to fail,
-both loud:
+**counter that derives the truth from the tree**. There are three ways to
+fail, all loud:
 
 - the stated count disagrees with the tree -- the drift the class is named for;
-- the anchor phrase is gone, so the regex matches nothing.
+- the anchor phrase is gone, so the regex matches nothing;
+- (#956) the claim's doc no longer resolves under the catalog root -- moved or
+  renamed away, which would otherwise let a false count go unreachable.
 
-The second is what keeps the gate from going vacuous. A reworded sentence would
-otherwise silently stop being checked, leaving a green gate over unverified
-prose -- which is exactly the failure mode #938 was filed about, one level up.
-So rewording one of these sentences is a deliberate edit here too, and the
-finding says so.
+The second and third are what keep the gate from going vacuous. A reworded
+sentence, or a doc moved out from under its claim, would otherwise silently
+stop being checked, leaving a green gate over unverified prose -- which is
+exactly the failure mode #938 was filed about, one level up. So rewording one
+of these sentences, or renaming one of these docs, is a deliberate edit here
+too, and the finding says so.
 
 Counts are matched in either spelling: the prose writes small numbers as words
 ("nine runner modules") and larger ones as digits ("32 committed schemas"), so
@@ -75,6 +78,38 @@ _RUST_TEST_RE = re.compile(r"#\[test\]")
 # The index is a listing OF the schemas, not one of them, so the count the
 # prose states ("32 committed schemas ... with an index") excludes it.
 _SCHEMA_INDEX_NAME = "index.json"
+
+# This module's own path *within* the repository, used as the marker that
+# identifies a linted tree as the catalog.
+#
+# CLAIMS below are literals about THIS repository -- its own doc paths, its
+# own counters -- so they only bind when the tree being linted IS this
+# repository. Anywhere else (the doclint fixtures, a test's tmp tree) is a
+# miniature tree that legitimately carries none of the claimed docs, and a
+# missing doc there is not a defect.
+#
+# The question is asked of the LINT TARGET -- does the tree being linted carry
+# the doclint source? -- not of this module's own `__file__`. The two answers
+# differ under a built wheel, where `__file__` resolves into the virtualenv
+# rather than into any checkout, so a location-derived root would match no tree
+# at all and every claim would silently go back to being skipped: #956 rebuilt
+# one level up, with a green gate over unverified prose. Asking the target
+# answers identically from an editable workspace and from a wheel.
+_CATALOG_MARKER = Path("tools/doclint/src/curie_doclint/counts.py")
+
+
+def _is_catalog_root(repo_root: Path) -> bool:
+    """Report whether the tree being linted is the repository ``CLAIMS`` describe.
+
+    Args:
+        repo_root: The repository root being linted.
+
+    Returns:
+        ``True`` when that tree carries the doclint source at [`_CATALOG_MARKER`],
+        which only this repository does -- so a claimed doc missing there was
+        moved or renamed away rather than never present.
+    """
+    return (repo_root / _CATALOG_MARKER).is_file()
 
 
 def parse_count(token: str) -> int | None:
@@ -195,18 +230,35 @@ def check_counts(repo_root: Path, claims: tuple[CountClaim, ...] = CLAIMS) -> li
         claims: The claims to check; defaults to the catalog's own [`CLAIMS`].
 
     Returns:
-        One finding per claim that drifted or whose anchor phrase vanished, and
-        an empty list when every stated count matches the tree.
+        One finding per claim that drifted, whose anchor phrase vanished, or
+        (when ``repo_root`` is the catalog root) whose doc no longer resolves,
+        and an empty list when every stated count matches the tree.
     """
     findings: list[Finding] = []
+    is_catalog = _is_catalog_root(repo_root)
 
     for claim in claims:
         doc = repo_root / claim.doc
-        # Not every repo root carries every seam doc -- the doclint fixtures
-        # are a miniature tree. Whether a seam doc should exist at all is the
-        # catalog's own concern, not a count claim's, so a missing doc is
-        # skipped rather than reported here twice over.
         if not doc.is_file():
+            if is_catalog:
+                # CLAIMS are literals about this repository, so when repo_root
+                # IS the catalog root a missing doc was moved or renamed away,
+                # not legitimately absent -- the #956 defect: the skip below
+                # let a renamed seam doc launder a false count past the gate.
+                findings.append(
+                    Finding(
+                        claim.doc,
+                        claim.label,
+                        f"the seam doc has moved, so this claim ({claim.source}) is "
+                        "no longer verified. Restore the doc at this path, or update "
+                        f"this claim's doc path in {_CATALOG_MARKER}.",
+                    )
+                )
+            # Not every repo root carries every seam doc -- the doclint
+            # fixtures and a test's tmp tree are miniature trees. Whether a
+            # seam doc should exist at all is the catalog's own concern, not a
+            # count claim's, so outside the catalog root a missing doc is
+            # skipped rather than reported here twice over.
             continue
 
         stated = claim.pattern.findall(doc.read_text(encoding="utf-8"))
@@ -217,7 +269,7 @@ def check_counts(repo_root: Path, claims: tuple[CountClaim, ...] = CLAIMS) -> li
                     claim.label,
                     "no sentence states this count any more, so it is no longer "
                     "verified. Restore the phrasing, or update this claim's pattern "
-                    "in tools/doclint/src/curie_doclint/counts.py "
+                    f"in {_CATALOG_MARKER} "
                     f"(source of truth: {claim.source}).",
                 )
             )
