@@ -33,6 +33,7 @@ import re
 import secrets
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
 from urllib.parse import quote
 
@@ -200,6 +201,46 @@ class ResolvedDeployment(BaseModel):
     secrets: dict[str, str] | None = None
 
 
+def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
+    """Warn when a channel resolves to more than one agent, naming the shadowed.
+
+    The ORDER BY picks one deterministic winner (prod-first, then most recent).
+    Since #38 the API enforces one agent per channel (a unique constraint on
+    agents.slack_channel, migration 0017), so this state is no longer reachable
+    through the write paths. It stays as defense in depth for rows predating the
+    constraint or written out of band, and because silently shadowing an agent is
+    the failure mode #38 existed to kill.
+
+    One agent with both a dev and a prod deployment active is two rows but one
+    agent, so count distinct agents, not rows.
+
+    ``rows`` is deliberately typed structurally rather than as SQLAlchemy's
+    ``RowMapping``: the helper only subscripts ``agent_id``, and naming the driver
+    type here would re-couple a function whose whole point is to be DB-free.
+
+    Pure and DB-free on purpose (#959): the branch is unreachable while the
+    constraint holds, so the only honest way to cover it was previously to DROP
+    that constraint against a shared developer database and restore it in a
+    `finally` -- which left the production invariant absent if the process died
+    in between. Taking rows as an argument moves the coverage to a unit test and
+    removes the destructive DDL entirely.
+    """
+
+    distinct_agents = {r["agent_id"] for r in rows}
+    if len(distinct_agents) <= 1:
+        return
+    chosen = rows[0]["agent_id"]
+    shadowed = sorted(str(a) for a in distinct_agents if a != chosen)
+    logger.warning(
+        "channel %s has %d agents bound; routing to agent %s and shadowing "
+        "%s (only one agent per channel responds; see issue #38)",
+        channel,
+        len(distinct_agents),
+        chosen,
+        ", ".join(shadowed),
+    )
+
+
 class BindingResolver:
     """Resolves a Slack channel to its active agent deployment (read-only)."""
 
@@ -215,26 +256,7 @@ class BindingResolver:
             rows = result.mappings().all()
         if not rows:
             return None
-        # The ORDER BY still picks one deterministic winner (prod-first, then most
-        # recent). Since #38 the API enforces one agent per channel (a unique
-        # constraint on agents.slack_channel, migration 0017), so two agents on one
-        # channel is no longer reachable through the write paths -- this stays as
-        # defense in depth for rows predating the constraint or written out of band,
-        # and because silently shadowing an agent is the failure mode #38 existed to
-        # kill. One agent with both a dev and a prod deployment active is two rows
-        # but one agent, so count distinct agents, not rows.
-        distinct_agents = {r["agent_id"] for r in rows}
-        if len(distinct_agents) > 1:
-            chosen = rows[0]["agent_id"]
-            shadowed = sorted(str(a) for a in distinct_agents if a != chosen)
-            logger.warning(
-                "channel %s has %d agents bound; routing to agent %s and shadowing "
-                "%s (only one agent per channel responds; see issue #38)",
-                channel,
-                len(distinct_agents),
-                chosen,
-                ", ".join(shadowed),
-            )
+        warn_if_multiple_agents_bound(channel, rows)
         data = dict(rows[0])
         # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
         # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
