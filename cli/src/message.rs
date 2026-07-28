@@ -951,7 +951,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // sentinel), post a real placeholder and enqueue against its ts with no
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
-    if let Some(bot_token) = local_connected_bot_token() {
+    if let Some(bot_token) = local_connected_bot_token().await {
         let channel = match opts.channel.as_deref() {
             Some(channel) => channel.to_string(),
             None => {
@@ -1426,33 +1426,84 @@ async fn resume_after_approval(
 /// dispatcher is wired to the local stub -- NOT a real workspace.
 const LOCAL_STUB_BOT_TOKEN: &str = "xoxb-dev";
 
-/// The workspace bot token that means "a real Slack workspace is connected" at
-/// local tier, or `None` when this is the stub/disconnected setup. Candidates are
-/// tried in precedence order (`CURIE_SLACK_BOT_TOKEN`, `SLACK_BOT_TOKEN`, the
-/// persisted secret); the first CONFIGURED one decides, and if that is the stub
-/// sentinel the answer is "not connected" rather than falling through to a
-/// staler value -- the effective config wins, so a deliberate `--disconnect`
-/// is never overridden by a leftover persisted token. Pure, so the precedence
-/// and the sentinel rejection are unit-testable without env or a secrets store.
-fn connected_local_bot_token(candidates: [Option<String>; 3]) -> Option<String> {
-    let configured = candidates
-        .into_iter()
-        .flatten()
-        .map(|token| token.trim().to_string())
-        .find(|token| !token.is_empty())?;
-    (configured != LOCAL_STUB_BOT_TOKEN).then_some(configured)
+/// The host in `comms::LOCAL_SLACK_STUB_URL`. A worker whose `SLACK_API_BASE_URL`
+/// points here talks to the in-compose stub, never to Slack.
+const LOCAL_SLACK_STUB_HOST: &str = "localhost:8155";
+
+/// The compose service (and container) that holds the worker's Slack transport.
+const LOCAL_WORKER_CONTAINER: &str = "curie-worker";
+
+/// The Slack transport the RUNNING compose worker is actually configured with:
+/// `(SLACK_API_BASE_URL, SLACK_BOT_TOKEN)` as the container holds them.
+type WorkerTransport = (Option<String>, Option<String>);
+
+/// The bot token to post a real placeholder with, or `None` when this stack is
+/// not wired to a real workspace.
+///
+/// Decided from the worker's OWN transport, never from CLI-side config (#957).
+/// The previous form read `CURIE_SLACK_BOT_TOKEN`/`SLACK_BOT_TOKEN`/the persisted
+/// secret vault and claimed a deliberate `--disconnect` could not be overridden
+/// by a stale vault entry. That claim was false and the failure was ugly:
+/// `local comms --disconnect` writes the stub sentinel only into the compose
+/// SUBPROCESS environment, and a child process cannot set its parent's env, so
+/// a vault token from `curie secrets set SLACK_BOT_TOKEN` (the documented #749
+/// setup) stayed visible to the CLI. A stub-only stack would then post a real
+/// placeholder into a real channel while the worker updated the stub -- an
+/// orphaned "..." in a customer channel and a reply nobody sees.
+///
+/// Two conditions, both read from the container:
+///
+/// 1. `SLACK_API_BASE_URL` must NOT point at the local stub. This is the
+///    definitive signal: it is literally the transport the worker will use to
+///    edit the placeholder, so if it is the stub, no real post can ever be
+///    updated, whatever any token says.
+/// 2. the token must be a real one, not the `xoxb-dev` sentinel.
+///
+/// Returning the worker's OWN token (rather than one the CLI resolved) also
+/// keeps the posting identity equal to the updating identity: Slack only lets the
+/// authoring bot `chat.update` a message, so two different tokens would leave the
+/// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
+///
+/// Pure, so both conditions are unit-testable without Docker.
+fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
+    let (api_base, token) = transport;
+    let api_base = api_base.unwrap_or_default();
+    // Wired to the stub (or to nothing resolvable) means not connected.
+    if api_base.is_empty() || api_base.contains(LOCAL_SLACK_STUB_HOST) {
+        return None;
+    }
+    let token = token?.trim().to_string();
+    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN).then_some(token)
 }
 
-/// Process-level wrapper over [`connected_local_bot_token`] reading the real env
-/// and the persisted secret store (#749). A secrets-store read failure is treated
-/// as "absent" rather than fatal: it only means we fall back to the stub path.
-fn local_connected_bot_token() -> Option<String> {
-    let env_var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    connected_local_bot_token([
-        env_var("CURIE_SLACK_BOT_TOKEN"),
-        env_var("SLACK_BOT_TOKEN"),
-        crate::secrets::get_value("SLACK_BOT_TOKEN").ok().flatten(),
+/// Read the running compose worker's Slack transport out of the container.
+///
+/// `docker inspect` on the worker container, so what we act on is what the worker
+/// holds -- the reconciliation #957 asks for. Any failure (no stack up, docker
+/// absent, container renamed) reads as "no transport", which falls back to the
+/// stub path: the safe direction, since the stub path never posts to real Slack.
+async fn running_worker_transport() -> WorkerTransport {
+    let out = match crate::docker::docker_capture(&[
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{range .Config.Env}}{{println .}}{{end}}".to_string(),
+        LOCAL_WORKER_CONTAINER.to_string(),
     ])
+    .await
+    {
+        Ok((status, stdout, _)) if status.success() => stdout,
+        _ => return (None, None),
+    };
+    let find = |key: &str| -> Option<String> {
+        out.lines()
+            .find_map(|l| l.strip_prefix(key).map(|v| v.to_string()))
+    };
+    (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
+}
+
+/// Process-level wrapper: the token to post with, or `None` for the stub path.
+async fn local_connected_bot_token() -> Option<String> {
+    connected_worker_bot_token(running_worker_transport().await)
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -1632,11 +1683,27 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
 
     // Bot token: explicit CURIE_SLACK_BOT_TOKEN override, else the release
     // Secret. Never printed; used only to post the placeholder.
+    //
+    // The Secret path is identity-correct by construction: the worker reads the
+    // same `slackBotToken` from the same Secret, so the bot that posts the
+    // placeholder is the bot that edits it. The OVERRIDE can diverge, and Slack
+    // only lets the authoring bot `chat.update` a message -- a mismatch leaves the
+    // placeholder stuck at "..." with `cant_update_message` (#957 mode B). Warn
+    // rather than refuse: an operator may legitimately be working around a stale
+    // Secret, and this is the escape hatch for exactly that.
     let bot_token = match std::env::var("CURIE_SLACK_BOT_TOKEN")
         .ok()
         .filter(|value| !value.is_empty())
     {
-        Some(token) => token,
+        Some(token) => {
+            ui.warn(
+                "using the CURIE_SLACK_BOT_TOKEN override instead of the release's \
+                 own Slack token: if this bot is not the one the worker posts as, \
+                 Slack will refuse the reply edit and the placeholder will stay \
+                 unchanged",
+            );
+            token
+        }
         None => crate::ops::discover_slack_bot_token(&opts.namespace, &opts.release).await?,
     };
 
@@ -3244,42 +3311,41 @@ mod tests {
     }
 
     #[test]
-    fn connected_local_bot_token_precedence_and_stub_sentinel() {
+    fn connected_only_when_the_worker_itself_talks_to_real_slack() {
         let t = |s: &str| Some(s.to_string());
-        // Precedence: CURIE_ override, then SLACK_BOT_TOKEN, then the secret.
+
+        // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            connected_local_bot_token([t("xoxb-a"), t("xoxb-b"), t("xoxb-c")]).as_deref(),
-            Some("xoxb-a")
-        );
-        assert_eq!(
-            connected_local_bot_token([None, t("xoxb-b"), t("xoxb-c")]).as_deref(),
-            Some("xoxb-b")
-        );
-        assert_eq!(
-            connected_local_bot_token([None, None, t("xoxb-c")]).as_deref(),
-            Some("xoxb-c")
-        );
-        // Nothing configured -> not connected (stub path).
-        assert_eq!(connected_local_bot_token([None, None, None]), None);
-        // Empty is unset, not a token (#540's empty-is-unset rule).
-        assert_eq!(
-            connected_local_bot_token([t(""), t("  "), t("xoxb-c")]).as_deref(),
-            Some("xoxb-c")
-        );
-        // The stub sentinel means NOT connected -- and a deliberate --disconnect
-        // is never overridden by a staler persisted token further down the chain.
-        assert_eq!(
-            connected_local_bot_token([t(LOCAL_STUB_BOT_TOKEN), None, None]),
-            None
-        );
-        assert_eq!(
-            connected_local_bot_token([t(LOCAL_STUB_BOT_TOKEN), t("xoxb-real"), None]),
-            None
-        );
-        // Surrounding whitespace is trimmed off a real token.
-        assert_eq!(
-            connected_local_bot_token([t(" xoxb-real "), None, None]).as_deref(),
+            connected_worker_bot_token((t("https://slack.com/api/"), t("xoxb-real"))).as_deref(),
             Some("xoxb-real")
+        );
+
+        // #957 mode A, the failure this replaced: a REAL token is present but the
+        // worker is wired to the stub, so posting would orphan a "..." in a real
+        // channel that the worker can never edit. Not connected.
+        assert_eq!(
+            connected_worker_bot_token((
+                t("http://localhost:8155/api/"),
+                t("xoxb-real-from-the-vault")
+            )),
+            None
+        );
+
+        // The stub sentinel is not a workspace token even if the base URL is odd.
+        assert_eq!(
+            connected_worker_bot_token((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            None
+        );
+        // No stack running / nothing resolvable -> stub path, never a real post.
+        assert_eq!(connected_worker_bot_token((None, None)), None);
+        assert_eq!(connected_worker_bot_token((t(""), t("xoxb-real"))), None);
+        assert_eq!(
+            connected_worker_bot_token((t("https://slack.com/api/"), None)),
+            None
+        );
+        assert_eq!(
+            connected_worker_bot_token((t("https://slack.com/api/"), t("  "))),
+            None
         );
     }
 
