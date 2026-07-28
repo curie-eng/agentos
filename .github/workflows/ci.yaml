@@ -785,8 +785,18 @@ jobs:
           fi
           base="${{ github.base_ref }}"
           git fetch --quiet origin "$base"
+          # The ladder-relevant surface. #906 reused #843's cluster-rung filter
+          # verbatim when it gated all three rungs, but the local and
+          # local-release rungs BOOT COMPOSE, so their input surface is strictly
+          # larger: compose.dev.yaml (local), the generated release compose and
+          # the generator/overlay under compose/ (local-release), and otel/ (the
+          # collector every profile starts). Without those a compose-only PR
+          # skipped the very rungs that exist to test compose -- including the
+          # local-release rung whose stated purpose is closing that parity seam
+          # (#958). compose.release.yaml is generated, not tracked, and is listed
+          # so a future decision to commit it does not silently re-open the hole.
           if git diff --name-only "origin/$base...HEAD" \
-              | grep -qE '^(charts/|cli/|apps/|runner/|packages/|\.github/workflows/ci\.yaml)'; then
+              | grep -qE '^(charts/|cli/|apps/|runner/|packages/|compose/|compose\.dev\.yaml|compose\.release\.yaml|otel/|\.github/workflows/ci\.yaml)'; then
             echo "ladder=true" >> "$GITHUB_OUTPUT"
           else
             echo "ladder=false" >> "$GITHUB_OUTPUT"
