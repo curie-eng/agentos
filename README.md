@@ -300,6 +300,10 @@ requires it, and you are free to use Curie whether or not you do.
   Sandbox as substrate, stateless-first sessions, Langfuse as the
   observability backbone, the frozen ACI, security rails as chart defaults,
   adopt-not-build boundaries), each with the live-cluster evidence behind it.
+- [`docs/agents.md`](docs/agents.md): the verification contract for an agent
+  driving Curie. The exact commands that prove an outcome, and the rule that a
+  file existing or a string appearing in output is never evidence. This is for
+  an agent using Curie, not one working in this repo.
 - [`AGENTS.md`](AGENTS.md) — the operative rules for anyone (human or agent)
   working in this repo: the verify commands, the dev stack, the
   frozen-contract escalation rule, and the build gotchas. Each top-level

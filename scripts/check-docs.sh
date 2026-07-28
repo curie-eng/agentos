@@ -38,7 +38,11 @@ if ! git diff --exit-code -- "${generated_docs[@]}"; then
   exit 1
 fi
 
-echo "== linting citations under the linted root =="
+# The single curie_doclint invocation that follows runs four phases in this
+# order -- generate, counts, commands, lint -- so a failure in any of them
+# surfaces here (#1041). Each finding names its own phase, so this script does
+# not enumerate them.
+echo "== verifying generated counts, the verification contract, and every citation =="
 uv run python -m curie_doclint --repo-root "$repo_root"
 
-echo "OK: the interface catalog is generated, drift-free, and every citation resolves."
+echo "OK: the interface catalog is generated and drift-free, every citation resolves, and every command the verification contract names is real."

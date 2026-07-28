@@ -6,6 +6,10 @@ git history (`git log -- docs/`).
 
 ## Living documentation
 
+- [`agents.md`](agents.md): the verification contract for an agent driving
+  Curie. The exact commands that prove an outcome, what to automate versus what
+  to ask a human for, and the rule that a file existing or a string appearing in
+  output is never evidence.
 - [`onboarding.md`](onboarding.md): the local dev onboarding path for a new
   engineer, from a fresh clone to a verified local turn with no Slack and no
   cluster.

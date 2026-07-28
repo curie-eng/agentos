@@ -1,0 +1,79 @@
+{
+  "about": "Curie CLI (fixture): a miniature stand-in for the real command manifest",
+  "args": [
+    {
+      "global": true,
+      "help": "Machine-readable JSON to stdout; human/log text to stderr",
+      "id": "json",
+      "long": "json",
+      "positional": false,
+      "possible_values": [
+        "true",
+        "false"
+      ],
+      "required": false
+    },
+    {
+      "global": true,
+      "help": "Payload only; suppress progress and diagnostics",
+      "id": "quiet",
+      "long": "quiet",
+      "positional": false,
+      "possible_values": [
+        "true",
+        "false"
+      ],
+      "required": false,
+      "short": "q"
+    },
+    {
+      "global": false,
+      "help": "Print the CLI version and exit (root-only, deliberately NOT global)",
+      "id": "version",
+      "long": "version",
+      "positional": false,
+      "required": false
+    }
+  ],
+  "hidden": false,
+  "name": "curie",
+  "subcommands": [
+    {
+      "about": "Work with a local runner session for a plugin bundle",
+      "hidden": false,
+      "name": "skill",
+      "subcommands": [
+        {
+          "about": "Report the running session",
+          "hidden": false,
+          "name": "status"
+        },
+        {
+          "about": "Run the bundle's eval cases through the local runner",
+          "args": [
+            {
+              "global": false,
+              "help": "Eval case file",
+              "id": "cases",
+              "long": "cases",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "eval"
+        },
+        {
+          "about": "Boot the bundle offline and report whether its servers loaded",
+          "hidden": false,
+          "name": "check"
+        }
+      ]
+    },
+    {
+      "about": "Print the machine-readable command manifest (JSON) to stdout",
+      "hidden": true,
+      "name": "schema"
+    }
+  ]
+}
