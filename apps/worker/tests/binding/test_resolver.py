@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import unittest.mock
 import uuid
 
 import pytest
@@ -23,6 +25,7 @@ from curie_worker.binding import (
     MEMORY_TOKEN_ENV,
     BindingResolver,
     ResolvedDeployment,
+    warn_if_multiple_agents_bound,
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox_token import verify
@@ -105,30 +108,6 @@ async def _seed_deployment(
             {"id": uuid.uuid4(), "agent_id": agent_id, "version_id": version_id,
              "env": environment, "status": status},
         )
-
-
-# The unique constraint migration 0017 adds for one-agent-per-channel (#38).
-# Dropping it is how the test below simulates a database whose constraint was
-# removed out of band, the only way the resolver's shadow branch is now
-# reachable. Safe because this suite runs serially (no pytest-xdist).
-_CHANNEL_CONSTRAINT = "agents_slack_channel_key"
-
-
-async def _set_channel_constraint(engine: AsyncEngine, *, present: bool) -> None:
-    async with engine.begin() as conn:
-        if present:
-            await conn.execute(
-                text(
-                    f"ALTER TABLE {_SCHEMA}.agents ADD CONSTRAINT {_CHANNEL_CONSTRAINT} "
-                    "UNIQUE (slack_channel)"
-                )
-            )
-        else:
-            await conn.execute(
-                text(
-                    f"ALTER TABLE {_SCHEMA}.agents DROP CONSTRAINT {_CHANNEL_CONSTRAINT}"
-                )
-            )
 
 
 async def _cleanup(engine: AsyncEngine, agent_ids: list[uuid.UUID]) -> None:
@@ -219,21 +198,18 @@ def test_prod_deployment_wins_over_dev() -> None:
     asyncio.run(go())
 
 
-def test_multiple_agents_on_one_channel_is_refused_and_still_warns_if_forced(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """#38 is fixed by PREVENTION, with the resolver warning kept as a net.
+def test_second_agent_on_a_bound_channel_is_refused() -> None:
+    """#38's invariant, asserted where the worker reads it: the database refuses a
+    second agent on an already-bound channel, so the silent-shadow state cannot be
+    created through any write path. The API asserts the same invariant as a 409.
 
-    Two halves:
-
-    1. The invariant: a second agent bound to an already-bound channel is refused
-       by the database (migration 0017's unique constraint), so the silent-shadow
-       state is unreachable through any write path. This is the worker-side proof
-       of the same invariant the API asserts as a 409.
-    2. Defense in depth: the resolver still warns rather than silently dropping an
-       agent, for a database whose constraint was removed out of band. That branch
-       is only reachable by removing the constraint, which is exactly what this
-       half does (serial suite, restored in the finally).
+    Deliberately does NOT drop the constraint to exercise the shadow branch (#959).
+    That earlier form committed a DROP CONSTRAINT against the shared developer
+    Postgres and restored it in a `finally`, so a killed process left the
+    production invariant absent -- and a concurrent duplicate on any other channel
+    could make the restoring ADD CONSTRAINT fail outright. The shadow branch is now
+    covered by `test_warn_if_multiple_agents_bound_names_the_shadowed_agent`, which
+    needs no database at all.
     """
 
     async def go() -> None:
@@ -247,58 +223,63 @@ def test_multiple_agents_on_one_channel_is_refused_and_still_warns_if_forced(
 
             token = uuid.uuid4().hex[:8]
             channel = f"C-{token}"
-            a_prod = await _seed_agent(
+            agent_id = await _seed_agent(
                 engine, channel=channel, name=f"agent-a-{token}", max_usd=None, max_tokens=None
             )
-
-            # 1. Prevention: the duplicate insert is refused by the constraint.
-            with pytest.raises(IntegrityError):
-                await _seed_agent(
-                    engine,
-                    channel=channel,
-                    name=f"agent-b-{token}",
-                    max_usd=None,
-                    max_tokens=None,
-                )
-
-            # 2. The net: force the state the constraint now prevents.
-            await _set_channel_constraint(engine, present=False)
-            a_dev: uuid.UUID | None = None
             try:
-                a_dev = await _seed_agent(
-                    engine,
-                    channel=channel,
-                    name=f"agent-b-{token}",
-                    max_usd=None,
-                    max_tokens=None,
-                )
-                await _seed_deployment(
-                    engine, agent_id=a_prod, environment="prod", bundle_ref="bundles/a.zip"
-                )
-                await _seed_deployment(
-                    engine, agent_id=a_dev, environment="dev", bundle_ref="bundles/b.zip"
-                )
-
-                with caplog.at_level("WARNING"):
-                    resolved = await _resolver(engine).resolve(channel)
-
-                # Deterministic winner (prod outranks dev) and a warning naming the
-                # shadowed agent, rather than a silent drop (#38).
-                assert resolved is not None
-                assert resolved.agent_id == a_prod
-                assert any(
-                    "agents bound" in r.message and str(a_dev) in r.message
-                    for r in caplog.records
-                )
+                with pytest.raises(IntegrityError):
+                    await _seed_agent(
+                        engine,
+                        channel=channel,
+                        name=f"agent-b-{token}",
+                        max_usd=None,
+                        max_tokens=None,
+                    )
             finally:
-                # Delete the duplicates BEFORE restoring the constraint, or the
-                # ALTER TABLE would fail on the very rows this test created.
-                await _cleanup(engine, [a for a in (a_prod, a_dev) if a is not None])
-                await _set_channel_constraint(engine, present=True)
+                await _cleanup(engine, [agent_id])
         finally:
             await engine.dispose()
 
     asyncio.run(go())
+
+
+def test_warn_if_multiple_agents_bound_names_the_shadowed_agent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The defense-in-depth branch, covered with no database and no DDL (#959).
+
+    Unreachable while the unique constraint holds, which is exactly why it must be
+    exercised against synthetic rows rather than by removing the constraint from a
+    shared database.
+    """
+
+    chosen = uuid.uuid4()
+    shadowed = uuid.uuid4()
+    rows = [{"agent_id": chosen}, {"agent_id": shadowed}]
+
+    with caplog.at_level("WARNING"):
+        warn_if_multiple_agents_bound("C-shadow", rows)
+
+    assert any(
+        "agents bound" in r.message
+        and str(shadowed) in r.message
+        and str(chosen) in r.message
+        for r in caplog.records
+    ), caplog.records
+
+
+def test_warn_if_multiple_agents_bound_is_quiet_for_one_agent() -> None:
+    """Negative control: one agent with two active deployments is two rows but one
+    agent, so it must NOT warn -- counting rows instead of distinct agents would
+    fire on every prod+dev pair."""
+
+    agent_id = uuid.uuid4()
+    rows = [{"agent_id": agent_id}, {"agent_id": agent_id}]
+
+    logger = logging.getLogger("curie_worker.binding")
+    with unittest.mock.patch.object(logger, "warning") as warned:
+        warn_if_multiple_agents_bound("C-single", rows)
+    warned.assert_not_called()
 
 
 def test_deployment_pointing_at_another_agents_version_does_not_resolve() -> None:
