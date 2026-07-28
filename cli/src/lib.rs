@@ -17,6 +17,7 @@ pub mod eval_init;
 pub mod evals;
 pub mod exit;
 pub mod guide;
+pub mod info;
 pub mod interactive;
 pub mod local;
 pub mod message;

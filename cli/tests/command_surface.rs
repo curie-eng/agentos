@@ -278,7 +278,13 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
     // cluster flag set must be a strict superset of the local one, differing only
     // by those two discovery flags -- a flag added to local can still never be
     // silently dropped from cluster.
-    for verb in ["versions", "memory", "approvals"] {
+    //
+    // `info` (#1040) is the fourth agent-target verb pair. Its extra `--check-mcp`
+    // does not perturb the property: the flag is DECLARED at both tiers (so each
+    // can decline it with a reason instead of erroring like an unknown-flag typo,
+    // #771/ADR-0041) and both carry the same single-sourced help prose, so it lands
+    // in both sets and the divergence stays exactly --namespace/--release.
+    for verb in ["versions", "memory", "approvals", "info"] {
         let local = help_flags(&["local", verb]);
         let cluster = help_flags(&["cluster", verb]);
         for flag in &local {
