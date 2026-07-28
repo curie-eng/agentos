@@ -62,3 +62,52 @@ fn error_json_fix_is_null_for_plain_error() {
     assert_eq!(value["error"], "kaboom");
     assert!(value["fix"].is_null());
 }
+
+/// #1040: `<local|cluster> info --check-mcp` is the one genuinely
+/// by-construction absence in this verb -- the probe boots a container mounting
+/// a bundle DIRECTORY, and a deployed bundle has none on this machine. The flag
+/// is DECLARED at those tiers so it can be declined with a reason (exit 4)
+/// rather than rejected as an unknown-flag typo (#771, ADR-0041).
+///
+/// The two properties are the same ones the `skill_versions_unavailable` unit
+/// tests assert, and they exist because the two consumers read different fields:
+/// a machine branches on `{error, fix}`, while a human sees only `{err:#}`.
+#[test]
+fn info_check_mcp_is_unsupported_with_a_fix_naming_the_skill_tier() {
+    let err = curie::commands::info_check_mcp_unavailable();
+    let (class, fix) = exit::classify(&err);
+    assert_eq!(
+        class,
+        ExitClass::Unsupported,
+        "a concept absent BY CONSTRUCTION is exit 4, never a plain failure"
+    );
+
+    let fix = fix.expect("the decline must carry an actionable alternative");
+    assert_eq!(
+        fix,
+        curie::commands::INFO_CHECK_MCP_ALT,
+        "the machine-readable `fix` is the single-sourced alternative verbatim, so \
+         the runtime answer and the clap help text cannot drift (#459)"
+    );
+    assert!(
+        fix.contains("curie skill info"),
+        "the alternative must name the tier that CAN answer, got {fix:?}"
+    );
+
+    // The human path renders only Display and discards `fix`, so an alternative
+    // that lived only in `fix` would tell a person why the verb cannot answer and
+    // never where it can.
+    let display = format!("{err:#}");
+    assert!(
+        display.contains("info --check-mcp"),
+        "the message must name the concept being declined, got: {display}"
+    );
+    assert!(
+        display.contains(curie::commands::INFO_CHECK_MCP_REASON),
+        "the message must carry the REASON verbatim, got: {display}"
+    );
+    assert!(
+        display.contains(curie::commands::INFO_CHECK_MCP_ALT),
+        "the message must ALSO carry the alternative, got: {display}"
+    );
+}
