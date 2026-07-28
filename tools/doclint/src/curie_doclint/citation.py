@@ -49,6 +49,13 @@ _IGNORE_LINE = "<!-- doclint:ignore-line -->"
 _MD = MarkdownIt("commonmark")
 
 
+def parse_markdown(text: str) -> list[Token]:
+    """Parse ``text`` with the shared parser. The one construction site for the
+    whole package, so a second ``MarkdownIt("commonmark")`` never drifts from
+    this one's config."""
+    return _MD.parse(text)
+
+
 @dataclass(frozen=True)
 class CodeSpan:
     content: str

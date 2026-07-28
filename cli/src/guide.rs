@@ -73,7 +73,12 @@ pub fn primer() -> Primer {
                   author the skill; the harness owns deployment parity.",
         verify_first: VerifyFirst {
             why: "Your training data is stale. Confirm a command exists before you run it -- \
-                  never invoke one you have not seen in the manifest or --help.",
+                  never invoke one you have not seen in the manifest or --help. A file \
+                  existing, a string appearing in output, or a command not erroring is never \
+                  evidence -- report success only when a command exits 0 and the stated fact \
+                  holds in its --json payload. The full verification contract is docs/agents.md \
+                  in the Curie repository \
+                  (https://github.com/curie-eng/curie/blob/main/docs/agents.md).",
             commands: vec!["curie schema", "curie skill --help"],
         },
         parity_ladder: vec![

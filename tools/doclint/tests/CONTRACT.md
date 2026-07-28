@@ -19,10 +19,11 @@ private module/function names are free to change.
 
 ## Findings API (documented, not asserted directly)
 
-`curie_doclint.lint(repo_root: Path) -> list[Finding]` runs the generate +
-lint phases in memory and returns the findings `main` prints. A `Finding`
-carries at least the repo-relative doc path, the offending citation/field, and
-a human reason. Tests exercise this through `main`.
+`curie_doclint.lint(repo_root: Path) -> list[Finding]` runs the generate,
+counts, agent-contract command, and citation lint phases in memory and
+returns the findings `main` prints. A `Finding` carries at least the
+repo-relative doc path, the offending citation/field, and a human reason.
+Tests exercise this through `main`.
 
 ## Generator surface
 
@@ -64,6 +65,16 @@ resolve is a finding (deletion, not a skip).
 - Missing allowlisted root doc (e.g. `ARCHITECTURE.md`) or missing ADR index
   (`docs/adr/README.md`): names the doc; neither is scaffolded back by
   `--write`, only reported.
+- Agent-contract command not a subcommand: names the token and contains
+  `is not a subcommand of`.
+- Agent-contract flag not declared: names the flag and contains `is not an
+  argument of` and `not a global flag`.
+- Agent-contract placeholder: names the token and contains `is a placeholder`
+  and `placeholders are banned`.
+- Agent-contract invocation names no subcommand: contains `names no
+  subcommand`.
+- Agent-contract names no command at all (vacuity guard): contains `no
+  \`curie\` command appears`.
 
 ## Front-matter schema (per `INTERFACE.md`)
 
