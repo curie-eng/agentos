@@ -102,9 +102,10 @@ cd apps/ui
 pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e
 ```
 
-**Docs (interface catalog):** if you edit any interface-catalog doc under
-`docs/`, regenerate and lint it with `bash scripts/check-docs.sh` (the local
-mirror of the CI docs gate) and commit the regenerated files.
+**Docs (interface catalog):** if you edit any doc under `docs/`, including the
+agent verification contract (`docs/agents.md`), regenerate and lint it with
+`bash scripts/check-docs.sh` (the local mirror of the CI docs gate) and commit
+the regenerated files.
 
 ### Testing discipline
 

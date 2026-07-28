@@ -11,7 +11,10 @@ plugin under a bot identity via the API's git-flow engine. Relay is the project
 codename; `curie` is the product-surface name (bot handle, CLI binary). Read
 `ARCHITECTURE.md` before touching a cross-component seam. If you are a coding
 agent orienting in this repo, [`llms.txt`](llms.txt) is the curated machine map
-of these docs, organized around the parity ladder. The two questions this repo
+of these docs, organized around the parity ladder. This file is for an agent
+working **on** this repository; an agent **driving** Curie (a released binary,
+someone else's bundle) wants [`docs/agents.md`](docs/agents.md), the
+verification contract that names the exact command proving each outcome. The two questions this repo
 exists to answer are
 [why did my agent work locally but break once deployed?](README.md#why-did-my-agent-work-locally-but-break-once-deployed)
 and
@@ -75,8 +78,9 @@ stackless Playwright suite; run `pnpm test`/`pnpm e2e` locally to match it.
 `docs/adr/`, whose citations are immutable history) or the repo-root docs on its
 allowlist (currently `ARCHITECTURE.md`) carries a line-number citation, that every cited
 path and Python symbol resolves, that each graded seam's `grade:` agrees with the row its
-`vision_row:` names in `docs/architecture-vision.md`, and that no two ADRs under
-`docs/adr/` claim the same number prefix. Run it after editing any interface-catalog doc
+`vision_row:` names in `docs/architecture-vision.md`, that no two ADRs under
+`docs/adr/` claim the same number prefix, and that every `curie ...` command named in
+`docs/agents.md` resolves against `cli/command-manifest.json`. Run it after editing any interface-catalog doc
 and commit the regenerated files; CI runs the same check (`scripts/check-docs.sh`) in the
 `python` job. To exempt a genuinely illustrative example path, put
 `<!-- doclint:ignore-line -->` on that line (or the line before it).

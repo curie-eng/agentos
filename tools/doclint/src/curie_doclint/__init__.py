@@ -1,13 +1,17 @@
 """The interface-catalog citation linter and index/header generator (#452).
 
-Three phases run over the linted root (``docs/`` excluding ``docs/adr/``):
+Four phases run over the linted root (``docs/`` excluding ``docs/adr/``):
 
 1. Generate: regenerate the seam table in ``docs/interfaces.md`` and each seam
    doc's header blockquote from front-matter, comparing to what is on disk.
 2. Counts: assert the bare counts a seam doc states about the tree ("nine
    runner modules import ``claude_agent_sdk``") against the tree itself, so
    prose numbers cannot silently re-drift (#938, see ``counts.py``).
-3. Lint: walk every citation, assert no line coordinates, every path exists,
+3. Commands: resolve every ``curie ...`` invocation the published verification
+   contract (``docs/agents.md``) names against the committed
+   ``cli/command-manifest.json``, so a contract cannot name a command that no
+   longer exists (#1041, see ``commands.py``).
+4. Lint: walk every citation, assert no line coordinates, every path exists,
    every Python symbol resolves.
 
 ``main`` is a pure check by default (drift is a finding, nothing is written);
@@ -33,6 +37,7 @@ from .citation import (
     path_exists,
     scan_raw_line_ban,
 )
+from .commands import check_agent_contract
 from .counts import check_counts
 from .finding import Finding
 from .frontmatter import SeamMeta, parse_and_validate
@@ -103,6 +108,11 @@ def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
     # region: the numbers sit mid-sentence, so they are asserted against source
     # rather than rewritten, and `--write` leaves them alone.
     findings.extend(check_counts(repo_root))
+    # The published verification contract names commands an agent is told to
+    # trust (#1041). Same class as check_counts: prose asserted against
+    # machine-readable ground truth, never rewritten, so `--write` leaves it
+    # alone.
+    findings.extend(check_agent_contract(repo_root))
     doc_findings, ignored = _check_docs(repo_root, cache)
     findings.extend(doc_findings)
     return findings, ignored

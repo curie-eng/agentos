@@ -46,10 +46,12 @@ jobs:
       - name: Import boundaries (harness SDK containment)
         run: uv run lint-imports
       # Regenerate the interface-catalog seam table and per-doc headers from
-      # each seam's front-matter, fail on drift, then lint every citation under
-      # docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it runs
-      # right after ruff/mypy and before the dev stack boots.
-      - name: Interface catalog docs (generate + drift + citation lint)
+      # each seam's front-matter, fail on drift, resolve every `curie ...`
+      # command named in the agent verification contract (docs/agents.md)
+      # against cli/command-manifest.json (#1041), then lint every citation
+      # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
+      # runs right after ruff/mypy and before the dev stack boots.
+      - name: Docs gate (catalog drift + agent contract + citations)
         run: bash scripts/check-docs.sh
       # _AciModel tolerant-decode gate (#625, following #492): every direct
       # ClassName.model_validate*(...) call on an _AciModel subclass must thread
