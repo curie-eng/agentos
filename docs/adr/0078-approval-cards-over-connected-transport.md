@@ -4,6 +4,12 @@ Date: 2026-07-23
 
 Status: Accepted
 
+**Mechanism superseded by [ADR-0082](0082-connected-transport-approval-cards-via-a-real-placeholder.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the empty-`reply_handle.placeholder` sentinel this ADR's Decision specifies is
+not implementable. 0082 carries this ADR's intent forward unchanged and states
+the mechanism that replaces it, with the reasoning there.
+
 ## Context
 
 ADR-0063 fixed the zero-Slack case of a `message`-driven approval: `curie
@@ -35,14 +41,6 @@ change across a sacred boundary, not a passenger on the offline fix:
   skip minting the stub and let the card and resumed reply ride that transport.
 
 ## Decision
-
-> **Mechanism superseded by ADR-0082.** The empty-`reply_handle.placeholder`
-> sentinel below cannot work: `ApprovalRequest.reply_placeholder` is
-> `min_length=1` in the frozen `packages/aci-protocol`, so such a turn is
-> rejected at approval-create and the pause escalates instead of posting a card.
-> ADR-0082 keeps this ADR's intent (the connected transport is the approval
-> surface) and replaces the mechanism: the CLI posts a REAL placeholder and
-> enqueues against its ts, needing no kernel or wire change.
 
 **When `message` runs against a connected transport (a running dispatcher),
 route the approval card and the resumed reply over the worker's default Slack

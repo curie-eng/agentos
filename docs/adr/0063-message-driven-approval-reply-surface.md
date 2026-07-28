@@ -3,6 +3,12 @@
 Date: 2026-07-21
 Status: Accepted
 
+**Deferral superseded by [ADR-0078](0078-approval-cards-over-connected-transport.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+this ADR's Decision defers the connected Slack transport as the approval surface
+("not (yet) the connected Slack transport", its Alternative 1, "Follow-up A").
+0078 adopts it. The zero-Slack keep-alive decision below is unaffected.
+
 ## Context
 
 `curie local message` and `curie cluster message` mint an in-process
