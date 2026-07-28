@@ -313,8 +313,10 @@ commands.
   assistant, the robot-emoji "Generated with" footer, or an attribution phrase next
   to a bare assistant name. Technical references (`CLAUDE.md`, `claude_agent_sdk`,
   `claude-sonnet-5`, `harness.claude`) are deliberately fine, and the script's
-  `--self-test` pins both halves so the distinction cannot silently rot. It checks
-  only the PR's own commits, so pre-gate history is not retroactively enforced.
+  `--self-test` pins both halves so the distinction cannot silently rot. A commit
+  range the script cannot resolve is a hard failure naming the range, not a silent
+  pass. It checks only the PR's own commits, so pre-gate history is not
+  retroactively enforced.
 - No dashes/emdashes in prose content; no emojis in code or docs.
 
 ## Decisions: ADR vs. GitHub issue
