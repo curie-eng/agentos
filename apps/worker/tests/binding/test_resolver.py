@@ -4,6 +4,11 @@ Seeds agents / agent_versions / deployments in the curie schema, then checks
 channel resolution, the prod-over-dev preference, unknown-channel -> None, and
 the budget/env construction. Rows are namespaced by a per-test token and cleaned
 up afterwards.
+
+The one exception is the shadowed-binding test, which needs two agents on a
+single channel and so cannot use the curie schema at all. It seeds into a
+throwaway schema copied from curie with CREATE TABLE ... (LIKE ...) and cleans up
+by dropping that schema; no curie object and no production invariant is touched.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import unittest.mock
 import uuid
 
@@ -30,7 +36,7 @@ from curie_worker.binding import (
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox_token import verify
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _DB_URL = os.environ.get(
@@ -49,12 +55,13 @@ async def _seed_agent(
     approval_tools: list[str] | None = None,
     approval_routes: dict | None = None,
     secrets: dict | None = None,
+    schema: str = _SCHEMA,
 ) -> uuid.UUID:
     agent_id = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.agents "
+                f"INSERT INTO {schema}.agents "
                 "(id, name, slack_channel, max_usd_per_day, max_output_tokens_per_run, "
                 "approval_required_tools, approval_routes, secrets) "
                 "VALUES (:id, :name, :channel, :usd, :tokens, "
@@ -86,24 +93,33 @@ async def _seed_deployment(
     environment: str,
     bundle_ref: str,
     status: str = "active",
+    schema: str = _SCHEMA,
+    environment_type: str = f"{_SCHEMA}.environment",
 ) -> None:
     version_id = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.agent_versions "
+                f"INSERT INTO {schema}.agent_versions "
                 "(id, agent_id, version_label, bundle_ref, created_by) "
                 "VALUES (:id, :agent_id, :label, :ref, :by)"
             ),
             {"id": version_id, "agent_id": agent_id, "label": f"v-{environment}",
              "ref": bundle_ref, "by": "test"},
         )
+        # The real schema's `environment` column is a `curie.environment` enum,
+        # which is why the cast target defaults to that type and stays pinned to
+        # `_SCHEMA` rather than following `schema`: the enum exists only in the
+        # real schema. The shadowed-binding test's throwaway copied schema passes
+        # "text" instead, because it deliberately downgrades its copied column to
+        # text so that a schema leaked by a killed run carries no dependency on
+        # any curie object.
         await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.deployments "
+                f"INSERT INTO {schema}.deployments "
                 "(id, agent_id, version_id, environment, status) "
                 "VALUES (:id, :agent_id, :version_id, "
-                f"CAST(:env AS {_SCHEMA}.environment), :status)"
+                f"CAST(:env AS {environment_type}), :status)"
             ),
             {"id": uuid.uuid4(), "agent_id": agent_id, "version_id": version_id,
              "env": environment, "status": status},
@@ -208,8 +224,12 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
     Postgres and restored it in a `finally`, so a killed process left the
     production invariant absent -- and a concurrent duplicate on any other channel
     could make the restoring ADD CONSTRAINT fail outright. The shadow branch is now
-    covered by `test_warn_if_multiple_agents_bound_names_the_shadowed_agent`, which
-    needs no database at all.
+    covered in two halves: its logic by
+    `test_warn_if_multiple_agents_bound_names_the_shadowed_agent`, which needs no
+    database at all, and its invocation by
+    `test_resolve_warns_when_two_agents_are_bound_to_one_channel`, which does use a
+    database but seeds a throwaway copied schema and so never removes the
+    constraint asserted here.
     """
 
     async def go() -> None:
@@ -243,14 +263,234 @@ def test_second_agent_on_a_bound_channel_is_refused() -> None:
     asyncio.run(go())
 
 
+def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Guards #1035 by proving resolve invokes the binding warning.
+
+    This closes the coverage gap left by #1022, so deleting the call site in
+    binding.py makes this test fail.
+
+    Two agents on one channel are unreachable in the curie schema (slack_channel
+    is unique), so the rows are seeded into a throwaway schema this test creates
+    and drops. No curie object is touched and the production invariant #959
+    protects stays in place for everyone else on the box.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable: {exc}")
+
+            # Reap any schema an earlier run leaked: the drop below is a
+            # `finally`, which a SIGKILL or a hung query skips. Every name
+            # carries the epoch seconds it was created at, and only schemas
+            # older than an hour are dropped. That age gate is what makes the
+            # sweep safe against a second pytest process running this file
+            # concurrently on this shared developer database: a live run's
+            # schema is always younger than the threshold, so it can never be
+            # reaped mid-flight. A name whose epoch does not parse is left
+            # alone rather than guessed at.
+            #
+            # The sweep is best-effort only where it has to be: a role that
+            # cannot see or drop another run's litter gives up quietly, and it
+            # runs before the CREATE privilege probe below, so an unguarded
+            # privilege failure here would pre-empt that probe's clean skip.
+            # Anything else is a bug in the sweep itself and is raised.
+            cutoff = int(time.time()) - 3600
+            try:
+                async with engine.begin() as conn:
+                    leaked = await conn.execute(
+                        text(
+                            "SELECT nspname FROM pg_namespace "
+                            "WHERE nspname LIKE 'curie\\_shadow\\_%'"
+                        )
+                    )
+                    for row in leaked.scalars().all():
+                        stale = str(row)
+                        parts = stale.split("_")
+                        if len(parts) != 4 or not parts[2].isdigit():
+                            continue
+                        if int(parts[2]) >= cutoff:
+                            continue
+                        # The name comes back from pg_namespace, not from this
+                        # process, so it is quoted as an identifier by Postgres
+                        # itself rather than pasted into the statement raw.
+                        # IF EXISTS because the SELECT above is a check-then-act:
+                        # a second reaper can drop the same stranded schema in
+                        # between.
+                        # CAST(:name AS text) because asyncpg cannot infer a
+                        # type for a bare bind parameter in this position and
+                        # raises IndeterminateDatatypeError.
+                        drop_sql: str = await conn.scalar(
+                            text(
+                                "SELECT format("
+                                "'DROP SCHEMA IF EXISTS %I CASCADE', "
+                                "CAST(:name AS text))"
+                            ),
+                            {"name": stale},
+                        )
+                        # exec_driver_sql, not execute(text(...)): drop_sql is
+                        # already a complete statement with the identifier
+                        # quoted by Postgres itself, so it must not be
+                        # re-parsed for :name-style bind parameters.
+                        await conn.exec_driver_sql(drop_sql)
+            except ProgrammingError as exc:
+                # Narrow on purpose: a blanket catch here previously turned a
+                # broken sweep into a silent no-op, because a plain programming
+                # error in the statement above was swallowed and the sweep
+                # looked like it had succeeded while reaping nothing. Only
+                # sqlstate 42501 (insufficient_privilege) is a legitimate reason
+                # for a healthy sweep to give up: this role may lack permission
+                # to see or drop another role's schema. `getattr` is defensive:
+                # a driver error shaped differently to asyncpg's has no sqlstate
+                # and so propagates rather than crashing this check.
+                if getattr(getattr(exc, "orig", None), "sqlstate", None) != "42501":
+                    raise
+
+            tmp_schema = f"curie_shadow_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(text(f"CREATE SCHEMA {tmp_schema}"))
+            except ProgrammingError as exc:
+                # Postgres is reachable but this role lacks CREATE on the
+                # database. Scoped to the CREATE alone, and within it to
+                # sqlstate 42501 (insufficient_privilege) alone, so a syntax
+                # error or a missing curie table still fails loudly instead of
+                # turning into a green skip. `getattr` is defensive: a driver
+                # error shaped differently to asyncpg's has no sqlstate and so
+                # propagates rather than crashing this check.
+                if getattr(getattr(exc, "orig", None), "sqlstate", None) != "42501":
+                    raise
+                pytest.skip(f"cannot create a schema as this role: {exc}")
+
+            # The schema exists from here, so its teardown is registered before
+            # any later step can fail and leak it.
+            try:
+                async with engine.begin() as conn:
+                    # LIKE ... INCLUDING DEFAULTS copies columns, types, NOT NULL
+                    # and defaults, and deliberately NOT indexes, unique
+                    # constraints or foreign keys. That is the point: without the
+                    # slack_channel unique two agents can share a channel here,
+                    # and without the FKs the seeded rows need no parent rows in
+                    # curie. INCLUDING ALL or INCLUDING INDEXES would copy the
+                    # unique constraint back and silently break this test.
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE {tmp_schema}.agents "
+                            f"(LIKE {_SCHEMA}.agents INCLUDING DEFAULTS)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE {tmp_schema}.agent_versions "
+                            f"(LIKE {_SCHEMA}.agent_versions INCLUDING DEFAULTS)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE {tmp_schema}.deployments "
+                            f"(LIKE {_SCHEMA}.deployments INCLUDING DEFAULTS)"
+                        )
+                    )
+                    # The copy carries the `environment` column's reference to
+                    # the curie.environment enum, so a schema leaked by a killed
+                    # process would keep a live dependency on a curie object and
+                    # block 0001_initial's downgrade from dropping that enum.
+                    # Downgrading the column to text severs it, leaving a leak as
+                    # inert clutter. The resolver only does `d.environment =
+                    # 'prod'`, which behaves identically against text.
+                    await conn.execute(
+                        text(
+                            f"ALTER TABLE {tmp_schema}.deployments "
+                            "ALTER COLUMN environment TYPE text"
+                        )
+                    )
+
+                token = uuid.uuid4().hex[:8]
+                channel = f"C-{token}"
+                agent_a = await _seed_agent(
+                    engine,
+                    channel=channel,
+                    name=f"agent-a-{token}",
+                    max_usd=None,
+                    max_tokens=None,
+                    schema=tmp_schema,
+                )
+                agent_b = await _seed_agent(
+                    engine,
+                    channel=channel,
+                    name=f"agent-b-{token}",
+                    max_usd=None,
+                    max_tokens=None,
+                    schema=tmp_schema,
+                )
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_a,
+                    environment="prod",
+                    bundle_ref=f"bundles/a-{token}.zip",
+                    schema=tmp_schema,
+                    environment_type="text",
+                )
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_b,
+                    environment="prod",
+                    bundle_ref=f"bundles/b-{token}.zip",
+                    schema=tmp_schema,
+                    environment_type="text",
+                )
+
+                resolver = BindingResolver(
+                    engine, WorkerConfig(db_schema=tmp_schema)
+                )
+                with caplog.at_level(
+                    "WARNING", logger="curie_worker.binding"
+                ):
+                    resolved = await resolver.resolve(channel)
+
+                assert resolved is not None
+                # Behavioral only: a WARNING from the binding logger naming both
+                # the chosen and the shadowed agent. No prose is matched, so a
+                # reword of the message cannot break this, while deleting the
+                # call site still does.
+                assert any(
+                    record.name == "curie_worker.binding"
+                    and record.levelno == logging.WARNING
+                    and str(agent_a) in record.message
+                    and str(agent_b) in record.message
+                    for record in caplog.records
+                ), caplog.records
+            finally:
+                async with engine.begin() as conn:
+                    # IF EXISTS so this cleanup can never raise 3F000 "schema
+                    # does not exist" from inside the `finally` and mask the real
+                    # failure that brought us here.
+                    await conn.execute(
+                        text(f"DROP SCHEMA IF EXISTS {tmp_schema} CASCADE")
+                    )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 def test_warn_if_multiple_agents_bound_names_the_shadowed_agent(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The defense-in-depth branch, covered with no database and no DDL (#959).
+    """The defense-in-depth branch's logic, covered with no database (#959).
 
-    Unreachable while the unique constraint holds, which is exactly why it must be
+    Unreachable while the unique constraint holds, which is exactly why it is
     exercised against synthetic rows rather than by removing the constraint from a
-    shared database.
+    shared database. The other half, that `resolve` actually calls this helper, is
+    covered by `test_resolve_warns_when_two_agents_are_bound_to_one_channel`: that
+    one needs a database, but seeds a throwaway copied schema and leaves the curie
+    schema and its constraints untouched.
     """
 
     chosen = uuid.uuid4()
