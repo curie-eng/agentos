@@ -183,8 +183,17 @@ pub fn check_outcome(report: &CheckReport) -> std::result::Result<(), crate::exi
     }
 }
 
-/// Run the offline MCP load check for a plugin bundle.
-pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
+/// Run the offline MCP load check for a plugin bundle and return its report.
+///
+/// Split out of `check` so a second caller (`info --check-mcp`) probes MCP load
+/// through the identical container path instead of forking one: the report is
+/// the shared product, and only what each caller does with it differs (`check`
+/// emits it and maps the verdict to an exit; `info` folds it into `load`).
+pub(crate) async fn run_check_report(
+    plugin_dir: PathBuf,
+    image: String,
+    timeout_s: u64,
+) -> Result<CheckReport> {
     let requested_dir = plugin_dir.display().to_string();
     let plugin_dir = plugin_dir.canonicalize().map_err(|err| {
         crate::exit::CliError::usage(format!("plugin dir not found: {requested_dir}: {err}"))
@@ -211,6 +220,13 @@ pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result
              docker exited {status}; stdout: {stdout}; stderr: {stderr}"
         )
     })?;
+
+    Ok(report)
+}
+
+/// Run the offline MCP load check for a plugin bundle.
+pub async fn check(plugin_dir: PathBuf, image: String, timeout_s: u64) -> Result<()> {
+    let report = run_check_report(plugin_dir, image, timeout_s).await?;
 
     crate::ui::ui().emit(&CheckOutput { report: &report });
     check_outcome(&report).map_err(anyhow::Error::from)
@@ -957,7 +973,7 @@ fn find_repo_root() -> Option<PathBuf> {
 /// The rule is frozen as data in tests/vectors/model-credential-forwarding.json,
 /// which both this lane and the worker lane assert against: changing the rule
 /// here without changing the worker (or the vectors) fails that gate (issue #495).
-fn select_passthrough_env(
+pub(crate) fn select_passthrough_env(
     fake_model: bool,
     base_url_override: bool,
     byo_credential: Option<&str>,
@@ -4096,7 +4112,7 @@ fn read_bundle_gates(plugin_dir: &Path) -> Result<Vec<(String, String)>> {
 /// read gates identically. Also validates the raw manifest against the frozen
 /// `plugin_format` schema once a policy is declared (#701) -- see
 /// `validate_against_plugin_format_schema`.
-fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)>> {
+pub(crate) fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)>> {
     let invalid = |problem: &str| {
         crate::exit::usage(format!(
             "invalid plugin manifest {source}: {problem}. The runner rejects this manifest and arms ZERO approval gates, including any well-formed ones"
@@ -4157,7 +4173,7 @@ fn parse_manifest_gates(body: &str, source: &str) -> Result<Vec<(String, String)
 /// (mirroring `binding.py`), then most recent. `list_deployments` returns rows
 /// oldest-first, so "most recent" is the last match. `None` when the agent has no
 /// active deployment (nothing is running its bundle yet).
-fn select_in_force_deployment(
+pub(crate) fn select_in_force_deployment(
     deployments: &[crate::api::Deployment],
 ) -> Option<&crate::api::Deployment> {
     let active: Vec<&crate::api::Deployment> = deployments
@@ -4422,6 +4438,25 @@ pub fn skill_approvals_list_unavailable() -> anyhow::Error {
         "approvals --list/--resolve",
         APPROVALS_LIST_REASON,
         APPROVALS_LIST_ALT,
+    )
+}
+
+/// Why `info --check-mcp` cannot be answered at the local/cluster tiers.
+pub const INFO_CHECK_MCP_REASON: &str = "the MCP load probe boots a runner container mounting a bundle DIRECTORY on this machine (`curie_runner.check`), and a deployed bundle exists only as stored files in the platform, with no directory here to mount";
+/// Where to probe MCP load instead.
+pub const INFO_CHECK_MCP_ALT: &str = "run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean";
+
+/// `<local|cluster> info --check-mcp`: answered, but unavailable at these tiers
+/// by construction. The static half of `info` still works at every tier; only
+/// the container probe has no directory to run against. The flag is DECLARED at
+/// every tier so this reports WHY (exit 4) rather than erroring like an
+/// unknown-flag typo, matching `skill_approvals_list_unavailable` (issue #771,
+/// ADR-0041).
+pub fn info_check_mcp_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "info --check-mcp",
+        INFO_CHECK_MCP_REASON,
+        INFO_CHECK_MCP_ALT,
     )
 }
 
