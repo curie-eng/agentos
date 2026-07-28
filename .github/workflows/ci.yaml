@@ -795,8 +795,14 @@ jobs:
           # local-release rung whose stated purpose is closing that parity seam
           # (#958). compose.release.yaml is generated, not tracked, and is listed
           # so a future decision to commit it does not silently re-open the hole.
+          # #1032 widened the surface again: examples/ is the fixed bundle every
+          # rung deploys (cli/scripts/e2e-ladder.sh hardcodes BUNDLE_SRC to
+          # examples/weather and copies it into both the local and local-release
+          # workdirs), and the root pyproject.toml / uv.lock are what every
+          # ladder image builds and boots. A PR editing any of the three changed
+          # what the rungs exercise while skipping every rung.
           if git diff --name-only "origin/$base...HEAD" \
-              | grep -qE '^(charts/|cli/|apps/|runner/|packages/|compose/|compose\.dev\.yaml|compose\.release\.yaml|otel/|\.github/workflows/ci\.yaml)'; then
+              | grep -qE '^(charts/|cli/|apps/|runner/|packages/|examples/|compose/|compose\.dev\.yaml|compose\.release\.yaml|otel/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yaml)'; then
             echo "ladder=true" >> "$GITHUB_OUTPUT"
           else
             echo "ladder=false" >> "$GITHUB_OUTPUT"
