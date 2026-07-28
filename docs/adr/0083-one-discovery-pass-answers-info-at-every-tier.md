@@ -261,16 +261,18 @@ The v1 `code` registry:
 | `secret` | `secret.unsatisfied`, `secret.name_invalid`, `secret.vault_unreadable` |
 | `boot_env` | `boot_env.not_set_at_this_tier`, `boot_env.rows_scoped` |
 | `approval_gate` | `approval_gate.manifest_invalid` |
-| `artifact` | none at v1 (see below) |
+| `artifact` | `artifact.symlink` (see below) |
 | `state` | `state.runner_absent`, `state.foreign_runner`, `state.unreadable` |
 | `deployed` | `deployed.no_active_deployment`, `deployed.bundle_unreadable` |
 
-`artifact` carries no `code` at v1 and still holds a slot in the closed `kind`
-enum. Every `artifacts[]` row's absence already has a dedicated `code` elsewhere
-in the pass (`mcp.not_in_bundle_view`, `evals.file_absent`, `skills.dir_absent`,
-the `manifest.*` family), so an `artifact.absent` beside them would be a second
-name for a rejection already reported. Keeping the `kind` reserved is free by the
-additive rule below; removing it would not be.
+`artifact` carries exactly one `code` at v1, `artifact.symlink`: a `.curieignore`
+that is a symlink, which `bundle::pack_tar_gz` refuses to pack, so the inventory
+was built from the built-in exclusions alone and describes a directory the
+platform cannot store. There is deliberately no `artifact.absent` beside it,
+because every `artifacts[]` row's absence already has a dedicated `code`
+elsewhere in the pass (`mcp.not_in_bundle_view`, `evals.file_absent`,
+`skills.dir_absent`, the `manifest.*` family), and a second name for a rejection
+already reported would split one consumer branch into two.
 
 `state.unreadable` was added during implementation, for a `.curie/runner.json`
 that exists but cannot be parsed. Reporting that as `state.runner_absent` would

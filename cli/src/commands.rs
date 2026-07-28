@@ -3951,7 +3951,7 @@ const PLUGIN_FORMAT_SCHEMA: &str =
 ///
 /// Returns the joined validator failures on failure so the CLI's error names the
 /// actual offending field rather than an approximation of one -- as LOCATIONS
-/// only, via `info::redact::schema_violation`. `ValidationError`'s own `Display`
+/// only, via `redact::schema_violation`. `ValidationError`'s own `Display`
 /// serializes the failing instance into its message, and this string reaches two
 /// places a manifest's own content must never reach: `skill approvals`' error and
 /// (through `parse_manifest_gates`) `info`'s exit-0 `diagnostics` payload.
@@ -3972,7 +3972,7 @@ fn validate_against_plugin_format_schema(
     });
     let errors: Vec<String> = validator
         .iter_errors(raw)
-        .map(|e| crate::info::redact::schema_violation(&e))
+        .map(|e| crate::redact::schema_violation(&e))
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -4479,8 +4479,10 @@ pub const INFO_CHECK_MCP_ALT: &str = "run `curie skill info --plugin-dir <dir> -
 /// not "never", and an agent that reads exit 4 stops retrying and stops asking.
 pub fn info_check_mcp_unavailable() -> anyhow::Error {
     anyhow::Error::from(
-        crate::exit::CliError::failure(format!(
-            "info --check-mcp is not available at this tier: {INFO_CHECK_MCP_REASON}; {INFO_CHECK_MCP_ALT}"
+        crate::exit::CliError::failure(crate::exit::not_available_here_message(
+            "info --check-mcp",
+            INFO_CHECK_MCP_REASON,
+            INFO_CHECK_MCP_ALT,
         ))
         .with_fix(INFO_CHECK_MCP_ALT),
     )

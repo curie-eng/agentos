@@ -46,13 +46,14 @@ pub(crate) enum IgnoreDefect {
 /// Entries the archive skips: the built-in names plus whatever the bundle's
 /// `.curieignore` declares.
 ///
-/// `pub(crate)` on purpose: `info`'s disk walk (`crate::info::BundleView`) must
-/// describe the SAME file set `pack_tar_gz` ships, so it asks this type "would
-/// the packer include this entry?" rather than mirroring [`EXCLUDED_NAMES`].
-/// A mirrored denylist drifts, and the mirror already had: it carried the
-/// built-in names but not the bundle's `.curieignore`, so the disk view and the
-/// deployed view described different bundles.
-pub(crate) struct Exclusions {
+/// `pub` on purpose: `info`'s disk walk (`crate::info::BundleView`) and the
+/// integration suite's deployed-view helper must both describe the SAME file set
+/// `pack_tar_gz` ships, so they ask this type "would the packer include this
+/// entry?" rather than mirroring [`EXCLUDED_NAMES`]. A mirrored denylist drifts,
+/// and the mirror already had: it carried the built-in names but not the
+/// bundle's `.curieignore`, so the disk view and the deployed view described
+/// different bundles.
+pub struct Exclusions {
     /// Bare names, matched against any entry at any depth.
     names: Vec<String>,
     /// Bundle-root-relative paths, matched against the exact entry.
@@ -67,7 +68,7 @@ impl Exclusions {
     /// bundle was already packed through [`Self::load`], so its `.curieignore`
     /// exclusions are baked into the file list; only the built-in names remain
     /// worth re-asserting.
-    pub(crate) fn builtin() -> &'static Self {
+    pub fn builtin() -> &'static Self {
         static BUILTIN: OnceLock<Exclusions> = OnceLock::new();
         BUILTIN.get_or_init(|| Self {
             names: EXCLUDED_NAMES.iter().map(|n| (*n).to_string()).collect(),
@@ -156,7 +157,7 @@ impl Exclusions {
     /// Callers that walk recursively (this module's [`append_dir`], `info`'s
     /// disk walk) only need this: excluding a directory prunes its whole
     /// subtree by never descending.
-    pub(crate) fn is_excluded(&self, rel: &Path) -> bool {
+    pub fn is_excluded(&self, rel: &Path) -> bool {
         let name = rel.file_name().unwrap_or_default();
         self.names.iter().any(|n| name == std::ffi::OsStr::new(n))
             || self.paths.iter().any(|p| rel == p)

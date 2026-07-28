@@ -73,7 +73,7 @@
 //! The inventory being content-free is only half of it: a `diagnostics` entry
 //! describes a bundle DEFECT, and every upstream producer of that text renders
 //! the offending value into its own message. So every diagnostic string is
-//! built through [`redact`] -- see that module for the rule and the reason.
+//! built through [`crate::redact`] -- see that module for the rule and the reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -274,82 +274,6 @@ impl From<Diag> for Diagnostic {
             looked_in: d.looked_in,
             reason: d.reason,
             fix: d.fix,
-        }
-    }
-}
-
-/// The one place an untrusted error becomes payload text.
-///
-/// A bundle defect is a `diagnostics` entry at exit 0 on stdout, in the command
-/// an agent is told to run before reporting success and to paste into a
-/// transcript, a CI log or an issue comment. Every upstream producer of that
-/// text -- `serde_json`, `jsonschema`, the probe container, the platform API --
-/// renders the OFFENDING VALUE into its own message, so a token mistyped into a
-/// manifest field, an eval suite or an MCP block would be echoed straight back
-/// through a `reason`. Collapsing an MCP row to four fields buys nothing if the
-/// diagnostic beside it reprints the same `env` block verbatim.
-///
-/// The rule every helper here implements: a diagnostic says WHAT was wrong and
-/// WHERE -- a JSON pointer, a type name, a line and column, an array index --
-/// and never WHAT THE CONTENT WAS. A pointer is also more useful to an agent
-/// than the echoed text it replaces.
-///
-/// Two things this module deliberately does not do. It never formats an
-/// untrusted error's `Display` (that is the echo itself), and it never scrubs a
-/// finished string for secret-looking substrings -- a denylist over
-/// attacker-shaped text is not a boundary. A new diagnostic builds its `reason`
-/// from these helpers plus its own static prose; interpolating an upstream error
-/// into one is the defect this module exists to make unnecessary.
-pub(crate) mod redact {
-    /// A JSON parse failure as its POSITION only. Serde's syntax-error catalogue
-    /// happens not to quote the source span today, but a payload string must not
-    /// rest on that; the line and column are the whole useful part anyway.
-    pub(crate) fn json_syntax(err: &serde_json::Error) -> String {
-        format!(
-            "a JSON syntax error at line {}, column {}",
-            err.line(),
-            err.column()
-        )
-    }
-
-    /// The JSON type of a value, named for "found X, expected Y" prose. Types
-    /// are derived facts; the value they describe never leaves this function.
-    pub(crate) fn json_type(value: &serde_json::Value) -> &'static str {
-        match value {
-            serde_json::Value::Null => "null",
-            serde_json::Value::Bool(_) => "a boolean",
-            serde_json::Value::Number(_) => "a number",
-            serde_json::Value::String(_) => "a string",
-            serde_json::Value::Array(_) => "an array",
-            serde_json::Value::Object(_) => "an object",
-        }
-    }
-
-    /// One `jsonschema` violation as its two LOCATIONS: where in the instance,
-    /// and which constraint of the committed schema it failed.
-    ///
-    /// `ValidationError`'s `Display` serializes the failing instance into the
-    /// message -- `PluginManifest.mcpServers` is `anyOf [string, object, null]`,
-    /// so declaring servers as an array (a routine authoring mistake) makes it
-    /// print the whole array including any `env` block inside it. Both
-    /// `Location`s are structural: property names and array indices on the
-    /// instance side, the committed schema's own path on the other.
-    pub(crate) fn schema_violation(err: &jsonschema::ValidationError<'_>) -> String {
-        format!(
-            "the value at {} does not satisfy the schema constraint at {}",
-            pointer(err.instance_path()),
-            pointer(err.schema_path())
-        )
-    }
-
-    /// Render a JSON pointer, naming the empty pointer rather than emitting the
-    /// empty string into the middle of a sentence.
-    fn pointer(location: impl std::fmt::Display) -> String {
-        let rendered = location.to_string();
-        if rendered.is_empty() {
-            "the document root".to_string()
-        } else {
-            rendered
         }
     }
 }
@@ -776,7 +700,7 @@ fn walk_disk(
 /// withhold facts the pass genuinely resolved. What is NOT true of such a bundle
 /// is that it corresponds to anything the platform could store, and that is
 /// exactly what this diagnostic says. It names the defect and its location only;
-/// no byte of the ignore file reaches the payload (see [`redact`]).
+/// no byte of the ignore file reaches the payload (see [`crate::redact`]).
 fn ignore_file_diagnostic(defect: crate::bundle::IgnoreDefect) -> Diagnostic {
     match defect {
         crate::bundle::IgnoreDefect::Symlink => Diag {
@@ -905,7 +829,7 @@ fn resolve_manifest(
                         "{location} is present but is not valid JSON ({}); the runner's \
                          manifest read fails on it, so every fact the manifest is the sole \
                          source of is unresolved rather than empty",
-                        redact::json_syntax(&err)
+                        crate::redact::json_syntax(&err)
                     ),
                     fix: Some(format!("fix the JSON syntax in {location}")),
                 }
@@ -1370,7 +1294,7 @@ fn discover_mcp(
                             "{MCP_FILE} is present but is not valid JSON ({}); the declared \
                              servers cannot be resolved, which is NOT the same fact as declaring \
                              none",
-                            redact::json_syntax(&err)
+                            crate::redact::json_syntax(&err)
                         ),
                         fix: Some(format!("fix the JSON syntax in {MCP_FILE}")),
                     }
@@ -1768,7 +1692,7 @@ fn discover_evals(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Maybe
                 diagnostics,
                 format!(
                     "{EVAL_SUITE} is not valid JSON ({})",
-                    redact::json_syntax(&err)
+                    crate::redact::json_syntax(&err)
                 ),
             )
         }
@@ -1836,13 +1760,16 @@ fn eval_shape_defect(value: &serde_json::Value) -> String {
     let Some(object) = value.as_object() else {
         return format!(
             "the suite is {} rather than an object with `name` and `cases`",
-            redact::json_type(value)
+            crate::redact::json_type(value)
         );
     };
     match object.get("name") {
         None => return "`name` is missing".to_string(),
         Some(name) if !name.is_string() => {
-            return format!("`name` is {} rather than a string", redact::json_type(name))
+            return format!(
+                "`name` is {} rather than a string",
+                crate::redact::json_type(name)
+            )
         }
         Some(_) => {}
     }
@@ -1852,7 +1779,7 @@ fn eval_shape_defect(value: &serde_json::Value) -> String {
     let Some(cases) = cases.as_array() else {
         return format!(
             "`cases` is {} rather than an array of case objects",
-            redact::json_type(cases)
+            crate::redact::json_type(cases)
         );
     };
     for (index, case) in cases.iter().enumerate() {
@@ -2004,62 +1931,9 @@ enum BootEnvProducer {
 /// and are named as out of scope by [`boot_env_scope_diagnostic`] rather than
 /// silently omitted.
 fn boot_env_rows(origin: &BundleOrigin) -> Vec<BootEnvRow> {
-    let rows: [(&str, BootEnvProducer); 11] = [
-        (env_keys::CURIE_PLUGIN_DIR, BootEnvProducer::Always),
-        (env_keys::CURIE_SESSION_ID, BootEnvProducer::Always),
-        (env_keys::CURIE_SANDBOX_ID, BootEnvProducer::Always),
-        (env_keys::CURIE_BUDGET, BootEnvProducer::Always),
-        (
-            env_keys::CURIE_FAKE_MODEL,
-            BootEnvProducer::PerInvocation(
-                "`skill up` writes this only under `--fake-model` (and not when `--local-model` \
-                 overrides it); it is never read from this shell",
-            ),
-        ),
-        (
-            env_keys::CURIE_MODEL,
-            BootEnvProducer::PerInvocation(
-                "`skill up` writes this only under `--model <id>`, which has no environment \
-                 default; a plain run leaves the SDK default",
-            ),
-        ),
-        (
-            env_keys::ANTHROPIC_BASE_URL,
-            BootEnvProducer::PerInvocation(
-                "`skill up` writes this only under `--local-model`, which points the runner at \
-                 the Ollama container it started",
-            ),
-        ),
-        (
-            env_keys::OTEL_EXPORTER_OTLP_ENDPOINT,
-            BootEnvProducer::PerInvocation(
-                "`skill up` writes this only under `--otel-endpoint <url>`; without it the \
-                 runner exports no traces",
-            ),
-        ),
-        (
-            env_keys::CURIE_APPROVAL_REQUIRED_TOOLS,
-            BootEnvProducer::Never(
-                "a plain `curie skill up` does not forward this: the container gets it only when \
-                 the invocation adds `--secret CURIE_APPROVAL_REQUIRED_TOOLS` with the value in \
-                 this shell or the vault, so it is an override the bundle cannot declare",
-            ),
-        ),
-        (
-            env_keys::CURIE_MEMORY_REF,
-            BootEnvProducer::Never(commands::MEMORY_REASON),
-        ),
-        (
-            env_keys::CURIE_HISTORY_REF,
-            BootEnvProducer::Never(
-                "`skill up` provisions no history namespace: the runner it boots keeps a turn's \
-                 history in process and nothing persists it",
-            ),
-        ),
-    ];
-
     let deployed = origin.is_deployed();
-    rows.into_iter()
+    BOOT_ENV_TABLE
+        .into_iter()
         .map(|(name, producer)| {
             let (set_by_this_tier, note) = match producer {
                 _ if deployed => (
@@ -2094,6 +1968,62 @@ fn boot_env_rows(origin: &BundleOrigin) -> Vec<BootEnvRow> {
         })
         .collect()
 }
+
+/// The table itself, a `const` so [`layer_boot_env`] resolves a row's PRODUCER
+/// from the one declaration rather than re-spelling the conditional key names.
+const BOOT_ENV_TABLE: [(&str, BootEnvProducer); 11] = [
+    (env_keys::CURIE_PLUGIN_DIR, BootEnvProducer::Always),
+    (env_keys::CURIE_SESSION_ID, BootEnvProducer::Always),
+    (env_keys::CURIE_SANDBOX_ID, BootEnvProducer::Always),
+    (env_keys::CURIE_BUDGET, BootEnvProducer::Always),
+    (
+        env_keys::CURIE_FAKE_MODEL,
+        BootEnvProducer::PerInvocation(
+            "`skill up` writes this only under `--fake-model` (and not when `--local-model` \
+                 overrides it); it is never read from this shell",
+        ),
+    ),
+    (
+        env_keys::CURIE_MODEL,
+        BootEnvProducer::PerInvocation(
+            "`skill up` writes this only under `--model <id>`, which has no environment \
+                 default; a plain run leaves the SDK default",
+        ),
+    ),
+    (
+        env_keys::ANTHROPIC_BASE_URL,
+        BootEnvProducer::PerInvocation(
+            "`skill up` writes this only under `--local-model`, which points the runner at \
+                 the Ollama container it started",
+        ),
+    ),
+    (
+        env_keys::OTEL_EXPORTER_OTLP_ENDPOINT,
+        BootEnvProducer::PerInvocation(
+            "`skill up` writes this only under `--otel-endpoint <url>`; without it the \
+                 runner exports no traces",
+        ),
+    ),
+    (
+        env_keys::CURIE_APPROVAL_REQUIRED_TOOLS,
+        BootEnvProducer::Never(
+            "a plain `curie skill up` does not forward this: the container gets it only when \
+                 the invocation adds `--secret CURIE_APPROVAL_REQUIRED_TOOLS` with the value in \
+                 this shell or the vault, so it is an override the bundle cannot declare",
+        ),
+    ),
+    (
+        env_keys::CURIE_MEMORY_REF,
+        BootEnvProducer::Never(commands::MEMORY_REASON),
+    ),
+    (
+        env_keys::CURIE_HISTORY_REF,
+        BootEnvProducer::Never(
+            "`skill up` provisions no history namespace: the runner it boots keeps a turn's \
+                 history in process and nothing persists it",
+        ),
+    ),
+];
 
 /// State the BOUNDARY of the `boot_env` block rather than letting a declared key
 /// be absent from it. The frozen `BootEnv` contract carries keys this CLI has no
@@ -2342,12 +2272,13 @@ async fn run_skill(
     report.tier = Maybe::Known(Tier::Skill.as_str().to_string());
 
     layer_shell_secrets(&mut report);
-    // ONE resolution, two consumers: the `model` block and the conditional
-    // `boot_env` rows. Computing them separately is what let the two contradict
+    // ONE fact, two consumers: this is a PLAIN invocation, so the `model` block
+    // and the conditional `boot_env` rows both answer for a run that passes no
+    // flags. Deciding that separately in each is what let the two contradict
     // each other in a single payload.
     let boot = plain_skill_up_boot();
     layer_model(&mut report, &root, &boot);
-    layer_boot_env(&mut report, &boot);
+    layer_boot_env(&mut report);
     layer_memory_note(&mut report);
     if check_mcp {
         probe_mcp(&mut report, &root, image, timeout_s).await;
@@ -2393,20 +2324,16 @@ fn layer_shell_secrets(report: &mut InfoReport) {
             continue;
         }
 
-        // The frozen empty-string-is-absent rule (#540): `NAME=""` forwards
-        // nothing usable, so reporting it satisfied would call a bundle ready
-        // while the sandbox gets nothing.
-        if commands::env_credential_present(&row.name) {
-            row.satisfied = Maybe::Known(true);
-            row.source = Maybe::Known("shell_env".to_string());
-            continue;
-        }
-        match crate::secrets::is_saved(&row.name) {
-            Ok(true) => {
+        match credential_location(&row.name) {
+            CredentialLocation::ShellEnv => {
+                row.satisfied = Maybe::Known(true);
+                row.source = Maybe::Known("shell_env".to_string());
+            }
+            CredentialLocation::Vault => {
                 row.satisfied = Maybe::Known(true);
                 row.source = Maybe::Known("curie_vault".to_string());
             }
-            Ok(false) => {
+            CredentialLocation::Absent => {
                 row.satisfied = Maybe::Known(false);
                 row.source = Maybe::Known("none".to_string());
                 diagnostics.push(
@@ -2432,11 +2359,11 @@ fn layer_shell_secrets(report: &mut InfoReport) {
                     .into(),
                 );
             }
-            Err(err) => {
+            CredentialLocation::Unreadable(cause) => {
                 // Claiming "unsatisfied" when the vault is merely locked sends an
                 // operator down the wrong path, so this is unresolved, not false.
                 let reason = format!(
-                    "the local credential store could not be read ({err:#}), so whether it \
+                    "the local credential store could not be read ({cause}), so whether it \
                      satisfies {} is unknown",
                     row.name
                 );
@@ -2463,6 +2390,41 @@ fn layer_shell_secrets(report: &mut InfoReport) {
     report.diagnostics.extend(diagnostics);
 }
 
+/// Where a credential NAME is satisfied from, in the frozen order: this shell
+/// first, then the local vault.
+///
+/// One predicate for the three callers that ask it -- the declared-secret rows,
+/// the ambient probe [`plain_skill_up_boot`] hands `select_passthrough_env`, and
+/// the `model` block's `credential.source`. Each maps the answer into its own
+/// payload wording, so no string moves here; what is shared is the ORDER and the
+/// empty-string-is-absent rule, which three hand-written copies of the predicate
+/// were free to disagree about.
+enum CredentialLocation {
+    /// Exported in this shell with a non-empty value.
+    ShellEnv,
+    /// Saved in the Curie private credential store.
+    Vault,
+    /// Neither.
+    Absent,
+    /// The store could not be read, so absence cannot be claimed. Carries the
+    /// rendered cause for the one caller that reports it.
+    Unreadable(String),
+}
+
+fn credential_location(name: &str) -> CredentialLocation {
+    // The frozen empty-string-is-absent rule (#540): `NAME=""` forwards nothing
+    // usable, so reporting it satisfied would call a bundle ready while the
+    // sandbox gets nothing.
+    if commands::env_credential_present(name) {
+        return CredentialLocation::ShellEnv;
+    }
+    match crate::secrets::is_saved(name) {
+        Ok(true) => CredentialLocation::Vault,
+        Ok(false) => CredentialLocation::Absent,
+        Err(err) => CredentialLocation::Unreadable(format!("{err:#}")),
+    }
+}
+
 /// What a PLAIN `curie skill up` from this shell resolves: the one resolution
 /// that feeds both the `model` block and the conditional `boot_env` rows.
 ///
@@ -2475,11 +2437,13 @@ fn layer_shell_secrets(report: &mut InfoReport) {
 /// CLI WRITES INTO the container (`docker::StartSpec::run_args`), never keys it
 /// reads to decide, so an exported `CURIE_FAKE_MODEL=0` reported `fake_model`
 /// for a run that would have gone live.
+///
+/// So the only fields here are the ones a plain run genuinely RESOLVES. Fake
+/// mode, the model id, the base-URL override and the OTEL endpoint are false or
+/// null by construction for every plain run, and carrying them as fields made
+/// three downstream branches look conditional while never taking their other
+/// arm.
 struct PlainSkillUpBoot {
-    fake_model: bool,
-    model_id: Option<String>,
-    model_base_url: Option<String>,
-    otel_endpoint: Option<String>,
     /// A BYO credential blob is present (in this shell or the vault), whatever
     /// its value.
     byo: Option<String>,
@@ -2489,17 +2453,14 @@ struct PlainSkillUpBoot {
     credential_source: &'static str,
 }
 
-fn plain_skill_up_boot() -> PlainSkillUpBoot {
-    // Every one of these is what `commands::up` derives for a no-flag run:
-    // `fake_model = opts.local_model.is_none() && opts.fake_model`,
-    // `base_url_override = model_base_url.is_some()` (set only by
-    // `--local-model`), `model` from `--model`, `otel_endpoint` from
-    // `--otel-endpoint`.
-    let fake_model = false;
-    let model_id: Option<String> = None;
-    let model_base_url: Option<String> = None;
-    let otel_endpoint: Option<String> = None;
+/// What `commands::up` derives for a no-flag run:
+/// `fake_model = opts.local_model.is_none() && opts.fake_model`, and
+/// `base_url_override = model_base_url.is_some()` (set only by `--local-model`).
+/// A plain run passes neither flag.
+const PLAIN_FAKE_MODEL: bool = false;
+const PLAIN_BASE_URL_OVERRIDE: bool = false;
 
+fn plain_skill_up_boot() -> PlainSkillUpBoot {
     // `commands::up` resolves a credential from the shell OR the vault (it
     // extends `docker_env` with `load_model_credentials_from_secret_store`
     // before calling `ambient_present_for`). Consulting only the shell reported
@@ -2507,7 +2468,10 @@ fn plain_skill_up_boot() -> PlainSkillUpBoot {
     // and made the `curie_vault` arm below unreachable. `--env-file` is the
     // third source and is invocation-only, so it is named in the note instead.
     let ambient_present = |name: &str| {
-        commands::env_credential_present(name) || crate::secrets::is_saved(name).unwrap_or(false)
+        matches!(
+            credential_location(name),
+            CredentialLocation::ShellEnv | CredentialLocation::Vault
+        )
     };
     let byo = std::env::var(env_keys::CURIE_CREDENTIALS)
         .ok()
@@ -2520,25 +2484,24 @@ fn plain_skill_up_boot() -> PlainSkillUpBoot {
     // The frozen #495 forwarding rule, called rather than forked. It returns
     // NAMES; no value ever reaches this report.
     let names = commands::select_passthrough_env(
-        fake_model,
-        model_base_url.is_some(),
+        PLAIN_FAKE_MODEL,
+        PLAIN_BASE_URL_OVERRIDE,
         byo.as_deref(),
         &ambient_present,
     );
     let credential_name = names.first().cloned();
     let credential_source = match credential_name.as_deref() {
         None => "none",
-        Some(name) if commands::env_credential_present(name) => "shell_env",
-        Some(name) => match crate::secrets::is_saved(name) {
-            Ok(true) => "curie_vault",
-            _ => "none",
+        Some(name) => match credential_location(name) {
+            CredentialLocation::ShellEnv => "shell_env",
+            CredentialLocation::Vault => "curie_vault",
+            // An unreadable store is reported as `none` here on purpose: this
+            // block answers "what would a plain run forward", and the row-level
+            // `secret.vault_unreadable` diagnostic carries the uncertainty.
+            CredentialLocation::Absent | CredentialLocation::Unreadable(_) => "none",
         },
     };
     PlainSkillUpBoot {
-        fake_model,
-        model_id,
-        model_base_url,
-        otel_endpoint,
         byo,
         credential_name,
         credential_source,
@@ -2548,9 +2511,10 @@ fn plain_skill_up_boot() -> PlainSkillUpBoot {
 /// What a plain `skill up` from THIS shell would resolve, plus whatever runner
 /// is actually recorded for the bundle.
 fn layer_model(report: &mut InfoReport, root: &Path, boot: &PlainSkillUpBoot) {
-    let mode = if boot.fake_model {
-        "fake_model"
-    } else if boot.byo.is_some() {
+    // No `fake_model` arm: fake mode is turned on by `--fake-model` alone, and
+    // this block answers for a run that passes no flags. The mode a fake run
+    // resolves is not unreported, it is simply not this block's question.
+    let mode = if boot.byo.is_some() {
         "byo_credential"
     } else if boot.credential_name.is_some() {
         "ambient_sdk_credential"
@@ -2565,8 +2529,11 @@ fn layer_model(report: &mut InfoReport, root: &Path, boot: &PlainSkillUpBoot) {
 
     report.model = Maybe::Known(ModelInfo {
         mode: mode.to_string(),
-        model_id: boot.model_id.clone(),
-        base_url_override: boot.model_base_url.is_some(),
+        // Both are properties of `--model` and `--local-model`, which a plain
+        // run does not pass; the `note` below states that boundary in the
+        // payload itself.
+        model_id: None,
+        base_url_override: PLAIN_BASE_URL_OVERRIDE,
         credential: CredentialInfo {
             name: boot.credential_name.clone(),
             source: boot.credential_source.to_string(),
@@ -2583,24 +2550,26 @@ fn layer_model(report: &mut InfoReport, root: &Path, boot: &PlainSkillUpBoot) {
     });
 }
 
-/// Fill the `boot_env` rows whose producer is conditional from the SAME
-/// resolution `layer_model` reports, so `model.base_url_override: false` beside
-/// `ANTHROPIC_BASE_URL: set_by_this_tier: true` -- two fields of one object
-/// disagreeing about one fact -- cannot happen.
-fn layer_boot_env(report: &mut InfoReport, boot: &PlainSkillUpBoot) {
+/// Fill the `boot_env` rows whose producer is conditional from the SAME fact
+/// `layer_model` reports -- that this run passes no flags -- so
+/// `model.base_url_override: false` beside `ANTHROPIC_BASE_URL:
+/// set_by_this_tier: true`, two fields of one object disagreeing about one fact,
+/// cannot happen.
+///
+/// The row is selected by its PRODUCER, read back out of [`BOOT_ENV_TABLE`],
+/// never by re-listing the conditional key names here. `PerInvocation` means
+/// "written only under a flag" by definition, so a fifth such key added to the
+/// table is answered the moment it is declared; a second list would have left it
+/// shipping `unresolved` forever with nothing to notice.
+fn layer_boot_env(report: &mut InfoReport) {
     for row in &mut report.boot_env {
-        let set = if row.name == env_keys::CURIE_FAKE_MODEL {
-            boot.fake_model
-        } else if row.name == env_keys::CURIE_MODEL {
-            boot.model_id.is_some()
-        } else if row.name == env_keys::ANTHROPIC_BASE_URL {
-            boot.model_base_url.is_some()
-        } else if row.name == env_keys::OTEL_EXPORTER_OTLP_ENDPOINT {
-            boot.otel_endpoint.is_some()
-        } else {
-            continue;
-        };
-        row.set_by_this_tier = Maybe::Known(set);
+        let producer = BOOT_ENV_TABLE
+            .iter()
+            .find(|(name, _)| *name == row.name)
+            .map(|(_, producer)| producer);
+        if matches!(producer, Some(BootEnvProducer::PerInvocation(_))) {
+            row.set_by_this_tier = Maybe::Known(false);
+        }
     }
 }
 
@@ -2952,7 +2921,14 @@ async fn run_deployed(tier: Tier, opts: AgentActionOpts) -> Result<InfoOutput> {
             "re-run `curie <tier> deploy` so the deployment names a version",
         )));
     };
-    let files = match client.bundle_files(&agent.id, &version_id).await {
+    // Two independent reads of the same agent: neither takes anything the other
+    // produces, so they go out together rather than one round trip after the
+    // other. The error handling below is unchanged, including the early return.
+    let (files, versions) = tokio::join!(
+        client.bundle_files(&agent.id, &version_id),
+        client.list_versions(&agent.id),
+    );
+    let files = match files {
         Ok(files) => files,
         Err(_) => {
             return Ok(InfoOutput::Report(deployed_gap(
@@ -2972,9 +2948,7 @@ async fn run_deployed(tier: Tier, opts: AgentActionOpts) -> Result<InfoOutput> {
 
     // Best effort: a version listing that fails costs the label and the content
     // hash, never the pass.
-    let version = client
-        .list_versions(&agent.id)
-        .await
+    let version = versions
         .unwrap_or_default()
         .into_iter()
         .find(|v| v.id == version_id);

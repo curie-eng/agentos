@@ -318,23 +318,19 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     for entry in std::fs::read_dir(dir).expect("read bundle dir") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
-        let name = entry.file_name();
+        let rel = path.strip_prefix(root).expect("path under root");
         // `bundle::pack_tar_gz` skips these, so a stored bundle never carries
         // them; a deployed view that included them would not be the same data.
-        if matches!(
-            name.to_string_lossy().as_ref(),
-            ".git" | ".curie" | ".venv" | "node_modules" | "__pycache__"
-        ) {
+        // Asked of the packer's own type rather than re-typed here: a hand-typed
+        // copy of the name list is the mirror this helper's parity claim rests
+        // on, and it had already drifted to a strict subset.
+        if curie::bundle::Exclusions::builtin().is_excluded(rel) {
             continue;
         }
+        let rel = rel.to_string_lossy().replace('\\', "/");
         if entry.file_type().expect("file type").is_dir() {
             collect_files(root, &path, out);
         } else if let Ok(content) = std::fs::read_to_string(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .expect("path under root")
-                .to_string_lossy()
-                .replace('\\', "/");
             out.push((rel, content));
         }
     }
@@ -857,8 +853,7 @@ fn the_mcp_pointer_form_is_diagnosed_without_echoing_the_pointer() {
     // Non-vacuous: the fixture must actually reach this rejection.
     let diag = diagnostic(&v, "mcp.declared_pointer");
 
-    let combined =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let combined = output_text(&out);
     assert!(
         !combined.contains(SENTINEL_URL),
         "the pointer string is bundle content and can carry a credential in its \
@@ -892,8 +887,7 @@ fn info_reports_a_secret_by_name_without_its_value() {
     let out = run_skill_info(fx.path(), &[], &[(PAT_NAME, PAT_SENTINEL)]);
     assert_exit(&out, 0, "skill info with the credential exported");
 
-    let combined =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let combined = output_text(&out);
     assert!(
         !combined.contains(PAT_SENTINEL),
         "the exported value must never be echoed\n{combined}"
@@ -1965,8 +1959,7 @@ fn a_symlinked_curieignore_is_a_diagnostic_not_a_crash() {
     );
 
     // The linked file's bytes reach neither stream.
-    let combined =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let combined = output_text(&out);
     assert!(
         !combined.contains(LINKED_CONTENT),
         "the symlink target's CONTENT reached the output; a diagnostic names the \
