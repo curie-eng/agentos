@@ -1257,7 +1257,7 @@
             },
             {
               "global": false,
-              "help": "Not available at this tier: the MCP load probe boots a runner container mounting a bundle DIRECTORY on this machine (`curie_runner.check`), and a deployed bundle exists only as stored files in the platform, with no directory here to mount; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean",
+              "help": "Not available at this tier: the MCP load probe boots a runner container against a bundle DIRECTORY (`curie_runner.check`), and this CLI does not yet write a deployed bundle's stored files out to a directory to probe; the bytes themselves are reachable over the API, so this is a step this CLI has not built rather than something the tier makes impossible; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean; probing a deployed bundle directly is a tracked follow-up (materialize `ApiClient::bundle_files` into a temp directory and hand it to `run_check_report`)",
               "id": "check_mcp",
               "long": "check-mcp",
               "positional": false,
@@ -2986,7 +2986,7 @@
             },
             {
               "global": false,
-              "help": "Not available at this tier: the MCP load probe boots a runner container mounting a bundle DIRECTORY on this machine (`curie_runner.check`), and a deployed bundle exists only as stored files in the platform, with no directory here to mount; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean",
+              "help": "Not available at this tier: the MCP load probe boots a runner container against a bundle DIRECTORY (`curie_runner.check`), and this CLI does not yet write a deployed bundle's stored files out to a directory to probe; the bytes themselves are reachable over the API, so this is a step this CLI has not built rather than something the tier makes impossible; run `curie skill info --plugin-dir <dir> --check-mcp` (or `curie skill check`) against the bundle source, then deploy the bundle that probed clean; probing a deployed bundle directly is a tracked follow-up (materialize `ApiClient::bundle_files` into a temp directory and hand it to `run_check_report`)",
               "id": "check_mcp",
               "long": "check-mcp",
               "positional": false,

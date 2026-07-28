@@ -26,6 +26,18 @@
 //! `.curie/runner.json` runner state, which deployed tier asked) is layered on
 //! by [`run`] after the pass, never inside it.
 //!
+//! ## A deployed view is a SUBSET of the bundle, and says so
+//!
+//! The platform serves a stored bundle's text files through an ALLOWLIST
+//! (`apps/api`'s `_collect_text_files`): the two manifest locations,
+//! `evals/cases.json`, and `skills/**/SKILL.md`. Nothing else is in it, so a
+//! deployed view carries no `.mcp.json` no matter what the bundle contains. The
+//! pass therefore never reads "absent from the view" as "absent from the
+//! bundle" for a path the view could not have carried; it reports the weaker,
+//! true claim (the file was never shown to this CLI) and sends the fact
+//! unresolved. `artifacts[].exists` means "present in the file view THIS report
+//! read", which is why the same row can be `false` here and `true` at `skill`.
+//!
 //! ## Two sentinels, never an omission and never an empty collection
 //!
 //! - [`Unavailable`] (`{available:false, reason, where}`) -- the concept has no
@@ -57,6 +69,11 @@
 //! names, counts, booleans and paths. MCP servers collapse to
 //! [`commands::DeclaredServer`]'s already-reviewed four fields plus a `load`
 //! status, and there is no `content` field anywhere in the contract.
+//!
+//! The inventory being content-free is only half of it: a `diagnostics` entry
+//! describes a bundle DEFECT, and every upstream producer of that text renders
+//! the offending value into its own message. So every diagnostic string is
+//! built through [`redact`] -- see that module for the rule and the reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -85,23 +102,6 @@ const MCP_FILE: &str = ".mcp.json";
 const EVAL_SUITE: &str = "evals/cases.json";
 /// The bundle-root-relative skills tree.
 const SKILLS_DIR: &str = "skills";
-/// The harness primer `curie init` drops at the bundle root.
-const AGENTS_MD: &str = "AGENTS.md";
-
-/// Entry names never packed into a stored bundle, so a disk view that carried
-/// them would not be the same data a deployed view sees. Mirrors
-/// `bundle::EXCLUDED_NAMES`, which is what `pack_tar_gz` actually applies.
-const EXCLUDED_NAMES: &[&str] = &[
-    ".curieignore",
-    ".curie",
-    ".git",
-    ".venv",
-    "venv",
-    "node_modules",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-];
 
 /// Frontmatter keys that LOOK like the tool grant and are silently ignored by
 /// the loader. Mirrors `plugin_format`'s `_CONFUSABLE_TOOLS_KEYS`: a bundle
@@ -274,6 +274,82 @@ impl From<Diag> for Diagnostic {
             looked_in: d.looked_in,
             reason: d.reason,
             fix: d.fix,
+        }
+    }
+}
+
+/// The one place an untrusted error becomes payload text.
+///
+/// A bundle defect is a `diagnostics` entry at exit 0 on stdout, in the command
+/// an agent is told to run before reporting success and to paste into a
+/// transcript, a CI log or an issue comment. Every upstream producer of that
+/// text -- `serde_json`, `jsonschema`, the probe container, the platform API --
+/// renders the OFFENDING VALUE into its own message, so a token mistyped into a
+/// manifest field, an eval suite or an MCP block would be echoed straight back
+/// through a `reason`. Collapsing an MCP row to four fields buys nothing if the
+/// diagnostic beside it reprints the same `env` block verbatim.
+///
+/// The rule every helper here implements: a diagnostic says WHAT was wrong and
+/// WHERE -- a JSON pointer, a type name, a line and column, an array index --
+/// and never WHAT THE CONTENT WAS. A pointer is also more useful to an agent
+/// than the echoed text it replaces.
+///
+/// Two things this module deliberately does not do. It never formats an
+/// untrusted error's `Display` (that is the echo itself), and it never scrubs a
+/// finished string for secret-looking substrings -- a denylist over
+/// attacker-shaped text is not a boundary. A new diagnostic builds its `reason`
+/// from these helpers plus its own static prose; interpolating an upstream error
+/// into one is the defect this module exists to make unnecessary.
+pub(crate) mod redact {
+    /// A JSON parse failure as its POSITION only. Serde's syntax-error catalogue
+    /// happens not to quote the source span today, but a payload string must not
+    /// rest on that; the line and column are the whole useful part anyway.
+    pub(crate) fn json_syntax(err: &serde_json::Error) -> String {
+        format!(
+            "a JSON syntax error at line {}, column {}",
+            err.line(),
+            err.column()
+        )
+    }
+
+    /// The JSON type of a value, named for "found X, expected Y" prose. Types
+    /// are derived facts; the value they describe never leaves this function.
+    pub(crate) fn json_type(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "a boolean",
+            serde_json::Value::Number(_) => "a number",
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            serde_json::Value::Object(_) => "an object",
+        }
+    }
+
+    /// One `jsonschema` violation as its two LOCATIONS: where in the instance,
+    /// and which constraint of the committed schema it failed.
+    ///
+    /// `ValidationError`'s `Display` serializes the failing instance into the
+    /// message -- `PluginManifest.mcpServers` is `anyOf [string, object, null]`,
+    /// so declaring servers as an array (a routine authoring mistake) makes it
+    /// print the whole array including any `env` block inside it. Both
+    /// `Location`s are structural: property names and array indices on the
+    /// instance side, the committed schema's own path on the other.
+    pub(crate) fn schema_violation(err: &jsonschema::ValidationError<'_>) -> String {
+        format!(
+            "the value at {} does not satisfy the schema constraint at {}",
+            pointer(err.instance_path()),
+            pointer(err.schema_path())
+        )
+    }
+
+    /// Render a JSON pointer, naming the empty pointer rather than emitting the
+    /// empty string into the middle of a sentence.
+    fn pointer(location: impl std::fmt::Display) -> String {
+        let rendered = location.to_string();
+        if rendered.is_empty() {
+            "the document root".to_string()
+        } else {
+            rendered
         }
     }
 }
@@ -524,6 +600,13 @@ pub struct BundleView {
     /// `bundle::pack_tar_gz` refuses to pack a symlink rather than dereference
     /// it, so a stored bundle contains none by construction.
     symlinks: BTreeSet<String>,
+    /// Why this bundle's `.curieignore` could not be applied, if it could not.
+    /// A bundle-CONTENT defect, so it rides the view to [`discover`] and comes
+    /// out as a diagnostic at exit 0 rather than failing the populator: a
+    /// caller who must first learn WHAT is wrong cannot be handed an error
+    /// instead of the report. Always `None` on a deployed view, which was
+    /// packed through a clean ignore file by construction.
+    ignore_defect: Option<crate::bundle::IgnoreDefect>,
 }
 
 impl BundleView {
@@ -550,9 +633,17 @@ impl BundleView {
                     .with_fix("point --plugin-dir at a bundle directory, not a file"),
             ));
         }
+        // The packer's own exclusion set, not a copy of one of its inputs: the
+        // built-in names PLUS whatever this bundle's `.curieignore` declares.
+        // Reading the ignore file here is what keeps the disk view describing
+        // the same bundle `pack_tar_gz` would ship. A `.curieignore` the packer
+        // would refuse comes back as a defect rather than an error, and is
+        // reported as a diagnostic below; the walk falls back to the built-in
+        // names, exactly what the packer applies before reading any ignore file.
+        let (exclusions, ignore_defect) = crate::bundle::Exclusions::resolve(&root)?;
         let mut files = BTreeMap::new();
         let mut symlinks = BTreeSet::new();
-        walk_disk(&root, &root, &mut files, &mut symlinks)?;
+        walk_disk(&root, &root, &exclusions, &mut files, &mut symlinks)?;
         if !MANIFEST_LOCATIONS
             .iter()
             .any(|loc| files.contains_key(*loc))
@@ -568,6 +659,7 @@ impl BundleView {
             origin: BundleOrigin::Disk { root },
             files,
             symlinks,
+            ignore_defect,
         })
     }
 
@@ -591,6 +683,7 @@ impl BundleView {
             origin,
             files: map,
             symlinks: BTreeSet::new(),
+            ignore_defect: None,
         }
     }
 
@@ -625,14 +718,18 @@ fn normalize_path(raw: &str) -> String {
     s
 }
 
-/// Is any segment of `key` a name a stored bundle never carries?
+/// Would the packer have dropped `key`? A deployed view has no directory to
+/// read a `.curieignore` from, and its bytes were already packed through one,
+/// so only the built-in names remain to re-assert. Asks
+/// `bundle::Exclusions` rather than mirroring its name list.
 fn excluded(key: &str) -> bool {
-    key.split('/').any(|seg| EXCLUDED_NAMES.contains(&seg))
+    crate::bundle::Exclusions::builtin().excludes_any_ancestor(Path::new(key))
 }
 
 fn walk_disk(
     root: &Path,
     dir: &Path,
+    exclusions: &crate::bundle::Exclusions,
     files: &mut BTreeMap<String, String>,
     symlinks: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -641,14 +738,17 @@ fn walk_disk(
     for entry in entries {
         let entry = entry.map_err(|err| anyhow::anyhow!("reading {}: {err}", dir.display()))?;
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if EXCLUDED_NAMES.contains(&name.as_str()) {
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        // Ordered exactly as `bundle::append_dir` orders it: exclusion runs
+        // before the symlink check, so an excluded entry that is itself a link
+        // is skipped rather than recorded. Matching on `rel` (not the bare
+        // name) is what lets a `.curieignore` path pattern land.
+        if exclusions.is_excluded(rel) {
             continue;
         }
         let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let Ok(rel) = path.strip_prefix(root) else {
             continue;
         };
         let key = normalize_path(&rel.to_string_lossy());
@@ -659,7 +759,7 @@ fn walk_disk(
             continue;
         }
         if kind.is_dir() {
-            walk_disk(root, &path, files, symlinks)?;
+            walk_disk(root, &path, exclusions, files, symlinks)?;
         } else if let Ok(content) = std::fs::read_to_string(&path) {
             // A non-UTF-8 file is skipped exactly as the stored-bundle read
             // does; the deployed `BundleFile.content` is a String.
@@ -667,6 +767,38 @@ fn walk_disk(
         }
     }
     Ok(())
+}
+
+/// Report a `.curieignore` the packer would refuse.
+///
+/// Not a sentinel case: every row this report carries is still a true statement
+/// about the directory on disk, so blanking the inventory to `unresolved` would
+/// withhold facts the pass genuinely resolved. What is NOT true of such a bundle
+/// is that it corresponds to anything the platform could store, and that is
+/// exactly what this diagnostic says. It names the defect and its location only;
+/// no byte of the ignore file reaches the payload (see [`redact`]).
+fn ignore_file_diagnostic(defect: crate::bundle::IgnoreDefect) -> Diagnostic {
+    match defect {
+        crate::bundle::IgnoreDefect::Symlink => Diag {
+            code: "artifact.symlink",
+            kind: DiagnosticKind::Artifact,
+            candidate: crate::bundle::IGNORE_FILE.to_string(),
+            looked_for: "a regular .curieignore file at the bundle root, declaring this bundle's \
+                 own packing exclusions",
+            looked_in: vec![crate::bundle::IGNORE_FILE.to_string()],
+            reason: "this .curieignore is a symlink, and `bundle::pack_tar_gz` refuses to pack a \
+                 bundle whose ignore file is a link out of the bundle root, so the inventory \
+                 below was built from the built-in exclusions alone and describes a directory \
+                 the platform cannot store"
+                .to_string(),
+            fix: Some(
+                "replace the symlink with a regular .curieignore file inside the bundle, or \
+                 delete it"
+                    .to_string(),
+            ),
+        }
+        .into(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +810,10 @@ fn walk_disk(
 /// `diagnostics` entry mean the same thing everywhere.
 pub fn discover(view: &BundleView) -> InfoReport {
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    let deployed = view.origin().is_deployed();
+
+    if let Some(defect) = view.ignore_defect {
+        diagnostics.push(ignore_file_diagnostic(defect));
+    }
 
     let manifest = resolve_manifest(view, &mut diagnostics);
     let bundle = build_bundle(view, manifest.as_ref(), &mut diagnostics);
@@ -689,32 +824,10 @@ pub fn discover(view: &BundleView) -> InfoReport {
     let approval_gates = discover_gates(manifest.as_ref(), &mut diagnostics);
     let evals = discover_evals(view, &mut diagnostics);
 
-    if deployed && manifest.is_some() {
-        // The ONE documented by-construction difference between the two
-        // populators, stated rather than papered over: a tar of files carries no
-        // empty directory, so a `skills/<dir>/` that was empty at pack time is
-        // invisible here while the disk pass rejects it with `skill.no_skill_md`.
-        diagnostics.push(
-            Diag {
-                code: "deployed.empty_dir_not_visible",
-                kind: DiagnosticKind::Deployed,
-                candidate: "the stored bundle's directory entries".to_string(),
-                looked_for: "an empty skills/<dir>/ with no SKILL.md",
-                looked_in: vec![SKILLS_DIR.to_string()],
-                reason:
-                    "a stored bundle is a list of FILES, so a directory that was empty at pack \
-                     time is invisible here; empty-directory rejections cannot be reported from \
-                     a deployed bundle and this report does not claim otherwise"
-                        .to_string(),
-                fix: Some(
-                    "run `curie skill info --plugin-dir <dir>` against the bundle source to see \
-                     empty-directory rejections"
-                        .to_string(),
-                ),
-            }
-            .into(),
-        );
-    }
+    // The `boot_env` rows are a SUBSET of the declared contract at every tier,
+    // so the boundary is stated on every report rather than left to be inferred
+    // from an absent row.
+    diagnostics.push(boot_env_scope_diagnostic());
 
     let mut report = InfoReport {
         info: INFO_FAMILY.to_string(),
@@ -730,7 +843,7 @@ pub fn discover(view: &BundleView) -> InfoReport {
         channel: channel_for(view.origin()),
         comms: comms_for(view.origin()),
         model: model_for(view.origin()),
-        artifacts: artifact_rows(view, &mut diagnostics),
+        artifacts: artifact_rows(view),
         diagnostics,
     };
     sort_diagnostics(&mut report.diagnostics);
@@ -789,9 +902,10 @@ fn resolve_manifest(
                     looked_for: "a plugin manifest that parses as JSON",
                     looked_in: vec![location.to_string()],
                     reason: format!(
-                        "{location} is present but is not valid JSON ({err}); the runner's \
+                        "{location} is present but is not valid JSON ({}); the runner's \
                          manifest read fails on it, so every fact the manifest is the sole \
-                         source of is unresolved rather than empty"
+                         source of is unresolved rather than empty",
+                        redact::json_syntax(&err)
                     ),
                     fix: Some(format!("fix the JSON syntax in {location}")),
                 }
@@ -934,7 +1048,9 @@ fn discover_skills(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Mayb
         .filter(|p| p.starts_with(prefix.as_str()))
         .collect();
 
-    if under.is_empty() && !view.paths().any(|p| p == SKILLS_DIR) {
+    // No second clause on `paths()`: a view key is only ever a FILE, from either
+    // populator, so "is `skills` itself a key" is dead by construction.
+    if under.is_empty() {
         diagnostics.push(
             Diag {
                 code: "skills.dir_absent",
@@ -942,9 +1058,12 @@ fn discover_skills(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Mayb
                 candidate: SKILLS_DIR.to_string(),
                 looked_for: "a skills/ tree carrying at least one SKILL.md",
                 looked_in: vec![SKILLS_DIR.to_string()],
-                reason: "this bundle has no skills/ tree at all, so it registers no skill; the \
-                     plugin-format validator returns silently in this case, which makes this \
-                     the only surface that says so"
+                reason: "this bundle carries no skills/ tree holding any FILE, so it registers no \
+                     skill; the plugin-format validator returns silently in this case, which \
+                     makes this the only surface that says so. An entirely empty skills/<dir>/ \
+                     is invisible to this pass from a disk walk and from a stored bundle alike \
+                     -- neither records directory entries, only files -- so this says nothing \
+                     about empty directories either way"
                     .to_string(),
                 fix: Some(
                     "add skills/<name>/SKILL.md, or run `curie init <name>` to scaffold one"
@@ -1248,9 +1367,10 @@ fn discover_mcp(
                         looked_for: "an MCP declaration that parses as JSON",
                         looked_in: vec![MCP_FILE.to_string()],
                         reason: format!(
-                            "{MCP_FILE} is present but is not valid JSON ({err}); the declared \
+                            "{MCP_FILE} is present but is not valid JSON ({}); the declared \
                              servers cannot be resolved, which is NOT the same fact as declaring \
-                             none"
+                             none",
+                            redact::json_syntax(&err)
                         ),
                         fix: Some(format!("fix the JSON syntax in {MCP_FILE}")),
                     }
@@ -1274,6 +1394,69 @@ fn discover_mcp(
         }
     }
 
+    // A manifest that is present but did not parse is the same unknown
+    // `discover_secrets` already reports: it is the only remaining source of an
+    // `mcpServers` declaration, and it could not be read. Answering `[]` here
+    // would assert the manifest names no server, which nothing established.
+    if let Some(unparsed) = manifest.filter(|m| m.value.is_none()) {
+        let reason = format!(
+            "there is no readable {MCP_FILE} in this bundle view, so {} is the only remaining \
+             source of an `mcpServers` declaration, and it is not valid JSON. Whether this \
+             bundle declares any server is unknown, which is NOT the same fact as declaring none",
+            unparsed.location
+        );
+        diagnostics.push(
+            Diag {
+                code: "mcp.manifest_unreadable",
+                kind: DiagnosticKind::Mcp,
+                candidate: unparsed.location.to_string(),
+                looked_for: "an `mcpServers` declaration in the only remaining source",
+                looked_in: vec![
+                    MCP_FILE.to_string(),
+                    format!("{}#/mcpServers", unparsed.location),
+                ],
+                reason: reason.clone(),
+                fix: Some(format!("fix the JSON syntax in {}", unparsed.location)),
+            }
+            .into(),
+        );
+        return Maybe::unresolved(reason);
+    }
+
+    // A deployed view is an allowlist that has never carried `.mcp.json` (see
+    // the module doc). "Not in the view" is all this CLI was shown, so it says
+    // exactly that rather than `mcp.no_declaration`'s "there is no .mcp.json".
+    if view.origin().is_deployed() {
+        let reason = format!(
+            "a deployed bundle is read through the platform's stored-TEXT-FILE view, which \
+             carries the plugin manifest, {EVAL_SUITE} and {SKILLS_DIR}/**/SKILL.md and nothing \
+             else, so {MCP_FILE} was never shown to this CLI whether or not the bundle ships \
+             one. No `mcpServers` fallback was readable from the plugin manifest either, so \
+             whether this bundle declares any server is unknown here. That is weaker than the \
+             skill tier's `mcp.declared_none`, which is a file that WAS read"
+        );
+        diagnostics.push(
+            Diag {
+                code: "mcp.not_in_bundle_view",
+                kind: DiagnosticKind::Mcp,
+                candidate: MCP_FILE.to_string(),
+                looked_for: "an mcpServers declaration",
+                looked_in: vec![
+                    format!("the deployed bundle's stored text files (no {MCP_FILE} entry)"),
+                    format!("{}#/mcpServers", MANIFEST_LOCATIONS[0]),
+                ],
+                reason: reason.clone(),
+                fix: Some(format!(
+                    "run `curie skill info --plugin-dir <dir>` against the bundle source to read \
+                     {MCP_FILE}, or declare the servers under the manifest's `mcpServers`, which \
+                     the deployed view DOES carry"
+                )),
+            }
+            .into(),
+        );
+        return Maybe::unresolved(reason);
+    }
+
     diagnostics.push(
         Diag {
             code: "mcp.no_declaration",
@@ -1284,9 +1467,11 @@ fn discover_mcp(
                 MCP_FILE.to_string(),
                 format!("{}#/mcpServers", MANIFEST_LOCATIONS[0]),
             ],
-            reason: "no MCP declaration was found at all: there is no .mcp.json and the manifest \
-                 names no `mcpServers`. The empty server list below means \"nothing was \
-                 declared anywhere\", not \"a declaration was read and named none\""
+            reason: "no MCP declaration was found at all: this bundle directory carries no \
+                 .mcp.json and its manifest, which WAS read, names no `mcpServers`. The empty \
+                 server list below means \"nothing was declared anywhere\", not \"a declaration \
+                 was read and named none\" -- and not the deployed tiers' weaker \"the file was \
+                 never shown to this CLI\""
                 .to_string(),
             fix: Some(format!(
                 "add {MCP_FILE} with an `mcpServers` object if this bundle should load MCP servers"
@@ -1305,7 +1490,7 @@ fn mcp_from_declaration(
 ) -> Maybe<Vec<McpRow>> {
     let declared = value.get("mcpServers");
 
-    if let Some(pointer) = declared.and_then(serde_json::Value::as_str) {
+    if declared.is_some_and(serde_json::Value::is_string) {
         diagnostics.push(
             Diag {
                 code: "mcp.declared_pointer",
@@ -1313,11 +1498,14 @@ fn mcp_from_declaration(
                 candidate: location.to_string(),
                 looked_for: "an `mcpServers` OBJECT keyed by server name",
                 looked_in: vec![format!("{location}#/mcpServers")],
-                reason: format!(
-                    "`mcpServers` is declared as the path string {pointer:?} rather than an \
-                     object; the loader ignores it and the servers never register, while the \
-                     bundle looks correct"
-                ),
+                // The declared string itself stays out of the payload: it is
+                // bundle-authored text in a field whose contract is "names,
+                // counts, booleans and paths", and a URL written here carries
+                // its own userinfo. `looked_in` already names the location.
+                reason: "`mcpServers` is declared as a path string rather than an object; the \
+                         loader ignores it and the servers never register, while the bundle \
+                         looks correct"
+                    .to_string(),
                 fix: Some(
                     "inline the servers as an `mcpServers` object keyed by server name".to_string(),
                 ),
@@ -1511,6 +1699,11 @@ fn discover_gates(
     // The fail-closed parse the runner itself performs (#520), reused rather
     // than forked. Its Err is a USAGE error for `skill approvals`; here it is a
     // diagnosis, because a bundle defect is never this verb's exit code.
+    //
+    // Forwarding that error's text is safe only because its schema half is
+    // redacted at the source (`commands::validate_against_plugin_format_schema`
+    // renders locations, not the failing instance); the alternative was to
+    // rebuild the same prose here and let the two drift.
     match commands::parse_manifest_gates(&manifest.body, manifest.location) {
         Ok(gates) => Maybe::Known(
             gates
@@ -1573,7 +1766,10 @@ fn discover_evals(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Maybe
         Err(err) => {
             return evals_invalid(
                 diagnostics,
-                format!("{EVAL_SUITE} is not valid JSON ({err})"),
+                format!(
+                    "{EVAL_SUITE} is not valid JSON ({})",
+                    redact::json_syntax(&err)
+                ),
             )
         }
     };
@@ -1599,19 +1795,26 @@ fn discover_evals(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Maybe
         return Maybe::unresolved(reason);
     }
 
-    let suite: crate::evals::EvalSuite = match serde_json::from_value(value) {
+    // Borrowed rather than moved so the shape locator below can read the same
+    // parsed value. A TYPED serde failure is the one deserialization in this
+    // module whose message quotes its input (`invalid type: string "<token>",
+    // expected a sequence`), so it is answered by a locator, never forwarded.
+    let suite: crate::evals::EvalSuite = match serde::Deserialize::deserialize(&value) {
         Ok(suite) => suite,
-        Err(err) => {
+        Err(_) => {
             return evals_invalid(
                 diagnostics,
-                format!("{EVAL_SUITE} is not a valid eval suite ({err})"),
+                format!(
+                    "{EVAL_SUITE} parses as JSON but does not match the eval-suite shape: {}",
+                    eval_shape_defect(&value)
+                ),
             )
         }
     };
     // The identical content-based validation `load_suite` delegates to, so both
     // tiers apply one suite rule rather than two.
-    if let Err(err) = crate::evals::validate_suite(&suite.name, &suite.cases) {
-        return evals_invalid(diagnostics, format!("{err:#}"));
+    if crate::evals::validate_suite(&suite.name, &suite.cases).is_err() {
+        return evals_invalid(diagnostics, eval_grader_defect(&suite));
     }
 
     Maybe::Known(EvalsInfo {
@@ -1619,6 +1822,73 @@ fn discover_evals(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Maybe
         suite_name: suite.name,
         case_count: suite.cases.len() as u64,
     })
+}
+
+/// Say WHERE a parsed suite departs from the eval-suite shape, and what TYPE
+/// sits there, never what the value was.
+///
+/// `EvalSuite`'s own deserialization stays the authority on whether the suite is
+/// valid; this only locates the defect it found. It does that by re-running the
+/// SAME types over narrower slices rather than by hand-mirroring their fields,
+/// so it cannot drift into disagreeing with them -- at worst it stops localizing
+/// and falls through to the generic tail.
+fn eval_shape_defect(value: &serde_json::Value) -> String {
+    let Some(object) = value.as_object() else {
+        return format!(
+            "the suite is {} rather than an object with `name` and `cases`",
+            redact::json_type(value)
+        );
+    };
+    match object.get("name") {
+        None => return "`name` is missing".to_string(),
+        Some(name) if !name.is_string() => {
+            return format!("`name` is {} rather than a string", redact::json_type(name))
+        }
+        Some(_) => {}
+    }
+    let Some(cases) = object.get("cases") else {
+        return "`cases` is missing".to_string();
+    };
+    let Some(cases) = cases.as_array() else {
+        return format!(
+            "`cases` is {} rather than an array of case objects",
+            redact::json_type(cases)
+        );
+    };
+    for (index, case) in cases.iter().enumerate() {
+        if <crate::evals::EvalCase as serde::Deserialize>::deserialize(case).is_err() {
+            return format!(
+                "`cases[{index}]` does not match the eval-case shape (`id` and `input` are \
+                 strings, and `grader` is an object with a declared `kind` and a string \
+                 `expected`)"
+            );
+        }
+    }
+    "the suite object does not match the eval-suite shape".to_string()
+}
+
+/// Say WHICH case carries a grader the local runner refuses, without printing
+/// the grader itself: `validate_suite`'s message interpolates the raw
+/// `grader.expected` pattern read straight out of the bundle. Re-running that
+/// same function per case is what locates the offender, so the rule stays in one
+/// place and this cannot disagree with it.
+fn eval_grader_defect(suite: &crate::evals::EvalSuite) -> String {
+    if suite.cases.is_empty() {
+        return format!(
+            "{EVAL_SUITE} declares zero eval cases, so the local grader has nothing to run"
+        );
+    }
+    match suite.cases.iter().position(|case| {
+        crate::evals::validate_suite(&suite.name, std::slice::from_ref(case)).is_err()
+    }) {
+        Some(index) => format!(
+            "{EVAL_SUITE} declares a grader at `cases[{index}]` the local runner refuses: an \
+             invalid regex pattern, or a `tool_called` grader with an empty tool name. The \
+             pattern is not reproduced here; `curie skill eval` reports it in full on the error \
+             channel"
+        ),
+        None => format!("{EVAL_SUITE} does not pass eval-suite validation"),
+    }
 }
 
 fn evals_invalid(diagnostics: &mut Vec<Diagnostic>, reason: String) -> Maybe<EvalsInfo> {
@@ -1710,28 +1980,78 @@ fn model_for(origin: &BundleOrigin) -> Maybe<ModelInfo> {
     }
 }
 
+/// Who writes a boot-env key at the `skill` tier, mirroring the ONE producer:
+/// `docker::StartSpec::run_args`.
+enum BootEnvProducer {
+    /// `skill up` writes it on every invocation (`run_args`'s unconditional
+    /// block).
+    Always,
+    /// `run_args` writes it only inside a conditional whose input is an
+    /// invocation FLAG. The pure pass cannot know a future invocation's flags,
+    /// so it answers `unresolved` and [`layer_boot_env`] fills it from the SAME
+    /// resolution the `model` block reports -- which is what stops the two
+    /// blocks contradicting each other in one payload.
+    PerInvocation(&'static str),
+    /// `skill up` never writes it, whatever the flags.
+    Never(&'static str),
+}
+
 /// The boot-env keys this report describes, with who writes each. Names come
 /// from the generated `env_keys` constants so a renamed key cannot drift.
+///
+/// The set is deliberately the keys the `skill up` boot path DECIDES, not the
+/// whole declared `BootEnv` contract; the rest are provisioned by the platform
+/// and are named as out of scope by [`boot_env_scope_diagnostic`] rather than
+/// silently omitted.
 fn boot_env_rows(origin: &BundleOrigin) -> Vec<BootEnvRow> {
-    // (key, set by `skill up`, note when it is not)
-    let rows: [(&str, bool, Option<&str>); 10] = [
-        (env_keys::CURIE_PLUGIN_DIR, true, None),
-        (env_keys::CURIE_SESSION_ID, true, None),
-        (env_keys::CURIE_SANDBOX_ID, true, None),
-        (env_keys::CURIE_BUDGET, true, None),
-        (env_keys::CURIE_FAKE_MODEL, true, None),
-        (env_keys::CURIE_MODEL, true, None),
-        (env_keys::ANTHROPIC_BASE_URL, true, None),
-        (env_keys::CURIE_APPROVAL_REQUIRED_TOOLS, true, None),
+    let rows: [(&str, BootEnvProducer); 11] = [
+        (env_keys::CURIE_PLUGIN_DIR, BootEnvProducer::Always),
+        (env_keys::CURIE_SESSION_ID, BootEnvProducer::Always),
+        (env_keys::CURIE_SANDBOX_ID, BootEnvProducer::Always),
+        (env_keys::CURIE_BUDGET, BootEnvProducer::Always),
+        (
+            env_keys::CURIE_FAKE_MODEL,
+            BootEnvProducer::PerInvocation(
+                "`skill up` writes this only under `--fake-model` (and not when `--local-model` \
+                 overrides it); it is never read from this shell",
+            ),
+        ),
+        (
+            env_keys::CURIE_MODEL,
+            BootEnvProducer::PerInvocation(
+                "`skill up` writes this only under `--model <id>`, which has no environment \
+                 default; a plain run leaves the SDK default",
+            ),
+        ),
+        (
+            env_keys::ANTHROPIC_BASE_URL,
+            BootEnvProducer::PerInvocation(
+                "`skill up` writes this only under `--local-model`, which points the runner at \
+                 the Ollama container it started",
+            ),
+        ),
+        (
+            env_keys::OTEL_EXPORTER_OTLP_ENDPOINT,
+            BootEnvProducer::PerInvocation(
+                "`skill up` writes this only under `--otel-endpoint <url>`; without it the \
+                 runner exports no traces",
+            ),
+        ),
+        (
+            env_keys::CURIE_APPROVAL_REQUIRED_TOOLS,
+            BootEnvProducer::Never(
+                "a plain `curie skill up` does not forward this: the container gets it only when \
+                 the invocation adds `--secret CURIE_APPROVAL_REQUIRED_TOOLS` with the value in \
+                 this shell or the vault, so it is an override the bundle cannot declare",
+            ),
+        ),
         (
             env_keys::CURIE_MEMORY_REF,
-            false,
-            Some(commands::MEMORY_REASON),
+            BootEnvProducer::Never(commands::MEMORY_REASON),
         ),
         (
             env_keys::CURIE_HISTORY_REF,
-            false,
-            Some(
+            BootEnvProducer::Never(
                 "`skill up` provisions no history namespace: the runner it boots keeps a turn's \
                  history in process and nothing persists it",
             ),
@@ -1740,32 +2060,79 @@ fn boot_env_rows(origin: &BundleOrigin) -> Vec<BootEnvRow> {
 
     let deployed = origin.is_deployed();
     rows.into_iter()
-        .map(|(name, set_by_skill_up, note)| BootEnvRow {
-            name: name.to_string(),
-            set_by_this_tier: if deployed {
-                Maybe::unavailable(
-                    "which producer writes a boot-env key at the deployed tiers is owned by the \
-                     worker and the chart (ADR-0049), and cannot be read from a stored bundle",
-                    "the chart values and the worker's sandbox configuration",
-                )
-            } else {
-                Maybe::Known(set_by_skill_up)
-            },
-            value_present: Maybe::unavailable(
-                "this CLI cannot read a running container's environment at any tier, so whether \
-                 the key holds a value is not observable from here",
-                "the runner container's own environment",
-            ),
-            note: if deployed {
-                None
-            } else {
-                note.map(str::to_string)
-            },
+        .map(|(name, producer)| {
+            let (set_by_this_tier, note) = match producer {
+                _ if deployed => (
+                    Maybe::unavailable(
+                        "which producer writes a boot-env key at the deployed tiers is owned by \
+                         the worker and the chart (ADR-0049), and cannot be read from a stored \
+                         bundle",
+                        "the chart values and the worker's sandbox configuration",
+                    ),
+                    None,
+                ),
+                BootEnvProducer::Always => (Maybe::Known(true), None),
+                BootEnvProducer::PerInvocation(note) => (
+                    Maybe::unresolved(format!(
+                        "whether `curie skill up` writes this key depends on the flags that \
+                         invocation passes, which the bundle pass does not know: {note}"
+                    )),
+                    Some(note.to_string()),
+                ),
+                BootEnvProducer::Never(note) => (Maybe::Known(false), Some(note.to_string())),
+            };
+            BootEnvRow {
+                name: name.to_string(),
+                set_by_this_tier,
+                value_present: Maybe::unavailable(
+                    "this CLI cannot read a running container's environment at any tier, so \
+                     whether the key holds a value is not observable from here",
+                    "the runner container's own environment",
+                ),
+                note,
+            }
         })
         .collect()
 }
 
-fn artifact_rows(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Vec<ArtifactRow> {
+/// State the BOUNDARY of the `boot_env` block rather than letting a declared key
+/// be absent from it. The frozen `BootEnv` contract carries keys this CLI has no
+/// say over (the state/history/memory tokens and URLs, the connector-secret key
+/// list, the turn caps, the runner port, the remaining `OTEL_*` pair), all
+/// provisioned platform-side; reporting only the ones `skill up` decides is
+/// fine, reporting them with no statement that the list is a subset is the
+/// verb's own lie-class one level down.
+fn boot_env_scope_diagnostic() -> Diagnostic {
+    Diag {
+        code: "boot_env.rows_scoped",
+        kind: DiagnosticKind::BootEnv,
+        candidate: "the declared BootEnv keys outside this report's rows".to_string(),
+        looked_for: "a producer this CLI can answer for",
+        looked_in: vec![
+            "the boot environment `curie skill up` writes".to_string(),
+            "the chart values and the worker's sandbox configuration".to_string(),
+        ],
+        reason: "the `boot_env` rows below are the keys the `curie skill up` boot path decides, \
+                 not the whole frozen BootEnv contract. Every other declared key (the state, \
+                 history and memory tokens and URLs, the connector-secret key list, the turn and \
+                 history caps, the runner port and the remaining OTEL_* pair) is provisioned \
+                 platform-side and is absent from the rows because this CLI cannot answer for \
+                 it, NOT because it is undeclared"
+            .to_string(),
+        fix: None,
+    }
+    .into()
+}
+
+/// The expected files of the bundle shape, present or not.
+///
+/// `exists` means "present in the FILE VIEW this report read", not "present in
+/// the bundle": a deployed view is served through an allowlist that has never
+/// carried `.mcp.json` (see the module doc), so `mcp_declaration.exists: false`
+/// there is a fact about the view. Each row's absence already has a dedicated
+/// `code` elsewhere in the pass, so no row emits an `artifact.*` diagnostic of
+/// its own.
+fn artifact_rows(view: &BundleView) -> Vec<ArtifactRow> {
     let manifest_path = MANIFEST_LOCATIONS
         .iter()
         .find(|loc| view.file(loc).is_some())
@@ -1773,7 +2140,7 @@ fn artifact_rows(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ar
         .unwrap_or(MANIFEST_LOCATIONS[0]);
     let has_skills = view.paths().any(|p| p.starts_with("skills/"));
 
-    let rows = vec![
+    vec![
         ArtifactRow {
             kind: "manifest".to_string(),
             path: manifest_path.to_string(),
@@ -1794,38 +2161,7 @@ fn artifact_rows(view: &BundleView, diagnostics: &mut Vec<Diagnostic>) -> Vec<Ar
             path: SKILLS_DIR.to_string(),
             exists: has_skills,
         },
-        ArtifactRow {
-            kind: "agents_md".to_string(),
-            path: AGENTS_MD.to_string(),
-            exists: view.file(AGENTS_MD).is_some(),
-        },
-    ];
-
-    // Only the harness primer gets an `artifact.*` diagnosis; every other row
-    // above already has a dedicated code, and restating it here would double
-    // every finding.
-    if view.file(AGENTS_MD).is_none() {
-        diagnostics.push(
-            Diag {
-                code: "artifact.absent",
-                kind: DiagnosticKind::Artifact,
-                candidate: AGENTS_MD.to_string(),
-                looked_for: "the root agent-instructions primer",
-                looked_in: vec![AGENTS_MD.to_string()],
-                reason: "this bundle ships no root AGENTS.md, so an agent working in it gets no \
-                     harness primer. Not a validation failure: the plugin format does not \
-                     require one, and `curie init` scaffolds it"
-                    .to_string(),
-                fix: Some(
-                    "add a root AGENTS.md, or run `curie init --adopt <dir>` to scaffold one"
-                        .to_string(),
-                ),
-            }
-            .into(),
-        );
-    }
-
-    rows
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -2006,7 +2342,12 @@ async fn run_skill(
     report.tier = Maybe::Known(Tier::Skill.as_str().to_string());
 
     layer_shell_secrets(&mut report);
-    layer_model(&mut report, &root);
+    // ONE resolution, two consumers: the `model` block and the conditional
+    // `boot_env` rows. Computing them separately is what let the two contradict
+    // each other in a single payload.
+    let boot = plain_skill_up_boot();
+    layer_model(&mut report, &root, &boot);
+    layer_boot_env(&mut report, &boot);
     layer_memory_note(&mut report);
     if check_mcp {
         probe_mcp(&mut report, &root, image, timeout_s).await;
@@ -2023,19 +2364,23 @@ fn layer_shell_secrets(report: &mut InfoReport) {
         return;
     };
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    for row in &mut secrets.declared {
-        if let Err(err) = crate::secrets::validate_name(&row.name) {
+    for (index, row) in secrets.declared.iter_mut().enumerate() {
+        if crate::secrets::validate_name(&row.name).is_err() {
+            // Positional, not quoted. This branch fires precisely when a
+            // `secrets[]` entry is not shaped like a name -- i.e. exactly when
+            // an author has pasted a VALUE there -- so reprinting the entry to
+            // explain the rejection would republish the thing it rejected.
             let reason = format!(
-                "the declared name {:?} is not a usable environment-variable name ({err:#}); \
-                 authoritative name validation, including the reserved boot-env list, runs \
-                 server-side in `plugin_format.validate_bundle` at deploy",
-                row.name
+                "the declared name at `secrets[{index}]` is not a usable environment-variable \
+                 name: it must be non-empty and match ^[A-Z_][A-Z0-9_]*$. Authoritative name \
+                 validation, including the reserved boot-env list, runs server-side in \
+                 `plugin_format.validate_bundle` at deploy"
             );
             diagnostics.push(
                 Diag {
                     code: "secret.name_invalid",
                     kind: DiagnosticKind::Secret,
-                    candidate: row.name.clone(),
+                    candidate: format!("secrets[{index}]"),
                     looked_for: "a declared secret name of the form ^[A-Z_][A-Z0-9_]*$",
                     looked_in: vec![format!("{}#/secrets", MANIFEST_LOCATIONS[0])],
                     reason: reason.clone(),
@@ -2118,22 +2463,70 @@ fn layer_shell_secrets(report: &mut InfoReport) {
     report.diagnostics.extend(diagnostics);
 }
 
-/// What a `skill up` from THIS shell would resolve, plus whatever runner is
-/// actually recorded for the bundle.
-fn layer_model(report: &mut InfoReport, root: &Path) {
-    let fake = commands::env_credential_present(env_keys::CURIE_FAKE_MODEL);
-    let base_url_override = commands::env_credential_present(env_keys::ANTHROPIC_BASE_URL);
+/// What a PLAIN `curie skill up` from this shell resolves: the one resolution
+/// that feeds both the `model` block and the conditional `boot_env` rows.
+///
+/// "Plain" is load-bearing and is stated in the payload's own `note`. Fake mode,
+/// the model id and the base-URL override are properties of an invocation's
+/// FLAGS (`--fake-model`, `--model`, `--local-model`, `--otel-endpoint`), none of
+/// which has an environment default (`cli/src/main.rs`). Reading them back out
+/// of this shell's `CURIE_FAKE_MODEL` / `CURIE_MODEL` / `ANTHROPIC_BASE_URL` --
+/// which is what an earlier draft did -- is a category error: those are keys the
+/// CLI WRITES INTO the container (`docker::StartSpec::run_args`), never keys it
+/// reads to decide, so an exported `CURIE_FAKE_MODEL=0` reported `fake_model`
+/// for a run that would have gone live.
+struct PlainSkillUpBoot {
+    fake_model: bool,
+    model_id: Option<String>,
+    model_base_url: Option<String>,
+    otel_endpoint: Option<String>,
+    /// A BYO credential blob is present (in this shell or the vault), whatever
+    /// its value.
+    byo: Option<String>,
+    /// The one credential NAME `select_passthrough_env` would forward.
+    credential_name: Option<String>,
+    /// `shell_env`, `curie_vault`, `env_file`, or `none`.
+    credential_source: &'static str,
+}
+
+fn plain_skill_up_boot() -> PlainSkillUpBoot {
+    // Every one of these is what `commands::up` derives for a no-flag run:
+    // `fake_model = opts.local_model.is_none() && opts.fake_model`,
+    // `base_url_override = model_base_url.is_some()` (set only by
+    // `--local-model`), `model` from `--model`, `otel_endpoint` from
+    // `--otel-endpoint`.
+    let fake_model = false;
+    let model_id: Option<String> = None;
+    let model_base_url: Option<String> = None;
+    let otel_endpoint: Option<String> = None;
+
+    // `commands::up` resolves a credential from the shell OR the vault (it
+    // extends `docker_env` with `load_model_credentials_from_secret_store`
+    // before calling `ambient_present_for`). Consulting only the shell reported
+    // `unauthenticated` for a bundle that boots live off `curie secrets set`,
+    // and made the `curie_vault` arm below unreachable. `--env-file` is the
+    // third source and is invocation-only, so it is named in the note instead.
+    let ambient_present = |name: &str| {
+        commands::env_credential_present(name) || crate::secrets::is_saved(name).unwrap_or(false)
+    };
     let byo = std::env::var(env_keys::CURIE_CREDENTIALS)
         .ok()
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            crate::secrets::is_saved(env_keys::CURIE_CREDENTIALS)
+                .unwrap_or(false)
+                .then(|| "stored".to_string())
+        });
     // The frozen #495 forwarding rule, called rather than forked. It returns
     // NAMES; no value ever reaches this report.
-    let names =
-        commands::select_passthrough_env(fake, base_url_override, byo.as_deref(), &|name: &str| {
-            commands::env_credential_present(name)
-        });
+    let names = commands::select_passthrough_env(
+        fake_model,
+        model_base_url.is_some(),
+        byo.as_deref(),
+        &ambient_present,
+    );
     let credential_name = names.first().cloned();
-    let source = match credential_name.as_deref() {
+    let credential_source = match credential_name.as_deref() {
         None => "none",
         Some(name) if commands::env_credential_present(name) => "shell_env",
         Some(name) => match crate::secrets::is_saved(name) {
@@ -2141,11 +2534,25 @@ fn layer_model(report: &mut InfoReport, root: &Path) {
             _ => "none",
         },
     };
-    let mode = if fake {
+    PlainSkillUpBoot {
+        fake_model,
+        model_id,
+        model_base_url,
+        otel_endpoint,
+        byo,
+        credential_name,
+        credential_source,
+    }
+}
+
+/// What a plain `skill up` from THIS shell would resolve, plus whatever runner
+/// is actually recorded for the bundle.
+fn layer_model(report: &mut InfoReport, root: &Path, boot: &PlainSkillUpBoot) {
+    let mode = if boot.fake_model {
         "fake_model"
-    } else if byo.is_some() {
+    } else if boot.byo.is_some() {
         "byo_credential"
-    } else if credential_name.is_some() {
+    } else if boot.credential_name.is_some() {
         "ambient_sdk_credential"
     } else {
         "unauthenticated"
@@ -2158,22 +2565,43 @@ fn layer_model(report: &mut InfoReport, root: &Path) {
 
     report.model = Maybe::Known(ModelInfo {
         mode: mode.to_string(),
-        // `RunnerState` records no model id, so even with a recorded runner this
-        // cannot be read back from disk; it reports the env value or null rather
-        // than inventing one.
-        model_id: std::env::var(env_keys::CURIE_MODEL)
-            .ok()
-            .filter(|v| !v.is_empty()),
-        base_url_override,
+        model_id: boot.model_id.clone(),
+        base_url_override: boot.model_base_url.is_some(),
         credential: CredentialInfo {
-            name: credential_name,
-            source: source.to_string(),
+            name: boot.credential_name.clone(),
+            source: boot.credential_source.to_string(),
         },
         recorded_runner,
-        note: "these are the values a `curie skill up` FROM THIS SHELL would resolve, not a \
-               running fact; a null model id means the SDK default"
+        note: "these are the values a PLAIN `curie skill up` FROM THIS SHELL would resolve -- no \
+               `--fake-model`, `--model`, `--local-model`, `--otel-endpoint` or `--env-file` -- \
+               and not a running fact. Those flags are the only thing that turns on fake mode, a \
+               model id or a base-URL override, so this block cannot answer for an invocation \
+               that passes them; `recorded_runner.fake_model` is the recorded fact for the \
+               runner that IS booted. A null model id means the SDK default. The credential is \
+               resolved from this shell and the local vault, in the frozen forwarding order"
             .to_string(),
     });
+}
+
+/// Fill the `boot_env` rows whose producer is conditional from the SAME
+/// resolution `layer_model` reports, so `model.base_url_override: false` beside
+/// `ANTHROPIC_BASE_URL: set_by_this_tier: true` -- two fields of one object
+/// disagreeing about one fact -- cannot happen.
+fn layer_boot_env(report: &mut InfoReport, boot: &PlainSkillUpBoot) {
+    for row in &mut report.boot_env {
+        let set = if row.name == env_keys::CURIE_FAKE_MODEL {
+            boot.fake_model
+        } else if row.name == env_keys::CURIE_MODEL {
+            boot.model_id.is_some()
+        } else if row.name == env_keys::ANTHROPIC_BASE_URL {
+            boot.model_base_url.is_some()
+        } else if row.name == env_keys::OTEL_EXPORTER_OTLP_ENDPOINT {
+            boot.otel_endpoint.is_some()
+        } else {
+            continue;
+        };
+        row.set_by_this_tier = Maybe::Known(set);
+    }
 }
 
 fn recorded_runner(root: &Path) -> (Maybe<RecordedRunner>, Option<Diagnostic>) {
@@ -2347,8 +2775,18 @@ async fn probe_mcp(report: &mut InfoReport, root: &Path, image: String, timeout_
     let probe = commands::run_check_report(root.to_path_buf(), image, timeout_s).await;
     let mut extra: Vec<Diagnostic> = Vec::new();
     match probe {
-        Err(err) => {
-            let reason = format!("the MCP load probe could not be run ({err:#})");
+        Err(_) => {
+            // The probe error carries the container's whole stdout and stderr,
+            // and that container has just executed this bundle's own MCP
+            // servers -- their argv, their env and whatever they print. It is
+            // real diagnostic material, so it stays where an unpasteable error
+            // channel already holds it rather than being folded into an exit-0
+            // report.
+            let reason = "the MCP load probe could not be run: the runner container returned no \
+                          usable check report. Its stdout and stderr are the bundle's own MCP \
+                          servers talking, so they are not reproduced here; `curie skill check` \
+                          reports them in full on the error channel"
+                .to_string();
             for row in rows.iter_mut() {
                 row.load = McpLoad::ProbeFailed;
                 extra.push(
@@ -2471,14 +2909,20 @@ async fn run_deployed(tier: Tier, opts: AgentActionOpts) -> Result<InfoOutput> {
     let agent = client.find_agent(&opts.agent).await?;
     let deployments = match client.list_deployments(&agent.id).await {
         Ok(d) => d,
-        Err(err) => {
+        Err(_) => {
             return Ok(InfoOutput::Report(deployed_gap(
                 tier,
                 &agent,
                 "deployed.bundle_unreadable",
-                format!("listing the agent's deployments failed: {err:#}"),
+                // Status and endpoint, never the response body: `expect_ok`
+                // appends the server's text verbatim, and this report is meant
+                // to be pasteable. `looked_in` already names the endpoint.
+                "listing the agent's deployments over the platform API did not succeed. The API \
+                 response is not reproduced here; every other verb reports it in full on the \
+                 error channel"
+                    .to_string(),
                 "check the API is reachable and the key is authorized, then re-run",
-            )))
+            )));
         }
     };
 
@@ -2510,14 +2954,19 @@ async fn run_deployed(tier: Tier, opts: AgentActionOpts) -> Result<InfoOutput> {
     };
     let files = match client.bundle_files(&agent.id, &version_id).await {
         Ok(files) => files,
-        Err(err) => {
+        Err(_) => {
             return Ok(InfoOutput::Report(deployed_gap(
                 tier,
                 &agent,
                 "deployed.bundle_unreadable",
-                format!("fetching the deployed bundle's files failed: {err:#}"),
+                // As above: the API response body is server-controlled text and
+                // stays on the error channel.
+                "fetching the deployed bundle's stored files over the platform API did not \
+                 succeed. The API response is not reproduced here; every other verb reports it \
+                 in full on the error channel"
+                    .to_string(),
                 "check the API is reachable and the key is authorized, then re-run",
-            )))
+            )));
         }
     };
 
@@ -2558,6 +3007,16 @@ async fn run_deployed(tier: Tier, opts: AgentActionOpts) -> Result<InfoOutput> {
 /// lookup did not complete" (#607) is reproduced here, and this is deliberately
 /// NOT the skill tier's exit-2 no-manifest path, which would misreport a
 /// platform-side gap as a bad `--plugin-dir`.
+///
+/// The pass is deliberately NOT run for a gap. Running `discover` over an empty
+/// file set would answer from files that were never fetched -- `skills: []`,
+/// `mcp_servers: []`, `evals` absent, every `artifacts[].exists: false` -- which
+/// is #607's distinction undone one level down, and worse than the disk case:
+/// an agent polling right after `deploy` would read a clean-looking empty
+/// inventory instead of "nothing is in force yet". Every bundle-derived fact is
+/// therefore `unresolved` with the gap's own reason, and `artifacts` carries no
+/// rows at all rather than rows asserting a path was absent from a bundle this
+/// CLI never read.
 fn deployed_gap(
     tier: Tier,
     agent: &crate::api::Agent,
@@ -2574,15 +3033,23 @@ fn deployed_gap(
         bundle_sha256: None,
         channel: agent.slack_channel.clone(),
     };
-    let view = BundleView::from_files(origin, Vec::new());
-    let mut report = discover(&view);
-    report.tier = Maybe::Known(tier.as_str().to_string());
-    report.bundle = Maybe::unresolved(reason.clone());
-    // Replace the pass's generic "no manifest in the stored files" note with the
-    // specific reason this lookup stopped where it did.
-    report
-        .diagnostics
-        .retain(|d| d.code != "deployed.bundle_unreadable");
+    let mut report = InfoReport {
+        info: INFO_FAMILY.to_string(),
+        version: INFO_REPORT_VERSION,
+        tier: Maybe::Known(tier.as_str().to_string()),
+        bundle: Maybe::unresolved(reason.clone()),
+        skills: Maybe::unresolved(reason.clone()),
+        mcp_servers: Maybe::unresolved(reason.clone()),
+        secrets: Maybe::unresolved(reason.clone()),
+        boot_env: boot_env_rows(&origin),
+        approval_gates: Maybe::unresolved(reason.clone()),
+        evals: Maybe::unresolved(reason.clone()),
+        channel: channel_for(&origin),
+        comms: comms_for(&origin),
+        model: model_for(&origin),
+        artifacts: Vec::new(),
+        diagnostics: vec![boot_env_scope_diagnostic()],
+    };
     report.diagnostics.push(
         Diag {
             code,

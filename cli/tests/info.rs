@@ -29,6 +29,9 @@ use std::process::{Command, Output};
 
 use curie::info::{discover, BundleOrigin, BundleView};
 
+mod support;
+use support::{serve, Response};
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -337,6 +340,26 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// The file set the DEPLOYED path actually produces.
+///
+/// `apps/api/src/agentos_api/bundles.py::_collect_text_files` is a hardcoded
+/// ALLOWLIST -- the manifest locations, `evals/cases.json`, and
+/// `skills/**/SKILL.md` -- so `bundle_files` never returns `.mcp.json`, a
+/// `.curieignore`, or anything else a bundle ships. Feeding the whole packed set
+/// to the deployed view proves parity against a file set that cannot occur,
+/// which is exactly how the deployed-tier MCP over-claim survived.
+fn allowlisted_deployed_files(root: &Path) -> Vec<(String, String)> {
+    deployed_files(root)
+        .into_iter()
+        .filter(|(path, _)| {
+            path == ".claude-plugin/plugin.json"
+                || path == "plugin.json"
+                || path == "evals/cases.json"
+                || (path.starts_with("skills/") && path.ends_with("/SKILL.md"))
+        })
+        .collect()
+}
+
 fn deployed_origin() -> BundleOrigin {
     BundleOrigin::Deployed {
         agent: "demo".to_string(),
@@ -351,6 +374,11 @@ fn deployed_origin() -> BundleOrigin {
 
 fn deployed_report(root: &Path) -> serde_json::Value {
     let view = BundleView::from_files(deployed_origin(), deployed_files(root));
+    serde_json::to_value(discover(&view)).expect("InfoReport serializes")
+}
+
+fn allowlisted_deployed_report(root: &Path) -> serde_json::Value {
+    let view = BundleView::from_files(deployed_origin(), allowlisted_deployed_files(root));
     serde_json::to_value(discover(&view)).expect("InfoReport serializes")
 }
 
@@ -630,12 +658,16 @@ fn local_and_cluster_info_dry_run_emit_a_plan() {
     }
 }
 
-/// AC5, negative: the ONE genuinely by-construction absence. The flag is
-/// DECLARED at these tiers so it can be declined with a reason (exit 4) rather
-/// than rejected as an unknown-flag typo, and the decline fires before any
-/// network or kubectl call.
+/// AC5, negative: the flag is DECLARED at these tiers so it can be declined with
+/// a reason rather than rejected as an unknown-flag typo, and the decline fires
+/// before any network or kubectl call.
+///
+/// Exit 1, not 4. A deployed bundle's bytes ARE reachable (`bundle_files`
+/// returns `(path, content)` pairs and `run_check_report` takes a `PathBuf`), so
+/// what is missing is the code to materialize them, not a capability the tier
+/// forbids. Exit 4 would tell an agent to stop asking forever.
 #[test]
-fn local_and_cluster_info_decline_check_mcp_with_exit_4() {
+fn local_and_cluster_info_decline_check_mcp_with_a_failure() {
     let cwd = scratch();
 
     let local = run_curie(
@@ -650,7 +682,13 @@ fn local_and_cluster_info_decline_check_mcp_with_exit_4() {
     );
 
     for (tier, out) in [("local", &local), ("cluster", &cluster)] {
-        assert_exit(out, 4, &format!("{tier} info --check-mcp"));
+        assert_exit(out, 1, &format!("{tier} info --check-mcp"));
+        assert_ne!(
+            out.status.code(),
+            Some(4),
+            "{tier}: exit 4 is reserved for by-construction absence; an unbuilt \
+             reconstruction step is a plain failure"
+        );
         let v = json_stdout(out);
         let keys: std::collections::BTreeSet<&str> = v
             .as_object()
@@ -680,44 +718,187 @@ fn local_and_cluster_info_decline_check_mcp_with_exit_4() {
     }
 }
 
-/// The security boundary. `info` sits adjacent to declared secret names, MCP
-/// `env` blocks, and model credentials; a value must never reach stdout OR
-/// stderr, while the NAME is still reported.
+/// The security boundary, and the ONE test that would have caught the six real
+/// leaks. Every one of them was a `diagnostics[].reason` interpolating an
+/// upstream error whose `Display` echoes BUNDLE FILE CONTENT: a serde syntax
+/// error, a `jsonschema::ValidationError` serializing the failing instance, an
+/// eval-suite parse failure. None of them read the shell env, which is why an
+/// earlier version of this test that planted sentinels only in the environment
+/// passed green while all six sat intact.
+///
+/// So the sentinels go INSIDE the bundle's files, on the exact paths that reach
+/// a rejection: a token in a malformed manifest's `mcpServers` `env` block, and
+/// a secret as the value of `cases` in `evals/cases.json`. The input is raw and
+/// unsanitized on purpose; sanitizing it in the fixture would verify the fixture
+/// instead of production. Deleting `info::redact` (or interpolating an upstream
+/// error's `Display` into any `reason`) must turn this red.
+///
+/// The `mcpServers` shape here is an ARRAY, not a string. A string is the #336
+/// pointer form, which `info` catches earlier and cheaply, emitting
+/// `mcp.declared_pointer` before anything reaches the schema validator -- so a
+/// string-shaped fixture never takes the path the leak lived on. That form is
+/// covered separately, in the test below.
 #[test]
-fn info_never_emits_a_secret_value() {
-    // Hoisted to constants so no test-only credential literal sits inline.
-    const PAT_NAME: &str = "GITHUB_PERSONAL_ACCESS_TOKEN";
-    const PAT_SENTINEL: &str = "sentinel-do-not-print";
-    const MODEL_CRED_NAME: &str = "ANTHROPIC_API_KEY";
-    const MODEL_CRED_SENTINEL: &str = "sk-ant-sentinel-do-not-print";
+fn info_never_emits_bundle_content_in_a_diagnostic() {
+    // Hoisted so no credential-shaped literal sits inline at a call site.
+    const SENTINEL_ENV: &str = "leak-canary-in-the-env-block";
+    const SENTINEL_CASES: &str = "leak-canary-in-the-cases-value";
+    const SENTINEL_SHELL: &str = "leak-canary-in-the-shell";
 
-    let fx = fixture("github-issues");
+    let fx = fixture("weather");
+
+    // (a) A manifest declaring `mcpServers` as an ARRAY: the security fixer's
+    // own reproduction shape. The frozen plugin-format schema types the field
+    // `anyOf [string, object, null]`, so an array satisfies no branch, and
+    // `ValidationError`'s Display serializes the whole failing instance --
+    // env block included -- into its message. The highest-yield of the six.
+    //
+    // The `approvalPolicy` is load-bearing, not decoration: it is what drives
+    // the manifest through the FULL frozen-schema validation where that Display
+    // is reached. Without it the validator never runs and this vector is not
+    // exercised at all.
+    std::fs::write(
+        fx.path().join(".claude-plugin/plugin.json"),
+        format!(
+            r#"{{"name": "weather", "version": "0.1.0",
+                "approvalPolicy": {{"gates": [{{"gate": "Bash", "route": "permission"}}]}},
+                "mcpServers": [{{"github": {{"env": {{"GITHUB_PERSONAL_ACCESS_TOKEN": "{SENTINEL_ENV}"}}}}}}]}}"#
+        ),
+    )
+    .expect("write the schema-violating manifest");
+
+    // (b) `cases` as a string rather than an array: the eval loader's own error
+    // is the echo vector here.
+    std::fs::write(
+        fx.path().join("evals/cases.json"),
+        format!(r#"{{"name": "weather", "cases": "{SENTINEL_CASES}"}}"#),
+    )
+    .expect("write the malformed eval suite");
+
     let out = run_skill_info(
         fx.path(),
         &[],
-        &[
-            (PAT_NAME, PAT_SENTINEL),
-            (MODEL_CRED_NAME, MODEL_CRED_SENTINEL),
-        ],
+        &[("GITHUB_PERSONAL_ACCESS_TOKEN", SENTINEL_SHELL)],
     );
-    assert_exit(&out, 0, "skill info with credentials in the environment");
+    assert_exit(
+        &out,
+        0,
+        "a bundle full of content defects is still a diagnosis",
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    for stream in [("stdout", &stdout), ("stderr", &stderr)] {
-        for sentinel in [PAT_SENTINEL, MODEL_CRED_SENTINEL] {
+    for (stream_name, stream) in [("stdout", &stdout), ("stderr", &stderr)] {
+        for sentinel in [SENTINEL_ENV, SENTINEL_CASES, SENTINEL_SHELL] {
             assert!(
-                !stream.1.contains(sentinel),
-                "a secret VALUE reached {}: the bundle's .mcp.json env block and the \
-                 model credential must collapse to a name and a boolean\n{}",
-                stream.0,
-                stream.1
+                !stream.contains(sentinel),
+                "a bundle file's CONTENT reached {stream_name} ({sentinel:?}); a diagnostic \
+                 says WHAT was wrong and WHERE (a JSON pointer, a type, a line and column) \
+                 and never what the content was\n{stream}"
             );
         }
     }
 
-    // ...while the NAME is still reported, satisfied. Absence of the sentinel is
-    // only meaningful if the verb actually resolved the secret.
+    // Not vacuous: the defects must actually have produced diagnostics, or the
+    // absence above would prove only that nothing was reported at all.
+    let v = json_stdout(&out);
+    assert_diagnostics_well_formed(&v);
+    let found = codes(&v);
+    assert!(
+        found.iter().any(|c| c == "evals.invalid"),
+        "the fixture must actually reach the evals.invalid rejection path, got {found:?}: {v}"
+    );
+    assert!(
+        found.iter().any(|c| c == "approval_gate.manifest_invalid"),
+        "the array-shaped `mcpServers` must reach the FULL frozen-schema validation, \
+         which is the path `ValidationError`'s Display leaked from. A fixture that \
+         short-circuits before it proves nothing. Got {found:?}: {v}"
+    );
+    // The positive half: the reason must be LOCATIONS, not the instance. Pointers
+    // are also more useful to an agent than the text they replace.
+    let reason = diagnostic(&v, "approval_gate.manifest_invalid")["reason"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        reason.contains("/mcpServers"),
+        "the reason must name the JSON pointer into the instance, got {reason:?}"
+    );
+    // And the declared secret NAME is still reported: a report that answered
+    // nothing would also contain no sentinel.
+    assert!(
+        v["secrets"].get("declared").is_some() || is_unresolved(&v["secrets"]),
+        "the secrets block must still answer, one way or the other: {v}"
+    );
+}
+
+/// Leak vector 4, kept in its own test rather than displaced by the array shape.
+///
+/// The #336 string-pointer form is caught early and cheaply, before the schema
+/// validator, so it can never share a fixture with the full-schema vector: it
+/// short-circuits it. It is still an echo vector in its own right, because the
+/// pointer string is bundle content and can carry a credential in a URL's
+/// userinfo or query. `mcp.declared_pointer` must name the FORM, never quote it.
+#[test]
+fn the_mcp_pointer_form_is_diagnosed_without_echoing_the_pointer() {
+    const SENTINEL_URL: &str = "leak-canary-in-the-pointer-url";
+
+    let fx = fixture("weather");
+    std::fs::write(
+        fx.path().join(".mcp.json"),
+        format!(r#"{{"mcpServers": "https://user:{SENTINEL_URL}@example.test/mcp"}}"#),
+    )
+    .expect("write the pointer-form declaration");
+
+    let out = run_skill_info(fx.path(), &[], &[]);
+    assert_exit(&out, 0, "a pointer-form declaration is a diagnosis");
+
+    let v = json_stdout(&out);
+    assert_diagnostics_well_formed(&v);
+    // Non-vacuous: the fixture must actually reach this rejection.
+    let diag = diagnostic(&v, "mcp.declared_pointer");
+
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !combined.contains(SENTINEL_URL),
+        "the pointer string is bundle content and can carry a credential in its \
+         userinfo; the diagnostic names the FORM, never the value\n{combined}"
+    );
+    let reason = diag["reason"].as_str().unwrap_or("");
+    assert!(
+        !reason.contains("https://"),
+        "the reason must not quote the declaration at all, got {reason:?}"
+    );
+    // Zero servers register from this form, so `[]` is the true count -- but ONLY
+    // because the diagnostic above sits beside it saying the declaration was read
+    // and silently ignored. The empty list alone would read as "this bundle
+    // declares no servers", which is the lie; the pair is the honest answer.
+    assert_eq!(
+        v["mcp_servers"],
+        serde_json::json!([]),
+        "a pointer-form declaration registers nothing: {v}"
+    );
+}
+
+/// The complementary half: a NAME is not a value. With the credential exported,
+/// the report still says the declared secret is satisfied and from where, using
+/// only a name, an enum and a boolean.
+#[test]
+fn info_reports_a_secret_by_name_without_its_value() {
+    const PAT_NAME: &str = "GITHUB_PERSONAL_ACCESS_TOKEN";
+    const PAT_SENTINEL: &str = "shell-canary-do-not-print";
+
+    let fx = fixture("github-issues");
+    let out = run_skill_info(fx.path(), &[], &[(PAT_NAME, PAT_SENTINEL)]);
+    assert_exit(&out, 0, "skill info with the credential exported");
+
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !combined.contains(PAT_SENTINEL),
+        "the exported value must never be echoed\n{combined}"
+    );
+
     let v = json_stdout(&out);
     let declared = v["secrets"]["declared"]
         .as_array()
@@ -936,9 +1117,9 @@ fn assert_cross_source_parity(root: &Path, what: &str) -> serde_json::Value {
     assert_diagnostics_well_formed(&disk);
     assert_diagnostics_well_formed(&deployed);
 
-    // The ONE documented by-construction difference: a stored bundle carries no
-    // empty directories and no symlinks, so the deployed pass may add a
-    // `deployed.*` note the disk pass has no reason to emit. Everything else --
+    // `deployed.*` diagnostics report on the deployed READ ITSELF (an unreadable
+    // stored bundle, no in-force deployment), so they belong to the populator and
+    // not to the shared pass. Everything else --
     // every manifest, skill, mcp, evals, secret, boot_env, approval_gate,
     // artifact and state rejection -- must be identical.
     let disk_diags = without_deployed_kind(&disk);
@@ -1319,5 +1500,487 @@ fn a_leading_dot_slash_in_a_deployed_file_list_normalizes_to_the_same_view_key()
         plain_report, dotted_report,
         "a leading ./ is a path-format artifact of the stored bundle, not a different \
          file; normalizing it is what makes the cross-source parity test a parity test"
+    );
+}
+
+// ===========================================================================
+// The deployed tier, against the file set the platform ACTUALLY returns
+// ===========================================================================
+
+/// The parity property, re-run against the ALLOWLISTED subset rather than the
+/// whole packed set.
+///
+/// `_collect_text_files` ships the manifest, `evals/cases.json` and
+/// `skills/**/SKILL.md` and nothing else, so a deployed view never sees
+/// `.mcp.json`. The honest answer is therefore NOT the skill tier's answer: the
+/// skills and evals inventories must still match exactly, while `mcp_servers`
+/// goes UNRESOLVED with `mcp.not_in_bundle_view`. Claiming `mcp_servers: []`
+/// here would be an over-claim about a file that was never shown to the CLI.
+#[test]
+fn the_deployed_view_sees_only_allowlisted_files_and_will_not_claim_mcp_from_their_absence() {
+    let fx = fixture("github-issues");
+    let disk = disk_report(fx.path());
+    let deployed = allowlisted_deployed_report(fx.path());
+    assert_diagnostics_well_formed(&deployed);
+
+    // The blocks the allowlist DOES carry resolve identically.
+    for block in ["skills", "evals"] {
+        assert_eq!(
+            disk[block], deployed[block],
+            "`{block}` comes from an allowlisted file, so it must resolve identically \
+             from disk and from the stored set"
+        );
+    }
+    assert!(
+        disk["skills"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "the fixture must actually register a skill or the equality is vacuous: {disk}"
+    );
+
+    // The block it does NOT carry must say so, and must not be confused with the
+    // skill tier's genuine "a file WAS read and declared nothing".
+    assert_unresolved(
+        &deployed["mcp_servers"],
+        "`mcp_servers` from an allowlisted deployed view",
+    );
+    let diag = diagnostic(&deployed, "mcp.not_in_bundle_view");
+    assert!(
+        looked_in(diag).iter().any(|p| p.contains(".mcp.json")),
+        "the diagnostic must name the file the deployed view cannot carry: {diag}"
+    );
+    assert!(
+        !codes(&deployed).iter().any(|c| c == "mcp.declared_none"),
+        "`declared_none` means a declaration WAS read and named nothing; the deployed \
+         view read no declaration at all, and conflating the two is the over-claim: {deployed}"
+    );
+
+    // The skill tier, reading the same bundle from disk, DOES answer.
+    assert!(
+        disk["mcp_servers"].as_array().is_some(),
+        "the skill tier reads .mcp.json and resolves a real list: {disk}"
+    );
+}
+
+/// The gap path: `discover` is not run at all when there is nothing to read, so
+/// every bundle-derived fact is `unresolved` and `artifacts` is empty.
+///
+/// This needs CLI-level coverage precisely because the `discover`-over-an-empty-
+/// view test is a DIFFERENT path and stays green either way. Running the pass
+/// over files that were never fetched would answer `skills: []`, `evals` absent
+/// and every `artifacts[].exists: false`, which an agent polling right after a
+/// deploy would read as a clean empty bundle instead of "nothing is in force".
+#[test]
+fn a_deployed_agent_with_no_in_force_deployment_resolves_nothing_rather_than_answering_empty() {
+    let server = serve(|req| match req.path.split('?').next().unwrap_or("") {
+        "/agents" => Response::json(
+            200,
+            r#"[{"id":"a_1","name":"demo","slack_channel":"C0DEMO"}]"#,
+        ),
+        // No deployment is in force: the agent exists, nothing runs its bundle.
+        "/deployments" => Response::json(200, "[]"),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let cwd = scratch();
+    let out = run_curie(
+        &[
+            "--json",
+            "local",
+            "info",
+            "demo",
+            "--api-url",
+            &server.base_url,
+            "--api-key",
+            "test-key",
+        ],
+        cwd.path(),
+        &[],
+    );
+    assert_exit(
+        &out,
+        0,
+        "no in-force deployment is a real answer, not an error",
+    );
+
+    let v = json_stdout(&out);
+    assert_diagnostics_well_formed(&v);
+    for block in [
+        "bundle",
+        "skills",
+        "mcp_servers",
+        "secrets",
+        "approval_gates",
+        "evals",
+    ] {
+        assert_unresolved(&v[block], &format!("`{block}` on the deployed gap path"));
+        assert!(
+            !v[block].is_array(),
+            "`{block}` must not be an empty collection: an empty array here reads as \
+             \"this bundle has none\", when the truth is nothing was ever read: {v}"
+        );
+    }
+    assert_eq!(
+        v["artifacts"],
+        serde_json::json!([]),
+        "artifacts must carry NO rows rather than rows asserting a path was absent \
+         from a bundle this CLI never read: {v}"
+    );
+    diagnostic(&v, "deployed.no_active_deployment");
+}
+
+// ===========================================================================
+// Model and boot env
+// ===========================================================================
+
+/// Nothing else asserts `model.mode` or the credential at all. The credential is
+/// resolved by the FROZEN #495 forwarding rule and reported BY NAME.
+#[test]
+fn the_model_block_names_the_credential_it_would_forward_and_says_when_there_is_none() {
+    const CRED: &str = "ANTHROPIC_API_KEY";
+    let fx = fixture("weather");
+
+    // Exported in this shell.
+    let out = run_skill_info(fx.path(), &[], &[(CRED, "a-real-looking-value")]);
+    assert_exit(&out, 0, "skill info with a model credential exported");
+    let v = json_stdout(&out);
+    assert_eq!(
+        v["model"]["credential"]["name"], CRED,
+        "the forwarded credential is reported by NAME: {v}"
+    );
+    assert_eq!(v["model"]["credential"]["source"], "shell_env", "{v}");
+    assert_eq!(
+        v["model"]["mode"], "ambient_sdk_credential",
+        "a plain `skill up` from this shell would boot live off the ambient credential: {v}"
+    );
+    assert!(
+        v["model"]["credential"].get("value").is_none(),
+        "there is no value field anywhere in this contract: {v}"
+    );
+
+    // Nothing exported and nothing in the vault.
+    let out = run_skill_info(fx.path(), &[], &[]);
+    assert_exit(&out, 0, "skill info with no model credential");
+    let v = json_stdout(&out);
+    assert!(
+        v["model"]["credential"]["name"].is_null(),
+        "with nothing to forward the name is an explicit null, never absent: {v}"
+    );
+    assert_eq!(v["model"]["credential"]["source"], "none", "{v}");
+    assert_eq!(
+        v["model"]["mode"], "unauthenticated",
+        "a bundle that would boot with no credential must SAY so rather than imply \
+         it works: {v}"
+    );
+
+    // An exported-but-EMPTY credential is absent, not present
+    // (`env_credential_present`'s frozen rule).
+    let out = run_skill_info(fx.path(), &[], &[(CRED, "")]);
+    assert_exit(&out, 0, "skill info with an empty model credential");
+    let v = json_stdout(&out);
+    assert_eq!(
+        v["model"]["credential"]["source"], "none",
+        "an empty-string export resolves to nothing forwardable: {v}"
+    );
+}
+
+/// Every boot-env row name must be a value declared by the generated
+/// `env_keys` module, so a renamed key cannot drift into a hand-typed literal.
+/// The declaration is parsed from the generated source rather than re-typed
+/// here, which is the same shape `schema_inventory.rs` uses.
+#[test]
+fn boot_env_row_names_all_come_from_the_generated_env_keys_declaration() {
+    let generated = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../packages/aci-protocol/generated/rust/src/lib.rs"
+    ))
+    .expect("the generated aci-protocol crate source must be readable");
+    let declared: std::collections::BTreeSet<String> = generated
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("pub const ")?;
+            let (_, value) = rest.split_once("&str = \"")?;
+            Some(value.trim_end_matches("\";").to_string())
+        })
+        .collect();
+    assert!(
+        declared.contains("CURIE_PLUGIN_DIR") && declared.len() > 20,
+        "the env_keys parse is broken, so every assertion below would pass \
+         vacuously: {declared:?}"
+    );
+
+    let fx = fixture("weather");
+    let out = run_skill_info(fx.path(), &[], &[]);
+    assert_exit(&out, 0, "skill info");
+    let v = json_stdout(&out);
+    let rows = v["boot_env"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`boot_env` is always an array: {v}"));
+    assert!(!rows.is_empty(), "the rows must not be empty: {v}");
+
+    let names: std::collections::BTreeSet<String> = rows
+        .iter()
+        .filter_map(|r| r["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(names.len(), rows.len(), "a key is reported twice: {v}");
+    let undeclared: Vec<&String> = names.difference(&declared).collect();
+    assert!(
+        undeclared.is_empty(),
+        "these boot-env row names are not declared by the generated env_keys module, \
+         so they were typed as literals and will drift on a rename: {undeclared:?}"
+    );
+
+    // The rows are a documented SUBSET, and the report must say so rather than
+    // let a declared key be silently absent.
+    assert!(
+        names.len() < declared.len(),
+        "the rows are the keys `skill up` decides, a strict subset: {names:?}"
+    );
+    diagnostic(&v, "boot_env.rows_scoped");
+}
+
+// ===========================================================================
+// `.curieignore` parity: the disk view must describe the bundle that SHIPS
+// ===========================================================================
+
+/// Every bundle-root-relative file path `pack_tar_gz` actually writes into the
+/// archive. The comparison target is the tar itself, never a hardcoded list, so
+/// the assertion fails if EITHER side drifts.
+fn packed_paths(root: &Path) -> std::collections::BTreeSet<String> {
+    let archive = curie::bundle::pack_tar_gz(root).expect("pack the fixture");
+    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(archive));
+    let mut tar = tar::Archive::new(decoder);
+    tar.entries()
+        .expect("read tar entries")
+        .filter_map(|entry| {
+            let entry = entry.expect("tar entry");
+            if entry.header().entry_type().is_dir() {
+                return None;
+            }
+            Some(
+                entry
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn view_paths(root: &Path) -> std::collections::BTreeSet<String> {
+    let view = BundleView::from_disk(root).expect("from_disk over the fixture");
+    view.paths().map(str::to_string).collect()
+}
+
+/// The regression the reuse fix exists to prevent: the disk view mirrored the
+/// packer's BUILT-IN names but not the bundle's `.curieignore`, so `info`
+/// described a different bundle from the one `deploy` ships.
+///
+/// Deleting `Exclusions::load` from `from_disk` (falling back to the built-in
+/// names) must turn this red, because the ignored entries would reappear in the
+/// view while staying out of the tar.
+#[test]
+fn the_disk_view_describes_exactly_the_file_set_pack_tar_gz_ships() {
+    let fx = fixture("weather");
+    let root = fx.path();
+
+    // A real skill directory and a real file, plus a bare name that must match
+    // at depth and a path pattern that must prune a whole subtree.
+    std::fs::create_dir_all(root.join("skills/weather/fixtures")).expect("mkdir");
+    std::fs::write(root.join("skills/weather/fixtures/sample.json"), "{}").expect("write");
+    std::fs::create_dir_all(root.join("skills/drafts/deep")).expect("mkdir");
+    std::fs::write(
+        root.join("skills/drafts/SKILL.md"),
+        "---\nname: drafts\ndescription: A draft.\n---\n",
+    )
+    .expect("write");
+    std::fs::write(root.join("skills/drafts/deep/notes.md"), "# deep").expect("write");
+    std::fs::write(root.join("scratch.txt"), "scratch").expect("write");
+    std::fs::write(
+        root.join(".curieignore"),
+        "# a bare name matches at any depth\nfixtures\n# a path pattern prunes a subtree\nskills/drafts\nscratch.txt\n",
+    )
+    .expect("write .curieignore");
+
+    let packed = packed_paths(root);
+    let viewed = view_paths(root);
+    assert_eq!(
+        viewed, packed,
+        "the disk view and the archive must describe the SAME bundle; a difference \
+         means `info` reports a file set `deploy` would never ship"
+    );
+
+    // Not vacuous: the exclusions must actually have removed something, in each
+    // of the two pattern shapes.
+    assert!(
+        !packed.iter().any(|p| p.contains("fixtures/")),
+        "the bare-name pattern must match `skills/weather/fixtures/` at depth: {packed:?}"
+    );
+    assert!(
+        !packed.iter().any(|p| p.starts_with("skills/drafts")),
+        "the path pattern must prune the whole `skills/drafts` subtree, not just the \
+         directory entry: {packed:?}"
+    );
+    assert!(
+        !packed.contains("scratch.txt"),
+        "an ignored root file must not ship: {packed:?}"
+    );
+    // And it must not have removed everything.
+    assert!(
+        packed.contains("skills/weather/SKILL.md") && packed.contains(".claude-plugin/plugin.json"),
+        "the real bundle must survive: {packed:?}"
+    );
+    // The ignore file itself never ships, and so must not appear in the view.
+    assert!(
+        !viewed.contains(".curieignore"),
+        "the ignore file is excluded by name: {viewed:?}"
+    );
+
+    // The consequence for the report: the pruned skill directory is gone from
+    // the bundle entirely, so it is neither registered nor reported as rejected.
+    let v = disk_report(root);
+    let skill_paths: Vec<&str> = v["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"))
+        .iter()
+        .filter_map(|s| s["path"].as_str())
+        .collect();
+    assert!(
+        !skill_paths.iter().any(|p| p.starts_with("skills/drafts")),
+        "an ignored skill is not part of this bundle: {v}"
+    );
+}
+
+/// A FLAT path list (the deployed populator's shape) must reach the same answer
+/// a recursive walk reaches by pruning: an entry is excluded when it or ANY
+/// ancestor is. Asked behaviorally through `from_files`, which is the only
+/// caller of the ancestor walk.
+#[test]
+fn a_flat_deployed_path_list_excludes_an_entry_whose_ancestor_is_excluded() {
+    let view = BundleView::from_files(
+        deployed_origin(),
+        vec![
+            (
+                ".claude-plugin/plugin.json".to_string(),
+                r#"{"name": "t", "version": "0.1.0"}"#.to_string(),
+            ),
+            // Neither of these has an excluded BASENAME; only an ancestor is
+            // excluded, which a name-only check would miss entirely.
+            (".curie/runner.json".to_string(), "{}".to_string()),
+            (
+                "a/node_modules/b/c.js".to_string(),
+                "module.exports = {};".to_string(),
+            ),
+            (
+                "skills/x/SKILL.md".to_string(),
+                VALID_FRONTMATTER.to_string(),
+            ),
+        ],
+    );
+    let paths: std::collections::BTreeSet<&str> = view.paths().collect();
+    assert!(
+        !paths.contains(".curie/runner.json"),
+        "workstation state under an excluded ancestor must never enter the view: {paths:?}"
+    );
+    assert!(
+        !paths.contains("a/node_modules/b/c.js"),
+        "an excluded ancestor prunes its whole subtree even on a flat list: {paths:?}"
+    );
+    assert!(
+        paths.contains("skills/x/SKILL.md") && paths.contains(".claude-plugin/plugin.json"),
+        "the real bundle files must survive: {paths:?}"
+    );
+}
+
+/// A symlinked `.curieignore` is an incomplete bundle, which the ticket settles
+/// as a DIAGNOSIS rather than a crash: exit 0 with the defect named.
+///
+/// Nothing is sentinelled, on purpose. Every reported row is still a true
+/// statement about this directory, and `unresolved` would claim the pass could
+/// not determine them, which is false. The one untrue claim available would be
+/// that this directory equals a storable bundle, and that is precisely what the
+/// diagnostic states instead.
+///
+/// The asymmetry is deliberate and pinned below: `info` diagnoses and still
+/// reports, while `pack_tar_gz` (and therefore `deploy`) refuses outright.
+#[test]
+fn a_symlinked_curieignore_is_a_diagnostic_not_a_crash() {
+    // The linked file's bytes must never surface. A future "helpful" diagnostic
+    // that quoted the resolved target would leak whatever it points at, which is
+    // the same never-print-content property the diagnostics-reason test pins.
+    const LINKED_CONTENT: &str = "SECRET-BUNDLE-CONTENT-leak-canary";
+
+    let fx = fixture("weather");
+    let outside = scratch();
+    let target = outside.path().join("elsewhere-ignore");
+    std::fs::write(&target, format!("skills\n{LINKED_CONTENT}\n"))
+        .expect("write the symlink target");
+    std::os::unix::fs::symlink(&target, fx.path().join(".curieignore"))
+        .expect("create the symlinked ignore file");
+
+    let out = run_skill_info(fx.path(), &[], &[]);
+    assert_exit(
+        &out,
+        0,
+        "an incomplete bundle is a diagnosis, not a crash (ticket AC2)",
+    );
+
+    let v = json_stdout(&out);
+    assert_diagnostics_well_formed(&v);
+    let diag = diagnostic(&v, "artifact.symlink");
+    assert_eq!(
+        diag["kind"], "artifact",
+        "`kind` is the closed axis and no new value was added; `code` is the open          one that carries the new case: {diag}"
+    );
+    let reason = diag["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains(".curieignore"),
+        "the reason must name the file that is a symlink, got {reason:?}"
+    );
+    assert!(
+        reason.contains("pack_tar_gz") || reason.contains("refus"),
+        "the reason must say the packer refuses such a bundle, so a reader knows          this directory is not storable, got {reason:?}"
+    );
+
+    // The inventory still resolves: the ignore file could not be read, but every
+    // row below it is a true statement about this directory.
+    let skills: Vec<&str> = v["skills"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the skills inventory must still resolve: {v}"))
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(
+        skills,
+        vec!["weather"],
+        "the built-in exclusions alone still describe a readable directory: {v}"
+    );
+    assert!(
+        !is_unresolved(&v["skills"]) && !is_unresolved(&v["bundle"]),
+        "a sentinel would claim the pass could not determine these, which is false: {v}"
+    );
+
+    // The linked file's bytes reach neither stream.
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !combined.contains(LINKED_CONTENT),
+        "the symlink target's CONTENT reached the output; a diagnostic names the \
+         defect, never the bytes behind it\n{combined}"
+    );
+
+    // The packer is deliberately unchanged, and this is the whole asymmetry:
+    // `info` answers, `deploy` refuses. No network and no stack needed.
+    let packed = curie::bundle::pack_tar_gz(fx.path());
+    let err =
+        packed.expect_err("pack_tar_gz must still refuse a bundle with a symlinked .curieignore");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(".curieignore") && message.contains("symlink"),
+        "the packer's refusal must name the same defect `info` diagnosed, got {message:?}"
     );
 }

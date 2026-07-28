@@ -135,18 +135,30 @@ The inversion, in full:
 | `comms` connectedness | unavailable | real |
 | `secrets.declared[].satisfied` | real (shell env or vault) | unavailable |
 | `model` (mode, credential name, recorded runner) | real | unavailable |
-| `mcp_servers[].load` under `--check-mcp` | probed | exit 4 on the flag |
+| `mcp_servers[].load` under `--check-mcp` | probed | exit 1 on the flag, not yet built |
+| `mcp_servers` themselves | read from `.mcp.json` | unresolved: the platform never ships the file |
 | the `skill.symlink` diagnostic | can fire | cannot fire, by construction |
-| an entirely empty `skills/<dir>/` | visible | not visible, stated explicitly |
 
-The last two rows are by construction, not by omission: `bundle::pack_tar_gz`
-refuses to pack a symlink rather than dereference it, so a stored bundle contains
-none; and a tar of files carries no empty directory, which the deployed pass
-records as `deployed.empty_dir_not_visible` rather than letting the two tiers
-differ silently.
+The `skill.symlink` row is by construction rather than by omission:
+`bundle::pack_tar_gz` refuses to pack a symlink rather than dereference it, so a
+stored bundle contains none. The `mcp_servers` row is a property of the platform's
+stored-file allowlist, recorded as a known limitation under Consequences.
+
+An entirely empty `skills/<dir>/` is deliberately **not** in this table, because
+it is not a tier difference: neither a disk walk nor a stored tar records a
+directory entry, only files, so the candidate is invisible at every tier alike.
+`skills.dir_absent` states that it therefore claims nothing about empty
+directories in either direction, rather than the pass inventing a tier-specific
+fact about them.
 
 Two invariants hold everywhere: no field is ever omitted, and no empty array is
-ever emitted for an unresolved concept.
+ever emitted for an unresolved concept. That applies hardest where fabricating
+one would be easiest: a deployed gap does not run the pass at all (every
+bundle-derived block is `unresolved` with the gap's own reason and `artifacts`
+carries no rows), an unparseable manifest with no readable `.mcp.json` leaves
+`mcp_servers` unresolved under `mcp.manifest_unreadable` rather than reporting
+`[]`, and a deployed tier reports `mcp.not_in_bundle_view` rather than borrowing
+the skill tier's `mcp.no_declaration`, which asserts a file was read.
 
 ### 5. A bundle defect is a diagnosis at exit 0
 
@@ -159,7 +171,9 @@ ever emitted for an unresolved concept.
 - **exit 1 or 3 (Failure or Transient)**, at the deployed tiers: whatever the
   existing `ApiClient` paths already classify (an unknown agent, a connect
   failure). `info` adds no new classification.
-- **exit 4 (Unsupported)**: `--check-mcp` at `local` or `cluster`, per decision 6.
+- **exit 1 (Failure)**, on the flag: `--check-mcp` at `local` or `cluster`, per
+  decision 6. Deliberately not exit 4: the probe is unbuilt at those tiers, not
+  impossible there.
 
 Everything else inside the bundle is a `diagnostics` entry at exit 0: a manifest
 that is not valid JSON, an `approvalPolicy` the runner would refuse, a missing
@@ -174,16 +188,39 @@ invalid `approvalPolicy`, and `info` **catches** it, converting it into a
 diagnostic and marking `approval_gates` unresolved. It must never report an empty
 gate list there.
 
-### 6. `--check-mcp` is a legitimate exit 4, by the same test decision 3 applies
+### 6. `--check-mcp` at the deployed tiers is exit 1, not exit 4
 
-The MCP load probe boots a runner container that **mounts a bundle directory**
-(`python -m curie_runner.check`), and a deployed bundle exists only as stored
-files in the platform, with no directory on this machine to mount. That is
-absence by construction, not absence by schedule, so it passes the test decision
-3 failed. `--check-mcp` is therefore **declared at all three tiers and declined
-at `local` and `cluster` with exit 4**, following the confirmed-sound
-`skill approvals --list` precedent: the flag is accepted so it can be declined
-with a reason, rather than rejected as an unknown-flag typo.
+The MCP load probe boots a runner container against a **bundle directory**
+(`python -m curie_runner.check`), and this CLI does not write a deployed
+bundle's stored files out to one. An earlier draft of this ADR called that
+absence by construction and declined the flag with exit 4. **That was wrong, and
+by decision 3's own test.** The bytes are reachable at the deployed tiers:
+`ApiClient::bundle_files` returns `(path, content)` pairs, and
+`commands::run_check_report` takes a `PathBuf`, so materializing the fetched
+files into a temp directory and running the identical probe is mechanically
+available today. Only the code to do it is missing, which is absence by
+schedule.
+
+The counter-argument considered and rejected: that a probe booted on the
+operator's workstation measures whether the servers load *there* rather than in
+the platform's own sandbox, making a reconstructed probe a different question
+and therefore permanently misleading. It does not hold, because the alternative
+this decline recommends is itself a local probe standing in for the deployed
+one, and the probe is offline, credential-free, and runs the same runner image
+at every tier. If a local probe answered a different question, the recommended
+workaround would mislead too.
+
+So `--check-mcp` is **declared at all three tiers and declined at `local` and
+`cluster` with exit 1 plus a `fix`**. The declare-then-decline shape follows the
+confirmed-sound `skill approvals --list` precedent (the flag is accepted so it
+can be declined with a reason rather than rejected as an unknown-flag typo);
+only the exit class differs, because exit 4 is reserved for what no input and no
+future release can answer here (ADR-0041). An agent that reads exit 4 stops
+retrying and stops asking, so spending it on a gap a follow-up will close is the
+lie-class this ADR spent decision 3 rejecting.
+
+Implementing the deployed-tier probe is a tracked follow-up, and it is the right
+long-term answer.
 
 The reason and the alternative are single-sourced as
 `commands::INFO_CHECK_MCP_REASON` and `commands::INFO_CHECK_MCP_ALT`, and flow
@@ -219,14 +256,21 @@ The v1 `code` registry:
 |---|---|
 | `manifest` | `manifest.invalid_json`, `manifest.location_fallback`, `manifest.name_invalid` |
 | `skill` | `skill.no_skill_md`, `skill.frontmatter_missing`, `skill.frontmatter_invalid`, `skill.tools_confusable`, `skill.symlink`, `skills.dir_absent`, `skills.empty` |
-| `mcp` | `mcp.no_declaration`, `mcp.declared_none`, `mcp.invalid_json`, `mcp.declared_pointer`, `mcp.not_probed`, `mcp.did_not_register`, `mcp.registered_zero_tools`, `mcp.probe_failed` |
+| `mcp` | `mcp.no_declaration`, `mcp.declared_none`, `mcp.manifest_unreadable`, `mcp.not_in_bundle_view`, `mcp.invalid_json`, `mcp.declared_pointer`, `mcp.not_probed`, `mcp.did_not_register`, `mcp.registered_zero_tools`, `mcp.probe_failed` |
 | `evals` | `evals.file_absent`, `evals.invalid`, `evals.retired_format` |
 | `secret` | `secret.unsatisfied`, `secret.name_invalid`, `secret.vault_unreadable` |
-| `boot_env` | `boot_env.not_set_at_this_tier` |
+| `boot_env` | `boot_env.not_set_at_this_tier`, `boot_env.rows_scoped` |
 | `approval_gate` | `approval_gate.manifest_invalid` |
-| `artifact` | `artifact.absent` |
+| `artifact` | none at v1 (see below) |
 | `state` | `state.runner_absent`, `state.foreign_runner`, `state.unreadable` |
-| `deployed` | `deployed.no_active_deployment`, `deployed.bundle_unreadable`, `deployed.empty_dir_not_visible` |
+| `deployed` | `deployed.no_active_deployment`, `deployed.bundle_unreadable` |
+
+`artifact` carries no `code` at v1 and still holds a slot in the closed `kind`
+enum. Every `artifacts[]` row's absence already has a dedicated `code` elsewhere
+in the pass (`mcp.not_in_bundle_view`, `evals.file_absent`, `skills.dir_absent`,
+the `manifest.*` family), so an `artifact.absent` beside them would be a second
+name for a rejection already reported. Keeping the `kind` reserved is free by the
+additive rule below; removing it would not be.
 
 `state.unreadable` was added during implementation, for a `.curie/runner.json`
 that exists but cannot be parsed. Reporting that as `state.runner_absent` would
@@ -271,6 +315,28 @@ Concretely:
 - `additionalProperties` is `false` at every level of the schema, so a field
   added carelessly fails the contract test rather than shipping.
 
+A content-free inventory is only half the boundary, and review found the other
+half open. A `diagnostics` entry describes a bundle **defect**, and every upstream
+producer of that text (`serde_json`, `jsonschema`, the probe container, the
+platform API) renders the offending value into its own message, so a token
+mistyped into a manifest field, an eval suite, or an MCP block would be echoed
+straight back through a `reason`. Collapsing an MCP row to four fields buys
+nothing if the diagnostic beside it reprints the same `env` block verbatim.
+
+So every diagnostic string is built through a shared `info::redact` module rather
+than by per-site care: a JSON parse failure becomes its line and column, a type
+mismatch becomes a type name, a schema violation becomes its two JSON pointers
+(instance location and schema location). The rule is that a diagnostic says
+**what** was wrong and **where**, never **what the content was**, and a pointer is
+more useful to an agent than the echoed text it replaces. The module deliberately
+does not scrub a finished string for secret-looking substrings: a denylist over
+attacker-shaped text is not a boundary. Making this a helper rather than a
+convention is what let it close a pre-existing leak at its root, in
+`commands::validate_against_plugin_format_schema`, where `skill approvals` was
+already formatting a `jsonschema::ValidationError` whose `Display` serializes the
+failing instance (`mcpServers` is `anyOf [string, object, null]`, so declaring
+servers as an array made it print the whole array, `env` blocks included).
+
 `info` also introduces no new `Deserialize` mirror of the plugin-manifest shape:
 it reads the manifest as a raw `serde_json::Value`, so
 `cli/plugin-format-mirrors.json` gains no entry. `InfoOutput::to_json` delegates
@@ -291,6 +357,20 @@ in `cli/api-mirrors.json`.
   local and cluster tiers. It is bounded by decision 8 (derived facts only,
   `additionalProperties: false`, no content field), and the contents are held in
   memory for the duration of one pass.
+- **Known limitation: a deployed bundle is served through an allowlist, so the
+  deployed tiers can never read `.mcp.json`.** The platform's `_collect_text_files`
+  (`apps/api/src/curie_api/bundles.py`) is a fixed allowlist of the bundle's
+  structured text surfaces: the two manifest locations, `evals/cases.json`, and
+  `skills/**/SKILL.md`. Nothing else is collected, so a deployed view carries no
+  `.mcp.json` whatever the bundle contains. This predates `info` and is not changed
+  here. Its consequence is that the deployed tiers report MCP state as **unknown**
+  (`mcp.not_in_bundle_view`, `mcp_servers` unresolved) rather than absent, and that
+  `artifacts[].exists` means "present in the file view this report read" rather than
+  "present in the bundle", which is why the same row can read `false` at `cluster`
+  and `true` at `skill`. Widening the allowlist is a separate change to the platform
+  API's response shape and is tracked as its own issue; until then, the manifest's
+  own `mcpServers` fallback is the declaration form the deployed tiers can see, and
+  the `fix` on the diagnostic says so.
 - **The report is a maintenance surface.** An intentional output change edits
   `cli/schema/info.schema.json` in the same change, or `cli/tests/json_contract.rs`
   goes red; a new `code` also updates the registry in the schema `description` and

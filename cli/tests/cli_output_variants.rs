@@ -269,7 +269,7 @@ fn info_report() -> InfoReport {
             "`curie local info <agent>`",
         )),
         model: Maybe::Known(ModelInfo {
-            mode: "live_from_credential".to_string(),
+            mode: "ambient_sdk_credential".to_string(),
             model_id: None,
             base_url_override: false,
             credential: CredentialInfo {
@@ -289,7 +289,7 @@ fn info_report() -> InfoReport {
                 exists: true,
             },
             ArtifactRow {
-                kind: "evals".to_string(),
+                kind: "eval_suite".to_string(),
                 path: "evals/cases.json".to_string(),
                 exists: false,
             },
