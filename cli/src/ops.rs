@@ -2239,7 +2239,30 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
             plain("name"),
         ],
     );
-    matches!(run_capture(&cmd).await, Ok((true, out, _)) if !out.trim().is_empty())
+    match run_capture(&cmd).await {
+        Ok((true, out, _)) => !out.trim().is_empty(),
+        // A probe that could not run is NOT evidence of "no workspace connected"
+        // (#957 mode C). Silently downgrading to the stub path here means the
+        // operator asked for the connected mode, got the other one, and was told
+        // nothing. Still fall back -- the stub path is the safe direction, and
+        // failing the command on a flaky kubectl would be worse -- but say so.
+        Ok((false, _, err)) => {
+            crate::ui::ui().warn(&format!(
+                "could not determine whether a Slack workspace is connected \
+                 (kubectl probe for {release}-dispatcher failed: {}); assuming \
+                 NOT connected and using the local reply stub",
+                err.trim().lines().next().unwrap_or("no stderr")
+            ));
+            false
+        }
+        Err(exc) => {
+            crate::ui::ui().warn(&format!(
+                "could not determine whether a Slack workspace is connected \
+                 ({exc}); assuming NOT connected and using the local reply stub"
+            ));
+            false
+        }
+    }
 }
 
 /// Read one data key out of a release's chart Secret, decoded server-side by
