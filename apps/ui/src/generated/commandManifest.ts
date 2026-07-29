@@ -349,6 +349,54 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Bind an approval route to a channel. Accepted so it can be DECLINED with a reason rather than error like a typo: a route binding is per-agent platform config, and the skill tier has no platform",
+              "id": "route",
+              "long": "route",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route",
+              "id": "route_approvers",
+              "long": "route-approvers",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read the route map from a JSON file. Declined at this tier for the same reason as --route",
+              "id": "routes_from",
+              "long": "routes-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route",
+              "id": "list_routes",
+              "long": "list-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove every route binding. Declined at this tier for the same reason as --route",
+              "id": "clear_routes",
+              "long": "clear-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
             }
           ],
           "hidden": false,
@@ -1377,6 +1425,54 @@ export const commandManifest = {
               "id": "actor_channel",
               "long": "actor-channel",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route",
+              "long": "route",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "id": "route_approvers",
+              "long": "route-approvers",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "id": "routes_from",
+              "long": "routes-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the agent's approval route bindings instead of its tool gates",
+              "id": "list_routes",
+              "long": "list-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove every approval route binding on the agent",
+              "id": "clear_routes",
+              "long": "clear-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -3083,6 +3179,54 @@ export const commandManifest = {
               "id": "actor_channel",
               "long": "actor-channel",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route",
+              "long": "route",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "id": "route_approvers",
+              "long": "route-approvers",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "id": "routes_from",
+              "long": "routes-from",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the agent's approval route bindings instead of its tool gates",
+              "id": "list_routes",
+              "long": "list-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove every approval route binding on the agent",
+              "id": "clear_routes",
+              "long": "clear-routes",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],

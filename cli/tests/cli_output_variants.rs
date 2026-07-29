@@ -253,6 +253,32 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
+            // Both binding shapes in one sample so the schema gate sees a route
+            // WITH an approvers block and one without: the absent block is the
+            // zero-setup default (card-channel membership), which is a distinct
+            // wire state from a declared one, not merely a missing key.
+            "Routes" => ApprovalsOutput::Routes {
+                agent: "a".to_string(),
+                routes: std::collections::BTreeMap::from([
+                    (
+                        "deal_desk".to_string(),
+                        curie::api::ApprovalRouteBinding {
+                            channel: "C0MANAGERS".to_string(),
+                            approvers: None,
+                        },
+                    ),
+                    (
+                        "finance".to_string(),
+                        curie::api::ApprovalRouteBinding {
+                            channel: "C0FINANCE0".to_string(),
+                            approvers: Some(curie::api::ApprovalApprovers {
+                                group: Some("S0FINGRP0".to_string()),
+                                users: None,
+                            }),
+                        },
+                    ),
+                ]),
+            },
         ],
     );
     m.insert(

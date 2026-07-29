@@ -4,6 +4,7 @@
 //! behavior and speaks only through the library modules (docker, runner, api,
 //! scaffold, state, evals, render).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -3460,6 +3461,263 @@ pub struct ApprovalCmd {
     pub reject: bool,
     pub note: Option<String>,
     pub actor_channel: Option<String>,
+    /// `--route NAME=CHANNEL`, repeatable.
+    pub route: Vec<String>,
+    /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
+    pub route_approvers: Vec<String>,
+    /// `--routes-from FILE`: the whole binding map as JSON.
+    pub routes_from: Option<PathBuf>,
+    pub list_routes: bool,
+    pub clear_routes: bool,
+}
+
+// --- Approval route bindings (#1052) -----------------------------------------
+//
+// Which channel an approval card posts to, and who may resolve it, live in the
+// agent's `approval_routes` map. Until this verb existed the only way to write
+// one was a hand-rolled `PATCH /agents/{id}`, against the repo's own "one entry
+// point: curie <command>" rule.
+//
+// Two properties shape the code below.
+//
+// The write is a FULL REPLACEMENT, exactly as `--gate` already is for
+// `approval_required_tools`. That is the field's semantics on `AgentUpdate`, and
+// a merge would make `--route` unable to express removal.
+//
+// Every parse and shape error is collected BEFORE any HTTP call. A partial write
+// of a binding map is a silently widened (or silently narrowed) approver set,
+// which is the failure ADR-0034 fails closed against, so a malformed entry
+// anywhere aborts the whole invocation with nothing sent.
+
+/// Slack ID shapes, mirroring the authoritative validators in
+/// `apps/api/src/curie_api/schemas.py`. The API is the gate for every caller and
+/// re-checks all of these; these exist only so a typo is answered locally with a
+/// fix hint instead of a round trip (the same split the API's own
+/// `_validate_slack_channel_id` docstring describes).
+static SLACK_CHANNEL_ID: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[CDG][A-Z0-9]{7,}$").expect("channel id re"));
+static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
+static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+
+/// Split `NAME=VALUE` once, rejecting an empty half.
+///
+/// Splits at the FIRST `=` so a value containing one is preserved; a route name
+/// containing `=` is not expressible, which is fine because a route name is a
+/// manifest identifier matched verbatim against `approvalPolicy`.
+fn split_route_arg<'a>(flag: &str, raw: &'a str) -> Result<(&'a str, &'a str)> {
+    let (name, value) = raw.split_once('=').ok_or_else(|| {
+        crate::exit::usage(format!(
+            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0123ABCD"
+        ))
+    })?;
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() {
+        return Err(crate::exit::usage(format!(
+            "{flag} {raw:?} has an empty route name; the name must match a route the \
+             bundle manifest's approvalPolicy declares"
+        )));
+    }
+    if value.is_empty() {
+        return Err(crate::exit::usage(format!(
+            "{flag} {raw:?} has an empty value"
+        )));
+    }
+    Ok((name, value))
+}
+
+/// Parse one `--route-approvers NAME=KIND:VALUES` value into its approver set.
+fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
+    let (kind, rest) = value.split_once(':').ok_or_else(|| {
+        crate::exit::usage(format!(
+            "--route-approvers value {value:?} is not KIND:VALUES; pass \
+             users:U0123ABCD,U0456DEFG or group:S0123ABCD"
+        ))
+    })?;
+    match kind.trim() {
+        "users" => {
+            let users: Vec<String> = rest
+                .split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect();
+            if users.is_empty() {
+                // The API refuses an empty list for the same reason: as silent
+                // config, "nobody may approve" means the request can only expire.
+                return Err(crate::exit::usage(
+                    "--route-approvers users: needs at least one Slack user ID",
+                ));
+            }
+            for user in &users {
+                if !SLACK_USER_ID.is_match(user) {
+                    return Err(crate::exit::CliError::usage(format!(
+                        "approvers user {user:?} is not a Slack user ID"
+                    ))
+                    .with_fix(
+                        "pass the user ID (e.g. U0123ABCD, or W0123ABCD on enterprise \
+                         grid), not a @handle or a display name: a member's ID is under \
+                         their profile's More menu, Copy member ID",
+                    )
+                    .into());
+                }
+            }
+            Ok(crate::api::ApprovalApprovers {
+                group: None,
+                users: Some(users),
+            })
+        }
+        "group" => {
+            let group = rest.trim().to_string();
+            if !SLACK_USERGROUP_ID.is_match(&group) {
+                // Naming the C-prefix case explicitly: a channel ID here is the
+                // likely mistake, and it is the one that would otherwise look
+                // plausible enough to debug for a while.
+                return Err(crate::exit::CliError::usage(format!(
+                    "approvers group {group:?} is not a Slack user-group ID"
+                ))
+                .with_fix(
+                    "pass a user-group ID (e.g. S0123ABCD), not a @handle or a name; a \
+                     C-prefixed value is a CHANNEL, not a user group. List group IDs via \
+                     the Slack usergroups.list API",
+                )
+                .into());
+            }
+            Ok(crate::api::ApprovalApprovers {
+                group: Some(group),
+                users: None,
+            })
+        }
+        other => Err(crate::exit::usage(format!(
+            "--route-approvers kind {other:?} is not recognized; pass `users:` or `group:`"
+        ))),
+    }
+}
+
+/// Build the binding map a write should send, from the three input forms.
+///
+/// `--routes-from` seeds the map and the repeatable flags apply on top, so a
+/// committed file can be spot-overridden on the command line. Every error is a
+/// usage error raised before the caller opens a connection.
+fn build_route_bindings(
+    route: &[String],
+    route_approvers: &[String],
+    routes_from: Option<&PathBuf>,
+) -> Result<BTreeMap<String, crate::api::ApprovalRouteBinding>> {
+    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBinding> = BTreeMap::new();
+
+    if let Some(path) = routes_from {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            crate::exit::usage(format!(
+                "--routes-from {}: {e}; the file must be JSON shaped \
+                 {{\"<route>\": {{\"channel\": \"C0123ABCD\"}}}}",
+                path.display()
+            ))
+        })?;
+        bindings = serde_json::from_str(&text).map_err(|e| {
+            crate::exit::usage(format!(
+                "--routes-from {}: {e}; expected JSON shaped \
+                 {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
+                 \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
+                path.display()
+            ))
+        })?;
+        for (name, binding) in &bindings {
+            validate_route_channel(name, &binding.channel)?;
+            if let Some(approvers) = &binding.approvers {
+                validate_parsed_approvers(name, approvers)?;
+            }
+        }
+    }
+
+    for raw in route {
+        let (name, channel) = split_route_arg("--route", raw)?;
+        validate_route_channel(name, channel)?;
+        bindings
+            .entry(name.to_string())
+            .and_modify(|b| b.channel = channel.to_string())
+            .or_insert_with(|| crate::api::ApprovalRouteBinding {
+                channel: channel.to_string(),
+                approvers: None,
+            });
+    }
+
+    for raw in route_approvers {
+        let (name, value) = split_route_arg("--route-approvers", raw)?;
+        let approvers = parse_route_approvers(value)?;
+        // Approvers narrow an EXISTING binding; without a channel there is
+        // nowhere for the card to post, and the API's model requires one. Refuse
+        // rather than invent a channel.
+        let binding = bindings.get_mut(name).ok_or_else(|| {
+            anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "--route-approvers {name:?} names a route with no channel to post its \
+                     card in"
+                ))
+                .with_fix(format!(
+                    "add --route {name}=<CHANNEL> to the same invocation (or name the \
+                     route in --routes-from): a write replaces the whole route map, so \
+                     every route it should keep must be present"
+                )),
+            )
+        })?;
+        binding.approvers = Some(approvers);
+    }
+
+    Ok(bindings)
+}
+
+/// Channel-shape check for one route binding, with the route named in the error.
+fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
+    if !SLACK_CHANNEL_ID.is_match(channel) {
+        return Err(crate::exit::CliError::usage(format!(
+            "route {route:?}: {channel:?} is not a Slack channel ID. Real Slack events \
+             carry the ID and the worker routes on it, so a #name binding never \
+             receives messages"
+        ))
+        .with_fix(
+            "pass the channel ID (e.g. C0123ABCD): find it in the channel's About tab, \
+             or at the end of the channel URL (.../archives/C0123ABCD)",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Re-run the flag-path approver checks over a `--routes-from` block, so the two
+/// input forms cannot disagree about what a valid binding is.
+fn validate_parsed_approvers(route: &str, approvers: &crate::api::ApprovalApprovers) -> Result<()> {
+    if approvers.group.is_none() && approvers.users.is_none() {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: an approvers block must declare group or users; omit the \
+             block entirely to keep card-channel membership"
+        )));
+    }
+    if let Some(group) = &approvers.group {
+        if !SLACK_USERGROUP_ID.is_match(group) {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: approvers group {group:?} is not a Slack user-group ID \
+                 (e.g. S0123ABCD); a C-prefixed value is a channel, not a user group"
+            )));
+        }
+    }
+    if let Some(users) = &approvers.users {
+        if users.is_empty() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: approvers users, when present, must contain at least \
+                 one user ID"
+            )));
+        }
+        for user in users {
+            if !SLACK_USER_ID.is_match(user) {
+                return Err(crate::exit::usage(format!(
+                    "route {route:?}: approvers user {user:?} is not a Slack user ID \
+                     (e.g. U0123ABCD, or W0123ABCD on enterprise grid)"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Output of `<tier> approvals <agent>`: the dry-run plan, the gate list (empty
@@ -3490,6 +3748,13 @@ pub enum ApprovalsOutput {
     },
     Resolved {
         record: crate::api::ApprovalRecord,
+    },
+    /// The agent's approval route bindings, read back after `--list-routes` or
+    /// after a write. `routes` empty means no route is bound, so any route the
+    /// bundle names escalates to a human rather than posting a card.
+    Routes {
+        agent: String,
+        routes: BTreeMap<String, crate::api::ApprovalRouteBinding>,
     },
 }
 
@@ -3533,6 +3798,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             }),
             ApprovalsOutput::Resolved { record } => serde_json::json!({
                 "resolved": approval_record_json(record),
+            }),
+            ApprovalsOutput::Routes { agent, routes } => serde_json::json!({
+                "agent": agent,
+                "routes": routes,
+                "count": routes.len(),
             }),
         }
     }
@@ -3591,7 +3861,58 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                     record.resolved_by.as_deref().unwrap_or("?")
                 ));
             }
+            ApprovalsOutput::Routes { agent, routes } => {
+                if routes.is_empty() {
+                    // Not a neutral empty list: with nothing bound, a route the
+                    // bundle names is escalated to a human instead of posting a
+                    // card, which is the state operators most often mistake for
+                    // "approvals are broken".
+                    ui.payload(&format!(
+                        "{agent}: no approval routes bound. Any route the bundle's \
+                         approvalPolicy names will escalate to a human rather than post \
+                         a card, since there is no channel to post it to"
+                    ));
+                } else {
+                    ui.payload(&format!(
+                        "{agent} — {} approval route(s) bound:",
+                        routes.len()
+                    ));
+                    for (name, binding) in routes {
+                        // Print WHERE and WHO as separate labelled facts: ADR-0034
+                        // unfused these two axes, and a single collapsed line would
+                        // re-fuse them in the operator's head.
+                        ui.kv(name, &format!("channel {}", binding.channel));
+                        ui.kv("", &format!("  approvers: {}", describe_approvers(binding)));
+                    }
+                }
+            }
         }
+    }
+}
+
+/// One line naming who may resolve a route's approvals, including the default.
+fn describe_approvers(binding: &crate::api::ApprovalRouteBinding) -> String {
+    match &binding.approvers {
+        None => format!(
+            "members of {} (the default: no approvers block declared)",
+            binding.channel
+        ),
+        Some(a) => match (&a.users, &a.group) {
+            // Mirror the API's precedence in the wording rather than hiding it:
+            // `users` wins over `group`, so a binding carrying both must not read
+            // as though the group also decides.
+            (Some(users), Some(group)) => format!(
+                "users {} (an explicit list wins over group {group}; the click channel is ignored)",
+                users.join(", ")
+            ),
+            (Some(users), None) => {
+                format!("users {} (the click channel is ignored)", users.join(", "))
+            }
+            (None, Some(group)) => {
+                format!("members of Slack user group {group} (the click channel is ignored)")
+            }
+            (None, None) => "unreadable: the block declares neither users nor group".to_string(),
+        },
     }
 }
 
@@ -3635,6 +3956,95 @@ pub async fn approvals(
     cmd: ApprovalCmd,
 ) -> Result<ApprovalsOutput> {
     let gate_mode = clear || !gate.is_empty();
+
+    // --route/--route-approvers/--routes-from/--list-routes/--clear-routes (#1052):
+    // the agent's route bindings, which decide WHERE a card posts and WHO may
+    // resolve it. Handled ahead of every other branch because it is a distinct
+    // object from both the tool gates and the pending records, and mixing it with
+    // either in one invocation would make the write's replace-the-whole-map
+    // semantics ambiguous.
+    let route_write = !cmd.route.is_empty()
+        || !cmd.route_approvers.is_empty()
+        || cmd.routes_from.is_some()
+        || cmd.clear_routes;
+    if route_write || cmd.list_routes {
+        if gate_mode || cmd.list || cmd.resolve.is_some() {
+            return Err(crate::exit::usage(
+                "the route-binding flags (--route/--route-approvers/--routes-from/\
+                 --list-routes/--clear-routes) address the agent's approval ROUTES; they \
+                 cannot be combined with --gate/--clear (tool gates) or --list/--resolve \
+                 (pending records). Run them as separate invocations",
+            ));
+        }
+        if route_write && cmd.list_routes {
+            return Err(crate::exit::usage(
+                "--list-routes reads; drop it to write, or run it as a second invocation",
+            ));
+        }
+        if cmd.clear_routes
+            && (!cmd.route.is_empty()
+                || !cmd.route_approvers.is_empty()
+                || cmd.routes_from.is_some())
+        {
+            return Err(crate::exit::usage(
+                "--clear-routes cannot be combined with --route/--route-approvers/\
+                 --routes-from (clear removes every binding)",
+            ));
+        }
+
+        // Parse and validate EVERYTHING before any network call, so a malformed
+        // entry can never leave a half-written binding map behind.
+        let bindings = if cmd.clear_routes {
+            BTreeMap::new()
+        } else {
+            build_route_bindings(&cmd.route, &cmd.route_approvers, cmd.routes_from.as_ref())?
+        };
+
+        if opts.dry_run {
+            let action = if route_write {
+                format!(
+                    "PATCH {}/agents/<id> approval_routes={} (a FULL REPLACEMENT of the map)",
+                    opts.api_url,
+                    serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into())
+                )
+            } else {
+                format!(
+                    "GET {}/agents/<id> (show approval route bindings)",
+                    opts.api_url
+                )
+            };
+            return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
+                lines: vec![format!(
+                    "{action}  (would resolve agent {:?} first)",
+                    opts.agent
+                )],
+            }));
+        }
+
+        let ui = crate::ui::ui();
+        let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+        let agent = client.find_agent(&opts.agent).await?;
+        let agent = if route_write {
+            let cl = ui.checklist();
+            let step = cl.step(&format!("updating approval routes for {}", agent.name));
+            match client.set_approval_routes(&agent.id, &bindings).await {
+                Ok(updated) => {
+                    step.done("updated");
+                    updated
+                }
+                Err(err) => {
+                    step.fail("failed");
+                    return Err(err);
+                }
+            }
+        } else {
+            agent
+        };
+        return Ok(ApprovalsOutput::Routes {
+            agent: agent.name,
+            routes: agent.approval_routes.unwrap_or_default(),
+        });
+    }
 
     // --resolve <id> --as <user>: resolve one live approval record (#506). It is
     // id-scoped, not gate config, so it is mutually exclusive with --gate/--clear/
@@ -4422,6 +4832,31 @@ pub fn skill_approvals_list_unavailable() -> anyhow::Error {
         "approvals --list/--resolve",
         APPROVALS_LIST_REASON,
         APPROVALS_LIST_ALT,
+    )
+}
+
+/// Why the route-binding flags cannot be answered at the skill tier (#1052).
+///
+/// A different reason from `APPROVALS_LIST_REASON`, and the difference matters:
+/// a pending record is missing because this tier runs no durable store, while a
+/// route binding is missing because it is per-AGENT platform config and this
+/// tier has no agent. Collapsing them would tell an operator to look in the
+/// wrong place.
+pub const APPROVALS_ROUTES_REASON: &str =
+    "an approval route binding is per-agent platform config (agents.approval_routes), and the skill tier runs a bare runner with no platform, no agent record, and therefore nothing to bind a route on";
+/// Where to bind approval routes instead.
+pub const APPROVALS_ROUTES_ALT: &str =
+    "use `curie local approvals <agent> --route <name>=<channel>` or `curie cluster approvals <agent> --route <name>=<channel>` for a deployed agent; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
+
+/// `skill approvals --route`/`--route-approvers`/`--routes-from`/`--list-routes`/
+/// `--clear-routes`: answered, but unavailable at this tier by construction
+/// (ADR-0041). Accepted so the tier reports WHY (exit 4) rather than erroring
+/// like an unknown-flag typo, matching `--list`/`--resolve` above.
+pub fn skill_approval_routes_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "approvals --route/--route-approvers/--routes-from/--list-routes/--clear-routes",
+        APPROVALS_ROUTES_REASON,
+        APPROVALS_ROUTES_ALT,
     )
 }
 

@@ -515,6 +515,27 @@ enum SkillAction {
         /// declined cleanly at this tier.
         #[arg(long)]
         reject: bool,
+        /// Bind an approval route to a channel. Accepted so it can be DECLINED
+        /// with a reason rather than error like a typo: a route binding is
+        /// per-agent platform config, and the skill tier has no platform.
+        #[arg(long = "route", value_name = "NAME=CHANNEL")]
+        route: Vec<String>,
+        /// Narrow a route's approvers. Declined at this tier for the same reason
+        /// as --route.
+        #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
+        route_approvers: Vec<String>,
+        /// Read the route map from a JSON file. Declined at this tier for the
+        /// same reason as --route.
+        #[arg(long = "routes-from", value_name = "FILE")]
+        routes_from: Option<PathBuf>,
+        /// Show the agent's route bindings. Declined at this tier for the same
+        /// reason as --route.
+        #[arg(long)]
+        list_routes: bool,
+        /// Remove every route binding. Declined at this tier for the same reason
+        /// as --route.
+        #[arg(long)]
+        clear_routes: bool,
     },
     // The about text is composed from the same consts the runtime `{error, fix}`
     // payload uses, so the discovery surface cannot drift from the answer
@@ -903,6 +924,27 @@ enum LocalAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
+        /// Bind a manifest approval route to the channel its card posts in, as
+        /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
+        /// the whole route map, like --gate does for tool gates.
+        #[arg(long = "route", value_name = "NAME=CHANNEL")]
+        route: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of where its card posts,
+        /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
+        /// card channel's members as the approvers.
+        #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
+        route_approvers: Vec<String>,
+        /// Read the whole route map from a JSON file, e.g.
+        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
+        /// top of it.
+        #[arg(long = "routes-from", value_name = "FILE")]
+        routes_from: Option<PathBuf>,
+        /// Show the agent's approval route bindings instead of its tool gates.
+        #[arg(long)]
+        list_routes: bool,
+        /// Remove every approval route binding on the agent.
+        #[arg(long)]
+        clear_routes: bool,
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
@@ -1416,6 +1458,27 @@ enum ClusterAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
+        /// Bind a manifest approval route to the channel its card posts in, as
+        /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
+        /// the whole route map, like --gate does for tool gates.
+        #[arg(long = "route", value_name = "NAME=CHANNEL")]
+        route: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of where its card posts,
+        /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
+        /// card channel's members as the approvers.
+        #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
+        route_approvers: Vec<String>,
+        /// Read the whole route map from a JSON file, e.g.
+        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
+        /// top of it.
+        #[arg(long = "routes-from", value_name = "FILE")]
+        routes_from: Option<PathBuf>,
+        /// Show the agent's approval route bindings instead of its tool gates.
+        #[arg(long)]
+        list_routes: bool,
+        /// Remove every approval route binding on the agent.
+        #[arg(long)]
+        clear_routes: bool,
     },
 }
 
@@ -1591,13 +1654,30 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear,
                 list,
                 resolve,
+                route,
+                route_approvers,
+                routes_from,
+                list_routes,
+                clear_routes,
                 ..
             } => {
                 // Answered, not absent (ADR-0041, ADR-0077): the durable
                 // list/resolve the local+cluster tiers have does not exist here,
                 // so the verb reports why and exits 4 rather than erroring like a
                 // typo. Gate config (view/set/clear) is unchanged.
-                if list || resolve.is_some() {
+                //
+                // The route flags decline with their OWN reason (#1052): a pending
+                // record is absent because this tier keeps no durable store, but a
+                // route binding is absent because it is per-agent platform config
+                // and this tier has no agent. Same wrong answer, different fix.
+                let routes_asked = !route.is_empty()
+                    || !route_approvers.is_empty()
+                    || routes_from.is_some()
+                    || list_routes
+                    || clear_routes;
+                if routes_asked {
+                    Err(commands::skill_approval_routes_unavailable())
+                } else if list || resolve.is_some() {
                     Err(commands::skill_approvals_list_unavailable())
                 } else {
                     emit(commands::skill_approvals(plugin_dir, gate, clear).await?)
@@ -1894,6 +1974,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
+                route,
+                route_approvers,
+                routes_from,
+                list_routes,
+                clear_routes,
             } => emit(
                 commands::approvals(
                     target.into(),
@@ -1906,6 +1991,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                         reject,
                         note,
                         actor_channel,
+                        route,
+                        route_approvers,
+                        routes_from,
+                        list_routes,
+                        clear_routes,
                     },
                 )
                 .await?,
@@ -2535,6 +2625,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
+                route,
+                route_approvers,
+                routes_from,
+                list_routes,
+                clear_routes,
             } => {
                 let ClusterAgentTarget {
                     agent,
@@ -2559,6 +2654,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                             reject,
                             note,
                             actor_channel,
+                            route,
+                            route_approvers,
+                            routes_from,
+                            list_routes,
+                            clear_routes,
                         },
                     )
                     .await?,

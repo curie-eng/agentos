@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.curietech.ai/cli/approvals/v1.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); or a single resolved record.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings, where each route's `channel` is where its card posts and its optional `approvers` block is who may resolve it.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -85,6 +85,43 @@
         "expires_at",
         "resolved_by"
       ]
+    },
+    "approvalRouteBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One route's workspace binding. `channel` is WHERE the card posts; the optional `approvers` block is WHO may act on it, and its absence means the card channel's members are the approvers (the zero-setup default).",
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "approvers": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "group": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "users": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "channel"
+      ]
     }
   },
   "oneOf": [
@@ -154,6 +191,29 @@
       },
       "required": [
         "resolved"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "routes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/approvalRouteBinding"
+          }
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agent",
+        "routes",
+        "count"
       ]
     }
   ]

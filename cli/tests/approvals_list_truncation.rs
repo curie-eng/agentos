@@ -71,6 +71,9 @@ fn pending_fields(out: &ApprovalsOutput) -> (usize, bool) {
         ApprovalsOutput::Resolved { .. } => {
             panic!("expected the pending list, not a resolved record")
         }
+        ApprovalsOutput::Routes { .. } => {
+            panic!("expected the pending list, not the route bindings")
+        }
     }
 }
 
@@ -194,6 +197,9 @@ async fn dry_run_plan_reports_the_same_limit_as_the_real_request() {
             );
         }
         ApprovalsOutput::Pending { .. } => panic!("expected a dry-run plan, not the pending list"),
+        ApprovalsOutput::Routes { .. } => {
+            panic!("expected a dry-run plan, not the route bindings")
+        }
         ApprovalsOutput::Gates { .. } => panic!("expected a dry-run plan, not the gate view"),
         ApprovalsOutput::Resolved { .. } => {
             panic!("expected a dry-run plan, not a resolved record")

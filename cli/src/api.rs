@@ -30,6 +30,41 @@ pub struct Agent {
     /// `#[serde(default)]` keeps older/leaner responses parsing to None.
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
+    /// Manifest route name -> workspace binding (#247, #420). Read back by
+    /// `approvals --list-routes` and written by `--route`/`--route-approvers`.
+    /// `#[serde(default)]` keeps a pre-#247 response parsing to None, which is
+    /// the same fact as "no routes bound".
+    #[serde(default)]
+    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBinding>>,
+}
+
+/// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.
+///
+/// The two fields are the axes ADR-0034 unfused and the CLI must keep visibly
+/// apart: `channel` is WHERE the card posts, `approvers` is WHO may act on it.
+/// Collapsing them in the output would re-fuse in presentation what the schema
+/// separates.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalRouteBinding {
+    pub channel: String,
+    /// Absent means the card channel's members are the approvers, the zero-setup
+    /// default. Skipped on serialize so a channel-only write sends no `approvers`
+    /// key at all: the API models the block with `extra="forbid"`, and an explicit
+    /// null is a different statement from an omitted key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Who may resolve a route's approvals, mirroring the committed
+/// `ApprovalApprovers`. The API settles the precedence (`users` wins over
+/// `group`); the CLI never reorders or merges them, it forwards what was asked
+/// for and lets the one authoritative validator answer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalApprovers {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users: Option<Vec<String>>,
 }
 
 /// One approval record, hand-mirroring the committed `ApprovalOut` (#506). Only
@@ -770,6 +805,38 @@ impl ApiClient {
             .await
             .context("PATCH /agents/{id} (approval gates)")?;
         Self::expect_ok(resp, "updating approval gates")
+            .await?
+            .json()
+            .await
+            .context("decoding updated agent")
+    }
+
+    /// Set the agent's approval route bindings: `PATCH /agents/{id}` with
+    /// `approval_routes`. Like `set_approval_tools` this is a FULL REPLACEMENT of
+    /// the map, not a merge, matching the field's semantics on `AgentUpdate`.
+    ///
+    /// An empty map is sent as JSON `null`, which is how the API spells "no
+    /// bindings" (`crud.update_agent_approval_routes` stores `routes or None`).
+    /// Sending `{}` would be a second spelling of the same state.
+    pub async fn set_approval_routes(
+        &self,
+        agent_id: &str,
+        routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
+    ) -> Result<Agent> {
+        let payload = if routes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::to_value(routes).context("encoding approval routes")?
+        };
+        let resp = self
+            .http
+            .patch(format!("{}/agents/{agent_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&json!({ "approval_routes": payload }))
+            .send()
+            .await
+            .context("PATCH /agents/{id} (approval routes)")?;
+        Self::expect_ok(resp, "updating approval routes")
             .await?
             .json()
             .await

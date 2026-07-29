@@ -15,10 +15,19 @@
         { "field": "repo_full_name", "why": "The deploy flow (ApiClient::resolve_agent/find_agent) matches and creates agents by name and reconciles slack_channel; it never reads the agent's linked git repo, so repo_full_name is not deserialized." },
         { "field": "behavior_packs", "why": "No CLI path reads an agent's behavior-pack list; deploy uploads a bundle rather than composing packs, so behavior_packs is never consumed." },
         { "field": "model", "why": "The CLI never displays or acts on an agent's default model (model routing is server- and claim-time bound, #473); the deploy and lifecycle verbs read only id/name/slack_channel." },
-        { "field": "approval_routes", "why": "The approvals verbs drive per-record gates via ApprovalRecord; the agent-level route roster (approval_routes) is enforced server-side and never read by the CLI." },
         { "field": "secrets", "why": "update_agent_secrets WRITES connector-secret names; the CLI never reads the stored secrets list back, so the response field is not modeled." },
         { "field": "created_at", "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/slack_channel only." }
       ]
+    },
+    {
+      "struct": "ApprovalRouteBinding",
+      "schema": "ApprovalRouteBinding",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalApprovers",
+      "schema": "ApprovalApprovers",
+      "omissions": []
     },
     {
       "struct": "ApprovalRecord",
