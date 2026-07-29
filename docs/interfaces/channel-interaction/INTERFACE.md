@@ -114,10 +114,19 @@ back into the contract:
    `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.post` (its
    settled/expired form via
    `apps/worker/src/curie_worker/blocks.py::expired_approval_card`), so no Block
-   Kit is built above the seam.
+   Kit is built above the seam. `allow_free_text` on that intent is rendered here
+   too: Slack expresses "this decision may carry free text" as a dialog opened by
+   the click, so the card carries the note-collecting action ids and the
+   dispatcher's `apps/dispatcher/src/curie_dispatcher/approval_actions.py::open_note_dialog`
+   opens the view.
 2. **Terminal (TUI selector)** — `cli/src/channel.rs`. It parses the same fence
    (`REPLY_FENCE`) into a `TerminalMessage` of plain lines plus actions, which the
-   TUI renders as a numbered selector per the TUI behavior above.
+   TUI renders as a numbered selector per the TUI behavior above. It expresses
+   `allow_free_text` as a typed reply alongside the numbered actions.
+
+Both renderers now honor `allow_free_text`; until #1053 the terminal one did and
+the Slack one silently dropped it, which is the sibling-path drift this catalog
+exists to make visible.
 
 The split is the point: Block Kit lives only in `blocks.py`, the numbered selector
 only in `channel.rs`, and the agent authors neither.

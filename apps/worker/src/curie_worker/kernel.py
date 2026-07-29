@@ -1078,6 +1078,16 @@ class Kernel:
                     prompt=summary,
                     confirm=Action(label="Approve", value=created.id),
                     cancel=Action(label="Reject", value=created.id),
+                    # An approval decision may carry a reason (#1053). This says
+                    # only that, semantically; each adapter decides how to
+                    # collect it (ADR-0020: the interaction is the port, the
+                    # widget is the adapter). Slack renders a dialog on the
+                    # click, the terminal renderer a typed reply. The note is
+                    # optional in every rendering, and the note the approver
+                    # leaves already reaches the requester -- the API stores it
+                    # on the record and build_resume_turn interpolates it into
+                    # the platform-authored resume text.
+                    allow_free_text=True,
                 ),
             )
             card_ts = await self._sink.post(

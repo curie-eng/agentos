@@ -291,7 +291,13 @@ class AsyncSlackSink:
         intent = message.interaction
         if isinstance(intent, ConfirmIntent):
             text, blocks = approval_card(
-                approval_id=intent.id, summary=message.text, requested_by=requested_by
+                approval_id=intent.id,
+                summary=message.text,
+                requested_by=requested_by,
+                # ADR-0020's semantic field, rendered by this adapter into the
+                # note-dialog buttons (#1053). Reading it here rather than in the
+                # kernel keeps the widget decision below the seam.
+                allow_free_text=intent.allow_free_text,
             )
         else:
             text, blocks = message.text, None

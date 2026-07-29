@@ -43,9 +43,21 @@ class FakeSocketClient:
     def __init__(self) -> None:
         self.logger = logging.getLogger("fake-socket")
         self.acked_envelope_ids: list[str] = []
+        # The ack BODY, not just the id (#1053). A block_actions ack is empty,
+        # but a view_submission ack is a channel in its own right: it is where a
+        # refused submission's reason is rendered, since the approver is standing
+        # in an open modal and an ephemeral would post behind it. A test cannot
+        # assert that from the envelope id alone.
+        self.ack_payloads: dict[str, Any] = {}
 
     def send_socket_mode_response(self, response: Any) -> None:
         self.acked_envelope_ids.append(response.envelope_id)
+        self.ack_payloads[response.envelope_id] = getattr(response, "payload", None)
+
+    def ack_payload_for(self, envelope_id: str) -> Any:
+        """The body this envelope was acked with, or None."""
+
+        return self.ack_payloads.get(envelope_id)
 
 # Compose defaults and connection params come from the shared curie_test_support.valkey helper.
 

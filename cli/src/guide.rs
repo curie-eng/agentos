@@ -233,9 +233,12 @@ pub fn primer() -> Primer {
                     title: "Declaring a route, then binding it",
                     detail: "A bundle declares routes in .claude-plugin/plugin.json under \
                              approvalPolicy.gates[], each entry {gate: <tool name>, route: \
-                             <route name>}. An operator then binds each route per agent as \
-                             approval_routes[<route>] = {channel, approvers}. `channel` is \
-                             WHERE the card posts; `approvers` is WHO may act on it.",
+                             <route name>}. An operator then binds each route per agent with \
+                             `approvals <AGENT> --route <name>=<channel>` (and optionally \
+                             `--route-approvers <name>=users:U1,U2` or `<name>=group:S1`). \
+                             `channel` is WHERE the card posts; `approvers` is WHO may act \
+                             on it. A write REPLACES the whole route map, so name every \
+                             route it should keep.",
                 },
                 ApprovalFact {
                     title: "Who may resolve is independent of where the card is",
@@ -246,6 +249,14 @@ pub fn primer() -> Primer {
                              room everyone reads while a narrow set decides. Every check runs \
                              server-side: the buttons are visible to all, and a refused click \
                              gets a private reason.",
+                },
+                ApprovalFact {
+                    title: "A decision can carry a reason",
+                    detail: "Approve and Reject open a short dialog for an OPTIONAL note \
+                             before the decision lands; cancelling it resolves nothing. A \
+                             note that is left reaches the requester on its own -- the API \
+                             stores it and the resume turn below interpolates it -- so a \
+                             skill does not collect or forward one itself.",
                 },
                 ApprovalFact {
                     title: "The resume turn is yours to handle",

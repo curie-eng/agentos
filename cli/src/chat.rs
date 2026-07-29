@@ -87,11 +87,19 @@ fn capped(budget: Duration, deadline: Instant) -> Duration {
     budget.min(deadline.saturating_duration_since(Instant::now()))
 }
 
-/// The Block Kit action id on the approval card's Approve button
-/// (`curie_dispatcher.approval_actions.APPROVE_ACTION_ID`). Its presence in a
-/// captured Slack call body is the unambiguous signal that a turn parked
-/// awaiting approval and posted a card (#529).
-pub const APPROVE_ACTION_ID: &str = "curie-approval-approve";
+/// The shared prefix of every approval-card Approve action id
+/// (`curie_dispatcher.approval_actions`). Its presence in a captured Slack call
+/// body is the unambiguous signal that a turn parked awaiting approval and
+/// posted a card (#529).
+///
+/// A PREFIX, deliberately, not one id: the card renders either
+/// `curie-approval-approve` (resolve on click) or `curie-approval-approve-note`
+/// (open a note dialog first, #1053), and this stub only needs to know a card
+/// was posted, not which variant. Matching the prefix covers both by
+/// construction. Anything that renames the ids must keep them sharing it, or
+/// this detection silently goes blind and `local message` stops reporting an
+/// awaiting-approval turn.
+pub const APPROVE_ACTION_ID_PREFIX: &str = "curie-approval-approve";
 
 /// One captured Slack Web API call at the stub.
 #[derive(Debug, Clone)]
@@ -236,7 +244,7 @@ async fn handle_call(
     // The approval card's Approve button carries this action id in the blocks,
     // which `extract_fields` does not parse -- match it on the raw body so an
     // awaiting-approval turn is detectable regardless of encoding (#529).
-    let approval_card = body.contains(APPROVE_ACTION_ID);
+    let approval_card = body.contains(APPROVE_ACTION_ID_PREFIX);
     // chat.update echoes the existing ts; a hypothetical new-message call has no
     // ts, so synthesize one so the response still looks like Slack.
     let ts_out = ts
@@ -274,7 +282,7 @@ pub enum Outcome {
 ///
 /// The turn counts as awaiting approval on EITHER of two signals:
 ///
-/// 1. An approval card was seen at this stub (the `APPROVE_ACTION_ID` in a
+/// 1. An approval card was seen at this stub (the `APPROVE_ACTION_ID_PREFIX` in a
 ///    captured call). Fastest and unambiguous, but not always present.
 /// 2. The latest placeholder text carries an authoritative trailing approval
 ///    notice ([`parse_approval_id`] validates the id as a UUID).

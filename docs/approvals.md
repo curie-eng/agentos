@@ -93,9 +93,19 @@ posted to the requesting channel. Silently widening a request to whoever happens
 in the requesting channel is exactly the failure the gate exists to prevent, so the
 platform refuses rather than guesses.
 
-> There is no `curie` flag for writing this binding yet; it is a `PATCH /agents/{id}`
-> today. Adding the verb is tracked in
-> [#1052](https://github.com/curie-eng/curie/issues/1052).
+Bind one from the CLI rather than by hand. A write REPLACES the whole map, so name
+every route it should keep:
+
+```bash
+curie local approvals my-agent --route finance=C0BBG383GLF \
+  --route-approvers finance=group:S0123ABCD
+
+curie local approvals my-agent --list-routes
+```
+
+`--route-approvers` also takes `users:U0123ABCD,W0456DEFG`, `--routes-from <file>` reads
+the whole map as JSON, and `--clear-routes` removes every binding. Nothing is written
+unless every entry parses, so a typo cannot leave a half-written map behind.
 
 ## Who may resolve
 
@@ -112,6 +122,12 @@ precedence is fixed: `users` beats `group` beats channel membership.
 Because `users` and `group` ignore the click channel entirely, a card can sit in a room
 everyone can read while only a narrow set may act. That unfusing of *where* from *who*
 is the whole subject of ADR-0034.
+
+Clicking Approve or Reject opens a short dialog for an **optional** note before the
+decision lands. Leave it blank and the decision is recorded with no note; type a reason
+and it is stored on the record, stamped onto the card in the approver channel, and
+carried to the requester in the resume turn below. Cancelling the dialog resolves
+nothing, so a misclick is recoverable.
 
 Three properties worth knowing before you design around this:
 

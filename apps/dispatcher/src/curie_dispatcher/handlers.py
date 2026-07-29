@@ -28,11 +28,16 @@ from slack_sdk.web import WebClient
 
 from .approval_actions import (
     APPROVE_ACTION_ID,
+    APPROVE_NOTE_ACTION_ID,
+    NOTE_MODAL_CALLBACK_ID,
     REJECT_ACTION_ID,
+    REJECT_NOTE_ACTION_ID,
     ApprovalResolveClient,
     build_resolver,
     is_approval_action,
+    open_note_dialog,
     process_approval_action,
+    process_note_submission,
 )
 from .config import DispatcherConfig
 from .queue import claim_event, enqueue
@@ -270,6 +275,50 @@ def register_handlers(
             resolver=approval_resolver,
             logger=logger,
         )
+
+    # The note-collecting variants (#1053): a click OPENS a dialog and resolves
+    # nothing; the submission below does the resolving. A card carries this pair
+    # only when the kernel emitted its Confirm intent with `allow_free_text`, so
+    # the immediate pair above stays the behavior for every other card.
+    @app.action(APPROVE_NOTE_ACTION_ID)
+    def _on_approve_with_note(ack: Callable[..., None], body: dict[str, Any]) -> None:
+        ack()
+        open_note_dialog(
+            body=body,
+            decision="approved",
+            web_client=web_client,
+            resolver=approval_resolver,
+            logger=logger,
+        )
+
+    @app.action(REJECT_NOTE_ACTION_ID)
+    def _on_reject_with_note(ack: Callable[..., None], body: dict[str, Any]) -> None:
+        ack()
+        open_note_dialog(
+            body=body,
+            decision="rejected",
+            web_client=web_client,
+            resolver=approval_resolver,
+            logger=logger,
+        )
+
+    # The dialog's submit. Unlike an action ack, a view ack CARRIES the response:
+    # ack() closes the dialog, ack(response_action="errors", ...) keeps it open
+    # with the refusal attached to the note field. That is the only surface a
+    # loser of the claim race can actually see, since an ephemeral posts behind
+    # the open modal.
+    @app.view(NOTE_MODAL_CALLBACK_ID)
+    def _on_note_submitted(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        _outcome, response = process_note_submission(
+            body=body,
+            web_client=web_client,
+            resolver=approval_resolver,
+            logger=logger,
+        )
+        if response is None:
+            ack()
+        else:
+            ack(response_action=response["response_action"], errors=response["errors"])
 
     # Any other Block Kit button click (a reply's action) becomes a turn. The
     # catch-all matches every action_id (including the approval ids above --

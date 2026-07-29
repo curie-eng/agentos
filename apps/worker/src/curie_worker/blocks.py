@@ -313,7 +313,11 @@ _APPROVAL_SUMMARY_MAX = 2900
 
 
 def approval_card(
-    *, approval_id: str, summary: str, requested_by: str
+    *,
+    approval_id: str,
+    summary: str,
+    requested_by: str,
+    allow_free_text: bool = False,
 ) -> tuple[str, list[dict[str, Any]]]:
     """The Block Kit approval card: what needs approval plus Approve/Reject.
 
@@ -321,14 +325,27 @@ def approval_card(
     (``curie_dispatcher.approval_actions``); each button's ``value`` carries
     the durable record id, so a click resolves exactly this approval. Returns
     ``(fallback_text, blocks)`` for ``chat.postMessage``.
+
+    ``allow_free_text`` is the ``ConfirmIntent`` field of the same name (ADR-0020),
+    rendered HERE because that is where a semantic intent becomes a widget: Slack
+    expresses "this decision may carry free text" as a dialog opened by the click,
+    so the card carries the note-collecting action ids instead of the immediate
+    ones. The terminal renderer expresses the same field as a typed reply
+    (``cli/src/channel.rs``); until now the Slack side ignored it, which left one
+    renderer honoring the field and its twin dropping it.
     """
 
     # Imported here (not module top) to keep the module importable in isolation;
     # the worker package already depends on the dispatcher for the queue seam.
     from curie_dispatcher.approval_actions import (
         APPROVE_ACTION_ID,
+        APPROVE_NOTE_ACTION_ID,
         REJECT_ACTION_ID,
+        REJECT_NOTE_ACTION_ID,
     )
+
+    approve_action = APPROVE_NOTE_ACTION_ID if allow_free_text else APPROVE_ACTION_ID
+    reject_action = REJECT_NOTE_ACTION_ID if allow_free_text else REJECT_ACTION_ID
 
     clamped = _truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX)
     fallback = _truncate(f"Approval required: {summary}", _SLACK_TEXT_MAX)
@@ -349,13 +366,13 @@ def approval_card(
                 {
                     **_button_shell("Approve"),
                     "style": "primary",
-                    "action_id": _truncate(APPROVE_ACTION_ID, _ACTION_ID_MAX),
+                    "action_id": _truncate(approve_action, _ACTION_ID_MAX),
                     "value": approval_id,
                 },
                 {
                     **_button_shell("Reject"),
                     "style": "danger",
-                    "action_id": _truncate(REJECT_ACTION_ID, _ACTION_ID_MAX),
+                    "action_id": _truncate(reject_action, _ACTION_ID_MAX),
                     "value": approval_id,
                 },
             ],
