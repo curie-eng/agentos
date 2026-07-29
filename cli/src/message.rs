@@ -2995,6 +2995,7 @@ mod tests {
             name: name.to_string(),
             slack_channel: channel.to_string(),
             approval_required_tools: None,
+            approval_routes: None,
         }
     }
 
@@ -3743,12 +3744,14 @@ mod tests {
                 name: "one".into(),
                 slack_channel: "C1".into(),
                 approval_required_tools: None,
+                approval_routes: None,
             },
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
                 slack_channel: "C2".into(),
                 approval_required_tools: None,
+                approval_routes: None,
             },
         ];
         // Explicit channel picks the matching agent's id.

@@ -63,6 +63,9 @@ fn gates(out: &ApprovalsOutput) -> (Vec<String>, Option<String>) {
         ApprovalsOutput::Pending { .. } | ApprovalsOutput::Resolved { .. } => {
             panic!("expected the gate view, not a pending/resolved record")
         }
+        ApprovalsOutput::Routes { .. } => {
+            panic!("expected the gate view, not the route bindings")
+        }
     }
 }
 
