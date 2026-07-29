@@ -120,9 +120,40 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
+      # third-party dependency (a tool binary, an image, a registry session, a
+      # build artifact) may be wrapped. Such a step can fail only on a network
+      # or registry error, never on a non-zero exit from this repository's own
+      # build, test, or gate, so a retry there cannot hide a defect in our
+      # code. Never wrap a step that builds, tests, or gates that code.
+      # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
       - name: Set up Buildx
+        id: setup_buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Back off before retrying Set up Buildx
+        if: steps.setup_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
+        id: ghcr_login
+        continue-on-error: true
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Back off before retrying Log in to GHCR
+        if: steps.ghcr_login.outcome == 'failure'
+        run: |
+          echo "Log in to GHCR failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Log in to GHCR (retry)
+        if: steps.ghcr_login.outcome == 'failure'
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
         with:
           registry: ghcr.io
@@ -177,14 +208,52 @@ jobs:
         name: [runner, api, dispatcher, worker, ui]
     steps:
       - name: Download digests
+        id: download_digests
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-image-${{ matrix.name }}-*
+          merge-multiple: true
+      - name: Back off before retrying Download digests
+        if: steps.download_digests.outcome == 'failure'
+        run: |
+          echo "Download digests failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Download digests (retry)
+        if: steps.download_digests.outcome == 'failure'
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-image-${{ matrix.name }}-*
           merge-multiple: true
       - name: Set up Buildx
+        id: setup_buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Back off before retrying Set up Buildx
+        if: steps.setup_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
+        id: ghcr_login
+        continue-on-error: true
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Back off before retrying Log in to GHCR
+        if: steps.ghcr_login.outcome == 'failure'
+        run: |
+          echo "Log in to GHCR failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Log in to GHCR (retry)
+        if: steps.ghcr_login.outcome == 'failure'
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
         with:
           registry: ghcr.io
@@ -241,8 +310,32 @@ jobs:
             echo "v=latest" >> "$GITHUB_OUTPUT"
           fi
       - name: Set up Buildx
+        id: setup_buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Back off before retrying Set up Buildx
+        if: steps.setup_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
+        id: ghcr_login
+        continue-on-error: true
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Back off before retrying Log in to GHCR
+        if: steps.ghcr_login.outcome == 'failure'
+        run: |
+          echo "Log in to GHCR failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Log in to GHCR (retry)
+        if: steps.ghcr_login.outcome == 'failure'
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
         with:
           registry: ghcr.io
@@ -289,14 +382,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
+        id: download_digests
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-worker-local-*
+          merge-multiple: true
+      - name: Back off before retrying Download digests
+        if: steps.download_digests.outcome == 'failure'
+        run: |
+          echo "Download digests failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Download digests (retry)
+        if: steps.download_digests.outcome == 'failure'
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-worker-local-*
           merge-multiple: true
       - name: Set up Buildx
+        id: setup_buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Back off before retrying Set up Buildx
+        if: steps.setup_buildx.outcome == 'failure'
+        run: |
+          echo "Set up Buildx failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Set up Buildx (retry)
+        if: steps.setup_buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
+        id: ghcr_login
+        continue-on-error: true
+        uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Back off before retrying Log in to GHCR
+        if: steps.ghcr_login.outcome == 'failure'
+        run: |
+          echo "Log in to GHCR failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Log in to GHCR (retry)
+        if: steps.ghcr_login.outcome == 'failure'
         uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
         with:
           registry: ghcr.io
@@ -480,6 +611,20 @@ jobs:
         # a rename artifact: as `curie-eng/agentos` the records read
         # `curie-eng~agentos~*` and never matched the then-`agentos-*` pattern.
         # Keep this prefix distinct from anything derivable from owner/repo.
+        id: download_binaries
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-asset-*
+          path: dist
+          merge-multiple: true
+      - name: Back off before retrying Download built binaries
+        if: steps.download_binaries.outcome == 'failure'
+        run: |
+          echo "Download built binaries failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Download built binaries (retry)
+        if: steps.download_binaries.outcome == 'failure'
         uses: actions/download-artifact@v8
         with:
           pattern: release-asset-*

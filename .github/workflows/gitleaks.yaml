@@ -24,6 +24,8 @@ jobs:
   gitleaks:
     name: gitleaks (full history)
     runs-on: ubuntu-latest
+    env:
+      GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
     steps:
       - uses: actions/checkout@v7
         with:
@@ -33,6 +35,41 @@ jobs:
           # full-history sweep the issue asks for (confirming the earlier history
           # rewrite left no secrets behind) and re-runs it on every push/PR/cron.
           fetch-depth: 0
+      # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
+      # third-party dependency (a tool binary, an image, a registry session, a
+      # build artifact) may be wrapped. Such a step can fail only on a network
+      # or registry error, never on a non-zero exit from this repository's own
+      # build, test, or gate, so a retry there cannot hide a defect in our
+      # code. Never wrap a step that builds, tests, or gates that code.
+      # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      #
+      # The pull is split out of the scan for exactly that reason: pulling the
+      # image is acquisition of a third party dependency, while `gitleaks
+      # detect` runs offline against the local checkout and is the gate. The
+      # retry above is prophylactic hardening of the registry fetch, not a
+      # response to observed evidence of a ghcr.io blip.
+      #
+      # Correction: issue #1106's Evidence table attributed the 2026-07-24
+      # gitleaks failures across three branches to a transient pull blip. The
+      # job logs show otherwise: `leaks found: 2`, exit code 1. The image
+      # pulled fine; those were true positives on a commit shared by all three
+      # branches. That is exactly why `gitleaks detect` must stay retry-free:
+      # retrying it would have rerun the scan against the same tree and
+      # silently buried two real leaks.
+      - name: Pull the gitleaks image
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if docker pull "$GITLEAKS_IMAGE"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 2 ]; then
+              echo "gitleaks image pull failed on attempt ${attempt} of 2, retrying in 15 seconds"
+              sleep 15
+            fi
+          done
+          echo "gitleaks image pull failed after 2 attempts"
+          exit 1
       # Run gitleaks from its official public image rather than the marketplace
       # action: the action requires a paid GITLEAKS_LICENSE for organization
       # accounts, while the CLI/image is MIT-licensed and free. Pinned to an
@@ -42,9 +79,11 @@ jobs:
       # legibility. Dependabot's github-actions ecosystem does not bump an image
       # ref inside a `run:` step, so bump this by hand when adopting a newer
       # gitleaks release -- re-resolve the digest with
-      # `docker buildx imagetools inspect ghcr.io/gitleaks/gitleaks:<tag>`.
+      # `docker buildx imagetools inspect ghcr.io/gitleaks/gitleaks:<tag>`. The
+      # reference now lives in this job's `env:` block as `GITLEAKS_IMAGE`, so
+      # the pull step above and the scan below share one pinned tag and digest.
       - name: Run gitleaks
         run: |
           docker run --rm -v "${{ github.workspace }}:/repo" \
-            ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            "$GITLEAKS_IMAGE" \
             detect --source /repo --redact --verbose --exit-code 1
