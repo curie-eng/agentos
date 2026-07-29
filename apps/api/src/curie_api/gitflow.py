@@ -8,6 +8,7 @@ only git-protocol access to the remote (local bare repos in tests) and never the
 GitHub API.
 """
 
+import base64
 import hashlib
 import hmac
 import os
@@ -15,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 
 from aci_protocol import EvalJob
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +72,55 @@ def environment_for_ref(ref: str | None, settings: Settings) -> Environment | No
     return None
 
 
+def _clone_credential_env(clone_url: str, settings: Settings) -> dict[str, str]:
+    """Git config env that authenticates the clone, or empty if not applicable.
+
+    Private repositories are the norm for a bundle -- it names internal hosts and
+    services -- so an unauthenticated clone makes git-flow unusable for most real
+    agents (#1058).
+
+    The credential travels as git config supplied through ``GIT_CONFIG_*``
+    environment variables rather than embedded in the URL. That keeps it out of
+    ``argv`` (so it cannot be read from ``ps`` or leak through a subprocess error
+    that echoes the command) and out of the cloned repo's ``.git/config``, which
+    URL-embedded credentials are persisted into.
+
+    The header is scoped to the clone URL's own host, so a webhook naming some
+    other host cannot make us send the token there.
+    """
+
+    token = settings.github_token
+    if not token or not clone_url.startswith("https://"):
+        return {}
+    host = urlsplit(clone_url).netloc
+    if not host:
+        return {}
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"http.https://{host}/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {basic}",
+    }
+
+
+def _git_failure_detail(exc: BaseException) -> str:
+    """git's stderr, which says *why* -- 'Repository not found' vs a timeout.
+
+    The old message interpolated the exception, whose repr is the argv and an
+    exit code: 'returned non-zero exit status 128' told an operator nothing, and
+    the actual reason was discarded despite being captured. argv is credential-
+    free by construction here (see ``_clone_credential_env``), but the tail is
+    bounded anyway so a hostile remote cannot flood the response.
+    """
+
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if isinstance(stderr, str) and stderr.strip():
+        return stderr.strip()[-400:]
+    return str(exc)[:200]
+
+
 def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
     """Mirror-clone the repo and return a tar of the tree at ``sha``.
 
@@ -87,6 +138,7 @@ def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
         **os.environ,
         "GIT_ALLOW_PROTOCOL": "file:https:http",
         "GIT_TERMINAL_PROMPT": "0",
+        **_clone_credential_env(clone_url, settings),
     }
     try:
         try:
@@ -105,7 +157,9 @@ def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
                 timeout=120,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise GitFlowError(f"could not archive {sha[:12]}: {exc}") from exc
+            raise GitFlowError(
+                f"could not archive {sha[:12]}: {_git_failure_detail(exc)}"
+            ) from exc
         return archived.stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -90,7 +90,10 @@ class Settings(BaseSettings):
     github_webhook_secret: str = "dev-webhook-secret"
     dev_branch: str = "dev"
     prod_branch: str = "main"
-    # Outbound GitHub commit-status API for the eval PR check (K1).
+    # Outbound GitHub credential. Used for the eval PR check's commit-status
+    # API (K1) AND to authenticate the git-flow bundle clone, without which
+    # a private repository cannot deploy at all (#1058). Sent as a scoped
+    # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
     github_token: str = ""
     # Upper bound on the GitHub webhook request body, enforced before the body is
