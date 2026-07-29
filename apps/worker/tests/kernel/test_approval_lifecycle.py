@@ -409,6 +409,11 @@ def test_pause_emits_a_confirm_intent_for_the_approval_card(make_harness) -> Non
             assert intent.confirm.value == "appr-1"
             assert intent.cancel.value == "appr-1"
             assert (intent.confirm.label, intent.cancel.label) == ("Approve", "Reject")
+            # #1053: the decision may carry a reason. Asserted at the KERNEL,
+            # not only at the renderer, because this is the field that decides
+            # whether the real product path offers a note at all -- a renderer
+            # test alone would stay green with the kernel emitting the default.
+            assert intent.allow_free_text is True
 
     asyncio.run(go())
 

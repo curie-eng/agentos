@@ -66,14 +66,24 @@ class ScriptedResolver:
         self.calls: list[dict[str, str]] = []
 
     def resolve(
-        self, approval_id: str, *, decision: str, resolved_by: str, actor_channel: str
+        self,
+        approval_id: str,
+        *,
+        decision: str,
+        resolved_by: str,
+        actor_channel: str,
+        note: str | None = None,
     ) -> ResolveOutcome:
+        # `note` is recorded, not ignored: the dialog path's whole point is that
+        # the approver's reason reaches the record, and a stand-in that dropped
+        # it would let that regress silently (#1053).
         self.calls.append(
             {
                 "approval_id": approval_id,
                 "decision": decision,
                 "resolved_by": resolved_by,
                 "actor_channel": actor_channel,
+                "note": note,
             }
         )
         return self.outcome
@@ -150,6 +160,9 @@ def test_authorized_click_resolves_and_stamps_the_card(
             "decision": "approved",
             "resolved_by": "U_MANAGER",
             "actor_channel": "C_MGRS",
+            # The immediate pair carries no note by construction; only the
+            # dialog pair can collect one (#1053).
+            "note": None,
         }
     ]
 

@@ -449,6 +449,52 @@ def test_approval_card_shape_and_click_contract() -> None:
     assert reject["style"] == "danger"
 
 
+def test_approval_card_renders_allow_free_text_as_the_note_buttons() -> None:
+    """ADR-0020's semantic field, rendered by this adapter (#1053).
+
+    `allow_free_text` says only "this decision may carry free text"; Slack
+    expresses that as a dialog opened by the click, so the card swaps in the
+    note-collecting action ids. Everything else about the card is unchanged --
+    the note is an enrichment, not a different card.
+    """
+
+    from curie_dispatcher.approval_actions import (
+        APPROVE_ACTION_ID,
+        APPROVE_NOTE_ACTION_ID,
+        REJECT_ACTION_ID,
+        REJECT_NOTE_ACTION_ID,
+    )
+    from curie_worker.blocks import approval_card
+
+    _, plain = approval_card(
+        approval_id="appr-1", summary="Give ACME a 20% discount", requested_by="U_AE"
+    )
+    _, with_note = approval_card(
+        approval_id="appr-1",
+        summary="Give ACME a 20% discount",
+        requested_by="U_AE",
+        allow_free_text=True,
+    )
+
+    plain_approve, plain_reject = plain[-1]["elements"]
+    note_approve, note_reject = with_note[-1]["elements"]
+    assert plain_approve["action_id"] == APPROVE_ACTION_ID
+    assert plain_reject["action_id"] == REJECT_ACTION_ID
+    assert note_approve["action_id"] == APPROVE_NOTE_ACTION_ID
+    assert note_reject["action_id"] == REJECT_NOTE_ACTION_ID
+
+    # Only the action ids differ: same record id, same styles, same body blocks.
+    assert note_approve["value"] == note_reject["value"] == "appr-1"
+    assert note_approve["style"] == "primary" and note_reject["style"] == "danger"
+    assert plain[:-1] == with_note[:-1]
+
+    # The CLI's Slack stub detects a posted card by matching the shared prefix
+    # of both Approve ids (cli/src/chat.rs APPROVE_ACTION_ID_PREFIX). Pin that
+    # relationship here: a rename that broke it would blind `local message` to
+    # awaiting-approval turns, and nothing else would fail.
+    assert APPROVE_NOTE_ACTION_ID.startswith(APPROVE_ACTION_ID)
+
+
 def test_approval_card_clamps_oversized_summary() -> None:
     from curie_worker.blocks import approval_card
 
