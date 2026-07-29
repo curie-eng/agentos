@@ -285,7 +285,10 @@ which calls
 [`apps/worker/src/curie_worker/kernel.py::Kernel._pause_for_approval`](apps/worker/src/curie_worker/kernel.py); ADR-0010,
 [`docs/adr/0010-approval-gates-and-human-in-the-loop.md`](docs/adr/0010-approval-gates-and-human-in-the-loop.md)).
 This is the governance story, and it is load-bearing: it is why an agent can hold
-a side-effectful tool call rather than firing it.
+a side-effectful tool call rather than firing it. The user-facing walkthrough of
+the whole plane -- declaring a route, binding it to a channel, who may resolve,
+and the resume turn a skill must handle -- is
+[`docs/approvals.md`](docs/approvals.md).
 
 The design property that makes it survive restarts is that **the paused turn is
 not a blocked consumer**. The event is marked done and acked immediately; the

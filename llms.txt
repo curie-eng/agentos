@@ -23,6 +23,7 @@ The point of the three targets (`skill` in-process, `local` via docker compose, 
 ## Architecture
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): the component map, message-flow and deploy-flow sequence diagrams, and the built vs deferred split.
+- [docs/approvals.md](docs/approvals.md): the human-in-the-loop plane, which spans every component and is not derivable from the command tree. How a turn pauses for a human decision, how an approval route is declared in the bundle and bound to a channel per agent, who is authorized to resolve it, and the `[approval resolved]` resume turn a skill must handle.
 - [docs/adr/](docs/adr/): the load-bearing architecture decisions, each with the live-cluster evidence behind it.
 - [AGENTS.md](AGENTS.md): the operative rules for working in this repo (verify commands, dev stack, frozen-contract escalation).
 

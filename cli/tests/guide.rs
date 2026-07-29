@@ -203,6 +203,37 @@ fn guide_documents_gvisor_fail_closed_opt_out() {
 }
 
 #[test]
+fn guide_documents_the_approval_plane() {
+    // AC (#1051): the approval plane is the least derivable subsystem in the
+    // product and the primer used to omit it entirely, so a coding agent reading
+    // only the CLI concluded cross-channel approval did not exist. Pin the four
+    // facts it cannot derive: the tool that raises a request, the where/who split
+    // on a route binding, that self-approval is refused, and the resume-turn
+    // prefix a skill must handle. Both renderings carry them.
+    let md = out_str(&run(&["guide"]));
+    let json = out_str(&run(&["guide", "--json"]));
+    for (label, text) in [("markdown", &md), ("json", &json)] {
+        for needle in [
+            "mcp__curie__request_approval",
+            "approval_routes",
+            "approvers.group",
+            "self-approval",
+            "[approval resolved]",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{label} primer missing the approval fact `{needle}`\n{text}"
+            );
+        }
+    }
+    // The section is structural in the markdown, not a stray landmine mention.
+    assert!(
+        md.contains("## Approvals"),
+        "markdown primer has no Approvals section\n{md}"
+    );
+}
+
+#[test]
 fn guide_is_registered_in_the_manifest() {
     let surface = Surface::load();
     assert!(

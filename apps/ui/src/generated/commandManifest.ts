@@ -1309,7 +1309,7 @@ export const commandManifest = {
           "name": "memory"
         },
         {
-          "about": "View or set the tools whose calls require human approval (`PATCH /agents/{id}`)",
+          "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",
           "args": [
             {
               "global": false,
@@ -3045,7 +3045,7 @@ export const commandManifest = {
           "name": "memory"
         },
         {
-          "about": "View or set the tools whose calls require human approval (`PATCH /agents/{id}`)",
+          "about": "The human-in-the-loop plane: list and resolve pending approval records, and view or set the tools whose calls require approval. Which channel an approval posts to, and who may resolve it, come from the agent's approval route bindings; `curie guide` explains the whole plane",
           "args": [
             {
               "global": false,

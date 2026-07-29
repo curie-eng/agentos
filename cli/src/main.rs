@@ -894,7 +894,10 @@ enum LocalAction {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
     },
-    /// View or set the tools whose calls require human approval (`PATCH /agents/{id}`).
+    /// The human-in-the-loop plane: list and resolve pending approval records,
+    /// and view or set the tools whose calls require approval. Which channel an
+    /// approval posts to, and who may resolve it, come from the agent's approval
+    /// route bindings; `curie guide` explains the whole plane.
     Approvals {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
@@ -1428,7 +1431,10 @@ enum ClusterAction {
         #[command(flatten)]
         target: ClusterAgentTarget,
     },
-    /// View or set the tools whose calls require human approval (`PATCH /agents/{id}`).
+    /// The human-in-the-loop plane: list and resolve pending approval records,
+    /// and view or set the tools whose calls require approval. Which channel an
+    /// approval posts to, and who may resolve it, come from the agent's approval
+    /// route bindings; `curie guide` explains the whole plane.
     Approvals {
         #[command(flatten)]
         target: ClusterAgentTarget,
