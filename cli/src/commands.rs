@@ -725,6 +725,7 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         api_url: opts.api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
+        repo: opts.repo,
         env: opts.env,
         label: opts.label,
         secret: opts.secret,
@@ -740,6 +741,11 @@ pub struct DeployNamedOpts {
     pub api_url: String,
     pub api_key: String,
     pub slack_channel: Option<String>,
+    /// `owner/name` to bind at agent CREATION so pushes to that repo deploy this
+    /// agent (ADR-0014). Identity, not config: it cannot be changed afterwards,
+    /// so omitting it here leaves the agent permanently unable to use git-flow
+    /// (#1064). Ignored with a warning when the agent already exists.
+    pub repo: Option<String>,
     pub env: DeployEnv,
     pub label: Option<String>,
     pub secret: Vec<String>,
@@ -2918,6 +2924,11 @@ pub struct DeployOpts {
     /// leaves an existing agent's channel untouched instead of masking intent
     /// with a default.
     pub slack_channel: Option<String>,
+    /// `owner/name` to bind at agent CREATION so pushes to that repo deploy this
+    /// agent (ADR-0014). Identity, not config: it cannot be changed afterwards,
+    /// so omitting it here leaves the agent permanently unable to use git-flow
+    /// (#1064). Ignored with a warning when the agent already exists.
+    pub repo: Option<String>,
     pub env: DeployEnv,
     pub label: Option<String>,
     /// Per-agent connector secret NAMES to bind on deploy (ADR-0009, #429). Each
@@ -3094,6 +3105,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             env,
             archive,
             &secrets,
+            opts.repo.as_deref(),
         )
         .await
     {
@@ -3109,6 +3121,12 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             return Err(err);
         }
     };
+
+    // A --repo that could not be applied is a silent no-op otherwise: the deploy
+    // succeeds, the agent looks fine, and git-flow never fires (#1064).
+    if let Some(note) = &outcome.repo_note {
+        ui.warn(note);
+    }
 
     let channel = match &outcome.channel {
         ChannelOutcome::Created(channel) => channel.clone(),
@@ -5956,6 +5974,7 @@ mod tests {
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
+            repo: None,
             env: super::DeployEnv::Dev,
             label: Some("v0".to_string()),
             secret: vec![],
@@ -6025,6 +6044,7 @@ mod tests {
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
+            repo: None,
             env: super::DeployEnv::Dev,
             label: Some("v0".to_string()),
             secret: vec!["GH_TOKEN".to_string()],
@@ -6058,6 +6078,7 @@ mod tests {
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
+            repo: None,
             env: super::DeployEnv::Dev,
             label: Some("v0".to_string()),
             secret: vec![],

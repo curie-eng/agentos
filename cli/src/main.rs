@@ -233,6 +233,16 @@ enum Command {
         /// omitting it leaves the deployed agent's channel untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
+        /// its dev/prod branches deploy it (ADR-0014).
+        ///
+        /// The binding is IDENTITY, not config: the platform sets it only when
+        /// the agent is created and `AgentUpdate` cannot change it. Deploying
+        /// without it creates an agent that can never use git-flow, and the
+        /// only remedy is recreating the agent (#1064). Passing it for an
+        /// agent that already exists warns and changes nothing.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: Option<String>,
         /// Target environment.
         #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
         env: DeployEnv,
@@ -870,6 +880,16 @@ enum LocalAction {
         /// omitting it leaves the deployed agent's channel untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
+        /// its dev/prod branches deploy it (ADR-0014).
+        ///
+        /// The binding is IDENTITY, not config: the platform sets it only when
+        /// the agent is created and `AgentUpdate` cannot change it. Deploying
+        /// without it creates an agent that can never use git-flow, and the
+        /// only remedy is recreating the agent (#1064). Passing it for an
+        /// agent that already exists warns and changes nothing.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: Option<String>,
         /// Target environment.
         #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
         env: DeployEnv,
@@ -1331,6 +1351,16 @@ enum ClusterAction {
         /// omitting it leaves the deployed agent's channel untouched.
         #[arg(long)]
         slack_channel: Option<String>,
+        /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
+        /// its dev/prod branches deploy it (ADR-0014).
+        ///
+        /// The binding is IDENTITY, not config: the platform sets it only when
+        /// the agent is created and `AgentUpdate` cannot change it. Deploying
+        /// without it creates an agent that can never use git-flow, and the
+        /// only remedy is recreating the agent (#1064). Passing it for an
+        /// agent that already exists warns and changes nothing.
+        #[arg(long = "repo", value_name = "OWNER/NAME")]
+        repo: Option<String>,
         /// Target environment.
         #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
         env: DeployEnv,
@@ -1944,6 +1974,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_url,
                 api_key,
                 slack_channel,
+                repo,
                 env,
                 label,
                 secret,
@@ -1957,6 +1988,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_url,
                         api_key,
                         slack_channel,
+                        repo,
                         env,
                         label,
                         secret,
@@ -2383,6 +2415,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 release,
                 api_key,
                 slack_channel,
+                repo,
                 env,
                 label,
                 secret,
@@ -2474,6 +2507,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_url,
                         api_key,
                         slack_channel,
+                        repo,
                         env,
                         label,
                         // Cluster connector-secret delivery is deferred to #440; no
@@ -2677,6 +2711,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             api_url,
             api_key,
             slack_channel,
+            repo,
             env,
             label,
             secret,
@@ -2687,6 +2722,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_url,
                     api_key,
                     slack_channel,
+                    repo,
                     env,
                     label,
                     secret,
