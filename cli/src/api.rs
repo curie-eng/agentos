@@ -26,6 +26,11 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub slack_channel: String,
+    /// The repository whose pushes deploy this agent (ADR-0014). Identity, set
+    /// only at creation -- `AgentUpdate` deliberately excludes it -- so the CLI
+    /// must send it up front or the agent can never reach git-flow (#1064).
+    #[serde(default)]
+    pub repo_full_name: Option<String>,
     /// Tool names gated behind human approval (#245). Present on `AgentOut`;
     /// `#[serde(default)]` keeps older/leaner responses parsing to None.
     #[serde(default)]
@@ -270,6 +275,10 @@ pub struct DeployOutcome {
     pub bundle: Bundle,
     pub deployment: Deployment,
     pub channel: ChannelOutcome,
+    /// Set when `--repo` could not be applied because the agent already exists
+    /// and its repo binding is immutable. Surfaced so the operator learns it
+    /// silently did nothing (#1064).
+    pub repo_note: Option<String>,
 }
 
 /// Whether this endpoint would send the `X-API-Key` over cleartext HTTP to a
@@ -316,6 +325,22 @@ fn warn_if_insecure(base_url: &str) {
     }
 }
 
+/// The `POST /agents` body. Pure so the shape is testable without a live API.
+///
+/// `repo_full_name` is sent only when asked: it is UNIQUE per agent, so an
+/// unsolicited value would 409 against whichever agent already owns that repo.
+fn agent_create_body(
+    name: &str,
+    slack_channel: &str,
+    repo_full_name: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({"name": name, "slack_channel": slack_channel});
+    if let Some(repo) = repo_full_name {
+        body["repo_full_name"] = json!(repo);
+    }
+    body
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -360,12 +385,18 @@ impl ApiClient {
             .context("decoding agent list")
     }
 
-    pub async fn create_agent(&self, name: &str, slack_channel: &str) -> Result<Agent> {
+    pub async fn create_agent(
+        &self,
+        name: &str,
+        slack_channel: &str,
+        repo_full_name: Option<&str>,
+    ) -> Result<Agent> {
+        let body = agent_create_body(name, slack_channel, repo_full_name);
         let resp = self
             .http
             .post(format!("{}/agents", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({"name": name, "slack_channel": slack_channel}))
+            .json(&body)
             .send()
             .await
             .context("POST /agents")?;
@@ -385,7 +416,7 @@ impl ApiClient {
         {
             return Ok(existing);
         }
-        self.create_agent(name, slack_channel).await
+        self.create_agent(name, slack_channel, None).await
     }
 
     pub async fn update_agent_channel(&self, agent_id: &str, slack_channel: &str) -> Result<Agent> {
@@ -436,36 +467,53 @@ impl ApiClient {
         &self,
         name: &str,
         slack_channel: Option<&str>,
-    ) -> Result<(Agent, ChannelOutcome)> {
+        repo_full_name: Option<&str>,
+    ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
         let existing = self
             .list_agents()
             .await?
             .into_iter()
             .find(|a| a.name == name);
         match existing {
-            Some(agent) => match slack_channel {
-                Some(channel) if channel != agent.slack_channel => {
-                    let from = agent.slack_channel.clone();
-                    let updated = self.update_agent_channel(&agent.id, channel).await?;
-                    let to = updated.slack_channel.clone();
-                    Ok((updated, ChannelOutcome::Updated { from, to }))
-                }
-                other => {
-                    let channel = agent.slack_channel.clone();
-                    Ok((
-                        agent,
+            Some(agent) => {
+                // The repo binding is identity: `AgentUpdate` excludes it, so a
+                // PATCH would return 200 and change nothing. Say so plainly
+                // rather than let the operator believe it took (#1064).
+                let repo_note = match (repo_full_name, agent.repo_full_name.as_deref()) {
+                    (Some(want), Some(have)) if want == have => None,
+                    (Some(want), Some(have)) => Some(format!(
+                        "agent is already bound to {have}; --repo {want} was NOT applied \
+                         (the repo binding is set at creation and cannot be changed)"
+                    )),
+                    (Some(want), None) => Some(format!(
+                        "agent exists with no repo binding; --repo {want} was NOT applied \
+                         (the binding is set at creation only, so this agent cannot use \
+                         git-flow -- recreate it to bind one)"
+                    )),
+                    (None, _) => None,
+                };
+                let outcome = match slack_channel {
+                    Some(channel) if channel != agent.slack_channel => {
+                        let from = agent.slack_channel.clone();
+                        let updated = self.update_agent_channel(&agent.id, channel).await?;
+                        let to = updated.slack_channel.clone();
+                        return Ok((updated, ChannelOutcome::Updated { from, to }, repo_note));
+                    }
+                    other => {
+                        let channel = agent.slack_channel.clone();
                         ChannelOutcome::Unchanged {
                             channel,
                             passed: other.is_some(),
-                        },
-                    ))
-                }
-            },
+                        }
+                    }
+                };
+                Ok((agent, outcome, repo_note))
+            }
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
-                let agent = self.create_agent(name, channel).await?;
+                let agent = self.create_agent(name, channel, repo_full_name).await?;
                 let outcome = ChannelOutcome::Created(agent.slack_channel.clone());
-                Ok((agent, outcome))
+                Ok((agent, outcome, None))
             }
         }
     }
@@ -557,8 +605,11 @@ impl ApiClient {
         environment: &str,
         archive: Vec<u8>,
         secrets: &std::collections::BTreeMap<String, String>,
+        repo_full_name: Option<&str>,
     ) -> Result<DeployOutcome> {
-        let (agent, channel) = self.resolve_agent(agent_name, slack_channel).await?;
+        let (agent, channel, repo_note) = self
+            .resolve_agent(agent_name, slack_channel, repo_full_name)
+            .await?;
         // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
         // a freshly created agent and a redeploy that rotates a value; an empty
         // map leaves the agent's current secrets untouched.
@@ -578,6 +629,7 @@ impl ApiClient {
             bundle,
             deployment,
             channel,
+            repo_note,
         })
     }
 
@@ -953,7 +1005,25 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::is_insecure_endpoint;
+    use super::{agent_create_body, is_insecure_endpoint};
+
+    #[test]
+    fn create_agent_body_omits_repo_unless_asked() {
+        // repo_full_name is UNIQUE per agent, so sending an unsolicited value
+        // would 409 against whichever agent already owns that repo.
+        let body = agent_create_body("bot", "C123", None);
+        assert_eq!(body["name"], "bot");
+        assert_eq!(body["slack_channel"], "C123");
+        assert!(body.get("repo_full_name").is_none());
+    }
+
+    #[test]
+    fn create_agent_body_binds_the_repo_when_asked() {
+        // Creation is the ONLY chance: AgentUpdate excludes repo_full_name, so
+        // an agent created without it can never reach git-flow (#1064).
+        let body = agent_create_body("bot", "C123", Some("acme/bundle"));
+        assert_eq!(body["repo_full_name"], "acme/bundle");
+    }
 
     #[test]
     fn https_is_always_secure() {

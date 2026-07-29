@@ -63,6 +63,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
             "dev",
             archive,
             &std::collections::BTreeMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -176,6 +177,7 @@ async fn run_deploy(client: &ApiClient, channel: Option<&str>) -> ChannelOutcome
             "dev",
             archive,
             &std::collections::BTreeMap::new(),
+            None,
         )
         .await
         .unwrap()
