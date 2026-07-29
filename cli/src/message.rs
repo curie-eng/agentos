@@ -2994,6 +2994,7 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             slack_channel: channel.to_string(),
+            repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
         }
@@ -3743,6 +3744,7 @@ mod tests {
                 id: "a1".into(),
                 name: "one".into(),
                 slack_channel: "C1".into(),
+                repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
             },
@@ -3750,6 +3752,7 @@ mod tests {
                 id: "a2".into(),
                 name: "two".into(),
                 slack_channel: "C2".into(),
+                repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
             },
