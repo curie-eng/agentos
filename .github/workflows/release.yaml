@@ -386,7 +386,7 @@ jobs:
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
-          name: curie-${{ matrix.target }}
+          name: release-asset-curie-${{ matrix.target }}
           path: |
             dist/curie-${{ matrix.target }}
             dist/curie-${{ matrix.target }}.spdx.json
@@ -440,7 +440,7 @@ jobs:
       - name: Upload chart artifact
         uses: actions/upload-artifact@v7
         with:
-          name: curie-chart
+          name: release-asset-chart
           path: |
             dist/curie-*.tgz
             dist/curie-*.tgz.spdx.json
@@ -448,7 +448,7 @@ jobs:
       - name: Upload release compose artifact
         uses: actions/upload-artifact@v7
         with:
-          name: curie-compose
+          name: release-asset-compose
           path: |
             dist/compose.release.yaml
             dist/compose.release.yaml.spdx.json
@@ -470,9 +470,19 @@ jobs:
         with:
           persist-credentials: false
       - name: Download built binaries
+        # The `release-asset-` prefix is load-bearing, not decoration. Every
+        # docker/build-push-action step also uploads a build record artifact
+        # auto-named `<owner>~<repo>~<id>.dockerbuild` -- i.e.
+        # `curie-eng~curie~ABC123.dockerbuild`. A `curie-*` pattern here matches
+        # those too, sweeping 12 build records into dist/ and tripping
+        # release/integrity.py's undeclared-asset gate, which fails the whole
+        # publish (it did exactly that on the first v0.5.0 tag). The collision is
+        # a rename artifact: as `curie-eng/agentos` the records read
+        # `curie-eng~agentos~*` and never matched the then-`agentos-*` pattern.
+        # Keep this prefix distinct from anything derivable from owner/repo.
         uses: actions/download-artifact@v8
         with:
-          pattern: curie-*
+          pattern: release-asset-*
           path: dist
           merge-multiple: true
       - name: Resolve version
