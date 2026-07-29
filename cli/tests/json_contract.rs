@@ -28,12 +28,41 @@ fn validator(schema: &serde_json::Value) -> jsonschema::Validator {
 #[test]
 fn status_json_validates_against_status_schema() {
     let schema = load_schema("status.schema.json");
-    let value = status_json("http://127.0.0.1:8787", &SessionStatus::Done);
+    let digest = "a".repeat(64);
+    let value = status_json(
+        "http://127.0.0.1:8787",
+        &SessionStatus::Done,
+        Some(digest.as_str()),
+    );
     let v = validator(&schema);
     assert!(
         v.is_valid(&value),
         "status_json output must validate against status.schema.json: {value}"
     );
+    // The recorded bundle identity (#1087) is what makes an agent able to
+    // confirm that messaging and eval ran the same artifact.
+    assert_eq!(value["bundle_digest"], serde_json::json!(digest));
+}
+
+/// The no-runner-recorded case (#1087, edge case E10): an agent pointing `skill
+/// status` at an arbitrary `--url`, or a `.curie/runner.json` written before
+/// #1087, must still emit the key -- as JSON `null`, never a missing key -- so a
+/// consumer can read it unconditionally. Proves the schema's
+/// `["string", "null"]` union, not just the happy path.
+#[test]
+fn status_json_validates_with_no_recorded_digest() {
+    let schema = load_schema("status.schema.json");
+    let value = status_json("http://127.0.0.1:8787", &SessionStatus::Done, None);
+    let v = validator(&schema);
+    assert!(
+        v.is_valid(&value),
+        "a null bundle_digest must still validate against status.schema.json: {value}"
+    );
+    assert!(
+        value.get("bundle_digest").is_some(),
+        "the key is always emitted, never omitted: {value}"
+    );
+    assert!(value["bundle_digest"].is_null(), "{value}");
 }
 
 #[test]
@@ -55,11 +84,48 @@ fn eval_json_validates_against_eval_schema() {
             "i do not know".to_string(),
         ),
     ];
-    let value = eval_json(&results);
+    let value = eval_json(&results, None);
     let v = validator(&schema);
     assert!(
         v.is_valid(&value),
         "eval_json output must validate against eval.schema.json: {value}"
+    );
+}
+
+/// #1087 AC2 is a "confirm" criterion, so the digest has to be readable from the
+/// MACHINE surface: `docs/agents.md` bans stderr as agent-facing evidence, and a
+/// human note is all the sweep used to emit. Both states are pinned -- a real
+/// digest and the null one -- because an agent consumer reads the key
+/// unconditionally, so it must never be simply omitted.
+#[test]
+fn eval_json_carries_the_bundle_digest_and_emits_null_when_none_applies() {
+    let schema = load_schema("eval.schema.json");
+    let v = validator(&schema);
+    let results = vec![(
+        "case-pass".to_string(),
+        CaseOutcome::Pass,
+        1.0_f64,
+        "4".to_string(),
+    )];
+
+    let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    let with_digest = eval_json(&results, Some(digest));
+    assert!(v.is_valid(&with_digest), "{with_digest}");
+    assert_eq!(
+        with_digest["bundle_digest"], digest,
+        "the eval payload must report the bundle it graded, so an agent can \
+         compare it against `skill status --json`: {with_digest}"
+    );
+
+    let without = eval_json(&results, None);
+    assert!(v.is_valid(&without), "{without}");
+    assert!(
+        without.get("bundle_digest").is_some(),
+        "the key is always emitted, never omitted: {without}"
+    );
+    assert!(
+        without["bundle_digest"].is_null(),
+        "no digest applies, so it is null -- never a borrowed one: {without}"
     );
 }
 
@@ -79,7 +145,7 @@ fn a_plumbing_ok_row_validates_and_is_neither_passed_nor_failed() {
         0.5_f64,
         "all done".to_string(),
     )];
-    let value = eval_json(&results);
+    let value = eval_json(&results, None);
     let v = validator(&schema);
     assert!(
         v.is_valid(&value),
@@ -123,7 +189,7 @@ fn the_eval_rollup_partitions_every_row_across_the_three_outcomes() {
             "all done".to_string(),
         ),
     ];
-    let value = eval_json(&results);
+    let value = eval_json(&results, None);
     assert!(validator(&schema).is_valid(&value), "{value}");
     assert_eq!(value["total"], 3, "{value}");
     assert_eq!(value["passed"], 1, "{value}");
@@ -750,7 +816,7 @@ fn eval_schema_gate_has_teeth() {
         1.0_f64,
         "ok".to_string(),
     )];
-    let mut value = eval_json(&results);
+    let mut value = eval_json(&results, None);
     // Strip a required top-level key; a schema with real teeth must now reject.
     value
         .as_object_mut()
@@ -949,7 +1015,38 @@ fn sweep_json_validates() {
             plumbing: 0,
         },
     ];
-    assert_valid("sweep.schema.json", &curie::commands::sweep_json(&rows));
+    assert_valid(
+        "sweep.schema.json",
+        &curie::commands::sweep_json(&rows, None),
+    );
+}
+
+/// The sweep half of #1087 AC2: same reasoning as
+/// `eval_json_carries_the_bundle_digest_and_emits_null_when_none_applies`. The
+/// sweep is where the digest was a stderr note ONLY, so this is the assertion
+/// that makes the criterion confirmable at all.
+#[test]
+fn sweep_json_carries_the_bundle_digest_and_emits_null_when_none_applies() {
+    let rows = vec![SweepRow {
+        model: "opus".to_string(),
+        passed: 3,
+        completed: 3,
+        total: 3,
+        plumbing: 0,
+    }];
+
+    let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    let with_digest = curie::commands::sweep_json(&rows, Some(digest));
+    assert_valid("sweep.schema.json", &with_digest);
+    assert_eq!(with_digest["bundle_digest"], digest, "{with_digest}");
+
+    let without = curie::commands::sweep_json(&rows, None);
+    assert_valid("sweep.schema.json", &without);
+    assert!(
+        without.get("bundle_digest").is_some(),
+        "the key is always emitted, never omitted: {without}"
+    );
+    assert!(without["bundle_digest"].is_null(), "{without}");
 }
 
 #[test]

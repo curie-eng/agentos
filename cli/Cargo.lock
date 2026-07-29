@@ -695,6 +695,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "syn 3.0.3",
  "tar",
  "tempfile",

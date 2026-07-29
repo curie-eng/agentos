@@ -226,7 +226,7 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 | `curie skill up` | Boot the local runner image in Docker with the ACI boot env (runner/README.md recipe), wait for health, print the boxed env summary. `--fake-model` runs offline; `--network` and `--otel-endpoint` join the compose stack for traces; `--model <id>` forwards `CURIE_MODEL` (omit for the SDK default). `--secret <NAME>` forwards bundle MCP secrets by name, using Curie private storage when the env var is not exported. `--env-file <PATH>` reads the model credential from a bundle `.env` as a last-resort fallback (precedence: shell env > stored secret > file; only `CURIE_CREDENTIALS`/`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` are read), so a bundle boots live with no `source` step (#749). A leftover container of the same name fails the boot with the remedies rather than a raw docker conflict; `--replace` removes it and boots fresh. |
 | `curie skill check` | Run an offline, credential free MCP load check and report declared servers, matches, and verdict. |
 | `curie skill approvals` | View the bundle's declared `approvalPolicy` gates, read straight from `.claude-plugin/plugin.json` (or `plugin.json`); no docker, no network. `--gate <TOOL>` (repeatable) or `--clear` mutate nothing -- they print the `CURIE_APPROVAL_REQUIRED_TOOLS=...` assignment to export, then re-run your original `skill up` invocation with `--secret CURIE_APPROVAL_REQUIRED_TOOLS` added, since the runner only resolves that env once at container boot. |
-| `curie skill versions` | Not available at this tier (exit 4): `skill up` runs the bundle bytes on disk, so no deployed version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
+| `curie skill versions` | Not available at this tier (exit 4): `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
 | `curie skill memory` | Not available at this tier (exit 4): this tier configures no memory namespace. Use `curie local memory <agent>` or `curie cluster memory <agent>`. |
 | `curie skill message "..."` | Send a synthetic Slack event: POST an ACI `event` frame to the local runner and stream the NDJSON reply (text deltas, tool notes, side effect flags, final). Abort a live turn with Ctrl-C. |
 | `curie skill eval` | Run `evals/cases.json` through the runner as `eval_case` events; prints a per case result table plus a pass or fail rollup; nonzero exit on failure. |
@@ -238,6 +238,15 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 `skill down` run from the bundle directory and resolve the runner from it, or
 accept `--url`. Setting `skill up --model <id>` makes token usage attributable
 in Langfuse traces.
+
+`skill up` also packs the bundle into a content-addressed snapshot under
+`<bundle>/.curie/snapshots/<digest>/` and mounts THAT read-only, matching what
+the local and cluster tiers do with a deployed bundle. So editing a bundle file
+on the host does not reach the running runner: re-run `curie skill up
+--replace` and confirm the new `bundle_digest` in `curie skill status --json`.
+`evals/cases.json` is the exception -- `skill eval` reads it live from source,
+so a contract edit needs no restart. `skill down` (and `--replace`) release the
+snapshot along with the container.
 
 ## `local` target: full platform via compose, no Slack
 

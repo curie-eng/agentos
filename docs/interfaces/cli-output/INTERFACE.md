@@ -95,7 +95,7 @@ Nine, all in the CLI crate:
   longer schema-free: there are 32 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — all 32 are validated against real
-  `to_json()` output across 53 tests in `cli/tests/json_contract.rs`. Those tests
+  `to_json()` output across 56 tests in `cli/tests/json_contract.rs`. Those tests
   drive each output type's `to_json()` once per output variant rather than calling
   the pure builder functions behind it, so a variant whose `to_json()` arm drifts
   from the schema is caught even when the builder it delegates to still validates.

@@ -51,6 +51,10 @@
           "never_completed"
         ]
       }
+    },
+    "bundle_digest": {
+      "type": ["string", "null"],
+      "description": "sha256 of the tar.gz snapshot every runner in the sweep mounted (#1087). Always present; the recorded runner's digest when the skill sweep reused it, the sweep's own ephemeral snapshot digest when it packed one, and null at the local/cluster tiers, which grade a deployed version rather than a locally snapshotted bundle."
     }
   },
   "required": [

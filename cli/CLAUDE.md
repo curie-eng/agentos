@@ -100,7 +100,13 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
 - **`skill up` records container state in `.curie/runner.json`** (gitignored
   by the scaffold) so `skill message`/`skill eval`/`skill status`/`skill down` can resolve the
   running container from the bundle directory alone. Do not add a second
-  state-tracking file for the same purpose.
+  state-tracking file for the same purpose. `.curie/` holds one other thing:
+  `skill up` packs the bundle into a content-addressed snapshot at
+  `.curie/snapshots/<digest>/` and mounts THAT read-only for the runner's
+  lifetime, so a host edit does not reach a running runner (`skill up
+  --replace` is the way to pick one up; `skill status --json` reports the loaded
+  `bundle_digest`). The snapshot is owned by the record and released by `skill
+  down`; `evals/cases.json` is deliberately still read live from source.
 - **The local skill verbs stay fully offline once their local inputs exist; the
   local and cluster target verbs are the exception.** `init`, `skill up`,
   `skill down`, `skill status`, `skill message`, and `skill eval` must keep

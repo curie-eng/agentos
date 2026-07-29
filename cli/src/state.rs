@@ -31,6 +31,18 @@ pub struct RunnerState {
     pub network: Option<String>,
     #[serde(default)]
     pub model_base_url: Option<String>,
+    /// sha256 of the tar.gz this runner's bundle was packed into (#1087),
+    /// computed exactly the way `apps/api` computes it on deploy: sha256 of the
+    /// packed archive bytes. It identifies THESE bytes from THIS packer, not the
+    /// source tree in the abstract -- the tar carries per-file mtime/uid/gid, so
+    /// the same content freshly cloned elsewhere digests differently. `None`
+    /// only for a record written before #1087.
+    #[serde(default)]
+    pub bundle_digest: Option<String>,
+    /// The materialized snapshot directory this runner has mounted, recorded
+    /// (never re-derived) so teardown removes exactly what boot created.
+    #[serde(default)]
+    pub bundle_snapshot_dir: Option<String>,
 }
 
 fn state_path(dir: &Path) -> PathBuf {
@@ -245,6 +257,8 @@ mod tests {
             ollama_container: None,
             network: None,
             model_base_url: None,
+            bundle_digest: None,
+            bundle_snapshot_dir: None,
         }
     }
 
@@ -300,6 +314,70 @@ mod tests {
         let loaded = load(dir.path()).unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().ollama_container, None);
+    }
+
+    /// #1087: what boot created, recorded so teardown removes exactly that --
+    /// asserted on the bytes that survive a real write/read round trip through
+    /// `.curie/runner.json`, not on the in-memory struct alone.
+    #[test]
+    fn round_trip_preserves_the_bundle_snapshot_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest = "a".repeat(64);
+        let snapshot_dir = format!("/tmp/deal-desk/.curie/snapshots/{digest}");
+        let state = RunnerState {
+            bundle_digest: Some(digest.clone()),
+            bundle_snapshot_dir: Some(snapshot_dir.clone()),
+            ..sample()
+        };
+        save(dir.path(), &state).unwrap();
+
+        let loaded = load(dir.path()).unwrap().expect("the record round trips");
+        assert_eq!(loaded.bundle_digest, Some(digest.clone()));
+        assert_eq!(loaded.bundle_snapshot_dir, Some(snapshot_dir.clone()));
+        // The file itself is the contract a later `skill down` and `skill
+        // status` read, so pin the keys on disk rather than only in memory.
+        let raw = std::fs::read_to_string(dir.path().join(STATE_DIR).join(STATE_FILE)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["bundle_digest"], serde_json::json!(digest));
+        assert_eq!(
+            parsed["bundle_snapshot_dir"],
+            serde_json::json!(snapshot_dir)
+        );
+    }
+
+    /// A `.curie/runner.json` written before #1087 must still load: the file
+    /// outlives the CLI version that wrote it, and `load` treats a parse failure
+    /// as a hard error (see `corrupt_state_is_an_error_not_a_silent_none`), so a
+    /// missing key without `serde(default)` would break `skill down` on every
+    /// bundle upgraded in place.
+    #[test]
+    fn load_accepts_older_state_without_bundle_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(STATE_DIR)).unwrap();
+        std::fs::write(
+            dir.path().join(STATE_DIR).join(STATE_FILE),
+            r#"{
+  "container_id": "abc123",
+  "container_name": "curie-runner-local",
+  "image": "curie-runner",
+  "port": 7245,
+  "base_url": "http://localhost:7245",
+  "session_id": "local-1",
+  "plugin_dir": "/tmp/deal-desk",
+  "fake_model": true,
+  "ollama_container": null,
+  "network": null,
+  "model_base_url": null
+}"#,
+        )
+        .unwrap();
+
+        let loaded = load(dir.path())
+            .expect("a pre-#1087 record must parse, not error")
+            .expect("a pre-#1087 record is a record, not an absent one");
+        assert_eq!(loaded.bundle_digest, None);
+        assert_eq!(loaded.bundle_snapshot_dir, None);
+        assert_eq!(loaded.container_name, "curie-runner-local");
     }
 
     fn default_cli_turn_args() -> CliTurnArgs {

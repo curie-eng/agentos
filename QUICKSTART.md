@@ -61,7 +61,9 @@ Curie itself — see [Where to go next](#where-to-go-next).
 That is the full loop. `curie skill up` starts the runner container,
 `curie skill message` sends a synthetic event and streams the reply, and
 `curie skill down` stops it. Edit `skills/my-agent/SKILL.md` in the bundle
-and re-run steps 2 and 3 to see your change answer.
+and re-run steps 2 and 3 to see your change answer -- `skill up` runs an
+immutable snapshot of the bundle, so an edit only reaches a runner you have
+restarted (`curie skill up --replace` if one is still running).
 
 A committed first-party example lives at `examples/weather/`: `cd
 examples/weather && curie skill up` runs it from a clean clone. For the
