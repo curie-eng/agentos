@@ -1174,6 +1174,40 @@ pub fn plan_recorded_state(
     }
 }
 
+/// The leading characters of a bundle digest, for a one-line summary (#1087).
+/// Taken by character rather than by byte slice so an unexpectedly short digest
+/// truncates instead of panicking.
+fn short_digest(digest: &str) -> String {
+    digest.chars().take(12).collect()
+}
+
+/// Release everything a boot that has already packed its snapshot leaves behind
+/// when it aborts: the ollama sidecar, the network `start` owns, and the
+/// snapshot itself.
+///
+/// One definition for all three abort arms between the pack and a recorded
+/// state, because nothing else will ever collect these: no state was saved, so
+/// no `skill down` can find them (#1087). A fourth abort path added later gets
+/// the whole sequence by calling this rather than by remembering three lines.
+///
+/// Every release is best effort and deliberately swallows its error: these run
+/// while a command is already failing for its own reason, and must not change
+/// the error it reports or the code it exits with.
+async fn release_boot_scaffolding(
+    ollama_container: Option<&String>,
+    owned_network: Option<&String>,
+    snapshot_dir: &Path,
+    plugin_dir: &Path,
+) {
+    if let Some(ollama) = ollama_container {
+        let _ = docker::remove_container(ollama).await;
+    }
+    if let Some(net) = owned_network {
+        let _ = docker::remove_network(net).await;
+    }
+    let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
+}
+
 pub async fn start(opts: StartOpts) -> Result<()> {
     let plugin_dir = opts
         .plugin_dir
@@ -1361,11 +1395,32 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         )
     };
 
+    // #1087: the skill tier executes an immutable, content-addressed snapshot,
+    // not the editable source -- matching what local and cluster already do. The
+    // packer is the deploy path's packer, so the digest is the same one the API
+    // records for this source. Placed AFTER the --replace teardown above so a
+    // re-up of unchanged source (same digest, same directory) cannot have the
+    // snapshot it just created torn down again.
+    let snapshot = match crate::bundle::snapshot(&plugin_dir) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            // Nothing of the runner exists yet, but the ollama sidecar above may:
+            // release it the same way every other abort on this path does.
+            if let Some(ollama) = &ollama_container {
+                let _ = docker::remove_container(ollama).await;
+            }
+            if let Some(net) = &owned_network {
+                let _ = docker::remove_network(net).await;
+            }
+            return Err(err.context("packaging the bundle snapshot for the runner"));
+        }
+    };
+
     let spec = StartSpec {
         image: opts.image.clone(),
         container_name: opts.name.clone(),
         host_port: opts.port,
-        plugin_dir: plugin_dir.clone(),
+        plugin_dir: snapshot.dir.clone(),
         session_id: session_id.clone(),
         sandbox_id: "local".into(),
         budget_json: opts.budget,
@@ -1386,12 +1441,15 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     let container_id = match docker::docker_with_env(&spec.run_args(), &spec.docker_env).await {
         Ok(id) => id,
         Err(err) => {
-            if let Some(ollama) = &ollama_container {
-                let _ = docker::remove_container(ollama).await;
-            }
-            if let Some(net) = &owned_network {
-                let _ = docker::remove_network(net).await;
-            }
+            // Nothing recorded the snapshot, so no teardown will ever find it
+            // (#1087); release it here alongside the sidecar and the network.
+            release_boot_scaffolding(
+                ollama_container.as_ref(),
+                owned_network.as_ref(),
+                &snapshot.dir,
+                &plugin_dir,
+            )
+            .await;
             // The preflight above can lose the race to a container created
             // between the probe and here; map that onto the same actionable
             // error rather than docker's raw conflict (#747).
@@ -1413,12 +1471,15 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         let logs = docker::container_logs(&opts.name, 40).await;
         ui.note(&logs);
         let _ = docker::remove_container(&opts.name).await;
-        if let Some(ollama) = &ollama_container {
-            let _ = docker::remove_container(ollama).await;
-        }
-        if let Some(net) = &owned_network {
-            let _ = docker::remove_network(net).await;
-        }
+        // Same as the start-failure arm above: unrecorded, so this is the only
+        // chance to release it (#1087).
+        release_boot_scaffolding(
+            ollama_container.as_ref(),
+            owned_network.as_ref(),
+            &snapshot.dir,
+            &plugin_dir,
+        )
+        .await;
         ui.failure(&format!("runner failed to become healthy: {err}"));
         bail!("runner failed to become healthy: {err}");
     }
@@ -1442,15 +1503,21 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             ollama_container: ollama_container.clone(),
             network: owned_network.clone(),
             model_base_url: model_base_url.clone(),
+            bundle_digest: Some(snapshot.digest.clone()),
+            bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
         },
     ) {
         let _ = docker::remove_container(&opts.name).await;
-        if let Some(ollama) = &ollama_container {
-            let _ = docker::remove_container(ollama).await;
-        }
-        if let Some(net) = &owned_network {
-            let _ = docker::remove_network(net).await;
-        }
+        // The last of the three abort paths between the pack and a recorded
+        // state; each releases the snapshot itself, so a failed boot leaves
+        // nothing behind (#1087).
+        release_boot_scaffolding(
+            ollama_container.as_ref(),
+            owned_network.as_ref(),
+            &snapshot.dir,
+            &plugin_dir,
+        )
+        .await;
         return Err(err.context("recording runner state (container removed again)"));
     }
 
@@ -1466,6 +1533,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         ),
         ("Skill eval", "curie skill eval".to_string()),
         ("Version", version),
+        // What makes AC1/AC3 confirmable by eye: re-up after a source edit and
+        // this visibly changes, while a source edit under a live runner does not.
+        (
+            "Bundle",
+            format!("{} (snapshot)", short_digest(&snapshot.digest)),
+        ),
     ];
     ui.payload_plain(&boxed_summary("curie dev environment", &rows));
     if let Some(local_model) = &opts.local_model {
@@ -1772,6 +1845,18 @@ async fn stop_recorded(
             Err(err) => ui.warn(&format!("could not remove network '{net}': {err}")),
         }
     }
+    // Remove the snapshot this record owns (#1087), the same way the ollama
+    // sidecar and the network above are released. Guarded and tolerant: a
+    // snapshot that will not delete is a warning, not a failed teardown (#323 --
+    // the agent consumer needs the teardown to succeed), and a recorded path
+    // outside <bundle>/.curie/snapshots/ is refused rather than deleted.
+    if let Some(snapshot_dir) = &saved.bundle_snapshot_dir {
+        if let Err(err) = crate::bundle::remove_snapshot(Path::new(snapshot_dir), dir) {
+            ui.warn(&format!(
+                "could not remove bundle snapshot '{snapshot_dir}': {err}"
+            ));
+        }
+    }
     state::remove(dir)?;
     Ok(())
 }
@@ -1781,8 +1866,16 @@ async fn stop_recorded(
 /// the frozen `SessionStatus` (contract test) and the runner's raw `/status`
 /// body (the live call site), which are both left unconstrained by
 /// `cli/schema/status.schema.json`. Pure so it stays contract-testable.
-pub fn status_json<T: serde::Serialize>(url: &str, status: &T) -> serde_json::Value {
-    serde_json::json!({ "url": url, "session": status })
+///
+/// `bundle_digest` (#1087) is the sha256 of the snapshot this runner mounted.
+/// The key is always emitted -- `null` when no runner is recorded or the record
+/// predates #1087 -- so an agent consumer can read it unconditionally.
+pub fn status_json<T: serde::Serialize>(
+    url: &str,
+    status: &T,
+    bundle_digest: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({ "url": url, "session": status, "bundle_digest": bundle_digest })
 }
 
 /// One eval case's result: `(id, outcome, seconds, output)`. `output` is the
@@ -1809,7 +1902,15 @@ fn eval_counts(results: &[EvalRow]) -> (usize, usize, usize) {
 /// The `curie skill eval --json` payload: the outcome roll-up plus one row per
 /// case. Pure so it stays unit/contract-testable against
 /// `cli/schema/eval.schema.json`.
-pub fn eval_json(results: &[EvalRow]) -> serde_json::Value {
+///
+/// `bundle_digest` (#1087 AC2) is the sha256 of the snapshot the evaluated
+/// runner mounted, carried on the MACHINE surface so an agent can confirm
+/// `skill message` and `skill eval` executed the same bundle without reading a
+/// human note off stderr. The key is always emitted -- `null` at the
+/// local/cluster tiers, which evaluate a deployed version rather than a locally
+/// snapshotted bundle, and on a skill run against a runner this checkout never
+/// recorded.
+pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json::Value {
     // Derive every count from `results` in one pass so the rollup can never
     // disagree with the per-case rows (no caller-supplied passed/total to drift).
     let total = results.len();
@@ -1835,17 +1936,43 @@ pub fn eval_json(results: &[EvalRow]) -> serde_json::Value {
         "passed": passed,
         "failed": failed,
         "plumbing_ok": plumbing_ok,
+        "bundle_digest": bundle_digest,
         "cases": cases,
     })
 }
 
+/// The recorded bundle digest that honestly applies to the runner at `url`
+/// (#1087) -- the one home of that rule, shared by `skill status` and
+/// `skill eval`.
+///
+/// A digest is only knowable for the runner this checkout recorded:
+/// `resolve_url` is explicit-wins, so an explicit `--url` at some other runner
+/// would otherwise marry a foreign session to the local bundle's digest.
+/// Matching the resolved url against the recorded `base_url` is the honest
+/// test -- with no `--url` the resolved value IS the recorded one, so the digest
+/// still reports. `None` when nothing is recorded here, when the record predates
+/// #1087, or when it points elsewhere: a null digest, never an error.
+fn recorded_bundle_digest(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
+    saved
+        .filter(|s| s.base_url == url)
+        .and_then(|s| s.bundle_digest.clone())
+}
+
 pub async fn status(url: Option<String>) -> Result<()> {
     let url = resolve_url(url)?;
+    // The bundle the runner BEING SHOWN is executing (#1087); see
+    // `recorded_bundle_digest` for why a foreign `--url` reports none. The load
+    // is tolerant because an unreadable `.curie/runner.json` must not break an
+    // explicit `--url`, a path that never read local state before #1087 (the
+    // no-`--url` path still hard-errors on it, inside `resolve_url`).
+    let saved = state::load(Path::new(".")).unwrap_or(None);
+    let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let status = client.status().await?;
     crate::ui::ui().emit(&StatusOutput {
         url,
         status: serde_json::to_value(&status)?,
+        bundle_digest,
     });
     Ok(())
 }
@@ -1856,15 +1983,25 @@ pub async fn status(url: Option<String>) -> Result<()> {
 struct StatusOutput {
     url: String,
     status: serde_json::Value,
+    /// The digest recorded in `.curie/runner.json` (#1087), and only when that
+    /// record is the runner at `url`; `None` otherwise, so the key never claims
+    /// a digest for a runner it was not recorded against.
+    bundle_digest: Option<String>,
 }
 
 impl crate::ui::CliOutput for StatusOutput {
     fn to_json(&self) -> serde_json::Value {
-        status_json(&self.url, &self.status)
+        status_json(&self.url, &self.status, self.bundle_digest.as_deref())
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         ui.note(&format!("runner {}", self.url));
+        // Diagnostics on stderr (#11): the digest is a note, so the machine
+        // payload on stdout is unchanged for a human-path consumer.
+        ui.note(&format!(
+            "bundle {}",
+            self.bundle_digest.as_deref().unwrap_or("<none recorded>")
+        ));
         ui.payload_plain(
             &serde_json::to_string_pretty(&self.status).unwrap_or_else(|_| self.status.to_string()),
         );
@@ -2038,6 +2175,7 @@ pub async fn eval(
             &models,
             &secrets,
             &image,
+            sweep_snapshot(saved.as_ref()),
             state_plugin_dir.as_deref(),
         )
         .await;
@@ -2045,6 +2183,12 @@ pub async fn eval(
 
     let fake = drives_a_fake_runner(saved.as_ref(), url.as_deref());
     let url = resolve_url(url)?;
+    // #1087 AC2: the bundle this eval graded, on the machine surface, so an
+    // agent can confirm it is the SAME digest `skill status`/`skill message`
+    // report without reading a human note off stderr (docs/agents.md bans
+    // stderr as agent-facing evidence). The honesty rule itself lives in
+    // `recorded_bundle_digest`, shared with `status`.
+    let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
     let bar = ui.progress_bar(suite.cases.len() as u64, "running evals");
@@ -2054,7 +2198,7 @@ pub async fn eval(
     let (results, _completed) = run_suite_cases(&client, &suite, fake, |_| bar.inc(1)).await?;
     bar.finish();
 
-    report_eval(&results)
+    report_eval(&results, bundle_digest.as_deref())
 }
 
 /// Whether the runner `skill eval` is about to drive is the fake. Learned from
@@ -2124,13 +2268,52 @@ async fn run_suite_cases(
     Ok((results, completed))
 }
 
+/// The `docker run` spec one eval-sweep runner boots with. Split out of
+/// [`boot_eval_runner`] (which needs a Docker daemon and the host credential
+/// store) so the mount that actually reaches the daemon is unit-testable: the
+/// #1087 AC2 seam ends in `run_args()`, not in a struct field. `boot_eval_runner`
+/// builds its spec ONLY through here, so there is one place the eval path names
+/// what it mounts, and that place can take nothing but an [`EvalBundle`].
+fn eval_runner_spec(
+    bundle: &EvalBundle,
+    image: &str,
+    port: u16,
+    name: &str,
+    model: &str,
+    passthrough_env: Vec<String>,
+    docker_env: Vec<(String, String)>,
+) -> StartSpec {
+    StartSpec {
+        image: image.to_string(),
+        container_name: name.to_string(),
+        host_port: port,
+        plugin_dir: bundle.dir().to_path_buf(),
+        session_id: format!("eval-{}", unix_now()),
+        sandbox_id: "local".into(),
+        budget_json: DEFAULT_BUDGET.to_string(),
+        fake_model: false,
+        network: None,
+        otel_endpoint: None,
+        model_base_url: None,
+        model: Some(model.to_string()),
+        passthrough_env,
+        docker_env,
+    }
+}
+
 /// Boot a throwaway runner for one model on `port`, forwarding the model
 /// credential and any `--secret` from the env or the host vault exactly like
 /// `skill up` (never in argv). Returns its base URL; the caller removes the
 /// container when done. Does NOT touch `.curie/runner.json`, so a sweep never
 /// clobbers a persistent `skill up` runner's recorded state.
+///
+/// `bundle` is a materialized bundle snapshot (#1087) -- the recorded runner's,
+/// or one this sweep packed -- and, being an [`EvalBundle`], cannot be a source
+/// directory: the skill tier executes an immutable bundle, so handing this the
+/// editable source would reopen exactly the gap the snapshot closes, and the
+/// type is what stops a caller doing it.
 async fn boot_eval_runner(
-    plugin_dir: &Path,
+    bundle: &EvalBundle,
     image: &str,
     port: u16,
     name: &str,
@@ -2163,22 +2346,15 @@ async fn boot_eval_runner(
             secrets,
         )
     };
-    let spec = StartSpec {
-        image: image.to_string(),
-        container_name: name.to_string(),
-        host_port: port,
-        plugin_dir: plugin_dir.to_path_buf(),
-        session_id: format!("eval-{}", unix_now()),
-        sandbox_id: "local".into(),
-        budget_json: DEFAULT_BUDGET.to_string(),
-        fake_model: false,
-        network: None,
-        otel_endpoint: None,
-        model_base_url: None,
-        model: Some(model.to_string()),
+    let spec = eval_runner_spec(
+        bundle,
+        image,
+        port,
+        name,
+        model,
         passthrough_env,
         docker_env,
-    };
+    );
     docker::docker_with_env(&spec.run_args(), &spec.docker_env)
         .await
         .with_context(|| format!("booting eval runner for model {model}"))
@@ -2256,68 +2432,224 @@ impl SweepRow {
     }
 }
 
+/// The snapshot the model sweep must mount (#1087 AC2). Reusing the recorded
+/// runner's snapshot is what makes `skill message` and `skill eval` report the
+/// SAME digest; `None` means no runner is recorded (or the record predates
+/// #1087), and the sweep packs its own snapshot rather than falling back to
+/// mutable source. Pure so the sibling path is testable without Docker.
+fn sweep_snapshot(saved: Option<&state::RunnerState>) -> Option<(PathBuf, String)> {
+    let saved = saved?;
+    // Both halves or nothing: a directory with no digest has nothing to report,
+    // and a digest with no directory has nothing to mount.
+    let dir = saved.bundle_snapshot_dir.as_ref()?;
+    let digest = saved.bundle_digest.as_ref()?;
+    Some((PathBuf::from(dir), digest.clone()))
+}
+
+/// What the model sweep mounts (#1087 AC2). Pure decision, split out of
+/// `eval_sweep` so the wiring regression -- a sweep handing SOURCE to
+/// `boot_eval_runner` -- reds a unit test instead of only the live run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SweepMount {
+    /// Mount the recorded runner's snapshot at this path, under this digest.
+    /// No re-pack: reusing the recorded snapshot is what makes the eval digest
+    /// the SAME value as the messaging digest, not merely equal-by-recompute.
+    Recorded { dir: PathBuf, digest: String },
+    /// No runner recorded: pack an EPHEMERAL snapshot from this source dir.
+    /// Never a fall-back to mounting the source itself.
+    PackEphemeral { source: PathBuf },
+}
+
+/// Resolve the sweep's mount. A recorded snapshot always wins, even when a
+/// bundle source is known too -- that is the decision `eval_sweep` must not
+/// re-make in its own body. There is deliberately no variant that mounts the
+/// editable source: that is the hole #1087 closes.
+fn resolve_sweep_mount(
+    recorded: Option<(PathBuf, String)>,
+    state_plugin_dir: Option<&Path>,
+) -> SweepMount {
+    match recorded {
+        Some((dir, digest)) => SweepMount::Recorded { dir, digest },
+        None => SweepMount::PackEphemeral {
+            source: state_plugin_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+        },
+    }
+}
+
+pub use eval_bundle::EvalBundle;
+
+/// Home of [`EvalBundle`], the only directory type the eval runner path accepts.
+///
+/// It is a module rather than a bare struct so its fields are private to it:
+/// nothing in `commands` -- `eval_sweep` above all -- can build one out of a
+/// path it happens to be holding. That is the #1087 AC2 wiring guard. Before
+/// this, restoring the old source-directory mount was a one-line variable swap
+/// in `eval_sweep` that no unit test could see, because `eval_sweep` needs
+/// Docker to run at all. Now that swap does not compile, and the only place the
+/// eval path can still name a directory to mount is
+/// [`EvalBundle::materialize`], which `cargo test` covers directly.
+mod eval_bundle {
+    use super::SweepMount;
+    use anyhow::{Context, Result};
+    use std::path::{Path, PathBuf};
+
+    /// A materialized, immutable bundle snapshot plus the digest that names it.
+    ///
+    /// Construct only via [`EvalBundle::materialize`]. There is deliberately no
+    /// constructor taking a bare path: a source directory cannot become one of
+    /// these without editing this module.
+    #[derive(Debug)]
+    pub struct EvalBundle {
+        dir: PathBuf,
+        digest: String,
+        /// The bundle source this snapshot was packed from, and only when THIS
+        /// value owns the snapshot: a recorded runner's snapshot belongs to
+        /// that runner's record and is released by `skill down`, never here.
+        ephemeral_source: Option<PathBuf>,
+    }
+
+    impl EvalBundle {
+        /// Turn a resolved [`SweepMount`] into a directory that exists on disk:
+        /// canonicalize the recorded snapshot, or pack an ephemeral one from
+        /// source. Neither arm may yield the source directory itself -- that is
+        /// the whole point of #1087, and it is what the unit tests pin.
+        ///
+        /// `pub(super)` rather than `pub`: the only caller is `eval_sweep` (and
+        /// the unit tests), and [`SweepMount`] is private to `commands`, so a
+        /// wider visibility would only leak that type out of the module.
+        pub(super) fn materialize(mount: SweepMount) -> Result<Self> {
+            match mount {
+                SweepMount::Recorded { dir, digest } => Ok(Self {
+                    dir: dir
+                        .canonicalize()
+                        .context("resolving the recorded bundle snapshot for the model sweep")?,
+                    digest,
+                    ephemeral_source: None,
+                }),
+                SweepMount::PackEphemeral { source } => {
+                    let source = source
+                        .canonicalize()
+                        .context("resolving the bundle directory for the model sweep")?;
+                    let snapshot = crate::bundle::snapshot_ephemeral(&source)
+                        .context("packaging the bundle snapshot for the model sweep")?;
+                    Ok(Self {
+                        dir: snapshot.dir,
+                        digest: snapshot.digest,
+                        ephemeral_source: Some(source),
+                    })
+                }
+            }
+        }
+
+        /// The directory to mount read-only at `/plugin`.
+        pub fn dir(&self) -> &Path {
+            &self.dir
+        }
+
+        /// The sha256 this bundle is content-addressed by -- the same value
+        /// `skill status`/`skill message` report when the snapshot is the
+        /// recorded runner's (#1087 AC2).
+        pub fn digest(&self) -> &str {
+            &self.digest
+        }
+
+        /// The source dir to release this snapshot against when the run ends,
+        /// or `None` when the snapshot is not this value's to remove.
+        pub fn ephemeral_source(&self) -> Option<&Path> {
+            self.ephemeral_source.as_deref()
+        }
+    }
+}
+
 /// Run the suite once per model in a fresh runner and report pass-rate per model.
 async fn eval_sweep(
     suite: &EvalSuite,
     models: &[String],
     secrets: &[String],
     image: &str,
+    recorded: Option<(PathBuf, String)>,
     state_plugin_dir: Option<&Path>,
 ) -> Result<()> {
     let ui = crate::ui::ui();
-    // Mount the recorded runner's bundle dir if one is known, else the cwd.
-    let plugin_dir = state_plugin_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .canonicalize()
-        .context("resolving the bundle directory for the model sweep")?;
+    // The mount is decided once, purely, by `resolve_sweep_mount`, then
+    // materialized once by `EvalBundle`; this body only acts on the result and
+    // has no path of its own it could mount instead.
+    let bundle = EvalBundle::materialize(resolve_sweep_mount(recorded, state_plugin_dir))?;
+    ui.note(&format!(
+        "model sweep: bundle {} ({})",
+        bundle.digest(),
+        if bundle.ephemeral_source().is_some() {
+            "packed"
+        } else {
+            "recorded runner's snapshot"
+        }
+    ));
     ui.note(&format!(
         "model sweep: {} model(s) x {} case(s)",
         models.len(),
         suite.cases.len()
     ));
     let cl = ui.checklist();
-    let mut rows: Vec<SweepRow> = Vec::with_capacity(models.len());
-    for (i, model) in models.iter().enumerate() {
-        let name = format!("curie-eval-sweep-{i}");
-        let port = DEFAULT_PORT + 100 + i as u16;
-        let step = cl.step(&format!("model {model}"));
-        let url = match boot_eval_runner(&plugin_dir, image, port, &name, model, secrets).await {
-            Ok(url) => url,
-            Err(err) => {
-                step.fail("boot failed");
-                return Err(err);
+    let sweep = async {
+        let mut rows: Vec<SweepRow> = Vec::with_capacity(models.len());
+        for (i, model) in models.iter().enumerate() {
+            let name = format!("curie-eval-sweep-{i}");
+            let port = DEFAULT_PORT + 100 + i as u16;
+            let step = cl.step(&format!("model {model}"));
+            let url = match boot_eval_runner(&bundle, image, port, &name, model, secrets).await {
+                Ok(url) => url,
+                Err(err) => {
+                    step.fail("boot failed");
+                    return Err(err);
+                }
+            };
+            let client = RunnerClient::new(&url)?;
+            // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
+            // REAL model whatever the standing dev runner is -- the sweep grades,
+            // so this in-CLI path never produces a plumbing-only row.
+            let run = run_suite_cases(&client, suite, false, |_| {}).await;
+            let _ = docker::remove_container(&name).await;
+            let (results, completed) = run?;
+            let passed = results
+                .iter()
+                .filter(|(_, o, _, _)| *o == CaseOutcome::Pass)
+                .count();
+            let total = suite.cases.len();
+            // Immediate per-model feedback (#622): a model that never completed a
+            // single case is a boot/resolution problem, not a graded loss, so the
+            // checklist marks it failed rather than "done" with a misleading score.
+            if completed == 0 {
+                step.fail(&format!("0/{total} completed -- {model} never answered"));
+            } else {
+                step.done(&format!("{passed}/{total}"));
             }
-        };
-        let client = RunnerClient::new(&url)?;
-        // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
-        // REAL model whatever the standing dev runner is -- the sweep grades,
-        // so this in-CLI path never produces a plumbing-only row.
-        let run = run_suite_cases(&client, suite, false, |_| {}).await;
-        let _ = docker::remove_container(&name).await;
-        let (results, completed) = run?;
-        let passed = results
-            .iter()
-            .filter(|(_, o, _, _)| *o == CaseOutcome::Pass)
-            .count();
-        let total = suite.cases.len();
-        // Immediate per-model feedback (#622): a model that never completed a
-        // single case is a boot/resolution problem, not a graded loss, so the
-        // checklist marks it failed rather than "done" with a misleading score.
-        if completed == 0 {
-            step.fail(&format!("0/{total} completed -- {model} never answered"));
-        } else {
-            step.done(&format!("{passed}/{total}"));
+            rows.push(SweepRow {
+                model: model.clone(),
+                passed,
+                completed,
+                total,
+                plumbing: 0,
+            });
         }
-        rows.push(SweepRow {
-            model: model.clone(),
-            passed,
-            completed,
-            total,
-            plumbing: 0,
-        });
+        // #1087 AC2: the digest rides the machine payload, so an agent confirms
+        // `skill message` and `skill eval` ran the same bundle from `--json`
+        // rather than from the stderr note above (docs/agents.md bans stderr as
+        // agent-facing evidence). It is the RECORDED runner's digest only when
+        // this sweep reused the recorded snapshot; a sweep that packed its own
+        // reports that ephemeral snapshot's digest instead, never a borrowed one.
+        report_sweep(&rows, Some(bundle.digest()))
     }
-    report_sweep(&rows)
+    .await;
+    // A snapshot this sweep packed is owned by this sweep alone, so it is
+    // released on the failure path as well as the success one (#1087). It can
+    // only ever be a `sweep-*` directory, never the canonical `<digest>/` one a
+    // live `skill up` runner may have mounted.
+    if let Some(source) = bundle.ephemeral_source() {
+        let _ = crate::bundle::remove_snapshot(bundle.dir(), source);
+    }
+    sweep
 }
 
 /// The `--json` sweep payload for one row: pure and independent of `Ui` so it
@@ -2347,8 +2679,18 @@ fn sweep_json_row(row: &SweepRow) -> serde_json::Value {
 /// against `cli/schema/sweep.schema.json` without a process-level stdout
 /// capture. `report_sweep` emits exactly this via `Ui::emit_json`, so the two
 /// never drift.
-pub fn sweep_json(rows: &[SweepRow]) -> serde_json::Value {
-    serde_json::json!({ "sweep": rows.iter().map(sweep_json_row).collect::<Vec<_>>() })
+///
+/// `bundle_digest` (#1087 AC2) is the snapshot every runner in the sweep
+/// mounted: the recorded runner's digest when the sweep reused it (the value
+/// `skill status`/`skill message` report, which is what makes AC2 confirmable
+/// from the machine surface), or the ephemeral snapshot's own digest when the
+/// sweep packed one because nothing was recorded. Always emitted, `null` at the
+/// local/cluster tiers where no locally snapshotted bundle applies.
+pub fn sweep_json(rows: &[SweepRow], bundle_digest: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "sweep": rows.iter().map(sweep_json_row).collect::<Vec<_>>(),
+        "bundle_digest": bundle_digest,
+    })
 }
 
 /// The human table row for one sweep row: `[model, "passed/total", pass rate,
@@ -2400,10 +2742,15 @@ fn sweep_table_row(row: &SweepRow) -> Vec<String> {
 /// tier without skipping any guard the caller still holds (a kept-alive
 /// port-forward at local/cluster) -- this function never calls
 /// `std::process::exit` itself.
-pub fn report_sweep(rows: &[SweepRow]) -> Result<()> {
+///
+/// `bundle_digest` (#1087 AC2) rides the `--json` payload for the same reason
+/// it rides `report_eval`'s: the digest was previously a stderr note only, and
+/// `docs/agents.md` bans stderr as agent-facing evidence. Callers pass `None`
+/// when no locally snapshotted bundle applies.
+pub fn report_sweep(rows: &[SweepRow], bundle_digest: Option<&str>) -> Result<()> {
     let ui = crate::ui::ui();
     if ui.json() {
-        ui.emit_json(&sweep_json(rows));
+        ui.emit_json(&sweep_json(rows, bundle_digest));
     } else {
         let table: Vec<Vec<String>> = rows.iter().map(sweep_table_row).collect();
         ui.payload_plain(&crate::ui::table(
@@ -2450,13 +2797,21 @@ pub fn report_sweep(rows: &[SweepRow]) -> Result<()> {
 /// ran on the fake tier is operationally successful without being a pass, so it
 /// exits 0 and says "plumbing OK" in words -- the documented onboarding loop is
 /// not red (#612), and it is not fake-green either (#606).
-pub fn report_eval(results: &[EvalRow]) -> Result<()> {
+///
+/// `bundle_digest` (#1087 AC2) rides the `--json` payload so the bundle a run
+/// graded is confirmable from the machine surface. Callers pass `None` when no
+/// locally snapshotted bundle applies (the local/cluster tiers grade a deployed
+/// version), never a digest they did not observe.
+pub fn report_eval(results: &[EvalRow], bundle_digest: Option<&str>) -> Result<()> {
     let (_passed, failed, _plumbing_ok) = eval_counts(results);
     // Emit through the one success point (#474), then apply the exit-code side
     // effect for BOTH paths -- the json path had it inline, the human path after.
     // Only a genuine `Fail` (failed > 0) exits non-zero: a plumbing-only run
     // graded nothing but is operationally successful, so it exits 0 (#606/#612).
-    crate::ui::ui().emit(&EvalOutput { results });
+    crate::ui::ui().emit(&EvalOutput {
+        results,
+        bundle_digest,
+    });
     if failed > 0 {
         std::process::exit(crate::exit::ExitClass::Failure.code());
     }
@@ -2469,11 +2824,14 @@ pub fn report_eval(results: &[EvalRow]) -> Result<()> {
 /// roll-up verdict + per-red-case reply notes.
 struct EvalOutput<'a> {
     results: &'a [EvalRow],
+    /// The snapshot digest the evaluated runner mounted (#1087), or `None` when
+    /// none applies to this run.
+    bundle_digest: Option<&'a str>,
 }
 
 impl crate::ui::CliOutput for EvalOutput<'_> {
     fn to_json(&self) -> serde_json::Value {
-        eval_json(self.results)
+        eval_json(self.results, self.bundle_digest)
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
@@ -4774,7 +5132,7 @@ pub async fn skill_approvals(
 
 /// Why `skill versions` cannot be answered at this tier.
 pub const VERSIONS_REASON: &str =
-    "`skill up` runs the bundle bytes on disk, so no deployed version is assigned";
+    "`skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned";
 /// Where to run `versions` instead.
 pub const VERSIONS_ALT: &str =
     "use `curie local versions <agent>` or `curie cluster versions <agent>` for a deployed agent";
@@ -4988,7 +5346,7 @@ mod tests {
         // scores 0% -- every case completed, the grader just disagreed -- must
         // still report 0% and exit 0. A sweep stays a comparison, not a gate.
         let rows = vec![row("opus", 0, 5, 5), row("sonnet", 2, 5, 5)];
-        assert!(report_sweep(&rows).is_ok());
+        assert!(report_sweep(&rows, None).is_ok());
     }
 
     #[test]
@@ -4999,7 +5357,7 @@ mod tests {
         // drops via normal unwind) and the message names the model and a likely
         // cause instead of the eval consumer.
         let rows = vec![row("bogus-model-xyz", 0, 0, 5), row("opus", 3, 5, 5)];
-        let err = report_sweep(&rows).expect_err("a never-completed row must fail the sweep");
+        let err = report_sweep(&rows, None).expect_err("a never-completed row must fail the sweep");
         let msg = err.to_string();
         assert!(msg.contains("bogus-model-xyz"), "{msg}");
         assert!(!msg.contains("eval consumer"), "{msg}");
@@ -5014,7 +5372,7 @@ mod tests {
     #[test]
     fn every_model_never_completed_still_names_every_one() {
         let rows = vec![row("model-alpha", 0, 0, 3), row("model-beta", 0, 0, 3)];
-        let err = report_sweep(&rows).unwrap_err();
+        let err = report_sweep(&rows, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("model-alpha"), "{msg}");
         assert!(msg.contains("model-beta"), "{msg}");
@@ -6592,5 +6950,335 @@ mod tests {
         assert_eq!(table[0], vec!["opus", "2/3", "67%", "-"]);
         assert_eq!(table[1], vec!["fake-model (plumbing)", "0/0", "n/a", "3"]);
         assert_ne!(table[0][2], table[1][2], "pass-rate columns must differ");
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // #1087 AC2: `skill message` and `skill eval` execute the SAME recorded
+    // bundle. The mount decision is pure, so the parity seam is provable in CI
+    // rather than only by the live sweep; each assertion terminates in the argv
+    // the Docker daemon receives, not in a struct field or an enum variant.
+    // ───────────────────────────────────────────────────────────────────────
+
+    use super::{
+        eval_runner_spec, recorded_bundle_digest, resolve_sweep_mount, sweep_snapshot, EvalBundle,
+        SweepMount,
+    };
+    use crate::docker::StartSpec;
+    use crate::state::RunnerState;
+
+    const RECORDED_SOURCE: &str = "/src";
+    const RECORDED_SNAPSHOT: &str = "/src/.curie/snapshots/abc";
+    const RECORDED_DIGEST: &str = "abc";
+    const RECORDED_URL: &str = "http://localhost:7245";
+
+    /// A recorded runner, parameterized by the two #1087 fields so the
+    /// pre-#1087 and half-written shapes are the SAME fixture with different
+    /// values rather than three hand-built structs that can drift apart.
+    fn recorded_runner(digest: Option<&str>, snapshot_dir: Option<&str>) -> RunnerState {
+        RunnerState {
+            container_id: "abc123".into(),
+            container_name: "curie-runner-local".into(),
+            image: "curie-runner".into(),
+            port: 7245,
+            base_url: RECORDED_URL.into(),
+            session_id: "local-1".into(),
+            plugin_dir: RECORDED_SOURCE.into(),
+            fake_model: false,
+            ollama_container: None,
+            network: None,
+            model_base_url: None,
+            bundle_digest: digest.map(str::to_string),
+            bundle_snapshot_dir: snapshot_dir.map(str::to_string),
+        }
+    }
+
+    /// The eval sweep's runner spec, mounting `dir`. Mirrors what
+    /// `boot_eval_runner` builds, so these tests end where the user's Docker
+    /// daemon does: in `run_args()`.
+    fn sweep_spec(dir: &Path) -> StartSpec {
+        StartSpec {
+            image: "curie-runner".into(),
+            container_name: "curie-eval-sweep-0".into(),
+            host_port: 7345,
+            plugin_dir: dir.to_path_buf(),
+            session_id: "eval-1".into(),
+            sandbox_id: "local".into(),
+            budget_json: r#"{"max_output_tokens_per_run":100000,"max_usd_per_day":5.0}"#.into(),
+            fake_model: false,
+            network: None,
+            otel_endpoint: None,
+            model_base_url: None,
+            model: Some("opus".into()),
+            passthrough_env: vec![],
+            docker_env: vec![],
+        }
+    }
+
+    fn mounts(spec: &StartSpec) -> Vec<String> {
+        spec.run_args()
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].clone())
+            .collect()
+    }
+
+    // #1087 AC2's honesty rule, tested where it now lives. Both `skill status`
+    // and `skill eval` call this, and both of their own paths need either a cwd
+    // with recorded state or a live Docker run to reach, so these are the only
+    // tests that can red when the rule is broken.
+
+    #[test]
+    fn recorded_bundle_digest_reports_the_digest_of_the_recorded_runner() {
+        let saved = recorded_runner(Some(RECORDED_DIGEST), Some(RECORDED_SNAPSHOT));
+
+        assert_eq!(
+            recorded_bundle_digest(Some(&saved), RECORDED_URL),
+            Some(RECORDED_DIGEST.to_string()),
+            "the record IS the runner being reported on, so its digest applies"
+        );
+    }
+
+    #[test]
+    fn recorded_bundle_digest_is_none_for_a_runner_the_record_is_not_about() {
+        let saved = recorded_runner(Some(RECORDED_DIGEST), Some(RECORDED_SNAPSHOT));
+
+        assert_eq!(
+            recorded_bundle_digest(Some(&saved), "http://localhost:9999"),
+            None,
+            "an explicit --url elsewhere must not be married to this bundle's digest"
+        );
+    }
+
+    #[test]
+    fn recorded_bundle_digest_is_none_when_the_record_predates_the_feature() {
+        let saved = recorded_runner(None, None);
+
+        assert_eq!(
+            recorded_bundle_digest(Some(&saved), RECORDED_URL),
+            None,
+            "a pre-#1087 record has no digest to report, and that is not an error"
+        );
+    }
+
+    #[test]
+    fn recorded_bundle_digest_is_none_without_a_record() {
+        assert_eq!(recorded_bundle_digest(None, RECORDED_URL), None);
+    }
+
+    #[test]
+    fn sweep_snapshot_reuses_the_recorded_runners_snapshot() {
+        let saved = recorded_runner(Some(RECORDED_DIGEST), Some(RECORDED_SNAPSHOT));
+
+        let (dir, digest) = sweep_snapshot(Some(&saved))
+            .expect("a recorded runner's snapshot is what the sweep must mount");
+
+        assert_eq!(dir, PathBuf::from(RECORDED_SNAPSHOT));
+        assert_eq!(
+            digest, RECORDED_DIGEST,
+            "the sweep reports the SAME digest the messaging path recorded"
+        );
+        assert_eq!(
+            mounts(&sweep_spec(&dir)),
+            vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+            "the sweep's runner must boot on the recorded snapshot"
+        );
+    }
+
+    #[test]
+    fn sweep_snapshot_is_none_without_a_recorded_snapshot() {
+        // No runner recorded at all.
+        assert!(sweep_snapshot(None).is_none());
+        // A record written before #1087: both fields absent.
+        assert!(sweep_snapshot(Some(&recorded_runner(None, None))).is_none());
+        // Half written (digest recorded, directory missing): there is nothing to
+        // mount, so the sweep packs its own rather than guessing a path.
+        assert!(sweep_snapshot(Some(&recorded_runner(Some(RECORDED_DIGEST), None))).is_none());
+        // ...and the mirror-image half: a directory with no digest to report.
+        assert!(sweep_snapshot(Some(&recorded_runner(None, Some(RECORDED_SNAPSHOT)))).is_none());
+    }
+
+    #[test]
+    fn sweep_snapshot_never_returns_the_source_dir() {
+        let saved = recorded_runner(Some(RECORDED_DIGEST), Some(RECORDED_SNAPSHOT));
+
+        let (dir, _) = sweep_snapshot(Some(&saved)).expect("a snapshot is recorded");
+
+        assert_ne!(
+            dir,
+            PathBuf::from(RECORDED_SOURCE),
+            "reading plugin_dir would remount the editable source the ticket removes"
+        );
+        assert!(dir.starts_with(format!("{RECORDED_SOURCE}/.curie/snapshots")));
+        assert!(
+            !mounts(&sweep_spec(&dir)).contains(&format!("{RECORDED_SOURCE}:/plugin:ro")),
+            "the mutable source must never reach the sweep's argv"
+        );
+    }
+
+    #[test]
+    fn resolve_sweep_mount_returns_the_recorded_snapshot_when_one_exists() {
+        // A source dir is supplied too: reusing the recorded snapshot regardless
+        // is the decision `eval_sweep` must not re-make in its own body.
+        let resolved = resolve_sweep_mount(
+            Some((
+                PathBuf::from(RECORDED_SNAPSHOT),
+                RECORDED_DIGEST.to_string(),
+            )),
+            Some(Path::new(RECORDED_SOURCE)),
+        );
+
+        match resolved {
+            SweepMount::Recorded { dir, digest } => {
+                assert_eq!(dir, PathBuf::from(RECORDED_SNAPSHOT));
+                assert_eq!(digest, RECORDED_DIGEST);
+                assert_eq!(
+                    mounts(&sweep_spec(&dir)),
+                    vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+                    "the resolved mount is what the sweep's docker run receives"
+                );
+            }
+            SweepMount::PackEphemeral { source } => panic!(
+                "a recorded snapshot must be reused, not repacked from {}",
+                source.display()
+            ),
+        }
+    }
+
+    #[test]
+    fn resolve_sweep_mount_packs_ephemeral_when_nothing_is_recorded() {
+        // With a recorded bundle source but no snapshot: pack from that source.
+        match resolve_sweep_mount(None, Some(Path::new(RECORDED_SOURCE))) {
+            SweepMount::PackEphemeral { source } => {
+                assert_eq!(source, PathBuf::from(RECORDED_SOURCE))
+            }
+            SweepMount::Recorded { dir, .. } => {
+                panic!(
+                    "nothing is recorded, so {} cannot be mounted",
+                    dir.display()
+                )
+            }
+        }
+        // With nothing recorded at all: pack from the cwd. The fall-back is
+        // always "pack" -- `SweepMount` has no variant that mounts mutable
+        // source, which is the hole this ticket closes.
+        match resolve_sweep_mount(None, None) {
+            SweepMount::PackEphemeral { source } => assert_eq!(source, PathBuf::from(".")),
+            SweepMount::Recorded { dir, .. } => {
+                panic!(
+                    "nothing is recorded, so {} cannot be mounted",
+                    dir.display()
+                )
+            }
+        }
+    }
+
+    /// A minimal on-disk bundle source, returned with its owning tempdir so the
+    /// caller keeps it alive. `EvalBundle::materialize` canonicalizes and packs
+    /// for real, so these cases need real files rather than the string paths the
+    /// pure-resolver tests above use.
+    fn bundle_source() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("bundle");
+        std::fs::create_dir_all(source.join("skills/demo")).unwrap();
+        std::fs::write(source.join("skills/demo/SKILL.md"), "# demo\n").unwrap();
+        (tmp, source)
+    }
+
+    /// The argv-terminating helper for the two `EvalBundle` tests: what
+    /// `boot_eval_runner` would hand the Docker daemon for this bundle.
+    fn eval_mounts(bundle: &EvalBundle) -> Vec<String> {
+        mounts(&eval_runner_spec(
+            bundle,
+            "curie-runner",
+            7345,
+            "curie-eval-sweep-0",
+            "opus",
+            vec![],
+            vec![],
+        ))
+    }
+
+    /// #1087 AC2's wiring guard. The pure-resolver tests above prove
+    /// `resolve_sweep_mount` decides correctly; they cannot prove the eval path
+    /// OBEYS it, because `eval_sweep` needs a Docker daemon to run at all. This
+    /// closes that gap from the other end: the eval path's only mountable value
+    /// is an `EvalBundle`, whose fields are private to its module, so
+    /// re-introducing the source-directory mount is a compile error in
+    /// `eval_sweep` and can only be written inside `materialize` -- where this
+    /// test sees it. Mutating the `PackEphemeral` arm to return `source` reds
+    /// this test.
+    #[test]
+    fn the_eval_bundle_packs_a_snapshot_and_never_mounts_the_mutable_source() {
+        let (_tmp, source) = bundle_source();
+
+        let bundle = EvalBundle::materialize(SweepMount::PackEphemeral {
+            source: source.clone(),
+        })
+        .expect("packing an ephemeral snapshot from a real bundle source");
+
+        let canonical_source = source.canonicalize().unwrap();
+        assert_ne!(
+            bundle.dir(),
+            canonical_source,
+            "the sweep must execute a snapshot, never the editable source"
+        );
+        assert!(
+            bundle
+                .dir()
+                .starts_with(canonical_source.join(".curie/snapshots")),
+            "a packed snapshot lives under the source's snapshot root, got {}",
+            bundle.dir().display()
+        );
+        assert!(
+            !bundle.digest().is_empty(),
+            "a packed snapshot reports its own digest for the --json payload"
+        );
+        // The source it must release when the sweep ends -- and the only reason
+        // this variant carries one.
+        assert_eq!(bundle.ephemeral_source(), Some(canonical_source.as_path()));
+
+        let mounts = eval_mounts(&bundle);
+        assert_eq!(
+            mounts,
+            vec![format!("{}:/plugin:ro", bundle.dir().display())],
+            "the snapshot is what reaches the Docker daemon"
+        );
+        assert!(
+            !mounts.contains(&format!("{}:/plugin:ro", canonical_source.display())),
+            "the mutable source must never reach the eval runner's argv"
+        );
+    }
+
+    /// The recorded arm of the same guard: the recorded runner's snapshot is
+    /// mounted as-is and its digest is carried through unchanged, which is what
+    /// makes `skill message` and `skill eval` report the SAME value rather than
+    /// two independently recomputed ones. It is also not this run's to delete.
+    #[test]
+    fn the_eval_bundle_reuses_the_recorded_snapshot_and_its_digest() {
+        let (_tmp, source) = bundle_source();
+        let recorded = source.join(".curie/snapshots/abc");
+        std::fs::create_dir_all(&recorded).unwrap();
+
+        let bundle = EvalBundle::materialize(SweepMount::Recorded {
+            dir: recorded.clone(),
+            digest: RECORDED_DIGEST.to_string(),
+        })
+        .expect("a recorded snapshot on disk resolves");
+
+        assert_eq!(bundle.dir(), recorded.canonicalize().unwrap());
+        assert_eq!(
+            bundle.digest(),
+            RECORDED_DIGEST,
+            "the recorded digest is reused, not recomputed"
+        );
+        assert_eq!(
+            bundle.ephemeral_source(),
+            None,
+            "the recorded runner owns this snapshot; the sweep must not release it"
+        );
+        assert_eq!(
+            eval_mounts(&bundle),
+            vec![format!("{}:/plugin:ro", bundle.dir().display())]
+        );
     }
 }

@@ -31,6 +31,10 @@
       "minimum": 0,
       "description": "Cases that completed on the fake model and so were not graded at all (ADR-0055). Neither passes nor failures; `passed + failed + plumbing_ok == total`."
     },
+    "bundle_digest": {
+      "type": ["string", "null"],
+      "description": "sha256 of the tar.gz snapshot the evaluated runner mounted (#1087). Always present; null at the local/cluster tiers, which grade a deployed version rather than a locally snapshotted bundle, and on a skill run against a runner this checkout never recorded. Read it against `skill status --json`'s bundle_digest to confirm messaging and eval executed the same bundle."
+    },
     "cases": {
       "type": "array",
       "items": {

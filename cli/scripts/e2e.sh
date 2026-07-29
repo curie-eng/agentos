@@ -154,6 +154,42 @@ echo "=== curie skill status ==="
 "$BIN" skill status
 
 echo
+echo "=== curie skill status --json (#1087: capture the initial bundle digest) ==="
+STATUS_JSON_1="$("$BIN" skill status --json)"
+printf '%s\n' "$STATUS_JSON_1"
+DIGEST_1="$(printf '%s' "$STATUS_JSON_1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_digest"])')"
+if [[ -z "$DIGEST_1" || "$DIGEST_1" == "None" ]]; then
+    echo "error: expected \`skill status --json\` to report a non-null bundle_digest for a just-booted runner; got '$DIGEST_1'." >&2
+    echo "payload: $STATUS_JSON_1" >&2
+    exit 1
+fi
+echo "initial bundle digest: $DIGEST_1"
+
+echo
+echo "=== #1087 AC1: edit the source after boot, confirm the running container keeps the ORIGINAL snapshot ==="
+SKILL_FILE_PATH="$WORKDIR/deal-desk/skills/deal-desk/SKILL.md"
+SKILL_FILE_ORIGINAL="$(cat "$SKILL_FILE_PATH")"
+MARKER="e2e-post-boot-source-edit-$$"
+echo "$MARKER" >> "$SKILL_FILE_PATH"
+
+MOUNTED_SKILL_MD="$(docker exec "$CONTAINER" cat /plugin/skills/deal-desk/SKILL.md)"
+if grep -qF "$MARKER" <<<"$MOUNTED_SKILL_MD"; then
+    echo "error: the running container's /plugin/skills/deal-desk/SKILL.md contains the marker '$MARKER', added to the HOST source after boot." >&2
+    echo "expected: the runner keeps executing the immutable snapshot it packed at \`skill up\` time, unaffected by a later host edit." >&2
+    exit 1
+fi
+echo "confirmed: the running container's /plugin mount does not see the post-boot host edit"
+
+STATUS_JSON_1B="$("$BIN" skill status --json)"
+DIGEST_1B="$(printf '%s' "$STATUS_JSON_1B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_digest"])')"
+if [[ "$DIGEST_1B" != "$DIGEST_1" ]]; then
+    echo "error: \`skill status --json\` reported bundle_digest '$DIGEST_1B' after a host-only source edit; expected it to stay '$DIGEST_1'." >&2
+    echo "expected: the digest identifies the snapshot mounted at boot, not the current (mutated) source." >&2
+    exit 1
+fi
+echo "confirmed: bundle_digest is unchanged by the post-boot host edit ($DIGEST_1)"
+
+echo
 echo "=== curie skill message (synthetic event, streamed NDJSON reply) ==="
 "$BIN" skill message "@curie can we approve the Meridian deal at 18% discount?"
 
@@ -170,6 +206,41 @@ echo "=== curie skill eval (explicit cases file) ==="
 echo
 echo "=== curie skill down ==="
 "$BIN" skill down
+
+echo
+echo "=== #1087 AC3: re-up on the mutated source, confirm a NEW bundle digest is packed ==="
+"$BIN" skill up "${START_ARGS[@]}"
+STATUS_JSON_2="$("$BIN" skill status --json)"
+DIGEST_2="$(printf '%s' "$STATUS_JSON_2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_digest"])')"
+if [[ -z "$DIGEST_2" || "$DIGEST_2" == "None" ]]; then
+    echo "error: expected \`skill status --json\` to report a non-null bundle_digest after re-\`skill up\`; got '$DIGEST_2'." >&2
+    echo "payload: $STATUS_JSON_2" >&2
+    exit 1
+fi
+if [[ "$DIGEST_2" == "$DIGEST_1" ]]; then
+    echo "error: bundle_digest is still '$DIGEST_1' after a fresh \`skill up\` on a source that changed since the first boot." >&2
+    echo "expected: a restart packages the changed source as a NEW digest." >&2
+    exit 1
+fi
+echo "confirmed: re-up on changed source produced a new bundle digest ($DIGEST_1 -> $DIGEST_2)"
+
+echo
+echo "=== restore the source and tear down the second runner ==="
+printf '%s\n' "$SKILL_FILE_ORIGINAL" > "$SKILL_FILE_PATH"
+"$BIN" skill down
+
+echo
+echo "=== #1087: confirm teardown released the bundle snapshot ==="
+SNAPSHOT_ROOT="$WORKDIR/deal-desk/.curie/snapshots"
+if [[ -d "$SNAPSHOT_ROOT" ]]; then
+    REMAINING="$(find "$SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1)"
+    if [[ -n "$REMAINING" ]]; then
+        echo "error: expected $SNAPSHOT_ROOT to be empty (or absent) after the final \`skill down\`, but it still contains:" >&2
+        echo "$REMAINING" >&2
+        exit 1
+    fi
+fi
+echo "confirmed: no bundle snapshot left under $SNAPSHOT_ROOT"
 
 echo
 echo "E2E PASS"

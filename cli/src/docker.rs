@@ -811,6 +811,36 @@ mod tests {
         assert_eq!(args.last().unwrap(), "curie-runner");
     }
 
+    /// #1087: the runner mounts whatever `plugin_dir` the spec carries, and
+    /// `skill up` now carries the materialized snapshot rather than the editable
+    /// source. Asserted on the argv the user's Docker daemon actually receives:
+    /// exactly one `-v ...:/plugin:ro`, naming the snapshot, with the bare source
+    /// path never mounted.
+    #[test]
+    fn run_args_mount_whatever_plugin_dir_the_spec_carries() {
+        let snapshot = format!("/tmp/deal-desk/.curie/snapshots/{}", "b".repeat(64));
+        let args = StartSpec {
+            plugin_dir: PathBuf::from(&snapshot),
+            ..spec()
+        }
+        .run_args();
+
+        let mounts: Vec<String> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].clone())
+            .collect();
+        assert_eq!(
+            mounts,
+            vec![format!("{snapshot}:/plugin:ro")],
+            "the only bundle mount must be the snapshot: {args:?}"
+        );
+        assert!(
+            !args.join(" ").contains("-v /tmp/deal-desk:/plugin:ro"),
+            "the editable source must never be mounted alongside it: {args:?}"
+        );
+    }
+
     #[test]
     fn run_args_apply_container_hardening() {
         // Every local runner boots hardened (#631): read-only rootfs with tmpfs

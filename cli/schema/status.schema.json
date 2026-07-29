@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.curietech.ai/cli/status/v1.json",
   "title": "curie skill status --json",
-  "description": "The agent-facing payload of `curie skill status --json`: the runner base URL plus the serialized ACI SessionStatus. The wrapper keys are what the CLI owns and are locked; the inner `session` is a frozen ACI contract elsewhere, so it is left unconstrained here rather than mirrored field-by-field.",
+  "description": "The agent-facing payload of `curie skill status --json`: the runner base URL, the serialized ACI SessionStatus, and the recorded bundle digest (#1087). The wrapper keys are what the CLI owns and are locked; the inner `session` is a frozen ACI contract elsewhere, so it is left unconstrained here rather than mirrored field-by-field.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,6 +13,10 @@
     "url": {
       "type": "string"
     },
-    "session": {}
+    "session": {},
+    "bundle_digest": {
+      "type": ["string", "null"],
+      "description": "sha256 of the tar.gz snapshot this runner mounted (#1087); null when the runner was recorded before #1087 or no runner is recorded."
+    }
   }
 }

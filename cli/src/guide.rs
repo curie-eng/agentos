@@ -297,6 +297,10 @@ pub fn primer() -> Primer {
                 detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter); a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
             },
             Landmine {
+                title: "The skill runner executes an immutable snapshot taken at `skill up`",
+                detail: "A `SKILL.md` or `.mcp.json` edit does not reach a running runner: re-run `curie skill up --replace` and confirm the new `bundle_digest` in `curie skill status --json`. `evals/cases.json` IS read live from source, so the contract can update while the behavior stays frozen at the boot snapshot.",
+            },
+            Landmine {
                 title: "secretKeyRef env vars resolve once, at pod start",
                 detail: "A connect that rotates a secret must also roll the pod; `curie cluster comms` does this for you.",
             },

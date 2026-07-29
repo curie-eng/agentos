@@ -2586,7 +2586,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             .await
             .context("reading the eval matrix")?;
         if let Some(rows) = sweep_ready_rows(&matrix, &triggered_sha, &want) {
-            return crate::commands::report_sweep(&rows);
+            return crate::commands::report_sweep(&rows, None);
         }
         if Instant::now() >= deadline {
             // Only report a partial once THIS run's version has landed at all;
@@ -2627,7 +2627,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             ui.warn(&format!(
                 "timed out waiting on some models ({missing}); reporting what landed so far"
             ));
-            return crate::commands::report_sweep(&rows);
+            return crate::commands::report_sweep(&rows, None);
         }
         tokio::time::sleep(SWEEP_POLL_INTERVAL).await;
     }
@@ -2749,7 +2749,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let results = run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await?;
-    crate::commands::report_eval(&results)
+    crate::commands::report_eval(&results, None)
 }
 
 /// Whether a surfaced enqueue/await error looks like a timeout or a stalled
@@ -2863,7 +2863,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    crate::commands::report_eval(&results)
+    crate::commands::report_eval(&results, None)
 }
 
 #[cfg(test)]
@@ -3896,7 +3896,7 @@ mod tests {
         // Feeding this row straight into the shared reporter fails the sweep
         // loudly, exactly as the skill-tier row does -- same signal, same gate,
         // regardless of which tier produced it.
-        let err = crate::commands::report_sweep(&rows).unwrap_err();
+        let err = crate::commands::report_sweep(&rows, None).unwrap_err();
         assert!(err.to_string().contains("bogus-model-xyz"));
     }
 
@@ -3975,7 +3975,7 @@ mod tests {
             "scoped to new-sha opus never completed a turn, so the sweep must fail loudly"
         );
         // The shared reporter fails the sweep and names the offending model.
-        let err = crate::commands::report_sweep(&rows).unwrap_err();
+        let err = crate::commands::report_sweep(&rows, None).unwrap_err();
         assert!(err.to_string().contains("opus"));
     }
 

@@ -54,6 +54,8 @@ fn bundle_with_recorded_runner(with_local_model: bool) -> (tempfile::TempDir, Ru
         ollama_container: with_local_model.then(|| format!("{name}-ollama")),
         network: with_local_model.then(|| format!("{name}-net")),
         model_base_url: None,
+        bundle_digest: None,
+        bundle_snapshot_dir: None,
     };
     state::save(&dir.path().join("bundle"), &recorded).expect("save recorded runner");
     (dir, recorded)

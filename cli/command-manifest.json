@@ -400,7 +400,7 @@
           "name": "approvals"
         },
         {
-          "about": "Not available at this tier: `skill up` runs the bundle bytes on disk, so no deployed version is assigned; use `curie local versions <agent>` or `curie cluster versions <agent>` for a deployed agent",
+          "about": "Not available at this tier: `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned; use `curie local versions <agent>` or `curie cluster versions <agent>` for a deployed agent",
           "hidden": false,
           "name": "versions"
         },
