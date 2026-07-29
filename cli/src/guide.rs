@@ -257,9 +257,9 @@ pub fn primer() -> Primer {
                 },
                 ApprovalFact {
                     title: "Driving it with no workspace connected",
-                    detail: "--list reports pending records with their ids and the channel each \
-                             one is bound to; --resolve settles one as a named actor. Resolution \
-                             is once-only: the first authorized resolver wins and a later one is \
+                    detail: "--list reports each pending record's id, summary, and the route it \
+                             named; --resolve settles one as a named actor. Resolution is \
+                             once-only: the first authorized resolver wins and a later one is \
                              told who won.",
                 },
             ],
@@ -321,7 +321,7 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "a resolve is refused with \"you are not an approver\"",
-                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel the record reports under `--list`.",
+                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
             },
             Recovery {
                 symptom: "the agent says a request is pending but no approval card appeared",

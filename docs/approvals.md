@@ -161,7 +161,7 @@ a bare runner keeps no durable store
 ([ADR-0077](adr/0077-skill-tier-durable-approvals-stay-unavailable.md)).
 
 ```bash
-# what is pending, with each record's id and bound channel
+# what is pending: each record's id, summary, and the route it named
 curie local approvals my-agent --list
 
 # settle one as a named actor (must not be the requester)
@@ -178,8 +178,9 @@ Resolution is **once-only**: the first authorized resolver wins the compare-and-
 a later one is told who won rather than overwriting the decision.
 
 `--actor-channel` is what proves channel membership for the default approver set. The
-channel to pass is the one `--list` reports for that record. A route that declares
-`approvers.users` or `approvers.group` ignores it, so passing it there is harmless.
+channel to pass is the one that record's route is bound to, or the requesting channel
+when `--list` shows the record named no route. A route that declares `approvers.users`
+or `approvers.group` ignores the channel entirely, so passing it there is harmless.
 
 ## Operational guarantees
 
