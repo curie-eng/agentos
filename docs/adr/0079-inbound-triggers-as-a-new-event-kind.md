@@ -1,14 +1,14 @@
 # 79. Inbound triggers as a new event kind, ingested by the API
 
 Date: 2026-07-10
-Status: Proposed
+Status: Accepted
 
 Proposes how "triggers beyond chat" (issue
 [#29](https://github.com/curie-eng/curie/issues/29)) enter the system: which
 service accepts a non-Slack trigger, and how a triggered turn produces output
-when there is no Slack placeholder to edit. This ADR is **Proposed**, not
-Accepted — it exists to get a decision from the worker/kernel owner before any
-code lands, because the mechanism touches the sacred kernel/dispatcher seam
+when there is no Slack placeholder to edit. This ADR is **Accepted**; the
+worker/kernel owner's decision authorizes the remaining implementation because
+the mechanism touches the sacred kernel/dispatcher seam
 (`apps/worker/CLAUDE.md`) and the hand-mirrored queue payload
 (`docs/roadmap.md` §2).
 
@@ -39,7 +39,7 @@ guessed in a PR:
    "post-instead-of-edit" output path for placeholder-less events (a kernel
    change).
 
-## Decision (proposed)
+## Decision
 
 1. **The API accepts inbound triggers.** Add `POST /hooks/{agent}/{hook}` to
    `apps/api`, reusing the existing HMAC verification pattern (per-agent hook
@@ -64,9 +64,8 @@ guessed in a PR:
    the new field by hand in the dispatcher (Python) and CLI (Rust).
 
 Decisions (2) and (3) are **kernel/contract changes owned by the worker
-single-owner** (Yichen); this ADR is the request to accept or amend the shape
-before that work starts. Decision (1) is API-lane and can proceed once the event
-shape in (2) is agreed.
+single-owner** (Yichen); this ADR records the accepted shape for that work.
+Decision (1) is API-lane and can proceed under the accepted event shape in (2).
 
 ## Alternatives considered
 
@@ -86,5 +85,5 @@ shape in (2) is agreed.
 - The kernel gains a placeholder-less output path, exercised by a provoking
   test alongside its existing invariants.
 - The turn payload becomes a first-class contract, retiring a known drift risk.
-- Until this is Accepted and the kernel side lands, the webhook cannot complete a
+- Until the kernel side lands, the webhook cannot complete a
   turn end to end, so no partial webhook code should merge.

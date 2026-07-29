@@ -184,7 +184,7 @@ its own decision when it lands:
 ## Status note
 
 Draft. Once Accepted, this ADR supersedes ADR-0032, and ADR-0032's status line is
-updated to point here. It is Draft, not Proposed, because the substrate and
+updated to point here. It remains Draft because the substrate and
 TLS-termination decisions above are unresolved and the shape of the credential
 injection contract is not yet pinned; it records the direction both reviews
 converged on so the future ADRs build to it.

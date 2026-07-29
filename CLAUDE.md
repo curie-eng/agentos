@@ -31,11 +31,16 @@ snapshot of the current state.
 
 Workflow for non-trivial work:
 
-- **Write an ADR for the decision** before or alongside the work, numbered
-  sequentially in `docs/adr/`.
-- **Issues reference their ADR(s).** A GitHub issue that implements a decision
-  links the ADR, so an agent picking up the issue reads the decision's intent
-  first and builds to it.
+- **For an architectural decision that qualifies for an ADR under
+  [`AGENTS.md`](AGENTS.md), write a Draft ADR**, numbered sequentially in
+  `docs/adr/`. A Draft may merge for discussion but cannot authorize
+  implementation.
+- **Obtain explicit maintainer acceptance before implementation.** Acceptance
+  means the ADR is published with `Status: Accepted`.
+- **Issues reference their Accepted ADR(s).** A GitHub issue that implements a
+  decision links the ADR, so an agent picking up the issue reads the decision's
+  intent first and builds to it.
 - Division of labor: **ADRs are the "why + when"**, **issues are the "what + track
   the work"**, and **`ARCHITECTURE.md` is the "what talks to what."** Keep decision
-  rationale in the ADR, not duplicated across issues.
+  rationale in the ADR, not duplicated across issues. Follow
+  [`docs/adr/AGENTS.md`](docs/adr/AGENTS.md) for the complete procedure.

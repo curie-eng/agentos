@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: Proposed (gated on a spike, see Decision 5)
+Status: Draft
 
 Together with [ADR-0060](0060-the-harness-is-a-declared-package.md) this replaces
 the Proposed [ADR-0031](0031-harness-neutral-runner-seams.md). 0059 decides

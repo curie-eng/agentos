@@ -332,6 +332,12 @@ commands.
 
 Two different tools; do not conflate them.
 
+Draft ADRs may merge for discussion, but they cannot authorize implementation.
+Implementation may start only after the ADR is published as `Accepted` with
+explicit maintainer approval, and it is tracked in a linked GitHub issue and
+pull request. Follow [`docs/adr/AGENTS.md`](docs/adr/AGENTS.md) for the complete
+procedure.
+
 - Write an **ADR** (`docs/adr/`, see ADR-0001) only for a **cross-cutting
   architectural decision that closes the door on alternatives.** It is a choice
   about the *shape* of the system (a contract, a seam, a substrate, an invariant)
