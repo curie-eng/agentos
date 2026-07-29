@@ -384,6 +384,12 @@ rung_local() {
     printf '%s\n' "$out"
     assert_finalized_reply "local" "$out"
 
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie local eval ==="
+        "$BIN" local eval --cases "$WORKDIR/bundle/evals/cases.json"
+    fi
+
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down ==="
@@ -509,6 +515,12 @@ rung_local_release() {
     printf '%s\n' "$out"
     assert_finalized_reply "local-release" "$out"
 
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie local eval (release compose stack) ==="
+        "$BIN" local eval --cases "$WORKDIR/bundle-release/evals/cases.json"
+    fi
+
     if (( LOCAL_STACK_OWNED )); then
         echo
         echo "=== curie local down -f compose.release.yaml ==="
@@ -601,6 +613,16 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     out="$("$BIN" "${msg_args[@]}" || true)"
     printf '%s\n' "$out"
     assert_finalized_reply "cluster" "$out"
+
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie cluster eval ==="
+        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+        if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
+            eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
+        fi
+        "$BIN" "${eval_args[@]}"
+    fi
 }
 
 echo

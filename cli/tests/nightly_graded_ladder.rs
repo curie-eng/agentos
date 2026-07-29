@@ -28,7 +28,9 @@
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Read a workflow file's raw text, or an empty string when it does not exist
 /// yet. Assertions on an empty string fail with their own readable messages
@@ -49,8 +51,22 @@ fn ci() -> String {
     workflow_text("ci.yaml")
 }
 
+fn ladder() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    fs::read_to_string(path).unwrap_or_default()
+}
+
 fn count_lines_containing(text: &str, needle: &str) -> usize {
     text.lines().filter(|line| line.contains(needle)).count()
+}
+
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).expect("write harness executable");
+    let mut permissions = fs::metadata(path)
+        .expect("read harness metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("mark harness executable");
 }
 
 // --- Assertion group 1: arms the GRADED path -------------------------------
@@ -238,4 +254,121 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
             );
         }
     }
+}
+
+#[test]
+fn live_local_rung_grades_the_deployed_weather_cases() {
+    let text = ladder();
+    let contract = r#"assert_finalized_reply "local" "$out"
+
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie local eval ==="
+        "$BIN" local eval --cases "$WORKDIR/bundle/evals/cases.json"
+    fi"#;
+    assert!(
+        text.contains(contract),
+        "the live local rung must run local eval after its plumbing assertion \
+         against the deployed weather bundle cases; ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn live_local_release_rung_grades_its_own_weather_cases_copy() {
+    let text = ladder();
+    let contract = r#"assert_finalized_reply "local-release" "$out"
+
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie local eval (release compose stack) ==="
+        "$BIN" local eval --cases "$WORKDIR/bundle-release/evals/cases.json"
+    fi"#;
+    assert!(
+        text.contains(contract),
+        "the live local release rung must run local eval after its plumbing \
+         assertion against its own deployed weather bundle cases copy; \
+         ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn live_cluster_rung_grades_weather_cases_with_the_message_listen_host() {
+    let text = ladder();
+    let contract = r#"assert_finalized_reply "cluster" "$out"
+
+    if [[ "$LIVE" == "1" ]]; then
+        echo
+        echo "=== curie cluster eval ==="
+        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+        if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
+            eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
+        fi
+        "$BIN" "${eval_args[@]}"
+    fi"#;
+    assert!(
+        text.contains(contract),
+        "the live cluster rung must run cluster eval after its plumbing \
+         assertion against the deployed weather bundle cases and forward the \
+         message listen host; ladder contents:\n{text}"
+    );
+}
+
+#[test]
+fn live_cluster_rung_propagates_deployed_evaluator_failure() {
+    let harness = tempfile::tempdir().expect("create harness directory");
+    let fake_curie = harness.path().join("curie");
+    let eval_marker = harness.path().join("eval_called");
+    write_executable(
+        &fake_curie,
+        r#"#!/bin/sh
+case "$*" in
+    "--version")
+        echo "curie test harness"
+        ;;
+    "--json cluster status")
+        printf '%s\n' '{"release_found":true}'
+        ;;
+    "cluster deploy --plugin-dir "*)
+        ;;
+    "--json cluster message "*)
+        printf '%s\n' '{"finalized":true,"reply":"live weather reply"}'
+        ;;
+    "cluster eval --cases "*)
+        printf '%s\n' called > "$EVAL_MARKER"
+        exit 42
+        ;;
+    *)
+        echo "unexpected curie invocation: $*" >&2
+        exit 97
+        ;;
+esac
+"#,
+    );
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    let output = Command::new("bash")
+        .arg(script)
+        .env("CURIE_BIN", &fake_curie)
+        .env("CURIE_E2E_TIERS", "cluster")
+        .env("CURIE_E2E_LIVE", "1")
+        .env("CURIE_CREDENTIALS", "test-credential")
+        .env("EVAL_MARKER", &eval_marker)
+        .env_remove("CURIE_E2E_LISTEN_HOST")
+        .output()
+        .expect("run the real ladder script");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        eval_marker.exists(),
+        "the deployed evaluator must run after the cluster message plumbing \
+         succeeds; status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "the ladder must preserve the deployed evaluator failure; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
