@@ -2,7 +2,7 @@
 
 Date: 2026-07-16
 
-Status: Proposed
+Status: Draft
 
 This is a **decision, not code**: it settles whether, and how deeply, Curie
 supports *workflow-controlled* agents — developer-authored orchestration

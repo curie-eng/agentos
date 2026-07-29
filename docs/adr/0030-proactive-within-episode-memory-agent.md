@@ -2,7 +2,7 @@
 
 Date: 2026-07-14
 
-Status: Proposed
+Status: Draft
 
 Extends [ADR-0025](0025-memory-port-and-first-loader.md) (the memory port and its
 passive cross-session preamble) and [ADR-0003](0003-stateless-first-rehydrate-on-resume.md)
@@ -59,7 +59,7 @@ Terminal-Bench 2.0** and **+6.8pp on τ²-Bench** for a Sonnet-class action agen
 **Add a proactive memory agent as an optional, plug-and-play layer over the frozen
 ACI injection seam. It is a *within-episode* execution-state layer that composes
 with, and does not replace, ADR-0025's cross-session lessons and ADR-0003's
-resume.** Proposed; the validation gate below governs promotion to Accepted.
+resume.** Draft. The validation gate below informs maintainer acceptance.
 
 - **A separate memory agent, not a harness change.** The memory agent runs as its
   own process alongside the action-agent runner (our one-process-per-sandbox shape
@@ -93,15 +93,15 @@ resume.** Proposed; the validation gate below governs promotion to Accepted.
   is out of scope here and named as future work. This ADR lands the within-episode
   layer only.
 
-### Validation gate (before this moves to Accepted)
+### Validation gate for maintainer acceptance
 
-Per ADR-0001, evidence-driven. Proposed until a spike shows, on a real bundle
-driven through `local`/`cluster`: (1) the reminder actually lands as a steer at the
-next loop boundary via the existing ACI path with no harness modification; (2) an
-eval delta on a long-horizon case set attributable to the memory layer (graded by
-ADR-0022's trajectory graders or ADR-0042's verifier); and (3) a token and latency
-accounting for the second (memory-agent) model call, which the paper acknowledges
-but never benchmarks.
+Per ADR-0001, a maintainer considers evidence from a spike on a real bundle
+driven through `local`/`cluster` before accepting this Draft: (1) the reminder
+actually lands as a steer at the next loop boundary via the existing ACI path with
+no harness modification; (2) an eval delta on a long-horizon case set attributable
+to the memory layer (graded by ADR-0022's trajectory graders or ADR-0042's
+verifier); and (3) a token and latency accounting for the second (memory-agent)
+model call, which the paper acknowledges but never benchmarks.
 
 ## Alternatives considered
 

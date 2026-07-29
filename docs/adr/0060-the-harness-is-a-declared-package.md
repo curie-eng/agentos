@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: Proposed
+Status: Accepted
 
 **Supersedes [ADR-0011](0011-opencode-second-harness.md)** ("OpenCode as the
 second harness behind the ACI"). Together with

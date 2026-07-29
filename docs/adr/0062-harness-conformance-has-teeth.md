@@ -2,7 +2,7 @@
 
 Date: 2026-07-21
 
-Status: Proposed
+Status: Draft
 
 Follows [ADR-0060](0060-the-harness-is-a-declared-package.md) (a harness is a
 declared package) and [ADR-0061](0061-out-of-process-harness-boundary.md) (the

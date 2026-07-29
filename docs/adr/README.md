@@ -59,7 +59,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0027 | [A thin broker port at the non-sacred seams; defer the second broker](0027-thin-broker-port-defer-second-broker.md) | Accepted |
 | 0028 | [The sandbox substrate is a resilience-only fallback, not a product swap axis](0028-substrate-is-resilience-fallback-not-product-swap-axis.md) | Accepted |
 | 0029 | [The conversation-history port and its first loader: transcript replay over the durable state store](0029-conversation-history-port-and-first-loader.md) | Accepted |
-| 0030 | [A proactive within-episode memory agent over the frozen ACI injection seam](0030-proactive-within-episode-memory-agent.md) | Proposed |
+| 0030 | [A proactive within-episode memory agent over the frozen ACI injection seam](0030-proactive-within-episode-memory-agent.md) | Draft |
 | 0031 | [Harness-neutral runner seams for the second harness](0031-harness-neutral-runner-seams.md) | Superseded by [ADR-0060](0060-the-harness-is-a-declared-package.md) and [ADR-0061](0061-out-of-process-harness-boundary.md) (decisions 2/3/5 become manifest fields in 0060; decision 4 carries forward unchanged; decision 1 becomes 0061's recorded fallback) |
 | 0032 | [Explicit named-provider egress, resolved at install](0032-explicit-provider-egress.md) | Accepted |
 | 0033 | [Scoped, least-privilege sandbox state token](0033-scoped-sandbox-state-token.md) | Accepted |
@@ -69,11 +69,11 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0037 | [Opt-in binding hook and Pareto model routing](0037-opt-in-binding-hook-and-pareto-model-routing.md) | Accepted |
 | 0038 | [An observability CLI helper for the agent-dev loop](0038-observability-cli-helper-for-the-agent-dev-loop.md) | Accepted |
 | 0039 | [Bounded delivery: a delivery cap and a dead-letter graveyard](0039-bounded-delivery-and-a-dead-letter-graveyard.md) | Accepted |
-| 0040 | [Adopt the Agent Client Protocol as an edge projection](0040-adopt-acp-as-an-edge-projection.md) | Proposed |
+| 0040 | [Adopt the Agent Client Protocol as an edge projection](0040-adopt-acp-as-an-edge-projection.md) | Draft |
 | 0041 | [Every verb is answered at every tier](0041-every-verb-is-answered-at-every-tier.md) | Accepted |
 | 0042 | [Adopt LLM-as-a-Verifier: a continuous-score semantic grader and a live progress signal](0042-llm-as-a-verifier-grader-and-progress-signal.md) | Accepted |
 | 0043 | [The interface catalog is generated from declared front-matter and gated in CI](0043-generated-interface-catalog-and-doc-lint-gate.md) | Accepted |
-| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Proposed |
+| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Draft |
 | 0045 | [The status line is the mutable part of an immutable ADR](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) | Accepted |
 | 0046 | [Converged approval gates: durable provenance, loud route resolution, and observe-only resume reconciliation](0046-converged-approval-gates-and-durable-provenance.md) | Accepted |
 | 0047 | [ADR-0047: Canonical env-var names for the API base URL and model credential](0047-canonical-env-var-names.md) | Accepted |
@@ -89,9 +89,9 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0057 | [`cluster deploy` self-plumbs a port-forward so the generated key stays off the cleartext proxy](0057-cluster-deploy-self-plumbs-port-forward-for-generated-key.md) | Accepted |
 | 0058 | [A pushed tag is not release authority: ancestry, checks, and an approval environment gate publication](0058-tag-push-is-not-release-authority.md) | Accepted |
 | 0059 | [The sandbox is a bounded resource envelope; capacity is a tenant boundary](0059-sandbox-is-a-bounded-resource-envelope.md) | Accepted |
-| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Proposed |
-| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Proposed (gated on a spike, see Decision 5) |
-| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Proposed |
+| 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Accepted |
+| 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft |
+| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Draft |
 | 0063 | [Message-driven approval reply surface](0063-message-driven-approval-reply-surface.md) | Accepted |
 | 0064 | [Fail-forward cluster teardown](0064-fail-forward-cluster-teardown.md) | Accepted |
 | 0065 | [Tag protection, not the workflow gate, binds a write actor](0065-tag-protection-not-the-workflow-gate-binds-a-write-actor.md) | Accepted |
@@ -108,9 +108,10 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0076 | [A closed, versioned attribute schema for the runner's OTel span stream](0076-closed-typed-telemetry-attribute-schema.md) | Accepted |
 | 0077 | [Skill-tier durable approvals stay unavailable, reported not absent](0077-skill-tier-durable-approvals-stay-unavailable.md) | Accepted |
 | 0078 | [Route message-driven approval cards through the connected Slack transport](0078-approval-cards-over-connected-transport.md) | Accepted |
-| 0079 | [Inbound triggers as a new event kind, ingested by the API](0079-inbound-triggers-as-a-new-event-kind.md) | Proposed |
+| 0079 | [Inbound triggers as a new event kind, ingested by the API](0079-inbound-triggers-as-a-new-event-kind.md) | Accepted |
 | 0080 | [Rename the project to Curie](0080-rename-to-curie.md) | Accepted |
 | 0081 | [A nightly graded parity ladder verifies the real-model promise CI cannot](0081-nightly-graded-parity-ladder.md) | Accepted |
 | 0082 | [Connected-transport approval cards ride a real CLI-posted placeholder](0082-connected-transport-approval-cards-via-a-real-placeholder.md) | Accepted |
 | 0084 | [Publish a verification contract for agents driving Curie](0084-publish-a-verification-contract-for-agents-driving-curie.md) | Accepted |
+| 0085 | [Acceptance, not implementation, authorizes an ADR](0085-acceptance-not-implementation-authorizes-an-adr.md) | Accepted |
 <!-- END GENERATED: adr-index -->
