@@ -1506,10 +1506,8 @@ fn read_chat_input(
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(None),
             (KeyCode::Esc, _) if chat.composing => chat.composing = false,
             (KeyCode::Esc, _) => return Ok(None),
-            (KeyCode::Enter, _) if chat.composing => {
-                if !chat.input.trim().is_empty() {
-                    return Ok(Some(chat.input.trim().to_string()));
-                }
+            (KeyCode::Enter, _) if chat.composing && !chat.input.trim().is_empty() => {
+                return Ok(Some(chat.input.trim().to_string()));
             }
             (KeyCode::Enter, _) => {
                 if chat.free_text_selected() {
