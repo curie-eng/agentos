@@ -252,6 +252,33 @@ pub(crate) fn recipes() -> Vec<Recipe> {
             ],
             notes: &["e.g. gate mcp__plugin_github-issues_github__create_issue so a write pauses for approval."],
         },
+        // The sibling of the gate recipe above, and the reason both exist: the
+        // gate one configures WHICH calls pause, this one shows the pending
+        // decisions that pausing produced. Offering only the first reads as
+        // "approvals means tool gating", which is the misreading `curie guide`'s
+        // approvals section exists to correct.
+        Recipe {
+            tabs: &["platform"],
+            title: "Review pending approvals",
+            description: "List the human decisions an agent is currently paused on.",
+            kind: RecipeKind::Command,
+            args: vec![
+                ArgPart::Tier,
+                ArgPart::Literal("approvals"),
+                ArgPart::Field("agent"),
+                ArgPart::Literal("--list"),
+            ],
+            fields: vec![Field {
+                key: "agent",
+                label: "Agent name",
+                default: None,
+                required: true,
+            }],
+            notes: &[
+                "Each record reports the id and the channel its route bound the card to; resolve one with `--resolve <id> --as <user> --actor-channel <channel>`.",
+                "The server blocks self-approval, so the resolving actor must not be the person whose turn raised the request.",
+            ],
+        },
         Recipe {
             tabs: &["platform"],
             title: "Inspect memory",
@@ -576,10 +603,11 @@ mod tests {
 
     /// The platform governance recipes that must work on BOTH tiers (#463).
     /// Observability is deliberately absent: see the local-only test below.
-    const TIERED_PLATFORM_RECIPES: [&str; 6] = [
+    const TIERED_PLATFORM_RECIPES: [&str; 7] = [
         "List versions",
         "Set budget",
         "Gate a tool (approvals)",
+        "Review pending approvals",
         "Inspect memory",
         "Kill an agent",
         "Resume an agent",
