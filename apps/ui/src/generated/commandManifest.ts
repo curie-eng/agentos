@@ -1180,6 +1180,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
+              "id": "repo",
+              "long": "repo",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "dev"
               ],
@@ -2498,6 +2506,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
+              "id": "repo",
+              "long": "repo",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "dev"
               ],
@@ -3279,6 +3295,14 @@ export const commandManifest = {
           "help": "Slack channel to bind the agent to. On first create it defaults to C0LOCALDEV; on redeploy it is only moved when you pass this flag, so omitting it leaves the deployed agent's channel untouched",
           "id": "slack_channel",
           "long": "slack-channel",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Bind this agent to a GitHub repository (`owner/name`) so pushes to its dev/prod branches deploy it (ADR-0014)",
+          "id": "repo",
+          "long": "repo",
           "positional": false,
           "required": false
         },
