@@ -78,6 +78,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubWebhookSecret
+            # Outbound GitHub credential: the eval commit status AND the
+            # git-flow bundle clone, without which a private repo cannot
+            # deploy (#1058).
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: githubToken
             - name: ENVIRONMENT
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
