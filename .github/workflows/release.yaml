@@ -339,6 +339,23 @@ jobs:
           # musl-tools) later if a fully static binary is wanted.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # arm64 Linux is the cheap-cloud target: Graviton and equivalents are
+          # ~20% less than x86 for this workload, and a single-node k3s box is a
+          # normal way to host a bot. Without a published binary the CLI cannot
+          # run on the host it is managing -- the only options were compiling it
+          # yourself or driving the cluster entirely from a laptop (#1065).
+          # Cross-compiled rather than run on an arm64 runner, so this costs no
+          # extra runner minutes. rustls pulls in `ring`, which compiles C, so a
+          # cross LINKER alone is not enough -- it needs a cross C compiler and
+          # the target libc headers. Without libc6-dev-arm64-cross, ring's build
+          # script reads the HOST /usr/include and dies on
+          # `bits/libc-header-start.h: No such file or directory`. Verified by
+          # reproducing this job in a clean amd64 container.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross_linker: aarch64-linux-gnu-gcc
+            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            cross_ar: aarch64-linux-gnu-ar
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
@@ -347,6 +364,11 @@ jobs:
           persist-credentials: false
       - name: Add target
         run: rustup target add ${{ matrix.target }}
+      - name: Install cross-linker
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
       - name: Assert tag matches the release-coupled versions
         run: |
           set -euo pipefail
@@ -364,11 +386,24 @@ jobs:
         working-directory: cli
         env:
           CURIE_BUILD_CHANNEL: release
+          # All empty for a native build. The CC/AR pair is what `ring`'s build
+          # script needs; the linker alone leaves it compiling C against the
+          # host sysroot.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cross_linker }}
+          AR_aarch64_unknown_linux_gnu: ${{ matrix.cross_ar }}
         run: cargo build --release --target ${{ matrix.target }}
       - name: Strip and name the binary
         run: |
           bin="cli/target/${{ matrix.target }}/release/curie"
-          strip "$bin" || true
+          # Host strip cannot process a cross-built arm64 ELF; use the matching
+          # cross binutils when present. `|| true` keeps an unstrippable binary
+          # shippable rather than failing the release over symbol size.
+          if [ -n "${{ matrix.cross_linker }}" ] && command -v aarch64-linux-gnu-strip >/dev/null; then
+            aarch64-linux-gnu-strip "$bin" || true
+          else
+            strip "$bin" || true
+          fi
           mkdir -p dist
           cp "$bin" "dist/curie-${{ matrix.target }}"
       # Cataloged from Cargo.lock, not the stripped binary: the lockfile is what
