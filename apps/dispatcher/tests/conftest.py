@@ -1,10 +1,13 @@
 """Shared fixtures. Stream/dedupe tests run against the REAL Valkey from the
-compose stack (per repo test discipline: never mock Valkey). Only the Slack Web
-API and socket transport are faked."""
+compose stack (per repo test discipline: never mock Valkey). The Slack Web API
+and socket transport are faked; `_black_hole_api` is not a fake but a real
+loopback socket standing in for an endpoint that never answers."""
 
 import logging
+import socket
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -58,6 +61,28 @@ class FakeSocketClient:
         """The body this envelope was acked with, or None."""
 
         return self.ack_payloads.get(envelope_id)
+
+
+@contextmanager
+def _black_hole_api() -> Iterator[str]:
+    """A real port that completes the TCP handshake and then never answers.
+
+    Nothing accepts the connection; the kernel's listen backlog completes the
+    handshake, so `connect` succeeds and the client is left reading from a
+    socket no one writes to. A refused connection fails instantly and can
+    never show a probe running past its deadline, so this is the fixture for
+    the opposite case: a probe whose read phase is what has to give up,
+    exactly the scenario an unbounded probe overshoots on. The preflight
+    suite is one consumer of this.
+    """
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    try:
+        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
+    finally:
+        sock.close()
+
 
 # Compose defaults and connection params come from the shared curie_test_support.valkey helper.
 

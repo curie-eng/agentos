@@ -37,7 +37,8 @@ from .approval_actions import (
     is_approval_action,
     open_note_dialog,
     process_approval_action,
-    process_note_submission,
+    render_note_submission,
+    resolve_note_submission,
 )
 from .config import DispatcherConfig
 from .queue import claim_event, enqueue
@@ -309,16 +310,29 @@ def register_handlers(
     # the open modal.
     @app.view(NOTE_MODAL_CALLBACK_ID)
     def _on_note_submitted(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        _outcome, response = process_note_submission(
+        # Decide first, with no Slack round trip in the way: Slack allows three
+        # seconds for the ack and the resolve POST is the only network hop the
+        # decision needs (#1077).
+        submission = resolve_note_submission(
             body=body,
-            web_client=web_client,
             resolver=approval_resolver,
             logger=logger,
         )
+        if submission is None:
+            # Unusable private_metadata: nothing resolved, nothing to render.
+            ack()
+            return
+        response = submission.response_action
         if response is None:
             ack()
         else:
             ack(response_action=response["response_action"], errors=response["errors"])
+
+        # Continue inline. Bolt returns the ack the moment ack() sets its
+        # response and keeps running the listener body on its own executor, so
+        # the card stamp needs no extra thread pool and no shutdown story of its
+        # own -- the same arrangement _on_action below already relies on.
+        render_note_submission(submission, web_client=web_client, logger=logger)
 
     # Any other Block Kit button click (a reply's action) becomes a turn. The
     # catch-all matches every action_id (including the approval ids above --

@@ -13,26 +13,38 @@ cannot have:
   click-is-the-decision behavior and must not regress;
 - and the widened claim race renders its refusal INSIDE the view, because the
   loser is standing in an open modal where an ephemeral is invisible.
+
+Plus the ack budget (#1077): the submit ack must reach the socket before any
+Slack round trip, and the note must stay small enough that the card stamp
+cannot bounce.
 """
 
+import threading
+import time
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import redis
-from curie_dispatcher.app import build_app
+from curie_dispatcher.app import build_app, build_web_client
 from curie_dispatcher.approval_actions import (
+    _VERDICT_LINE_MAX,
     APPROVE_NOTE_ACTION_ID,
     NOTE_MODAL_CALLBACK_ID,
     REJECT_NOTE_ACTION_ID,
+    ApprovalResolveClient,
     ResolveOutcome,
+    _refusal_text,
 )
 from curie_dispatcher.config import DispatcherConfig
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.web import WebClient
 
-from .conftest import FakeSocketClient, _authorize
+from .conftest import FakeSocketClient, _authorize, _black_hole_api
 
 APPROVAL_ID = "9a1e8a10-0000-0000-0000-000000001053"
 CARD_TS = "1700.0042"
@@ -76,19 +88,47 @@ class ScriptedResolver:
         return self.outcome
 
 
+def _gated_history(gate: threading.Event) -> Callable[..., dict[str, Any]]:
+    """A ``conversations.history`` that blocks until the test releases ``gate``.
+
+    How the ack-ordering tests turn "the ack did not wait on a Slack call" into a
+    structural fact rather than a timing hope.
+    """
+
+    def _history(**_kwargs: Any) -> dict[str, Any]:
+        gate.wait(5)
+        return {"messages": [_CARD_MESSAGE]}
+
+    return _history
+
+
 def _build(
     config: DispatcherConfig,
     redis_client: redis.Redis,
     resolver: ScriptedResolver,
     *,
     views_open_raises: bool = False,
+    history_side_effect: Callable[..., Any] | BaseException | None = None,
 ) -> tuple[App, WebClient]:
+    """Build the app under test.
+
+    ``history_side_effect`` is handed straight to the ``conversations.history``
+    mock, so a test picks the failure mode it needs: a callable that blocks (see
+    ``_gated_history``) for a Slack call that is SLOW, or an exception instance
+    for one that FAILS. ``slack_sdk`` 3.43.0 raises ``SlackApiError`` from
+    ``WebClient`` whenever Slack answers ``ok: false``
+    (``slack_sdk.web.base_client.BaseClient.api_call`` ends in
+    ``validate_slack_response``), so that is the exception a real
+    ``conversations.history`` failure arrives as.
+    """
+
     web_client = WebClient(token="xoxb-test")
     web_client.chat_postMessage = MagicMock(return_value={"ts": "555.000"})  # type: ignore[method-assign]
     web_client.chat_update = MagicMock(return_value={"ok": True})  # type: ignore[method-assign]
     web_client.chat_postEphemeral = MagicMock(return_value={"ok": True})  # type: ignore[method-assign]
     web_client.conversations_history = MagicMock(  # type: ignore[method-assign]
-        return_value={"messages": [_CARD_MESSAGE]}
+        side_effect=history_side_effect,
+        return_value={"messages": [_CARD_MESSAGE]},
     )
     web_client.views_open = MagicMock(  # type: ignore[method-assign]
         side_effect=RuntimeError("trigger_id expired") if views_open_raises else None,
@@ -373,3 +413,351 @@ def test_a_failed_views_open_falls_forward_and_resolves(
     # Nothing here is silent: the approver is told the note step was skipped.
     web_client.chat_postEphemeral.assert_called_once()
     assert "note" in web_client.chat_postEphemeral.call_args.kwargs["text"].lower()
+
+
+def test_the_ack_lands_before_any_slack_call_on_the_submit_path(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The ack must not be waiting on a Slack round trip (#1077).
+
+    Slack gives an interaction three seconds to be acknowledged
+    (https://api.slack.com/interactivity/handling#acknowledgment_response),
+    which slack_bolt 1.30.0 mirrors as ``ack_timeout: int = 3`` on
+    ``slack_bolt.listener.custom_listener.CustomListener``. The ack itself is a
+    two-thread affair: the listener body runs on Bolt's ``listener_executor`` and
+    only sets ``ack.response``, while the dispatch thread polls for it
+    (``slack_bolt.listener.thread_runner.ThreadListenerRunner.run``) and then
+    writes the envelope response
+    (``slack_bolt.adapter.socket_mode.internals.send_response``).
+
+    So the proof is the assertion made WHILE ``conversations.history`` is still
+    blocked: the ack reached the socket before that call returned, therefore it
+    cannot have been waiting on it. A "who was recorded first" list would not
+    prove this -- the listener thread starts the fetch the instant it acks, well
+    before the dispatch thread's 10ms poll wakes up to send the response.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    gate = threading.Event()
+    app, web_client = _build(
+        config, redis_client, resolver, history_side_effect=_gated_history(gate)
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    try:
+        handler.handle(sock, _note_submit("env-slow", note="shipping it"))
+        assert sock.acked_envelope_ids == ["env-slow"], (
+            "the submit was not acked while the Slack call was still outstanding"
+        )
+    finally:
+        # In a finally so a failed assertion cannot leave the listener parked.
+        gate.set()
+    _drain(app)
+
+    # The fetch still happens; it just happens after the ack.
+    web_client.conversations_history.assert_called_once()
+
+
+def test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The claim-race loser's refusal is on time AND the stale card is refreshed.
+
+    The refusal rides on the view ack, so it is subject to the same three second
+    deadline as the happy path: a loser who is told late is told nothing, because
+    Slack has already closed the interaction. And the 409 branch's card refresh
+    is the piece most likely to be dropped when the pre-ack work is split off, so
+    it gets asserted after the gate is released.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=409,
+            resolved_by=None,
+            detail="already resolved by U_FIRST (approved)",
+        )
+    )
+    gate = threading.Event()
+    app, web_client = _build(
+        config, redis_client, resolver, history_side_effect=_gated_history(gate)
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    try:
+        handler.handle(sock, _note_submit("env-slow-409", note="mine"))
+        payload = sock.ack_payload_for("env-slow-409")
+        assert payload is not None, (
+            "a refused submission must ack with a response_action before any Slack call"
+        )
+        assert payload.get("response_action") == "errors"
+        assert (
+            next(iter(payload["errors"].values())) == "already resolved by U_FIRST (approved)"
+        )
+    finally:
+        gate.set()
+    _drain(app)
+
+    # _refresh_settled_card must survive the split: a settled record must stop
+    # offering buttons.
+    web_client.chat_update.assert_called_once()
+
+
+def test_a_failing_card_read_still_acks_and_still_stamps_the_card(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The other half of the post-ack hazard: a Slack call that FAILS (#1077).
+
+    A raise from the post-ack half is not a logged traceback, it is a lost ack.
+    slack_bolt 1.30.0 handles an exception out of a non-auto-ack listener by
+    setting ``ack.response = None`` when the listener had already acked
+    (``slack_bolt.listener.thread_runner.ThreadListenerRunner.run``, the
+    ``run_ack_function_asynchronously`` branch), while the dispatch thread is
+    still polling ``ack.response`` in its 10ms loop. Lose that race and the
+    dispatch thread polls to its three second timeout and sends nothing at all,
+    leaving the modal open on an interaction Slack considers unacknowledged.
+
+    That executor also SWALLOWS the exception, so calling the listener and
+    checking that nothing propagated proves nothing. The observation that has
+    teeth is the socket's: the envelope was acked, and the card was still
+    stamped from the empty message the failed read falls back to.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    app, web_client = _build(
+        config,
+        redis_client,
+        resolver,
+        history_side_effect=SlackApiError(
+            "channel_not_found", {"ok": False, "error": "channel_not_found"}
+        ),
+    )
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _note_submit("env-hist-fail", note="shipping it"))
+    assert sock.acked_envelope_ids == ["env-hist-fail"], (
+        "a failing post-ack Slack call ate the submit's ack"
+    )
+    _drain(app)
+
+    web_client.conversations_history.assert_called_once()
+    # Fall forward: the read is best-effort, so the verdict still lands on the
+    # card built from an empty original rather than being dropped with the read.
+    web_client.chat_update.assert_called_once()
+    assert "shipping it" in web_client.chat_update.call_args.kwargs["text"]
+
+
+def test_a_conflict_from_another_approver_still_names_that_approver(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The loser of a claim race must be told WHO holds the decision.
+
+    Grounded on the outcome ``ApprovalResolveClient`` really builds from the
+    platform API's conflict (see the test below): ``resolved_by`` is None and the
+    winning approver's id lives inside the detail string. So the id reaches the
+    submitter only if the detail is rendered verbatim; a wording that dropped it
+    would leave the loser of a race told nothing about who took the decision.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=409,
+            resolved_by=None,
+            detail="already resolved by U_FIRST (approved)",
+        )
+    )
+    app, _ = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _note_submit("env-409-other", note="mine", user="U_MANAGER"))
+    _drain(app)
+
+    payload = sock.ack_payload_for("env-409-other")
+    assert payload is not None
+    assert next(iter(payload["errors"].values())) == "already resolved by U_FIRST (approved)"
+
+
+def test_a_real_api_conflict_carries_no_resolver_id_and_names_the_approver_in_its_detail() -> None:
+    """The conflict the platform API actually sends, parsed by the real client.
+
+    ``curie_api.routers.approvals.resolve_approval`` raises its resolve-path
+    conflict as ``HTTPException(status.HTTP_409_CONFLICT, f"already resolved by
+    {current.resolved_by} ({current.status})")``, and FastAPI serializes an
+    ``HTTPException`` as ``{"detail": <str>}`` and nothing else. There is no
+    ``resolved_by`` key in the body, so ``ResolveOutcome.resolved_by`` is None on
+    every real conflict and the winning approver's id survives only inside the
+    detail text.
+
+    Driven through ``ApprovalResolveClient.resolve`` itself, over an
+    ``httpx.MockTransport`` injected via its existing ``client`` parameter, so
+    nothing between the wire body and the outcome is faked. Every other test in
+    this file hands a ``ResolveOutcome`` straight to the app, which is why they
+    cannot see the gap between the shape the API sends and the shape the
+    dispatcher assumes.
+    """
+
+    def _conflict(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith(f"/approvals/{APPROVAL_ID}/resolve")
+        return httpx.Response(409, json={"detail": "already resolved by U_MANAGER (approved)"})
+
+    client = ApprovalResolveClient(
+        api_base_url="http://platform.invalid",
+        api_key="k",
+        client=httpx.Client(transport=httpx.MockTransport(_conflict)),
+    )
+    try:
+        outcome = client.resolve(
+            APPROVAL_ID,
+            decision="approved",
+            resolved_by="U_MANAGER",
+            actor_channel=CARD_CHANNEL,
+            note="mine",
+        )
+    finally:
+        client._client.close()
+
+    assert outcome.status_code == 409
+    assert outcome.resolved_by is None
+    assert outcome.detail == "already resolved by U_MANAGER (approved)"
+    # So the only thing there is to tell the approver is what the API said. A
+    # wording composed from ``resolved_by`` would render "Already resolved by
+    # None." here, which is why that field must not be trusted on a 409.
+    assert _refusal_text(outcome) == "already resolved by U_MANAGER (approved)"
+
+
+def test_a_discarded_outcome_does_not_read_the_card_at_all(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """Only the 200 and 409 renders use the fetched message, so every other
+    outcome pays a Slack round trip for a message nobody reads -- and pays it by
+    holding one of Bolt's five shared listener workers while it waits.
+
+    The contrast is asserted on the paths that DO need it: the 200 case in
+    ``test_the_ack_lands_before_any_slack_call_on_the_submit_path`` and the 409
+    case in ``test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it``.
+    """
+
+    resolver = ScriptedResolver(ResolveOutcome(status_code=403, detail="self-approval is blocked"))
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-403-no-fetch", note="please"))
+    _drain(app)
+
+    web_client.conversations_history.assert_not_called()
+
+
+def test_the_web_client_gives_up_inside_the_ack_budget(config: DispatcherConfig) -> None:
+    """slack_sdk 3.43.0 defaults ``timeout`` to 30 seconds
+    (``slack_sdk.web.base_client.BaseClient.__init__``), an order of magnitude
+    past Slack's three second interaction deadline
+    (https://api.slack.com/interactivity/handling#acknowledgment_response).
+
+    Asserted against the deadline rather than pinned to an exact number, so
+    retuning the value does not red this test.
+    """
+
+    assert build_web_client(config).timeout < 3
+
+
+def test_the_resolver_gives_up_inside_the_ack_budget() -> None:
+    """The resolve call is the only network hop left inside the ack budget.
+
+    Behavioral, against a real loopback listener that accepts the connection and
+    never replies -- a local server, not a mocked dependency. Asserting the
+    elapsed wall clock rather than a private timeout attribute means the test
+    survives an internal rename and still fails if the budget is blown by some
+    other means (a retry loop, a second hop).
+    """
+
+    with _black_hole_api() as url:
+        client = ApprovalResolveClient(api_base_url=url, api_key="k")
+        try:
+            started = time.monotonic()
+            outcome = client.resolve(
+                APPROVAL_ID,
+                decision="approved",
+                resolved_by="U_MANAGER",
+                actor_channel=CARD_CHANNEL,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            # The client owns an httpx.Client (and its connection pool) and
+            # exposes no close(), so releasing it here is the only deterministic
+            # teardown; left to the garbage collector it leaks a socket into the
+            # rest of the session. Reached through the attribute deliberately: if
+            # that attribute is renamed this test should red rather than quietly
+            # leak again.
+            client._client.close()
+
+    # The httpx.HTTPError path: the approver gets "try again shortly" inside the
+    # still-open modal instead of a blown ack.
+    assert outcome.status_code == 0
+    assert elapsed < 3.0, f"the resolver held the ack budget for {elapsed:.1f}s"
+
+
+def test_an_over_long_note_cannot_break_the_card_stamp(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """Slack caps a text object's ``text`` at 3000 characters
+    (https://api.slack.com/reference/block-kit/composition-objects#text), so a
+    long note concatenated onto the attribution produces a card edit real Slack
+    rejects. ``chat_update`` is a MagicMock here and accepts anything, so the
+    assertion that catches it is the LENGTH, not an exception.
+    """
+
+    note = "x" * 3000
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-long", note=note))
+    _drain(app)
+
+    web_client.chat_update.assert_called_once()
+    text = web_client.chat_update.call_args.kwargs["text"]
+    assert len(text) <= 2900
+    # The note is what gets cut, never the attribution.
+    assert text.startswith("Approved by <@U_MANAGER>")
+    # A single U+2026, not three periods: the marker is shared with the worker's
+    # ``_truncate`` in ``curie_worker.blocks``, so the same Slack card surface
+    # does not end truncated text two ways depending on which service stamped it.
+    assert text.endswith("…")
+    assert not any(
+        b.get("type") == "actions" for b in web_client.chat_update.call_args.kwargs["blocks"]
+    )
+    # Only the display is clamped: the durable record keeps the whole note, which
+    # is what the requester's resume turn interpolates.
+    assert resolver.calls[0]["note"] == note
+
+
+def test_the_note_modal_declares_a_limit_below_the_card_clamp(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The human-facing guard and the structural backstop must not converge.
+
+    Slack shows a counter and blocks submit at the input's ``max_length``. If it
+    equalled the verdict-line clamp the truncation branch would be unreachable
+    through the modal, so the two are asserted to be ordered rather than equal.
+    """
+
+    resolver = ScriptedResolver(ResolveOutcome(status_code=200, resolved_by="U_MANAGER"))
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_click("env-lim", action_id=APPROVE_NOTE_ACTION_ID))
+    _drain(app)
+
+    element = web_client.views_open.call_args.kwargs["view"]["blocks"][0]["element"]
+    assert "max_length" in element, "the modal must declare the note limit to the human"
+    assert element["max_length"] > 0
+    assert element["max_length"] < _VERDICT_LINE_MAX

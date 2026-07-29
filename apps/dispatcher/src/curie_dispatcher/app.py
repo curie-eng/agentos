@@ -26,6 +26,23 @@ from .supervisor import Connection
 # construction. A placeholder is therefore harmless.
 _SOCKET_MODE_SIGNING_PLACEHOLDER = "unused-in-socket-mode"
 
+# How long any one phase of a Slack Web API call may take (#1077). slack_sdk
+# defaults this to 30 seconds (measured on slack_sdk 3.43.0,
+# ``slack_sdk.web.base_client.BaseClient.__init__``), an order of magnitude past
+# Slack's three second interaction deadline, so a single slow call could hold one
+# of Bolt's five shared listener-executor workers for most of a minute.
+#
+# What two seconds buys is that bounded hold, and nothing stronger. It is NOT a
+# two second ceiling on a call: slack_sdk's default ``retry_handlers`` include a
+# ``ConnectionErrorRetryHandler(max_retry_count=1)``, and urllib raises a
+# connect/send-phase timeout as a ``URLError``, which that handler retries once
+# after a jittered backoff. The worst case for such a call is therefore about
+# 2 + 0.5 + 2 = 4.5s, past the three second deadline. (A read-phase timeout
+# surfaces as ``TimeoutError``, which the handler does not match, so that phase
+# is not retried.) Do not read this constant as making a Web API call safe to put
+# back on a pre-ack path -- nothing on the ack path may call Slack at all.
+_SLACK_API_TIMEOUT_SECONDS = 2
+
 
 def build_redis(config: DispatcherConfig) -> redis.Redis:
     """A decode_responses Valkey client (str in, str out) for stream + dedupe ops."""
@@ -40,7 +57,7 @@ def build_redis(config: DispatcherConfig) -> redis.Redis:
 
 def build_web_client(config: DispatcherConfig) -> WebClient:
     """The dispatcher's own Web API client, authenticated with the bot token."""
-    return WebClient(token=config.slack_bot_token)
+    return WebClient(token=config.slack_bot_token, timeout=_SLACK_API_TIMEOUT_SECONDS)
 
 
 def build_app(
