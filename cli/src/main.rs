@@ -105,7 +105,7 @@ struct ClusterAgentTarget {
 /// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
 /// otherwise discover it from the release (UI `/api` proxy for the URL, the chart
 /// Secret for the key). Discovery failures are actionable errors naming the
-/// release (see `ops::discover_ui_api_url` / `ops::discover_api_key`).
+/// release (see `ops::discover_api_url` / `ops::discover_api_key`).
 async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, String)> {
     let ClusterConn {
         api_url,
@@ -115,7 +115,7 @@ async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, Stri
     } = conn;
     let api_url = match api_url {
         Some(url) => url,
-        None => ops::discover_ui_api_url(&namespace, &release).await?,
+        None => ops::discover_api_url(&namespace, &release).await?,
     };
     let api_key = match api_key {
         Some(key) => key,
