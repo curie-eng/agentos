@@ -754,6 +754,19 @@ pub fn model_egress_status_lines(
 /// their own paths (`cluster comms`, `CURIE_MODEL_CREDENTIALS`), not
 /// generated. `langfuse.encryptionKey` must be exactly 64 hex chars, so its 32
 /// bytes are load-bearing.
+/// Values owned by `cluster comms`, not by `cluster up`.
+///
+/// `comms` writes these with `helm upgrade --reuse-values`; `up` does a full
+/// upgrade and therefore drops anything it does not itself pass. That silently
+/// deleted the dispatcher and its Slack tokens whenever `up` ran after `comms`
+/// -- the bot simply stopped answering, with no error and nothing in the diff
+/// to suggest `up` had touched Slack at all (#1067).
+///
+/// Preserved the same way generated secrets are: read back from the release and
+/// re-supplied through the values file, never argv, so a bot token cannot leak
+/// into `ps` or shell history.
+const COMMS_MANAGED_KEYS: &[&str] = &["dispatcher.slack.appToken", "dispatcher.slack.botToken"];
+
 const REQUIRED_SECRETS: &[(&str, usize)] = &[
     ("postgres.auth.password", 24),
     ("valkey.password", 24),
@@ -805,6 +818,29 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
         cursor = cursor.get(part)?;
     }
     cursor.as_str().map(str::to_string)
+}
+
+/// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
+///
+/// An operator `--set` for a key always wins, and a key helm has no record of
+/// is left alone -- so this only ever preserves, never invents.
+fn resolve_comms_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let overridden = operator_set_keys(operator_sets);
+    let Some(values) = existing else {
+        return Vec::new();
+    };
+    COMMS_MANAGED_KEYS
+        .iter()
+        .filter(|key| !overridden.contains(**key))
+        .filter_map(|key| {
+            lookup_dotted(values, key)
+                .filter(|current| !current.is_empty())
+                .map(|current| ((*key).to_string(), current))
+        })
+        .collect()
 }
 
 /// Decide which [`REQUIRED_SECRETS`] values `cluster up` supplies, and how.
@@ -1538,6 +1574,14 @@ pub async fn up(mut opts: UpOpts) -> Result<ClusterUpOutput> {
         };
         let fresh = existing.is_none();
         opts.secrets = resolve_generated_secrets(existing.as_ref(), &opts.set)?;
+        let preserved = resolve_comms_values(existing.as_ref(), &opts.set);
+        if !preserved.is_empty() {
+            ui.note(&format!(
+                "preserving {} value(s) set by `cluster comms`; run comms again only to change them",
+                preserved.len()
+            ));
+            opts.secrets.extend(preserved);
+        }
         if fresh && !opts.secrets.is_empty() && !opts.common.dry_run {
             ui.note(&format!(
                 "generated strong per-release secrets for {} required chart credential(s); re-running `cluster up` reuses them",
@@ -4342,6 +4386,95 @@ mod tests {
         // (Exercising it here would hang the test run if it ever read a TTY.)
         let _ = resolve_generated_secrets(None, &[]).unwrap();
         let _ = resolve_generated_secrets(Some(&serde_json::Value::Null), &[]).unwrap();
+    }
+
+    #[test]
+    fn up_routes_preserved_slack_tokens_through_the_values_file_not_argv() {
+        // End of the path, not just the resolver: a preserved bot token is a
+        // live credential, so it must land in the private -f file like any other
+        // secret and never appear in argv or the printed line.
+        let cmds = up_commands(&UpOpts {
+            common: common(),
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![(
+                "dispatcher.slack.botToken".into(),
+                "xoxb-preserved-secret".into(),
+            )],
+            dev: false,
+            no_expose: true,
+            set: vec![],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        });
+        let line = cmds[0].display();
+        assert!(!line.contains("xoxb-preserved-secret"), "leaked: {line}");
+
+        let (materialized, _guards) = cmds[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(!argv.contains("xoxb-preserved-secret"), "argv leak: {argv}");
+        let f_pos = materialized.argv().iter().position(|a| a == "-f").unwrap();
+        let body = std::fs::read_to_string(&materialized.argv()[f_pos + 1]).unwrap();
+        assert!(body.contains("xoxb-preserved-secret"), "{body}");
+    }
+
+    #[test]
+    fn up_preserves_slack_tokens_a_previous_comms_recorded() {
+        // `comms` writes with --reuse-values; `up` does a full upgrade and drops
+        // whatever it does not pass. That deleted the dispatcher and its tokens
+        // with no error and nothing in the diff mentioning Slack (#1067).
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {"appToken": "xapp-existing", "botToken": "xoxb-existing"}}
+        });
+        let preserved = resolve_comms_values(Some(&existing), &[]);
+        assert_eq!(
+            preserved,
+            vec![
+                (
+                    "dispatcher.slack.appToken".to_string(),
+                    "xapp-existing".to_string()
+                ),
+                (
+                    "dispatcher.slack.botToken".to_string(),
+                    "xoxb-existing".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn up_lets_an_explicit_set_override_a_preserved_comms_value() {
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {"appToken": "xapp-old", "botToken": "xoxb-old"}}
+        });
+        let preserved = resolve_comms_values(
+            Some(&existing),
+            &["dispatcher.slack.botToken=xoxb-new".to_string()],
+        );
+        // Only the untouched key is re-supplied; the operator's --set wins.
+        assert_eq!(
+            preserved,
+            vec![(
+                "dispatcher.slack.appToken".to_string(),
+                "xapp-old".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn up_preserves_nothing_on_a_fresh_install_or_when_slack_was_never_set() {
+        assert!(resolve_comms_values(None, &[]).is_empty());
+        let no_slack = serde_json::json!({"nameOverride": "sre-bot"});
+        assert!(resolve_comms_values(Some(&no_slack), &[]).is_empty());
+        // An empty string is what `comms --disconnect` writes; do not resurrect it.
+        let disconnected = serde_json::json!({
+            "dispatcher": {"slack": {"appToken": "", "botToken": ""}}
+        });
+        assert!(resolve_comms_values(Some(&disconnected), &[]).is_empty());
     }
 
     #[test]
