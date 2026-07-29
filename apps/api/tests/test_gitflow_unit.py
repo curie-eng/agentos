@@ -115,11 +115,7 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     assert result == b"tar-bytes"
 
     # Locate the `git archive` invocation among the subprocess calls.
-    archive_argv = next(
-        call.args[0]
-        for call in run.call_args_list
-        if "archive" in call.args[0]
-    )
+    archive_argv = next(call.args[0] for call in run.call_args_list if "archive" in call.args[0])
     assert "--" in archive_argv, archive_argv
     dash_index = archive_argv.index("--")
     assert archive_argv[dash_index + 1] == good_sha, archive_argv
@@ -181,3 +177,37 @@ def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
         with pytest.raises(GitFlowError) as err:
             clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings)
     assert "Repository not found" in str(err.value)
+
+
+def test_rejected_push_is_logged_loudly() -> None:
+    # A rejected push still returns 200 -- GitHub would retry a non-2xx and the
+    # push will not succeed on a retry. The cost is that every dashboard reports
+    # success while nothing was deployed, so the platform must say so itself.
+    from curie_api.routers.github import _log_outcome
+    from curie_api.schemas import WebhookResult
+
+    result = WebhookResult(
+        status="rejected",
+        errors=[{"code": "git.archive_failed", "message": "Repository not found"}],
+    )
+    payload = {
+        "ref": "refs/heads/dev",
+        "after": _VALID_SHA1,
+        "repository": {"full_name": "acme/private-bundle"},
+    }
+    with mock.patch("curie_api.routers.github.logger") as log:
+        _log_outcome(result, payload)
+    log.warning.assert_called_once()
+    rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
+    assert "acme/private-bundle" in rendered
+    assert "git.archive_failed" in rendered
+
+
+def test_successful_push_does_not_warn() -> None:
+    from curie_api.routers.github import _log_outcome
+    from curie_api.schemas import WebhookResult
+
+    with mock.patch("curie_api.routers.github.logger") as log:
+        _log_outcome(WebhookResult(status="deployed"), {})
+        _log_outcome(WebhookResult(status="ignored"), {})
+    log.warning.assert_not_called()
