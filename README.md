@@ -19,14 +19,16 @@ console. Both names refer to the same system.
 ## What does Curie do?
 
 Your agent worked on your laptop and then broke once it was deployed. Curie is
-a harness that runs the **same immutable bundle** and the **same
-`evals/cases.json`** identically across three targets (`skill` in-process,
-`local` via docker compose, `cluster` on Kubernetes), so a tier-to-tier
-divergence surfaces as the harness catching a real environment bug before
-production, not a silent regression after it. A coding agent can already write a
-`skill.md`; what it cannot guarantee alone is that the skill behaves the same
-deployed as it did locally. That guarantee is the harness's job: the local loop
-is the production loop.
+a harness that runs the same bundle format and the same `evals/cases.json`
+across three targets (`skill` on host Docker, `local` via docker compose, `cluster`
+on Kubernetes), so the ladder can surface environment differences before
+production when bundle content and grading behavior match. `local`
+and `cluster` use stored immutable versioned bundles. `skill` bind mounts the
+working bundle directory read only, but host edits can still change it, as
+tracked in [issue 1087](https://github.com/curie-eng/curie/issues/1087). A
+coding agent can already write a `skill.md`; what it cannot guarantee alone is
+that the skill behaves the same deployed as it did locally. That guarantee is
+the harness's job: the local loop is the production loop.
 
 A Slack `@mention` (or DM) is answered by a versioned plugin running in an
 isolated Kubernetes sandbox, with the run traced end to end and steerable
@@ -41,24 +43,30 @@ diagram.
 Because "locally" and "deployed" were different runtimes: a different Python, a
 missing tool, an MCP server that resolved on your laptop and not in the cluster,
 a credential that was present in one place and absent in the other. Curie
-removes that gap by construction. The thing you run locally and the thing that
-runs in production are the **same immutable bundle** claimed by the **same
-runner image** speaking the **same frozen ACI contract**; only the substrate
-underneath changes (in-process, docker compose, Kubernetes). So a difference in
-behavior between tiers is a real environment difference the harness surfaces —
-not a mystery you debug after users hit it. Start from the
+removes that gap by construction. The platform paths run immutable versioned
+bundles through the **same runner image** speaking the **same frozen ACI
+contract**; only the substrate underneath changes (in process, docker compose,
+Kubernetes). The `skill` path currently bind mounts its working directory, so
+host edits remain observable under
+[issue 1087](https://github.com/curie-eng/curie/issues/1087). With matching
+bundle content and grading behavior, a difference between tiers can identify an
+environment difference before users hit it. Start from the
 [target table](#which-target-do-i-want) and climb `skill` → `local` → `cluster`;
-each rung is the same bundle on a heavier substrate.
+each rung exercises the same bundle format on a heavier substrate, while
+`skill` continues to use its working directory.
 
 ## How do I test an agent the same way locally and on Kubernetes?
 
 You run the **same `evals/cases.json`** at every tier. `curie skill eval`
-grades the bundle in-process; the `local` and `cluster` targets drive the same
+grades the bundle in process; the `local` and `cluster` targets drive the same
 cases through the real queue → worker → sandbox → runner path a Slack mention
-takes, so an eval that passes on your laptop and fails on the cluster is the
-harness catching a deployment bug, not a flaky test. The grader, the case shape,
-and the bundle are identical across tiers — that identity is the whole point (a
-tier-to-tier eval divergence is signal, not noise). See
+takes, so with matching bundle content and grading behavior, an eval that passes
+on your laptop and fails on the cluster can identify a deployment difference.
+The case shape and grading
+semantics are shared, while `skill` grades in Rust and `local` and `cluster`
+grade in Python; conformance fixtures hold those implementations together.
+[ADR 0022](docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)
+defers a single runner side grader. See
 [How do I develop and verify a change?](#how-do-i-develop-and-verify-a-change)
 for the per-package verify commands and
 [`cli/README.md`](cli/README.md) for the full `eval` reference across targets.
@@ -94,8 +102,8 @@ journeys filed as `epic`-labeled issues.
 Every CLI command that touches an environment takes a **target noun** in the
 middle: `skill`, `local`, or `cluster`. Pick the lightest one that answers your
 question. (`curie init` is the exception: it scaffolds a bundle on disk and
-targets no environment.) The point of the three targets is that the identical
-bundle and the identical `evals/cases.json` run across all of them, so promoting
+targets no environment.) The point of the three targets is that the same bundle
+format and the same `evals/cases.json` run across all of them, so promoting
 `skill` to `local` to `cluster` is a parity ladder, not three separate setups.
 
 | Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
@@ -105,7 +113,11 @@ bundle and the identical `evals/cases.json` run across all of them, so promoting
 | `cluster` | The platform on Kubernetes (a Helm release). | optional | yes | `up` `down` `status` `message` `deploy` | Operate and drive a deployed cluster release. |
 
 The universal quartet `up`/`down`/`status`/`message` is on all three targets;
-`skill` adds `eval`, and `local`/`cluster` add `deploy`.
+`skill` adds `eval`, and `local`/`cluster` add `deploy`. Parity does not mean
+every capability is implemented at every tier: every verb is answered at every
+tier, with unsupported concepts returning a deterministic reason and an
+alternative, as defined in
+[ADR 0041](docs/adr/0041-every-verb-is-answered-at-every-tier.md).
 
 The distinction that matters: `skill` is the **runner-only** loop, it boots just
 the runner container and talks straight to its ACI HTTP surface with no platform
@@ -259,6 +271,22 @@ theirs. A downloaded release binary resolves the pinned chart release asset for
 its version, and `curie local up` likewise resolves the pinned
 `compose.release.yaml`, caching both under `~/.cache/curie/` with no repo
 checkout needed.
+
+### Recommended setup
+
+Docker covers the `skill` and `local` rungs. For the `cluster` rung, we
+recommend a single node k3s cluster on a Linux host with at least 8 GB of
+memory. k3s default kube router networking enforces NetworkPolicy. The 4 GB
+profile is tight. The full promotion ladder therefore needs Docker, kubectl,
+Helm, and access to that cluster.
+
+kind and Minikube are fine for disposable tests, but k3s is the lasting
+recommendation. Their loopback API can require the documented listen host
+escape hatch. Real model workloads require `runsc` on every node unless gVisor
+is explicitly disabled. Fake model installation works without `runsc`. See
+[`docs/operations.md`](docs/operations.md) for setup details; `curie cluster up`
+remains the install path.
+
 Use `--chart <path>` when developing the chart locally. The short version:
 
 - `curie cluster up` runs `helm upgrade --install` of `charts/curie`; it reads
