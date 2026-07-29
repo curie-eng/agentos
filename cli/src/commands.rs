@@ -4005,7 +4005,9 @@ pub async fn approvals(
                 format!(
                     "PATCH {}/agents/<id> approval_routes={} (a FULL REPLACEMENT of the map)",
                     opts.api_url,
-                    serde_json::to_string(&bindings).unwrap_or_else(|_| "{}".into())
+                    // Deliberately not valid JSON. "{}" is the real clear payload, so a
+                    // fallback that looked like "{}" would misreport a full revocation.
+                    serde_json::to_string(&bindings).unwrap_or_else(|_| "<unserializable>".into())
                 )
             } else {
                 format!(
