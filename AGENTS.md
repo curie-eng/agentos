@@ -190,6 +190,11 @@ Known seam pairs:
   (`apps/worker/src/curie_worker/sandbox/docker.py`) and the CLI picker
   (`cli/src/commands.rs`) can't share code across Python/Rust, so they are frozen
   together in `tests/vectors/model-credential-forwarding.json`.
+- dispatcher vs CLI approval action ids -- the approval-card action-id constants
+  (`apps/dispatcher/src/curie_dispatcher/approval_actions.py`) and the CLI's
+  `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
+  Python/Rust, so they are frozen together in
+  `tests/vectors/approval-action-ids.json`.
 - real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
 - runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
 - CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).

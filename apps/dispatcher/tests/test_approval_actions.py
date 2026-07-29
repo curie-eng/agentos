@@ -9,12 +9,16 @@ resolved by X", and the ordinary-button catch-all never double-handles an
 approval click.
 """
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import redis
 from curie_dispatcher.app import build_app
 from curie_dispatcher.approval_actions import (
+    _APPROVAL_ACTION_IDS,
+    _DECISION_BY_ACTION_ID,
     APPROVE_ACTION_ID,
     REJECT_ACTION_ID,
     ApprovalResolveClient,
@@ -416,3 +420,94 @@ def test_non_json_403_body_is_not_captured_as_detail() -> None:
 
     assert outcome.status_code == 403
     assert raw_body not in outcome.detail
+
+
+_ACTION_ID_VECTOR = (
+    Path(__file__).resolve().parents[3] / "tests" / "vectors" / "approval-action-ids.json"
+)
+
+# Every top-level key the vector may carry. Checked exactly, so an unrecognized
+# key is a loud failure rather than an input this lane silently ignores: a key
+# one lane cannot see would otherwise pass vacuously, which is the exact drift
+# the gate exists to catch. The Rust lane rejects unknown fields the same way,
+# via `#[serde(deny_unknown_fields)]` on its ActionIdVector.
+_EXPECTED_VECTOR_KEYS = frozenset(
+    {
+        "comment",
+        "approve_action_id_prefix",
+    }
+)
+
+
+def test_action_ids_match_the_frozen_vector() -> None:
+    """The Python half of the cross-language approval action-id gate (#1079).
+
+    Pins the dispatcher's Approve action ids to the one literal the vector
+    freezes, the Approve prefix; no id set is compared, since the prefix is the
+    only value duplicated across Python and Rust. The Rust CLI reads the same
+    file in its own lane (cli/src/chat.rs's test module), so a rename in one
+    language without the other fails that language's test. The rule itself is
+    not restated here: it lives in the vector file.
+    """
+
+    vector = json.loads(_ACTION_ID_VECTOR.read_text(encoding="utf-8"))
+
+    keys = set(vector)
+    assert keys == _EXPECTED_VECTOR_KEYS, (
+        f"{_ACTION_ID_VECTOR} has unexpected keys "
+        f"{sorted(keys - _EXPECTED_VECTOR_KEYS)} and is missing "
+        f"{sorted(_EXPECTED_VECTOR_KEYS - keys)}. A new key is rejected on purpose: "
+        "one a lane cannot see would pass vacuously. Teach the new key to "
+        "_EXPECTED_VECTOR_KEYS here, to ActionIdVector in cli/src/chat.rs, and to "
+        "both lanes' assertions."
+    )
+
+    prefix = vector["approve_action_id_prefix"]
+
+    # Deliberately kept, not an orphan of the vector narrowing: the Approve
+    # sweep below discovers variants by iterating _DECISION_BY_ACTION_ID, so an
+    # id registered in only one of the two production registries would slip past
+    # this gate entirely. Pin them to each other so they cannot drift.
+    assert set(_DECISION_BY_ACTION_ID) == _APPROVAL_ACTION_IDS, (
+        "_DECISION_BY_ACTION_ID and _APPROVAL_ACTION_IDS no longer register the "
+        "same action ids "
+        f"(only in the map: {sorted(set(_DECISION_BY_ACTION_ID) - _APPROVAL_ACTION_IDS)}; "
+        f"only in the set: {sorted(_APPROVAL_ACTION_IDS - set(_DECISION_BY_ACTION_ID))}). "
+        "An id missing from either registry is invisible to both "
+        "is_approval_action and this gate, so register every id in both."
+    )
+
+    # Discovery, not lookup: every id the production map resolves to "approved" is
+    # checked, so a third Approve variant added later is covered with no test edit.
+    approved = sorted(
+        action_id
+        for action_id, decision in _DECISION_BY_ACTION_ID.items()
+        if decision == "approved"
+    )
+    # A map emptied or reshaped must not let the loop below pass vacuously. Today
+    # the plain id and the note variant (#1053) are both there.
+    assert len(approved) >= 2, (
+        f"found only {len(approved)} action ids mapped to 'approved' in "
+        "_DECISION_BY_ACTION_ID; this gate is no longer pinning anything, so a "
+        "card rendered with an unprefixed Approve id would go undetected by "
+        "cli/src/chat.rs's body.contains(APPROVE_ACTION_ID_PREFIX) and `curie "
+        "local message` would stop reporting an awaiting-approval turn."
+    )
+    for action_id in approved:
+        assert action_id.startswith(prefix), (
+            f"the Approve action id {action_id!r} does not start with the frozen "
+            f"prefix {prefix!r}; a card rendered with that variant would go "
+            "undetected by cli/src/chat.rs's "
+            "body.contains(APPROVE_ACTION_ID_PREFIX) and `curie local message` "
+            "would stop reporting an awaiting-approval turn."
+        )
+
+    # Equality here, startswith above: the asymmetry is the production contract.
+    # The base Approve id IS the prefix; the variants only have to extend it.
+    assert APPROVE_ACTION_ID == prefix, (
+        f"APPROVE_ACTION_ID ({APPROVE_ACTION_ID}) no longer equals the frozen "
+        f"prefix ({prefix}) that cli/src/chat.rs matches on; "
+        "body.contains(APPROVE_ACTION_ID_PREFIX) would stop detecting a posted "
+        "approval card and `curie local message` would stop reporting an "
+        "awaiting-approval turn."
+    )

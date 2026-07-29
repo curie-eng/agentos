@@ -252,9 +252,12 @@ pub fn parse_terminal_message(text: &str) -> Option<TerminalMessage> {
 mod tests {
     use super::*;
 
-    /// The committed cross-language corpus (#490): the SAME file the Python
+    /// The committed cross-language corpus (#490, #1079): the SAME file the Python
     /// channel-protocol model test asserts against, so a field-bound change on one
-    /// side without the other fails a corpus test here or there.
+    /// side without the other fails a corpus test here or there. It pins field
+    /// bounds (#490) AND field semantics (#1079): every valid case carries an
+    /// explicit `allow_free_text` that both sides compare against, so a side that
+    /// hardcodes the flag instead of carrying the value through fails here.
     const CORPUS: &str =
         include_str!("../../packages/channel-protocol/schema/channel-protocol.corpus.json");
 
@@ -263,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn field_bounds_match_the_shared_schema_corpus() {
+    fn matches_the_shared_schema_corpus() {
         let corpus: serde_json::Value = serde_json::from_str(CORPUS).unwrap();
         // A valid message renders an interactive widget (non-empty actions).
         for message in corpus["valid"].as_array().unwrap() {
@@ -272,6 +275,26 @@ mod tests {
                 !parsed.actions.is_empty(),
                 "corpus valid message rendered no widget: {message}"
             );
+            // Compared, not just rendered: a side that hardcoded the flag would
+            // otherwise pass every corpus case regardless of what it carries. The
+            // key is REQUIRED, not presence-guarded, so deleting it from a corpus
+            // case reds this test instead of silently disarming the comparison.
+            // Omitted-key defaults (choice `true`, confirm `false`, per
+            // ChoiceIntent/ConfirmIntent in
+            // packages/channel-protocol/src/channel_protocol/models.py) are
+            // deliberately out of scope for this corpus.
+            if let Some(interaction) = message.get("interaction") {
+                let expected = interaction
+                    .get("allow_free_text")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        panic!("corpus valid message carries no allow_free_text: {message}")
+                    });
+                assert_eq!(
+                    parsed.allow_free_text, expected,
+                    "corpus valid message rendered the wrong allow_free_text: {message}"
+                );
+            }
         }
         // An out-of-bounds message must NOT render a widget: the bound guard fails
         // and it degrades to plain text (no actions) -- the same rejection the

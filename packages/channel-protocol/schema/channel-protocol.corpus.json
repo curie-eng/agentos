@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-language bound gate (#490): the committed channel-protocol schema declares field bounds (Action.label<=75, value<=255, interaction id<=255, choice options<=10, all min 1). The Python OutboundMessage model rejects violations; the Rust adapter (cli/src/channel.rs) must NOT render a violating message as a widget -- it degrades to plain text (no actions). Each side asserts against this corpus so a bound change on one side without the other fails a test.",
+  "_comment": "Cross-language field gate (#490, #1079): the committed channel-protocol schema declares field bounds (Action.label<=75, value<=255, interaction id<=255, choice options<=10, all min 1). The Python OutboundMessage model rejects violations; the Rust adapter (cli/src/channel.rs) must NOT render a violating message as a widget -- it degrades to plain text (no actions). This corpus also pins field semantics (#1079): every valid case carries an explicit allow_free_text, which both sides require and compare against the parsed value, so a side that hardcodes the flag instead of carrying the value through fails here (that is why the deploy-with-note case, identical to deploy but for allow_free_text: true, is load-bearing). Each side asserts against this corpus so a bound or field-semantics change on one side without the other fails a test.",
   "valid": [
     {
       "version": "1.0",
@@ -33,6 +33,24 @@
           "value": "cancel"
         },
         "allow_free_text": false
+      }
+    },
+    {
+      "version": "1.0",
+      "text": "Deploy?",
+      "interaction": {
+        "kind": "confirm",
+        "id": "deploy-with-note",
+        "prompt": "Deploy with a note?",
+        "confirm": {
+          "label": "Deploy",
+          "value": "deploy"
+        },
+        "cancel": {
+          "label": "Cancel",
+          "value": "cancel"
+        },
+        "allow_free_text": true
       }
     },
     {
