@@ -104,8 +104,10 @@ curie local approvals my-agent --list-routes
 ```
 
 `--route-approvers` also takes `users:U0123ABCD,W0456DEFG`, `--routes-from <file>` reads
-the whole map as JSON, and `--clear-routes` removes every binding. Nothing is written
-unless every entry parses, so a typo cannot leave a half-written map behind.
+the whole map as JSON, and `--clear-routes` removes every binding. A `--routes-from`
+file containing `{}` clears every binding too, the same as `--clear-routes`. Nothing
+is written unless every entry parses, so a typo cannot leave a half-written map
+behind.
 
 ## Who may resolve
 

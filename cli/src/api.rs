@@ -815,24 +815,22 @@ impl ApiClient {
     /// `approval_routes`. Like `set_approval_tools` this is a FULL REPLACEMENT of
     /// the map, not a merge, matching the field's semantics on `AgentUpdate`.
     ///
-    /// An empty map is sent as JSON `null`, which is how the API spells "no
-    /// bindings" (`crud.update_agent_approval_routes` stores `routes or None`).
-    /// Sending `{}` would be a second spelling of the same state.
+    /// An empty map is sent as `{}`, not JSON `null` (#1071). The router clears the
+    /// bindings only behind `if data.approval_routes is not None` (#247), and
+    /// Pydantic decodes an explicit `null` and an omitted key to the same `None`, so
+    /// `null` reads as "field omitted" and the bindings survive. Only `{}` passes
+    /// that guard. `crud.update_agent_approval_routes` storing `routes or None` is
+    /// the STORAGE normalization applied after the guard, not the wire spelling.
     pub async fn set_approval_routes(
         &self,
         agent_id: &str,
         routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
     ) -> Result<Agent> {
-        let payload = if routes.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::to_value(routes).context("encoding approval routes")?
-        };
         let resp = self
             .http
             .patch(format!("{}/agents/{agent_id}", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({ "approval_routes": payload }))
+            .json(&json!({ "approval_routes": routes }))
             .send()
             .await
             .context("PATCH /agents/{id} (approval routes)")?;

@@ -21,6 +21,7 @@
 mod support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
+use std::sync::{Arc, Mutex};
 use support::{serve, MockServer, Response};
 
 const TEST_API_KEY: &str = "test-key";
@@ -49,6 +50,62 @@ fn stub(list_routes: &'static str, patch_echo: &'static str) -> MockServer {
     })
 }
 
+/// How `crud.update_agent_approval_routes` renders stored bindings: an unset
+/// map is the literal `null`, since it stores `routes or None`.
+fn render_routes(state: &Option<serde_json::Value>) -> String {
+    match state {
+        Some(routes) => routes.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+/// A stub that MODELS the router instead of echoing a canned response, so a
+/// clear that does not take is visible in what the next read returns.
+///
+/// It holds the agent's bindings as server-side state and mirrors the guard at
+/// `apps/api/src/curie_api/routers/agents.py:154`, which is
+/// `if data.approval_routes is not None`. Pydantic decodes an omitted key and an
+/// explicit JSON `null` to the same `None`, so both of those spellings skip the
+/// guard and leave the bindings alone; only an explicit object reaches crud, and
+/// an empty one clears. That collapse of `null` into "omitted" is the whole
+/// defect, so the stub encodes it rather than papering over it.
+/// `initial_routes` is the agent's starting bindings and must be a bound map
+/// (e.g. `{}` or `{"deal_desk":{...}}`), not `null`.
+fn router_stub(initial_routes: &str) -> MockServer {
+    let initial: serde_json::Value =
+        serde_json::from_str(initial_routes).expect("the seed bindings must be valid JSON");
+    let state: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(Some(initial)));
+
+    serve(move |req| match req.path.split('?').next().unwrap() {
+        "/agents" => {
+            let current = render_routes(&state.lock().unwrap());
+            Response::json(200, &agents_list(&current))
+        }
+        p if p.strip_prefix("/agents/") == Some(AGENT_ID) => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("PATCH body must be valid JSON");
+            let mut current = state.lock().unwrap();
+            match body.get("approval_routes") {
+                // Key absent: the field was omitted, so the guard is skipped and
+                // the bindings are left alone.
+                None => {}
+                // Explicit null: Pydantic hands the router the SAME `None` an
+                // omitted key gives, so the guard is skipped here too and the
+                // bindings survive.
+                Some(serde_json::Value::Null) => {}
+                // An explicit empty object passes the guard and reaches crud,
+                // which stores `routes or None`, i.e. NULL.
+                Some(serde_json::Value::Object(routes)) if routes.is_empty() => *current = None,
+                // Any other explicit value passes the guard and replaces the map.
+                Some(routes) => *current = Some(routes.clone()),
+            }
+            let updated = render_routes(&current);
+            Response::json(200, &patched_agent(&updated))
+        }
+        other => panic!("unexpected request: {other}"),
+    })
+}
+
 async fn run(server: &MockServer, cmd: ApprovalCmd) -> anyhow::Result<ApprovalsOutput> {
     approvals(
         AgentActionOpts {
@@ -71,6 +128,36 @@ fn patch_body(server: &MockServer) -> serde_json::Value {
         .find(|r| r.path.starts_with(&format!("/agents/{AGENT_ID}")))
         .expect("the PATCH endpoint must have been called");
     serde_json::from_slice(&patch.body).expect("PATCH body must be valid JSON")
+}
+
+/// The payload a `--dry-run` plan promises, parsed back out of its
+/// `approval_routes=` clause. Read from the plan the code emitted rather than
+/// restated, so the comparison is against the real plan and not a literal.
+fn planned_routes_payload(lines: &[String]) -> serde_json::Value {
+    let line = lines
+        .iter()
+        .find(|l| l.contains("approval_routes="))
+        .unwrap_or_else(|| panic!("the plan must name the approval_routes payload, got {lines:?}"));
+    let rest = line
+        .split_once("approval_routes=")
+        .expect("the line was chosen for containing it")
+        .1;
+    let payload = rest.split_once(" (").map_or(rest, |(p, _)| p);
+    serde_json::from_str(payload)
+        .unwrap_or_else(|err| panic!("the plan's payload must be JSON, got {payload:?}: {err}"))
+}
+
+/// The shared assertion for both cleared-routes tests: the output must be the
+/// `Routes` variant AND its map must be empty. `context` distinguishes the two
+/// call sites' panic messages (flag-driven vs file-driven).
+fn assert_routes_cleared(out: ApprovalsOutput, context: &str) {
+    match out {
+        ApprovalsOutput::Routes { routes, .. } => assert!(
+            routes.is_empty(),
+            "{context}: the agent still has bindings {routes:?}"
+        ),
+        _ => panic!("expected the Routes output"),
+    }
 }
 
 /// No PATCH reached the server. The assertion for every rejected input: the
@@ -228,10 +315,13 @@ async fn list_routes_reads_without_writing() {
 }
 
 #[tokio::test]
-async fn clear_routes_sends_null_not_an_empty_object() {
-    // `crud.update_agent_approval_routes` stores `routes or None`, so null is how
-    // the API spells "no bindings". Sending `{}` would be a second spelling of the
-    // same state and would round-trip back as null anyway.
+async fn clear_routes_sends_an_empty_object_not_null() {
+    // The router guards with `if data.approval_routes is not None`, and Pydantic
+    // decodes an explicit JSON null and an omitted key to the same `None`, so
+    // both spellings mean "leave the bindings alone" and the clear never runs.
+    // An empty object is the only spelling that passes the guard and reaches
+    // `crud.update_agent_approval_routes`, whose `routes or None` is a STORAGE
+    // normalization applied after the guard, not the wire contract (#1071).
     let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
 
     run(
@@ -245,9 +335,108 @@ async fn clear_routes_sends_null_not_an_empty_object() {
     .expect("--clear-routes should succeed");
 
     let body = patch_body(&server);
-    assert!(
-        body["approval_routes"].is_null(),
-        "clear must send an explicit null, got {body:?}"
+    let routes = body.get("approval_routes").unwrap_or_else(|| {
+        panic!("clear must send the approval_routes key; an omitted key reads as \"leave the bindings alone\", got {body:?}")
+    });
+    assert_eq!(
+        routes,
+        &serde_json::json!({}),
+        "clear must send an empty object, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn clear_routes_actually_clears_the_bindings() {
+    // The effect, not the bytes: drive the clear against a stub that applies the
+    // router's guard, then read what it hands back. A spelling the guard skips
+    // leaves the binding in place, so the operator is told "updated" while the
+    // approver set they meant to revoke is still live.
+    let server = router_stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            clear_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("--clear-routes should succeed");
+
+    assert_routes_cleared(out, "the clear did not take");
+}
+
+#[tokio::test]
+async fn a_routes_file_holding_an_empty_map_clears_the_bindings() {
+    // The second entry point. `--clear-routes` is refused alongside
+    // `--routes-from`, so a `{}` file reaches the empty map through
+    // `build_route_bindings` rather than through the flag's direct empty map.
+    // Both must land on the same wire spelling.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, "{}").expect("write routes file");
+
+    let server = router_stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a routes file holding an empty map should succeed");
+
+    assert_routes_cleared(out, "the file-driven clear did not take");
+}
+
+#[tokio::test]
+async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
+    // A plan an operator reads before running the real thing is only worth
+    // reading if it names the same request. Both halves are read back from what
+    // the code produced; comparing two literals would prove nothing.
+    let planned = {
+        let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
+        let out = approvals(
+            AgentActionOpts {
+                api_url: server.base_url.clone(),
+                api_key: TEST_API_KEY.to_string(),
+                agent: "deal-desk".to_string(),
+                dry_run: true,
+            },
+            vec![],
+            false,
+            ApprovalCmd {
+                clear_routes: true,
+                ..ApprovalCmd::default()
+            },
+        )
+        .await
+        .expect("--clear-routes --dry-run should succeed");
+
+        assert_no_write(&server);
+        match out {
+            ApprovalsOutput::DryRun(plan) => planned_routes_payload(&plan.lines),
+            _ => panic!("expected the DryRun output"),
+        }
+    };
+
+    let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
+    run(
+        &server,
+        ApprovalCmd {
+            clear_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("--clear-routes should succeed");
+    let sent = patch_body(&server)["approval_routes"].clone();
+
+    assert_eq!(
+        planned, sent,
+        "the plan promised approval_routes={planned} but the request sent {sent}"
     );
 }
 
