@@ -48,6 +48,7 @@ def _declared(
     *,
     authed: bool = False,
     cred_vars: list[str] | None = None,
+    remote: bool = False,
 ) -> dict:
     return {
         "name": name,
@@ -55,6 +56,7 @@ def _declared(
         "form": form,
         "authed": authed,
         "cred_vars": list(cred_vars or []),
+        "remote": remote,
     }
 
 
@@ -78,13 +80,9 @@ def _status(
     return entry
 
 
-def _write_bundle(
-    root: Path, manifest: dict, *, mcp_files: dict[str, dict] | None = None
-) -> Path:
+def _write_bundle(root: Path, manifest: dict, *, mcp_files: dict[str, dict] | None = None) -> Path:
     (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-    (root / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
+    (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     for rel, payload in (mcp_files or {}).items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +94,8 @@ def _write_bundle(
 # Test 1 -- declared extraction over real bundle dirs (no mocks)
 # --------------------------------------------------------------------------- #
 def test_extract_inline_object_form() -> None:
-    # Canonical declared shape: exactly {name, source, form, authed, cred_vars},
+    # Canonical declared shape: exactly {name, source, form, authed, cred_vars,
+    # remote},
     # nothing else. A plain stdio server with no env is authed=False, cred_vars=[].
     assert extract_declared(str(_MCP_GREEN)) == [
         {
@@ -105,6 +104,7 @@ def test_extract_inline_object_form() -> None:
             "form": "inline",
             "authed": False,
             "cred_vars": [],
+            "remote": False,
         }
     ]
 
@@ -410,9 +410,7 @@ def test_authed_advisory_in_hints_when_registered_green() -> None:
     # Authed server connected with tools -> verdict green, yet the advisory must
     # still fire so the green is not read as "auth verified".
     declared = [_declared("github", authed=True, cred_vars=["GITHUB_PERSONAL_ACCESS_TOKEN"])]
-    result = evaluate(
-        declared, [_status("plugin:x:github", tools=[_tool("list_issues")])]
-    )
+    result = evaluate(declared, [_status("plugin:x:github", tools=[_tool("list_issues")])])
     assert result["verdict"] == "green"
     assert result["reasons"] == []
     advisory = _authed_hint(result)
@@ -537,3 +535,78 @@ def test_run_check_red_pointer_bundle_is_invalid_bundle() -> None:
     # bundle error: the stable diagnostic code plus the offending path.
     assert "[mcp.declared_pointer]" in joined, joined
     assert "config/mcp.json" in joined, joined
+
+
+# --------------------------------------------------------------------------- #
+# Remote servers: unreachable by design, not a bundle defect (#1093)
+# --------------------------------------------------------------------------- #
+def test_remote_server_declared_by_url_only_is_marked_remote(tmp_path: Path) -> None:
+    # The common remote shape carries neither `env` nor `headers` -- the endpoint
+    # itself is the parameterised part -- so it was invisible to both the authed
+    # flag and cred-var extraction, and produced a bare red with no explanation.
+    root = _write_bundle(
+        tmp_path,
+        {"name": "b", "version": "0.1.0"},
+        mcp_files={
+            ".mcp.json": {"mcpServers": {"grafana": {"type": "http", "url": "${GRAFANA_MCP_URL}"}}}
+        },
+    )
+    rows = extract_declared(str(root))
+    assert rows == [
+        _declared(
+            "grafana",
+            source=".mcp.json",
+            form="bare_file",
+            cred_vars=["GRAFANA_MCP_URL"],
+            remote=True,
+        )
+    ]
+
+
+def test_remote_url_var_strips_a_shell_style_default(tmp_path: Path) -> None:
+    # `${VAR:-fallback}` is how a bundle keeps one declaration working across
+    # tiers; the operator still forwards VAR, so name VAR and not the default.
+    root = _write_bundle(
+        tmp_path,
+        {"name": "b", "version": "0.1.0"},
+        mcp_files={
+            ".mcp.json": {
+                "mcpServers": {
+                    "grafana": {"type": "http", "url": "${GRAFANA_MCP_URL:-http://svc:8000/mcp}"}
+                }
+            }
+        },
+    )
+    assert extract_declared(str(root))[0]["cred_vars"] == ["GRAFANA_MCP_URL"]
+
+
+def test_remote_advisory_says_the_red_is_expected_and_names_the_secret() -> None:
+    from curie_runner.check import _remote_advisory
+
+    hint = _remote_advisory("grafana", ["GRAFANA_MCP_URL"])
+    # The point of the advisory: distinguish "offline contract did its job" from
+    # "your bundle is broken", which both rendered as red before.
+    assert "cannot be reached offline" in hint
+    assert "NOT evidence" in hint
+    assert "--secret GRAFANA_MCP_URL" in hint
+
+
+def test_remote_advisory_takes_precedence_over_the_authed_one() -> None:
+    # A remote server WITH headers is both remote and authed. Unreachable-by-
+    # design is the more specific explanation, so it should be the one shown.
+    from curie_runner.check import evaluate
+
+    declared = [
+        {
+            "name": "grafana",
+            "source": ".mcp.json",
+            "form": "bare_file",
+            "authed": True,
+            "cred_vars": ["TOKEN"],
+            "remote": True,
+        }
+    ]
+    result = evaluate(declared, [])
+    hints = " ".join(result["hints"])
+    assert "cannot be reached offline" in hints
+    assert "was not exercised offline" not in hints

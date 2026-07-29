@@ -59,6 +59,23 @@ _EXIT_CODES = {"green": 0, "red": 1, "invalid_bundle": 2}
 _HEADER_VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
 
+def _remote_advisory(name: str, cred_vars: list[str]) -> str:
+    # A remote (``url``) server is unreachable by construction here: the check
+    # container runs with ``--network none`` so a bundle cannot pass by phoning
+    # home. That makes a red for a remote server ambiguous -- it may mean the
+    # declaration is broken, or simply that the offline contract did its job --
+    # and previously nothing said which (#1093).
+    suffix = ""
+    if cred_vars:
+        suffix = " " + " ".join(f"--secret {var}" for var in cred_vars)
+    return (
+        f"remote server {name} cannot be reached offline; this check runs with "
+        "no network on purpose, so a red here is expected and is NOT evidence "
+        "the bundle is broken -- run `curie skill up"
+        f"{suffix}` for the real end-to-end test"
+    )
+
+
 def _authed_advisory(name: str, cred_vars: list[str]) -> str:
     # ``--secret`` forwards an environment-variable NAME, not the server name, so
     # name the real credential var(s) when we could extract them; otherwise fall
@@ -79,7 +96,7 @@ def _authed_advisory(name: str, cred_vars: list[str]) -> str:
 # Declared-server extraction (bundle intent)
 # --------------------------------------------------------------------------- #
 def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
-    """Parse declared MCP servers into ``{name, source, form, authed, cred_vars}`` rows.
+    """Parse declared MCP servers into ``{name, source, form, authed, cred_vars, remote}`` rows.
 
     Covers all three declaration forms (plan Section 3): a ``plugin.json``
     ``mcpServers`` object (``inline``), a ``mcpServers`` string pointer resolved
@@ -101,7 +118,12 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
     seen: set[str] = set()
 
     def _add(
-        name: str, source: str, form: str, authed: bool, cred_vars: list[str]
+        name: str,
+        source: str,
+        form: str,
+        authed: bool,
+        cred_vars: list[str],
+        remote: bool = False,
     ) -> None:
         if name not in seen:
             declared.append(
@@ -110,6 +132,7 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
                     "source": source,
                     "form": form,
                     "authed": authed,
+                    "remote": remote,
                     "cred_vars": cred_vars,
                 }
             )
@@ -121,7 +144,14 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
 
     if isinstance(mcp, dict):
         for name, server in mcp.items():
-            _add(str(name), "plugin.json", "inline", _is_authed(server), _cred_vars(server))
+            _add(
+                str(name),
+                "plugin.json",
+                "inline",
+                _is_authed(server),
+                _cred_vars(server),
+                _is_remote(server),
+            )
     elif isinstance(mcp, str):
         pointed = _servers_map(_read_json(root / mcp))
         if pointed:
@@ -132,6 +162,7 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
                     "string_pointer",
                     _is_authed(server),
                     _cred_vars(server),
+                    _is_remote(server),
                 )
         else:
             # Pointed file missing/unparseable: the intent (a string-pointer
@@ -143,7 +174,14 @@ def extract_declared(plugin_dir: str) -> list[dict[str, Any]]:
 
     bare = _servers_map(_read_json(root / ".mcp.json"))
     for name, server in bare.items():
-        _add(str(name), ".mcp.json", "bare_file", _is_authed(server), _cred_vars(server))
+        _add(
+            str(name),
+            ".mcp.json",
+            "bare_file",
+            _is_authed(server),
+            _cred_vars(server),
+            _is_remote(server),
+        )
 
     return declared
 
@@ -154,6 +192,18 @@ def _servers_map(payload: Any) -> dict[str, Any]:
         if isinstance(servers, dict):
             return servers
     return {}
+
+
+def _is_remote(server: Any) -> bool:
+    """True for a server the check can never reach: it is declared by ``url``.
+
+    The check container runs with ``--network none`` (a bundle must not be able
+    to pass by phoning home), so a remote server cannot connect here no matter
+    how it is configured. Recording it lets the report explain the red instead
+    of leaving it indistinguishable from a genuine bundle defect.
+    """
+
+    return isinstance(server, dict) and bool(server.get("url"))
 
 
 def _is_authed(server: Any) -> bool:
@@ -190,16 +240,25 @@ def _cred_vars(server: Any) -> list[str]:
     env = server.get("env")
     if isinstance(env, dict) and env:
         return [str(key) for key in env]
+    found: list[str] = []
     headers = server.get("headers")
     if isinstance(headers, dict) and headers:
-        found: list[str] = []
         for value in headers.values():
             if isinstance(value, str):
                 for var in _HEADER_VAR_RE.findall(value):
                     if var not in found:
                         found.append(var)
-        return found
-    return []
+    # A remote server often carries no headers at all and instead parameterises
+    # the endpoint itself -- `"url": "${GRAFANA_MCP_URL}"`. That var is what the
+    # operator must forward, so name it rather than falling back to a generic
+    # placeholder. Strips any `:-default` shell-style suffix.
+    url = server.get("url")
+    if isinstance(url, str):
+        for var in _HEADER_VAR_RE.findall(url):
+            var = var.split(":-", 1)[0].strip()
+            if var and var not in found:
+                found.append(var)
+    return found
 
 
 def _read_json(path: Path) -> Any:
@@ -212,9 +271,7 @@ def _read_json(path: Path) -> Any:
 # --------------------------------------------------------------------------- #
 # Verdict (pure: no I/O, no SDK)
 # --------------------------------------------------------------------------- #
-def evaluate(
-    declared: list[dict[str, Any]], registered: list[dict[str, Any]]
-) -> dict[str, Any]:
+def evaluate(declared: list[dict[str, Any]], registered: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute the verdict from declared intent vs registered MCP servers.
 
     The registered list is ``McpServerStatus``-shaped. Only the bundle's **own**
@@ -236,10 +293,13 @@ def evaluate(
     # forwards, so a green here proves only wiring and a red may be just a missing
     # token. Advise regardless of verdict so a demo-watcher cannot misread either.
     for row in declared:
-        if row.get("authed"):
-            hints.append(
-                _authed_advisory(str(row["name"]), list(row.get("cred_vars") or []))
-            )
+        cred_vars = list(row.get("cred_vars") or [])
+        if row.get("remote"):
+            # Takes precedence over the authed advisory: unreachable-by-design is
+            # the more specific and more actionable explanation of the red.
+            hints.append(_remote_advisory(str(row["name"]), cred_vars))
+        elif row.get("authed"):
+            hints.append(_authed_advisory(str(row["name"]), cred_vars))
 
     connected_with_tools = 0
     for row in declared:
@@ -261,9 +321,7 @@ def evaluate(
         )
 
     if declared and connected_with_tools == 0:
-        reasons.append(
-            f"declared {len(declared)} MCP server(s); none registered with tools"
-        )
+        reasons.append(f"declared {len(declared)} MCP server(s); none registered with tools")
 
     verdict = "red" if reasons else "green"
     return {"matches": matches, "verdict": verdict, "reasons": reasons, "hints": hints}
@@ -320,9 +378,7 @@ async def run_check(plugin_dir: str) -> dict[str, Any]:
     try:
         registered = await asyncio.wait_for(_connect_and_poll(plugins), timeout_s)
     except TimeoutError:
-        return _red_result(
-            plugin_dir, declared, f"MCP init did not complete within {timeout_s}s"
-        )
+        return _red_result(plugin_dir, declared, f"MCP init did not complete within {timeout_s}s")
     except Exception as exc:
         # A non-timeout failure while setting up the MCP client (Claude CLI
         # subprocess fails to start, an incompatible --image, an SDK error)
@@ -339,9 +395,7 @@ async def run_check(plugin_dir: str) -> dict[str, Any]:
     return _assemble(plugin_dir, declared, registered, evaluate(declared, registered))
 
 
-def _red_result(
-    plugin_dir: str, declared: list[dict[str, Any]], reason: str
-) -> dict[str, Any]:
+def _red_result(plugin_dir: str, declared: list[dict[str, Any]], reason: str) -> dict[str, Any]:
     """Assemble a RED result (no registered servers) with a single override reason.
 
     Shared by the timeout and MCP-client-startup failure paths in ``run_check``:
@@ -377,11 +431,7 @@ async def _connect_and_poll(plugins: list[Any]) -> list[dict[str, Any]]:
         while True:
             status = await client.get_mcp_status()
             servers = [dict(s) for s in status.get("mcpServers", [])]
-            pending = [
-                s
-                for s in servers
-                if _plugin_owned(s) and s.get("status") == "pending"
-            ]
+            pending = [s for s in servers if _plugin_owned(s) and s.get("status") == "pending"]
             if not pending:
                 return servers
             await asyncio.sleep(_POLL_INTERVAL_S)
@@ -440,9 +490,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     plugin_dir = os.environ.get(PLUGIN_DIR_ENV)
     if not plugin_dir or not Path(plugin_dir).is_dir():
-        result = _invalid_bundle_result(
-            plugin_dir or "", [f"plugin dir not found: {plugin_dir!r}"]
-        )
+        result = _invalid_bundle_result(plugin_dir or "", [f"plugin dir not found: {plugin_dir!r}"])
         print(json.dumps(result))
         return _EXIT_CODES["invalid_bundle"]
 
