@@ -28,8 +28,27 @@ pub struct Primer {
     pub verify_first: VerifyFirst,
     pub parity_ladder: Vec<Rung>,
     pub decision_logic: Vec<Decision>,
+    pub approvals: Approvals,
     pub landmines: Vec<Landmine>,
     pub recovery: Vec<Recovery>,
+}
+
+/// The human-in-the-loop plane. It earns a section of its own rather than a
+/// landmine because none of it is derivable: the command tree shows one
+/// `approvals` verb whose flags read as tool-gate config, while the plane behind
+/// it spans a bundle declaration, an operator route binding, three approver sets
+/// resolved server-side, and a resume turn the skill itself must handle.
+#[derive(Serialize)]
+pub struct Approvals {
+    pub summary: &'static str,
+    pub facts: Vec<ApprovalFact>,
+    pub commands: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct ApprovalFact {
+    pub title: &'static str,
+    pub detail: &'static str,
 }
 
 #[derive(Serialize)]
@@ -192,7 +211,72 @@ pub fn primer() -> Primer {
                          promote a bundle whose evals are red.",
             },
         ],
+        approvals: Approvals {
+            summary: "A turn can end without a reply: it pauses for a human decision and \
+                      resumes once someone resolves it. The platform owns the durable record, \
+                      the authorization, and the resume; your skill only raises the request and \
+                      handles the resume turn. Approval records live in the platform, so this \
+                      plane exists at the local and cluster tiers, not at skill.",
+            facts: vec![
+                ApprovalFact {
+                    title: "Raising one from a skill",
+                    detail: "Call the built-in request_approval tool (it appears as \
+                             mcp__curie__request_approval) with a one-line summary and, when \
+                             your instructions name one, a route. It executes nothing: it marks \
+                             the turn, which then ends awaiting-approval. Tell the user the \
+                             request is pending and end your turn. The other trigger is \
+                             configuration rather than the model: a tool named in the bundle's \
+                             approvalPolicy is denied before it runs and ends the turn the same \
+                             way.",
+                },
+                ApprovalFact {
+                    title: "Declaring a route, then binding it",
+                    detail: "A bundle declares routes in .claude-plugin/plugin.json under \
+                             approvalPolicy.gates[], each entry {gate: <tool name>, route: \
+                             <route name>}. An operator then binds each route per agent as \
+                             approval_routes[<route>] = {channel, approvers}. `channel` is \
+                             WHERE the card posts; `approvers` is WHO may act on it.",
+                },
+                ApprovalFact {
+                    title: "Who may resolve is independent of where the card is",
+                    detail: "approvers.users (an explicit Slack user list) beats approvers.group \
+                             (a Slack user group) beats the card channel's members, which is the \
+                             zero-setup default when no approvers block is declared. users and \
+                             group ignore the click channel entirely, so a card can sit in a \
+                             room everyone reads while a narrow set decides. Every check runs \
+                             server-side: the buttons are visible to all, and a refused click \
+                             gets a private reason.",
+                },
+                ApprovalFact {
+                    title: "The resume turn is yours to handle",
+                    detail: "A resolution wakes the session with a platform-authored turn whose \
+                             text starts `[approval resolved]` (or `[approval expired]`), naming \
+                             the decision, who made it, and any note they left. A skill with no \
+                             instruction for that prefix silently drops the verdict, and nothing \
+                             in the command tree tells you the turn exists.",
+                },
+                ApprovalFact {
+                    title: "Driving it with no workspace connected",
+                    detail: "--list reports each pending record's id, summary, and the route it \
+                             named; --resolve settles one as a named actor. Resolution is \
+                             once-only: the first authorized resolver wins and a later one is \
+                             told who won.",
+                },
+            ],
+            commands: vec![
+                "curie local approvals <AGENT> --list",
+                "curie local approvals <AGENT> --resolve <id> --as <user> --actor-channel <channel>",
+            ],
+        },
         landmines: vec![
+            Landmine {
+                title: "Self-approval is refused, from any channel",
+                detail: "The platform blocks the author of the turn that raised a request from resolving it, under every approver set. Testing an approval flow therefore needs a second actor: pass `--as <other-user>` on the resolve.",
+            },
+            Landmine {
+                title: "Silence after a request usually means an unbound route",
+                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere. Check the binding before suspecting the gate.",
+            },
             Landmine {
                 title: "Fake vs live model is symmetric across skill and local",
                 detail: "`curie skill up` and `curie local up` both run the real model when a credential is present and the fake model otherwise; `curie skill up --fake-model` or CURIE_FAKE_MODEL=1 forces the offline fake at either tier.",
@@ -230,6 +314,18 @@ pub fn primer() -> Primer {
             Recovery {
                 symptom: "the agent answers but never calls your MCP tools",
                 fix: "Run `curie skill check` -- a RED verdict names the server that failed to load and how to fix the declaration.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"self-approval is blocked\"",
+                fix: "You are the author of the turn that raised it, which no approver set overrides. Resolve as a different actor with `--as <user>`.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"you are not an approver\"",
+                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
+            },
+            Recovery {
+                symptom: "the agent says a request is pending but no approval card appeared",
+                fix: "The route it named is not bound for this agent, so the turn escalated instead of posting. Bind the route in the agent's approval_routes, then re-run the turn.",
             },
             Recovery {
                 symptom: "a command \"does not exist\"",
@@ -295,6 +391,17 @@ fn render_markdown(p: &Primer) -> String {
     for d in &p.decision_logic {
         s.push_str(&format!("- **{}**\n  {}\n\n", d.question, d.answer));
     }
+
+    s.push_str("## Approvals (a turn can end without a reply)\n\n");
+    s.push_str(p.approvals.summary);
+    s.push_str("\n\n");
+    for f in &p.approvals.facts {
+        s.push_str(&format!("- **{}**\n  {}\n\n", f.title, f.detail));
+    }
+    for c in &p.approvals.commands {
+        s.push_str(&format!("    {c}\n"));
+    }
+    s.push('\n');
 
     s.push_str("## Landmines (non-discoverable)\n\n");
     for l in &p.landmines {

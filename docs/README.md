@@ -37,6 +37,9 @@ git history (`git log -- docs/`).
   adopted component's swap seam lives.
 - [`interfaces.md`](interfaces.md): the swappable-seam catalog (INTERFACE.md per
   black line) with the swap-readiness grade table.
+- [`approvals.md`](approvals.md): the human-in-the-loop plane. How a turn pauses
+  for a human decision, how a route is declared and bound to a channel, who is
+  allowed to resolve it, and the resume turn your skill has to handle.
 - [`behavior-packs.md`](behavior-packs.md): per-agent, opt-in UX touches (load
   lines, capability tips, greeting/help) applied around a turn — why packs are
   declarative data rather than code, and what is wired today.
