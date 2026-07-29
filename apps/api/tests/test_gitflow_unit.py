@@ -1,5 +1,6 @@
 """Unit tests for git-flow signature, ref mapping, and clone-url guarding."""
 
+import base64
 import hashlib
 import hmac
 import subprocess
@@ -122,3 +123,61 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     assert "--" in archive_argv, archive_argv
     dash_index = archive_argv.index("--")
     assert archive_argv[dash_index + 1] == good_sha, archive_argv
+
+
+def test_clone_authenticates_a_private_https_remote_without_touching_argv() -> None:
+    # A private repo is the normal case for a bundle -- it names internal hosts
+    # and services -- so an unauthenticated clone made git-flow unusable (#1058).
+    # The credential must ride in git config env, never in argv: argv is visible
+    # in `ps` and is echoed verbatim by CalledProcessError.
+    settings = Settings(github_token="ghs-secret-token")
+    url = "https://github.com/acme/private-bundle.git"
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive(url, _VALID_SHA1, settings)
+
+    clone_call = run.call_args_list[0]
+    argv = clone_call.args[0]
+    env = clone_call.kwargs["env"]
+
+    assert "ghs-secret-token" not in " ".join(argv)
+    assert url in argv  # the URL itself is unmodified -- no embedded credential
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    # Scoped to this host, so a webhook naming another remote cannot harvest it.
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic ")
+    decoded = base64.b64decode(env["GIT_CONFIG_VALUE_0"].split()[-1]).decode()
+    assert decoded == "x-access-token:ghs-secret-token"
+
+
+def test_clone_sends_no_credential_when_none_is_configured() -> None:
+    settings = Settings(github_token="")
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive("https://github.com/acme/public.git", _VALID_SHA1, settings)
+    env = run.call_args_list[0].kwargs["env"]
+    assert "GIT_CONFIG_COUNT" not in env
+
+
+def test_clone_does_not_send_the_credential_over_plain_http() -> None:
+    # http:// is in the transport allowlist for local/test remotes; a bearer
+    # token must not be handed to a cleartext endpoint.
+    settings = Settings(github_token="ghs-secret-token")
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive("http://insecure.example/repo.git", _VALID_SHA1, settings)
+    assert "GIT_CONFIG_COUNT" not in run.call_args_list[0].kwargs["env"]
+
+
+def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
+    # The old message interpolated the exception, so an operator saw only
+    # "returned non-zero exit status 128" while the actual reason -- captured in
+    # stderr -- was discarded. That cost real debugging time on a private repo.
+    settings = Settings()
+    failure = subprocess.CalledProcessError(
+        128, ["git", "clone"], stderr=b"remote: Repository not found.\nfatal: could not read\n"
+    )
+    with mock.patch("curie_api.gitflow.subprocess.run", side_effect=failure):
+        with pytest.raises(GitFlowError) as err:
+            clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings)
+    assert "Repository not found" in str(err.value)
