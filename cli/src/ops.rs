@@ -2318,24 +2318,50 @@ fn ui_api_url_from_parts(ui_svc_json: &str, host: Option<&str>) -> Result<String
     }
 }
 
-/// Discover the UI `/api` proxy URL for a NodePort-exposed release so
-/// `cluster deploy` reaches the platform API with no port-forward.
-pub async fn discover_ui_api_url(namespace: &str, release: &str) -> Result<String> {
+/// Build a direct platform-API base URL from the api service, used when the UI
+/// is not deployed. No `/api` suffix: this is the API itself, not the UI proxy.
+fn api_url_from_parts(api_svc_json: &str, host: Option<&str>) -> Option<String> {
+    match parse_service(api_svc_json) {
+        Some((svc_type, Some(np), _)) if svc_type == "NodePort" => {
+            host.map(|h| node_http_url(h, np, ""))
+        }
+        _ => None,
+    }
+}
+
+/// Discover the platform API URL for a release.
+///
+/// Prefers the UI's `/api` proxy, which is how a default install is reached
+/// with no port-forward. Falls back to the api service directly when the UI is
+/// absent: `ui.deploy=false` is a legitimate way to run a Slack-only bot with a
+/// smaller footprint, and it used to break EVERY `cluster` verb -- deploy,
+/// versions, kill, delete -- with an error naming only the UI, which reads like
+/// a broken release rather than a supported configuration (#1068).
+pub async fn discover_api_url(namespace: &str, release: &str) -> Result<String> {
     let common = CommonOpts {
         namespace: namespace.to_string(),
         release: release.to_string(),
         dry_run: false,
     };
-    let svc_json = match run_capture(&svc_cmd(&common, "ui")).await {
-        Ok((true, out, _)) => out,
-        _ => {
-            return Err(api_url_usage_err(format!(
-                "could not read the {release}-ui service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
-            )))
-        }
-    };
     let host = resolve_node_host().await;
-    ui_api_url_from_parts(&svc_json, host.as_deref())
+
+    if let Ok((true, ui_json, _)) = run_capture(&svc_cmd(&common, "ui")).await {
+        return ui_api_url_from_parts(&ui_json, host.as_deref());
+    }
+
+    // No UI. The api service may still be reachable on its own NodePort.
+    if let Ok((true, api_json, _)) = run_capture(&svc_cmd(&common, "api")).await {
+        if let Some(url) = api_url_from_parts(&api_json, host.as_deref()) {
+            return Ok(url);
+        }
+        return Err(api_url_usage_err(format!(
+            "the {release}-ui service is absent (ui.deploy=false?) and {release}-api is not NodePort-exposed, so there is no reachable platform API URL; expose it with --set api.service.type=NodePort, or pass --api-url (e.g. via `kubectl port-forward svc/{release}-api 8123:8000`)"
+        )));
+    }
+
+    Err(api_url_usage_err(format!(
+        "could not read the {release}-ui or {release}-api service in namespace {namespace} to discover the platform API URL; pass --api-url to target the API directly"
+    )))
 }
 
 /// First node InternalIP from `kubectl get nodes -o json`.
@@ -2682,7 +2708,7 @@ pub async fn cluster_observability_endpoints(
     // (ADR-0021/0038), and a `localhost` URL that will not resolve is worse for
     // it than an explicit note saying the host could not be determined. It also
     // matches the `resolve_node_host()`+Option pattern #360 set for every
-    // URL-producing path (`discover_ui_api_url`) and the `api_base_endpoint`
+    // URL-producing path (`discover_api_url`) and the `api_base_endpoint`
     // row. `cluster status` stays human-facing and keeps its display
     // convenience.
     let (host, ui_svc, langfuse_svc) = tokio::join!(
@@ -4511,6 +4537,30 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--no-expose"), "{msg}");
         assert!(msg.contains("--api-url"), "{msg}");
+    }
+
+    #[test]
+    fn api_url_falls_back_to_the_api_service_nodeport() {
+        // ui.deploy=false is a supported way to run a Slack-only bot; when the
+        // UI is absent the api service's own NodePort is still a valid target.
+        // No /api suffix -- that path is the UI's proxy, not the API itself.
+        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30799}]}}"#;
+        let url = api_url_from_parts(json, Some("10.0.0.5")).expect("should build a direct URL");
+        assert_eq!(url, "http://10.0.0.5:30799");
+    }
+
+    #[test]
+    fn api_url_fallback_declines_a_clusterip_api_service() {
+        // ClusterIP is unreachable from outside the cluster, so there is no URL
+        // to return; the caller turns this into an actionable error.
+        let json = r#"{"spec":{"type":"ClusterIP","ports":[{"port":8000}]}}"#;
+        assert!(api_url_from_parts(json, Some("10.0.0.5")).is_none());
+    }
+
+    #[test]
+    fn api_url_fallback_declines_without_a_host() {
+        let json = r#"{"spec":{"type":"NodePort","ports":[{"port":8000,"nodePort":30799}]}}"#;
+        assert!(api_url_from_parts(json, None).is_none());
     }
 
     #[test]
