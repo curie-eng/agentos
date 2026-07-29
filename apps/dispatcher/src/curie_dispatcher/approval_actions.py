@@ -55,6 +55,29 @@ NOTE_MODAL_CALLBACK_ID = "curie-approval-note"
 _NOTE_BLOCK_ID = "note"
 _NOTE_ACTION_ID = "note-input"
 
+# The human-facing note limit, declared on the modal's input so Slack shows a
+# counter and blocks submit (#1077). Slack would otherwise accept up to 3000, and
+# the verdict line concatenates the note onto an attribution prefix, so an
+# unbounded note produces a text object over the cap and ``chat_update`` raises.
+_NOTE_MAX_LENGTH = 2000
+
+# The structural backstop on the stamped context line, applied in
+# ``_verdict_line`` so a non-modal caller is guarded too. It mirrors the value
+# the codebase already settled on for the same class of problem: the worker's
+# ``_APPROVAL_SUMMARY_MAX`` and ``_CHUNK_TARGET``, both in
+# ``curie_worker.blocks``, are the same 2900 (copied rather than imported: the
+# dispatcher must not depend on apps/worker). The three share a derivation from
+# Slack's text-object limit, not a coupling to each other -- two of them guard
+# different block types in a different service, and nothing gates any of the
+# three against the others; this comment naming the other two is the only
+# cross-reference there is.
+#
+# Assumption, stated because it is inferred rather than cited: Slack documents
+# 3000 as the general maximum for a text object's ``text``, but documents no
+# per-element cap for the elements of a CONTEXT block specifically. 2900 is
+# therefore a deliberate margin under an inferred limit, not a documented one.
+_VERDICT_LINE_MAX = 2900
+
 _APPROVAL_ACTION_IDS = frozenset(
     {
         APPROVE_ACTION_ID,
@@ -95,6 +118,63 @@ class ResolveOutcome:
     decision: str | None = None
 
 
+@dataclass(frozen=True)
+class NoteSubmission:
+    """A note dialog that has already been resolved, carried across the ack.
+
+    Everything the render half needs travels in here so that no Slack call has
+    to precede the ack (#1077): ``resolve_note_submission`` fills it in and
+    ``render_note_submission`` consumes it, with ``ack()`` in between.
+    ``response_action`` is the body Bolt must ack the view with -- None closes
+    the dialog, and an ``errors`` response keeps it open with the reason
+    attached to the note field.
+    """
+
+    approval_id: str
+    decision: str
+    user: str
+    channel: str
+    card_ts: str
+    note: str | None
+    outcome: ResolveOutcome
+    response_action: dict[str, Any] | None
+
+
+# The resolve POST is the only network round trip left inside the
+# ``view_submission`` ack budget (#1077), so it must give up well inside Slack's
+# three seconds. All four phases are named explicitly because httpx timeouts are
+# PER PHASE and the phases are sequential: any phase left at its default silently
+# joins the sum. A single-argument ``httpx.Timeout(1.0, connect=0.5)`` reads like
+# 1.5s and is actually 3.5s, over the deadline this constant exists to fit inside.
+#
+# Be precise about what the four numbers bound: each caps INACTIVITY inside its own
+# I/O operation, not elapsed wall clock. pool 0.1 + connect 0.4 + write 0.3 + read
+# 1.4 = 2.2s is the worst case for a response that arrives in the normal way, which
+# leaves real margin inside the three seconds for websocket transit and Bolt's own
+# dispatch. It is NOT a guaranteed ceiling. A slowly-streaming response resets the
+# read clock on every chunk, so it can run past the ack budget without ever
+# tripping a timeout, and httpx cannot express a total-request deadline at all.
+# What makes that acceptable is the peer rather than the setting: this talks to the
+# platform API, which answers with one small JSON body that lands in a single read,
+# so there is no trickle for the read clock to keep forgiving.
+#
+# The shape of the split is deliberate. Read gets the largest share because it is
+# the phase that legitimately waits on the authorizer doing work: a group-bound
+# approval whose membership cache has expired makes the API perform a live Slack
+# lookup inside this request. Connect is tighter because a platform API that has
+# not accepted the socket in 0.4s is down, not busy. Pool is tiny because pool
+# exhaustion is near-impossible here (five Bolt listener workers against httpx's
+# default pool of 100), so failing fast is the right answer if it ever happens.
+#
+# Timing out yields ``ResolveOutcome(status_code=0)``. Be clear about what that
+# does and does not mean: for anything past the connect phase the request WAS
+# delivered, so the outcome is UNKNOWN to the dispatcher and the server may well
+# have committed the resolution. What keeps a retry safe is the server-side
+# compare-and-set, not the record being untouched -- a retry of a decision that
+# did land comes back 409 instead of resolving it a second time.
+_RESOLVE_TIMEOUT = httpx.Timeout(connect=0.4, read=1.4, write=0.3, pool=0.1)
+
+
 class ApprovalResolveClient:
     """Thin client for POST /approvals/{id}/resolve (shared API key auth)."""
 
@@ -103,7 +183,7 @@ class ApprovalResolveClient:
     ) -> None:
         self._base = api_base_url.rstrip("/")
         self._headers = {"X-API-Key": api_key} if api_key else {}
-        self._client = client or httpx.Client(timeout=10.0)
+        self._client = client or httpx.Client(timeout=_RESOLVE_TIMEOUT)
 
     def resolve(
         self,
@@ -186,8 +266,20 @@ def _verdict_line(decision: str, user: str, note: str | None) -> str:
     verdict.
     """
 
+    # Build the whole line, then cut only if it does not fit. The cut takes from
+    # the tail, which is the note, so the attribution survives in preference to
+    # it: who decided is the part of this line that must survive. The cut is
+    # marked so a reader can tell the card is showing an excerpt; the durable
+    # record still holds the whole note, and the requester's resume turn
+    # interpolates that one. The marker is the same single ellipsis character
+    # the worker's ``_truncate`` in ``curie_worker.blocks`` uses, so a truncated
+    # note ends the same way whichever service stamped the card.
     line = f"{decision.capitalize()} by <@{user}>"
-    return f"{line}\nNote: {note}" if note else line
+    if note:
+        line = f"{line}\nNote: {note}"
+    if len(line) <= _VERDICT_LINE_MAX:
+        return line
+    return line[: _VERDICT_LINE_MAX - 1] + "…"
 
 
 def build_note_modal(
@@ -227,6 +319,7 @@ def build_note_modal(
                     "type": "plain_text_input",
                     "action_id": _NOTE_ACTION_ID,
                     "multiline": True,
+                    "max_length": _NOTE_MAX_LENGTH,
                 },
             }
         ],
@@ -308,24 +401,30 @@ def open_note_dialog(
     return outcome
 
 
-def process_note_submission(
+def resolve_note_submission(
     *,
     body: dict[str, Any],
-    web_client: WebClient,
     resolver: ApprovalResolveClient,
     logger: logging.Logger | None = None,
-) -> tuple[ResolveOutcome | None, dict[str, Any] | None]:
-    """Resolve from a submitted note dialog (#1053).
+) -> NoteSubmission | None:
+    """Decide a submitted note dialog, making no Slack call at all (#1053, #1077).
 
-    Returns ``(outcome, response_action)``. The second element is the body Bolt
-    must ack the view with: ``None`` closes the dialog, and an ``errors``
-    response keeps it open with the reason attached to the note field.
+    The pre-ack half. It parses ``private_metadata``, extracts the note, and
+    resolves; the returned ``NoteSubmission`` carries the body Bolt must ack the
+    view with, so the caller can ack immediately and render afterwards. Returns
+    None when the payload is unusable, in which case there is nothing to render.
 
-    That second channel exists because the claim race widened. Resolution now
-    happens at submit rather than at click, so two approvers can hold open
-    dialogs at once. The compare-and-set still makes exactly one win, but the
-    loser is now standing inside a modal, where an ephemeral is invisible --
-    so every refusal is rendered INTO the view rather than posted behind it.
+    The resolve genuinely cannot move past the ack: a view ack CARRIES the
+    response. That second channel exists because the claim race widened.
+    Resolution now happens at submit rather than at click, so two approvers can
+    hold open dialogs at once. The compare-and-set still makes exactly one win,
+    but the loser is now standing inside a modal, where an ephemeral is
+    invisible -- so every refusal is rendered INTO the view rather than posted
+    behind it.
+
+    It takes no ``web_client``: that is what makes "nothing talks to Slack before
+    the ack" a structural property of the signature rather than a matter of
+    ordering discipline inside the body.
     """
 
     log = logger or logging.getLogger(__name__)
@@ -342,35 +441,101 @@ def process_note_submission(
     user = (body.get("user") or {}).get("id") or ""
     if not approval_id or not channel or not user or decision not in ("approved", "rejected"):
         log.info("note submission with unusable private_metadata, skipping")
-        return None, None
+        return None
 
     values = (view.get("state") or {}).get("values") or {}
     note = ((values.get(_NOTE_BLOCK_ID) or {}).get(_NOTE_ACTION_ID) or {}).get("value")
     note = (note or "").strip() or None
 
-    # The card's original blocks are not in a view_submission payload, so re-read
-    # the message the card lives on to stamp it in place. Best-effort: a failed
-    # read only costs the in-place edit, never the resolution.
-    message = _fetch_card_message(web_client, channel=channel, card_ts=card_ts, log=log)
-
-    outcome = _resolve_and_render(
+    outcome = resolver.resolve(
+        approval_id,
+        decision=decision,
+        resolved_by=user,
+        actor_channel=channel,
+        note=note,
+    )
+    response_action = (
+        None
+        if outcome.status_code == 200
+        else {
+            "response_action": "errors",
+            "errors": {_NOTE_BLOCK_ID: _refusal_text(outcome)},
+        }
+    )
+    return NoteSubmission(
         approval_id=approval_id,
         decision=decision,
         user=user,
         channel=channel,
         card_ts=card_ts,
-        message=message,
         note=note,
-        web_client=web_client,
-        resolver=resolver,
-        log=log,
+        outcome=outcome,
+        response_action=response_action,
     )
-    if outcome.status_code == 200:
-        return outcome, None
-    return outcome, {
-        "response_action": "errors",
-        "errors": {_NOTE_BLOCK_ID: _refusal_text(outcome)},
-    }
+
+
+def render_note_submission(
+    submission: NoteSubmission,
+    *,
+    web_client: WebClient,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Stamp the card for an already-decided submission (#1077).
+
+    The post-ack half, and the only place the dialog path talks to Slack. It
+    never raises: by the time it runs the view has been acked and there is no
+    surface left to report an error on.
+
+    Note the deliberate consequence of running here: the card is now read AFTER
+    the resolve rather than before, so a claim-race loser commonly reads a card
+    the winner has already stamped and appends a second context line under it.
+    That is a redundant extra line, not a lost decision.
+    """
+
+    log = logger or logging.getLogger(__name__)
+
+    # The outer net that makes "never raises" structural rather than incidental.
+    # Every Slack call below already carries its own best-effort handler, so
+    # totality holds by inspection today -- but only by inspection, and the cost
+    # of it lapsing is not a logged traceback. Bolt's thread runner, on a raise
+    # from a post-ack listener, sets ``ack.response`` back to None while the
+    # dispatch thread is still polling it, so a raise inside that window eats the
+    # ack entirely and the view never closes: the exact failure #1077 exists to
+    # remove. A future edit that adds a call here must not be able to
+    # reintroduce it by forgetting a handler.
+    try:
+        # The card's original blocks are not in a view_submission payload, so
+        # re-read the message the card lives on to stamp it in place.
+        # Best-effort: a failed read only costs the in-place edit, never the
+        # resolution. Skip the read entirely on the outcomes that discard it --
+        # only the 200 and 409 branches of ``_render_outcome`` use ``message``,
+        # and a fetch nobody reads still costs a Slack round trip and holds one
+        # of Bolt's five shared listener workers.
+        message: dict[str, Any] = {}
+        if submission.outcome.status_code in (200, 409):
+            message = _fetch_card_message(
+                web_client,
+                channel=submission.channel,
+                card_ts=submission.card_ts,
+                log=log,
+            )
+
+        _render_outcome(
+            approval_id=submission.approval_id,
+            decision=submission.decision,
+            user=submission.user,
+            channel=submission.channel,
+            card_ts=submission.card_ts,
+            message=message,
+            note=submission.note,
+            outcome=submission.outcome,
+            web_client=web_client,
+            log=log,
+        )
+    except Exception as exc:  # noqa: BLE001 - a raise past the ack eats the ack
+        log.warning(
+            "post-ack render failed for approval %s: %s", submission.approval_id, exc
+        )
 
 
 def _fetch_card_message(
@@ -436,11 +601,13 @@ def _resolve_and_render(
     resolver: ApprovalResolveClient,
     log: logging.Logger,
 ) -> ResolveOutcome:
-    """Resolve one approval and stamp the card, shared by both click paths.
+    """Resolve one approval and hand the verdict to ``_render_outcome``.
 
-    The immediate-click path and the note-dialog path must agree on what a
-    settled card looks like and on when the ephemeral is skipped, so they share
-    this rather than each rendering their own.
+    The resolve-then-render pair for a caller that is free to talk to Slack
+    inline: the immediate-click path, and the note-dialog path's fall-forward
+    when the dialog could not be opened. The rendering itself lives in
+    ``_render_outcome``, which the post-ack dialog path calls on its own, so
+    this is only the ordering of the two halves plus the returned outcome.
     """
 
     outcome = resolver.resolve(
@@ -450,6 +617,45 @@ def _resolve_and_render(
         actor_channel=channel,
         note=note,
     )
+    _render_outcome(
+        approval_id=approval_id,
+        decision=decision,
+        user=user,
+        channel=channel,
+        card_ts=card_ts,
+        message=message,
+        note=note,
+        outcome=outcome,
+        web_client=web_client,
+        log=log,
+    )
+    return outcome
+
+
+def _render_outcome(
+    *,
+    approval_id: str,
+    decision: str,
+    user: str,
+    channel: str,
+    card_ts: str,
+    message: dict[str, Any],
+    note: str | None,
+    outcome: ResolveOutcome,
+    web_client: WebClient,
+    log: logging.Logger,
+) -> None:
+    """Render an already-decided outcome back into Slack.
+
+    Split out of ``_resolve_and_render`` so the note-dialog path can run it
+    AFTER ``ack()`` (#1077): every call in here talks to Slack, and none of it
+    feeds the ack body. It must never raise -- past the ack a raise does not just
+    go unreported, it can eat the ack: Bolt's thread runner sets ``ack.response``
+    back to None on a listener exception while the dispatch thread is still
+    polling it, so the view is left open with no response at all. Every Slack
+    call therefore keeps its own best-effort handler, and the caller wraps the
+    whole of this in an outer net.
+    """
 
     if outcome.status_code == 200:
         verdict = _verdict_line(outcome.decision or decision, user, note)
@@ -465,7 +671,7 @@ def _resolve_and_render(
         except Exception as exc:  # noqa: BLE001 - render is best-effort
             log.warning("approval card update failed for %s: %s", approval_id, exc)
         log.info("approval %s %s by %s", approval_id, decision, user)
-        return outcome
+        return
 
     if outcome.status_code == 409:
         # Refresh a stale card so it stops offering buttons for a settled
@@ -485,7 +691,6 @@ def _resolve_and_render(
         outcome.status_code,
         outcome.detail,
     )
-    return outcome
 
 
 def process_approval_action(
@@ -499,8 +704,8 @@ def process_approval_action(
     """Resolve one card click immediately and render the verdict back into Slack.
 
     The no-dialog path, for a card rendered without ``allow_free_text``. It shares
-    ``_resolve_and_render`` with the dialog path so the two cannot disagree about
-    what a settled card looks like; only the surface a refusal is rendered on
+    ``_render_outcome`` with the dialog path so the two cannot disagree about what
+    a settled card looks like; only the surface a refusal is rendered on
     differs, and that difference is real: here nothing is open, so an ephemeral is
     the right place for it.
 

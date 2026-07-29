@@ -23,15 +23,14 @@ one that ships.
 from __future__ import annotations
 
 import logging
-import socket
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 import httpx
 import pytest
 from curie_dispatcher.config import DispatcherConfig
 from curie_dispatcher.preflight import ApiUnreachableError, check_api_reachable
+
+from .conftest import _black_hole_api
 
 API_URL = "http://curie-api:8000"
 
@@ -211,25 +210,6 @@ def test_the_loop_spends_its_whole_budget_with_production_backoff_ratios() -> No
         f"the error must report the time actually elapsed, not the configured "
         f"deadline; got {str(excinfo.value)!r}"
     )
-
-
-@contextmanager
-def _black_hole_api() -> Iterator[str]:
-    """A real port that completes the TCP handshake and then never answers.
-
-    The counterpart to `_refusing`: a refused connection fails instantly, so it
-    can never show a probe running past the deadline. This one hangs until some
-    timeout fires, which is exactly the case where an unbounded probe overshoots.
-    Nothing accepts the socket; the kernel's listen backlog completes the
-    handshake, so `connect` succeeds and the read blocks.
-    """
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    sock.listen(1)
-    try:
-        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
-    finally:
-        sock.close()
 
 
 def test_the_loop_does_not_probe_past_its_deadline() -> None:

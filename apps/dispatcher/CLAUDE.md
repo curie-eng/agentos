@@ -36,6 +36,17 @@ summary.
   failures, unrecoverable exits) and owns graceful shutdown (`request_stop`
   wired to SIGINT/SIGTERM). Do not add ad hoc retry logic elsewhere for a
   connection failure -- it belongs in the supervisor's `BackoffPolicy`.
+- **Slack allows a `view_submission` three seconds to be acked, and the ack
+  body is load-bearing.** It carries `response_action: errors` on a refusal,
+  the only surface a claim-race loser can see behind an open modal. The only
+  thing permitted before `ack()` on that path is the resolve call itself;
+  both Slack calls (the card read and the card stamp, in
+  `render_note_submission`) run after the ack. The enforcement is structural,
+  not discipline: `resolve_note_submission` takes no `web_client` parameter
+  at all, so the pre-ack half physically cannot call Slack -- a future change
+  must preserve that property rather than relying on call ordering. The
+  post-ack half runs on Bolt's shared listener executor, which is why the
+  Slack client carries an explicit short timeout.
 
 ## Config surface
 
