@@ -489,9 +489,14 @@ def test_approval_card_renders_allow_free_text_as_the_note_buttons() -> None:
     assert plain[:-1] == with_note[:-1]
 
     # The CLI's Slack stub detects a posted card by matching the shared prefix
-    # of both Approve ids (cli/src/chat.rs APPROVE_ACTION_ID_PREFIX). Pin that
-    # relationship here: a rename that broke it would blind `local message` to
-    # awaiting-approval turns, and nothing else would fail.
+    # of both Approve ids (cli/src/chat.rs APPROVE_ACTION_ID_PREFIX). This
+    # assertion is Python-internal and pins only that the two ids here share a
+    # prefix; the Python-to-Rust coupling of that prefix to the CLI constant is
+    # frozen in tests/vectors/approval-action-ids.json (#1079), read by
+    # test_action_ids_match_the_frozen_vector in
+    # apps/dispatcher/tests/test_approval_actions.py and by
+    # prefix_matches_the_frozen_action_id_vector in cli/src/chat.rs's test
+    # module.
     assert APPROVE_NOTE_ACTION_ID.startswith(APPROVE_ACTION_ID)
 
 

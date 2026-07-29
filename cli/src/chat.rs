@@ -96,9 +96,14 @@ fn capped(budget: Duration, deadline: Instant) -> Duration {
 /// `curie-approval-approve` (resolve on click) or `curie-approval-approve-note`
 /// (open a note dialog first, #1053), and this stub only needs to know a card
 /// was posted, not which variant. Matching the prefix covers both by
-/// construction. Anything that renames the ids must keep them sharing it, or
-/// this detection silently goes blind and `local message` stops reporting an
-/// awaiting-approval turn.
+/// construction -- the base Approve id IS this constant, and every note-or-later
+/// variant extends it. The coupling to the dispatcher's ids is pinned by the
+/// frozen vector `tests/vectors/approval-action-ids.json`, which this constant
+/// is checked against in `tests::prefix_matches_the_frozen_action_id_vector`
+/// below; the dispatcher's own constants are checked against the same file by
+/// `test_action_ids_match_the_frozen_vector` in
+/// `apps/dispatcher/tests/test_approval_actions.py`. A rename on either side is
+/// therefore red rather than a silently blind detection (#1079).
 pub const APPROVE_ACTION_ID_PREFIX: &str = "curie-approval-approve";
 
 /// One captured Slack Web API call at the stub.
@@ -575,6 +580,60 @@ pub fn resolve_targets(channel: Option<&str>, thread: Option<&str>) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    /// The frozen action-id vector, parsed strictly. `deny_unknown_fields` is
+    /// the whole point: a key this lane cannot see would pass vacuously, which
+    /// is the exact drift the gate exists to catch. The Python lane rejects
+    /// unknown keys the same way, via `_EXPECTED_VECTOR_KEYS` in
+    /// `apps/dispatcher/tests/test_approval_actions.py`.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ActionIdVector {
+        /// The file-level rationale; parsed so it is not an unknown field.
+        /// Underscore-prefixed so rustc's dead_code lint skips it; the serde
+        /// rename keeps the JSON key it matches on as `comment`.
+        #[serde(rename = "comment")]
+        _comment: String,
+        approve_action_id_prefix: String,
+    }
+
+    /// The Rust half of the cross-language approval action-id gate (#1079).
+    ///
+    /// `APPROVE_ACTION_ID_PREFIX` is an independent Rust literal, so nothing but
+    /// this pins it to the prefix the dispatcher's card actually renders. The
+    /// dispatcher's own constants are checked against the same file by
+    /// `test_action_ids_match_the_frozen_vector` in
+    /// `apps/dispatcher/tests/test_approval_actions.py`, so a rename in one
+    /// language without the vector fails that language's test. The rule is not
+    /// restated here: it lives in the vector file.
+    #[test]
+    fn prefix_matches_the_frozen_action_id_vector() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/approval-action-ids.json"
+        ))
+        .expect("read tests/vectors/approval-action-ids.json");
+        let parsed: ActionIdVector = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "parse tests/vectors/approval-action-ids.json: {err}\n\
+                 An unknown field is rejected on purpose: a key this lane cannot see \
+                 would pass vacuously. Teach the new key to ActionIdVector here, to \
+                 _EXPECTED_VECTOR_KEYS in \
+                 apps/dispatcher/tests/test_approval_actions.py, and to both lanes' \
+                 assertions."
+            )
+        });
+        let prefix = parsed.approve_action_id_prefix.as_str();
+
+        assert_eq!(
+            prefix, APPROVE_ACTION_ID_PREFIX,
+            "the frozen approve_action_id_prefix ({prefix}) no longer matches this \
+             CLI's prefix ({APPROVE_ACTION_ID_PREFIX}); `body.contains(...)` would \
+             stop detecting a posted approval card and `local message` would stop \
+             reporting an awaiting-approval turn"
+        );
+    }
 
     #[test]
     fn extract_fields_reads_form_and_json_bodies() {
