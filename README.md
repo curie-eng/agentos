@@ -259,6 +259,22 @@ theirs. A downloaded release binary resolves the pinned chart release asset for
 its version, and `curie local up` likewise resolves the pinned
 `compose.release.yaml`, caching both under `~/.cache/curie/` with no repo
 checkout needed.
+
+### Recommended setup
+
+Docker covers the `skill` and `local` rungs. For the `cluster` rung, we
+recommend a single node k3s cluster on a Linux host with at least 8 GB of
+memory. k3s default kube router networking enforces NetworkPolicy. The 4 GB
+profile is tight. The full promotion ladder therefore needs Docker, kubectl,
+Helm, and access to that cluster.
+
+kind and Minikube are fine for disposable tests, but k3s is the lasting
+recommendation. Their loopback API can require the documented listen host
+escape hatch. Real model workloads require `runsc` on every node unless gVisor
+is explicitly disabled. Fake model installation works without `runsc`. See
+[`docs/operations.md`](docs/operations.md) for setup details; `curie cluster up`
+remains the install path.
+
 Use `--chart <path>` when developing the chart locally. The short version:
 
 - `curie cluster up` runs `helm upgrade --install` of `charts/curie`; it reads
