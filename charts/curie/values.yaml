@@ -447,6 +447,15 @@ api:
   orgName: Curie
   # HMAC secret the GitHub git-flow webhook authenticates inbound events with.
   githubWebhookSecret: dev-webhook-secret
+  # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
+  # authenticating the git-flow bundle clone. Without it git-flow can only deploy
+  # a PUBLIC repository -- a private one is rejected with git.archive_failed
+  # (#1058). Empty by default, which keeps public-repo installs unchanged.
+  #
+  # Scope it to reading the bundle repositories this install deploys; a
+  # fine-grained PAT or a GitHub App installation token is preferable to a
+  # personal classic token, which carries the whole user's access.
+  githubToken: ""
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
