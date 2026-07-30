@@ -121,9 +121,8 @@ fail-forward design.
 
 ### Manually, with `curie cluster deploy`
 
-This pushes your bundle to the Curie API -- the control-plane component
-that `cluster up` installs as part of the release, not a third-party
-service -- which stores it and hands it to the deployed worker.
+This pushes your plugin bundle to the Curie API -- the control-plane component
+that `cluster up` installs as part of the release.
 
 ```bash
 curie cluster deploy --plugin-dir <bundle-dir>
@@ -201,7 +200,7 @@ curie cluster message "hello, are you there?"
 
 | Flag | What it does |
 |---|---|
-| `--continue` | Reuse the same conversation thread as your last `cluster message` call (reads `.curie/last-turn.json`). |
+| `--continue` | Reuse the same conversation thread as your last `cluster message` call. |
 | `--thread <id>` | Continue a specific earlier conversation thread by ID, instead of the most recent one. |
 | `--force-wire` | `cluster message` normally refuses to run against a release that's already wired to a real Slack workspace, since driving it would send replies into that workspace instead. Pass `--force-wire` to override that guard. |
 
@@ -212,7 +211,9 @@ This exercises a deployed release end to end with no Slack at all. It:
 - prints the reply
 
 `cluster message` handles the port-forwards, channel resolution, and stub
-routing itself, so none of that is something you need to set up.
+routing itself, so none of that is something you need to set up. `--continue`
+reads its saved context from `.curie/last-turn.json` in the current <!-- doclint:ignore-line -->
+directory.
 
 This lets a developer iterate on an agent built for someone else's
 workspace with no Slack access. Full flag reference is in
