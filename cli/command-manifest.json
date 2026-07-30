@@ -1832,6 +1832,27 @@
               "required": false
             },
             {
+              "env": "CURIE_GITHUB_TOKEN",
+              "global": false,
+              "help": "GitHub credential the API uses for the git-flow bundle clone and the eval commit status, needed for private repositories. Passed to helm through a private 0600 values file, not as an argument, so it stays out of the helm command line and the printed plan. Supply it through CURIE_GITHUB_TOKEN to also keep it out of your shell history and the process table: a value typed after this flag is in curie's own argv. Omit it and a later cluster up preserves whatever was recorded",
+              "id": "github_token",
+              "long": "github-token",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the recorded GitHub credential from the release. An empty --github-token does NOT clear it; this flag is the only way, so an empty environment variable cannot destroy a working credential",
+              "id": "clear_github_token",
+              "long": "clear-github-token",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
               "global": false,
               "help": "Extra `--set KEY=VAL` passed through to helm verbatim (repeatable)",
               "id": "set",

@@ -341,6 +341,12 @@ pub struct UpOpts {
     /// argv tests and whenever `--dev` keeps the chart's dev defaults. Delivered
     /// through a private 0600 `-f` values file, never the argv.
     pub secrets: Vec<(String, String)>,
+    /// What this run does with `api.githubToken`, resolved by [`up`] from
+    /// `--github-token` / `CURIE_GITHUB_TOKEN` / `--clear-github-token` and the
+    /// value the release already recorded. `Untouched` in the pure argv tests.
+    /// A `Set` value is a live GitHub credential and is delivered through the
+    /// private 0600 `-f` values file, never the argv.
+    pub github_token: GithubTokenPlan,
     /// `--dev`: keep the chart's deterministic dev-default secrets instead of
     /// generating strong per-release randoms (the first-class dev escape hatch
     /// that replaces hand-passing `--set` for every secret).
@@ -445,6 +451,24 @@ pub fn check_runner_model_conflict(model: Option<&str>, set: &[String]) -> Resul
                  runner model is unambiguous."
             );
         }
+    }
+    Ok(())
+}
+
+/// Reject supplying the GitHub credential through BOTH the private input and the
+/// argv `--set` pass-through. Silently letting `--set` win would discard the
+/// operator's protected input AND leak the `--set` value into the process table,
+/// which is the exact defect #1124 exists to close, so this is a usage error
+/// rather than a precedence rule.
+pub fn check_github_token_conflict(flag: Option<&str>, clear: bool, set: &[String]) -> Result<()> {
+    let explicit = clear || flag.is_some_and(|v| !v.is_empty());
+    if explicit && operator_set_keys(set).contains(GITHUB_TOKEN_KEY) {
+        bail!(
+            "conflicting GitHub credential: `--set {GITHUB_TOKEN_KEY}=` was passed \
+             alongside `--github-token` / `--clear-github-token`. Remove the \
+             `--set`: it puts the complete token in the process table and shell \
+             history, which the dedicated input exists to avoid."
+        );
     }
     Ok(())
 }
@@ -779,6 +803,48 @@ const REQUIRED_SECRETS: &[(&str, usize)] = &[
     ("api.githubWebhookSecret", 24),
 ];
 
+/// The chart value carrying the API's OUTBOUND GitHub credential: the eval
+/// commit status and the git-flow bundle clone (#1058/#1097/#1109).
+///
+/// Deliberately NOT in [`REQUIRED_SECRETS`]: that list GENERATES a random for a
+/// key it finds absent, which is right for a credential the install must have
+/// and wrong for this one. Empty here means "no GitHub credential, public repos
+/// only"; a generated random would be 32 characters of noise sent to GitHub as a
+/// bearer token, failing auth in a way that reads like a permissions problem
+/// rather than a missing one (#1109). Preserved, never invented.
+pub(crate) const GITHUB_TOKEN_KEY: &str = "api.githubToken";
+
+/// What `cluster up` does with [`GITHUB_TOKEN_KEY`] on this run.
+///
+/// Three states, resolved once in [`up`] and consumed by the pure builder:
+/// - `Untouched`: supply nothing. Either the operator pinned the key through
+///   `--set` (theirs to own), or there is no recorded value to keep.
+/// - `Set`: write this value through the private 0600 `-f` values file -- an
+///   explicit `--github-token`, or the value the last run recorded.
+/// - `Clear`: write an empty value, the same shape `comms --disconnect` writes,
+///   so a subsequent plain `up` finds an empty record and does not resurrect it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GithubTokenPlan {
+    Untouched,
+    Set(String),
+    Clear,
+}
+
+/// Hand-written so `{:?}` on this type (or on the `UpOpts` that holds it)
+/// never prints the live token -- AC2 requires the credential be absent from
+/// debug output too. `Set` renders the same masked form [`mask_secret`]
+/// produces everywhere else, never the raw value; a derived `Debug` would
+/// print it in full.
+impl std::fmt::Debug for GithubTokenPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Untouched => write!(f, "Untouched"),
+            Self::Set(v) => write!(f, "Set({})", mask_secret(v)),
+            Self::Clear => write!(f, "Clear"),
+        }
+    }
+}
+
 /// `n_bytes` of OS CSPRNG output, lowercase-hex encoded (so `2 * n_bytes`
 /// chars). Hex keeps the value shell-, env- and URL-safe and satisfies every
 /// backing store's charset/min-length rule, and a hex `langfuse.encryptionKey`
@@ -795,19 +861,34 @@ fn random_hex(n_bytes: usize) -> Result<String> {
     Ok(out)
 }
 
+/// The operator's `--set` arguments split into raw `(key, value)` halves: the
+/// single parser behind [`operator_set_keys`] and
+/// [`set_passthrough_leaks_github_token`], though not the only reader of this
+/// grammar in the file ([`explicit_runner_model`] hand-rolls a last-wins
+/// prefix match with different semantics, and is deliberately left alone).
+/// Handles both repeated
+/// `--set` flags and helm's comma-joined `a=1,b=2` form; an element with no `=`
+/// (a bare `KEY`, an empty element, the tail of a trailing comma) assigns
+/// nothing and contributes no entry.
+///
+/// Both halves are returned VERBATIM, whitespace included, because the callers
+/// want different things from it: a key is matched trimmed, while a value's
+/// surrounding whitespace is only ever shell noise. Trimming here would decide
+/// that for them.
+fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
+    sets.iter()
+        .flat_map(|s| s.split(','))
+        .filter_map(|part| part.split_once('='))
+        .collect()
+}
+
 /// The bare value keys an operator already pinned through `--set` (so the CLI
-/// leaves those to the operator rather than generating over them). Handles both
-/// repeated `--set` flags and helm's comma-joined `a=1,b=2` form.
+/// leaves those to the operator rather than generating over them).
 fn operator_set_keys(sets: &[String]) -> std::collections::HashSet<String> {
-    let mut keys = std::collections::HashSet::new();
-    for s in sets {
-        for part in s.split(',') {
-            if let Some((k, _)) = part.split_once('=') {
-                keys.insert(k.trim().to_string());
-            }
-        }
-    }
-    keys
+    operator_set_entries(sets)
+        .into_iter()
+        .map(|(key, _)| key.trim().to_string())
+        .collect()
 }
 
 /// Read a dotted helm key (`langfuse.encryptionKey`) out of a values JSON
@@ -820,6 +901,14 @@ fn lookup_dotted(values: &serde_json::Value, dotted: &str) -> Option<String> {
     cursor.as_str().map(str::to_string)
 }
 
+/// The value helm already recorded for `key`, when there is a real one. An
+/// empty record is what a `--disconnect` / `--clear-*` wrote and is not a
+/// credential; returning `None` for it is what stops a cleared value being
+/// resurrected on the next plain `up`.
+fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    lookup_dotted(existing?, key).filter(|current| !current.is_empty())
+}
+
 /// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
 ///
 /// An operator `--set` for a key always wins, and a key helm has no record of
@@ -829,18 +918,78 @@ fn resolve_comms_values(
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
     let overridden = operator_set_keys(operator_sets);
-    let Some(values) = existing else {
-        return Vec::new();
-    };
     COMMS_MANAGED_KEYS
         .iter()
         .filter(|key| !overridden.contains(**key))
         .filter_map(|key| {
-            lookup_dotted(values, key)
-                .filter(|current| !current.is_empty())
-                .map(|current| ((*key).to_string(), current))
+            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
         })
         .collect()
+}
+
+/// Resolve [`GITHUB_TOKEN_KEY`] for this run.
+///
+/// - `flag` is the `--github-token` value: `None` when the flag and
+///   `CURIE_GITHUB_TOKEN` are both unset.
+/// - `clear` is `--clear-github-token`.
+///
+/// Precedence, and why:
+/// 1. An operator `--set api.githubToken=` wins outright and we supply nothing,
+///    matching every other secret (`operator_set_secret_is_left_to_the_operator`).
+///    Passing BOTH is rejected earlier by [`check_github_token_conflict`].
+/// 2. An explicit clear removes it.
+/// 3. An explicit non-empty value replaces it.
+/// 4. Otherwise preserve whatever helm recorded -- so a plain `cluster up`
+///    (which does a FULL upgrade and drops anything it does not re-pass) cannot
+///    silently reset a working credential to the chart's empty default.
+///
+/// An EMPTY explicit value is state 4, not state 2. An exported-but-empty
+/// `CURIE_GITHUB_TOKEN` is a routine shell accident, and letting an ambiguous
+/// signal destroy a live credential is the wrong failure direction; destroying
+/// requires the unambiguous `--clear-github-token`.
+///
+/// Pure and non-interactive, like the resolvers around it.
+fn resolve_github_token(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    flag: Option<&str>,
+    clear: bool,
+) -> GithubTokenPlan {
+    if operator_set_keys(operator_sets).contains(GITHUB_TOKEN_KEY) {
+        return GithubTokenPlan::Untouched;
+    }
+    if clear {
+        return GithubTokenPlan::Clear;
+    }
+    if let Some(value) = flag.filter(|v| !v.is_empty()) {
+        return GithubTokenPlan::Set(value.to_string());
+    }
+    match preserved_value(existing, GITHUB_TOKEN_KEY) {
+        Some(current) => GithubTokenPlan::Set(current),
+        None => GithubTokenPlan::Untouched,
+    }
+}
+
+/// Whether an operator `--set` assigns a NON-EMPTY value to
+/// [`GITHUB_TOKEN_KEY`], i.e. whether the complete token is riding in argv.
+///
+/// The pass-through stays legal (it is verbatim by design and breaking it would
+/// break existing operators), but a non-empty one leaks into the process table,
+/// shell history and the printed plan, so `up` steers the operator to the
+/// private input. An EMPTY assignment is the operator clearing the key by hand:
+/// nothing leaks, so warning about it would be noise on a correct command.
+/// Reads the same [`operator_set_entries`] parse the rest of this file does,
+/// since helm accepts the comma-joined `a=1,b=2` form.
+///
+/// The trims are asymmetric on purpose. Whitespace AROUND an assignment is
+/// shell noise (`--set " api.githubToken=x "` still leaks a token), so it is
+/// trimmed off both ends; whitespace INSIDE the key is not (`api.githubToken =x`
+/// assigns a differently-named helm key, which this credential does not ride
+/// on), so a key is compared with its leading noise removed and nothing else.
+fn set_passthrough_leaks_github_token(set: &[String]) -> bool {
+    operator_set_entries(set)
+        .into_iter()
+        .any(|(key, value)| key.trim_start() == GITHUB_TOKEN_KEY && !value.trim_end().is_empty())
 }
 
 /// Decide which [`REQUIRED_SECRETS`] values `cluster up` supplies, and how.
@@ -871,10 +1020,8 @@ fn resolve_generated_secrets(
         }
         match existing {
             Some(values) => {
-                if let Some(current) = lookup_dotted(values, key) {
-                    if !current.is_empty() {
-                        resolved.push(((*key).to_string(), current));
-                    }
+                if let Some(current) = preserved_value(Some(values), key) {
+                    resolved.push(((*key).to_string(), current));
                 }
             }
             None => resolved.push(((*key).to_string(), random_hex(*len)?)),
@@ -968,6 +1115,23 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
             "agentSandbox.runner.credentials",
             credentials,
         ));
+    }
+    // The GitHub credential is a live bearer token, so it takes the same private
+    // 0600 `-f` values file as the model credential above and never touches the
+    // argv (#1124). An explicit clear is the empty string, which is NOT secret
+    // and rides as a visible plain `--set` -- the same shape
+    // `comms --disconnect` writes -- so the operator can see the removal in the
+    // preview instead of inferring it from an absence. Both sit before the
+    // passthrough `--set`s, so an operator `--set` keeps helm precedence.
+    match &o.github_token {
+        GithubTokenPlan::Untouched => {}
+        GithubTokenPlan::Set(token) => {
+            args.push(secret_values_file(GITHUB_TOKEN_KEY, token));
+        }
+        GithubTokenPlan::Clear => {
+            args.push(plain("--set"));
+            args.push(plain(format!("{GITHUB_TOKEN_KEY}=")));
+        }
     }
     // Egress allowlist entries share one running index so the array stays
     // contiguous no matter which source contributes: the resolved named-provider
@@ -1542,13 +1706,35 @@ impl crate::ui::CliOutput for ClusterUpOutput {
     }
 }
 
-pub async fn up(mut opts: UpOpts) -> Result<ClusterUpOutput> {
+/// Whether `up()` should read the release's existing helm values before
+/// resolving secrets and the GitHub credential.
+///
+/// Deliberately does NOT depend on `dev`: a `cluster up --dev` must still
+/// preserve whatever credential (e.g. the GitHub token, #1124) a real release
+/// already recorded -- `--dev` only governs the chart's dev-default secret
+/// values, not whether the read happens. Re-adding a `dev` term here is the
+/// specific regression this function exists to make visible. `dry_run` is the
+/// only thing that skips the read, since `--dry-run` stays fully offline and
+/// never touches helm.
+fn should_read_existing(dev: bool, dry_run: bool) -> bool {
+    let _ = dev;
+    !dry_run
+}
+
+pub async fn up(
+    mut opts: UpOpts,
+    github_token: Option<String>,
+    clear_github_token: bool,
+) -> Result<ClusterUpOutput> {
     let ui = crate::ui::ui();
     validate_web_egress_cidrs(&opts.allow_web_egress)
         .context("invalid --allow-web-egress value")?;
     // Fail loud (even under --dry-run) if CURIE_MODEL and an explicit
     // `--set agentSandbox.runner.model=` disagree (#361).
     check_runner_model_conflict(opts.model.as_deref(), &opts.set)?;
+    // Fail loud (even under --dry-run) when the credential is supplied through
+    // both the private input and the leaky `--set` pass-through (#1124).
+    check_github_token_conflict(github_token.as_deref(), clear_github_token, &opts.set)?;
     // Each `--allow-egress-host` must name a known provider. An unknown value is
     // a usage error (exit 2) pointing at `--allow-web-egress`; the `?` carries
     // the CliError's exit class into the anyhow chain.
@@ -1563,15 +1749,18 @@ pub async fn up(mut opts: UpOpts) -> Result<ClusterUpOutput> {
     // recorded (so a live store's credential is never rotated). `--dry-run`
     // stays offline (it never touches the cluster), so it previews the fresh
     // install shape -- a live run reuses any existing release's secrets.
+    //
+    // Read once, used by both the generated-secret resolution below (sealed
+    // installs only) and the GitHub-credential resolution (every install --
+    // `--dev` governs the chart's dev DEFAULTS, not an operator's credential).
+    // `--dry-run` stays offline and therefore previews the fresh-install shape.
+    let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
+        require_on_path("helm")?;
+        fetch_existing_values(&opts.common).await?
+    } else {
+        None
+    };
     if !opts.dev {
-        if !opts.common.dry_run {
-            require_on_path("helm")?;
-        }
-        let existing = if opts.common.dry_run {
-            None
-        } else {
-            fetch_existing_values(&opts.common).await?
-        };
         let fresh = existing.is_none();
         opts.secrets = resolve_generated_secrets(existing.as_ref(), &opts.set)?;
         let preserved = resolve_comms_values(existing.as_ref(), &opts.set);
@@ -1588,6 +1777,86 @@ pub async fn up(mut opts: UpOpts) -> Result<ClusterUpOutput> {
                 opts.secrets.len()
             ));
         }
+    }
+
+    // The API's outbound GitHub credential: an explicit `--github-token` /
+    // `--clear-github-token`, otherwise whatever the release already recorded,
+    // so a plain `cluster up` cannot silently reset it (#1124).
+    opts.github_token = resolve_github_token(
+        existing.as_ref(),
+        &opts.set,
+        github_token.as_deref(),
+        clear_github_token,
+    );
+    // `existing.is_some()` means this is an UPGRADE: an API pod is already
+    // running on the old value and keeps it until it restarts (the api pod
+    // template carries no checksum/secret annotation). On a FRESH install the
+    // pod has not started yet and comes up with the new value, so the restart
+    // advice would be false and is suppressed.
+    let upgrading = existing.is_some();
+    // Named by label selector, not `{release}-api`: the chart derives the
+    // actual Deployment name through `curie.fullname`, which is only
+    // `{release}-curie` unless the release name already contains "curie"
+    // (`charts/curie/templates/_helpers.tpl:15-25`), so a literal `-api`
+    // suffix on the release name is wrong under a non-default `--release`.
+    // `app.kubernetes.io/instance={release}` plus the fixed `component: api`
+    // label match the Deployment's own `selectorLabels` regardless of any
+    // `nameOverride`/`fullnameOverride`, so this is correct in every case.
+    let restart_hint = format!(
+        "kubectl -n {} rollout restart deployment -l app.kubernetes.io/instance={},app.kubernetes.io/component=api",
+        opts.common.namespace, opts.common.release
+    );
+    // An explicit but EMPTY `--github-token` / `CURIE_GITHUB_TOKEN`: a routine
+    // shell accident that preserves rather than clears (`resolve_github_token`),
+    // so each arm below folds it into its own single note.
+    let empty_flag = github_token.as_deref().is_some_and(str::is_empty);
+    match &opts.github_token {
+        GithubTokenPlan::Set(_) if github_token.as_deref().is_some_and(|v| !v.is_empty()) => {
+            if upgrading {
+                ui.note(&format!(
+                    "GitHub credential set through the private values path; the running API keeps the old one until it restarts: {restart_hint}"
+                ));
+            } else {
+                ui.note("GitHub credential set through the private values path");
+            }
+        }
+        GithubTokenPlan::Clear => {
+            // A clear only actually removes something when a credential was
+            // recorded; on a fresh install (or an existing release that never
+            // had one) there is nothing to remove, so the wording must not
+            // claim there was.
+            if preserved_value(existing.as_ref(), GITHUB_TOKEN_KEY).is_some() {
+                // This is an incident-response verb, not a revocation: the
+                // running API keeps the old token until it restarts, and the
+                // token stays valid at GitHub until revoked there directly.
+                ui.note(&format!(
+                    "GitHub credential cleared here, not revoked: the running API keeps the old token until it restarts ({restart_hint}), and the token is still valid at GitHub until you revoke it at https://github.com/settings/tokens (or rotate the App installation credential)"
+                ));
+            } else {
+                ui.note("no GitHub credential was recorded; nothing to clear");
+            }
+        }
+        GithubTokenPlan::Set(_) => {
+            // Preservation, reached either by a plain `up` or by an EMPTY
+            // explicit value (state 4 in `resolve_github_token`). One note per
+            // outcome: when the value was empty, say so here rather than
+            // trailing a second, overlapping note after this match.
+            if empty_flag {
+                ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; preserving the GitHub credential recorded by an earlier cluster up. Pass --clear-github-token to remove it.");
+            } else {
+                ui.note("preserving the GitHub credential recorded by an earlier cluster up; pass --github-token to change it or --clear-github-token to remove it");
+            }
+        }
+        GithubTokenPlan::Untouched => {
+            // Distinct wording: an empty value with nothing recorded preserves
+            // nothing, so it must not read as if it kept a credential.
+            if empty_flag {
+                ui.note("--github-token (or CURIE_GITHUB_TOKEN) was empty; no GitHub credential is recorded to keep.");
+            }
+        }
+    }
+    if set_passthrough_leaks_github_token(&opts.set) {
+        ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
     // Resolve the named providers' API host(s) to narrow host-route CIDRs. This
@@ -2843,6 +3112,7 @@ mod tests {
     fn up_defaults_expose_ui_and_langfuse() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -2869,6 +3139,7 @@ mod tests {
     fn up_no_expose_drops_the_nodeport_sets() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -2891,6 +3162,7 @@ mod tests {
     fn up_passthrough_set_is_appended_verbatim() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -2917,6 +3189,7 @@ mod tests {
         // or egress sets (the fake model stays on, egress stays fail-closed).
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -2942,6 +3215,7 @@ mod tests {
         // install even when the caller had a credential in the environment.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -2964,6 +3238,7 @@ mod tests {
     fn up_with_credentials_enables_real_model_and_masks() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
             chart: "charts/curie".into(),
@@ -3097,6 +3372,7 @@ mod tests {
     fn up_local_model_adds_inference_sets() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3119,6 +3395,7 @@ mod tests {
     fn up_without_local_model_omits_inference_sets() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3142,6 +3419,7 @@ mod tests {
         // CURIE_MODEL set, no explicit --set: inject the runner model (#361).
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3167,6 +3445,7 @@ mod tests {
         // No CURIE_MODEL: inject nothing, the chart default stands (#361).
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3190,6 +3469,7 @@ mod tests {
         // already carries it, so no duplicate injection (#361).
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3219,6 +3499,7 @@ mod tests {
         // `--set agentSandbox.runner.model=<model>` on top of it (#361).
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3292,6 +3573,7 @@ mod tests {
     fn up_opens_web_egress_after_model() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
             chart: "charts/curie".into(),
@@ -3328,6 +3610,7 @@ mod tests {
     fn up_web_egress_without_model_uses_index_zero() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3361,6 +3644,7 @@ mod tests {
     fn up_web_egress_multiple_cidrs_contiguous() {
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
             chart: "charts/curie".into(),
@@ -3393,6 +3677,7 @@ mod tests {
     fn up_no_web_egress_stays_sealed() {
         let sealed_cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -3411,6 +3696,7 @@ mod tests {
 
         let model_cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4395,6 +4681,7 @@ mod tests {
         // secret and never appear in argv or the printed line.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4483,6 +4770,7 @@ mod tests {
         // private -f values file, never in the executed argv / process table.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4537,6 +4825,7 @@ mod tests {
         // pre-#196 argv test) emits no secret values file.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4561,6 +4850,7 @@ mod tests {
         // random values and the dev/e2e stack would not match compose.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4587,6 +4877,7 @@ mod tests {
         // the sealed chart generates strong per-release credentials there.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5422,6 +5713,7 @@ mod tests {
         // web destinations continue contiguously -- one array, no gaps.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             model: None,
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["10.0.0.1/32".into(), "2001:db8::1/128".into()],
@@ -5470,6 +5762,7 @@ mod tests {
         // sandbox stays sealed and the model is unreachable by design.
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             model: None,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
@@ -5501,6 +5794,7 @@ mod tests {
         // a declared web destination still occupies index [0].
         let cmds = up_commands(&UpOpts {
             common: common(),
+            github_token: GithubTokenPlan::Untouched,
             model: None,
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
@@ -5521,5 +5815,736 @@ mod tests {
         );
         assert!(!line.contains("allowedEgress[1]"), "{line}");
         assert!(!line.contains("160.79.104.0/23"), "{line}");
+    }
+
+    // -----------------------------------------------------------------------
+    // `api.githubToken` as a private durable cluster input (#1124)
+    //
+    // The API's OUTBOUND GitHub credential (git-flow bundle clone + eval commit
+    // status, #1058/#1097/#1109). Every assertion below reads a user-visible
+    // outcome -- what `display()` renders, what `argv()` carries after
+    // materialization, what the `--dry-run --json` plan serializes to -- never an
+    // internal `CmdArg` shape, so renaming any of the machinery breaks nothing.
+    // -----------------------------------------------------------------------
+
+    /// One sentinel everywhere, so a leak is unambiguous in any output form and
+    /// its masked prefix (`mask_secret` keeps 8 chars) is `ghp-SENT***`.
+    const GH_SENTINEL: &str = "ghp-SENTINEL-1124-leak-canary";
+
+    /// The masked form the operator SHOULD see: enough prefix to recognise the
+    /// credential is applied, not enough to use it.
+    const GH_MASKED: &str = "api.githubToken=ghp-SENT***";
+
+    /// A `cluster up` carrying nothing but the GitHub credential plan, so each
+    /// assertion below reads exactly one variable.
+    fn up_with_github_token(plan: GithubTokenPlan) -> Vec<OpsCommand> {
+        up_commands(&UpOpts {
+            common: common(),
+            github_token: plan,
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![],
+            dev: false,
+            no_expose: true,
+            set: vec![],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        })
+    }
+
+    /// Every values file a materialized command hands helm, in argv order.
+    ///
+    /// Plural on purpose: a real sealed `cluster up` emits more than one
+    /// `SecretValuesFile` (the model credential, the GitHub credential, and the
+    /// generated/preserved chart secrets are three separate args), so a helper
+    /// that read only the FIRST `-f` would silently assert against the model
+    /// credential file while believing it was reading the token's.
+    fn secret_values_file_bodies(cmd: &OpsCommand) -> Vec<String> {
+        let argv = cmd.argv();
+        let bodies: Vec<String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "-f")
+            .map(|(i, _)| {
+                std::fs::read_to_string(&argv[i + 1]).expect("reading the secret values file")
+            })
+            .collect();
+        assert!(
+            !bodies.is_empty(),
+            "no -f values file in the materialized argv: {argv:?}"
+        );
+        bodies
+    }
+
+    #[test]
+    fn github_token_rides_the_private_values_file_not_argv() {
+        // AC1. A live GitHub bearer token gets the model credential's treatment:
+        // a private 0600 `-f` values file, never a `--set`. `SecretSet` would
+        // mask the printed form but still put `key=value` in the real argv, which
+        // is the exact defect #1124 exists to close.
+        let cmds = up_with_github_token(GithubTokenPlan::Set(GH_SENTINEL.into()));
+        let line = cmds[0].display();
+        assert!(
+            !line.contains(GH_SENTINEL),
+            "token leaked into display: {line}"
+        );
+        assert!(line.contains(GH_MASKED), "masked form missing: {line}");
+
+        let (materialized, guards) = cmds[0]
+            .materialize_secret_files()
+            .expect("materializing the secret values file");
+        let argv = materialized.argv();
+        let argv_joined = argv.join(" ");
+        assert!(
+            !argv_joined.contains(GH_SENTINEL),
+            "token leaked into argv: {argv_joined}"
+        );
+        assert!(
+            !argv_joined.contains("api.githubToken="),
+            "the credential must not ride as a --set at all: {argv_joined}"
+        );
+
+        // The file helm actually reads carries the real value, nested for helm.
+        let f_pos = argv
+            .iter()
+            .position(|a| a == "-f")
+            .expect("a -f flag in the materialized argv");
+        let values_path = std::path::PathBuf::from(&argv[f_pos + 1]);
+        let body = std::fs::read_to_string(&values_path).expect("reading the values file");
+        assert!(
+            body.contains(GH_SENTINEL),
+            "token missing from values file: {body}"
+        );
+        assert!(
+            body.contains("api") && body.contains("githubToken"),
+            "values file is not the expected nested shape: {body}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&values_path)
+                .expect("stat values file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "values file must be 0600, was {mode:o}");
+        }
+        drop(guards);
+        assert!(
+            !values_path.exists(),
+            "values file should be deleted once the guard drops"
+        );
+    }
+
+    #[test]
+    fn github_token_absent_from_every_rendered_form() {
+        // AC2, all four renderings in ONE test so none can be silently forgotten:
+        // the human preview (`display()`), the executed argv, the `--dry-run`
+        // plan built the way `up()` builds it, and that plan's `--json` string.
+        // The `--verbose` plumbing echo is the same `display()` (run_step's
+        // `ui.plumbing("+ {display()}")`), so it is covered by the first form.
+        //
+        // AC2's fifth surface, "errors", is NOT covered here and has no test:
+        // `run_step`'s failure line is built inline
+        // (`ui.failure(&format!("`{}` failed: {reason}", cmd.program))`) and
+        // written to a process-global `Ui` with no capture seam, so a unit test
+        // cannot read it. Asserting on a hand-rebuilt copy of that string would
+        // be a tautology that survives changing `cmd.program` to `cmd.argv()`,
+        // so there is deliberately no such test. Closing it needs `run_step`'s
+        // failure line extracted into a named pure function, a production change.
+        use crate::ui::CliOutput;
+
+        let cmds = up_with_github_token(GithubTokenPlan::Set(GH_SENTINEL.into()));
+
+        // 1. Human preview.
+        let line = cmds[0].display();
+        assert!(!line.contains(GH_SENTINEL), "display leak: {line}");
+
+        // 2. Executed argv, after the executor's materialization step.
+        let (materialized, _guards) = cmds[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(!argv.contains(GH_SENTINEL), "argv leak: {argv}");
+
+        // 3. The `--dry-run` plan, constructed exactly as `up()` constructs it.
+        let plan = crate::ui::DryRunPlan {
+            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
+        };
+        for planned in &plan.lines {
+            assert!(
+                !planned.contains(GH_SENTINEL),
+                "dry-run plan leak: {planned}"
+            );
+        }
+
+        // 4. The `--dry-run --json` serialization of that same plan.
+        let json = plan.to_json().to_string();
+        assert!(!json.contains(GH_SENTINEL), "dry-run --json leak: {json}");
+
+        // And the masked form IS present in each printed form, so an operator can
+        // still see the credential is being applied rather than inferring it.
+        assert!(
+            line.contains(GH_MASKED),
+            "masked form missing from display: {line}"
+        );
+        assert!(
+            plan.lines.iter().any(|l| l.contains(GH_MASKED)),
+            "masked form missing from the dry-run plan: {:?}",
+            plan.lines
+        );
+        assert!(
+            json.contains(GH_MASKED),
+            "masked form missing from --json: {json}"
+        );
+    }
+
+    #[test]
+    fn github_token_masked_form_shows_only_the_prefix() {
+        // AC2. `mask_secret`'s contract is 8 chars plus `***`; a ninth character
+        // of a live bearer token is a leak, not a nicety.
+        let cmds = up_with_github_token(GithubTokenPlan::Set(GH_SENTINEL.into()));
+        let line = cmds[0].display();
+        assert!(line.contains(GH_MASKED), "{line}");
+        assert!(
+            !line.contains("ghp-SENTI"),
+            "a ninth token character reached the printed form: {line}"
+        );
+    }
+
+    #[test]
+    fn preserved_github_token_never_reaches_argv_either() {
+        // AC2 secondary path. A token arriving through the PRESERVE path (what a
+        // plain `cluster up` takes) is exactly as live as one just typed, so it
+        // gets the same four-form treatment. Armed through the resolver over a
+        // recorded release, never through the flag.
+        use crate::ui::CliOutput;
+
+        let existing = serde_json::json!({"api": {"githubToken": GH_SENTINEL}});
+        let plan_state = resolve_github_token(Some(&existing), &[], None, false);
+        assert_eq!(plan_state, GithubTokenPlan::Set(GH_SENTINEL.to_string()));
+
+        let cmds = up_with_github_token(plan_state);
+        let line = cmds[0].display();
+        assert!(!line.contains(GH_SENTINEL), "display leak: {line}");
+        assert!(line.contains(GH_MASKED), "masked form missing: {line}");
+
+        let (materialized, _guards) = cmds[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(!argv.contains(GH_SENTINEL), "argv leak: {argv}");
+
+        let plan = crate::ui::DryRunPlan {
+            lines: cmds.iter().map(|cmd| cmd.display()).collect(),
+        };
+        for planned in &plan.lines {
+            assert!(
+                !planned.contains(GH_SENTINEL),
+                "dry-run plan leak: {planned}"
+            );
+        }
+        let json = plan.to_json().to_string();
+        assert!(!json.contains(GH_SENTINEL), "dry-run --json leak: {json}");
+    }
+
+    #[test]
+    fn set_and_flag_together_is_rejected() {
+        // AC2 guard. Letting `--set` quietly win would discard the operator's
+        // protected input AND put the token in the process table, so supplying
+        // both is a usage error rather than a precedence rule.
+        let err = check_github_token_conflict(
+            Some(GH_SENTINEL),
+            false,
+            &["api.githubToken=ghp-other".to_string()],
+        )
+        .expect_err("flag + --set must be rejected")
+        .to_string();
+        assert!(err.contains("--github-token"), "{err}");
+        assert!(err.contains("--set"), "{err}");
+        assert!(err.contains("api.githubToken"), "{err}");
+
+        // The comma-joined form helm also accepts, which `operator_set_keys`
+        // splits -- a guard that only matched the bare form would miss it.
+        assert!(
+            check_github_token_conflict(
+                Some(GH_SENTINEL),
+                false,
+                &["worker.replicas=2,api.githubToken=ghp-other".to_string()],
+            )
+            .is_err(),
+            "the comma-joined --set form must be rejected too"
+        );
+
+        // The clear is just as explicit an input as a value.
+        assert!(
+            check_github_token_conflict(None, true, &["api.githubToken=ghp-other".to_string()])
+                .is_err(),
+            "--clear-github-token + --set must be rejected"
+        );
+
+        // Legal: exactly one side supplied.
+        assert!(check_github_token_conflict(Some(GH_SENTINEL), false, &[]).is_ok());
+        assert!(check_github_token_conflict(None, true, &[]).is_ok());
+        assert!(
+            check_github_token_conflict(None, false, &["api.githubToken=ghp-other".to_string()])
+                .is_ok(),
+            "a lone --set stays legal (it is a verbatim pass-through by design)"
+        );
+        // An EMPTY flag value is not an explicit input (an exported-but-empty
+        // CURIE_GITHUB_TOKEN is a routine shell accident), so it does not conflict.
+        assert!(
+            check_github_token_conflict(
+                Some(""),
+                false,
+                &["api.githubToken=ghp-other".to_string()]
+            )
+            .is_ok(),
+            "an empty --github-token is absence, not a competing input"
+        );
+    }
+
+    #[test]
+    fn plain_up_preserves_the_recorded_github_token() {
+        // AC3. `up` does a FULL upgrade and drops whatever it does not re-pass,
+        // so without this a later plain `cluster up` silently resets the
+        // credential to the chart's empty default and private clones start
+        // failing with nothing in the diff mentioning GitHub (#1067's shape).
+        let existing = serde_json::json!({"api": {"githubToken": "ghp-recorded"}});
+        assert_eq!(
+            resolve_github_token(Some(&existing), &[], None, false),
+            GithubTokenPlan::Set("ghp-recorded".to_string())
+        );
+    }
+
+    #[test]
+    fn fresh_install_or_never_set_preserves_nothing() {
+        // AC3. Nothing recorded means nothing to keep, and an EMPTY record is
+        // what `--clear-github-token` wrote -- resurrecting it would make the
+        // clear a one-shot. Mirrors
+        // `up_preserves_nothing_on_a_fresh_install_or_when_slack_was_never_set`.
+        assert_eq!(
+            resolve_github_token(None, &[], None, false),
+            GithubTokenPlan::Untouched
+        );
+        let no_token = serde_json::json!({"nameOverride": "sre-bot"});
+        assert_eq!(
+            resolve_github_token(Some(&no_token), &[], None, false),
+            GithubTokenPlan::Untouched
+        );
+        let cleared = serde_json::json!({"api": {"githubToken": ""}});
+        assert_eq!(
+            resolve_github_token(Some(&cleared), &[], None, false),
+            GithubTokenPlan::Untouched
+        );
+    }
+
+    #[test]
+    fn github_token_is_not_in_the_generating_list() {
+        // AC3, the CLI half of #1109's pin. `REQUIRED_SECRETS` GENERATES a random
+        // for a key it finds absent, which is right for a credential the install
+        // must have and wrong for this one: 32 characters of noise sent to GitHub
+        // as a bearer token fails auth in a way that reads like a permissions
+        // problem rather than a missing credential. It joins the preserve-only
+        // semantics instead.
+        assert!(
+            !REQUIRED_SECRETS
+                .iter()
+                .any(|(k, _)| *k == "api.githubToken"),
+            "api.githubToken must never join the generating list: {REQUIRED_SECRETS:?}"
+        );
+        let secrets = resolve_generated_secrets(None, &[]).unwrap();
+        assert_eq!(secrets.len(), REQUIRED_SECRETS.len());
+        assert!(
+            !secrets.iter().any(|(k, _)| k == "api.githubToken"),
+            "a fresh install minted a GitHub token: {secrets:?}"
+        );
+    }
+
+    #[test]
+    fn dev_never_skips_the_existing_values_read_only_dry_run_does() {
+        // AC3, and the pin on the change that actually makes a `cluster up --dev`
+        // preserve a recorded GitHub token: the existing-values read must happen
+        // on the `--dev` path too. Before the hoist that read sat inside
+        // `if !opts.dev`, so a `--dev` upgrade saw no record, resolved
+        // `Untouched`, and the full helm upgrade reset the credential to the
+        // chart's empty default with nothing in the output mentioning GitHub.
+        //
+        // All four combinations, so this states the whole rule rather than one
+        // corner: `dry_run` is the ONLY input that may skip the read (`--dry-run`
+        // stays fully offline), and `dev` must never be a term. Re-adding a `dev`
+        // term is the specific regression this catches, and it fails here in the
+        // `dev = true, dry_run = false` case regardless of which direction the
+        // term is written.
+        assert!(
+            should_read_existing(false, false),
+            "a plain live cluster up must read the release's existing values"
+        );
+        assert!(
+            should_read_existing(true, false),
+            "a live `cluster up --dev` must ALSO read them: --dev governs the chart's \
+             dev-default secret VALUES, not whether an operator's recorded credential \
+             is preserved (#1124)"
+        );
+        assert!(
+            !should_read_existing(false, true),
+            "--dry-run stays offline and never touches helm"
+        );
+        assert!(
+            !should_read_existing(true, true),
+            "--dev --dry-run stays offline too"
+        );
+    }
+
+    #[test]
+    fn dev_flag_does_not_suppress_the_github_token_values_file() {
+        // AC3 secondary path, and the name states EXACTLY what it proves: the
+        // `--dev` branch of `up_commands` adds only
+        // `security.allowDevDefaults=true`, so a resolved credential still rides
+        // the private values file beside it rather than being swallowed.
+        //
+        // The other half of `--dev` preservation, the decision to read the
+        // release's existing values at all, is pinned by
+        // `dev_never_skips_the_existing_values_read_only_dry_run_does`: that test
+        // is what fails if someone re-adds a `dev` term to
+        // `should_read_existing` and reinstates the pre-hoist `if !opts.dev` gate.
+        //
+        // Neither test covers the path end to end, which is worth stating rather
+        // than leaving implied: `up()` is async and the read runs behind
+        // `require_on_path("helm")` plus a live `helm get values`, so no unit test
+        // exercises a real `--dev` upgrade actually re-supplying a recorded token.
+        // Between them these two pin the read DECISION and the argv it feeds; the
+        // live evidence is the E2E's `--dev` arm.
+        let cmds = up_commands(&UpOpts {
+            common: common(),
+            github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![],
+            dev: true,
+            no_expose: true,
+            set: vec![],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        });
+        let line = cmds[0].display();
+        assert!(line.contains("security.allowDevDefaults=true"), "{line}");
+        assert!(line.contains(GH_MASKED), "{line}");
+        assert!(!line.contains(GH_SENTINEL), "display leak: {line}");
+
+        let (materialized, _guards) = cmds[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(!argv.contains(GH_SENTINEL), "argv leak: {argv}");
+        assert!(
+            secret_values_file_bodies(&materialized)
+                .iter()
+                .any(|body| body.contains(GH_SENTINEL)),
+            "the --dev install dropped the credential"
+        );
+    }
+
+    #[test]
+    fn github_token_and_generated_secrets_ride_separate_values_files_that_merge() {
+        // The shape a real sealed (`!dev`) `cluster up` actually emits, which no
+        // other test covers: TWO `SecretValuesFile` args whose bodies both carry
+        // a top-level `api` map -- `{"api":{"githubToken":...}}` from the
+        // credential arm and `{"api":{"apiKey":...}}` from the generated/preserved
+        // chart secrets. That is only correct because helm's `mergeMaps`
+        // DEEP-merges successive `-f` files rather than replacing them
+        // ("Priority is given to the last (right-most) file specified",
+        // `helm install --help`, helm v3; values files are merged, not
+        // overwritten, per helm's Values Files docs). A change that flattened
+        // these into one map or made a later file replace an earlier one would
+        // silently drop either `api.apiKey` (breaking platform auth) or the
+        // credential, so both keys must survive to their own file and neither
+        // may reach argv.
+        let cmds = up_commands(&UpOpts {
+            common: common(),
+            github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
+            allow_egress_host: vec![],
+            resolved_egress_cidrs: vec![],
+            chart: "charts/curie".into(),
+            secrets: vec![
+                ("api.apiKey".into(), "generated-api-key".into()),
+                (
+                    "api.githubWebhookSecret".into(),
+                    "generated-webhook-secret".into(),
+                ),
+            ],
+            dev: false,
+            no_expose: true,
+            set: vec![],
+            allow_web_egress: vec![],
+            fake_model: false,
+            credentials: None,
+            local_model: None,
+            model: None,
+        });
+
+        // Both credentials are masked in the printed form, neither is raw.
+        let line = cmds[0].display();
+        assert!(
+            !line.contains(GH_SENTINEL),
+            "token leaked into display: {line}"
+        );
+        assert!(
+            !line.contains("generated-api-key"),
+            "api key leaked into display: {line}"
+        );
+        assert!(line.contains(GH_MASKED), "{line}");
+        assert!(line.contains("api.apiKey=generate***"), "{line}");
+
+        let (materialized, _guards) = cmds[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            !argv.contains(GH_SENTINEL),
+            "token leaked into argv: {argv}"
+        );
+        assert!(
+            !argv.contains("generated-api-key"),
+            "api key leaked into argv: {argv}"
+        );
+
+        // Two distinct `-f` files, not one: the token must not be folded into
+        // the generated-secret map (that would put it in the same document helm
+        // already had, losing the separation) and neither may be dropped.
+        let bodies = secret_values_file_bodies(&materialized);
+        assert_eq!(
+            bodies.len(),
+            2,
+            "a sealed up with a credential must emit exactly two values files: {bodies:?}"
+        );
+        let token_file = bodies
+            .iter()
+            .find(|body| body.contains(GH_SENTINEL))
+            .unwrap_or_else(|| panic!("no values file carries the GitHub credential: {bodies:?}"));
+        let secrets_file = bodies
+            .iter()
+            .find(|body| body.contains("generated-api-key"))
+            .unwrap_or_else(|| panic!("no values file carries the generated secrets: {bodies:?}"));
+        assert_ne!(
+            token_file, secrets_file,
+            "the credential and the generated secrets must stay in separate files"
+        );
+        assert!(
+            secrets_file.contains("generated-webhook-secret"),
+            "the generated-secret file lost a key: {secrets_file}"
+        );
+        // Each nests under `api`, which is exactly why the deep merge matters.
+        for body in [token_file, secrets_file] {
+            let doc: serde_json::Value =
+                serde_json::from_str(body).expect("each values file is a JSON document helm reads");
+            assert!(
+                doc.get("api").and_then(|v| v.as_object()).is_some(),
+                "expected a top-level `api` map: {body}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(token_file).unwrap()["api"]["githubToken"],
+            serde_json::Value::String(GH_SENTINEL.to_string())
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(secrets_file).unwrap()["api"]["apiKey"],
+            serde_json::Value::String("generated-api-key".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_flag_replaces_the_recorded_value() {
+        // AC4. An explicit value is a rotation; it must win over the record.
+        let existing = serde_json::json!({"api": {"githubToken": "ghp-recorded"}});
+        assert_eq!(
+            resolve_github_token(Some(&existing), &[], Some("ghp-new"), false),
+            GithubTokenPlan::Set("ghp-new".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_clear_writes_an_empty_value() {
+        // AC4. The clear is the EMPTY string, which is not secret: it rides as a
+        // visible plain `--set` (the shape `comms --disconnect` writes) so the
+        // operator sees the removal in the preview instead of inferring it from
+        // an absence, and so the release records the empty value.
+        let existing = serde_json::json!({"api": {"githubToken": GH_SENTINEL}});
+        assert_eq!(
+            resolve_github_token(Some(&existing), &[], None, true),
+            GithubTokenPlan::Clear
+        );
+
+        // Assert on argv, which is what helm actually receives.
+        let cmds = up_with_github_token(GithubTokenPlan::Clear);
+        let argv = cmds[0].argv();
+        let pos = argv
+            .iter()
+            .position(|a| a == "api.githubToken=")
+            .unwrap_or_else(|| panic!("no empty api.githubToken assignment in argv: {argv:?}"));
+        assert!(pos > 0, "the assignment has no preceding flag: {argv:?}");
+        assert_eq!(argv[pos - 1], "--set", "{argv:?}");
+        assert!(
+            !argv.join(" ").contains(GH_SENTINEL),
+            "a clear must carry no token at all: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn clear_then_plain_up_stays_cleared() {
+        // AC4. The real state chain: a clear writes `""` into the release, and
+        // the next plain `cluster up` reads that record back. If an empty record
+        // preserved as a value the clear would be one-shot; if it were treated as
+        // a credential the operator would see it re-applied.
+        assert_eq!(
+            resolve_github_token(
+                Some(&serde_json::json!({"api": {"githubToken": GH_SENTINEL}})),
+                &[],
+                None,
+                true
+            ),
+            GithubTokenPlan::Clear
+        );
+        assert_eq!(
+            resolve_github_token(
+                Some(&serde_json::json!({"api": {"githubToken": ""}})),
+                &[],
+                None,
+                false
+            ),
+            GithubTokenPlan::Untouched
+        );
+    }
+
+    #[test]
+    fn empty_value_preserves_and_never_clears() {
+        // AC4 negative, the destructive-ambiguity pin. `export
+        // CURIE_GITHUB_TOKEN="$UNSET_VAR"` is a routine shell accident and clap
+        // hands an exported-but-empty variable through as `Some("")`, not `None`.
+        // An ambiguous signal must never trigger the sticky destructive state:
+        // destroying a live credential requires the unambiguous
+        // `--clear-github-token`.
+        let existing = serde_json::json!({"api": {"githubToken": "ghp-recorded"}});
+        assert_eq!(
+            resolve_github_token(Some(&existing), &[], Some(""), false),
+            GithubTokenPlan::Set("ghp-recorded".to_string())
+        );
+        // With nothing recorded an empty value is simply absence, not a clear.
+        assert_eq!(
+            resolve_github_token(None, &[], Some(""), false),
+            GithubTokenPlan::Untouched
+        );
+    }
+
+    #[test]
+    fn set_passthrough_leaves_the_key_to_the_operator() {
+        // AC4. A key the operator pinned through `--set` is theirs to own, and
+        // the CLI supplies nothing for it -- matching
+        // `operator_set_secret_is_left_to_the_operator`. (Passing BOTH is
+        // rejected earlier by `check_github_token_conflict`.)
+        let existing = serde_json::json!({"api": {"githubToken": "ghp-recorded"}});
+        assert_eq!(
+            resolve_github_token(
+                Some(&existing),
+                &["api.githubToken=ghp-operator".to_string()],
+                None,
+                false
+            ),
+            GithubTokenPlan::Untouched
+        );
+    }
+
+    #[test]
+    fn lone_set_passthrough_leak_is_detected() {
+        // AC2's one mitigation on the surviving leak path. A lone `--set
+        // api.githubToken=<value>` stays legal (the pass-through is verbatim by
+        // design and breaking it would break existing operators), but it lands
+        // the complete token in the process table, shell history and the printed
+        // plan, so `up` steers the operator to the private input.
+        //
+        // Named for DETECTION, not for the warning: this pins the predicate
+        // `up()` gates that `ui.warn` on, and nothing more. The `ui.warn` call
+        // site itself is unguarded -- deleting it leaves this green -- because
+        // `crate::ui::ui()` is a process-global `OnceLock<Ui>` writing straight
+        // to `anstream::stderr()` with no capture seam, and the warning lives
+        // inside async `up()` behind a live `helm get values`. Covering the call
+        // site needs either a `Ui` capture seam or the note/warn set lifted into
+        // a pure function returning the lines, both production changes.
+        assert!(set_passthrough_leaks_github_token(&[
+            "api.githubToken=ghp-operator".to_string()
+        ]));
+        // The comma-joined form helm also accepts leaks identically.
+        assert!(set_passthrough_leaks_github_token(&[
+            "worker.replicas=2,api.githubToken=ghp-operator".to_string()
+        ]));
+        // An empty assignment is the operator clearing the key by hand. Nothing
+        // leaks, so warning about it would be noise on a correct command.
+        assert!(!set_passthrough_leaks_github_token(&[
+            "api.githubToken=".to_string()
+        ]));
+        // And an unrelated `--set` must stay silent.
+        assert!(!set_passthrough_leaks_github_token(&[
+            "worker.replicas=2".to_string()
+        ]));
+        assert!(!set_passthrough_leaks_github_token(&[]));
+    }
+
+    #[test]
+    fn set_passthrough_shell_noise_still_leaks_but_a_respaced_key_is_a_different_key() {
+        // The whitespace contract on the `--set` grammar, which decides both
+        // which invocations warn AND (through the same
+        // `operator_set_entries` parse) which ones
+        // `check_github_token_conflict` rejects.
+        //
+        // The two trims are asymmetric ON PURPOSE, and this test exists so a
+        // future reader does not "clean it up" into symmetry: the pair
+        // reproduces, exactly, the behavior of the two hand-rolled parsers the
+        // shared `operator_set_entries` replaced. Whitespace AROUND an
+        // assignment is shell noise -- `--set " api.githubToken=ghp-x "` is the
+        // same command an operator meant to type, and the token leaks either
+        // way -- while whitespace INSIDE the key is not noise: helm reads
+        // `api.githubToken ` as a differently-named value that this credential
+        // does not ride on, so there is nothing to warn about.
+
+        // Leading noise on the key is stripped: the token still leaks.
+        assert!(set_passthrough_leaks_github_token(&[
+            " api.githubToken=ghp-x".to_string()
+        ]));
+        // Noise on BOTH ends of the assignment, the shape a real shell produces.
+        assert!(set_passthrough_leaks_github_token(&[
+            " api.githubToken=ghp-x ".to_string()
+        ]));
+        // Trailing noise on a non-empty value does not make it empty: still a leak.
+        assert!(set_passthrough_leaks_github_token(&[
+            "api.githubToken=ghp-x   ".to_string()
+        ]));
+        // Whitespace BEFORE the `=` names a different helm key. Nothing this
+        // credential rides on is being set, so nothing leaks. This is the case
+        // that dies if the key's `trim_start` is widened to a `trim`.
+        assert!(!set_passthrough_leaks_github_token(&[
+            "api.githubToken =ghp-x".to_string()
+        ]));
+        // A whitespace-only value is an empty assignment, not a credential.
+        assert!(!set_passthrough_leaks_github_token(&[
+            "api.githubToken=   ".to_string()
+        ]));
+
+        // The sibling reader trims the key SYMMETRICALLY
+        // (`operator_set_keys`), so `api.githubToken =x` is a key the CLI leaves
+        // to the operator and a value the conflict guard rejects, even though it
+        // raises no leak warning. Recorded here so the divergence between the two
+        // consumers of one parse is deliberate rather than discovered later.
+        assert!(
+            operator_set_keys(&["api.githubToken =ghp-x".to_string()]).contains(GITHUB_TOKEN_KEY)
+        );
+        assert!(
+            check_github_token_conflict(
+                Some(GH_SENTINEL),
+                false,
+                &["api.githubToken =ghp-x".to_string()]
+            )
+            .is_err(),
+            "the conflict guard matches the key trimmed on both ends"
+        );
     }
 }

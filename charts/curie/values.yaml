@@ -455,6 +455,14 @@ api:
   # Scope it to reading the bundle repositories this install deploys; a
   # fine-grained PAT or a GitHub App installation token is preferable to a
   # personal classic token, which carries the whole user's access.
+  #
+  # Prefer `curie cluster up` with CURIE_GITHUB_TOKEN set in the environment
+  # over a `--set` for this key: the CLI hands the value to helm through a
+  # private 0600 values file rather than as an argument, so the complete token
+  # stays out of the helm command line and the printed plan, and a later plain
+  # `cluster up` preserves it. The `--github-token` flag takes that same path
+  # to helm, but a token typed on the command line is still in curie's own
+  # argv, so it does reach your shell history and the process table.
   githubToken: ""
   # The one git origin the API clones from for git-flow. A pushed repository
   # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`

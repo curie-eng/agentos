@@ -20,6 +20,13 @@
 # container and holds its env names to the generated key export; Assertion 7 is
 # the negative control proving Assertion 6 can fail.
 #
+# Issue #1109/#1124 (the API's outbound GitHub credential), Assertion 11 and its
+# negative control. api.githubToken is the one OPTIONAL credential in the
+# Secret, so it is a deliberate plain pass-through rather than a
+# curie.managedSecret: empty must render empty ("no GitHub credential, public
+# repos only") and an explicit value must render verbatim. The negative control
+# routes it through the generating helper and requires the assert to fire.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -500,5 +507,77 @@ python3 "$NP_CHECK" "$NP_OFF_OUT" "absent" \
   || fail "with security.networkPolicy.enabled=false (Rail 1 off), spec.networkPolicyManagement should be left unset (default Managed) so the controller's own baseline policy still applies, but it was set."
 echo "  ok: with Rail 1 off, networkPolicyManagement is left unset (falls back to the controller's own Managed default rather than nothing)"
 
+echo "=== Assertion 11: api.githubToken is passed through, never generated (#1109, #1124) ==="
+# The one OPTIONAL credential in this Secret. curie.managedSecret GENERATES when
+# the value equals its default, which for an optional token means 32 characters
+# of noise sent to GitHub as a bearer token, failing auth in a way that reads
+# like a permissions problem rather than a missing credential (#1109 shipped that
+# and reverted it). Empty must stay EMPTY -- empty means "no GitHub credential,
+# public repos only" -- and an explicit value must render verbatim on the sealed
+# path, which is what makes `curie cluster up --github-token` reach the API pod.
+#
+# Returns nonzero rather than exiting, so the negative control below can assert
+# the failure. Same shape as check_runner_env for Assertions 6/7, except it
+# takes an ALREADY-RENDERED Secret rather than a chart dir: the sealed render is
+# the one captured once at the top of this script and shared with Assertions 1
+# and 2, so only the negative control (a mutated chart copy) renders its own.
+check_github_token_empty() {
+  # $1 = rendered secrets.yaml, $2 = label
+  local out="$1" label="$2" got
+  if ! got="$(read_key "$out" githubToken)"; then
+    echo "githubToken is missing from the rendered Secret entirely; the pass-through assert would be vacuous." >&2
+    return 1
+  fi
+  if [[ -n "$got" ]]; then
+    echo "sealed render must leave githubToken EMPTY (empty means 'no GitHub credential, public repos only'); got '${got}' -- api.githubToken has been routed through a generating helper (#1109 regression)." >&2
+    return 1
+  fi
+  echo "  ok: $label leaves githubToken empty (not generated)"
+}
+
+check_github_token_empty "$SEALED" "sealed render" \
+  || fail "sealed render does not leave api.githubToken empty; see the message above."
+
+GHT="$TMP/githubtoken.yaml"
+SENTINEL="ghp-render-sentinel-1124" # gitleaks:allow -- fake render sentinel, not a real token
+helm template "$CHART" --set api.githubToken="$SENTINEL" \
+  --show-only templates/secrets.yaml > "$GHT"
+got="$(read_key "$GHT" githubToken)"
+if [[ "$got" != "$SENTINEL" ]]; then
+  fail "an explicit api.githubToken must render verbatim; expected '$SENTINEL', got '$got'."
+fi
+echo "  ok: explicit githubToken renders verbatim"
+
+for key in "${KEYS[@]}"; do
+  [[ "$key" == "githubToken" ]] && fail "githubToken must NOT be in KEYS: that list asserts a value is GENERATED on the sealed path, which is the exact #1109 regression."
+done
+echo "  ok: githubToken is not in the generated-key list"
+
+echo "=== Assertion 11 negative control: routing githubToken through curie.managedSecret FAILS ==="
+# Mandatory, per Assertion 7's convention: an assert that has never been shown
+# failing is not a pin, and the three checks above all pass at base. Mutate a
+# TEMP COPY of the chart (never the real template) into exactly the #1109
+# regression and require the check to reject it, naming the key.
+GHT_MUTANT="$TMP/mutant-githubtoken"
+cp -a "$CHART" "$GHT_MUTANT"
+python3 - "$GHT_MUTANT/templates/secrets.yaml" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+old = '  githubToken: {{ .Values.api.githubToken | default "" | quote }}'
+new = ('  githubToken: {{ include "curie.managedSecret" (dict "root" . "key" "githubToken" '
+       '"value" .Values.api.githubToken "default" "" "hex" false "existingData" $existingSecret) | quote }}')
+if old not in text:
+    sys.stderr.write(f"negative control could not find {old!r} to mutate\n")
+    sys.exit(1)
+p.write_text(text.replace(old, new, 1))
+PYEOF
+GHT_MUTANT_RENDER="$TMP/mutant-githubtoken.yaml"
+helm template "$GHT_MUTANT" --show-only templates/secrets.yaml > "$GHT_MUTANT_RENDER"
+if check_github_token_empty "$GHT_MUTANT_RENDER" "mutant (githubToken via curie.managedSecret)" 2>&1; then
+  fail "negative control did not fire: githubToken routed through curie.managedSecret still rendered empty, so Assertion 11 is not actually pinning anything."
+fi
+echo "  ok: a generated githubToken is rejected (the assert can fail)"
+
 echo
-echo "PASS: sealed render generates strong values for all 9 keys (encryptionKey 64-hex); dev overlay keeps published defaults; explicit override wins on the sealed path; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off."
+echo "PASS: sealed render generates strong values for all 9 keys (encryptionKey 64-hex); dev overlay keeps published defaults; explicit override wins on the sealed path; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; and api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control."

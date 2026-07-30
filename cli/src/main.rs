@@ -1139,6 +1139,26 @@ enum ClusterAction {
         /// fully sealed.
         #[arg(long = "allow-web-egress", value_name = "CIDR")]
         allow_web_egress: Vec<String>,
+        /// GitHub credential the API uses for the git-flow bundle clone and the
+        /// eval commit status, needed for private repositories. Passed to helm
+        /// through a private 0600 values file, not as an argument, so it stays
+        /// out of the helm command line and the printed plan. Supply it through
+        /// CURIE_GITHUB_TOKEN to also keep it out of your shell history and the
+        /// process table: a value typed after this flag is in curie's own argv.
+        /// Omit it and a later cluster up preserves whatever was recorded.
+        #[arg(
+            long = "github-token",
+            value_name = "TOKEN",
+            env = "CURIE_GITHUB_TOKEN",
+            hide_env_values = true,
+            conflicts_with = "clear_github_token"
+        )]
+        github_token: Option<String>,
+        /// Remove the recorded GitHub credential from the release. An empty
+        /// --github-token does NOT clear it; this flag is the only way, so an
+        /// empty environment variable cannot destroy a working credential.
+        #[arg(long = "clear-github-token")]
+        clear_github_token: bool,
         /// Extra `--set KEY=VAL` passed through to helm verbatim (repeatable).
         #[arg(long = "set", value_name = "KEY=VAL")]
         set: Vec<String>,
@@ -2185,6 +2205,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 local_model,
                 allow_egress_host,
                 allow_web_egress,
+                github_token,
+                clear_github_token,
                 set,
                 dev,
                 dry_run,
@@ -2203,33 +2225,41 @@ async fn run(command: Option<Command>) -> Result<()> {
                     ops::resolve_up_credentials(fake_model, ops::model_credential_env())
                 };
                 emit(
-                    ops::up(UpOpts {
-                        common: CommonOpts {
-                            namespace,
-                            release,
-                            dry_run,
+                    ops::up(
+                        UpOpts {
+                            common: CommonOpts {
+                                namespace,
+                                release,
+                                dry_run,
+                            },
+                            chart,
+                            no_expose,
+                            set,
+                            allow_egress_host,
+                            // Populated by ops::up (resolve named providers to host
+                            // routes on a live run); empty here so the pure builder and
+                            // --dry-run start clean.
+                            resolved_egress_cidrs: vec![],
+                            allow_web_egress,
+                            fake_model,
+                            credentials,
+                            local_model,
+                            // Default `agentSandbox.runner.model` from the shell
+                            // `CURIE_MODEL` (None when unset/empty) for cross-tier
+                            // parity with `local up` (#361).
+                            model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
+                            // Populated by ops::up (generate on fresh install / reuse on
+                            // upgrade); empty here so the pure builder starts clean.
+                            secrets: vec![],
+                            // Resolved by ops::up from the flags below plus the
+                            // value the release already recorded; Untouched here so
+                            // the pure builder starts clean.
+                            github_token: ops::GithubTokenPlan::Untouched,
+                            dev,
                         },
-                        chart,
-                        no_expose,
-                        set,
-                        allow_egress_host,
-                        // Populated by ops::up (resolve named providers to host
-                        // routes on a live run); empty here so the pure builder and
-                        // --dry-run start clean.
-                        resolved_egress_cidrs: vec![],
-                        allow_web_egress,
-                        fake_model,
-                        credentials,
-                        local_model,
-                        // Default `agentSandbox.runner.model` from the shell
-                        // `CURIE_MODEL` (None when unset/empty) for cross-tier
-                        // parity with `local up` (#361).
-                        model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
-                        // Populated by ops::up (generate on fresh install / reuse on
-                        // upgrade); empty here so the pure builder starts clean.
-                        secrets: vec![],
-                        dev,
-                    })
+                        github_token,
+                        clear_github_token,
+                    )
                     .await?,
                 )
             }
@@ -2863,6 +2893,127 @@ mod tests {
             "u",
         ])
         .expect("skill approvals --resolve --as should parse");
+    }
+
+    /// Serializes the two `cluster up` GitHub-credential cases below.
+    ///
+    /// `cluster_up_clap_accepts_the_token_from_the_environment_only` has to arm
+    /// the input through `CURIE_GITHUB_TOKEN` alone, and clap reads an `env =`
+    /// binding from the PROCESS environment at parse time, with no injection
+    /// seam, so the variable is set on this process and restored afterwards.
+    ///
+    /// What this lock DOES guarantee, precisely: the two tests that take it
+    /// never run concurrently, so neither observes the other's mutation and
+    /// neither leaves `CURIE_GITHUB_TOKEN` behind.
+    ///
+    /// What it does NOT guarantee: `setenv` is not thread-safe against a
+    /// concurrent `getenv` from a thread that does not take this lock, and cargo
+    /// runs this binary's tests in parallel. Other tests call `std::env::var`
+    /// and `std::env::temp_dir()` (which reads `TMPDIR`) while these two mutate
+    /// the environment. That is a latent data race, not a race this `Mutex` can
+    /// close -- it is exactly why Rust 2024 made `std::env::set_var` `unsafe`;
+    /// this crate is `edition = "2021"`, so it compiles. The precedent already
+    /// in the tree is `cli/src/slack.rs`. The real fix is a clap-level
+    /// injection seam (parsing from an explicit env source rather than the
+    /// process environment), which is a production change.
+    static GITHUB_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A failing assertion panics while holding the lock, which poisons it. The
+    /// data is `()`, so there is nothing to corrupt: recover the guard rather
+    /// than let the first red case cascade into bogus `PoisonError` failures.
+    fn github_token_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        GITHUB_TOKEN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn cluster_up_clap_accepts_the_token_from_the_environment_only() {
+        // #1124 AC1, armed through the SECONDARY path: the environment variable
+        // alone, never the command line. The env var is the input that keeps the
+        // credential out of shell history, so it has to work with no flag
+        // present. `Option<String>` with no `default_value` is what makes
+        // "absent" distinguishable from "empty"; an empty variable is covered by
+        // the resolver's `empty_value_preserves_and_never_clears`.
+        //
+        // The name is CURIE_GITHUB_TOKEN, never GITHUB_TOKEN: the latter is
+        // exported in the shells of most people who use `gh` and in most CI
+        // runners, so binding to it would silently capture a personal PAT into a
+        // persistent cluster Secret (#496 canonicalized the CURIE_ namespace).
+        let _guard = github_token_env_lock();
+        let previous = std::env::var("CURIE_GITHUB_TOKEN").ok();
+
+        std::env::set_var("CURIE_GITHUB_TOKEN", "ghp-SENTINEL-1124-leak-canary"); // gitleaks:allow -- test leak canary, not a real token
+        let from_env = Cli::try_parse_from(["curie", "cluster", "up"])
+            .expect("cluster up should parse with only the env var set");
+        std::env::remove_var("CURIE_GITHUB_TOKEN");
+        let without = Cli::try_parse_from(["curie", "cluster", "up"])
+            .expect("cluster up should parse with nothing set");
+        match previous {
+            Some(value) => std::env::set_var("CURIE_GITHUB_TOKEN", value),
+            None => std::env::remove_var("CURIE_GITHUB_TOKEN"),
+        }
+
+        match from_env.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Up { github_token, .. },
+            }) => assert_eq!(
+                github_token.as_deref(),
+                Some("ghp-SENTINEL-1124-leak-canary")
+            ),
+            _ => panic!("expected cluster up"),
+        }
+        match without.command {
+            Some(Command::Cluster {
+                action: ClusterAction::Up { github_token, .. },
+            }) => assert_eq!(
+                github_token, None,
+                "an unset variable must be absence, not an empty credential"
+            ),
+            _ => panic!("expected cluster up"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_flag_and_clear_together() {
+        // #1124 AC4, armed through the PARSER rather than the resolver: the
+        // fourth, invalid state (set and clear at once) never reaches
+        // `resolve_github_token` at all. This also catches `conflicts_with`
+        // naming clap's arg ID wrongly -- a spelling like "clear-github-token"
+        // compiles and then panics at runtime on the first parse.
+        let _guard = github_token_env_lock();
+        let previous = std::env::var("CURIE_GITHUB_TOKEN").ok();
+        std::env::remove_var("CURIE_GITHUB_TOKEN");
+
+        let both = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "up",
+            "--github-token",
+            "ghp-SENTINEL-1124-leak-canary",
+            "--clear-github-token",
+        ]);
+        // Each alone still parses, so the rejection is the conflict and not a
+        // broken flag.
+        let set_only = Cli::try_parse_from([
+            "curie",
+            "cluster",
+            "up",
+            "--github-token",
+            "ghp-SENTINEL-1124-leak-canary",
+        ]);
+        let clear_only = Cli::try_parse_from(["curie", "cluster", "up", "--clear-github-token"]);
+
+        if let Some(value) = previous {
+            std::env::set_var("CURIE_GITHUB_TOKEN", value);
+        }
+
+        assert!(
+            both.is_err(),
+            "--github-token with --clear-github-token must be a clap conflict"
+        );
+        assert!(set_only.is_ok(), "--github-token alone must parse");
+        assert!(clear_only.is_ok(), "--clear-github-token alone must parse");
     }
 
     #[test]
