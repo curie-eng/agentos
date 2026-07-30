@@ -240,8 +240,17 @@ async def read_version_connectors(
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, "no bundle stored for this version"
         )
+    # Object names are scoped to the agent, not just the release (#1116). Curie
+    # runs many agents per release, so a release-scoped name lets two agents
+    # that each declare `grafana` overwrite one another's Deployment, Service,
+    # and credential with no error. The agent NAME (not the id) is used so the
+    # objects stay recognisable in `kubectl get`.
+    agent = await crud.get_agent(session, agent_id)
+    if agent is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     data = await store.get(version.bundle_ref)
     settings = get_settings()
+    agent_name = agent.name
 
     def _render() -> ConnectorManifests:
         with tempfile.TemporaryDirectory() as tmp:
@@ -253,17 +262,20 @@ async def read_version_connectors(
                 max_members=settings.bundle_max_members,
             )
             declared = bundles.read_connectors(Path(tmp))
-            secret_name = f"{release}-connector-secrets"
+            # Per-agent too: a release-scoped Secret means deploying the prod
+            # agent overwrites the dev agent's token in place (#1116).
+            secret_name = f"{release}-{agent_name}-connector-secrets"
             return ConnectorManifests(
                 manifests=bundles.render_connector_manifests(
                     declared,
                     release=release,
+                    agent=agent_name,
                     namespace=namespace,
                     app_name=app_name,
                     secret_name=secret_name,
                 ),
                 mcp_entries=bundles.connector_mcp_entries(
-                    declared, release=release, namespace=namespace
+                    declared, release=release, agent=agent_name, namespace=namespace
                 ),
             )
 

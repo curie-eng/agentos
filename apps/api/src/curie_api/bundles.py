@@ -117,6 +117,7 @@ def render_connector_manifests(
     connectors: ConnectorsFile,
     *,
     release: str,
+    agent: str,
     namespace: str,
     app_name: str,
     secret_name: str,
@@ -134,13 +135,13 @@ def render_connector_manifests(
     objects: list[dict[str, Any]] = []
     for name, spec in sorted(connectors.connectors.items()):
         objects.extend(
-            connector_render.render(release, namespace, app_name, name, spec, secret_name)
+            connector_render.render(release, agent, namespace, app_name, name, spec, secret_name)
         )
     return objects
 
 
 def connector_mcp_entries(
-    connectors: ConnectorsFile, *, release: str, namespace: str
+    connectors: ConnectorsFile, *, release: str, agent: str, namespace: str
 ) -> dict[str, Any]:
     """The `.mcp.json` entries for declared connectors, keyed by name.
 
@@ -149,7 +150,7 @@ def connector_mcp_entries(
     """
 
     return {
-        name: connector_render.mcp_entry(release, namespace, name, spec)
+        name: connector_render.mcp_entry(release, agent, namespace, name, spec)
         for name, spec in sorted(connectors.connectors.items())
     }
 

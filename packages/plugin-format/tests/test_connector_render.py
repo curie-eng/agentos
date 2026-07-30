@@ -26,7 +26,7 @@ REMOTE = ConnectorSpec(url="https://mcp.internal/mcp", headers={"Authorization":
 
 
 def _objs(release: str = "sre-bot", app: str = "sre-bot") -> list[dict]:
-    return r.render(release, "sre-bot", app, "grafana", HOSTED, "conn-secrets")
+    return r.render(release, "sre-bot", "sre-bot", app, "grafana", HOSTED, "conn-secrets")
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +51,7 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
     # to every OTHER release's sandboxes in the namespace. Both fail silently.
     np = next(
         o
-        for o in r.render("relA", "ns", "sre-bot", "g", HOSTED, "s")
+        for o in r.render("relA", "a", "ns", "sre-bot", "g", HOSTED, "s")
         if o["kind"] == "NetworkPolicy"
     )
     assert np["spec"]["podSelector"]["matchLabels"] == {
@@ -63,10 +63,14 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
 
 def test_two_releases_do_not_select_each_others_sandboxes() -> None:
     a = next(
-        o for o in r.render("relA", "ns", "app", "g", HOSTED, "s") if o["kind"] == "NetworkPolicy"
+        o
+        for o in r.render("relA", "a", "ns", "app", "g", HOSTED, "s")
+        if o["kind"] == "NetworkPolicy"
     )
     b = next(
-        o for o in r.render("relB", "ns", "app", "g", HOSTED, "s") if o["kind"] == "NetworkPolicy"
+        o
+        for o in r.render("relB", "a", "ns", "app", "g", HOSTED, "s")
+        if o["kind"] == "NetworkPolicy"
     )
     assert a["spec"]["podSelector"] != b["spec"]["podSelector"]
 
@@ -79,17 +83,17 @@ def test_host_aliases_cover_every_name_the_sandbox_could_dial() -> None:
     # loopback, so an in-cluster caller reaching them by Service DNS gets
     # `forbidden: host not allowed`. Curie named the Service, so Curie can
     # supply the full set; an author would have to guess it.
-    aliases = r.host_aliases("sre-bot", "grafana", "ns", 8000)
-    assert "sre-bot-mcp-grafana:8000" in aliases
-    assert "sre-bot-mcp-grafana.ns:8000" in aliases
-    assert "sre-bot-mcp-grafana.ns.svc.cluster.local:8000" in aliases
+    aliases = r.host_aliases("sre-bot", "a", "grafana", "ns", 8000)
+    assert "sre-bot-a-mcp-grafana:8000" in aliases
+    assert "sre-bot-a-mcp-grafana.ns:8000" in aliases
+    assert "sre-bot-a-mcp-grafana.ns.svc.cluster.local:8000" in aliases
 
 
 def test_injected_url_matches_the_service_that_was_rendered() -> None:
     # Hand-writing this URL is how a bundle ends up with an address that does
     # not resolve in the tier it is deployed to.
     svc = next(o for o in _objs() if o["kind"] == "Service")
-    url = r.mcp_entry("sre-bot", "sre-bot", "grafana", HOSTED)["url"]
+    url = r.mcp_entry("sre-bot", "sre-bot", "sre-bot", "grafana", HOSTED)["url"]
     assert svc["metadata"]["name"] in url
     assert url.endswith("/mcp")
 
@@ -126,11 +130,11 @@ def test_plain_env_is_passed_through() -> None:
 # Remote connectors own no objects
 # --------------------------------------------------------------------------- #
 def test_remote_connector_renders_nothing_to_run() -> None:
-    assert r.render("sre-bot", "ns", "app", "internal", REMOTE, "s") == []
+    assert r.render("sre-bot", "a", "ns", "app", "internal", REMOTE, "s") == []
 
 
 def test_remote_connector_keeps_its_own_url_and_headers() -> None:
-    entry = r.mcp_entry("sre-bot", "ns", "internal", REMOTE)
+    entry = r.mcp_entry("sre-bot", "a", "ns", "internal", REMOTE)
     assert entry["url"] == "https://mcp.internal/mcp"
     assert entry["headers"]["Authorization"] == "Bearer ${T}"
 
@@ -166,3 +170,63 @@ def test_selector_matches_what_the_chart_actually_renders() -> None:
             chart_selector = doc["spec"]["podSelector"]["matchLabels"]
     assert chart_selector, "could not find Rail 1's default-deny egress policy"
     assert r.sandbox_selector("myrel", "sre-bot") == chart_selector
+
+
+# --------------------------------------------------------------------------- #
+# Cross-AGENT collision -- #1116
+# --------------------------------------------------------------------------- #
+DEV = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", env={"GRAFANA_URL": "https://dev.g"})
+PROD = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", env={"GRAFANA_URL": "https://prod.g"})
+
+
+def test_two_agents_in_one_release_do_not_share_object_names() -> None:
+    # Curie runs many agents per release. Release-scoped names meant sre-dev and
+    # sre-prod both rendered `curie-mcp-grafana`, so deploying prod silently
+    # repointed the DEV agent at the prod endpoint -- and, because the Secret was
+    # release-scoped too, handed it the prod token. Nothing errored.
+    dev = [
+        o["metadata"]["name"]
+        for o in r.render("curie", "sre-dev", "ns", "curie", "grafana", DEV, "s")
+    ]
+    prod = [
+        o["metadata"]["name"]
+        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+    ]
+    assert not set(dev) & set(prod), f"agents share object names: {dev} vs {prod}"
+
+
+def test_two_agents_do_not_share_pod_labels() -> None:
+    # The Service selector is these labels. Sharing them would route one agent's
+    # traffic to the other's pods even with distinct object names.
+    dev = next(
+        o
+        for o in r.render("curie", "sre-dev", "ns", "curie", "grafana", DEV, "s")
+        if o["kind"] == "Service"
+    )
+    prod = next(
+        o
+        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+        if o["kind"] == "Service"
+    )
+    assert dev["spec"]["selector"] != prod["spec"]["selector"]
+
+
+def test_each_agent_gets_its_own_url() -> None:
+    dev = r.mcp_entry("curie", "sre-dev", "ns", "grafana", DEV)["url"]
+    prod = r.mcp_entry("curie", "sre-prod", "ns", "grafana", PROD)["url"]
+    assert dev != prod
+
+
+def test_over_long_names_stay_valid_dns_labels() -> None:
+    name = r.object_name("a" * 30, "b" * 30, "c" * 40)
+    assert len(name) <= 63
+    assert name[0].isalnum() and name[-1].isalnum()
+
+
+def test_over_long_names_that_share_a_prefix_still_differ() -> None:
+    # Clipping alone would map these onto one object, reintroducing the very
+    # collision the agent scoping exists to prevent.
+    a = r.object_name("release", "agent-with-a-very-long-name-number-one", "grafana")
+    b = r.object_name("release", "agent-with-a-very-long-name-number-two", "grafana")
+    assert len(a) <= 63 and len(b) <= 63
+    assert a != b

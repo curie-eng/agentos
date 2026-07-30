@@ -41,13 +41,14 @@ HOSTED = (
 )
 
 
-def _render(root: Path) -> list[dict]:
+def _render(root: Path, agent: str = "sre-bot") -> list[dict]:
     return bundles.render_connector_manifests(
         bundles.read_connectors(root),
         release="sre-bot",
+        agent=agent,
         namespace="sre-bot",
         app_name="sre-bot",
-        secret_name="sre-bot-connectors",
+        secret_name=f"sre-bot-{agent}-connectors",
     )
 
 
@@ -83,7 +84,7 @@ def test_secret_is_referenced_not_inlined(tmp_path: Path) -> None:
     dep = next(o for o in _render(_bundle(tmp_path, HOSTED)) if o["kind"] == "Deployment")
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
     token = next(e for e in env if e["name"] == "GRAFANA_TOKEN")
-    assert token["valueFrom"]["secretKeyRef"]["name"] == "sre-bot-connectors"
+    assert token["valueFrom"]["secretKeyRef"]["name"] == "sre-bot-sre-bot-connectors"
     assert "value" not in token
 
 
@@ -98,7 +99,7 @@ def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
     root = _bundle(tmp_path, HOSTED)
     svc = next(o for o in _render(root) if o["kind"] == "Service")
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="sre-bot", namespace="sre-bot"
+        bundles.read_connectors(root), release="sre-bot", agent="sre-bot", namespace="sre-bot"
     )
     assert svc["metadata"]["name"] in entries["grafana"]["url"]
 
@@ -107,6 +108,16 @@ def test_remote_connector_contributes_an_entry_but_no_objects(tmp_path: Path) ->
     root = _bundle(tmp_path, "connectors:\n  x:\n    url: https://mcp.internal/mcp\n")
     assert _render(root) == []
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="sre-bot", namespace="sre-bot"
+        bundles.read_connectors(root), release="sre-bot", agent="sre-bot", namespace="sre-bot"
     )
     assert entries["x"]["url"] == "https://mcp.internal/mcp"
+
+
+def test_two_agents_sharing_a_release_render_distinct_objects(tmp_path: Path) -> None:
+    # The deploy path's half of #1116: same bundle, same release, two agents.
+    # Release-scoped naming made these identical, so deploying one silently
+    # overwrote the other's Deployment and credential.
+    root = _bundle(tmp_path, HOSTED)
+    dev = {o["metadata"]["name"] for o in _render(root, agent="sre-dev")}
+    prod = {o["metadata"]["name"] for o in _render(root, agent="sre-prod")}
+    assert not dev & prod, f"agents collide: {dev} vs {prod}"
