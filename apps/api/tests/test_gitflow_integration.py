@@ -3,6 +3,12 @@
 No github.com and no network: the "remote" is a local bare repository and the
 webhook payloads are HMAC-signed exactly as GitHub signs them. This exercises
 the real deploy/promote path (git archive -> validate -> store -> deploy row).
+
+The bare repositories live under a per-test `file://` clone base laid out as
+`<base>/<owner>/<name>.git`, and `GITHUB_CLONE_BASE` points at that base, so the
+URL git is handed is the derived origin the production code computes -- the same
+way a GitHub Enterprise operator points the setting at their own host. Nothing
+here is a test-only code branch.
 """
 
 import asyncio
@@ -12,9 +18,11 @@ import json
 import os
 import subprocess
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
 from curie_api import crud
 from curie_api.config import get_settings
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -27,6 +35,27 @@ VALID_FILES = {
     "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: does alpha\n---\n",
     "skills/beta/SKILL.md": "---\nname: beta\ndescription: does beta\n---\n",
 }
+
+
+@pytest.fixture
+def trusted_clone_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[Path]:
+    """Point `GITHUB_CLONE_BASE` at a per-test `file://` base and yield it.
+
+    `routers/github.py` calls `get_settings()` per request rather than through a
+    cached dependency, so the app does not need rebuilding. The clear-AFTER-undo
+    ordering at teardown is load-bearing: clearing first would let the still-set
+    env value be re-cached and leak into a later test.
+    """
+
+    base = tmp_path / "remotes"
+    base.mkdir()
+    monkeypatch.setenv("GITHUB_CLONE_BASE", f"file://{base}")
+    get_settings.cache_clear()
+    yield base
+    monkeypatch.undo()
+    get_settings.cache_clear()
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -48,11 +77,18 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return out.stdout.strip()
 
 
-def _build_bare_repo(tmp_path: Path, files: dict[str, str]) -> tuple[str, str]:
-    """Create a local bare repo with `files` committed on dev. Returns (url, sha)."""
+def _build_bare_repo(
+    base_dir: Path, repo_full_name: str, files: dict[str, str]
+) -> tuple[str, str]:
+    """Create a bare repo at `<base_dir>/<repo_full_name>.git`. Returns (url, sha).
 
-    work = tmp_path / "work"
-    work.mkdir()
+    The returned URL is byte-identical to the origin the API derives from
+    `GITHUB_CLONE_BASE` plus the agent's stored `repo_full_name`, so these tests
+    exercise the derivation instead of bypassing it.
+    """
+
+    work = base_dir / "_work" / repo_full_name
+    work.mkdir(parents=True)
     _git("init", "-q", "-b", "dev", cwd=work)
     for rel, content in files.items():
         path = work / rel
@@ -61,7 +97,8 @@ def _build_bare_repo(tmp_path: Path, files: dict[str, str]) -> tuple[str, str]:
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "init", cwd=work)
     sha = _git("rev-parse", "HEAD", cwd=work)
-    bare = tmp_path / "bare.git"
+    bare = base_dir / f"{repo_full_name}.git"
+    bare.parent.mkdir(parents=True, exist_ok=True)
     _git("clone", "--quiet", "--bare", str(work), str(bare))
     return f"file://{bare}", sha
 
@@ -127,10 +164,13 @@ def _register_agent(client: Any, headers: dict[str, str]) -> str:
 
 
 def test_dev_push_deploys_dev_bot(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent_id = _register_agent(client, auth_headers)
-    clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
 
     resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
     assert resp.status_code == 200, resp.text
@@ -160,10 +200,13 @@ def test_dev_push_deploys_dev_bot(
 
 
 def test_main_push_promotes_and_reuses_the_built_version(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent_id = _register_agent(client, auth_headers)
-    clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
 
     dev = _post(
         client, "push", _push_payload("refs/heads/dev", sha, clone_url)
@@ -187,10 +230,13 @@ def test_main_push_promotes_and_reuses_the_built_version(
 
 
 def test_partial_version_is_rebuilt_not_reused(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent_id = _register_agent(client, auth_headers)
-    clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
     _insert_partial_version(agent_id, sha)
 
     resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
@@ -230,20 +276,26 @@ def test_ping_event_pongs(
 
 
 def test_unknown_repo_is_ignored(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     # No agent registered for REPO.
-    clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
     resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
 
 
 def test_non_deploy_branch_is_ignored(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     _register_agent(client, auth_headers)
-    clone_url, sha = _build_bare_repo(tmp_path, VALID_FILES)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
     resp = _post(
         client, "push", _push_payload("refs/heads/feature-x", sha, clone_url)
     )
@@ -252,12 +304,15 @@ def test_non_deploy_branch_is_ignored(
 
 
 def test_malformed_bundle_push_is_rejected(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent_id = _register_agent(client, auth_headers)
     files = dict(VALID_FILES)
     files["skills/beta/SKILL.md"] = "# no frontmatter\n"
-    clone_url, sha = _build_bare_repo(tmp_path, files)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
 
     resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
     assert resp.status_code == 200
@@ -271,3 +326,112 @@ def test_malformed_bundle_push_is_rejected(
         "/deployments", params={"agent_id": agent_id}, headers=auth_headers
     ).json()
     assert deployments == []
+
+
+def test_signed_push_with_a_foreign_clone_url_is_rejected(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # The ticket's attack driven through the real consumer path: a correctly
+    # HMAC-signed push naming the registered repository, with an attacker's
+    # clone URL. A real bare repo exists at the trusted path and the same push
+    # deploys fine when the URL matches (test_dev_push_deploys_dev_bot), so the
+    # rejection here is the origin pin and nothing else.
+    agent_id = _register_agent(client, auth_headers)
+    _url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    resp = _post(
+        client,
+        "push",
+        _push_payload(
+            "refs/heads/dev", sha, f"https://evil.example/{REPO}.git"
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "rejected"
+    codes = {e["code"] for e in body["errors"]}
+    assert "git.origin_mismatch" in codes
+
+    # Nothing was built and nothing was deployed.
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get(
+            "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+        ).json()
+        == []
+    )
+
+
+def test_push_using_the_repository_url_fallback_still_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # `repository.url` is the rarely-executed sibling of `repository.clone_url`
+    # at gitflow.py:189. GitHub's push payload carries `clone_url` WITH the .git
+    # suffix and `url` WITHOUT it, so this arms the guard via the secondary path
+    # only and proves it agrees with the primary path (AGENTS.md parity-seam
+    # rule).
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    resp = _post(
+        client,
+        "push",
+        {
+            "ref": "refs/heads/dev",
+            "after": sha,
+            "repository": {
+                "full_name": REPO,
+                "url": clone_url.removesuffix(".git"),
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deployed"
+
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1
+
+
+def test_signed_push_with_a_foreign_url_fallback_is_rejected(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # The fallback must not be an unguarded back door: the same comparison
+    # applies whichever payload field supplied the URL.
+    agent_id = _register_agent(client, auth_headers)
+    _url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    resp = _post(
+        client,
+        "push",
+        {
+            "ref": "refs/heads/dev",
+            "after": sha,
+            "repository": {
+                "full_name": REPO,
+                "url": f"https://evil.example/{REPO}",
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert "git.origin_mismatch" in {e["code"] for e in body["errors"]}
+
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get(
+            "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+        ).json()
+        == []
+    )

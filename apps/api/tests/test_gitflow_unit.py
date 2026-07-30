@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 from curie_api.config import Settings
 from curie_api.gitflow import (
+    CloneOriginMismatch,
     GitFlowError,
     clone_and_archive,
     environment_for_ref,
@@ -19,7 +20,20 @@ from curie_api.models import Environment
 SECRET = "top-secret"
 _VALID_SHA1 = "a" * 40
 _VALID_SHA256 = "a" * 64
-_ALLOWED_URL = "file:///tmp/nonexistent-gitflow-repo"
+# The repository binding these tests are pinned to, and a clone base whose
+# derived origin is `_ALLOWED_URL`. Every call site supplies `repo_full_name`,
+# because the trusted origin is derived from the stored binding plus config and
+# the payload's clone URL is only ever compared against it (#1122).
+_REPO = "octo/demo-agent"
+_LOCAL_BASE = "file:///tmp/gitflow-none"
+_ALLOWED_URL = f"{_LOCAL_BASE}/{_REPO}.git"
+_GITHUB_URL = f"https://github.com/{_REPO}.git"
+
+
+def _local_settings() -> Settings:
+    """Settings whose derived origin for `_REPO` is exactly `_ALLOWED_URL`."""
+
+    return Settings(github_clone_base=_LOCAL_BASE)
 
 
 def _sign(body: bytes) -> str:
@@ -59,10 +73,16 @@ def test_environment_for_ref_requires_exact_head_ref() -> None:
 
 def test_clone_and_archive_refuses_disallowed_scheme() -> None:
     # ext:: is git's arbitrary-command transport; it must be refused before any
-    # subprocess runs, regardless of the allowlist.
-    settings = Settings()
-    with pytest.raises(GitFlowError):
-        clone_and_archive("ext::sh -c whoami", "0" * 40, settings)
+    # subprocess runs, regardless of the allowlist. The scheme allowlist runs
+    # BEFORE the origin comparator, so this must still fail on the scheme --
+    # asserting the error is not a CloneOriginMismatch pins that ordering.
+    settings = _local_settings()
+    with pytest.raises(GitFlowError) as err:
+        clone_and_archive(
+            "ext::sh -c whoami", "0" * 40, settings, repo_full_name=_REPO
+        )
+    assert not isinstance(err.value, CloneOriginMismatch)
+    assert "scheme" in str(err.value)
 
 
 @pytest.mark.parametrize(
@@ -89,10 +109,12 @@ def test_clone_and_archive_rejects_invalid_sha_before_any_subprocess(
 ) -> None:
     # An invalid ref must be refused by the format gate BEFORE git ever runs, so
     # a leading-dash sha can never reach `git archive` as an injected option.
-    settings = Settings()
+    # The clone URL here matches the derived origin, so the sha gate is provably
+    # what rejects, not the origin comparator.
+    settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(GitFlowError):
-            clone_and_archive(_ALLOWED_URL, bad_sha, settings)
+            clone_and_archive(_ALLOWED_URL, bad_sha, settings, repo_full_name=_REPO)
     run.assert_not_called()
 
 
@@ -107,10 +129,12 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     # A full lowercase-hex SHA-1 or SHA-256 passes the format gate, and the
     # `git archive` argv must place a `--` separator immediately before the sha
     # so a value can never be parsed as a git option.
-    settings = Settings()
+    settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(_ALLOWED_URL, good_sha, settings)
+        result = clone_and_archive(
+            _ALLOWED_URL, good_sha, settings, repo_full_name=_REPO
+        )
 
     assert result == b"tar-bytes"
 
@@ -121,47 +145,328 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     assert archive_argv[dash_index + 1] == good_sha, archive_argv
 
 
-def test_clone_authenticates_a_private_https_remote_without_touching_argv() -> None:
+def test_clone_refuses_a_foreign_host_before_any_subprocess() -> None:
+    # The ticket's exact attack (#1122): a correctly signed payload names a
+    # registered repository and an attacker-controlled clone URL. Before this
+    # guard the platform GitHub token was scoped to -- and therefore delivered
+    # to -- that attacker's host on the very first request.
+    settings = Settings(github_token="ghs-secret-token")
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        with pytest.raises(CloneOriginMismatch):
+            clone_and_archive(
+                f"https://evil.example/{_REPO}.git",
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+            )
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "payload_url",
+    [
+        # Userinfo of any kind: a credential in the payload URL is never honored.
+        f"https://x-access-token:t@github.com/{_REPO}.git",
+        # The classic reviewer-fooling URL: hostname is evil.example, the
+        # "github.com" is the username. Fails on both host and userinfo.
+        f"https://github.com@evil.example/{_REPO}.git",
+        # A non-default port reaches a different service on the same host.
+        f"https://github.com:8443/{_REPO}.git",
+        # Scheme downgrade: a cleartext clone of a substituted bundle is still a
+        # deploy of attacker code under a registered agent's identity.
+        f"http://github.com/{_REPO}.git",
+        # Path prefix. Whole-key equality, never startswith -- this is the single
+        # most likely implementation bug in the change.
+        "https://github.com/octo/demo-agent-evil.git",
+        # Path suffix.
+        "https://github.com/octo/demo-agent/evil.git",
+        # Different owner.
+        "https://github.com/evil/demo-agent.git",
+        # IDN homograph: Cyrillic small i (U+0456) in "github". hostname
+        # lowercases but does not IDNA-normalize, so the strings simply differ.
+        f"https://gіthub.com/{_REPO}.git",
+        # Percent-encoded host: urlsplit does not decode escapes in the netloc.
+        f"https://%67ithub.com/{_REPO}.git",
+        # Trailing-dot host: resolves identically in DNS, mismatches here. Over
+        # strict on purpose; no real GitHub payload carries it.
+        f"https://github.com./{_REPO}.git",
+        # Query and fragment are both in the comparison key.
+        f"https://github.com/{_REPO}.git?x=1",
+        f"https://github.com/{_REPO}.git#x",
+        # Unparseable port: urlsplit().port raises ValueError, which must read as
+        # a mismatch rather than escaping the threadpool as a 500.
+        f"https://github.com:notaport/{_REPO}.git",
+        # Malformed IPv6 literal: urlsplit itself raises ValueError.
+        f"https://[::1/{_REPO}.git",
+    ],
+)
+def test_clone_refuses_every_mismatch_dimension_before_any_subprocess(
+    payload_url: str,
+) -> None:
+    # Every dimension AC1 names -- host, user information, port, normalized path
+    # -- plus the parse failures, rejected before tempfile.mkdtemp and before any
+    # subprocess. Anything not provably identical to the derived origin is a
+    # mismatch; that default is the design.
+    settings = Settings(github_token="ghs-secret-token")
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        with pytest.raises(CloneOriginMismatch):
+            clone_and_archive(
+                payload_url, _VALID_SHA1, settings, repo_full_name=_REPO
+            )
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "payload_url",
+    [
+        # GitHub's push payload sets clone_url with .git and url without it.
+        f"https://github.com/{_REPO}.git",
+        f"https://github.com/{_REPO}",
+        # Trailing slash, with and without .git before it. Stripping order
+        # matters: slashes, then one .git, then slashes again.
+        f"https://github.com/{_REPO}.git/",
+        f"https://github.com/{_REPO}/",
+        # An explicit default port is the same origin.
+        f"https://github.com:443/{_REPO}.git",
+        # urlsplit().hostname lowercases ASCII hosts.
+        f"https://GitHub.com/{_REPO}.git",
+    ],
+)
+def test_clone_accepts_the_registered_origin_in_its_equivalent_forms(
+    payload_url: str,
+) -> None:
+    # A legitimate push must not break. Each accepted form still results in git
+    # being handed the derived origin, never the payload string.
+    settings = Settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        result = clone_and_archive(
+            payload_url, _VALID_SHA1, settings, repo_full_name=_REPO
+        )
+
+    assert result == b"tar-bytes"
+    assert _GITHUB_URL in run.call_args_list[0].args[0]
+
+
+def test_clone_refuses_a_mixed_case_scheme() -> None:
+    # `HTTPS://` is rejected by the PRE-EXISTING case-sensitive scheme allowlist
+    # at gitflow.py:131 (`clone_url.startswith(settings.git_allowed_schemes)`),
+    # which runs BEFORE the origin comparator -- not by the comparator, whose own
+    # scheme .lower() never gets the chance to accept this form. Asserting the
+    # error is not a CloneOriginMismatch is what pins that.
+    #
+    # This is deliberately a rejection, not an acceptance: no real GitHub webhook
+    # payload carries a mixed-case scheme, and case-folding that allowlist to
+    # make an accept-case go green would be widening a security gate to pass a
+    # test. Nobody may do that.
+    settings = Settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        with pytest.raises(GitFlowError) as err:
+            clone_and_archive(
+                f"HTTPS://github.com/{_REPO}.git",
+                _VALID_SHA1,
+                settings,
+                repo_full_name=_REPO,
+            )
+    assert not isinstance(err.value, CloneOriginMismatch)
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "clone_base",
+    [
+        "github.com",  # no scheme at all
+        "ssh://git@github.com",  # a scheme outside the allowlist
+    ],
+)
+def test_clone_refuses_a_configured_base_outside_the_scheme_allowlist(
+    clone_base: str,
+) -> None:
+    # The scheme allowlist validates the PAYLOAD string, which is compared and
+    # then discarded. The string git actually receives is the derived
+    # `trusted_url`, and it is never checked against `git_allowed_schemes`. That
+    # is safe today only by transitivity through the origin comparison, and the
+    # design's own argument is that the comparison is not the protection.
+    #
+    # No payload can be constructed that both passes the payload allowlist AND
+    # matches a derived URL whose scheme is disallowed: the comparison key holds
+    # the scheme, so matching would require the payload to carry the disallowed
+    # scheme too, which the payload allowlist already refuses. That impossibility
+    # is exactly why the derived URL needs a check of its own, and it is why the
+    # assertion that matters here is the error TYPE. A misconfigured base must
+    # fail as a configuration error, not be mistaken for a forged push.
+    settings = Settings(github_token="ghs-secret-token", github_clone_base=clone_base)
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        with pytest.raises(GitFlowError) as err:
+            clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+    assert not isinstance(err.value, CloneOriginMismatch)
+    run.assert_not_called()
+
+
+def test_clone_refuses_a_configured_base_git_would_read_as_an_option() -> None:
+    # A `github_clone_base` beginning with a dash reaches argv construction as a
+    # positional that git parses as an option. `--upload-pack=` is the live
+    # payload: git clone runs it as a command against the remote. Operator
+    # supplied config is not attacker supplied, but a value that turns into a
+    # git option must be refused before any subprocess, exactly as a leading dash
+    # sha already is.
+    settings = Settings(
+        github_token="ghs-secret-token",
+        github_clone_base="--upload-pack=touch /tmp/pwned",
+    )
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        with pytest.raises(GitFlowError) as err:
+            clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+    assert not isinstance(err.value, CloneOriginMismatch)
+    run.assert_not_called()
+
+
+def test_clone_argv_inserts_dash_dash_before_the_url() -> None:
+    # Belt to the previous test's braces, and the half that survives someone
+    # relaxing the scheme gate later: `git clone` accepts `--` before its
+    # positional, so the URL can never be parsed as an option regardless of what
+    # configuration produced it. `git archive` already does this for the sha.
+    settings = Settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+
+    clone_argv = next(
+        call.args[0] for call in run.call_args_list if "clone" in call.args[0]
+    )
+    assert "--" in clone_argv, clone_argv
+    dash_index = clone_argv.index("--")
+    assert clone_argv[dash_index + 1] == _GITHUB_URL, clone_argv
+    assert dash_index > clone_argv.index("clone"), clone_argv
+
+
+def test_clone_accepts_a_well_formed_https_base() -> None:
+    # The control on the two rejection tests above: a guard that refused every
+    # configured base would satisfy them and break every real deploy. A
+    # well-formed https base must still reach git, carrying the derived URL.
+    base = "https://ghe.corp.example"
+    derived = f"{base}/{_REPO}.git"
+    settings = Settings(github_clone_base=base)
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        result = clone_and_archive(
+            derived, _VALID_SHA1, settings, repo_full_name=_REPO
+        )
+
+    assert result == b"tar-bytes"
+    assert derived in run.call_args_list[0].args[0]
+
+
+def test_clone_hands_git_the_derived_origin_not_the_payload_url() -> None:
+    # The load-bearing property: there is no code path from the payload's
+    # clone_url to subprocess.run. The payload value is compared and discarded;
+    # git receives a URL computed from configuration plus the stored binding, so
+    # even a normalization bug that wrongly ACCEPTS a hostile URL cannot leak the
+    # credential. This fails if an implementer keeps clone_url in the argv even
+    # with a correct comparison, which is the likeliest partial implementation.
+    payload_url = f"https://github.com/{_REPO}/"  # accepted, but not byte-equal
+    settings = Settings(github_token="ghs-secret-token")
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
+
+    argv = run.call_args_list[0].args[0]
+    assert _GITHUB_URL in argv
+    assert payload_url not in argv
+    assert payload_url not in " ".join(argv)
+
+
+@pytest.mark.parametrize(
+    ("clone_base", "expected_key"),
+    [
+        ("https://github.com", "http.https://github.com/.extraheader"),
+        ("https://ghe.corp.example", "http.https://ghe.corp.example/.extraheader"),
+    ],
+)
+def test_clone_credential_is_keyed_to_the_derived_origin(
+    clone_base: str, expected_key: str
+) -> None:
     # A private repo is the normal case for a bundle -- it names internal hosts
     # and services -- so an unauthenticated clone made git-flow unusable (#1058).
     # The credential must ride in git config env, never in argv: argv is visible
     # in `ps` and is echoed verbatim by CalledProcessError.
-    settings = Settings(github_token="ghs-secret-token")
-    url = "https://github.com/acme/private-bundle.git"
+    #
+    # The GHE case is the half that proves the header is keyed to the DERIVED
+    # origin rather than coincidentally to github.com: change the configured
+    # base and the extraheader key follows it.
+    repo = "acme/private-bundle"
+    derived = f"{clone_base}/{repo}.git"
+    settings = Settings(github_token="ghs-secret-token", github_clone_base=clone_base)
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive(url, _VALID_SHA1, settings)
+        clone_and_archive(derived, _VALID_SHA1, settings, repo_full_name=repo)
 
     clone_call = run.call_args_list[0]
     argv = clone_call.args[0]
     env = clone_call.kwargs["env"]
 
     assert "ghs-secret-token" not in " ".join(argv)
-    assert url in argv  # the URL itself is unmodified -- no embedded credential
+    assert derived in argv  # the derived URL, unmodified -- no embedded credential
     assert env["GIT_CONFIG_COUNT"] == "1"
-    # Scoped to this host, so a webhook naming another remote cannot harvest it.
-    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_KEY_0"] == expected_key
     assert env["GIT_CONFIG_VALUE_0"].startswith("Authorization: Basic ")
     decoded = base64.b64decode(env["GIT_CONFIG_VALUE_0"].split()[-1]).decode()
     assert decoded == "x-access-token:ghs-secret-token"
+
+
+def test_clone_pins_redirect_following_off() -> None:
+    # git 2.43.0. `git help config` on http.followRedirects: "If set to initial,
+    # git will follow redirects only for the initial request to a remote, but not
+    # for subsequent follow-up HTTP requests. [...] The default is initial." The
+    # request that carries the extraheader IS that initial request, so the
+    # default would let a redirect target receive it. `-c` must precede the
+    # `clone` subcommand to take effect.
+    #
+    # This is an argv-shape check and explicitly NOT the AC4 proof;
+    # test_gitflow_redirect.py proves it by executing git. This test exists to
+    # localize the failure when that one goes red.
+    settings = _local_settings()
+    with mock.patch("curie_api.gitflow.subprocess.run") as run:
+        run.return_value = _completed(b"tar-bytes")
+        clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
+
+    argv = run.call_args_list[0].args[0]
+    assert "-c" in argv, argv
+    flag_index = argv.index("-c")
+    assert argv[flag_index + 1] == "http.followRedirects=false", argv
+    assert flag_index + 1 < argv.index("clone"), argv
 
 
 def test_clone_sends_no_credential_when_none_is_configured() -> None:
     settings = Settings(github_token="")
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive("https://github.com/acme/public.git", _VALID_SHA1, settings)
+        clone_and_archive(
+            "https://github.com/acme/public.git",
+            _VALID_SHA1,
+            settings,
+            repo_full_name="acme/public",
+        )
     env = run.call_args_list[0].kwargs["env"]
     assert "GIT_CONFIG_COUNT" not in env
 
 
 def test_clone_does_not_send_the_credential_over_plain_http() -> None:
     # http:// is in the transport allowlist for local/test remotes; a bearer
-    # token must not be handed to a cleartext endpoint.
-    settings = Settings(github_token="ghs-secret-token")
+    # token must not be handed to a cleartext endpoint. This is also why the AC4
+    # redirect proof must not assert on an absent Authorization header: over
+    # loopback http there was never going to be one.
+    settings = Settings(
+        github_token="ghs-secret-token", github_clone_base="http://insecure.example"
+    )
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        clone_and_archive("http://insecure.example/repo.git", _VALID_SHA1, settings)
+        clone_and_archive(
+            "http://insecure.example/repo.git",
+            _VALID_SHA1,
+            settings,
+            repo_full_name="repo",
+        )
     assert "GIT_CONFIG_COUNT" not in run.call_args_list[0].kwargs["env"]
 
 
@@ -169,13 +474,15 @@ def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
     # The old message interpolated the exception, so an operator saw only
     # "returned non-zero exit status 128" while the actual reason -- captured in
     # stderr -- was discarded. That cost real debugging time on a private repo.
-    settings = Settings()
+    settings = _local_settings()
     failure = subprocess.CalledProcessError(
         128, ["git", "clone"], stderr=b"remote: Repository not found.\nfatal: could not read\n"
     )
     with mock.patch("curie_api.gitflow.subprocess.run", side_effect=failure):
         with pytest.raises(GitFlowError) as err:
-            clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings)
+            clone_and_archive(
+                _ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO
+            )
     assert "Repository not found" in str(err.value)
 
 

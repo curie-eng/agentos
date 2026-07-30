@@ -456,6 +456,11 @@ api:
   # fine-grained PAT or a GitHub App installation token is preferable to a
   # personal classic token, which carries the whole user's access.
   githubToken: ""
+  # The one git origin the API clones from for git-flow. A pushed repository
+  # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`
+  # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
+  # base to deploy from GHE.
+  githubCloneBase: "https://github.com"
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.

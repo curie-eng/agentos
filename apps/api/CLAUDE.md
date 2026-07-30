@@ -33,6 +33,17 @@ worker, Postgres, MinIO/S3, Langfuse, and GitHub.
   independent of GitHub API rate limits and scopes. Do not introduce a GitHub
   API client into `gitflow.py` for something the git protocol already gives
   you.
+- **The webhook's HMAC signature authenticates the sender, not the payload's
+  clone URL.** A valid signature proves the sender holds the shared secret,
+  exactly the attacker the threat model assumes, so `clone_and_archive`
+  (`gitflow.py`) never hands git `repository.clone_url` from the payload.
+  It hands git `trusted_clone_url`, derived from `Settings.github_clone_base`
+  plus the `repo_full_name` read from the database row; the payload URL is
+  only compared against that derived one, to reject and log a forged push
+  (`CloneOriginMismatch`), before being discarded. `repo_full_name` is a
+  required keyword-only parameter for this reason and must not get a default.
+  The clone also pins `http.followRedirects=false`, since git's default
+  follows a redirect on the very request carrying the auth header.
 - **Prod push reuses the dev-built bundle; it does not rebuild.** A push to
   the prod branch looks up the `Version` already created for that sha (from
   the dev push) and only creates a new `Deployment` row. If you find yourself

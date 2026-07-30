@@ -160,14 +160,19 @@ nothing's been deployed yet, `curie cluster message` will say so plainly.
 ### Automatically, with git-flow
 
 Beyond `curie cluster deploy`, a bundle can also deploy automatically on
-every `git push`. Three things need to be true for a push to actually
+every `git push`. Four things need to be true for a push to actually
 promote:
 
 1. **The agent's repo is set.** The webhook resolves which agent a push
    belongs to by matching the payload's `repo.full_name` (owner/name)
    against that agent's `repo_full_name`. This field is set when the agent
    is created (console or Curie API); `curie cluster deploy` only pushes a
-   bundle to an agent that already exists and does not set this field.
+   bundle to an agent that already exists and does not set this field. The
+   match is case sensitive, so the stored `repo_full_name` must match
+   GitHub's canonical owner and repository casing exactly, or the lookup
+   finds no agent, the push is silently ignored, and (unlike a rejection)
+   nothing is logged, so the only symptom is a green delivery in GitHub
+   with nothing deployed.
 2. **GitHub can reach the Curie API.** Add a webhook, in the repo's GitHub
    settings, to `<your-api-url>/github/webhook`. This requires the
    Curie API to be reachable from GitHub's servers (an ingress, a load
@@ -181,6 +186,14 @@ promote:
    kubectl get secret <release>-secrets -o jsonpath='{.data.githubWebhookSecret}' | base64 -d
    ```
    and paste it into the webhook's secret field.
+4. **The push comes from the configured clone origin.** The API derives the
+   trusted clone URL from `GITHUB_CLONE_BASE` (chart value
+   `api.githubCloneBase`), which defaults to `https://github.com`, and
+   rejects any push whose `clone_url` doesn't match with the error code
+   `git.origin_mismatch` -- the webhook still returns 200, so this fails
+   silently from GitHub's side. The default covers github.com with no extra setup; set
+   `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
+   live elsewhere, such as GitHub Enterprise Server.
 
 Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same
