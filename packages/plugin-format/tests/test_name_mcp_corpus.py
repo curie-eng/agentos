@@ -10,9 +10,7 @@ from plugin_format import validate_bundle
 from plugin_format.validate import _NAME_RE
 
 _CORPUS = json.loads(
-    (Path(__file__).parents[1] / "schema" / "name-mcp.fixture.json").read_text(
-        encoding="utf-8"
-    )
+    (Path(__file__).parents[1] / "schema" / "name-mcp.fixture.json").read_text(encoding="utf-8")
 )
 
 
@@ -28,13 +26,9 @@ def _mcp_codes(tmp_path: Path, connector: object) -> set[str]:
     error codes (empty = the connector object is accepted)."""
     manifest = json.dumps({"name": "demo", "mcpServers": {"conn": connector}})
     (tmp_path / ".claude-plugin").mkdir(parents=True)
-    (tmp_path / ".claude-plugin" / "plugin.json").write_text(
-        manifest, encoding="utf-8"
-    )
+    (tmp_path / ".claude-plugin" / "plugin.json").write_text(manifest, encoding="utf-8")
     return {
-        issue.code
-        for issue in validate_bundle(tmp_path).errors
-        if issue.code.startswith("mcp.")
+        issue.code for issue in validate_bundle(tmp_path).errors if issue.code.startswith("mcp.")
     }
 
 

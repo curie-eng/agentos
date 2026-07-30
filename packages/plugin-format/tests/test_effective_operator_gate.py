@@ -78,9 +78,7 @@ def test_already_prefixed_name_for_undeclared_prefix_fails_closed() -> None:
     # expected_prefixes check. A typo'd wrongbundle/wrongserver name arms a literal
     # the runtime never matches -> fail OPEN; this must fail CLOSED (None).
     assert (
-        effective_operator_gate(
-            "b", {"github"}, "mcp__plugin_wrongbundle_wrongserver__tool"
-        )
+        effective_operator_gate("b", {"github"}, "mcp__plugin_wrongbundle_wrongserver__tool")
         is None
     )
 
@@ -102,10 +100,7 @@ def test_poisoned_servers_fail_mcp_names_closed_but_pass_builtins_verbatim() -> 
     # override, so "cannot verify" must fail closed, not pass through. Only a
     # built-in (no mcp__ prefix, no server lookup) still passes verbatim.
     assert effective_operator_gate("b", None, "mcp__github__update_issue") is None
-    assert (
-        effective_operator_gate("b", None, "mcp__plugin_b_github__update_issue")
-        is None
-    )
+    assert effective_operator_gate("b", None, "mcp__plugin_b_github__update_issue") is None
     assert effective_operator_gate("b", None, "Bash") == "Bash"
 
 
@@ -113,10 +108,7 @@ def test_falsy_bundle_name_fails_mcp_names_closed() -> None:
     # No bundle name means the effective prefix cannot be constructed to verify an
     # mcp__ name -> fail closed. Built-ins still pass verbatim.
     assert effective_operator_gate("", {"github"}, "mcp__github__update_issue") is None
-    assert (
-        effective_operator_gate("", {"github"}, "mcp__plugin_b_github__update_issue")
-        is None
-    )
+    assert effective_operator_gate("", {"github"}, "mcp__plugin_b_github__update_issue") is None
     assert effective_operator_gate("", {"github"}, "Bash") == "Bash"
 
 

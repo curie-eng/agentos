@@ -62,9 +62,7 @@ def test_mcp_server_without_command_or_url_is_reported() -> None:
 
 def test_inline_object_mcp_declaration_stays_valid(tmp_path: Path) -> None:
     # The fix the string-pointer error names. It must keep validating clean.
-    bundle = _bundle(
-        tmp_path, '{"name": "demo", "mcpServers": {"crm": {"command": "crm-server"}}}'
-    )
+    bundle = _bundle(tmp_path, '{"name": "demo", "mcpServers": {"crm": {"command": "crm-server"}}}')
     result = validate_bundle(bundle)
     assert result.valid, result.errors
 
@@ -212,18 +210,14 @@ _REDIRECT_CAPTURE_KEYS = [
 
 
 @pytest.mark.parametrize("name", _REDIRECT_CAPTURE_KEYS)
-def test_reserved_redirect_capture_secret_name_is_rejected(
-    tmp_path: Path, name: str
-) -> None:
+def test_reserved_redirect_capture_secret_name_is_rejected(tmp_path: Path, name: str) -> None:
     bundle = _bundle(tmp_path, f'{{"name": "demo", "secrets": ["{name}"]}}')
     assert "secrets.name_reserved" in _codes(bundle)
 
 
 def test_legitimate_connector_secret_name_is_not_reserved(tmp_path: Path) -> None:
     # Negative control: a real connector token name still validates clean.
-    bundle = _bundle(
-        tmp_path, '{"name": "demo", "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}'
-    )
+    bundle = _bundle(tmp_path, '{"name": "demo", "secrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}')
     assert "secrets.name_reserved" not in _codes(bundle)
 
 
@@ -465,9 +459,7 @@ def test_string_pointer_mcp_declaration_does_not_add_a_gate_error(tmp_path: Path
         '"approvalPolicy": {"gates": ['
         '{"gate": "mcp__plugin_demo_crm__send_contract", "route": "legal"}]}}',
     )
-    _write_mcp(
-        bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}', "config/servers.json"
-    )
+    _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}', "config/servers.json")
 
     codes = _codes(bundle)
     assert _POINTER_CODE in codes
@@ -567,9 +559,7 @@ def test_hyphenated_bundle_and_underscored_server_names_resolve(tmp_path: Path) 
     )
     good_dir = tmp_path / "good"
     good_dir.mkdir()
-    good = _bundle(
-        good_dir, manifest.format(gate="mcp__plugin_github-issues_local_tools__x")
-    )
+    good = _bundle(good_dir, manifest.format(gate="mcp__plugin_github-issues_local_tools__x"))
     assert validate_bundle(good).valid, validate_bundle(good).errors
 
     bad_dir = tmp_path / "bad"
@@ -585,8 +575,7 @@ def test_malformed_mcp_gate_is_rejected(tmp_path: Path) -> None:
     # to the general rule; no special case exists for it.
     bundle = _bundle(
         tmp_path,
-        '{"name": "demo", "approvalPolicy": {"gates": ['
-        '{"gate": "mcp__", "route": "legal"}]}}',
+        '{"name": "demo", "approvalPolicy": {"gates": [{"gate": "mcp__", "route": "legal"}]}}',
     )
     _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}')
 
@@ -634,9 +623,7 @@ def test_each_offending_gate_is_reported_at_its_own_location(tmp_path: Path) -> 
     )
     _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}')
 
-    locations = [
-        i.location for i in validate_bundle(bundle).errors if i.code == _GATE_CODE
-    ]
+    locations = [i.location for i in validate_bundle(bundle).errors if i.code == _GATE_CODE]
     # Both entries are reported, each anchored to its own gates[i].
     assert len(locations) == 2, locations
     assert any("gates[0]" in loc for loc in locations)
@@ -654,9 +641,7 @@ def test_each_offending_gate_is_reported_at_its_own_location(tmp_path: Path) -> 
 def test_string_pointer_mcp_declaration_is_rejected(tmp_path: Path) -> None:
     # File present AND itself valid -- the case that validates clean today.
     bundle = _bundle(tmp_path, '{"name": "demo", "mcpServers": "config/servers.json"}')
-    _write_mcp(
-        bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}', "config/servers.json"
-    )
+    _write_mcp(bundle, '{"mcpServers": {"crm": {"command": "crm-server"}}}', "config/servers.json")
 
     result = validate_bundle(bundle)
     assert not result.valid
@@ -696,9 +681,7 @@ def _write_skill(bundle: Path, frontmatter: str) -> Path:
 
 
 @pytest.mark.parametrize("key", _CONFUSABLE_KEYS)
-def test_confusable_tools_key_without_allowed_tools_is_rejected(
-    tmp_path: Path, key: str
-) -> None:
+def test_confusable_tools_key_without_allowed_tools_is_rejected(tmp_path: Path, key: str) -> None:
     bundle = _bundle(tmp_path, '{"name": "demo"}')
     _write_skill(bundle, f"{key}:\n  - Bash\n")
 
@@ -744,9 +727,7 @@ def test_unknown_key_without_allowed_tools_validates_clean(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize("key", _CONFUSABLE_KEYS)
-def test_confusable_key_alongside_allowed_tools_validates_clean(
-    tmp_path: Path, key: str
-) -> None:
+def test_confusable_key_alongside_allowed_tools_validates_clean(tmp_path: Path, key: str) -> None:
     # An author who already has the right key is not confused, whatever else the
     # bundle carries. Erroring here would reject real Claude Code bundles.
     bundle = _bundle(tmp_path, '{"name": "demo"}')

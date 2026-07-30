@@ -73,6 +73,7 @@ returns actionable, path-qualified issues instead of raising:
 
 ```python
 from plugin_format import validate_bundle
+
 result = validate_bundle("path/to/bundle")
 if not result.valid:
     for issue in result.errors:
