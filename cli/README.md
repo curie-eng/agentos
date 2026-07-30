@@ -79,6 +79,85 @@ after Ns`, never a hang. Compatibility is handled automatically:
   `✗ fail`, `⚠ warn`), and glyphs fall back to ASCII (`v`/`x`/`!`, `- \ | /`
   spinner) in non-UTF-8 locales.
 
+## Agent-facing output contract
+
+The CLI's primary consumer is a coding agent (ADR-0021), so its output and
+control flow are machine-first.
+
+**`--json`** (global) makes every agent-facing verb emit a single
+machine-readable JSON object on **stdout** instead of empty output: the
+read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
+lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
+and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
+[<lines>]}`) all route through one centralized emitter.
+
+The `message` verbs keep their own, more specific shapes: `curie local
+message` and `curie cluster message` emit one structured line per terminal
+state on stdout --
+
+- a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
+  (the model's reply, which is null on a no-edit completion, plus the thread
+  the turn ran under);
+- a turn parked on a human approval gate emits `{"reply": ..., "thread":
+  ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
+  approval card rather than finalizing, and `reply` is the card's placeholder
+  text if seen);
+- a **timeout** emits `{"reply": null, "finalized": false,
+  "timed_out": true}` before exiting 3 (transient);
+- a turn **enqueued** onto the real Valkey stream in connected transport mode
+  emits `{"status": "enqueued", "channel": ..., "thread": ...}` -- the CLI
+  does not wait for the reply, so this is a terminal state of the command,
+  not of the turn; and
+- `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
+  "target": "local"|"cluster", "stream": ..., "channel": ...,
+  "reply_endpoint": ...}` (`channel` is null when it would be resolved from
+  the sole deployed agent).
+
+The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
+lag this contract on their real-path success output: `curie skill message`,
+and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still
+print human text rather than JSON on success (tracked in #485). All human and
+log text (progress, notes, warnings) goes to **stderr**, so a plain `...
+--json | jq` yields clean data. On failure under `--json`, the error is
+emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
+a prose message, so an agent can recover without parsing prose. `NO_COLOR`,
+`CLICOLOR`, and `--color=never` are honored on every command.
+
+**Versioned result schemas.** Every agent-facing `--json` result maps to a
+committed JSON Schema under `cli/schema/` with an explicit version identity (the
+`vN` segment of its `$id`); `cli/schema/index.json` is the inventory of every
+result family, the schema it maps to, and its version. The schemas are embedded
+in the released binary, so the discovery path works with no source checkout:
+`curie schema-index` prints the inventory index, and `curie schema-index
+<name>` (e.g. `curie schema-index kill`) prints one schema. A contract test
+(`cli/tests/schema_inventory.rs`) fails CI if a new result family lands without a
+schema, and `cli/tests/json_contract.rs` validates every result's real output
+against its schema. The compatibility policy — additive changes stay at the same
+version, breaking changes ship a new version — is
+[ADR-0074](../docs/adr/0074-versioned-json-schemas-for-cli-results.md).
+
+**Semantic exit codes** let an agent branch on *why* a command failed without
+parsing output:
+
+| Code | Class     | Meaning                                                                 |
+|------|-----------|-------------------------------------------------------------------------|
+| 0    | success   | The command did what was asked.                                         |
+| 1    | failure   | A genuine runtime failure (well-formed request, operation did not succeed). Do not retry blindly. |
+| 2    | usage     | A deterministic input error (missing `--yes`, a malformed flag/value, no bundle). Retrying the same argv fails identically -- fix the input. |
+| 3    | transient | A retryable condition (the endpoint was unreachable or timed out). The same argv may succeed once the dependency is up. |
+| 4    | unsupported | The verb was understood, but the concept it inspects does not exist at this tier by construction (`curie skill versions`, `curie skill memory`). No input and no retry changes that -- the same argv never succeeds here; the `fix` hint names the tier that does answer it. |
+
+**Non-interactive by default.** Every mutating command has a non-interactive
+path (`--yes` on `cluster down`/`kill`/`delete`/`reset-thread`, `local
+reset-thread`, and `local down --wipe`); none block on stdin. A confirmation
+prompt that would otherwise read stdin refuses
+with a usage error (exit 2) when the session is not a terminal, rather than
+hanging.
+
+(`curie local status` and `curie cluster status` proxy raw
+`docker compose`/`helm`/`kubectl` output and do not yet support `--json`; use
+`curie skill status` for a machine-readable runner status today.)
+
 ## For users
 
 ### `curie secrets`
@@ -322,6 +401,15 @@ it reuses the last successful `local message` context from
 is required, explicit flags override the saved channel/thread/transport
 settings, and the same replay exclusions apply.
 
+### Prototyping agents in a source checkout
+
+Two shortcuts for working with the repo's own `agents/` scratch directory:
+
+| Command | What it does |
+|---|---|
+| `curie list-agents` | List the plugin bundles under `agents/`, a personal, gitignored directory (sibling of `examples/`, source checkout only) for in-progress agent projects. Empty, not an error, when the directory doesn't exist. |
+| `curie deploy-local <folder>` | Deploy `agents/<folder>` to the local platform by name -- shorthand for `curie local deploy --plugin-dir agents/<folder>` (identical operation, same flags minus `--plugin-dir`). Local tier only; use `curie cluster deploy --plugin-dir agents/<folder>` for the cluster tier. The interactive "How to deploy to Slack" workflow offers the same `agents/` bundles as a picker. |
+
 ### `cluster` target: deployed Helm release
 
 Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
@@ -483,85 +571,6 @@ means the ts must name a real message in the channel -- a thread ts carried over
 from a stub run will be rejected by Slack, and the command tells you to drop
 `--thread` to start a new one.
 
-### Agent-facing output contract
-
-The CLI's primary consumer is a coding agent (ADR-0021), so its output and
-control flow are machine-first.
-
-**`--json`** (global) makes every agent-facing verb emit a single
-machine-readable JSON object on **stdout** instead of empty output: the
-read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
-lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
-and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
-[<lines>]}`) all route through one centralized emitter.
-
-The `message` verbs keep their own, more specific shapes: `curie local
-message` and `curie cluster message` emit one structured line per terminal
-state on stdout --
-
-- a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
-  (the model's reply, which is null on a no-edit completion, plus the thread
-  the turn ran under);
-- a turn parked on a human approval gate emits `{"reply": ..., "thread":
-  ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
-  approval card rather than finalizing, and `reply` is the card's placeholder
-  text if seen);
-- a **timeout** emits `{"reply": null, "finalized": false,
-  "timed_out": true}` before exiting 3 (transient);
-- a turn **enqueued** onto the real Valkey stream in connected transport mode
-  emits `{"status": "enqueued", "channel": ..., "thread": ...}` -- the CLI
-  does not wait for the reply, so this is a terminal state of the command,
-  not of the turn; and
-- `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
-  "target": "local"|"cluster", "stream": ..., "channel": ...,
-  "reply_endpoint": ...}` (`channel` is null when it would be resolved from
-  the sole deployed agent).
-
-The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
-lag this contract on their real-path success output: `curie skill message`,
-and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still
-print human text rather than JSON on success (tracked in #485). All human and
-log text (progress, notes, warnings) goes to **stderr**, so a plain `...
---json | jq` yields clean data. On failure under `--json`, the error is
-emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
-a prose message, so an agent can recover without parsing prose. `NO_COLOR`,
-`CLICOLOR`, and `--color=never` are honored on every command.
-
-**Versioned result schemas.** Every agent-facing `--json` result maps to a
-committed JSON Schema under `cli/schema/` with an explicit version identity (the
-`vN` segment of its `$id`); `cli/schema/index.json` is the inventory of every
-result family, the schema it maps to, and its version. The schemas are embedded
-in the released binary, so the discovery path works with no source checkout:
-`curie schema-index` prints the inventory index, and `curie schema-index
-<name>` (e.g. `curie schema-index kill`) prints one schema. A contract test
-(`cli/tests/schema_inventory.rs`) fails CI if a new result family lands without a
-schema, and `cli/tests/json_contract.rs` validates every result's real output
-against its schema. The compatibility policy — additive changes stay at the same
-version, breaking changes ship a new version — is
-[ADR-0074](../docs/adr/0074-versioned-json-schemas-for-cli-results.md).
-
-**Semantic exit codes** let an agent branch on *why* a command failed without
-parsing output:
-
-| Code | Class     | Meaning                                                                 |
-|------|-----------|-------------------------------------------------------------------------|
-| 0    | success   | The command did what was asked.                                         |
-| 1    | failure   | A genuine runtime failure (well-formed request, operation did not succeed). Do not retry blindly. |
-| 2    | usage     | A deterministic input error (missing `--yes`, a malformed flag/value, no bundle). Retrying the same argv fails identically -- fix the input. |
-| 3    | transient | A retryable condition (the endpoint was unreachable or timed out). The same argv may succeed once the dependency is up. |
-| 4    | unsupported | The verb was understood, but the concept it inspects does not exist at this tier by construction (`curie skill versions`, `curie skill memory`). No input and no retry changes that -- the same argv never succeeds here; the `fix` hint names the tier that does answer it. |
-
-**Non-interactive by default.** Every mutating command has a non-interactive
-path (`--yes` on `cluster down`/`kill`/`delete`/`reset-thread`, `local
-reset-thread`, and `local down --wipe`); none block on stdin. A confirmation
-prompt that would otherwise read stdin refuses
-with a usage error (exit 2) when the session is not a terminal, rather than
-hanging.
-
-(`curie local status` and `curie cluster status` proxy raw
-`docker compose`/`helm`/`kubectl` output and do not yet support `--json`; use
-`curie skill status` for a machine-readable runner status today.)
-
 ## For contributors
 
 ### `curie install`
@@ -610,13 +619,11 @@ they error clearly -- a release binary has no dev scripts.
 | `curie dev emit-parity` | `bash cli/scripts/check-emit-parity.sh` -- assert a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal covers that struct's fields, one hop downstream of `field-parity` (#699). |
 | `curie dev wire-tolerance` | `bash scripts/check-wire-tolerance.sh` -- assert every direct `ClassName.model_validate*(...)` call on an `_AciModel` subclass threads `READER_CONTEXT` or is a declared exception (#625). |
 
-### Source-checkout tooling
+### Building the runner image from source
 
 | Command | What it does |
 |---|---|
 | `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR (GitHub Container Registry) automatically and never needs to build. |
-| `curie list-agents` | List the plugin bundles under `agents/`, a personal, gitignored directory (sibling of `examples/`, source checkout only) for in-progress agent projects. Empty, not an error, when the directory doesn't exist. |
-| `curie deploy-local <folder>` | Deploy `agents/<folder>` to the local platform by name -- shorthand for `curie local deploy --plugin-dir agents/<folder>` (identical operation, same flags minus `--plugin-dir`). Local tier only; use `curie cluster deploy --plugin-dir agents/<folder>` for the cluster tier. The interactive "How to deploy to Slack" workflow offers the same `agents/` bundles as a picker. |
 
 ### Verify
 
