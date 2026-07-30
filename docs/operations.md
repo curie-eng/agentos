@@ -65,13 +65,10 @@ a specific provider for a tighter posture. A default-route value
 warning, since it removes the default-deny rail for a prompt-injectable
 sandbox.
 
-The two egress flags compose into one `allowedEgress` array, in order:
-`--allow-egress-host` entries take the leading indices, followed by any
-`--allow-web-egress` CIDRs. The raw helm equivalent of a single web-egress
-rule (no provider egress) is `--set
-'security.networkPolicy.allowedEgress[0].cidr=0.0.0.0/0'` plus
-`...[0].ports[0].protocol=TCP` and `...[0].ports[0].port=443`; shift the
-index up by one for each preceding `--allow-egress-host` entry.
+You don't need to worry about ordering when using the CLI flags together --
+`cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
+one list automatically, with named-provider entries first and web-egress
+CIDRs after.
 
 ### `curie cluster status`
 
@@ -79,9 +76,11 @@ index up by one for each preceding `--allow-egress-host` entry.
 curie cluster status
 ```
 
-Reports release health, pod readiness, and the access URLs. The UI URL
-carries `?api=1`, so it opens wired to the in-cluster API (the deployed UI
-proxies `/api/` there).
+Reports whether the release is healthy, which pods are ready, and the URLs
+to reach it -- including the web console, where you can see your agents,
+their deployed versions, and their run history. That console URL includes a
+`?api=1` parameter; leave it as-is when you open it, it's just what points
+the console at this cluster's own API.
 
 ### `curie cluster down`
 
@@ -93,26 +92,18 @@ curie cluster down
 |---|---|
 | `--yes` | Skip the confirmation prompt. |
 
-Uninstalls the release and sweeps its namespaces: only the namespaces this
-release created (identified by the ownership label
-`curietech.ai/created-by=<release>`) are deleted. Pre-existing (unlabeled)
-namespaces and the `agents.x-k8s.io` CRDs are left untouched.
+`curie cluster down` safely removes everything this release created, and
+only what it created -- other things on the cluster are untouched,
+including pre-existing namespaces and the Agent Sandbox CRDs.
 
-**Fail-forward teardown.** If `helm uninstall` fails (for example a
-transient API-server blip), teardown does not abort -- the ownership-scoped
-namespace sweep still runs so compute is not left orphaned. If the sweep's
-label selector matches nothing (for example a pre-existing namespace, which
-is never stamped with the ownership label), the error message says so
-plainly rather than claiming namespaces were removed.
-
-If teardown still cannot complete, the command exits nonzero (exit 3 for a
-transient/retryable failure, exit 1 otherwise) and prints an exact resumable
-cleanup command (also carried in the `--json` `{error, fix}` payload) to run
-once the API server is reachable. That resumable command aggregates both
-the uninstall and the sweep's exit statuses, so re-running it verbatim
-cannot misreport success while the release record is still stale. See
-ADR-0064 (Architecture Decision Record;
-`docs/adr/0064-fail-forward-cluster-teardown.md`).
+It's also safe to re-run if something goes wrong. If the underlying
+uninstall fails (say, a brief API-server hiccup), teardown doesn't just
+stop -- it keeps going and cleans up whatever it safely can, so you're not
+left with orphaned compute. If it still can't finish, the command tells
+you exactly what to run next: an exact cleanup command you can copy-paste
+once the cluster is reachable again. See ADR-0064 (Architecture Decision
+Record; `docs/adr/0064-fail-forward-cluster-teardown.md`) for the full
+fail-forward design.
 
 ## Deploying your plugin bundle onto the Curie platform
 
@@ -128,29 +119,28 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | `--api-url <url>` / `CURIE_API_URL` | Direct-dial this URL instead of self-plumbing a loopback tunnel. |
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
 
-With no `--api-url`, `cluster deploy` self-plumbs a `kubectl port-forward`
-to `svc/<release>-api` (a loopback tunnel, per ADR-0057) and dials
-`http://localhost:<port>` directly -- no manual port-forward and no UI
-NodePort proxy involved. With no `--api-key` either, the key is
-auto-discovered by reading `api.apiKey` out of the release's
-`<release>-secrets` Secret (decoded server-side, so the plaintext never
-lands in argv); the discovered key travels only in the `X-API-Key` header
-over the loopback tunnel, never over the cleartext UI `/api` NodePort proxy
-that ADR-0024 used for this path.
+Beyond pointing it at your bundle, `cluster deploy` needs no other flags by
+default: it automatically finds a way to reach the cluster's API and
+automatically finds the credentials to use, so
+`curie cluster deploy --plugin-dir <bundle-dir>` just works.
 
-An explicit `--api-url` (e.g. `http://<node>:30080/api`, ADR-0024's UI proxy
-still available as the escape hatch) or `CURIE_API_URL` direct-dials the
-given URL exactly as given, with no tunnel. If the auto-discovered key would
-then travel over plain `http://`, `cluster deploy` refuses rather than leak
-it on the wire. To proceed, either pass `--api-key` explicitly to
-acknowledge, use an `https://` URL, or omit `--api-url` to go back over the
-loopback tunnel.
+Under the hood, it opens a secure local tunnel to the API (so nothing needs
+to be exposed publicly) and reads the API key straight out of the release's
+own Kubernetes Secret -- the key is never printed or stored anywhere in
+your shell history.
 
-Key discovery fails with a usage error telling you to pass `--api-key` when
-the release's `<release>-secrets` Secret cannot be read. The port-forward
-itself fails with a hint to check `curie cluster status` if the release is
-not healthy. Without a deploy, `curie cluster message` fails with `no
-agents are deployed on the platform API`.
+Override this only for a non-default setup: `--api-url` to talk to a
+specific address instead of tunneling, or `--api-key` to use a specific key
+instead of the auto-discovered one. As a safety check, if you point at a
+plain `http://` URL, `cluster deploy` refuses to send an auto-discovered
+key over it unencrypted -- pass `--api-key` explicitly to confirm that's
+what you want, switch to `https://`, or drop `--api-url` to go back to the
+safe default.
+
+If something's not working: a discovery failure means the release's Secret
+couldn't be read (pass `--api-key` yourself); a tunnel failure usually means
+the release isn't healthy (check with `curie cluster status`); and if
+nothing's been deployed yet, `curie cluster message` will say so plainly.
 
 ### Automatically, with git-flow
 
