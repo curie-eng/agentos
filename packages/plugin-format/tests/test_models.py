@@ -66,9 +66,7 @@ def test_manifest_secrets_field() -> None:
     # Absent -> None (backward compatible; bundles without it still validate).
     assert PluginManifest.model_validate({"name": "demo"}).secrets is None
     # Serializes back under the verbatim key.
-    assert manifest.model_dump(exclude_none=True)["secrets"] == [
-        "GITHUB_PERSONAL_ACCESS_TOKEN"
-    ]
+    assert manifest.model_dump(exclude_none=True)["secrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
 
 
 def test_manifest_trigger_and_approval_policy_fields() -> None:

@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .approval_policy import declared_mcp_server_names, effective_tool_prefix, grantable_routes
-from .connectors import validate_connectors
+from .connectors import ConnectorsFile, validate_connectors
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -106,9 +106,43 @@ def _validate_connectors(root: Path, c: _Collector) -> None:
     except (OSError, yaml.YAMLError) as exc:
         c.error("connectors.unreadable", f"{CONNECTORS_FILE}: {exc}", CONNECTORS_FILE)
         return
-    _, errors = validate_connectors(data)
+    parsed, errors = validate_connectors(data)
     for code, message in errors:
         c.error(code, message, CONNECTORS_FILE)
+    if parsed is not None:
+        _reject_connector_name_collisions(root, parsed, c)
+
+
+def _reject_connector_name_collisions(root: Path, parsed: ConnectorsFile, c: _Collector) -> None:
+    """Reject a server name declared in BOTH ``connectors.yaml`` and MCP config.
+
+    Curie injects the connector's entry into the agent's MCP configuration
+    (ADR-0086) alongside whatever the bundle declares. When both name the same
+    server, which one the agent ends up talking to is decided downstream, and
+    the loser is overridden with no diagnostic -- so the author's committed
+    ``.mcp.json`` entry could be silently ignored, or could silently win over
+    the objects Curie actually created.
+
+    Neither outcome should be discoverable only at turn time, and a precedence
+    rule would just be a thing to remember. One name, one owner: say so here,
+    where the fix is a one-line edit.
+    """
+
+    declared = declared_mcp_server_names(root)
+    if declared is None:
+        # A declaration exists but is unreadable. `_validate_mcp` already errors
+        # on that; cross-checking a partial set would add a confusing second
+        # error about a name we cannot actually confirm.
+        return
+    for name in sorted(set(parsed.connectors) & declared):
+        c.error(
+            "connectors.duplicate_server",
+            f"connectors.{name}: `{name}` is declared in both {CONNECTORS_FILE} and the "
+            "bundle's MCP config. Curie derives this server's URL from the Service it "
+            f"creates, so remove the `{name}` entry from the MCP config and let "
+            f"{CONNECTORS_FILE} own it.",
+            CONNECTORS_FILE,
+        )
 
 
 def _validate_manifest(root: Path, c: _Collector) -> PluginManifest | None:

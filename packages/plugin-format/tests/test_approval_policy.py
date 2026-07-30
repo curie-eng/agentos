@@ -24,9 +24,7 @@ def test_empty_input_yields_empty_map_and_no_ambiguity() -> None:
 
 
 def test_single_grantable_gate_maps_route_to_tool() -> None:
-    routes, ambiguous = grantable_routes(
-        [_gate("close_issue", "deal-desk", grantable=True)]
-    )
+    routes, ambiguous = grantable_routes([_gate("close_issue", "deal-desk", grantable=True)])
     assert routes == {"deal-desk": "close_issue"}
     assert ambiguous == set()
 

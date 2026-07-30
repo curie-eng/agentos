@@ -97,9 +97,7 @@ def service_dns(release: str, agent: str, connector: str, namespace: str) -> str
     return f"{object_name(release, agent, connector)}.{namespace}.svc.cluster.local"
 
 
-def host_aliases(
-    release: str, agent: str, connector: str, namespace: str, port: int
-) -> list[str]:
+def host_aliases(release: str, agent: str, connector: str, namespace: str, port: int) -> list[str]:
     """Every name the sandbox might use to reach this connector.
 
     Passed to servers that validate the Host header. Curie created the Service,
@@ -115,9 +113,7 @@ def host_aliases(
     ]
 
 
-def render_service(
-    release: str, agent: str, connector: str, spec: ConnectorSpec
-) -> dict[str, Any]:
+def render_service(release: str, agent: str, connector: str, spec: ConnectorSpec) -> dict[str, Any]:
     name = object_name(release, agent, connector)
     return {
         "apiVersion": "v1",

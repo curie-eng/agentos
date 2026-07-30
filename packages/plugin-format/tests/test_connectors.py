@@ -155,3 +155,43 @@ def test_bundle_with_a_valid_connector_passes(tmp_path: Path) -> None:
         "    secrets: [GRAFANA_TOKEN]\n",
     )
     assert validate_bundle(str(root)).valid
+
+
+# --------------------------------------------------------------------------- #
+# One name, one owner (#1118)
+# --------------------------------------------------------------------------- #
+def test_a_name_in_both_connectors_yaml_and_mcp_json_is_rejected(tmp_path: Path) -> None:
+    # Curie injects the connector's entry alongside whatever the bundle declares.
+    # With both naming `grafana`, which one the agent talks to is decided
+    # downstream and the loser is overridden with no diagnostic -- either the
+    # author's committed entry is ignored, or it silently wins over the objects
+    # Curie actually created. Caught here, the fix is a one-line edit.
+    root = _bundle(tmp_path, "connectors:\n  grafana:\n    image: x:1\n")
+    (root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"grafana": {"type": "http", "url": "http://hand-written/mcp"}}}),
+        encoding="utf-8",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert any(e.code == "connectors.duplicate_server" for e in result.errors)
+
+
+def test_distinct_names_across_the_two_files_are_fine(tmp_path: Path) -> None:
+    # The files are complementary by design: connectors.yaml for what Curie
+    # hosts, .mcp.json for anything else (a stdio server, say).
+    root = _bundle(tmp_path, "connectors:\n  grafana:\n    image: x:1\n")
+    (root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"local-tool": {"command": "./bin/tool"}}}),
+        encoding="utf-8",
+    )
+    assert validate_bundle(str(root)).valid
+
+
+def test_an_unreadable_mcp_config_does_not_add_a_confusing_second_error(tmp_path: Path) -> None:
+    # `_validate_mcp` already errors on the unreadable declaration. Cross-checking
+    # a partial set would name a collision we cannot actually confirm.
+    root = _bundle(tmp_path, "connectors:\n  grafana:\n    image: x:1\n")
+    (root / ".mcp.json").write_text("{not json", encoding="utf-8")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert not any(e.code == "connectors.duplicate_server" for e in result.errors)
