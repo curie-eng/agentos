@@ -8,8 +8,8 @@ installs and runs it, wrapping the umbrella Helm chart the way `linkerd` or
 
 ## The Kubernetes cluster
 
-This doc covers the `cluster` target specifically. If `skill` or `local`
-answers your question instead, see the target comparison table in the
+This doc covers the `cluster` target specifically. For `skill` or `local`
+Targets, see the target comparison table in the
 [README](../README.md#which-target-do-i-want) or [`cli/README.md`](../cli/README.md).
 
 **Prerequisites:**
@@ -17,22 +17,33 @@ answers your question instead, see the target comparison table in the
 | Requirement | Why |
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
-| A reachable cluster | The chart's preflights install the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) and expect a NetworkPolicy-enforcing CNI (Container Network Interface) already on the cluster; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node -- **real models only** | A real-model install fails closed without it, unless kernel isolation is explicitly disabled (`--set security.gvisor.mode=off`). Fake-model installs work without it. |
+| A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
+| `runsc` (gVisor) on every node -- **real models only** | Real-model installs refuse to start without it, as a safety measure against running a live model in a less-isolated sandbox. Skip the check with `--set security.gvisor.mode=off` if your cluster doesn't have it. Fake-model installs don't need it. |
 
-**Which cluster to point at:** a single-node **k3s** cluster on a Linux host
-(8 GB+ memory) is the lasting recommendation -- its default kube-router CNI
-enforces NetworkPolicy out of the box. **kind** and **minikube** work fine
-for disposable local tests, but their API server typically binds loopback,
-which can make it unreachable from a pod; if `cluster message` can't
-auto-detect a pod-reachable host, pass `--listen-host` explicitly (see
-`cli/README.md`).
+**For testing**, pick between **k3s**, **kind**, and **minikube** based on
+your host and how disposable the cluster needs to be. A single-node **k3s**
+cluster (8 GB+ memory) is the lasting recommendation if you're on Linux --
+its default kube-router CNI enforces NetworkPolicy out of the box, though
+k3s itself only runs on Linux. **kind** and **minikube** work anywhere
+Docker does and are fine for disposable local tests, but their Kubernetes
+API server typically binds loopback, which can make it unreachable from a
+pod; if `cluster message` can't auto-detect a pod-reachable host, pass
+`--listen-host` explicitly (see `cli/README.md`).
+
+**For production**, you'll likely point at a managed or self-hosted cluster
+instead. Curie has no cluster-selection flag of its own -- every `cluster`
+command just uses whatever `kubectl` and `helm` are already pointed at, so
+switch clusters the normal `kubectl` way:
+
+```bash
+kubectl config use-context <your-production-context>
+```
 
 ## Installing and inspecting the Curie platform on the cluster
 
 ### `curie cluster up`
 
-Installs (or upgrades) Curie onto the cluster you're pointed at:
+Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
 
 ```bash
 curie cluster up
@@ -57,13 +68,14 @@ the sandbox stays fail-closed until you open its provider egress with one of
 the two flags above. Neither flag bakes provider IPs into the binary --
 only hostnames are resolved (to narrow `/32`+`/128` host routes) at install
 time, because provider/CDN IPs rotate; re-run `up` to re-resolve if calls
-start failing. The weather example (#36) is what `--allow-web-egress` is
-for: `curie cluster up --allow-web-egress 0.0.0.0/0` opens the open internet
-(still minus the `169.254.169.254` metadata endpoint), or narrow the CIDR to
-a specific provider for a tighter posture. A default-route value
-(`0.0.0.0/0`, `::/0`, any `/0` prefix) prints a distinct rail-removal
-warning, since it removes the default-deny rail for a prompt-injectable
-sandbox.
+start failing. `--allow-web-egress` is for agents whose skills need to
+reach the open web -- a search tool, a weather lookup, anything beyond the
+named model providers above: `curie cluster up --allow-web-egress
+0.0.0.0/0` opens the open internet (still minus the `169.254.169.254`
+metadata endpoint), or narrow the CIDR to a specific destination for a
+tighter posture. A default-route value (`0.0.0.0/0`, `::/0`, any `/0`
+prefix) prints a distinct rail-removal warning, since it removes the
+default-deny rail for a prompt-injectable sandbox.
 
 You don't need to worry about ordering when using the CLI flags together --
 `cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
@@ -80,7 +92,7 @@ Reports whether the release is healthy, which pods are ready, and the URLs
 to reach it -- including the web console, where you can see your agents,
 their deployed versions, and their run history. That console URL includes a
 `?api=1` parameter; leave it as-is when you open it, it's just what points
-the console at this cluster's own API.
+the console at this release's Curie API.
 
 ### `curie cluster down`
 
@@ -97,7 +109,7 @@ only what it created -- other things on the cluster are untouched,
 including pre-existing namespaces and the Agent Sandbox CRDs.
 
 It's also safe to re-run if something goes wrong. If the underlying
-uninstall fails (say, a brief API-server hiccup), teardown doesn't just
+uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
 stop -- it keeps going and cleans up whatever it safely can, so you're not
 left with orphaned compute. If it still can't finish, the command tells
 you exactly what to run next: an exact cleanup command you can copy-paste
@@ -108,6 +120,10 @@ fail-forward design.
 ## Deploying your plugin bundle onto the Curie platform
 
 ### Manually, with `curie cluster deploy`
+
+This pushes your bundle to the Curie API -- the control-plane component
+that `cluster up` installs as part of the release, not a third-party
+service -- which stores it and hands it to the deployed worker.
 
 ```bash
 curie cluster deploy --plugin-dir <bundle-dir>
@@ -120,14 +136,14 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
 
 Beyond pointing it at your bundle, `cluster deploy` needs no other flags by
-default: it automatically finds a way to reach the cluster's API and
+default: it automatically finds a way to reach the Curie API and
 automatically finds the credentials to use, so
 `curie cluster deploy --plugin-dir <bundle-dir>` just works.
 
-Under the hood, it opens a secure local tunnel to the API (so nothing needs
-to be exposed publicly) and reads the API key straight out of the release's
-own Kubernetes Secret -- the key is never printed or stored anywhere in
-your shell history.
+Under the hood, it opens a secure local tunnel to the Curie API (so
+nothing needs to be exposed publicly) and reads the API key straight out
+of the release's own Kubernetes Secret -- the key is never printed or
+stored anywhere in your shell history.
 
 Override this only for a non-default setup: `--api-url` to talk to a
 specific address instead of tunneling, or `--api-key` to use a specific key
@@ -151,11 +167,11 @@ promote:
 1. **The agent's repo is set.** The webhook resolves which agent a push
    belongs to by matching the payload's `repo.full_name` (owner/name)
    against that agent's `repo_full_name`. This field is set when the agent
-   is created (console or API); `curie cluster deploy` only pushes a bundle
-   to an agent that already exists and does not set this field.
-2. **GitHub can reach the API.** Add a webhook, in the repo's GitHub
+   is created (console or Curie API); `curie cluster deploy` only pushes a
+   bundle to an agent that already exists and does not set this field.
+2. **GitHub can reach the Curie API.** Add a webhook, in the repo's GitHub
    settings, to `<your-api-url>/github/webhook`. This requires the
-   cluster's API to be reachable from GitHub's servers (an ingress, a load
+   Curie API to be reachable from GitHub's servers (an ingress, a load
    balancer, or a tunnel); how you expose it is an infrastructure decision
    this chart does not make for you.
 3. **The webhook secret matches.** GitHub signs each delivery
@@ -185,18 +201,18 @@ curie cluster message "hello, are you there?"
 
 | Flag | What it does |
 |---|---|
-| `--thread` | Continue a multi-turn conversation (see `cli/README.md` for the full flow). |
-| `--force-wire` | Allow driving a release that's already connected to a real Slack workspace (refused by default). |
+| `--continue` | Reuse the same conversation thread as your last `cluster message` call (reads `.curie/last-turn.json`). |
+| `--thread <id>` | Continue a specific earlier conversation thread by ID, instead of the most recent one. |
+| `--force-wire` | `cluster message` normally refuses to run against a release that's already wired to a real Slack workspace, since driving it would send replies into that workspace instead. Pass `--force-wire` to override that guard. |
 
 This exercises a deployed release end to end with no Slack at all. It:
 
-- stands up a local Slack API stub
-- self-manages the kubectl port-forwards
-- resolves the target agent's channel from the API
-- points the deployed worker at the stub (`helm upgrade --reuse-values`)
-- enqueues the exact event a Slack mention would produce
-- boots the real Kubernetes sandbox
+- simulates the exact Slack event your bot would receive
+- runs it through the real deployed worker and a real Kubernetes sandbox
 - prints the reply
+
+`cluster message` handles the port-forwards, channel resolution, and stub
+routing itself, so none of that is something you need to set up.
 
 This lets a developer iterate on an agent built for someone else's
 workspace with no Slack access. Full flag reference is in
@@ -215,13 +231,10 @@ curie cluster comms --slack
 | `--disconnect` | Disconnect Slack and revert to CLI-driven testing. |
 | `--dry-run` | Print the masked `helm` command without executing (env-backed token values are masked, never printed in full). |
 
-`curie cluster comms --slack` is a thin `helm upgrade --reuse-values`
-wrapper that sets the dispatcher's app and bot tokens and, on connect,
-clears `worker.slackApiBaseUrl=` to un-wire any `curie cluster message` stub
-routing. After the upgrade, it also restarts and waits for the worker (and,
-on connect, the dispatcher) so the running pods pick up the changed tokens
--- a Secret change alone does not roll pods whose token comes from a
-`secretKeyRef` env var.
+`curie cluster comms --slack` wires your release up to a real Slack
+workspace: it stores the tokens you pass, points the release at Slack
+instead of the local `cluster message` stub, and restarts the affected pods
+so the change takes effect immediately.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
