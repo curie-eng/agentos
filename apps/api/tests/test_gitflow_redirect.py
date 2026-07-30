@@ -44,11 +44,12 @@ def _origin_handler(
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's contract
-            recorded.append(self.path)
+            safe_path = self.path.replace("\r", "").replace("\n", "")
+            recorded.append(safe_path)
             # A different HOSTNAME, same loopback address: cross-host from git's
             # point of view, and reachable without any external network.
             self.send_response(302)
-            self.send_header("Location", f"http://localhost:{target_port}{self.path}")
+            self.send_header("Location", f"http://localhost:{target_port}{safe_path}")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
