@@ -197,9 +197,21 @@ def _parse_approvers(
     binding: malformed approvers content fails closed here rather than becoming
     an unenforceable binding. A typo'd sibling key (``approver`` for
     ``approvers``) is caught at write time instead, by the model's
-    ``extra="forbid"``, which is sufficient because the API is the binding's
-    only writer. Absent and null are treated identically -- bindings written
-    before #420 have no key at all.
+    ``extra="forbid"``.
+
+    That guard used to be described here as sufficient because the API was the
+    binding's only writer. It no longer is: the CLI's ``--routes-from`` (#1057)
+    is a second writer, and because it parsed the operator's file into a struct
+    and re-serialized it, the operator's own bytes never reached this model at
+    all -- an unknown key was dropped before the request was built, and the
+    channel-only binding that survived widened the approver set to the whole
+    card channel (#1072). Each writer now refuses unknown keys on its own input
+    (``cli/src/api.rs``'s ``RouteBindingInput``); this model stays the
+    authoritative gate for anything that does reach it. A future writer that
+    re-serializes rather than forwarding raw bytes owes the same check.
+
+    Absent and null are treated identically -- bindings written before #420
+    have no key at all.
 
     A binding that is present but not a JSON object (a hand-edited JSONB row, a
     future writer bug) fails closed here, distinct from the absent None above: a

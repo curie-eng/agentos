@@ -85,6 +85,64 @@ pub struct ApprovalApprovers {
     pub users: Option<Vec<String>>,
 }
 
+// --- The input side of the same contract (#1072) -------------------------------
+//
+// The two structs above decode API RESPONSES and must stay tolerant: a field a
+// newer server adds should not break an older CLI. The two below decode an
+// OPERATOR-AUTHORED `--routes-from` file and must do the opposite.
+//
+// The asymmetry is the whole fix, so the pair lives here next to its lenient
+// twin rather than off in the command module. A typo'd key in a route file is
+// not a harmless unknown: dropping `approver` (for `approvers`) leaves a
+// channel-only binding, and a binding with no approvers block falls back to
+// card-channel membership, so the operator who meant to narrow authority to one
+// group has instead granted it to everyone in the channel.
+//
+// The API already guards this with `extra="forbid"` on `ApprovalRouteBinding`,
+// on the stated premise that it is the binding's only writer. #1057 made the
+// CLI a second writer and re-serialized a parsed struct, so the operator's own
+// bytes never reached that guard. This restores it on the writer that bypassed
+// it, and follows the convention `cli/src/spec.rs` already states for
+// operator-authored files: an authoring typo fails loud rather than silently
+// dropping the intended field.
+
+/// One route binding as written in a `--routes-from` file. Strict by design.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteBindingInput {
+    pub channel: String,
+    #[serde(default)]
+    pub approvers: Option<ApproversInput>,
+}
+
+/// An `approvers` block as written in a `--routes-from` file. Strict by design.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApproversInput {
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub users: Option<Vec<String>>,
+}
+
+impl From<ApproversInput> for ApprovalApprovers {
+    fn from(input: ApproversInput) -> Self {
+        ApprovalApprovers {
+            group: input.group,
+            users: input.users,
+        }
+    }
+}
+
+impl From<RouteBindingInput> for ApprovalRouteBinding {
+    fn from(input: RouteBindingInput) -> Self {
+        ApprovalRouteBinding {
+            channel: input.channel,
+            approvers: input.approvers.map(Into::into),
+        }
+    }
+}
+
 /// One approval record, hand-mirroring the committed `ApprovalOut` (#506). Only
 /// the fields the CLI renders are modeled; serde ignores the rest of the payload.
 #[derive(Debug, Clone, Deserialize)]

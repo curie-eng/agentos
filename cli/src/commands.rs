@@ -3990,19 +3990,46 @@ fn build_route_bindings(
                 path.display()
             ))
         })?;
-        bindings = serde_json::from_str(&text).map_err(|e| {
-            crate::exit::usage(format!(
-                "--routes-from {}: {e}; expected JSON shaped \
-                 {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
-                 \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
-                path.display()
-            ))
-        })?;
-        for (name, binding) in &bindings {
-            validate_route_channel(name, &binding.channel)?;
+        // Decode in two steps rather than straight into the binding map, so an
+        // unknown key can be reported against the ROUTE that carries it. Serde's
+        // own error names the key but not which entry of the map it came from,
+        // and "unknown field `approver`" with no route is a poor thing to hand
+        // someone holding a twenty-route file.
+        let raw: BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(&text).map_err(|e| {
+                crate::exit::usage(format!(
+                    "--routes-from {}: {e}; expected JSON shaped \
+                     {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
+                     \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
+                    path.display()
+                ))
+            })?;
+        for (name, value) in raw {
+            // RouteBindingInput is the strict, operator-file twin of the
+            // response-side type: it refuses an unknown key instead of dropping
+            // it (#1072). A dropped `approver` would leave a channel-only
+            // binding, which widens the approver set to the whole card channel.
+            let input: crate::api::RouteBindingInput =
+                serde_json::from_value(value).map_err(|e| {
+                    anyhow::Error::from(
+                        crate::exit::CliError::usage(format!(
+                            "--routes-from {}: route {name:?}: {e}",
+                            path.display()
+                        ))
+                        .with_fix(
+                            "a route binding takes `channel` and an optional `approvers` \
+                             block of `group` or `users`, and nothing else. A dropped \
+                             sibling key would leave a channel-only binding, which makes \
+                             every member of that channel an approver",
+                        ),
+                    )
+                })?;
+            let binding: crate::api::ApprovalRouteBinding = input.into();
+            validate_route_channel(&name, &binding.channel)?;
             if let Some(approvers) = &binding.approvers {
-                validate_parsed_approvers(name, approvers)?;
+                validate_parsed_approvers(&name, approvers)?;
             }
+            bindings.insert(name, binding);
         }
     }
 
