@@ -19,12 +19,11 @@ below.
   - [Using different tiers](#using-different-tiers)
     - [`skill` target: runner-only, fully offline](#skill-target-runner-only-fully-offline)
     - [`local` target: full platform via compose, no Slack](#local-target-full-platform-via-compose-no-slack)
-    - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
+      - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
     - [`cluster` target: deployed Helm release](#cluster-target-deployed-helm-release)
-      - [Bundle packing exclusions](#bundle-packing-exclusions)
-      - [Artifact resolution](#artifact-resolution)
-    - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
-      - [Targeting a deployed agent and continuing a thread](#targeting-a-deployed-agent-and-continuing-a-thread)
+      - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
+    - [Bundle packing exclusions](#bundle-packing-exclusions)
+    - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
@@ -327,7 +326,7 @@ the optional Slack dispatcher.
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737). The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted. Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 
-#### `curie local message`: the same roundtrip against the compose stack
+##### `curie local message`: the same roundtrip against the compose stack
 
 `local message` drives the local compose stack (`curie local up`) instead of a
 Kubernetes release, so the whole loop is one machine with no cluster:
@@ -405,48 +404,7 @@ and auto-discovers the release key (ADR-0057), the lifecycle verbs do neither
 `--dry-run` (prints the plan, makes no request); the destructive
 `kill`/`reset-thread`/`delete` also require `--yes`.
 
-##### Bundle packing exclusions
-
-`local deploy` and `cluster deploy` never pack `.curieignore`, `.curie`,
-`.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `.mypy_cache`, or
-`.pytest_cache`, matched by name at any depth. An optional `.curieignore`
-at the bundle root adds more patterns, one per line (`#` comments and blank
-lines skipped, surrounding whitespace and a trailing `/` stripped):
-
-```
-# .curieignore
-scratch
-notebooks/drafts
-```
-
-A bare name matches that entry at any depth; a path containing `/` matches
-only that bundle-root-relative path and its subtree. There is no glob
-support (`*.log` never matches), and a pattern reaching outside the bundle
-(absolute, or containing `.` or `..`) is dropped. Symlinks are still a
-packing error unless excluded, by design: the packer never dereferences a
-link to upload host files from outside the bundle root.
-
-##### Artifact resolution
-
-Release builds resolve default artifacts from the binary version: `curie local
-up` fetches the self contained `compose.release.yaml` release asset, so it
-works with no checkout, `curie cluster up` uses the pinned chart release
-asset, and runner sessions (`curie skill up`) use the pinned GHCR runner
-image. Fetched artifacts cache under
-`${XDG_CACHE_HOME:-$HOME/.cache}/curie/<version>/`, so repeated
-`curie cluster up` and `curie local up` reuse the cache.
-
-Dev builds use the local `compose.dev.yaml`, `charts/curie`, and
-`curie-runner` when present. A dev binary run with no local artifact errors,
-telling you to pass `-f <compose>`, `--chart <path>`, or `--image <ref>` (or use
-a released binary); those same flags override the defaults. `--dry-run` prints
-the resolved argv without fetching.
-
-`curie cluster message` is not yet wired through this resolver: it still defaults
-`--chart` to the repo-relative `charts/curie`, so a no-checkout binary must
-pass `--chart <path-or-tgz>` explicitly for now.
-
-#### `curie cluster message`: drive the deployed cluster with zero Slack
+##### `curie cluster message`: drive the deployed cluster with zero Slack
 
 Before connecting a real workspace, `cluster message` is the zero-Slack path.
 When you are ready to wire Slack onto a deployed release, use:
@@ -504,8 +462,6 @@ does not replay `--stream`, `--listen-port`, `--valkey-local-port`,
 `--api-local-port`, or `--user`, so pass any of those again explicitly if the
 original turn used a non-default value.
 
-##### Targeting a deployed agent and continuing a thread
-
 The worker binds a channel to an agent by exact equality on
 `agents.slack_channel`, so a random synthetic channel can never reach a
 deployed agent. Use `--channel <id>` to send as a specific channel: pass the
@@ -533,6 +489,47 @@ that placeholder's real Slack ts, so you can reply to it in Slack. Passing
 means the ts must name a real message in the channel -- a thread ts carried over
 from a stub run will be rejected by Slack, and the command tells you to drop
 `--thread` to start a new one.
+
+#### Bundle packing exclusions
+
+`local deploy` and `cluster deploy` never pack `.curieignore`, `.curie`,
+`.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `.mypy_cache`, or
+`.pytest_cache`, matched by name at any depth. An optional `.curieignore`
+at the bundle root adds more patterns, one per line (`#` comments and blank
+lines skipped, surrounding whitespace and a trailing `/` stripped):
+
+```
+# .curieignore
+scratch
+notebooks/drafts
+```
+
+A bare name matches that entry at any depth; a path containing `/` matches
+only that bundle-root-relative path and its subtree. There is no glob
+support (`*.log` never matches), and a pattern reaching outside the bundle
+(absolute, or containing `.` or `..`) is dropped. Symlinks are still a
+packing error unless excluded, by design: the packer never dereferences a
+link to upload host files from outside the bundle root.
+
+#### Artifact resolution
+
+Release builds resolve default artifacts from the binary version: `curie local
+up` fetches the self contained `compose.release.yaml` release asset, so it
+works with no checkout, `curie cluster up` uses the pinned chart release
+asset, and runner sessions (`curie skill up`) use the pinned GHCR runner
+image. Fetched artifacts cache under
+`${XDG_CACHE_HOME:-$HOME/.cache}/curie/<version>/`, so repeated
+`curie cluster up` and `curie local up` reuse the cache.
+
+Dev builds use the local `compose.dev.yaml`, `charts/curie`, and
+`curie-runner` when present. A dev binary run with no local artifact errors,
+telling you to pass `-f <compose>`, `--chart <path>`, or `--image <ref>` (or use
+a released binary); those same flags override the defaults. `--dry-run` prints
+the resolved argv without fetching.
+
+`curie cluster message` is not yet wired through this resolver: it still defaults
+`--chart` to the repo-relative `charts/curie`, so a no-checkout binary must
+pass `--chart <path-or-tgz>` explicitly for now.
 
 ### Managing secrets
 
