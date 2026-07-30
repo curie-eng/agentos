@@ -114,5 +114,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0082 | [Connected-transport approval cards ride a real CLI-posted placeholder](0082-connected-transport-approval-cards-via-a-real-placeholder.md) | Accepted |
 | 0084 | [Publish a verification contract for agents driving Curie](0084-publish-a-verification-contract-for-agents-driving-curie.md) | Accepted |
 | 0085 | [Acceptance, not implementation, authorizes an ADR](0085-acceptance-not-implementation-authorizes-an-adr.md) | Accepted |
-| 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Draft |
+| 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Accepted |
 <!-- END GENERATED: adr-index -->
