@@ -415,6 +415,82 @@ def test_a_failed_views_open_falls_forward_and_resolves(
     assert "note" in web_client.chat_postEphemeral.call_args.kwargs["text"].lower()
 
 
+def test_a_failed_views_open_reports_a_403_refusal_to_the_clicker(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """#1085: the fall-forward handled one failure but not two.
+
+    When ``views.open`` fails AND the fall-forward resolve is then refused, the
+    in-view error channel cannot fire (there is no view, that is why we are on
+    this path) and the ephemeral used to be gated on a 200. The clicker got
+    nothing at all, which for a non-approver is indistinguishable from the
+    platform being down.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(
+            status_code=403,
+            detail="self-approval is blocked: the requester cannot resolve their own request",
+        )
+    )
+    app, web_client = _build(config, redis_client, resolver, views_open_raises=True)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_click("env-n9", action_id=APPROVE_NOTE_ACTION_ID))
+    _drain(app)
+
+    assert len(resolver.calls) == 1, "the fall-forward must still attempt the resolve"
+    web_client.chat_postEphemeral.assert_called_once()
+    text = web_client.chat_postEphemeral.call_args.kwargs["text"]
+    # The API's own reason, verbatim: the refusal classes stay distinguishable
+    # (#453 AC5), so this must not read like a generic failure.
+    assert "self-approval is blocked" in text, text
+    # A refusal is not a resolution: the card keeps its live buttons.
+    web_client.chat_update.assert_not_called()
+
+
+def test_a_failed_views_open_reports_an_expiry_to_the_clicker(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The 410 sibling of the case above, and the one where silence costs most:
+    the clicker's only question is why nothing happened, and expiry is the
+    answer."""
+
+    resolver = ScriptedResolver(ResolveOutcome(status_code=410, detail="approval expired"))
+    app, web_client = _build(config, redis_client, resolver, views_open_raises=True)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_click("env-n10", action_id=REJECT_NOTE_ACTION_ID))
+    _drain(app)
+
+    web_client.chat_postEphemeral.assert_called_once()
+    text = web_client.chat_postEphemeral.call_args.kwargs["text"]
+    assert "expired" in text.lower(), text
+    web_client.chat_update.assert_not_called()
+
+
+def test_the_fall_forward_ephemeral_matches_the_in_view_wording(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """One refusal, one wording, whichever surface it lands on.
+
+    The two paths differ only in WHERE a refusal is rendered (an ephemeral when
+    no view opened, the view's own ack when one did). If they worded it
+    differently, the same refusal would read as two different problems.
+    """
+
+    outcome = ResolveOutcome(status_code=409, resolved_by="U_FIRST")
+    resolver = ScriptedResolver(outcome)
+    app, web_client = _build(config, redis_client, resolver, views_open_raises=True)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_click("env-n11", action_id=APPROVE_NOTE_ACTION_ID))
+    _drain(app)
+
+    web_client.chat_postEphemeral.assert_called_once()
+    assert web_client.chat_postEphemeral.call_args.kwargs["text"] == _refusal_text(outcome)
+
+
 def test_the_ack_lands_before_any_slack_call_on_the_submit_path(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
