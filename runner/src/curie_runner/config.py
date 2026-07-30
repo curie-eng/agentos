@@ -33,6 +33,11 @@ class RunnerConfig:
     # through the harness registry; an unregistered selection fails the boot.
     harness: str
     max_turns: int
+    # Where this sandbox's hosted connectors live (ADR-0086, #1118). Absent as
+    # a set on any tier that hosts nothing -- see connectors.derive_mcp_servers.
+    connector_release: str | None
+    connector_agent: str | None
+    connector_namespace: str | None
     history_ref: str | None
     # Tool names whose calls require human approval (#245, ADR-0010). The
     # runner intercepts these proactively via the SDK can_use_tool callback
@@ -122,6 +127,9 @@ class RunnerConfig:
             model=boot.model,
             harness=harness,
             max_turns=boot.max_turns if boot.max_turns is not None else 20,
+            connector_release=boot.connector_release,
+            connector_agent=boot.connector_agent,
+            connector_namespace=boot.connector_namespace,
             history_ref=boot.history_ref,
             approval_required_tools=boot.approval_required_tools,
             approval_grant_tool=boot.approval_grant_tool,
