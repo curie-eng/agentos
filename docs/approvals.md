@@ -131,6 +131,14 @@ and it is stored on the record, stamped onto the card in the approver channel, a
 carried to the requester in the resume turn below. Cancelling the dialog resolves
 nothing, so a misclick is recoverable.
 
+The dialog is not optional the way the note is: **every** approval card opens one, in
+every deployment, with no toggle. That costs an approver who wants no note one extra
+click, and it is deliberate. A reason is the half of a rejection the requester actually
+needs, and the dialog is what makes leaving one the default rather than something you
+remember to do from the CLI. If a deployment turns out to want the opt-out, it would be
+operator-written config, never a bundle-declared field: an agent must not get to widen
+how its own approvals are collected.
+
 Three properties worth knowing before you design around this:
 
 - **Self-approval is refused under every set.** The author of the turn that raised the

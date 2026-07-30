@@ -414,7 +414,56 @@ def test_pause_emits_a_confirm_intent_for_the_approval_card(make_harness) -> Non
             # not only at the renderer, because this is the field that decides
             # whether the real product path offers a note at all -- a renderer
             # test alone would stay green with the kernel emitting the default.
+            #
+            # #1076: and asserted UNCONDITIONALLY, because the value being the
+            # same for every card is itself the decision. Nothing here reads
+            # config, so if a toggle is ever added this assertion is where the
+            # change surfaces, rather than the always-on behavior quietly
+            # becoming sometimes-on.
             assert intent.allow_free_text is True
+
+    asyncio.run(go())
+
+
+def test_every_posted_card_carries_the_note_variant(make_harness) -> None:
+    """#1076: always-on is the decision, so pin it across card SHAPES.
+
+    ``allow_free_text`` is set at one call site with no config behind it, which
+    is easy to read as an accident of that call site. This drives the two shapes
+    that differ -- the in-thread card of an UNROUTED approval and the top-level
+    card of a ROUTED one -- and asserts both carry it. A change that made it
+    conditional on the routing branch would fail here rather than surfacing only
+    as a UX difference nobody tests.
+    """
+
+    async def go() -> None:
+        # Unrouted: the card joins the requesting thread.
+        async with make_harness(approvals=RecordingApprovals()) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            await h.kernel.process_event(_qevent("please discount", thread="th-unrouted"))
+            unrouted = h.sink.posts[0]
+
+        # Routed: the card posts top-level in the bound channel.
+        binding = RoutedBinding({"finance": {"channel": "C_FINANCE"}})
+        async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Approve the invoice", "finance")
+            await h.kernel.process_event(_qevent("please invoice", thread="th-routed"))
+            routed = h.sink.posts[0]
+
+        # The two really are different shapes, or this test proves nothing.
+        assert unrouted[3] == "th-unrouted", "the unrouted card must be in-thread"
+        assert routed[3] is None, "the routed card must be top-level"
+
+        for label, (channel, message, _by, _ts, _endpoint) in (
+            ("unrouted", unrouted),
+            ("routed", routed),
+        ):
+            intent = message.interaction
+            assert isinstance(intent, ConfirmIntent)
+            assert intent.allow_free_text is True, (
+                f"the {label} card for {channel} came without the note variant; "
+                "every card carries it (#1076)"
+            )
 
     asyncio.run(go())
 
