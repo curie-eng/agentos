@@ -11,7 +11,9 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Any
 
+import yaml
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -20,9 +22,12 @@ from plugin_format import (
     UnsupportedArchive,
     ValidationResult,
     bundle_root,
+    connector_render,
     safe_extract,
     validate_bundle,
 )
+from plugin_format.connectors import ConnectorsFile, validate_connectors
+from plugin_format.validate import CONNECTORS_FILE
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -89,6 +94,64 @@ def extract_and_validate(
     )
     result = validate_bundle(bundle_root(dest))
     return extension, content_type, result
+
+
+def read_connectors(root: Path) -> ConnectorsFile:
+    """Parse a validated bundle's ``connectors.yaml``, or an empty set.
+
+    Safe to call only after ``validate_bundle`` has passed: every malformed
+    shape is already rejected there, so this cannot be the place a bad
+    declaration first surfaces.
+    """
+
+    path = bundle_root(root) / CONNECTORS_FILE
+    if not path.is_file():
+        return ConnectorsFile()
+    parsed, errors = validate_connectors(yaml.safe_load(path.read_text(encoding="utf-8")))
+    if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
+        return ConnectorsFile()
+    return parsed
+
+
+def render_connector_manifests(
+    connectors: ConnectorsFile,
+    *,
+    release: str,
+    namespace: str,
+    app_name: str,
+    secret_name: str,
+) -> list[dict[str, Any]]:
+    """Kubernetes objects for a bundle's hosted connectors (ADR-0086, #1063).
+
+    The API renders but never applies. Rendering is a pure function, so it needs
+    no cluster access, and the API's RBAC stays the deliberately read-only
+    `pods: list` + `pods/log: get` it has today -- which matters because this is
+    the component that receives webhooks from the internet. The CLI applies the
+    result with the operator's own kubectl credentials, so cluster-write
+    authority stays where it already was.
+    """
+
+    objects: list[dict[str, Any]] = []
+    for name, spec in sorted(connectors.connectors.items()):
+        objects.extend(
+            connector_render.render(release, namespace, app_name, name, spec, secret_name)
+        )
+    return objects
+
+
+def connector_mcp_entries(
+    connectors: ConnectorsFile, *, release: str, namespace: str
+) -> dict[str, Any]:
+    """The `.mcp.json` entries for declared connectors, keyed by name.
+
+    Derived from the Service the manifests define, so an author never writes a
+    URL that resolves in one tier and not another.
+    """
+
+    return {
+        name: connector_render.mcp_entry(release, namespace, name, spec)
+        for name, spec in sorted(connectors.connectors.items())
+    }
 
 
 def _collect_text_files(root: Path) -> list[tuple[str, str]]:
