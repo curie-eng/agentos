@@ -30,9 +30,17 @@ not write.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from .connectors import ConnectorSpec
+
+# Service names are DNS labels, so 63 characters is the hard ceiling. Names that
+# would exceed it are truncated and disambiguated with a digest rather than
+# clipped, since clipping alone can collide two distinct connectors back
+# together -- the exact failure this module's naming is meant to prevent.
+_DNS_LABEL_MAX = 63
+_DIGEST_LEN = 8
 
 
 def sandbox_selector(release: str, app_name: str) -> dict[str, str]:
@@ -59,17 +67,39 @@ def sandbox_selector(release: str, app_name: str) -> dict[str, str]:
     }
 
 
-def object_name(release: str, connector: str) -> str:
-    """Kubernetes object name for a connector. Stable and derivable."""
+def object_name(release: str, agent: str, connector: str) -> str:
+    """Kubernetes object name for a connector. Stable and derivable.
 
-    return f"{release}-mcp-{connector}"
+    Scoped to the AGENT, not just the release. Curie runs many agents per
+    release, so a release-scoped name means two agents that each declare a
+    connector called ``grafana`` render byte-identical objects and silently
+    overwrite one another -- with different images, different env, and a
+    different credential. The dev-tier agent ends up pointed at the prod
+    endpoint holding the prod token, and nothing errors (#1116).
+
+    It also makes pruning safe. Objects are pruned by an owner label; with
+    colliding names, ownership silently transfers to whoever deployed last, and
+    one agent removing a connector deletes another agent's running server.
+    """
+
+    base = f"{release}-{agent}-mcp-{connector}"
+    if len(base) <= _DNS_LABEL_MAX:
+        return base
+    # Truncate WITH a digest of the full name: clipping alone would map two long
+    # names that share a prefix onto the same object, reintroducing the very
+    # collision this function exists to prevent.
+    digest = hashlib.sha256(base.encode()).hexdigest()[:_DIGEST_LEN]
+    keep = _DNS_LABEL_MAX - _DIGEST_LEN - 1
+    return f"{base[:keep].rstrip('-')}-{digest}"
 
 
-def service_dns(release: str, connector: str, namespace: str) -> str:
-    return f"{object_name(release, connector)}.{namespace}.svc.cluster.local"
+def service_dns(release: str, agent: str, connector: str, namespace: str) -> str:
+    return f"{object_name(release, agent, connector)}.{namespace}.svc.cluster.local"
 
 
-def host_aliases(release: str, connector: str, namespace: str, port: int) -> list[str]:
+def host_aliases(
+    release: str, agent: str, connector: str, namespace: str, port: int
+) -> list[str]:
     """Every name the sandbox might use to reach this connector.
 
     Passed to servers that validate the Host header. Curie created the Service,
@@ -77,32 +107,34 @@ def host_aliases(release: str, connector: str, namespace: str, port: int) -> lis
     guessing wrong yields ``forbidden: host not allowed`` with no hint.
     """
 
-    short = object_name(release, connector)
+    short = object_name(release, agent, connector)
     return [
         f"{short}:{port}",
         f"{short}.{namespace}:{port}",
-        f"{service_dns(release, connector, namespace)}:{port}",
+        f"{service_dns(release, agent, connector, namespace)}:{port}",
     ]
 
 
-def render_service(release: str, connector: str, spec: ConnectorSpec) -> dict[str, Any]:
-    name = object_name(release, connector)
+def render_service(
+    release: str, agent: str, connector: str, spec: ConnectorSpec
+) -> dict[str, Any]:
+    name = object_name(release, agent, connector)
     return {
         "apiVersion": "v1",
         "kind": "Service",
-        "metadata": {"name": name, "labels": _labels(release, connector)},
+        "metadata": {"name": name, "labels": _labels(release, agent, connector)},
         "spec": {
             "type": "ClusterIP",
-            "selector": _labels(release, connector),
+            "selector": _labels(release, agent, connector),
             "ports": [{"name": "http", "port": spec.port, "targetPort": "http"}],
         },
     }
 
 
 def render_deployment(
-    release: str, connector: str, spec: ConnectorSpec, secret_name: str
+    release: str, agent: str, connector: str, spec: ConnectorSpec, secret_name: str
 ) -> dict[str, Any]:
-    name = object_name(release, connector)
+    name = object_name(release, agent, connector)
     env: list[dict[str, Any]] = [{"name": k, "value": v} for k, v in sorted(spec.env.items())]
     # Declared secrets arrive by reference, never as literals in the manifest.
     env += [
@@ -115,12 +147,12 @@ def render_deployment(
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": name, "labels": _labels(release, connector)},
+        "metadata": {"name": name, "labels": _labels(release, agent, connector)},
         "spec": {
             "replicas": 1,
-            "selector": {"matchLabels": _labels(release, connector)},
+            "selector": {"matchLabels": _labels(release, agent, connector)},
             "template": {
-                "metadata": {"labels": _labels(release, connector)},
+                "metadata": {"labels": _labels(release, agent, connector)},
                 "spec": {
                     # Hardened by construction. The author never writes this, so
                     # the author cannot omit it.
@@ -154,7 +186,7 @@ def render_deployment(
 
 
 def render_networkpolicy(
-    release: str, app_name: str, connector: str, spec: ConnectorSpec
+    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
 ) -> dict[str, Any]:
     """Egress from the sandbox to this connector.
 
@@ -166,15 +198,15 @@ def render_networkpolicy(
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": {
-            "name": f"{object_name(release, connector)}-allow",
-            "labels": _labels(release, connector),
+            "name": f"{object_name(release, agent, connector)}-allow",
+            "labels": _labels(release, agent, connector),
         },
         "spec": {
             "podSelector": {"matchLabels": sandbox_selector(release, app_name)},
             "policyTypes": ["Egress"],
             "egress": [
                 {
-                    "to": [{"podSelector": {"matchLabels": _labels(release, connector)}}],
+                    "to": [{"podSelector": {"matchLabels": _labels(release, agent, connector)}}],
                     "ports": [{"protocol": "TCP", "port": spec.port}],
                 }
             ],
@@ -184,6 +216,7 @@ def render_networkpolicy(
 
 def render(
     release: str,
+    agent: str,
     namespace: str,
     app_name: str,
     connector: str,
@@ -195,13 +228,15 @@ def render(
     if not spec.is_hosted:
         return []
     return [
-        render_service(release, connector, spec),
-        render_deployment(release, connector, spec, secret_name),
-        render_networkpolicy(release, app_name, connector, spec),
+        render_service(release, agent, connector, spec),
+        render_deployment(release, agent, connector, spec, secret_name),
+        render_networkpolicy(release, agent, app_name, connector, spec),
     ]
 
 
-def mcp_entry(release: str, namespace: str, connector: str, spec: ConnectorSpec) -> dict[str, Any]:
+def mcp_entry(
+    release: str, agent: str, namespace: str, connector: str, spec: ConnectorSpec
+) -> dict[str, Any]:
     """The ``.mcp.json`` entry Curie injects, so the author writes no URL.
 
     For a hosted connector the URL is derived from the Service that Curie just
@@ -212,7 +247,7 @@ def mcp_entry(release: str, namespace: str, connector: str, spec: ConnectorSpec)
     if spec.is_hosted:
         return {
             "type": "http",
-            "url": f"http://{service_dns(release, connector, namespace)}:{spec.port}/mcp",
+            "url": f"http://{service_dns(release, agent, connector, namespace)}:{spec.port}/mcp",
         }
     entry: dict[str, Any] = {"type": "http", "url": spec.url}
     if spec.headers:
@@ -220,8 +255,8 @@ def mcp_entry(release: str, namespace: str, connector: str, spec: ConnectorSpec)
     return entry
 
 
-def _labels(release: str, connector: str) -> dict[str, str]:
+def _labels(release: str, agent: str, connector: str) -> dict[str, str]:
     return {
-        "app.kubernetes.io/name": object_name(release, connector),
+        "app.kubernetes.io/name": object_name(release, agent, connector),
         "app.kubernetes.io/part-of": release,
     }
