@@ -386,18 +386,24 @@ def open_note_dialog(
         resolver=resolver,
         log=log,
     )
+    # Every outcome is rendered, not just the success (#1085). The in-view error
+    # channel the submit path uses cannot fire here -- there is no view, that is
+    # why we are on this path at all -- so the ephemeral is the ONLY surface left.
+    # Reporting only the 200 left a refused clicker with total silence, which for
+    # a non-approver is indistinguishable from the platform being down, and for an
+    # expired approval hides the one fact they need.
     if outcome.status_code == 200:
-        _ephemeral(
-            web_client,
-            channel=channel,
-            user=user,
-            text=(
-                "The note box could not be opened, so this was resolved without a "
-                "note. Add one with `curie <tier> approvals <agent> --resolve` if "
-                "it matters."
-            ),
-            log=log,
+        text = (
+            "The note box could not be opened, so this was resolved without a "
+            "note. Add one with `curie <tier> approvals <agent> --resolve` if "
+            "it matters."
         )
+    else:
+        # The same wording the in-view path renders, so a refusal reads
+        # identically whether or not the dialog managed to open, and the three
+        # refusal classes stay distinguishable (#453 AC5).
+        text = _refusal_text(outcome)
+    _ephemeral(web_client, channel=channel, user=user, text=text, log=log)
     return outcome
 
 
