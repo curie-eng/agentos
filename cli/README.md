@@ -6,6 +6,31 @@ HTTP/NDJSON (newline-delimited JSON), and the platform API's committed
 openapi.json) and orchestrates a local runner container via Docker, so a
 plugin runs on a dev laptop with zero Slack involved.
 
+## Table of contents
+
+- [Which target do I want?](#which-target-do-i-want)
+- [Output](#output)
+- [Agent-facing output contract](#agent-facing-output-contract)
+- [For users](#for-users)
+  - [`curie secrets`](#curie-secrets)
+  - [`curie` / `curie interactive`](#curie--curie-interactive)
+  - [`init` (top-level)](#init-top-level)
+    - [`init --from-spec` spec shape](#init---from-spec-spec-shape)
+  - [`skill` target: runner-only, fully offline](#skill-target-runner-only-fully-offline)
+  - [`local` target: full platform via compose, no Slack](#local-target-full-platform-via-compose-no-slack)
+  - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
+  - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
+  - [`cluster` target: deployed Helm release](#cluster-target-deployed-helm-release)
+    - [Bundle packing exclusions](#bundle-packing-exclusions)
+    - [Artifact resolution](#artifact-resolution)
+  - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
+    - [Targeting a deployed agent and continuing a thread](#targeting-a-deployed-agent-and-continuing-a-thread)
+- [For contributors](#for-contributors)
+  - [`curie install`](#curie-install)
+  - [`curie dev`](#curie-dev)
+  - [Building the runner image from source](#building-the-runner-image-from-source)
+  - [Verify](#verify)
+
 ## Which target do I want?
 
 Every environment command takes a **target noun** in the middle: `skill`,
