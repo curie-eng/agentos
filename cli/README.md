@@ -12,7 +12,7 @@ below.
 
 - [Interactive mode](#interactive-mode)
 - [Output](#output)
-- [Agent-facing output contract](#agent-facing-output-contract)
+- [Agent driven CLI](#agent-driven-cli)
 - [For users](#for-users)
   - [Scaffolding an agent plugin](#scaffolding-an-agent-plugin)
     - [`init --from-spec` spec shape](#init---from-spec-spec-shape)
@@ -89,10 +89,15 @@ On an interactive terminal, progress renders as spinners and a live checklist;
 it degrades automatically to plain, colorless status lines on a non-TTY, in
 CI, or when `NO_COLOR`/`TERM=dumb` are set.
 
-## Agent-facing output contract
+## Agent driven CLI
 
 The CLI's primary consumer is a coding agent (ADR-0021), so its output and
 control flow are machine-first.
+
+Run `curie guide` to print a self-contained primer for a coding agent
+driving the harness -- the parity ladder, when/which decision logic, the
+landmines, and verify-first guidance -- to stdout. `--json` emits the same
+content as a structured variant.
 
 **`--json`** (global) makes every agent-facing verb emit a single
 machine-readable JSON object on **stdout** instead of empty output: the
@@ -177,11 +182,6 @@ hanging.
 | `curie init <name>` | Scaffold a plugin bundle (Claude Code plugin shape: `.claude-plugin/plugin.json`, `skills/<name>/SKILL.md`, `.mcp.json`) plus an `evals/cases.json` seed, a root `AGENTS.md`, and an installable `.claude/skills/using-curie/SKILL.md` harness primer. |
 | `curie init --from-spec <path>` | Scaffold **non-interactively** from an agent-authored spec file (JSON). The bundle name comes from the spec, not a positional argument. A coding agent interviews the human, writes the spec, then this command lays down the same plugin-format shape deterministically -- zero prompts. See the spec shape below. |
 | `curie init --adopt <dir>` | Adopt an existing non-plugin directory: scaffold the same plugin skeleton **into** it, alongside your code and never overwriting an existing file, with the bundle name derived from the directory unless a `<name>` is given. The on-ramp for a pre-plugin (`agent-ss-template`) bundle; the logic port is manual afterward -- see `docs/adopting-a-bundle.md`. |
-| `curie` | Open the keyboard-driven terminal interface. Explicit forms: `curie interactive`, `curie ui`, `curie tui`. |
-| `curie secrets set <NAME>` | Save a local secret in Curie's mode-0600 credential file with hidden input. `--from-env <VAR>` reads from an existing environment variable for non-interactive use without putting the value in argv. |
-| `curie secrets list` | List saved Curie secret names. Values are never printed. |
-| `curie secrets unset <NAME>` | Remove a saved local secret. |
-| `curie guide` | Print a self-contained primer (ADR-0021) for a coding agent driving the harness: the parity ladder, when/which decision logic, the landmines, and verify-first, to stdout. `--json` emits the same content as a structured variant (data on stdout). |
 
 #### `init --from-spec` spec shape
 
