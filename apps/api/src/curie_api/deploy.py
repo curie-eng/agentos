@@ -39,7 +39,9 @@ class BundleTooLarge(Exception):
     """
 
 
-def validate_archive(data: bytes, settings: Settings | None = None) -> tuple[str, str]:
+def validate_archive(
+    data: bytes, settings: Settings | None = None
+) -> tuple[str, str]:
     """Validate an archive's bytes. Returns (extension, content_type).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),

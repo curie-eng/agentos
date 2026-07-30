@@ -51,7 +51,9 @@ def _zip(files: dict[str, str]) -> bytes:
 
 
 def test_valid_tar_gz_passes_validation(tmp_path: Path) -> None:
-    ext, content_type, result = bundles.extract_and_validate(_tar_gz(_valid_files()), tmp_path)
+    ext, content_type, result = bundles.extract_and_validate(
+        _tar_gz(_valid_files()), tmp_path
+    )
     assert ext == ".tar.gz"
     assert content_type == "application/gzip"
     assert result.valid, result.errors
@@ -124,7 +126,9 @@ def test_upload_store_fetch_round_trip(
     archive = _tar_gz(_valid_files())
     url = f"/agents/{agent_id}/versions/{version_id}/bundle"
 
-    resp = client.put(url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers)
+    resp = client.put(
+        url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers
+    )
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["bundle_ref"] == f"bundles/{agent_id}/{version_id}.tar.gz"
@@ -132,7 +136,9 @@ def test_upload_store_fetch_round_trip(
     assert body["size_bytes"] == len(archive)
 
     # The version now advertises the stored bundle.
-    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
+    version = client.get(
+        f"/agents/{agent_id}/versions", headers=auth_headers
+    ).json()[0]
     assert version["bundle_ref"] == body["bundle_ref"]
     assert version["bundle_sha256"] == body["bundle_sha256"]
 
@@ -143,14 +149,20 @@ def test_upload_store_fetch_round_trip(
     assert hashlib.sha256(got.content).hexdigest() == body["bundle_sha256"]
 
 
-def test_bundles_are_immutable(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
+def test_bundles_are_immutable(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
     agent_id, version_id = _create_version(client, auth_headers)
     url = f"/agents/{agent_id}/versions/{version_id}/bundle"
     archive = _tar_gz(_valid_files())
 
-    first = client.put(url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers)
+    first = client.put(
+        url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers
+    )
     assert first.status_code == 201
-    second = client.put(url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers)
+    second = client.put(
+        url, files={"file": ("demo.tar.gz", archive)}, headers=auth_headers
+    )
     assert second.status_code == 409
 
 
@@ -176,7 +188,9 @@ def test_fetch_missing_bundle_is_404(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     agent_id, version_id = _create_version(client, auth_headers)
-    resp = client.get(f"/agents/{agent_id}/versions/{version_id}/bundle", headers=auth_headers)
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/bundle", headers=auth_headers
+    )
     assert resp.status_code == 404
 
 
@@ -197,7 +211,9 @@ def test_read_version_files_returns_bundle_text_surfaces(
     )
     assert put.status_code == 201, put.text
 
-    resp = client.get(f"/agents/{agent_id}/versions/{version_id}/files", headers=auth_headers)
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/files", headers=auth_headers
+    )
     assert resp.status_code == 200, resp.text
     returned = {f["path"]: f["content"] for f in resp.json()["files"]}
     assert set(returned) == {
@@ -216,7 +232,9 @@ def test_read_version_files_missing_bundle_is_404(
 ) -> None:
     # A version with no bundle stored yet has nothing to read.
     agent_id, version_id = _create_version(client, auth_headers)
-    resp = client.get(f"/agents/{agent_id}/versions/{version_id}/files", headers=auth_headers)
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/files", headers=auth_headers
+    )
     assert resp.status_code == 404
 
 
@@ -225,5 +243,7 @@ def test_read_version_files_unknown_version_is_404(
 ) -> None:
     agent_id, _ = _create_version(client, auth_headers)
     missing = "00000000-0000-0000-0000-000000000000"
-    resp = client.get(f"/agents/{agent_id}/versions/{missing}/files", headers=auth_headers)
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{missing}/files", headers=auth_headers
+    )
     assert resp.status_code == 404

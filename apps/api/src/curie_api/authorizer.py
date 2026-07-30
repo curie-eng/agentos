@@ -42,7 +42,9 @@ from .models import Approval
 
 # The one wording for a self-approval refusal, so the dispatcher's rendering of
 # it does not depend on which set the approval happened to be bound to.
-_SELF_APPROVAL_REASON = "self-approval is blocked: the requester cannot resolve their own request"
+_SELF_APPROVAL_REASON = (
+    "self-approval is blocked: the requester cannot resolve their own request"
+)
 
 
 @dataclass(frozen=True)
@@ -90,5 +92,7 @@ async def authorize_approval(
         # Both refuse, and the set says why: it is the only one that knows
         # whether it could not determine membership or the actor is genuinely
         # outside the set.
-        return name, AuthzDecision(allowed=False, reason=verdict.reason, evidence=verdict.evidence)
+        return name, AuthzDecision(
+            allowed=False, reason=verdict.reason, evidence=verdict.evidence
+        )
     return name, AuthzDecision(allowed=True, evidence=verdict.evidence)

@@ -141,7 +141,9 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
     headers = {"X-API-Key": app}
 
     for ns in ("memory", "transcript"):
-        put = client.put(f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers)
+        put = client.put(
+            f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers
+        )
         assert put.status_code == 403, f"{ns}: {put.text}"
         assert "reserved" in put.text
         # Every verb over a reserved namespace is refused, not just writes.
@@ -180,7 +182,8 @@ def test_namespace_enumeration_hides_reserved_from_the_app_token(
     assert app_names == {"workflow"}, app_names
 
     platform_names = {
-        row["namespace"] for row in client.get(f"/agents/{aid}/state", headers=auth_headers).json()
+        row["namespace"]
+        for row in client.get(f"/agents/{aid}/state", headers=auth_headers).json()
     }
     assert platform_names == {"memory", "transcript", "workflow"}, platform_names
 
@@ -211,7 +214,9 @@ def test_broad_state_token_and_platform_key_reach_reserved_namespaces(
 
     for headers in ({"X-API-Key": broad}, auth_headers):
         for ns in ("memory", "transcript"):
-            r = client.put(f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers)
+            r = client.put(
+                f"/agents/{aid}/state/{ns}/k", json={"value": {"n": 1}}, headers=headers
+            )
             assert r.status_code == 200, f"{ns}: {r.text}"
 
 
@@ -222,7 +227,9 @@ def test_put_get_list_delete_round_trip(
     base = f"/agents/{aid}/state/approvals"
 
     # put (create) -> version 1
-    r = client.put(f"{base}/thread-1", json={"value": {"status": "pending"}}, headers=auth_headers)
+    r = client.put(
+        f"{base}/thread-1", json={"value": {"status": "pending"}}, headers=auth_headers
+    )
     assert r.status_code == 200, r.text
     assert r.json()["value"] == {"status": "pending"}
     assert r.json()["version"] == 1
@@ -239,7 +246,9 @@ def test_put_get_list_delete_round_trip(
     assert r2.json()["version"] == 2
 
     # list by namespace returns both keys
-    client.put(f"{base}/thread-2", json={"value": {"status": "pending"}}, headers=auth_headers)
+    client.put(
+        f"{base}/thread-2", json={"value": {"status": "pending"}}, headers=auth_headers
+    )
     listed = client.get(base, headers=auth_headers).json()
     assert {e["key"] for e in listed} == {"thread-1", "thread-2"}
 
@@ -259,12 +268,16 @@ def test_compare_and_set_rejects_a_stale_version(
     assert v1["version"] == 1
 
     # CAS with the current version succeeds and bumps to 2.
-    ok = client.put(url, json={"value": {"n": 2}, "expected_version": 1}, headers=auth_headers)
+    ok = client.put(
+        url, json={"value": {"n": 2}, "expected_version": 1}, headers=auth_headers
+    )
     assert ok.status_code == 200
     assert ok.json()["version"] == 2
 
     # CAS with the now-stale version 1 is rejected, and the value is unchanged.
-    stale = client.put(url, json={"value": {"n": 3}, "expected_version": 1}, headers=auth_headers)
+    stale = client.put(
+        url, json={"value": {"n": 3}, "expected_version": 1}, headers=auth_headers
+    )
     assert stale.status_code == 409, stale.text
     assert client.get(url, headers=auth_headers).json()["value"] == {"n": 2}
 
@@ -273,7 +286,9 @@ def test_put_unknown_agent_is_404(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     missing = "00000000-0000-0000-0000-000000000000"
-    r = client.put(f"/agents/{missing}/state/ns/k", json={"value": {}}, headers=auth_headers)
+    r = client.put(
+        f"/agents/{missing}/state/ns/k", json={"value": {}}, headers=auth_headers
+    )
     assert r.status_code == 404
 
 

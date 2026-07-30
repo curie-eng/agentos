@@ -19,7 +19,9 @@ from ..schemas import (
 )
 from ..wirebody import EvalReportBody
 
-router = APIRouter(prefix="/evals", tags=["evals"], dependencies=[Depends(require_api_key)])
+router = APIRouter(
+    prefix="/evals", tags=["evals"], dependencies=[Depends(require_api_key)]
+)
 
 
 @router.post("/trigger", response_model=EvalTriggerResult)
@@ -37,10 +39,14 @@ async def trigger_eval(
     if body.version_id is not None:
         version = await crud.get_version(session, body.version_id)
         if version is None or version.agent_id != agent.id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found for this agent")
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "version not found for this agent"
+            )
         sha = version.commit_sha
     else:
-        deployment = await crud.get_active_deployment(session, agent.id, Environment.dev)
+        deployment = await crud.get_active_deployment(
+            session, agent.id, Environment.dev
+        )
         if deployment is None:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
@@ -48,7 +54,9 @@ async def trigger_eval(
             )
         version = await crud.get_version(session, deployment.version_id)
         if version is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "deployed version not found")
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "deployed version not found"
+            )
         sha = version.commit_sha or deployment.commit_sha
 
     if sha is None:
@@ -94,7 +102,9 @@ async def trigger_eval(
 
 
 @router.get("/matrix", response_model=EvalMatrix)
-async def eval_matrix(lf: LangfuseDep, suite: str, versions: int = 5) -> EvalMatrix:
+async def eval_matrix(
+    lf: LangfuseDep, suite: str, versions: int = 5
+) -> EvalMatrix:
     # Filtered by SUITE, the real dimension on eval traces. There is
     # deliberately no agent filter: eval traces are tagged by suite + version,
     # not agent, so an agent param would be dead. Do not re-add one.
@@ -103,7 +113,9 @@ async def eval_matrix(lf: LangfuseDep, suite: str, versions: int = 5) -> EvalMat
 
 
 @router.post("/report", response_model=EvalReportResult)
-async def report_eval(report: EvalReportBody, reporter: GitHubReporterDep) -> EvalReportResult:
+async def report_eval(
+    report: EvalReportBody, reporter: GitHubReporterDep
+) -> EvalReportResult:
     # The eval Job (or the fan-out consumer) posts its rollup here on completion;
     # the API turns it into a GitHub commit status. Posting twice is harmless
     # (GitHub statuses are last-write-wins per context), so no dedupe.
@@ -124,12 +136,14 @@ async def report_eval(report: EvalReportBody, reporter: GitHubReporterDep) -> Ev
         if exc.status_code == status.HTTP_404_NOT_FOUND:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
-                f"repo or commit not found on GitHub: {report.repo_full_name}@{report.sha}",
+                f"repo or commit not found on GitHub: "
+                f"{report.repo_full_name}@{report.sha}",
             ) from exc
         if 400 <= exc.status_code < 500:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"GitHub rejected the commit-status post ({exc.status_code}): {exc.detail}",
+                f"GitHub rejected the commit-status post "
+                f"({exc.status_code}): {exc.detail}",
             ) from exc
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
