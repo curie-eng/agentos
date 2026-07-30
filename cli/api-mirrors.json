@@ -113,6 +113,11 @@
         { "field": "models", "why": "The model dimension the CLI acts on is model_version_summaries[].model; the separate models label list is not read." },
         { "field": "model_summaries", "why": "The window-blended per-model rollup sums completed across every in-window sha, which masks a triggered sha's zero-completed outcome (#814); the sweep reads the per-(version, model) model_version_summaries scoped to the triggered sha instead, so the blended rollup is not consumed by the CLI." }
       ]
+    },
+    {
+      "struct": "ConnectorManifests",
+      "schema": "ConnectorManifests",
+      "omissions": []
     }
   ],
   "non_mirrors": [],

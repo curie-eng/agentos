@@ -495,6 +495,22 @@ class BundleFiles(BaseModel):
     files: list[BundleFile]
 
 
+class ConnectorManifests(BaseModel):
+    """Kubernetes objects derived from a version's ``connectors.yaml``.
+
+    The API renders; the caller applies. Rendering is a pure function of the
+    bundle plus the deployment context the caller supplies, so producing this
+    needs no cluster access and the API's read-only RBAC is untouched
+    (ADR-0086, #1063).
+    """
+
+    manifests: list[dict[str, Any]] = Field(default_factory=list)
+    # name -> the `.mcp.json` entry the agent should use. Derived from the
+    # Service in `manifests`, so an author never hand-writes a URL that
+    # resolves in one tier and not another.
+    mcp_entries: dict[str, Any] = Field(default_factory=dict)
+
+
 class DeploymentCreate(BaseModel):
     agent_id: uuid.UUID
     version_id: uuid.UUID
