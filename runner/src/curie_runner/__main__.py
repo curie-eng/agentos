@@ -25,6 +25,7 @@ from .approval import (
     resolve_approval_policy,
 )
 from .config import RunnerConfig
+from .connectors import derive_mcp_servers
 from .fake import FakeModelSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -222,6 +223,19 @@ def build_runner(
                     {STATE_SERVER_NAME: build_state_server(state_client)}
                     if state_client is not None
                     else {}
+                ),
+                # Connectors the bundle DECLARED and Curie hosts (ADR-0086,
+                # #1118). Platform-supplied, exactly like the two above, so they
+                # ride the same channel -- nothing rewrites the read-only
+                # bundle. The URL derives from the Service Curie created via the
+                # same function that rendered it, so the two cannot disagree. A
+                # name clashing with the bundle's own MCP config is already a
+                # deploy-time error (#1149), so this cannot shadow it.
+                **derive_mcp_servers(
+                    config.session.plugin_dir,
+                    release=config.connector_release,
+                    agent=config.connector_agent,
+                    namespace=config.connector_namespace,
                 ),
             },
             can_use_tool=(
