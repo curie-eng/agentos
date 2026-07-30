@@ -227,9 +227,9 @@ worker, sandbox) in front of the identical runner and ACI. A `message` on
 either therefore walks the same path a real Slack mention would take.
 
 See `cli/README.md` for the full command reference per target
-([`skill`](cli/README.md#skill-target-runner-only-fully-offline),
-[`local`](cli/README.md#local-target-full-platform-via-compose-no-slack),
-[`cluster`](cli/README.md#cluster-target-deployed-helm-release)),
+([`skill`](cli/README.md#skill-target),
+[`local`](cli/README.md#local-target),
+[`cluster`](cli/README.md#cluster-target)),
 [`docs/slack-local-runbook.md`](docs/slack-local-runbook.md) for connecting local Slack, and
 [`docs/operations.md`](docs/operations.md) for cluster operations - the Quickstart above already
 walks through `skill`, `local`, and `cluster` end to end.

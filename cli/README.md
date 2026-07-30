@@ -17,11 +17,9 @@ below.
   - [Scaffolding an agent plugin](#scaffolding-an-agent-plugin)
     - [`init --from-spec` spec shape](#init---from-spec-spec-shape)
   - [Using different tiers](#using-different-tiers)
-    - [`skill` target: runner-only, fully offline](#skill-target-runner-only-fully-offline)
-    - [`local` target: full platform via compose, no Slack](#local-target-full-platform-via-compose-no-slack)
-      - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
-    - [`cluster` target: deployed Helm release](#cluster-target-deployed-helm-release)
-      - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
+    - [`skill` target](#skill-target)
+    - [`local` target](#local-target)
+    - [`cluster` target](#cluster-target)
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
@@ -273,7 +271,7 @@ front; `local` and `cluster` put the **full platform** (queue, worker,
 sandbox) in front of the identical runner and ACI, so a `message` walks the
 same path a real Slack mention would.
 
-#### `skill` target: runner-only, fully offline
+#### `skill` target
 
 Boots just the runner container on the host Docker daemon and speaks its ACI
 HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
@@ -305,7 +303,7 @@ on the host does not reach the running runner: re-run `curie skill up
 so a contract edit needs no restart. `skill down` (and `--replace`) release the
 snapshot along with the container.
 
-#### `local` target: full platform via compose, no Slack
+#### `local` target
 
 Wraps the `compose.dev.yaml` stack so a `message` walks the real
 queue -> worker -> sandboxed runner -> reply path on one machine, no Slack and
@@ -372,7 +370,7 @@ it reuses the last successful `local message` context from
 is required, explicit flags override the saved channel/thread/transport
 settings, and the same replay exclusions apply.
 
-#### `cluster` target: deployed Helm release
+#### `cluster` target
 
 Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 `cilium` wrap theirs. Every operator verb takes `--dry-run`. Full runbook in
