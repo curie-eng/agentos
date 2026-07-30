@@ -3508,6 +3508,11 @@
           "name": "emit-parity"
         },
         {
+          "about": "Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points at, not merely that its NetworkPolicies are applied (#1153, `bash scripts/check-netpol-enforcement.sh`). Structured as a non-vacuity check: it proves a DENIED direction is genuinely blocked before trusting any allowed one, so a CNI that ignores NetworkPolicy (kindnet, minikube's default) FAILS rather than passing green",
+          "hidden": false,
+          "name": "netpol-check"
+        },
+        {
           "about": "Assert the release-coupled versions agree: cli/Cargo.toml, Chart.yaml version, and appVersion (`bash scripts/check-version-consistency.sh`)",
           "hidden": false,
           "name": "version-check"

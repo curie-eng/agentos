@@ -906,11 +906,24 @@ jobs:
       # kind config: map the UI NodePort (chart default 30080) to the host so
       # `cluster deploy`'s UI `/api` NodePort discovery -- which resolves the
       # loopback kubeconfig host (127.0.0.1) -- reaches the in-cluster API.
+      #
+      # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
+      # implements NO NetworkPolicy controller, so every policy the chart ships
+      # -- including Rail 1's default-deny egress for runner sandboxes
+      # (ADR-0067) -- is applied and then silently never evaluated. A totally
+      # broken policy is indistinguishable from a correct one, which is how an
+      # egress rule naming a Service ClusterIP (unmatchable: kube-proxy DNATs
+      # to a pod IP before policy runs) reached a real cluster. Calico is
+      # installed below so this cluster behaves like the k3s and EKS clusters
+      # Curie actually runs on.
       - name: Write the kind cluster config
         run: |
           cat > kind-config.yaml <<'EOF'
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
           nodes:
             - role: control-plane
               extraPortMappings:
@@ -951,6 +964,14 @@ jobs:
           node_image: kindest/node:v1.31.0
           cluster_name: curie-e2e
           config: kind-config.yaml
+      # The cluster has no CNI until this lands (disableDefaultCNI above), so
+      # every node stays NotReady and nothing schedules until Calico is up.
+      - name: Install Calico so NetworkPolicy is actually enforced
+        run: |
+          set -euo pipefail
+          kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
       # Load the four locally-built images into the node store so the install's
       # pullPolicy Never overrides bind them with no registry pull.
       - name: Load images into the kind cluster
@@ -1035,6 +1056,16 @@ jobs:
           CURIE_BIN: cli/target/release/curie
           CURIE_E2E_TIERS: cluster
         run: bash cli/scripts/e2e-ladder.sh
+      # Rail 1 (ADR-0067) is a load-bearing security control that nothing else
+      # here asserts ENFORCES -- only that its policies exist (#1153). Runs
+      # after the round trip so a genuine turn failure surfaces first, and is
+      # itself a non-vacuity check: it proves a DENIED direction is blocked
+      # before trusting any allowed one, so it fails rather than passes green
+      # if the CNI ever stops enforcing.
+      - name: Rail 1 enforces (not just applied)
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash scripts/check-netpol-enforcement.sh curie curie curie
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure
