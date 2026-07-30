@@ -136,7 +136,7 @@ curie local down
 Finally, deploy the bundle on Kubernetes.
 Point `kubectl`/`helm` at a cluster - k3s is the lasting recommendation; if you don't have a cluster
 handy, [install minikube](https://minikube.sigs.k8s.io/) and run the following command
-(See [`docs/operations.md`](docs/operations.md#choosing-a-cluster) for the tradeoffs between k3s and minikube):
+(See [`docs/operations.md`](docs/operations.md#the-kubernetes-cluster) for the tradeoffs between k3s and minikube):
 
 ```bash
 minikube start
@@ -157,7 +157,7 @@ installed.
 `--allow-egress-host` opens the model call; a credential alone doesn't, since the cluster sandbox is
 fail-closed by default (skill/local aren't).
 
-See [`docs/operations.md`](docs/operations.md#install-and-inspect) for cluster prerequisites and the full egress model.
+See [`docs/operations.md`](docs/operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster) for cluster prerequisites and the full egress model.
 
 Then continue this conversation thread
 
@@ -173,7 +173,7 @@ curie cluster down --yes
 
 **4. Ship it: your CI/CD**
 
-Connect this bundle's repo once (see [`docs/operations.md`](docs/operations.md#connecting-a-repo-for-git-flow-deploys)), then:
+Connect this bundle's repo once (see [`docs/operations.md`](docs/operations.md#automatically-with-git-flow)), then:
 
 ```bash
 git push origin dev
