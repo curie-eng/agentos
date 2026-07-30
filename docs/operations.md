@@ -133,13 +133,16 @@ curie cluster deploy --plugin-dir <bundle-dir>
 | Flag / env var | What it does |
 |---|---|
 | `--plugin-dir <dir>` | The bundle directory to package and push. |
+| `--repo <owner/name>` | Bind this agent to a GitHub repo so pushes deploy it; set only on the deploy that creates the agent and unchangeable after. Omit it and the agent can never use git-flow. |
 | `--api-url <url>` / `CURIE_API_URL` | Direct-dial this URL instead of self-plumbing a loopback tunnel. |
 | `--api-key <key>` / `CURIE_API_KEY` | Override the auto-discovered API key. |
 
-Beyond pointing it at your bundle, `cluster deploy` needs no other flags by
-default: it automatically finds a way to reach the Curie API and
-automatically finds the credentials to use, so
-`curie cluster deploy --plugin-dir <bundle-dir>` just works.
+Beyond pointing it at your bundle, `cluster deploy` needs no `--api-url` or
+`--api-key` by default: it automatically finds a way to reach the Curie API
+and automatically finds the credentials to use, so
+`curie cluster deploy --plugin-dir <bundle-dir>` just works. The one flag
+you do need is `--repo`, and only if you want git-flow -- see
+[Automatically, with git-flow](#automatically-with-git-flow) below.
 
 Under the hood, it opens a secure local tunnel to the Curie API (so
 nothing needs to be exposed publicly) and reads the API key straight out
