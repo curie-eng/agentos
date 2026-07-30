@@ -4,63 +4,74 @@ The `curie` CLI (Rust: clap + tokio + reqwest). It speaks
 only the frozen contracts (the generated `curie-aci-protocol` crate over
 HTTP/NDJSON (newline-delimited JSON), and the platform API's committed
 openapi.json) and orchestrates a local runner container via Docker, so a
-plugin runs on a dev laptop with zero Slack involved.
+plugin runs on a dev laptop with zero Slack involved. `curie` alone opens a
+keyboard-driven interactive interface -- see [Interactive mode](#interactive-mode)
+below.
 
 ## Table of contents
 
-- [Which target do I want?](#which-target-do-i-want)
+- [Interactive mode](#interactive-mode)
 - [Output](#output)
 - [Agent-facing output contract](#agent-facing-output-contract)
 - [For users](#for-users)
-  - [`curie secrets`](#curie-secrets)
-  - [`curie` / `curie interactive`](#curie--curie-interactive)
-  - [`init` (top-level)](#init-top-level)
+  - [Scaffolding an agent plugin](#scaffolding-an-agent-plugin)
     - [`init --from-spec` spec shape](#init---from-spec-spec-shape)
-  - [`skill` target: runner-only, fully offline](#skill-target-runner-only-fully-offline)
-  - [`local` target: full platform via compose, no Slack](#local-target-full-platform-via-compose-no-slack)
-  - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
-  - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
-  - [`cluster` target: deployed Helm release](#cluster-target-deployed-helm-release)
-    - [Bundle packing exclusions](#bundle-packing-exclusions)
-    - [Artifact resolution](#artifact-resolution)
-  - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
-    - [Targeting a deployed agent and continuing a thread](#targeting-a-deployed-agent-and-continuing-a-thread)
+  - [Using different tiers](#using-different-tiers)
+    - [`skill` target: runner-only, fully offline](#skill-target-runner-only-fully-offline)
+    - [`local` target: full platform via compose, no Slack](#local-target-full-platform-via-compose-no-slack)
+    - [`curie local message`: the same roundtrip against the compose stack](#curie-local-message-the-same-roundtrip-against-the-compose-stack)
+    - [`cluster` target: deployed Helm release](#cluster-target-deployed-helm-release)
+      - [Bundle packing exclusions](#bundle-packing-exclusions)
+      - [Artifact resolution](#artifact-resolution)
+    - [`curie cluster message`: drive the deployed cluster with zero Slack](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack)
+      - [Targeting a deployed agent and continuing a thread](#targeting-a-deployed-agent-and-continuing-a-thread)
+  - [Managing secrets](#managing-secrets)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
   - [Building the runner image from source](#building-the-runner-image-from-source)
+  - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
   - [Verify](#verify)
 
-## Which target do I want?
+## Interactive mode
 
-Every environment command takes a **target noun** in the middle: `skill`,
-`local`, or `cluster`. Pick the lightest one that answers your question.
-`curie init` is the exception, a top-level verb that scaffolds a bundle on
-disk and targets no environment.
+The interactive terminal interface is a human-friendly command surface over the
+same `curie ...` subcommands documented here. It opens a full-screen TUI
+(Terminal User Interface) with target navigation, action selection, command
+previews, and guarded execution:
+when an action needs values (for example message text or a channel id), the TUI
+temporarily leaves the alternate screen, prompts for the values, runs the exact
+previewed command, then returns to the interface. Some actions also require a
+tier (local or cluster); the TUI asks which tier before prompting for the
+other values, and the command preview shows `<local|cluster>` in the tier's
+position until that question is answered.
 
-| Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
-|---|---|---|---|---|---|
-| `skill` | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none | none | `up` `check` `down` `status` `message` `eval` | Iterate a plugin/skill against a local runner, the fastest loop. |
-| `local` | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker). | stub by default, optional real Slack with `--slack` | none | `up` `down` `status` `comms` `message` `eval` `deploy` `reset-thread` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
-| `cluster` | The platform on Kubernetes (a Helm release). | optional | yes | `up` `down` `status` `comms` `message` `eval` `deploy` `kill` `resume` `budget` `reset-thread` `delete` | Operate and drive a deployed cluster release, and control its agents' lifecycle. |
+```bash
+curie
+curie interactive
+curie ui
+curie tui
+```
 
-The universal quartet `up`/`down`/`status`/`message` is on all three targets;
-`skill` adds `eval`, while `local` and `cluster` add `comms`, `eval`, plus `deploy`; `cluster`
-further adds the agent-lifecycle verbs `kill`/`resume`/`budget`/`delete`, and both `local`
-and `cluster` add `reset-thread` to force a stuck thread's sandbox to be released
-(#737). `eval` is on
-all three, running the SAME `evals/cases.json` with the SAME grader at each tier: a
-text-matcher case (`exact`/`contains`/`regex`) that passes at `skill` re-asserts the
-same way at `local` and `cluster`. `tool_called` cases are the one exception --
-`local` and `cluster` can only grade the reply text, not the tool-call trajectory, so
-a `tool_called` case only ever passes at `skill eval` (a known gap;
-[ADR-0022](../docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)
-tracks closing it by moving grading server-side). The distinction
-that matters: `skill` is the **runner-only** loop, talking straight to a runner
-container's ACI (Agent Container Interface) HTTP surface with no platform in
-front; `local` and `cluster` put the **full platform** (queue, worker,
-sandbox) in front of the identical runner and ACI, so a `message` walks the
-same path a real Slack mention would.
+Keyboard:
+
+| Key | Action |
+|---|---|
+| `Up`/`Down` or `k`/`j` | Move through actions |
+| `Tab` / `Left` / `Right` | Switch target filters |
+| `Enter` or `r` | Prompt for fields and run the selected command |
+| `q` or `Esc` | Exit |
+
+The first surface focuses on the common inner-loop and operations paths:
+`skill up/message/eval`, an **Explore examples** picker with live agent chat,
+`secrets set/list/unset`, `local up/message/status`, `cluster status/message`,
+`install`, and `dev contracts`.
+
+**Explore examples** opens a dialog for GitHub issues, Text stats engine, or
+Weather. After selection, Curie checks that example's credentials, starts its
+bundle once, and opens a persistent conversation. Type a message, read the
+reply, and continue for as many turns as needed. Leaving chat stops the runner
+and returns to Curie.
 
 ## Output
 
@@ -160,77 +171,7 @@ hanging.
 
 ## For users
 
-### `curie secrets`
-
-Local secrets are stored in `~/.config/curie/credentials.json` with mode 0600,
-not in the repo, shell history, command argv, `.env`, or Curie state files.
-This follows the prompt-free private-config pattern used by developer CLIs.
-Curie keeps a separate non-secret index so secret names can be listed without
-opening values. Existing Keychain credentials are copied into the private file
-on first use; Curie never writes to or deletes from Keychain during migration.
-
-```bash
-curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN
-curie secrets set ANTHROPIC_API_KEY
-curie secrets list
-curie secrets unset GITHUB_PERSONAL_ACCESS_TOKEN
-```
-
-For CI or other non-interactive setup, read from an existing environment
-variable instead of prompting:
-
-```bash
-curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN --from-env GITHUB_PAT
-```
-
-`curie skill up --secret <NAME>` first uses a real environment variable when
-one is already set. If it is missing, the CLI tries the Curie secret store and
-hydrates the process environment just long enough for Docker to forward `-e
-<NAME>` into the runner. The same lookup applies to saved model credentials
-(`CURIE_CREDENTIALS`, `ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN`) for
-live `skill up` runs.
-
-### `curie` / `curie interactive`
-
-The interactive terminal interface is a human-friendly command surface over the
-same `curie ...` subcommands documented here. It opens a full-screen TUI
-(Terminal User Interface) with target navigation, action selection, command
-previews, and guarded execution:
-when an action needs values (for example message text or a channel id), the TUI
-temporarily leaves the alternate screen, prompts for the values, runs the exact
-previewed command, then returns to the interface. Some actions also require a
-tier (local or cluster); the TUI asks which tier before prompting for the
-other values, and the command preview shows `<local|cluster>` in the tier's
-position until that question is answered.
-
-```bash
-curie
-curie interactive
-curie ui
-curie tui
-```
-
-Keyboard:
-
-| Key | Action |
-|---|---|
-| `Up`/`Down` or `k`/`j` | Move through actions |
-| `Tab` / `Left` / `Right` | Switch target filters |
-| `Enter` or `r` | Prompt for fields and run the selected command |
-| `q` or `Esc` | Exit |
-
-The first surface focuses on the common inner-loop and operations paths:
-`skill up/message/eval`, an **Explore examples** picker with live agent chat,
-`secrets set/list/unset`, `local up/message/status`, `cluster status/message`,
-`install`, and `dev contracts`.
-
-**Explore examples** opens a dialog for GitHub issues, Text stats engine, or
-Weather. After selection, Curie checks that example's credentials, starts its
-bundle once, and opens a persistent conversation. Type a message, read the
-reply, and continue for as many turns as needed. Leaving chat stops the runner
-and returns to Curie.
-
-### `init` (top-level)
+### Scaffolding an agent plugin
 
 | Command | What it does |
 |---|---|
@@ -302,7 +243,38 @@ with the platform grader, not an oversight.
 curie init --from-spec agent-spec.json   # bundle name (deal-desk) comes from the spec
 ```
 
-### `skill` target: runner-only, fully offline
+### Using different tiers
+
+Every environment command takes a **target noun** in the middle: `skill`,
+`local`, or `cluster`. Pick the lightest one that answers your question.
+`curie init` is the exception, a top-level verb that scaffolds a bundle on
+disk and targets no environment.
+
+| Target | What runs | Slack | Kubernetes | Verbs | Reach for it to |
+|---|---|---|---|---|---|
+| `skill` | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none | none | `up` `check` `down` `status` `message` `eval` | Iterate a plugin/skill against a local runner, the fastest loop. |
+| `local` | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker). | stub by default, optional real Slack with `--slack` | none | `up` `down` `status` `comms` `message` `eval` `deploy` `reset-thread` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
+| `cluster` | The platform on Kubernetes (a Helm release). | optional | yes | `up` `down` `status` `comms` `message` `eval` `deploy` `kill` `resume` `budget` `reset-thread` `delete` | Operate and drive a deployed cluster release, and control its agents' lifecycle. |
+
+The universal quartet `up`/`down`/`status`/`message` is on all three targets;
+`skill` adds `eval`, while `local` and `cluster` add `comms`, `eval`, plus `deploy`; `cluster`
+further adds the agent-lifecycle verbs `kill`/`resume`/`budget`/`delete`, and both `local`
+and `cluster` add `reset-thread` to force a stuck thread's sandbox to be released
+(#737). `eval` is on
+all three, running the SAME `evals/cases.json` with the SAME grader at each tier: a
+text-matcher case (`exact`/`contains`/`regex`) that passes at `skill` re-asserts the
+same way at `local` and `cluster`. `tool_called` cases are the one exception --
+`local` and `cluster` can only grade the reply text, not the tool-call trajectory, so
+a `tool_called` case only ever passes at `skill eval` (a known gap;
+[ADR-0022](../docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)
+tracks closing it by moving grading server-side). The distinction
+that matters: `skill` is the **runner-only** loop, talking straight to a runner
+container's ACI (Agent Container Interface) HTTP surface with no platform in
+front; `local` and `cluster` put the **full platform** (queue, worker,
+sandbox) in front of the identical runner and ACI, so a `message` walks the
+same path a real Slack mention would.
+
+#### `skill` target: runner-only, fully offline
 
 Boots just the runner container on the host Docker daemon and speaks its ACI
 HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
@@ -334,7 +306,7 @@ on the host does not reach the running runner: re-run `curie skill up
 so a contract edit needs no restart. `skill down` (and `--replace`) release the
 snapshot along with the container.
 
-### `local` target: full platform via compose, no Slack
+#### `local` target: full platform via compose, no Slack
 
 Wraps the `compose.dev.yaml` stack so a `message` walks the real
 queue -> worker -> sandboxed runner -> reply path on one machine, no Slack and
@@ -351,11 +323,11 @@ the optional Slack dispatcher.
 | `curie local observability` | Print the local platform's observability surfaces: Curie Console, Langfuse UI (traces / cost / evals), and the Curie API base. URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser. |
 | `curie local comms --slack` | Connect or disconnect a real Slack workspace for the compose stack. Resolves `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a value persisted with `curie secrets set` (so tokens saved once need no per-session re-export, #749), masks them in dry run output, starts or stops the dispatcher, and switches the worker between real Slack and the local stub. |
 | `curie local message "..."` | Drive the local compose stack end to end with zero Slack. Enqueues straight to the compose Valkey and lets the containerized worker answer. |
-| `curie local eval` | Run the bundle's `evals/cases.json` through the compose stack's enqueue -> worker -> sandbox -> reply path (one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure. `--cases` overrides the file; `--dry-run` prints the plan. `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709). Only the reply text is observed here, so a `tool_called` case always fails -- see "Which target do I want?" above. |
+| `curie local eval` | Run the bundle's `evals/cases.json` through the compose stack's enqueue -> worker -> sandbox -> reply path (one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure. `--cases` overrides the file; `--dry-run` prints the plan. `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709). Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above. |
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737). The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted. Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 
-### `curie local message`: the same roundtrip against the compose stack
+#### `curie local message`: the same roundtrip against the compose stack
 
 `local message` drives the local compose stack (`curie local up`) instead of a
 Kubernetes release, so the whole loop is one machine with no cluster:
@@ -401,16 +373,7 @@ it reuses the last successful `local message` context from
 is required, explicit flags override the saved channel/thread/transport
 settings, and the same replay exclusions apply.
 
-### Prototyping agents in a source checkout
-
-Two shortcuts for working with the repo's own `agents/` scratch directory:
-
-| Command | What it does |
-|---|---|
-| `curie list-agents` | List the plugin bundles under `agents/`, a personal, gitignored directory (sibling of `examples/`, source checkout only) for in-progress agent projects. Empty, not an error, when the directory doesn't exist. |
-| `curie deploy-local <folder>` | Deploy `agents/<folder>` to the local platform by name -- shorthand for `curie local deploy --plugin-dir agents/<folder>` (identical operation, same flags minus `--plugin-dir`). Local tier only; use `curie cluster deploy --plugin-dir agents/<folder>` for the cluster tier. The interactive "How to deploy to Slack" workflow offers the same `agents/` bundles as a picker. |
-
-### `cluster` target: deployed Helm release
+#### `cluster` target: deployed Helm release
 
 Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 `cilium` wrap theirs. Every operator verb takes `--dry-run`. Full runbook in
@@ -424,7 +387,7 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster observability` | Report the release's observability surfaces (Curie Console, Langfuse UI, Curie API base), using the same NodePort discovery as `cluster status`. Degrades a missing, ClusterIP, or unresolvable surface to a note instead of failing. URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser. `--dry-run` prints the read-only discovery commands. |
 | `curie cluster comms --slack` | Connect or disconnect a real Slack workspace with a thin `helm upgrade --reuse-values`; env-backed tokens are masked in dry-run output. |
 | `curie cluster message "..."` | Drive the deployed release end to end with zero Slack: self plumbs kubectl port forwards, points the deployed worker at a local Slack stub (`helm upgrade --reuse-values`), enqueues, and prints the reply. Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
-| `curie cluster eval` | Run the bundle's `evals/cases.json` through the deployed release (self-plumbed port-forwards + per-turn reply stub, one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure. `--cases` overrides the file; `--dry-run` prints the plan. `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709). Only the reply text is observed here, so a `tool_called` case always fails -- see "Which target do I want?" above. Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#790). |
+| `curie cluster eval` | Run the bundle's `evals/cases.json` through the deployed release (self-plumbed port-forwards + per-turn reply stub, one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure. `--cases` overrides the file; `--dry-run` prints the plan. `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709). Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above. Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#790). |
 | `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API. When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057). Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |
@@ -442,7 +405,7 @@ and auto-discovers the release key (ADR-0057), the lifecycle verbs do neither
 `--dry-run` (prints the plan, makes no request); the destructive
 `kill`/`reset-thread`/`delete` also require `--yes`.
 
-#### Bundle packing exclusions
+##### Bundle packing exclusions
 
 `local deploy` and `cluster deploy` never pack `.curieignore`, `.curie`,
 `.git`, `.venv`, `venv`, `node_modules`, `__pycache__`, `.mypy_cache`, or
@@ -463,7 +426,7 @@ support (`*.log` never matches), and a pattern reaching outside the bundle
 packing error unless excluded, by design: the packer never dereferences a
 link to upload host files from outside the bundle root.
 
-#### Artifact resolution
+##### Artifact resolution
 
 Release builds resolve default artifacts from the binary version: `curie local
 up` fetches the self contained `compose.release.yaml` release asset, so it
@@ -483,7 +446,7 @@ the resolved argv without fetching.
 `--chart` to the repo-relative `charts/curie`, so a no-checkout binary must
 pass `--chart <path-or-tgz>` explicitly for now.
 
-### `curie cluster message`: drive the deployed cluster with zero Slack
+#### `curie cluster message`: drive the deployed cluster with zero Slack
 
 Before connecting a real workspace, `cluster message` is the zero-Slack path.
 When you are ready to wire Slack onto a deployed release, use:
@@ -541,7 +504,7 @@ does not replay `--stream`, `--listen-port`, `--valkey-local-port`,
 `--api-local-port`, or `--user`, so pass any of those again explicitly if the
 original turn used a non-default value.
 
-#### Targeting a deployed agent and continuing a thread
+##### Targeting a deployed agent and continuing a thread
 
 The worker binds a channel to an agent by exact equality on
 `agents.slack_channel`, so a random synthetic channel can never reach a
@@ -570,6 +533,36 @@ that placeholder's real Slack ts, so you can reply to it in Slack. Passing
 means the ts must name a real message in the channel -- a thread ts carried over
 from a stub run will be rejected by Slack, and the command tells you to drop
 `--thread` to start a new one.
+
+### Managing secrets
+
+Local secrets are stored in `~/.config/curie/credentials.json` with mode 0600,
+not in the repo, shell history, command argv, `.env`, or Curie state files.
+This follows the prompt-free private-config pattern used by developer CLIs.
+Curie keeps a separate non-secret index so secret names can be listed without
+opening values. Existing Keychain credentials are copied into the private file
+on first use; Curie never writes to or deletes from Keychain during migration.
+
+```bash
+curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN
+curie secrets set ANTHROPIC_API_KEY
+curie secrets list
+curie secrets unset GITHUB_PERSONAL_ACCESS_TOKEN
+```
+
+For CI or other non-interactive setup, read from an existing environment
+variable instead of prompting:
+
+```bash
+curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN --from-env GITHUB_PAT
+```
+
+`curie skill up --secret <NAME>` first uses a real environment variable when
+one is already set. If it is missing, the CLI tries the Curie secret store and
+hydrates the process environment just long enough for Docker to forward `-e
+<NAME>` into the runner. The same lookup applies to saved model credentials
+(`CURIE_CREDENTIALS`, `ANTHROPIC_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN`) for
+live `skill up` runs.
 
 ## For contributors
 
@@ -624,6 +617,15 @@ they error clearly -- a release binary has no dev scripts.
 | Command | What it does |
 |---|---|
 | `curie build` | Build the runner image locally: `docker build -f runner/Dockerfile -t curie-runner .` from the repo root (found by walking up to `runner/Dockerfile`). `--tag` overrides the tag. Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR (GitHub Container Registry) automatically and never needs to build. |
+
+### Prototyping agents in a source checkout
+
+Two shortcuts for working with the repo's own `agents/` scratch directory:
+
+| Command | What it does |
+|---|---|
+| `curie list-agents` | List the plugin bundles under `agents/`, a personal, gitignored directory (sibling of `examples/`, source checkout only) for in-progress agent projects. Empty, not an error, when the directory doesn't exist. |
+| `curie deploy-local <folder>` | Deploy `agents/<folder>` to the local platform by name -- shorthand for `curie local deploy --plugin-dir agents/<folder>` (identical operation, same flags minus `--plugin-dir`). Local tier only; use `curie cluster deploy --plugin-dir agents/<folder>` for the cluster tier. The interactive "How to deploy to Slack" workflow offers the same `agents/` bundles as a picker. |
 
 ### Verify
 
