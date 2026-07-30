@@ -24,19 +24,139 @@ The universal quartet `up`/`down`/`status`/`message` is on all three targets;
 further adds the agent-lifecycle verbs `kill`/`resume`/`budget`/`delete`, and both `local`
 and `cluster` add `reset-thread` to force a stuck thread's sandbox to be released
 (#737). `eval` is on
-all three: it runs the SAME `evals/cases.json` with the SAME grader at each tier (the
-per-tier parity gate). A text-matcher case (`exact`/`contains`/`regex`) that passes at
-`skill` re-asserts the same way at `local` and `cluster`. `tool_called` cases are the one
-exception: `local` and `cluster` only observe a turn's reply text over the message-relay
-path, never its tool-call trajectory, so a `tool_called` case can only be graded at
-`skill eval`. This is the fallback, client-side grading path; the preferred end state is
-to grade server-side at the runner instead, which would close this gap
-([ADR-0022](../docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)). The distinction
+all three, running the SAME `evals/cases.json` with the SAME grader at each tier: a
+text-matcher case (`exact`/`contains`/`regex`) that passes at `skill` re-asserts the
+same way at `local` and `cluster`. `tool_called` cases are the one exception --
+`local` and `cluster` can only grade the reply text, not the tool-call trajectory, so
+a `tool_called` case only ever passes at `skill eval` (a known gap;
+[ADR-0022](../docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)
+tracks closing it by moving grading server-side). The distinction
 that matters: `skill` is the **runner-only** loop, talking straight to a runner
 container's ACI (Agent Container Interface) HTTP surface with no platform in
 front; `local` and `cluster` put the **full platform** (queue, worker,
 sandbox) in front of the identical runner and ACI, so a `message` walks the
 same path a real Slack mention would.
+
+## Output
+
+Three global flags apply to every subcommand: `--debug` shows the verbose
+plumbing (helm/kubectl/compose command lines and their output, as dim lines),
+`-q`/`--quiet` prints the payload only (suppressing all progress and diagnostics
+on stderr), and `--color <auto|always|never>` (default `auto`) controls ANSI
+color.
+
+Stream discipline is strict: the **payload** (streamed agent reply tokens,
+resolved URLs, the status table, eval results, the deploy result, `skill status`
+JSON, the worker reply) goes to **stdout**, and every **diagnostic**
+(waiting/helm/kubectl/rollout/port-forward chatter, spinners, progress, notes)
+goes to **stderr**. So the payload pipes and redirects cleanly while progress
+still shows on the terminal:
+
+```bash
+curie cluster message "..." | jq         # clean JSON on stdout, progress on stderr
+curie local message "..." > reply.txt    # reply captured, progress on the terminal
+curie skill eval > results.txt           # results captured, progress on the terminal
+```
+
+On an interactive terminal, progress renders as a spinner-to-checkmark checklist
+(each step spins with a live dim elapsed counter, then freezes to a green `✓` or
+red `✗` with its elapsed time), a determinate bar for real totals (eval
+`N/total`), and streamed tokens that spin only until the first token then stream
+raw to stdout. Every wait resolves: a blown timeout ends in `✗ ... timed out
+after Ns`, never a hang. Compatibility is handled automatically:
+
+- **Auto-disable off a TTY.** Rendering is gated on `stderr.is_terminal()` plus
+  the cross-tool env standards. On a non-TTY, a pipe, `CI`, `TERM=dumb`,
+  `NO_COLOR`, or `CLICOLOR=0`, output is plain discrete status lines with no ANSI
+  and no `\r` redraws. `CLICOLOR_FORCE` / `--color=always` force color on;
+  `--color=never` forces it off. Color is resolved per stream, so a colored
+  terminal stderr never leaks ANSI into a redirected stdout.
+- **Graceful degradation.** The brand palette (success green, error red, amber
+  warn, dim grey plumbing, cyan URLs/ids, bold payload) is truecolor, degrading
+  to the 16 named ANSI colors where truecolor is unsupported (Apple Terminal,
+  tmux without passthrough).
+- **Never color-only.** Every status pairs a glyph with a word (`✓ pass`,
+  `✗ fail`, `⚠ warn`), and glyphs fall back to ASCII (`v`/`x`/`!`, `- \ | /`
+  spinner) in non-UTF-8 locales.
+
+## Agent-facing output contract
+
+The CLI's primary consumer is a coding agent (ADR-0021), so its output and
+control flow are machine-first.
+
+**`--json`** (global) makes every agent-facing verb emit a single
+machine-readable JSON object on **stdout** instead of empty output: the
+read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
+lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
+and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
+[<lines>]}`) all route through one centralized emitter.
+
+The `message` verbs keep their own, more specific shapes: `curie local
+message` and `curie cluster message` emit one structured line per terminal
+state on stdout --
+
+- a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
+  (the model's reply, which is null on a no-edit completion, plus the thread
+  the turn ran under);
+- a turn parked on a human approval gate emits `{"reply": ..., "thread":
+  ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
+  approval card rather than finalizing, and `reply` is the card's placeholder
+  text if seen);
+- a **timeout** emits `{"reply": null, "finalized": false,
+  "timed_out": true}` before exiting 3 (transient);
+- a turn **enqueued** onto the real Valkey stream in connected transport mode
+  emits `{"status": "enqueued", "channel": ..., "thread": ...}` -- the CLI
+  does not wait for the reply, so this is a terminal state of the command,
+  not of the turn; and
+- `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
+  "target": "local"|"cluster", "stream": ..., "channel": ...,
+  "reply_endpoint": ...}` (`channel` is null when it would be resolved from
+  the sole deployed agent).
+
+The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
+lag this contract on their real-path success output: `curie skill message`,
+and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still
+print human text rather than JSON on success (tracked in #485). All human and
+log text (progress, notes, warnings) goes to **stderr**, so a plain `...
+--json | jq` yields clean data. On failure under `--json`, the error is
+emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
+a prose message, so an agent can recover without parsing prose. `NO_COLOR`,
+`CLICOLOR`, and `--color=never` are honored on every command.
+
+**Versioned result schemas.** Every agent-facing `--json` result maps to a
+committed JSON Schema under `cli/schema/` with an explicit version identity (the
+`vN` segment of its `$id`); `cli/schema/index.json` is the inventory of every
+result family, the schema it maps to, and its version. The schemas are embedded
+in the released binary, so the discovery path works with no source checkout:
+`curie schema-index` prints the inventory index, and `curie schema-index
+<name>` (e.g. `curie schema-index kill`) prints one schema. A contract test
+(`cli/tests/schema_inventory.rs`) fails CI if a new result family lands without a
+schema, and `cli/tests/json_contract.rs` validates every result's real output
+against its schema. The compatibility policy — additive changes stay at the same
+version, breaking changes ship a new version — is
+[ADR-0074](../docs/adr/0074-versioned-json-schemas-for-cli-results.md).
+
+**Semantic exit codes** let an agent branch on *why* a command failed without
+parsing output:
+
+| Code | Class     | Meaning                                                                 |
+|------|-----------|-------------------------------------------------------------------------|
+| 0    | success   | The command did what was asked.                                         |
+| 1    | failure   | A genuine runtime failure (well-formed request, operation did not succeed). Do not retry blindly. |
+| 2    | usage     | A deterministic input error (missing `--yes`, a malformed flag/value, no bundle). Retrying the same argv fails identically -- fix the input. |
+| 3    | transient | A retryable condition (the endpoint was unreachable or timed out). The same argv may succeed once the dependency is up. |
+| 4    | unsupported | The verb was understood, but the concept it inspects does not exist at this tier by construction (`curie skill versions`, `curie skill memory`). No input and no retry changes that -- the same argv never succeeds here; the `fix` hint names the tier that does answer it. |
+
+**Non-interactive by default.** Every mutating command has a non-interactive
+path (`--yes` on `cluster down`/`kill`/`delete`/`reset-thread`, `local
+reset-thread`, and `local down --wipe`); none block on stdin. A confirmation
+prompt that would otherwise read stdin refuses
+with a usage error (exit 2) when the session is not a terminal, rather than
+hanging.
+
+(`curie local status` and `curie cluster status` proxy raw
+`docker compose`/`helm`/`kubectl` output and do not yet support `--json`; use
+`curie skill status` for a machine-readable runner status today.)
 
 ## `init` (top-level)
 
@@ -282,6 +402,52 @@ the optional Slack dispatcher.
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737). The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted. Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 
+## `curie local message`: the same roundtrip against the compose stack
+
+`local message` drives the local compose stack (`curie local up`) instead of a
+Kubernetes release, so the whole loop is one machine with no cluster:
+
+```bash
+curie local up
+curie local deploy --plugin-dir <dir> --slack-channel C0123ABCD --api-url http://localhost:28000
+curie local message "what changed in the last deploy?"
+```
+
+Local mode drops every cluster-specific step -- no kubectl, no `helm upgrade`
+wiring, no port-forwards, no dispatcher guard -- and answers by claiming a
+runner container on the host Docker daemon instead of a Kubernetes sandbox.
+Channel comes from `--channel` or, when omitted, the sole deployed agent
+looked up on the compose API. `local message` composes with `--channel`,
+`--thread`, and `--timeout-secs`, and rejects the cluster-only flags
+(`--namespace`, `--release`, `--force-wire`, ...) with a clear error.
+
+The compose worker runs the fake model by default (a canned reply, no
+credentials). Export a credential in your shell and `local up`/`local comms`
+go live automatically; or point `curie local up --env-file .env` at the
+bundle's own dotfile so the credential (`CURIE_CREDENTIALS`,
+`CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`) is read from it instead,
+with no `source` step and the value never reaching argv or logs. Set
+`CURIE_FAKE_MODEL=1` to force the fake model regardless of a credential
+being present.
+
+Use `curie local comms --slack` when you want the same compose stack to talk
+to a real Slack workspace. Connect resolves `SLACK_APP_TOKEN` and
+`SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a
+value persisted with `curie secrets set SLACK_APP_TOKEN` /
+`curie secrets set SLACK_BOT_TOKEN` -- so tokens saved once in Curie private
+storage need no per-session re-export -- masks them in printed commands, starts
+the dispatcher, and points the worker at real Slack, resolving the model the same
+way as `local up` (live when a credential is present, fake otherwise).
+`--disconnect` stops the dispatcher and restores the local stub. `--dry-run`
+prints the compose command only.
+
+`--continue` works the same way here as it does for
+[`cluster message`](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack):
+it reuses the last successful `local message` context from
+`.curie/last-turn.json` in the current working directory, so only the new text
+is required, explicit flags override the saved channel/thread/transport
+settings, and the same replay exclusions apply.
+
 ## `cluster` target: deployed Helm release
 
 Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
@@ -355,48 +521,6 @@ the resolved argv without fetching.
 `--chart` to the repo-relative `charts/curie`, so a no-checkout binary must
 pass `--chart <path-or-tgz>` explicitly for now.
 
-## Output
-
-Three global flags apply to every subcommand: `--debug` shows the verbose
-plumbing (helm/kubectl/compose command lines and their output, as dim lines),
-`-q`/`--quiet` prints the payload only (suppressing all progress and diagnostics
-on stderr), and `--color <auto|always|never>` (default `auto`) controls ANSI
-color.
-
-Stream discipline is strict: the **payload** (streamed agent reply tokens,
-resolved URLs, the status table, eval results, the deploy result, `skill status`
-JSON, the worker reply) goes to **stdout**, and every **diagnostic**
-(waiting/helm/kubectl/rollout/port-forward chatter, spinners, progress, notes)
-goes to **stderr**. So the payload pipes and redirects cleanly while progress
-still shows on the terminal:
-
-```bash
-curie cluster message "..." | jq         # clean JSON on stdout, progress on stderr
-curie local message "..." > reply.txt    # reply captured, progress on the terminal
-curie skill eval > results.txt           # results captured, progress on the terminal
-```
-
-On an interactive terminal, progress renders as a spinner-to-checkmark checklist
-(each step spins with a live dim elapsed counter, then freezes to a green `✓` or
-red `✗` with its elapsed time), a determinate bar for real totals (eval
-`N/total`), and streamed tokens that spin only until the first token then stream
-raw to stdout. Every wait resolves: a blown timeout ends in `✗ ... timed out
-after Ns`, never a hang. Compatibility is handled automatically:
-
-- **Auto-disable off a TTY.** Rendering is gated on `stderr.is_terminal()` plus
-  the cross-tool env standards. On a non-TTY, a pipe, `CI`, `TERM=dumb`,
-  `NO_COLOR`, or `CLICOLOR=0`, output is plain discrete status lines with no ANSI
-  and no `\r` redraws. `CLICOLOR_FORCE` / `--color=always` force color on;
-  `--color=never` forces it off. Color is resolved per stream, so a colored
-  terminal stderr never leaks ANSI into a redirected stdout.
-- **Graceful degradation.** The brand palette (success green, error red, amber
-  warn, dim grey plumbing, cyan URLs/ids, bold payload) is truecolor, degrading
-  to the 16 named ANSI colors where truecolor is unsupported (Apple Terminal,
-  tmux without passthrough).
-- **Never color-only.** Every status pairs a glyph with a word (`✓ pass`,
-  `✗ fail`, `⚠ warn`), and glyphs fall back to ASCII (`v`/`x`/`!`, `- \ | /`
-  spinner) in non-UTF-8 locales.
-
 ## `curie cluster message`: drive the deployed cluster with zero Slack
 
 Before connecting a real workspace, `cluster message` is the zero-Slack path.
@@ -425,37 +549,23 @@ curie cluster message "summarize the latest deploy"
 curie cluster message --channel CSIM123 "another question"
 ```
 
-What it does, in order:
+What it does: self-manages its own port-forwards and a local reply-stub the
+release can post back to, so no manual `kubectl port-forward` is needed. Then:
 
-1. **Self-managed port-forwards** (children of the CLI, killed on exit): the
-   in-cluster Valkey (`svc/<release>-valkey`, local `56381`) for the enqueue, and
-   the API (`svc/<release>-api`, local `8123`) only when `--channel` is omitted,
-   to look up the default channel.
-2. **Channel default**: with no `--channel`, `GET /agents` and use the sole
-   deployed agent's `slack_channel`. Zero or multiple agents is an error naming
-   them and requiring `--channel` (the worker binds a channel to an agent by
-   exact equality, so guessing would route nowhere).
-3. **Reachable stub**: binds `0.0.0.0:<--listen-port>` (default `8155`) and
-   advertises a routable host so the in-cluster worker can post back to it.
-   `--listen-host` wins; otherwise the local IP the kernel would use to reach the
-   cluster is auto-detected.
-4. **Worker wiring** (`--wire`, the default): points the deployed worker at the
-   stub via `helm upgrade --reuse-values --set worker.slackApiBaseUrl=<url>` (take
-   `--chart` like the other ops verbs) and waits for the rollout. `--no-wire`
-   instead refuses to run unless the worker is already wired, printing the exact
-   command to apply.
-5. **Safety guard**: if the release is connected to a real Slack workspace (a
-   `<release>-dispatcher` deployment exists, which only renders when both Slack
-   tokens are set), wiring is refused unless `--force-wire`, since pointing the
-   worker at the stub would hijack that workspace's replies cluster-wide. In the
-   demo flow `message` runs **before** a real Slack workspace is connected, so the
-   guard never fires; and the helm upgrade that connects Slack (setting
-   `worker.slackApiBaseUrl=` to empty in the same command) un-wires the stub when
-   real Slack is connected.
-6. **Enqueue + wait**: `XADD`s the exact `QueuedSlackEvent`, waits for the worker
-   to finalize, prints the reply, and emits a `continue this conversation: ...`
-   line for multi turn threads. On timeout it prints stream diagnostics and
-   exits nonzero.
+- **Picks a channel.** With no `--channel`, it looks up the sole deployed
+  agent's channel via the API; zero or multiple agents is an error requiring
+  `--channel` explicitly (the worker binds a channel to an agent by exact
+  equality, so guessing would route nowhere).
+- **Wires the worker at the stub** (`--wire`, the default) via a `helm
+  upgrade`, and waits for the rollout. `--no-wire` instead refuses to run
+  unless the worker is already wired, printing the exact command to apply.
+- **Refuses to hijack a connected workspace.** If the release is already
+  wired to a real Slack workspace, wiring the stub is refused unless you pass
+  `--force-wire` -- this guard exists purely so a stray `cluster message` run
+  can't silently steal a real workspace's replies.
+- **Enqueues the event and waits for the worker's reply**, printing a
+  `continue this conversation: ...` line for follow-ups. A timeout prints
+  stream diagnostics and exits nonzero.
 
 `--dry-run` prints the kubectl/helm command lines, the stub URL, and the enqueue
 description without executing anything.
@@ -498,137 +608,6 @@ that placeholder's real Slack ts, so you can reply to it in Slack. Passing
 means the ts must name a real message in the channel -- a thread ts carried over
 from a stub run will be rejected by Slack, and the command tells you to drop
 `--thread` to start a new one.
-
-## `curie local message`: the same roundtrip against the compose stack
-
-`local message` drives the local compose stack (`curie local up`) instead of a
-Kubernetes release, so the whole loop is one machine with no cluster:
-
-```bash
-curie local up
-curie local deploy --plugin-dir <dir> --slack-channel C0123ABCD --api-url http://localhost:28000
-curie local message "what changed in the last deploy?"
-```
-
-Local mode keeps only the shared engine (stub + `QueuedSlackEvent` enqueue +
-ack-based completion) and drops every cluster-specific step: no kubectl, no
-`helm upgrade` wiring, no port-forwards, no dispatcher guard. It enqueues
-straight to the compose Valkey (`localhost:26379`) and the containerized
-`curie-worker` service (already pointed at the stub via a fixed
-`SLACK_API_BASE_URL=http://localhost:8155/api/`) answers by claiming a runner
-container on the host Docker daemon. Channel comes from `--channel` or, when
-omitted, the sole deployed agent looked up on the compose API (`--api-url`,
-default `http://localhost:28000`; the API is reached directly, so no `/api`
-suffix). `local message` composes with `--channel`, `--thread`, and
-`--timeout-secs` and rejects the cluster only flags (`--namespace`,
-`--release`, `--force-wire`, ...)
-with a clear error. The compose worker runs the fake model by default (a canned
-reply, no credentials); export a credential in your shell and `local up` or
-`local comms` goes live automatically for a real model. Instead of exporting it
-every session, point `curie local up --env-file .env` at the bundle's own
-dotfile: the model credential is read from it as a last-resort fallback
-(precedence: shell env > file), so the stack boots live with no
-`set -a; source .env` step. Only `CURIE_CREDENTIALS`, `CLAUDE_CODE_OAUTH_TOKEN`,
-and `ANTHROPIC_API_KEY` are read; every other key in the file is ignored, and the
-value never reaches argv or logs. Set `CURIE_FAKE_MODEL=1` to force the fake
-model regardless of a credential being present.
-
-Use `curie local comms --slack` when you want the same compose stack to talk
-to a real Slack workspace. Connect resolves `SLACK_APP_TOKEN` and
-`SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a
-value persisted with `curie secrets set SLACK_APP_TOKEN` /
-`curie secrets set SLACK_BOT_TOKEN` -- so tokens saved once in Curie private
-storage need no per-session re-export -- masks them in printed commands, starts
-the dispatcher, and points the worker at real Slack, resolving the model the same
-way as `local up` (live when a credential is present, fake otherwise).
-`--disconnect` stops the dispatcher and restores the local stub. `--dry-run`
-prints the compose command only.
-
-`--continue` works the same way here as it does for
-[`cluster message`](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack):
-it reuses the last successful `local message` context from
-`.curie/last-turn.json` in the current working directory, so only the new text
-is required, explicit flags override the saved channel/thread/transport
-settings, and the same replay exclusions apply.
-
-## Agent-facing output contract
-
-The CLI's primary consumer is a coding agent (ADR-0021), so its output and
-control flow are machine-first.
-
-**`--json`** (global) makes every agent-facing verb emit a single
-machine-readable JSON object on **stdout** instead of empty output: the
-read/query verbs (`versions`, `memory`, `approvals`, `observability`), the
-lifecycle result verbs (`kill`, `resume`, `budget`, `reset-thread`, `delete`),
-and every verb's `--dry-run` plan (uniform shape `{"dry_run": true, "plan":
-[<lines>]}`) all route through one centralized emitter.
-
-The `message` verbs keep their own, more specific shapes: `curie local
-message` and `curie cluster message` emit one structured line per terminal
-state on stdout --
-
-- a completed turn emits `{"reply": ..., "thread": ..., "finalized": ...}`
-  (the model's reply, which is null on a no-edit completion, plus the thread
-  the turn ran under);
-- a turn parked on a human approval gate emits `{"reply": ..., "thread":
-  ..., "finalized": false, "awaiting_approval": true}` (the worker posted an
-  approval card rather than finalizing, and `reply` is the card's placeholder
-  text if seen);
-- a **timeout** emits `{"reply": null, "finalized": false,
-  "timed_out": true}` before exiting 3 (transient);
-- a turn **enqueued** onto the real Valkey stream in connected transport mode
-  emits `{"status": "enqueued", "channel": ..., "thread": ...}` -- the CLI
-  does not wait for the reply, so this is a terminal state of the command,
-  not of the turn; and
-- `--json --dry-run` emits a planned-action descriptor `{"dry_run": true,
-  "target": "local"|"cluster", "stream": ..., "channel": ...,
-  "reply_endpoint": ...}` (`channel` is null when it would be resolved from
-  the sole deployed agent).
-
-The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two verbs
-lag this contract on their real-path success output: `curie skill message`,
-and the operator verbs (`up`, `down`, `status`, `comms`) plus `deploy`, still
-print human text rather than JSON on success (tracked in #485). All human and
-log text (progress, notes, warnings) goes to **stderr**, so a plain `...
---json | jq` yields clean data. On failure under `--json`, the error is
-emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
-a prose message, so an agent can recover without parsing prose. `NO_COLOR`,
-`CLICOLOR`, and `--color=never` are honored on every command.
-
-**Versioned result schemas.** Every agent-facing `--json` result maps to a
-committed JSON Schema under `cli/schema/` with an explicit version identity (the
-`vN` segment of its `$id`); `cli/schema/index.json` is the inventory of every
-result family, the schema it maps to, and its version. The schemas are embedded
-in the released binary, so the discovery path works with no source checkout:
-`curie schema-index` prints the inventory index, and `curie schema-index
-<name>` (e.g. `curie schema-index kill`) prints one schema. A contract test
-(`cli/tests/schema_inventory.rs`) fails CI if a new result family lands without a
-schema, and `cli/tests/json_contract.rs` validates every result's real output
-against its schema. The compatibility policy — additive changes stay at the same
-version, breaking changes ship a new version — is
-[ADR-0074](../docs/adr/0074-versioned-json-schemas-for-cli-results.md).
-
-**Semantic exit codes** let an agent branch on *why* a command failed without
-parsing output:
-
-| Code | Class     | Meaning                                                                 |
-|------|-----------|-------------------------------------------------------------------------|
-| 0    | success   | The command did what was asked.                                         |
-| 1    | failure   | A genuine runtime failure (well-formed request, operation did not succeed). Do not retry blindly. |
-| 2    | usage     | A deterministic input error (missing `--yes`, a malformed flag/value, no bundle). Retrying the same argv fails identically -- fix the input. |
-| 3    | transient | A retryable condition (the endpoint was unreachable or timed out). The same argv may succeed once the dependency is up. |
-| 4    | unsupported | The verb was understood, but the concept it inspects does not exist at this tier by construction (`curie skill versions`, `curie skill memory`). No input and no retry changes that -- the same argv never succeeds here; the `fix` hint names the tier that does answer it. |
-
-**Non-interactive by default.** Every mutating command has a non-interactive
-path (`--yes` on `cluster down`/`kill`/`delete`/`reset-thread`, `local
-reset-thread`, and `local down --wipe`); none block on stdin. A confirmation
-prompt that would otherwise read stdin refuses
-with a usage error (exit 2) when the session is not a terminal, rather than
-hanging.
-
-(`curie local status` and `curie cluster status` proxy raw
-`docker compose`/`helm`/`kubectl` output and do not yet support `--json`; use
-`curie skill status` for a machine-readable runner status today.)
 
 ## Verify
 
