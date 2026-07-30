@@ -61,9 +61,7 @@ def render_block() -> str:
         lines.append(f"#   {producer:<9} {note}")
     lines.append("#")
     for key in BootEnv.env_keys():
-        producers = ", ".join(
-            p for p in _PRODUCER_NOTES if key in BootEnv.env_keys(producer=p)
-        )
+        producers = ", ".join(p for p in _PRODUCER_NOTES if key in BootEnv.env_keys(producer=p))
         lines.append(f"# {key:<{width}}  producers: {producers}")
     lines.append(_END)
     return "\n".join(lines)

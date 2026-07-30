@@ -463,6 +463,9 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         model_env_key="MY_PROVIDER_KEY",
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-scoped-token",
+        connector_release="curie",
+        connector_agent="sre-dev",
+        connector_namespace="curie",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
     assert set(maximal) <= worker_owned
@@ -695,6 +698,9 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_APPROVAL_RESUMED_KIND",
         "CURIE_APPROVAL_DECISION",
         "CURIE_CONNECTOR_SECRET_KEYS",
+        "CURIE_CONNECTOR_RELEASE",
+        "CURIE_CONNECTOR_AGENT",
+        "CURIE_CONNECTOR_NAMESPACE",
         "CURIE_RUNNER_PORT",
         "ANTHROPIC_BASE_URL",
         "CURIE_MODEL_API_BACKEND",
@@ -835,3 +841,24 @@ def test_every_rendered_key_is_a_declared_env_key() -> None:
     """
     assert set(_full_boot_env().to_env()) <= set(BootEnv.env_keys())
     assert set(_worker_env(fake_model=True, base_url="http://x")) <= set(BootEnv.env_keys())
+
+
+def test_connector_scope_is_emitted_as_a_set_or_not_at_all() -> None:
+    # The runner derives `<release>-<agent>-mcp-<connector>.<namespace>` from all
+    # three or derives nothing. A partial scope would name a Service that cannot
+    # exist, and the failure would be a connection refused at turn time.
+    partial = _worker_env(connector_release="curie", connector_agent="sre-dev")
+    assert not [k for k in partial if k.startswith("CURIE_CONNECTOR_")]
+
+    full = _worker_env(
+        connector_release="curie", connector_agent="sre-dev", connector_namespace="curie"
+    )
+    assert full["CURIE_CONNECTOR_RELEASE"] == "curie"
+    assert full["CURIE_CONNECTOR_AGENT"] == "sre-dev"
+    assert full["CURIE_CONNECTOR_NAMESPACE"] == "curie"
+
+
+def test_connector_scope_is_absent_by_default() -> None:
+    # Absent is meaningful, not degraded: the skill tier hosts nothing, so there
+    # is no Service to derive a URL from.
+    assert not [k for k in _worker_env() if k.startswith("CURIE_CONNECTOR_")]

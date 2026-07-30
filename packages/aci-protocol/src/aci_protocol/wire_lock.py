@@ -114,9 +114,7 @@ def wire_fingerprint(models: tuple[type[BaseModel], ...] | None = None) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def check_wire_lock(
-    *, fingerprint: str, version: str, lock: dict[str, str]
-) -> None:
+def check_wire_lock(*, fingerprint: str, version: str, lock: dict[str, str]) -> None:
     """Fail an unbumped wire change; pass a version-only bump or an unchanged wire.
 
     Truth table (plan decision 4):
@@ -153,9 +151,7 @@ def check_against_base(base_lock: dict[str, str] | None) -> None:
 
     if base_lock is None:
         return
-    check_wire_lock(
-        fingerprint=wire_fingerprint(), version=PROTOCOL_VERSION, lock=base_lock
-    )
+    check_wire_lock(fingerprint=wire_fingerprint(), version=PROTOCOL_VERSION, lock=base_lock)
 
 
 def _lock_path() -> Path:

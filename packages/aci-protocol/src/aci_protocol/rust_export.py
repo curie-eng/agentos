@@ -167,9 +167,7 @@ def _struct_fields(model: type[BaseModel], skip: set[str], public: bool) -> list
             # matching the NDJSON decoder. Detected by name (WIRE_VERSION_FIELD),
             # not by type, so dropping the old Literal does not silently remove
             # the guard and let #[serde(default)] make version optional.
-            out.append(
-                '    #[serde(deserialize_with = "require_compatible_protocol_version")]'
-            )
+            out.append('    #[serde(deserialize_with = "require_compatible_protocol_version")]')
         elif not field.is_required():
             # Any other field with a Pydantic default is omittable on the wire,
             # so Rust accepts it missing too.

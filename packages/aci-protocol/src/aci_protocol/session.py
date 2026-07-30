@@ -321,9 +321,7 @@ class BootEnv(_AciModel):
     # ``/<namespace>/<key>`` onto it. state_token is the scoped ``state`` token
     # (ADR-0033) the caller presents as X-API-Key -- the same per-turn scoped
     # derivative used for memory/history, never the raw platform key.
-    state_url: str | None = Field(
-        default=None, json_schema_extra=_env("CURIE_STATE_URL", "worker")
-    )
+    state_url: str | None = Field(default=None, json_schema_extra=_env("CURIE_STATE_URL", "worker"))
     state_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_STATE_TOKEN", "worker")
     )
@@ -357,10 +355,29 @@ class BootEnv(_AciModel):
     connector_secret_keys: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_CONNECTOR_SECRET_KEYS", "worker")
     )
-    # Substrate-authoritative; see the class docstring's anti-clobber note.
-    port: int | None = Field(
-        default=None, json_schema_extra=_env("CURIE_RUNNER_PORT", "substrate")
+    # Where this sandbox's hosted connectors live (ADR-0086, #1063/#1118).
+    # Curie derives each declared connector's MCP URL from the Service it
+    # created, whose name is `<release>-<agent>-mcp-<connector>` in
+    # `<namespace>`. Those three are install-time facts the bundle cannot know:
+    # the Helm release name and nameOverride live with whoever ran `cluster up`,
+    # and the agent name is assigned at deploy.
+    #
+    # Optional as a set, and absent is MEANINGFUL rather than a degraded
+    # cluster boot: the skill tier hosts nothing, so there is no Service to
+    # derive a URL from and a declared connector is correctly reported as
+    # "declared but not exercisable here" (#1093). The runner treats all three
+    # missing as "no hosted connectors in this tier" and derives nothing.
+    connector_release: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONNECTOR_RELEASE", "worker")
     )
+    connector_agent: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONNECTOR_AGENT", "worker")
+    )
+    connector_namespace: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_CONNECTOR_NAMESPACE", "worker")
+    )
+    # Substrate-authoritative; see the class docstring's anti-clobber note.
+    port: int | None = Field(default=None, json_schema_extra=_env("CURIE_RUNNER_PORT", "substrate"))
     # Worker-authoritative with a chart fallback default.
     base_url: str | None = Field(
         default=None, json_schema_extra=_env("ANTHROPIC_BASE_URL", "worker", "substrate")
@@ -464,8 +481,7 @@ class BootEnv(_AciModel):
         declared = cls._declared()
         if field not in declared:
             raise KeyError(
-                f"{field!r} is not a declared boot-env field; "
-                f"known fields: {sorted(declared)}"
+                f"{field!r} is not a declared boot-env field; known fields: {sorted(declared)}"
             )
         return declared[field][0]
 
@@ -491,6 +507,9 @@ class BootEnv(_AciModel):
         state_url: str | None = None,
         state_token: str | None = None,
         approval_required_tools: Sequence[str] | None = None,
+        connector_release: str | None = None,
+        connector_agent: str | None = None,
+        connector_namespace: str | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -547,6 +566,13 @@ class BootEnv(_AciModel):
             env[cls.env_key("state_url")] = state_url
         if state_token:
             env[cls.env_key("state_token")] = state_token
+        # Emitted as a SET or not at all: the runner derives a connector URL
+        # from all three or derives nothing, so a partial scope would name a
+        # Service that cannot exist.
+        if connector_release and connector_agent and connector_namespace:
+            env[cls.env_key("connector_release")] = connector_release
+            env[cls.env_key("connector_agent")] = connector_agent
+            env[cls.env_key("connector_namespace")] = connector_namespace
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -576,6 +602,12 @@ class BootEnv(_AciModel):
             env[self.env_key("history_token")] = self.history_token
         if self.memory_token is not None:
             env[self.env_key("memory_token")] = self.memory_token
+        if self.connector_release is not None:
+            env[self.env_key("connector_release")] = self.connector_release
+        if self.connector_agent is not None:
+            env[self.env_key("connector_agent")] = self.connector_agent
+        if self.connector_namespace is not None:
+            env[self.env_key("connector_namespace")] = self.connector_namespace
         if self.state_url is not None:
             env[self.env_key("state_url")] = self.state_url
         if self.state_token is not None:

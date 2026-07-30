@@ -105,8 +105,7 @@ def warn_if_deprecated_api_url_env(env: Mapping[str, str] | None = None) -> None
     environ = os.environ if env is None else env
     if API_URL_ENV_DEPRECATED in environ and API_URL_ENV not in environ:
         logger.warning(
-            "%s is deprecated and will be removed in a future release; "
-            "set %s instead.",
+            "%s is deprecated and will be removed in a future release; set %s instead.",
             API_URL_ENV_DEPRECATED,
             API_URL_ENV,
         )
@@ -130,9 +129,7 @@ class AliasOnlyEnvSource(EnvSettingsSource):
     only the field-name fallback is filtered, so both names keep resolving.
     """
 
-    def _extract_field_info(
-        self, field: FieldInfo, field_name: str
-    ) -> list[tuple[str, str, bool]]:
+    def _extract_field_info(self, field: FieldInfo, field_name: str) -> list[tuple[str, str, bool]]:
         infos = super()._extract_field_info(field, field_name)
         if field.validation_alias is not None:
             infos = [info for info in infos if info[0] != field_name]

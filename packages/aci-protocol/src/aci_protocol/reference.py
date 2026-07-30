@@ -26,9 +26,7 @@ def reference_producer(message: Event | Interrupt) -> Iterable[str]:
 
     if isinstance(message, Interrupt):
         return [
-            to_ndjson_line(
-                Final(text="run interrupted", status=SessionStatus.IDLE_AWAITING_INPUT)
-            )
+            to_ndjson_line(Final(text="run interrupted", status=SessionStatus.IDLE_AWAITING_INPUT))
         ]
 
     if message.type == "eval_case":
