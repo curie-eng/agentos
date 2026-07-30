@@ -249,6 +249,54 @@
           ],
           "title": "Bundle Ref"
         },
+        "connector_agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CONNECTOR_AGENT",
+          "producer": [
+            "worker"
+          ],
+          "title": "Connector Agent"
+        },
+        "connector_namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CONNECTOR_NAMESPACE",
+          "producer": [
+            "worker"
+          ],
+          "title": "Connector Namespace"
+        },
+        "connector_release": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_CONNECTOR_RELEASE",
+          "producer": [
+            "worker"
+          ],
+          "title": "Connector Release"
+        },
         "connector_secret_keys": {
           "anyOf": [
             {
@@ -1179,6 +1227,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.2.7",
-  "title": "ACI Protocol v0.2.7"
+  "protocolVersion": "0.2.8",
+  "title": "ACI Protocol v0.2.8"
 }

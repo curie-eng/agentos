@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.2.7";
+pub const PROTOCOL_VERSION: &str = "0.2.8";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -156,6 +156,12 @@ pub struct BootEnv {
     #[serde(default)]
     pub connector_secret_keys: Option<Vec<String>>,
     #[serde(default)]
+    pub connector_release: Option<String>,
+    #[serde(default)]
+    pub connector_agent: Option<String>,
+    #[serde(default)]
+    pub connector_namespace: Option<String>,
+    #[serde(default)]
     pub port: Option<i64>,
     #[serde(default)]
     pub base_url: Option<String>,
@@ -182,6 +188,9 @@ pub mod env_keys {
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
     pub const CURIE_BUDGET: &str = "CURIE_BUDGET";
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
+    pub const CURIE_CONNECTOR_AGENT: &str = "CURIE_CONNECTOR_AGENT";
+    pub const CURIE_CONNECTOR_NAMESPACE: &str = "CURIE_CONNECTOR_NAMESPACE";
+    pub const CURIE_CONNECTOR_RELEASE: &str = "CURIE_CONNECTOR_RELEASE";
     pub const CURIE_CONNECTOR_SECRET_KEYS: &str = "CURIE_CONNECTOR_SECRET_KEYS";
     pub const CURIE_CREDENTIALS: &str = "CURIE_CREDENTIALS";
     pub const CURIE_FAKE_MODEL: &str = "CURIE_FAKE_MODEL";

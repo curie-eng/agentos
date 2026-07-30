@@ -55,9 +55,7 @@ def test_missing_version_is_rejected() -> None:
 
 
 def test_current_version_is_accepted() -> None:
-    good = json.dumps(
-        {"type": "final", "version": PROTOCOL_VERSION, "text": "x", "status": "done"}
-    )
+    good = json.dumps({"type": "final", "version": PROTOCOL_VERSION, "text": "x", "status": "done"})
     assert parse_ndjson_line(good) == Final(text="x")
 
 
@@ -118,9 +116,7 @@ def test_unknown_field_is_ignored_on_inbound_read() -> None:
 def test_compatible_patch_version_is_accepted() -> None:
     # AC: a same-major-minor patch difference is not an error. Build speaks
     # 0.2.0; a 0.2.7 line decodes fine.
-    line = json.dumps(
-        {"type": "final", "version": "0.2.7", "text": "x", "status": "done"}
-    )
+    line = json.dumps({"type": "final", "version": "0.2.7", "text": "x", "status": "done"})
     decoded = parse_ndjson_line(line)
     assert isinstance(decoded, Final)
     assert decoded.text == "x"
@@ -129,9 +125,7 @@ def test_compatible_patch_version_is_accepted() -> None:
 def test_incompatible_minor_is_rejected_naming_both_versions() -> None:
     # AC: rejects an incompatible version with a message naming both versions.
     # The assertion is on the message content, not just the exception type.
-    line = json.dumps(
-        {"type": "final", "version": "0.3.0", "text": "x", "status": "done"}
-    )
+    line = json.dumps({"type": "final", "version": "0.3.0", "text": "x", "status": "done"})
     with pytest.raises(ProtocolVersionError) as excinfo:
         parse_ndjson_line(line)
     message = str(excinfo.value)
@@ -140,9 +134,7 @@ def test_incompatible_minor_is_rejected_naming_both_versions() -> None:
 
 
 def test_incompatible_major_is_rejected() -> None:
-    line = json.dumps(
-        {"type": "final", "version": "1.0.0", "text": "x", "status": "done"}
-    )
+    line = json.dumps({"type": "final", "version": "1.0.0", "text": "x", "status": "done"})
     with pytest.raises(ProtocolVersionError):
         parse_ndjson_line(line)
 
@@ -168,8 +160,6 @@ def test_malformed_version_is_rejected_via_the_decoder_contract(bad_version: str
     # Edge 5: a malformed version must reject through the decoder's own error
     # contract (ProtocolVersionError), never escape as an IndexError/ValueError
     # out of a bare .split(".").
-    line = json.dumps(
-        {"type": "final", "version": bad_version, "text": "x", "status": "done"}
-    )
+    line = json.dumps({"type": "final", "version": bad_version, "text": "x", "status": "done"})
     with pytest.raises(ProtocolVersionError):
         parse_ndjson_line(line)
