@@ -580,6 +580,107 @@ async fn routes_from_seeds_the_map_and_flags_override_it() {
 }
 
 #[tokio::test]
+async fn a_routes_file_with_an_unknown_binding_key_writes_nothing() {
+    // #1072: the typo that matters. `approver` (for `approvers`) used to be
+    // silently stripped, and the write that landed was a channel-only binding --
+    // which falls back to card-channel membership, so an operator who meant to
+    // narrow authority to one group had instead granted it to everyone in the
+    // channel. The API guards this with `extra="forbid"`; #1057 made the CLI a
+    // second writer that re-serialized a parsed struct, so the operator's bytes
+    // never reached that guard.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(
+        &path,
+        r#"{"deal_desk":{"channel":"C0GENERAL0","approver":{"group":"S0DESKGRP"}}}"#,
+    )
+    .expect("write");
+
+    let server = stub("null", "null");
+
+    let Err(err) = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    else {
+        panic!("an unknown key at the binding level must be refused, not stripped");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("approver"),
+        "the error must name the key: {msg}"
+    );
+    assert!(
+        msg.contains("deal_desk"),
+        "the error must name the route carrying it: {msg}"
+    );
+    assert_no_write(&server);
+}
+
+#[tokio::test]
+async fn a_routes_file_with_an_unknown_approvers_key_writes_nothing() {
+    // The sibling case one level down. Already refused before #1072 (the
+    // approvers block was validated when present), and it must stay refused --
+    // the fix moved where parsing happens, so this pins that it did not regress.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(
+        &path,
+        r#"{"finance":{"channel":"C0FINANCE0","approvers":{"grup":"S0FINGRP0"}}}"#,
+    )
+    .expect("write");
+
+    let server = stub("null", "null");
+
+    let Err(err) = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    else {
+        panic!("an unknown key inside approvers must be refused");
+    };
+
+    assert!(err.to_string().contains("grup"), "unexpected error: {err}");
+    assert_no_write(&server);
+}
+
+#[tokio::test]
+async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
+    // The other half of the #1072 asymmetry, and the reason the fix is a second
+    // struct rather than `deny_unknown_fields` on the existing one: the RESPONSE
+    // side must keep decoding a binding a newer server has added a field to,
+    // or an older CLI breaks against a newer platform.
+    let bound = r#"{"deal_desk":{"channel":"C0MANAGERS","escalation_after_s":3600}}"#;
+    let server = stub(bound, bound);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            list_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("an unmodeled server field must not break the read");
+
+    match out {
+        ApprovalsOutput::Routes { routes, .. } => {
+            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+        }
+        _ => panic!("expected the Routes output"),
+    }
+}
+
+#[tokio::test]
 async fn a_malformed_routes_file_writes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("routes.json");

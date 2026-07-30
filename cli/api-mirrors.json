@@ -29,6 +29,16 @@
       "omissions": []
     },
     {
+      "struct": "RouteBindingInput",
+      "schema": "ApprovalRouteBinding",
+      "omissions": []
+    },
+    {
+      "struct": "ApproversInput",
+      "schema": "ApprovalApprovers",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalRecord",
       "schema": "ApprovalOut",
       "omissions": [
