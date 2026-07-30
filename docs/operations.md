@@ -28,6 +28,18 @@ Prerequisites: `kubectl` and `helm` on PATH, pointed at a reachable cluster
 (the `agents.x-k8s.io` Agent Sandbox CRDs and a NetworkPolicy-enforcing CNI are
 installed by the chart's preflights; see `charts/curie/README.md`).
 
+## Choosing a cluster
+
+A single-node **k3s** cluster on a Linux host (8 GB+
+memory) is the lasting recommendation -- its default kube-router CNI enforces
+NetworkPolicy out of the box. **kind** and **minikube** work fine for
+disposable local tests, but their API server typically binds loopback, which
+can make it unreachable from a pod; if `cluster message` can't auto-detect a
+pod-reachable host, pass `--listen-host` explicitly (see `cli/README.md`).
+Real-model installs additionally require `runsc` (gVisor) on every node unless
+kernel isolation is explicitly disabled (`--set security.gvisor.mode=off`);
+fake-model installs work without it.
+
 ## Install and inspect
 
 - `curie cluster up` runs `helm upgrade --install` using the chart resolved
@@ -198,6 +210,34 @@ healthy.
 
 Without a deploy, `curie cluster message` fails with `no agents are deployed on
 the platform API`.
+
+## Connecting a repo for git-flow deploys
+
+Beyond `curie cluster deploy`, a bundle can also deploy automatically on every
+`git push`. Three things need to be true for a push to actually promote:
+
+1. **The agent's repo is set.** The webhook resolves which agent a push
+   belongs to by matching the payload's `repo.full_name` (owner/name) against
+   that agent's `repo_full_name`, set when the agent is created (console or
+   API) -- `curie cluster deploy` only pushes a bundle to an agent that
+   already exists, it does not set this field.
+2. **GitHub can reach the API.** Add a webhook, in the repo's GitHub settings,
+   to `<your-api-url>/github/webhook`. This requires the cluster's API to be
+   reachable from GitHub's servers (an ingress, a load balancer, or a tunnel);
+   how you expose it is an infrastructure decision this chart does not make
+   for you.
+3. **The webhook secret matches.** GitHub signs each delivery
+   (`x-hub-signature-256`), verified against the chart-managed
+   `githubWebhookSecret`. Retrieve the generated value from the same Secret
+   `cluster deploy` reads its API key from:
+   ```bash
+   kubectl get secret <release>-secrets -o jsonpath='{.data.githubWebhookSecret}' | base64 -d
+   ```
+   and paste it into the webhook's secret field.
+
+Once wired, a push to the agent's dev branch builds and deploys under its dev
+bot identity; a push or merge to its prod branch promotes that same built
+artifact without rebuilding.
 
 ## Driving a deployed cluster with zero Slack
 
