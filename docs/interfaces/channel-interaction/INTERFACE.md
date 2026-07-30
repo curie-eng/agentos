@@ -118,7 +118,11 @@ back into the contract:
    too: Slack expresses "this decision may carry free text" as a dialog opened by
    the click, so the card carries the note-collecting action ids and the
    dispatcher's `apps/dispatcher/src/curie_dispatcher/approval_actions.py::open_note_dialog`
-   opens the view.
+   opens the view. Stamping a settled card re-reads the original through
+   `conversations.replies` rather than `conversations.history`, because the
+   default card is a thread reply and the channel timeline does not carry one
+   (#1073); a card that cannot be read is left unstamped rather than rebuilt
+   from nothing.
 2. **Terminal (TUI selector)** — `cli/src/channel.rs`. It parses the same fence
    (`REPLY_FENCE`) into a `TerminalMessage` of plain lines plus actions, which the
    TUI renders as a numbered selector per the TUI behavior above. It expresses
