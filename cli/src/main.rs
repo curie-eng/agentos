@@ -102,6 +102,45 @@ struct ClusterAgentTarget {
     dry_run: bool,
 }
 
+/// Stand up the connectors this version declares, and prune what it dropped.
+///
+/// Split across the two components on purpose (ADR-0086): the API RENDERS the
+/// Kubernetes objects -- a pure function of the bundle, so it needs no cluster
+/// access and keeps its read-only RBAC on the service that receives internet
+/// webhooks -- and the CLI APPLIES them under the operator's own kubectl
+/// credentials, where cluster-write authority already lived.
+///
+/// A bundle with no `connectors.yaml` still reaches the prune: that is the case
+/// where a connector was REMOVED, and leaving it running with a credential
+/// mounted and nothing referencing it is the leak nobody notices.
+async fn sync_connectors(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    agent_id: &str,
+    agent_name: &str,
+    version_id: &str,
+) -> anyhow::Result<()> {
+    let app_name = curie::connectors::discover_app_name(namespace, release).await?;
+    let client = curie::api::ApiClient::new(api_url, api_key)?;
+    let rendered = client
+        .version_connectors(agent_id, version_id, release, namespace, &app_name)
+        .await?;
+    let synced = curie::connectors::sync(
+        &rendered.manifests,
+        &rendered.mcp_entries,
+        namespace,
+        agent_name,
+    )
+    .await?;
+    let ui = curie::ui::ui();
+    for (name, url) in &synced.urls {
+        ui.note(&format!("connector {name}: {url}"));
+    }
+    Ok(())
+}
+
 /// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
 /// otherwise discover it from the release (UI `/api` proxy for the URL, the chart
 /// Secret for the key). Discovery failures are actionable errors naming the
@@ -2501,27 +2540,43 @@ async fn run(command: Option<Command>) -> Result<()> {
                         "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{release}-api."
                     )
                 };
-                emit(
-                    commands::deploy(DeployOpts {
-                        plugin_dir,
-                        api_url,
-                        api_key,
-                        slack_channel,
-                        repo,
-                        env,
-                        label,
-                        // Cluster connector-secret delivery is deferred to #440; no
-                        // `--secret` flag on `cluster deploy` (see the note above).
-                        secret: Vec::new(),
-                        // Secret binding is not wired on cluster until #440, so the
-                        // declared-secrets policy gate (#464) is skipped here: it
-                        // would otherwise hard-fail every secrets-declaring bundle
-                        // with a `--secret <NAME>` remediation this tier lacks.
-                        secret_binding_supported: false,
-                        connect_hint,
-                    })
-                    .await?,
+                let deployed = commands::deploy(DeployOpts {
+                    plugin_dir,
+                    api_url: api_url.clone(),
+                    api_key: api_key.clone(),
+                    slack_channel,
+                    repo,
+                    env,
+                    label,
+                    // Cluster connector-secret delivery is deferred to #440; no
+                    // `--secret` flag on `cluster deploy` (see the note above).
+                    secret: Vec::new(),
+                    // Secret binding is not wired on cluster until #440, so the
+                    // declared-secrets policy gate (#464) is skipped here: it
+                    // would otherwise hard-fail every secrets-declaring bundle
+                    // with a `--secret <NAME>` remediation this tier lacks.
+                    secret_binding_supported: false,
+                    connect_hint,
+                })
+                .await?;
+
+                // Stand up whatever the bundle's connectors.yaml declares
+                // (ADR-0086, #1063). After the deploy, so the objects exist
+                // before the next turn reaches for them; the credentials here
+                // are the CONNECTOR's, resolved locally and written straight to
+                // a K8s Secret, which is a different path from the sandbox
+                // secret delivery #440 tracks.
+                sync_connectors(
+                    &api_url,
+                    &api_key,
+                    &namespace,
+                    &release,
+                    &deployed.agent_id,
+                    &deployed.agent_name,
+                    &deployed.version_id,
                 )
+                .await?;
+                emit(deployed)
             }
             ClusterAction::Kill {
                 agent,
