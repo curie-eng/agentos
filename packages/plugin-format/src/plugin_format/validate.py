@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .approval_policy import declared_mcp_server_names, effective_tool_prefix, grantable_routes
+from .connectors import validate_connectors
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -33,7 +34,6 @@ _TRIGGERS_ADAPTER = TypeAdapter(list[TriggerDeclaration])
 
 # Claude Code plugin names are kebab-case: lowercase alphanumerics and hyphens.
 _NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-
 
 
 class ValidationIssue(BaseModel):
@@ -60,9 +60,7 @@ class _Collector:
         self.warnings.append(ValidationIssue(code=code, message=message, location=location))
 
     def result(self) -> ValidationResult:
-        return ValidationResult(
-            valid=not self.errors, errors=self.errors, warnings=self.warnings
-        )
+        return ValidationResult(valid=not self.errors, errors=self.errors, warnings=self.warnings)
 
 
 def validate_bundle(path: str | Path) -> ValidationResult:
@@ -84,8 +82,33 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         _validate_approval_policy(manifest, mcp_servers, c)
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
+        _validate_connectors(root, c)
 
     return c.result()
+
+
+CONNECTORS_FILE = "connectors.yaml"
+
+
+def _validate_connectors(root: Path, c: _Collector) -> None:
+    """Validate ``connectors.yaml`` if present (ADR-0086).
+
+    Optional: a bundle with no hosted connectors simply omits it. When present
+    it must parse, because every error it can raise would otherwise surface as
+    an opaque Kubernetes apply failure long after the author stopped looking.
+    """
+
+    path = root / CONNECTORS_FILE
+    if not path.is_file():
+        return
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        c.error("connectors.unreadable", f"{CONNECTORS_FILE}: {exc}", CONNECTORS_FILE)
+        return
+    _, errors = validate_connectors(data)
+    for code, message in errors:
+        c.error(code, message, CONNECTORS_FILE)
 
 
 def _validate_manifest(root: Path, c: _Collector) -> PluginManifest | None:

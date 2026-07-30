@@ -95,9 +95,7 @@ _CURIE_BOOT_KEYS = frozenset(
     }
 )
 
-RESERVED_BOOT_ENV: frozenset[str] = (
-    _CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS | _CURIE_BOOT_KEYS
-)
+RESERVED_BOOT_ENV: frozenset[str] = _CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS | _CURIE_BOOT_KEYS
 
 
 def is_reserved_boot_env_name(name: str) -> bool:

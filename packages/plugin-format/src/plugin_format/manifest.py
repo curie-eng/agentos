@@ -26,6 +26,4 @@ def resolve_manifest(root: str | Path) -> Path | None:
     over a root ``plugin.json``. Returns ``None`` when neither exists.
     """
     base = Path(root)
-    return next(
-        (base / loc for loc in MANIFEST_LOCATIONS if (base / loc).is_file()), None
-    )
+    return next((base / loc for loc in MANIFEST_LOCATIONS if (base / loc).is_file()), None)
