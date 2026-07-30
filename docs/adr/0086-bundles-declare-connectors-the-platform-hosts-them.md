@@ -1,7 +1,7 @@
 # 86. Bundles declare connectors; the platform hosts them
 
 Date: 2026-07-29
-Status: Draft
+Status: Accepted
 
 ## Context
 
