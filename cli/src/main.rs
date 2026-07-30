@@ -419,6 +419,13 @@ enum DevAction {
     /// downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`).
     /// Offline, no credential.
     EmitParity,
+    /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
+    /// at, not merely that its NetworkPolicies are applied (#1153,
+    /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
+    /// non-vacuity check: it proves a DENIED direction is genuinely blocked
+    /// before trusting any allowed one, so a CNI that ignores NetworkPolicy
+    /// (kindnet, minikube's default) FAILS rather than passing green.
+    NetpolCheck,
     /// Assert the release-coupled versions agree: cli/Cargo.toml, Chart.yaml
     /// version, and appVersion (`bash scripts/check-version-consistency.sh`).
     VersionCheck,
@@ -1663,6 +1670,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 commands::dev_script("cli/scripts/check-field-parity.sh").await
             }
             DevAction::EmitParity => commands::dev_script("cli/scripts/check-emit-parity.sh").await,
+            DevAction::NetpolCheck => {
+                commands::dev_script("scripts/check-netpol-enforcement.sh").await
+            }
             DevAction::VersionCheck => {
                 commands::dev_script("scripts/check-version-consistency.sh").await
             }
