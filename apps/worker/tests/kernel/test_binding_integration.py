@@ -49,6 +49,7 @@ class StubBinding:
 def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=agent_id,
+        agent_name="test-agent",
         version_id=uuid.uuid4(),
         version_label="v1",
         bundle_ref=bundle,
@@ -193,6 +194,7 @@ def test_kill_interrupts_a_live_turn(make_harness) -> None:
 def _resolved_with_packs(behavior_packs: dict) -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=uuid.uuid4(),
+        agent_name="test-agent",
         version_id=uuid.uuid4(),
         version_label="v1",
         bundle_ref="bundles/x.zip",

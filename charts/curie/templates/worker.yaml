@@ -96,6 +96,12 @@ spec:
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            # The Helm release name, so the worker can tell the sandbox where
+            # its hosted connectors live (ADR-0086, #1118). Connector object
+            # names are `<release>-<agent>-mcp-<connector>`, and the release
+            # name is knowable only here.
+            - name: CURIE_RELEASE
+              value: {{ .Release.Name | quote }}
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
             - name: CURIE_RUNNER_PORT
