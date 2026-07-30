@@ -64,45 +64,20 @@ same path a real Slack mention would.
 
 ## Output
 
-Three global flags apply to every subcommand: `--debug` shows the verbose
-plumbing (helm/kubectl/compose command lines and their output, as dim lines),
-`-q`/`--quiet` prints the payload only (suppressing all progress and diagnostics
-on stderr), and `--color <auto|always|never>` (default `auto`) controls ANSI
-color.
+| Flag | What it does |
+|---|---|
+| `--debug` | Show the verbose plumbing (helm/kubectl/compose command lines and their output), dimmed. |
+| `-q` / `--quiet` | Print the payload only, suppressing all progress and diagnostics. |
+| `--color <auto\|always\|never>` | Control ANSI color (default `auto`). |
 
-Stream discipline is strict: the **payload** (streamed agent reply tokens,
-resolved URLs, the status table, eval results, the deploy result, `skill status`
-JSON, the worker reply) goes to **stdout**, and every **diagnostic**
-(waiting/helm/kubectl/rollout/port-forward chatter, spinners, progress, notes)
-goes to **stderr**. So the payload pipes and redirects cleanly while progress
-still shows on the terminal:
+The payload (reply tokens, resolved URLs, status/eval results, JSON output)
+always goes to **stdout**; every diagnostic (progress, spinners, helm/kubectl/
+compose chatter) always goes to **stderr** -- so piping or redirecting the
+payload never picks up progress noise.
 
-```bash
-curie cluster message "..." | jq         # clean JSON on stdout, progress on stderr
-curie local message "..." > reply.txt    # reply captured, progress on the terminal
-curie skill eval > results.txt           # results captured, progress on the terminal
-```
-
-On an interactive terminal, progress renders as a spinner-to-checkmark checklist
-(each step spins with a live dim elapsed counter, then freezes to a green `✓` or
-red `✗` with its elapsed time), a determinate bar for real totals (eval
-`N/total`), and streamed tokens that spin only until the first token then stream
-raw to stdout. Every wait resolves: a blown timeout ends in `✗ ... timed out
-after Ns`, never a hang. Compatibility is handled automatically:
-
-- **Auto-disable off a TTY.** Rendering is gated on `stderr.is_terminal()` plus
-  the cross-tool env standards. On a non-TTY, a pipe, `CI`, `TERM=dumb`,
-  `NO_COLOR`, or `CLICOLOR=0`, output is plain discrete status lines with no ANSI
-  and no `\r` redraws. `CLICOLOR_FORCE` / `--color=always` force color on;
-  `--color=never` forces it off. Color is resolved per stream, so a colored
-  terminal stderr never leaks ANSI into a redirected stdout.
-- **Graceful degradation.** The brand palette (success green, error red, amber
-  warn, dim grey plumbing, cyan URLs/ids, bold payload) is truecolor, degrading
-  to the 16 named ANSI colors where truecolor is unsupported (Apple Terminal,
-  tmux without passthrough).
-- **Never color-only.** Every status pairs a glyph with a word (`✓ pass`,
-  `✗ fail`, `⚠ warn`), and glyphs fall back to ASCII (`v`/`x`/`!`, `- \ | /`
-  spinner) in non-UTF-8 locales.
+On an interactive terminal, progress renders as spinners and a live checklist;
+it degrades automatically to plain, colorless status lines on a non-TTY, in
+CI, or when `NO_COLOR`/`TERM=dumb` are set.
 
 ## Agent-facing output contract
 
