@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
     github_token: str = ""
+    # The one git origin this installation deploys from. The webhook payload's
+    # `clone_url` is compared against `<base>/<repo_full_name>.git` and a
+    # mismatch is rejected before any subprocess starts; git is then handed the
+    # derived URL rather than the payload's, so the credential above can only
+    # ever reach this host (#1122). Point it at a GitHub Enterprise Server base
+    # to deploy from GHE, exactly as with `github_api_url` above.
+    github_clone_base: str = "https://github.com"
     # Upper bound on the GitHub webhook request body, enforced before the body is
     # fully buffered, parsed, or HMAC-authenticated (#633) so an unauthenticated
     # oversized request cannot exhaust memory. GitHub caps webhook payloads at

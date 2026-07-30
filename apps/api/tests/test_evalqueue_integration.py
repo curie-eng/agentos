@@ -12,9 +12,11 @@ import os
 import secrets
 import subprocess
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import pytest
 import redis
 import redis.asyncio as aioredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, EvalJob
@@ -110,9 +112,38 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return out.stdout.strip()
 
 
-def _build_bare_repo(tmp_path: Path) -> tuple[str, str]:
-    work = tmp_path / "work"
-    work.mkdir()
+@pytest.fixture
+def trusted_clone_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Iterator[Path]:
+    """Point `GITHUB_CLONE_BASE` at a per-test `file://` base and yield it.
+
+    This file carries its own copy rather than importing
+    `test_gitflow_integration`'s. `routers/github.py` calls `get_settings()` per
+    request, so the app needs no rebuild; the clear-AFTER-undo ordering at
+    teardown is load-bearing, since clearing first would re-cache the still-set
+    env value into a later test.
+    """
+
+    base = tmp_path / "remotes"
+    base.mkdir()
+    monkeypatch.setenv("GITHUB_CLONE_BASE", f"file://{base}")
+    get_settings.cache_clear()
+    yield base
+    monkeypatch.undo()
+    get_settings.cache_clear()
+
+
+def _build_bare_repo(base_dir: Path, repo_full_name: str) -> tuple[str, str]:
+    """Create a bare repo at `<base_dir>/<repo_full_name>.git`. Returns (url, sha).
+
+    The returned URL is byte-identical to the origin the API derives from
+    `GITHUB_CLONE_BASE` plus the agent's stored `repo_full_name`, so the fan-out
+    path exercises the derivation instead of bypassing it.
+    """
+
+    work = base_dir / "_work" / repo_full_name
+    work.mkdir(parents=True)
     _git("init", "-q", "-b", "dev", cwd=work)
     for rel, content in VALID_FILES.items():
         path = work / rel
@@ -121,7 +152,8 @@ def _build_bare_repo(tmp_path: Path) -> tuple[str, str]:
     _git("add", "-A", cwd=work)
     _git("commit", "-q", "-m", "init", cwd=work)
     sha = _git("rev-parse", "HEAD", cwd=work)
-    bare = tmp_path / "bare.git"
+    bare = base_dir / f"{repo_full_name}.git"
+    bare.parent.mkdir(parents=True, exist_ok=True)
     _git("clone", "--quiet", "--bare", str(work), str(bare))
     return f"file://{bare}", sha
 
@@ -171,14 +203,17 @@ def _count_eval_entries_for_agent(agent_id: str) -> int:
 
 
 def test_dev_push_fans_out_prod_push_does_not(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent = client.post(
         "/agents",
         json={"name": "k1-fanout", "slack_channel": "C000000K01", "repo_full_name": REPO},
         headers=auth_headers,
     ).json()
-    clone_url, sha = _build_bare_repo(tmp_path)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO)
 
     assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == (
         "deployed"
@@ -206,14 +241,17 @@ def test_dev_push_fans_out_prod_push_does_not(
 
 
 def test_redelivered_dev_push_does_not_refan_out(
-    client: Any, auth_headers: dict[str, str], clean_db: None, tmp_path: Path
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
 ) -> None:
     agent = client.post(
         "/agents",
         json={"name": "k1-redeliver", "slack_channel": "C000000K01", "repo_full_name": REPO},
         headers=auth_headers,
     ).json()
-    clone_url, sha = _build_bare_repo(tmp_path)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO)
 
     # First delivery builds the bundle and fans out exactly one eval job.
     assert _post_push(client, "refs/heads/dev", sha, clone_url).json()["status"] == (

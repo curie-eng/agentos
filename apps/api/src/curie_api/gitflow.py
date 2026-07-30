@@ -46,6 +46,10 @@ class GitFlowError(Exception):
     """The repo could not be fetched or archived at the requested commit."""
 
 
+class CloneOriginMismatch(GitFlowError):
+    """The payload's clone URL is not the registered repository's origin."""
+
+
 def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
     """Constant-time check of GitHub's X-Hub-Signature-256 over the raw body."""
 
@@ -72,7 +76,71 @@ def environment_for_ref(ref: str | None, settings: Settings) -> Environment | No
     return None
 
 
-def _clone_credential_env(clone_url: str, settings: Settings) -> dict[str, str]:
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def trusted_clone_url(repo_full_name: str, settings: Settings) -> str:
+    """The one origin this installation is allowed to clone for that repo.
+
+    Derived from configuration plus the repository binding stored on the agent
+    row, never from the webhook payload, so the platform GitHub credential can
+    only ever travel to the configured host (#1122).
+    """
+
+    return f"{settings.github_clone_base.rstrip('/')}/{repo_full_name}.git"
+
+
+def _origin_key(url: str) -> tuple[str, str, str, str, int | None, str, str, str]:
+    """A normalized comparison key for a clone URL.
+
+    Covers every dimension that decides where a request actually goes: scheme,
+    user information, host, port (with the scheme's default applied so an
+    explicit ``:443`` matches), path modulo a trailing ``.git`` and trailing
+    slashes, query, and fragment. User information is carried IN the key rather
+    than rejected separately, so any credential in the payload URL mismatches
+    automatically against a derived URL that never carries one.
+
+    Keys are compared as WHOLE TUPLES for equality. No element may ever be
+    compared with ``startswith`` or a substring test: that is exactly what would
+    let ``owner/repo-evil`` pass against a registered ``owner/repo``.
+    """
+
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    path = parts.path.rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    path = path.rstrip("/")
+    return (
+        scheme,
+        parts.username or "",
+        parts.password or "",
+        parts.hostname or "",
+        port,
+        path,
+        parts.query,
+        parts.fragment,
+    )
+
+
+def _origins_match(requested: str, trusted: str) -> bool:
+    """Whole-key equality between a requested clone URL and the trusted origin.
+
+    An unparseable URL reads as a mismatch rather than crashing inside the
+    threadpool: ``urlsplit().port`` raises ``ValueError`` on a non-numeric port
+    and ``urlsplit`` itself raises on a malformed IPv6 literal.
+    """
+
+    try:
+        return _origin_key(requested) == _origin_key(trusted)
+    except ValueError:
+        return False
+
+
+def _clone_credential_env(trusted_url: str, settings: Settings) -> dict[str, str]:
     """Git config env that authenticates the clone, or empty if not applicable.
 
     Private repositories are the norm for a bundle -- it names internal hosts and
@@ -85,14 +153,16 @@ def _clone_credential_env(clone_url: str, settings: Settings) -> dict[str, str]:
     that echoes the command) and out of the cloned repo's ``.git/config``, which
     URL-embedded credentials are persisted into.
 
-    The header is scoped to the clone URL's own host, so a webhook naming some
-    other host cannot make us send the token there.
+    The URL reaching this function is the origin derived from the stored
+    repository binding (``trusted_clone_url``), never the webhook payload's
+    ``clone_url``, so the header is scoped to the one host this installation
+    deploys from (#1122).
     """
 
     token = settings.github_token
-    if not token or not clone_url.startswith("https://"):
+    if not token or not trusted_url.startswith("https://"):
         return {}
-    host = urlsplit(clone_url).netloc
+    host = urlsplit(trusted_url).netloc
     if not host:
         return {}
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
@@ -121,11 +191,19 @@ def _git_failure_detail(exc: BaseException) -> str:
     return str(exc)[:200]
 
 
-def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
+def clone_and_archive(
+    clone_url: str, sha: str, settings: Settings, *, repo_full_name: str
+) -> bytes:
     """Mirror-clone the repo and return a tar of the tree at ``sha``.
 
     Refuses clone URLs outside the configured scheme allowlist and restricts git
     to safe transports, so a webhook cannot coerce an arbitrary git command.
+
+    ``clone_url`` is the untrusted webhook payload value: it is compared against
+    the origin derived from ``repo_full_name`` (which the caller must have read
+    from the agent row) and then discarded. Git is handed the derived origin,
+    for both the clone argv and the credential header, so a signed-but-forged
+    payload cannot choose where the platform GitHub token travels (#1122).
     """
 
     if not clone_url.startswith(settings.git_allowed_schemes):
@@ -133,17 +211,55 @@ def clone_and_archive(clone_url: str, sha: str, settings: Settings) -> bytes:
     if not _is_valid_sha(sha):
         raise GitFlowError(f"invalid commit sha: {sha!r}")
 
+    trusted_url = trusted_clone_url(repo_full_name, settings)
+    if not trusted_url.startswith(settings.git_allowed_schemes):
+        # The derived URL, not the payload, is what git actually clones. The
+        # comparison below is not a substitute for this check: it is safe
+        # today only by transitivity, and a misconfigured `github_clone_base`
+        # must fail as a deployment configuration error, not be reported as a
+        # forged push. Never interpolate the credential here; this URL never
+        # carries one (see `_clone_credential_env`), but keep it that way.
+        raise GitFlowError(
+            f"configured github_clone_base produces a clone url outside the "
+            f"allowed schemes {settings.git_allowed_schemes!r}: {trusted_url!r}"
+        )
+    if not _origins_match(clone_url, trusted_url):
+        # Truncated: this lands in the webhook response body and in the warning
+        # log, and a forged payload must not be able to flood either.
+        raise CloneOriginMismatch(
+            f"clone url does not match the registered repository "
+            f"{repo_full_name!r}: {clone_url[:200]!r}"
+        )
+
     tmp = tempfile.mkdtemp(prefix="gitflow-")
     env = {
         **os.environ,
         "GIT_ALLOW_PROTOCOL": "file:https:http",
         "GIT_TERMINAL_PROMPT": "0",
-        **_clone_credential_env(clone_url, settings),
+        **_clone_credential_env(trusted_url, settings),
     }
     try:
         try:
+            # `git help config` (git 2.43.0): "http.followRedirects: Whether git
+            # should follow HTTP redirects. ... If set to false, git will treat
+            # all redirects as errors. If set to initial, git will follow
+            # redirects only for the initial request to a remote, but not for
+            # subsequent follow-up HTTP requests. ... The default is initial."
+            # The initial request is precisely the one carrying the extraheader,
+            # so the default would let a redirect target receive the credential.
+            # `-c` must precede the `clone` subcommand to take effect.
             subprocess.run(
-                ["git", "clone", "--quiet", "--mirror", clone_url, tmp],
+                [
+                    "git",
+                    "-c",
+                    "http.followRedirects=false",
+                    "clone",
+                    "--quiet",
+                    "--mirror",
+                    "--",
+                    trusted_url,
+                    tmp,
+                ],
                 check=True,
                 capture_output=True,
                 env=env,
@@ -191,7 +307,10 @@ async def process_push(
         return WebhookResult(status="ignored")
 
     agent = await crud.get_agent_by_repo(session, full_name)
-    if agent is None:
+    # The second clause is unreachable in practice (the lookup's predicate is
+    # `Agent.repo_full_name == full_name` with a non-None argument); it exists
+    # solely to narrow `str | None` to `str` for the origin derivation below.
+    if agent is None or agent.repo_full_name is None:
         return WebhookResult(status="ignored")
 
     version = await crud.get_version_by_commit(session, agent.id, after)
@@ -204,10 +323,24 @@ async def process_push(
     bundle_built = version is None or version.bundle_ref is None
     if bundle_built:
         try:
+            # The stored binding, never the payload's full_name: AC1 says the
+            # origin is derived from what the database holds.
             data = await run_in_threadpool(
-                clone_and_archive, clone_url, after, settings
+                clone_and_archive,
+                clone_url,
+                after,
+                settings,
+                repo_full_name=agent.repo_full_name,
             )
             extension, content_type = deploy.validate_archive(data, settings)
+        # CloneOriginMismatch is a GitFlowError subclass, so it must be caught
+        # first or its clause is dead code. An operator has to be able to tell a
+        # forged push apart from a network failure.
+        except CloneOriginMismatch as exc:
+            return WebhookResult(
+                status="rejected",
+                errors=[{"code": "git.origin_mismatch", "message": str(exc)}],
+            )
         except GitFlowError as exc:
             return WebhookResult(
                 status="rejected",
