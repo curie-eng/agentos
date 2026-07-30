@@ -51,6 +51,7 @@ _STATE_URL = f"http://localhost:8000/agents/{_AGENT}/state"
 
 def _resolved(**kwargs: object) -> ResolvedDeployment:
     base: dict[str, object] = {
+        "agent_name": "test-agent",
         "agent_id": _AGENT,
         "version_id": uuid.UUID("22222222-2222-4222-8222-222222222222"),
         "version_label": "v1",
@@ -313,3 +314,23 @@ def test_inject_connector_secrets_is_the_markers_sole_writer() -> None:
 
     inject_connector_secrets(rendered, {"GITHUB_TOKEN": "ghp-1"}, agent_label=_AGENT)
     assert rendered["CURIE_CONNECTOR_SECRET_KEYS"] == "GITHUB_TOKEN"
+
+
+def test_connector_scope_reaches_the_sandbox_when_the_release_is_configured() -> None:
+    # The runner derives `<release>-<agent>-mcp-<connector>.<namespace>` and can
+    # know none of those three from inside the sandbox (ADR-0086, #1118).
+    env = _boot_env(
+        WorkerConfig(connector_release="curie", connector_namespace="curie"),
+        _resolved(),
+    )
+    assert env["CURIE_CONNECTOR_RELEASE"] == "curie"
+    assert env["CURIE_CONNECTOR_AGENT"] == "test-agent"
+    assert env["CURIE_CONNECTOR_NAMESPACE"] == "curie"
+
+
+def test_no_connector_scope_when_the_release_is_unset() -> None:
+    # An install that predates the chart plumbing emits NO scope rather than a
+    # partial one naming a Service that cannot exist. The runner then mounts no
+    # hosted connector, which is visible, instead of dialing a dead address.
+    env = _boot_env(WorkerConfig(connector_namespace="curie"), _resolved())
+    assert not [k for k in env if k.startswith("CURIE_CONNECTOR_")]

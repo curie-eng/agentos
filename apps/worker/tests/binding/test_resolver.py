@@ -778,6 +778,7 @@ def test_boot_env_mints_no_token_when_the_signing_key_is_empty() -> None:
         resolver = BindingResolver(engine, WorkerConfig(db_schema=_SCHEMA, api_key=""))
         resolved = ResolvedDeployment(
             agent_id=uuid.uuid4(),
+            agent_name="test-agent",
             version_id=uuid.uuid4(),
             version_label="v",
             bundle_ref=None,

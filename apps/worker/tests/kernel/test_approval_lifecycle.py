@@ -239,6 +239,7 @@ class GrantBinding:
 
         return ResolvedDeployment(
             agent_id=self.agent_id,
+            agent_name="test-agent",
             version_id=uuid.uuid4(),
             version_label="v1",
             bundle_ref=None,
@@ -452,6 +453,7 @@ class RoutedBinding:
 
         return ResolvedDeployment(
             agent_id=self.agent_id,
+            agent_name="test-agent",
             version_id=uuid.uuid4(),
             version_label="v1",
             bundle_ref=None,

@@ -153,6 +153,7 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
 
 _RESOLVE_SQL = """
 SELECT a.id AS agent_id,
+       a.name AS agent_name,
        a.max_usd_per_day AS max_usd_per_day,
        a.max_output_tokens_per_run AS max_output_tokens_per_run,
        a.behavior_packs AS behavior_packs,
@@ -175,6 +176,10 @@ class ResolvedDeployment(BaseModel):
     """The agent binding for a channel: which version to run and its budget."""
 
     agent_id: uuid.UUID
+    # The agent's NAME, not just its id: connector object names are agent-scoped
+    # (#1116) and use the name, so the runner needs it to derive a URL that
+    # matches the Service that exists.
+    agent_name: str
     version_id: uuid.UUID
     version_label: str
     bundle_ref: str | None
@@ -569,6 +574,13 @@ class BindingResolver:
             # tool calls via can_use_tool and pauses awaiting approval. Names are
             # comma-joined by the render (validated comma-free at the API).
             approval_required_tools=resolved.approval_required_tools,
+            # Where this sandbox's hosted connectors live (ADR-0086, #1118).
+            # render_worker emits these as a SET or not at all, so an install
+            # missing either operator value yields no scope rather than a
+            # partial one naming a Service that cannot exist.
+            connector_release=self._config.connector_release or None,
+            connector_agent=resolved.agent_name,
+            connector_namespace=self._config.connector_namespace or None,
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,

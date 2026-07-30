@@ -28,6 +28,7 @@ from curie_worker.sandbox_token import verify
 def _resolved(model: str | None = None) -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=uuid.uuid4(),
+        agent_name="test-agent",
         version_id=uuid.uuid4(),
         version_label="v1",
         bundle_ref="bundles/x.zip",

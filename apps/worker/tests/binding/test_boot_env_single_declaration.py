@@ -114,6 +114,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CLAIM_TIMEOUT_SECONDS",
         "CURIE_DOCKER_NETWORK",
         "CURIE_NAMESPACE",
+        # The Helm release name (ADR-0086, #1118). Read from the WORKER's env by
+        # WorkerConfig, exactly like CURIE_NAMESPACE above, and never injected
+        # into a sandbox: what the runner receives is the derived connector
+        # scope (CURIE_CONNECTOR_RELEASE), which IS a declared BootEnv key.
+        "CURIE_RELEASE",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",

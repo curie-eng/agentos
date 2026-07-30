@@ -150,6 +150,17 @@ class WorkerConfig(BaseSettings):
         default=False, validation_alias="CURIE_FALSE_COMPLETION_CHECK"
     )
 
+    # Where this release's hosted connectors live (ADR-0086, #1118). The runner
+    # derives each declared connector's MCP URL from the Service Curie created,
+    # `<release>-<agent>-mcp-<connector>` in `<namespace>`, and neither value is
+    # knowable inside the sandbox: the Helm release name lives with whoever ran
+    # `cluster up`. Both default empty, and the boot env carries the connector
+    # scope only when the whole set resolves -- so a worker that predates the
+    # chart plumbing simply mounts no hosted connector rather than emitting a
+    # scope that names a Service which cannot exist.
+    connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
+    connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
+
     # When true, clear the Slack assistant-thread status (the "shimmer" the
     # dispatcher set) once a turn ends -- editing the placeholder does not
     # auto-clear it. Off by default; pairs with the dispatcher's CURIE_SHIMMER.
