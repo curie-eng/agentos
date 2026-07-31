@@ -1,0 +1,161 @@
+"""Decide what a connector reconcile should change (ADR-0090).
+
+The pure half. Given what an agent's in-force version DECLARES and what the
+cluster currently HAS, this computes a plan: which objects to apply, which to
+delete, and which are already correct. It touches no cluster and no database,
+so the decision that can delete a running connector is testable without either.
+
+That split is the same one ADR-0087 drew between rendering and applying, for
+the same reason: the dangerous step is the decision, not the API call. A prune
+that selects one object too many takes down a live agent's tools, and a plan is
+something you can assert against exhaustively where a `kubectl delete` is not.
+
+Two properties this must never violate, both learned the hard way on the CLI
+path (#1063):
+
+- **Never touch an object Curie did not create.** Ownership is the
+  ``curie.dev/connector-owner`` label. sre-bot ran a hand-written connector
+  beside a Curie-managed one through its whole migration; an unlabelled object
+  is someone else's and is invisible here.
+- **Never prune across agents.** Ownership is scoped to the agent name, not to
+  "is a connector". Two agents in one release each declare `grafana`, and one
+  removing it must not delete the other's (#1116).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+# Set by whoever created the object, naming the agent that declared it. The CLI
+# applier stamps the same label, so an object created by one path and
+# reconciled by the other is not a special case (ADR-0090).
+OWNER_LABEL = "curie.dev/connector-owner"
+
+
+def owner_of(obj: dict[str, Any]) -> str | None:
+    """The agent that declared this object, or None if Curie did not create it."""
+
+    labels = obj.get("metadata", {}).get("labels") or {}
+    value = labels.get(OWNER_LABEL)
+    return value if isinstance(value, str) and value else None
+
+
+def identity(obj: dict[str, Any]) -> tuple[str, str]:
+    """``(kind, name)`` -- what makes two objects the same object."""
+
+    return (str(obj.get("kind", "")), str(obj.get("metadata", {}).get("name", "")))
+
+
+@dataclass(frozen=True)
+class ReconcilePlan:
+    """What converging this agent's connectors requires."""
+
+    # Objects to create or update: everything declared that is missing or
+    # drifted. An object that already matches is NOT here -- re-applying it
+    # every loop would be a hot loop with extra steps.
+    apply: list[dict[str, Any]] = field(default_factory=list)
+    # Objects Curie owns for this agent that are no longer declared.
+    delete: list[tuple[str, str]] = field(default_factory=list)
+    # Live objects that already match. Reported, not acted on -- a reconciler
+    # that logs "converged 4 objects" every loop is noise nobody reads.
+    unchanged: list[tuple[str, str]] = field(default_factory=list)
+    # Live objects whose spec drifted from what is declared. A subset of
+    # `apply`, surfaced separately because correcting drift is the one thing
+    # here that overrides a human's `kubectl edit` and must be visible.
+    drifted: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.apply and not self.delete
+
+
+def plan(
+    desired: list[dict[str, Any]],
+    live: list[dict[str, Any]],
+    *,
+    agent: str,
+) -> ReconcilePlan:
+    """Compute the change set for one agent's connectors.
+
+    ``desired`` is what the API rendered for the in-force version, already
+    owner-labelled. ``live`` is every object currently in the namespace that
+    might be relevant -- this filters it rather than trusting the caller's
+    query, because a mis-scoped list here deletes someone else's connector.
+    """
+
+    owned_live = {identity(o): o for o in live if owner_of(o) == agent}
+    desired_by_id = {identity(o): o for o in desired}
+
+    to_apply: list[dict[str, Any]] = []
+    unchanged: list[tuple[str, str]] = []
+    drifted: list[tuple[str, str]] = []
+
+    for obj_id, want in desired_by_id.items():
+        have = owned_live.get(obj_id)
+        if have is None:
+            to_apply.append(want)
+        elif _differs(want, have):
+            to_apply.append(want)
+            drifted.append(obj_id)
+        else:
+            unchanged.append(obj_id)
+
+    # Only ever objects this agent owns AND no longer declares. Both halves
+    # matter: the ownership filter keeps another agent's `grafana` safe, and
+    # the declaration check is what makes removing a connector from
+    # connectors.yaml actually remove it.
+    to_delete = sorted(obj_id for obj_id in owned_live if obj_id not in desired_by_id)
+
+    return ReconcilePlan(
+        apply=to_apply,
+        delete=to_delete,
+        unchanged=sorted(unchanged),
+        drifted=sorted(drifted),
+    )
+
+
+def _differs(want: dict[str, Any], have: dict[str, Any]) -> bool:
+    """Has the live object drifted from what is declared?
+
+    Compares only what Curie sets. A live object carries fields the cluster
+    added -- resourceVersion, uid, creationTimestamp, status, and defaulted
+    spec fields -- and treating those as drift would make every loop rewrite
+    every object forever, which is indistinguishable from a hot loop.
+    """
+
+    return _curie_owned_view(want) != _curie_owned_view(have)
+
+
+# Metadata the API server owns. Present on a live object, absent on a rendered
+# one, and never a reason to re-apply.
+_SERVER_METADATA = frozenset(
+    {
+        "annotations",
+        "creationTimestamp",
+        "generation",
+        "managedFields",
+        "namespace",
+        "ownerReferences",
+        "resourceVersion",
+        "selfLink",
+        "uid",
+    }
+)
+
+
+def _curie_owned_view(obj: dict[str, Any]) -> dict[str, Any]:
+    metadata = {k: v for k, v in (obj.get("metadata") or {}).items() if k not in _SERVER_METADATA}
+    return {
+        "kind": obj.get("kind"),
+        "apiVersion": obj.get("apiVersion"),
+        "metadata": metadata,
+        "spec": obj.get("spec"),
+        # A Secret carries no spec; its payload is data/stringData. Compared so
+        # a rotated credential is picked up, but note the live object returns
+        # base64 `data` where the rendered one sets `stringData` -- the caller
+        # must normalize before comparing or every loop sees drift.
+        "data": obj.get("data"),
+        "stringData": obj.get("stringData"),
+        "type": obj.get("type"),
+    }
