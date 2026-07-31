@@ -281,6 +281,21 @@ def render(
     ]
 
 
+def unhosted_mcp_entry(spec: ConnectorSpec) -> dict[str, Any] | None:
+    """The entry for a tier that cannot host this connector, or None.
+
+    None is a real answer, not a failure: a hosted connector with nowhere to
+    point at IS "declared but not exercisable here" (#1093). Mounting a URL that
+    resolves nowhere would turn that into a connection refused mid-turn.
+    """
+
+    if not spec.is_hosted:
+        return mcp_entry("", "", "", "", spec)
+    if not spec.unhosted_url:
+        return None
+    return {"type": "http", "url": spec.unhosted_url}
+
+
 def mcp_entry(
     release: str, agent: str, namespace: str, connector: str, spec: ConnectorSpec
 ) -> dict[str, Any]:

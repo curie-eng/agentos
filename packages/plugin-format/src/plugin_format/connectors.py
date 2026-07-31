@@ -57,6 +57,20 @@ class ConnectorSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     port: int = 8000
 
+    # Where to reach this connector on a tier that CANNOT host it (#1160).
+    #
+    # The hosted form's escape hatch, not a second remote form. `cluster` runs
+    # the image and derives the URL from the Service it created; `skill` hosts
+    # nothing at all, and `local` does not host connectors yet (#1159). Without
+    # this a bundle whose only connector is hosted simply has no connector on
+    # those rungs, which is right when there is genuinely nothing to point at
+    # and wrong when the developer has a copy running on port 8765.
+    #
+    # `${VAR}` is expanded from the sandbox environment by the MCP client, the
+    # same expansion `.mcp.json` has always used -- so the value can be supplied
+    # per machine with `--secret`, and the bundle stays safe to commit.
+    unhosted_url: str | None = None
+
     # -- remote form --
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
@@ -158,6 +172,15 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connectors.remote_has_runtime",
                     f"{where}: `args`/`env` configure a process Curie starts; a `url` "
                     "connector is already running, so they would be silently ignored",
+                )
+            )
+        if spec.url and spec.unhosted_url:
+            errors.append(
+                (
+                    "connectors.remote_has_unhosted_url",
+                    f"{where}: `unhosted_url` is the hosted form's fallback for tiers that "
+                    "cannot run the image. A `url` connector is already reachable everywhere, "
+                    "so this would never apply",
                 )
             )
         if spec.image and spec.headers:

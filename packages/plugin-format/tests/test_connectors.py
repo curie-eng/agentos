@@ -229,3 +229,30 @@ def test_the_validator_and_the_renderer_share_one_placeholder_list() -> None:
             {"connectors": {"g": {"image": "x:1", "args": ["${" + name + "}"]}}}
         )
         assert errors == [], f"renderer substitutes ${{{name}}} but the validator rejects it"
+
+
+# --------------------------------------------------------------------------- #
+# The hosted form's escape hatch for tiers that cannot host -- #1160
+# --------------------------------------------------------------------------- #
+def test_a_hosted_connector_may_declare_where_to_reach_it_when_unhosted() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "grafana": {
+                    "image": "grafana/mcp-grafana:0.17.2",
+                    "unhosted_url": "${GRAFANA_MCP_URL}",
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].is_hosted, "still hosted where Curie can host"
+
+
+def test_unhosted_url_on_a_remote_connector_is_rejected() -> None:
+    # A `url` connector is already reachable on every tier, so the fallback
+    # could never apply -- accepting it would be a silent no-op.
+    assert "connectors.remote_has_unhosted_url" in _codes(
+        {"connectors": {"g": {"url": "https://y/mcp", "unhosted_url": "http://z/mcp"}}}
+    )
