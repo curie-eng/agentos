@@ -255,6 +255,20 @@ def register_handlers(
 
     # Approval-card clicks (#246): resolve through the API (which enforces the
     # authorizer server-side) and render the verdict; never enqueue a turn.
+    #
+    # MIGRATION-ONLY as of #1059 (#1076). The kernel now emits every approval
+    # Confirm intent with `allow_free_text`, so every card this worker posts
+    # carries the note-collecting pair below. This pair is still registered
+    # because a card posted by a PRE-#1059 worker can still be pending and
+    # clickable, and dropping the listener would answer that click with nothing.
+    #
+    # Removal condition, and it is not a clock: an approval with no SLA never
+    # expires (`crud.create_approval` leaves `expires_at` NULL when the request
+    # named no `expires_in_seconds`, and the sweeper only selects rows where it
+    # is NOT NULL), so pre-#1059 cards do not all drain on their own. This pair
+    # can go once `curie <tier> approvals <AGENT> --list` shows no pending
+    # approval created before the deploy that introduced the note variants --
+    # checked per install, not assumed after some interval.
     @app.action(APPROVE_ACTION_ID)
     def _on_approve(ack: Callable[..., None], body: dict[str, Any]) -> None:
         ack()
@@ -278,9 +292,11 @@ def register_handlers(
         )
 
     # The note-collecting variants (#1053): a click OPENS a dialog and resolves
-    # nothing; the submission below does the resolving. A card carries this pair
-    # only when the kernel emitted its Confirm intent with `allow_free_text`, so
-    # the immediate pair above stays the behavior for every other card.
+    # nothing; the submission below does the resolving. This is the pair EVERY
+    # card posted by this worker carries -- the kernel sets `allow_free_text`
+    # unconditionally, a decision recorded there and in docs/approvals.md
+    # (#1076). The pair above is the migration entry point for older cards, not
+    # a second live behavior; the earlier wording claimed otherwise.
     @app.action(APPROVE_NOTE_ACTION_ID)
     def _on_approve_with_note(ack: Callable[..., None], body: dict[str, Any]) -> None:
         ack()

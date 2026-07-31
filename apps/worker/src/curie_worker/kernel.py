@@ -1087,6 +1087,29 @@ class Kernel:
                     # leaves already reaches the requester -- the API stores it
                     # on the record and build_resume_turn interpolates it into
                     # the platform-authored resume text.
+                    #
+                    # UNCONDITIONAL, and that is the decision rather than an
+                    # oversight (#1076). It costs an approver who wants no note
+                    # one extra click, on every approval, in every deployment,
+                    # so it was worth stating rather than leaving as the only
+                    # reachable arm of a branch that looked configurable.
+                    #
+                    # Rejected: exposing a per-agent or env toggle. A reason is
+                    # the half of a rejection the requester actually needs, and
+                    # the dialog is what makes leaving one the default rather
+                    # than a thing you remember to do from the CLI. A toggle
+                    # would also keep TWO settled-card render paths alive
+                    # permanently, which is what #1073 and #1084 exist to
+                    # collapse into one. And the evidence for whether operators
+                    # want the opt-out does not exist yet: discussion #1061
+                    # settles that the approval plane's plumbing gets fixed
+                    # first and governance knobs are decided from evidence
+                    # after, which applies to this knob as much as to #1054's.
+                    #
+                    # If that evidence arrives, this field is still the one flip
+                    # -- but the flip needs an operator-written source, never a
+                    # bundle-declared one (the #520 anti-hollow-out rule: an
+                    # agent must not widen how its own approvals are collected).
                     allow_free_text=True,
                 ),
             )
