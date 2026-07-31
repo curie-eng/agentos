@@ -230,3 +230,56 @@ def test_over_long_names_that_share_a_prefix_still_differ() -> None:
     b = r.object_name("release", "agent-with-a-very-long-name-number-two", "grafana")
     assert len(a) <= 63 and len(b) <= 63
     assert a != b
+
+
+# --------------------------------------------------------------------------- #
+# Placeholders: values only Curie can know -- #1156
+# --------------------------------------------------------------------------- #
+HOSTED_WITH_HOSTS = ConnectorSpec(
+    image="grafana/mcp-grafana:0.17.2",
+    args=["-t", "streamable-http", "-allowed-hosts", "${CURIE_ALLOWED_HOSTS}"],
+)
+
+
+def _dep(agent: str = "sre-dev", spec: ConnectorSpec = HOSTED_WITH_HOSTS) -> dict:
+    return next(
+        o
+        for o in r.render("sre-bot", agent, "sre-bot", "sre-bot", "grafana", spec, "s")
+        if o["kind"] == "Deployment"
+    )
+
+
+def test_allowed_hosts_expands_to_every_name_the_sandbox_could_dial() -> None:
+    # Servers that guard against DNS rebinding default their allowlist to
+    # loopback, so without this the connector starts and answers every in-cluster
+    # call with `forbidden: host not allowed` -- healthy in `kubectl get pods`,
+    # working for nobody.
+    args = _dep()["spec"]["template"]["spec"]["containers"][0]["args"]
+    value = args[args.index("-allowed-hosts") + 1]
+    assert "${" not in value, "placeholder reached the container unsubstituted"
+    for alias in r.host_aliases("sre-bot", "sre-dev", "grafana", "sre-bot", 8000):
+        assert alias in value
+
+
+def test_each_agent_gets_its_own_allowlist() -> None:
+    # Since #1116 the Service name is agent-scoped, so one hardcoded allowlist
+    # cannot serve two agents built from the same bundle.
+    def hosts(agent: str) -> str:
+        a = _dep(agent)["spec"]["template"]["spec"]["containers"][0]["args"]
+        return a[a.index("-allowed-hosts") + 1]
+
+    assert hosts("sre-dev") != hosts("sre-prod")
+
+
+def test_placeholders_expand_in_env_too() -> None:
+    spec = ConnectorSpec(image="x:1", env={"SELF_URL": "${CURIE_CONNECTOR_URL}"})
+    env = _dep(spec=spec)["spec"]["template"]["spec"]["containers"][0]["env"]
+    entry = next(e for e in env if e["name"] == "SELF_URL")
+    assert entry["value"].startswith("http://sre-bot-sre-dev-mcp-grafana.sre-bot")
+
+
+def test_text_without_placeholders_is_untouched() -> None:
+    spec = ConnectorSpec(image="x:1", args=["-t", "streamable-http"], env={"A": "b"})
+    c = _dep(spec=spec)["spec"]["template"]["spec"]["containers"][0]
+    assert c["args"] == ["-t", "streamable-http"]
+    assert {"name": "A", "value": "b"} in c["env"]
