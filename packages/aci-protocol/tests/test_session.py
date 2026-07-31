@@ -464,7 +464,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         state_url="http://api:8000/agents/agent-abc/state",
         state_token="st-scoped-token",
         connector_release="curie",
-        connector_agent="sre-dev",
+        connector_agent="acme-dev",
         connector_namespace="curie",
     )
     worker_owned = set(BootEnv.env_keys(producer="worker"))
@@ -847,14 +847,14 @@ def test_connector_scope_is_emitted_as_a_set_or_not_at_all() -> None:
     # The runner derives `<release>-<agent>-mcp-<connector>.<namespace>` from all
     # three or derives nothing. A partial scope would name a Service that cannot
     # exist, and the failure would be a connection refused at turn time.
-    partial = _worker_env(connector_release="curie", connector_agent="sre-dev")
+    partial = _worker_env(connector_release="curie", connector_agent="acme-dev")
     assert not [k for k in partial if k.startswith("CURIE_CONNECTOR_")]
 
     full = _worker_env(
-        connector_release="curie", connector_agent="sre-dev", connector_namespace="curie"
+        connector_release="curie", connector_agent="acme-dev", connector_namespace="curie"
     )
     assert full["CURIE_CONNECTOR_RELEASE"] == "curie"
-    assert full["CURIE_CONNECTOR_AGENT"] == "sre-dev"
+    assert full["CURIE_CONNECTOR_AGENT"] == "acme-dev"
     assert full["CURIE_CONNECTOR_NAMESPACE"] == "curie"
 
 

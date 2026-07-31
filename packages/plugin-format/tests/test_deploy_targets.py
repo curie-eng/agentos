@@ -36,11 +36,11 @@ def _bundle(root: Path, deploy_yaml: str | None) -> Path:
 REAL = (
     "targets:\n"
     "  dev:\n"
-    "    agent: sre-dev\n"
+    "    agent: acme-dev\n"
     "    env: dev\n"
     "    slack_channel: C0EXAMPLE2\n"
     "  prod:\n"
-    "    agent: sre-bot\n"
+    "    agent: acme-bot\n"
     "    env: prod\n"
     "    slack_channel: C0EXAMPLE1\n"
 )
@@ -50,15 +50,15 @@ def test_the_shape_the_adr_specifies_is_accepted() -> None:
     parsed, errors = validate_deploy_targets(
         {
             "targets": {
-                "dev": {"agent": "sre-dev", "env": "dev", "slack_channel": "C0EXAMPLE2"},
-                "prod": {"agent": "sre-bot", "env": "prod", "slack_channel": "C0EXAMPLE1"},
+                "dev": {"agent": "acme-dev", "env": "dev", "slack_channel": "C0EXAMPLE2"},
+                "prod": {"agent": "acme-bot", "env": "prod", "slack_channel": "C0EXAMPLE1"},
             }
         }
     )
     assert errors == []
     assert parsed is not None
     assert parsed.targets["prod"].env == "prod"
-    assert parsed.targets["dev"].agent == "sre-dev"
+    assert parsed.targets["dev"].agent == "acme-dev"
 
 
 def test_absent_file_is_fine(tmp_path: Path) -> None:
@@ -122,5 +122,5 @@ def test_bundle_surfaces_unparseable_yaml(tmp_path: Path) -> None:
     assert any(e.code == "deploy.unreadable" for e in result.errors)
 
 
-def test_the_real_sre_bot_routing_validates(tmp_path: Path) -> None:
+def test_the_real_acme_bot_routing_validates(tmp_path: Path) -> None:
     assert validate_bundle(str(_bundle(tmp_path, REAL))).valid

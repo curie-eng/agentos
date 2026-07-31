@@ -14,7 +14,7 @@ from curie_runner.connectors import derive_mcp_servers
 HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [T]\n"
 REMOTE = "connectors:\n  internal:\n    url: https://mcp.internal/mcp\n"
 
-SCOPE = {"release": "curie", "agent": "sre-dev", "namespace": "curie"}
+SCOPE = {"release": "curie", "agent": "acme-dev", "namespace": "curie"}
 
 
 def _bundle(root: Path, connectors: str | None = None, mcp: dict | None = None) -> Path:
@@ -35,7 +35,7 @@ def test_the_author_never_writes_the_url(tmp_path: Path) -> None:
     # whoever wrote the bundle.
     servers = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE)
     assert servers["grafana"]["url"] == (
-        "http://curie-sre-dev-mcp-grafana.curie.svc.cluster.local:8000/mcp"
+        "http://curie-acme-dev-mcp-grafana.curie.svc.cluster.local:8000/mcp"
     )
 
 
@@ -44,7 +44,7 @@ def test_two_agents_from_one_bundle_dial_different_servers(tmp_path: Path) -> No
     # guaranteed wrong for at least one of two agents sharing a bundle. Deriving
     # per-boot is what makes one bundle serve both.
     root = _bundle(tmp_path, HOSTED)
-    dev = derive_mcp_servers(root, release="curie", agent="sre-dev", namespace="curie")
+    dev = derive_mcp_servers(root, release="curie", agent="acme-dev", namespace="curie")
     prod = derive_mcp_servers(root, release="curie", agent="sre-prod", namespace="curie")
     assert dev["grafana"]["url"] != prod["grafana"]["url"]
 
