@@ -26,6 +26,14 @@ pub const DEFAULT_SLACK_CHANNEL: &str = "C0LOCALDEV";
 /// The API renders these; the CLI applies them. Rendering is a pure function so
 /// the API needs no cluster access for it, and cluster-write authority stays
 /// with the operator running this command (ADR-0086, #1063).
+/// What a named `deploy.yaml` target resolves to (ADR-0089).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResolvedTarget {
+    pub agent: Option<String>,
+    pub env: String,
+    pub slack_channel: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ConnectorManifests {
     #[serde(default)]
@@ -827,6 +835,33 @@ impl ApiClient {
     /// `release`/`namespace`/`app_name` are install-time facts the API does not
     /// know -- they live with whoever ran `cluster up` -- so the caller supplies
     /// them and the API stays a pure function.
+    /// Resolve a named target by POSTing the `deploy.yaml` TEXT.
+    ///
+    /// The CLI deliberately does not parse this file. One parser means the CLI
+    /// and the validator cannot disagree about where a deploy lands, and it
+    /// keeps a YAML crate out of this binary -- serde_yaml is deprecated and
+    /// its half-dozen forks have no clear successor to depend on (ADR-0089).
+    pub async fn resolve_deploy_target(
+        &self,
+        content: &str,
+        target: &str,
+    ) -> Result<ResolvedTarget> {
+        let resp = self
+            .http
+            .post(format!("{}/deploy-targets/resolve", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&serde_json::json!({"content": content, "target": target}))
+            .send()
+            .await
+            .context("resolving the deploy target")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("resolving target `{target}` failed with {status}: {body}");
+        }
+        serde_json::from_str(&body).context("decoding the resolved deploy target")
+    }
+
     pub async fn version_connectors(
         &self,
         agent_id: &str,

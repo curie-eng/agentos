@@ -125,6 +125,11 @@
       ]
     },
     {
+      "struct": "ResolvedTarget",
+      "schema": "ResolvedTarget",
+      "omissions": []
+    },
+    {
       "struct": "ConnectorManifests",
       "schema": "ConnectorManifests",
       "omissions": []

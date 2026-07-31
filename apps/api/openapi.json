@@ -2019,6 +2019,59 @@
         "title": "PodLogs",
         "type": "object"
       },
+      "ResolveTargetRequest": {
+        "description": "A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).\n\nThe CLI sends the file CONTENT rather than parsing it, so there is exactly\none parser for this format. Two would be a drift hazard on a file whose\nwhole job is to be unambiguous about where a deploy lands -- and the Rust\nYAML ecosystem has no maintained successor to serde_yaml to pick from.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "target": {
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "target"
+        ],
+        "title": "ResolveTargetRequest",
+        "type": "object"
+      },
+      "ResolvedTarget": {
+        "description": "What a named target resolves to. Pure function of the file.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
+          "env": {
+            "default": "dev",
+            "title": "Env",
+            "type": "string"
+          },
+          "slack_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slack Channel"
+          }
+        },
+        "title": "ResolvedTarget",
+        "type": "object"
+      },
       "RunnerPods": {
         "description": "The runner sandbox pods in a namespace (populates the Logs pod dropdown).",
         "properties": {
@@ -5037,6 +5090,66 @@
         "summary": "Get Config",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/deploy-targets/resolve": {
+      "post": {
+        "description": "Resolve a named target from a bundle's ``deploy.yaml`` (ADR-0089).\n\nPure function of the supplied text: no database, no store, no cluster. It\nlives here rather than in the CLI so there is exactly ONE parser for this\nformat. A second implementation in Rust could disagree with this one about\nthe same file, and the file's entire purpose is to be unambiguous about\nwhere a deploy lands -- a disagreement would route a deploy somewhere the\nauthor did not intend and report success.\n\nValidation errors are returned rather than swallowed, because every one of\nthem describes a deploy that would otherwise succeed against the wrong\nagent, environment, or channel.",
+        "operationId": "resolve_deploy_target_deploy_targets_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveTargetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolvedTarget"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Deploy Target",
+        "tags": [
+          "deploy-targets"
         ]
       }
     },

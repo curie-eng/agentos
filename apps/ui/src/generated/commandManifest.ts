@@ -1138,6 +1138,14 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
+              "help": "Resolve the agent, environment, and channel from a target declared in the bundle's `deploy.yaml` (ADR-0089)",
+              "id": "target",
+              "long": "target",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Deploy under this agent name instead of the manifest's `name`",
               "id": "agent",
               "long": "agent",
@@ -1196,11 +1204,8 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "dev"
-              ],
               "global": false,
-              "help": "Target environment",
+              "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
               "id": "env",
               "long": "env",
               "positional": false,
@@ -2456,6 +2461,14 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
+              "help": "Resolve the agent, environment, and channel from a target declared in the bundle's `deploy.yaml` (ADR-0089)",
+              "id": "target",
+              "long": "target",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Deploy under this agent name instead of the manifest's `name`",
               "id": "agent",
               "long": "agent",
@@ -2530,11 +2543,8 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "dev"
-              ],
               "global": false,
-              "help": "Target environment",
+              "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
               "id": "env",
               "long": "env",
               "positional": false,
@@ -3323,11 +3333,8 @@ export const commandManifest = {
           "required": false
         },
         {
-          "default_values": [
-            "dev"
-          ],
           "global": false,
-          "help": "Target environment",
+          "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
           "id": "env",
           "long": "env",
           "positional": false,
