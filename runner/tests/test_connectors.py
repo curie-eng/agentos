@@ -99,3 +99,38 @@ def test_invalid_connectors_file_mounts_nothing(tmp_path: Path) -> None:
 
 def test_no_plugin_dir_is_not_an_error(tmp_path: Path) -> None:
     assert derive_mcp_servers(None, **SCOPE) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Reaching a hosted connector on a tier that cannot host it -- #1160
+# --------------------------------------------------------------------------- #
+HOSTED_WITH_FALLBACK = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    unhosted_url: http://host.docker.internal:8765/mcp\n"
+)
+
+
+def test_a_fallback_makes_a_hosted_connector_reachable_at_the_skill_tier(tmp_path: Path) -> None:
+    # The skill tier hosts nothing, but the developer has mcp-grafana running.
+    # Without this the eval lane silently loses its connector.
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED_WITH_FALLBACK), release=None, agent=None, namespace=None
+    )
+    assert servers["grafana"]["url"] == "http://host.docker.internal:8765/mcp"
+
+
+def test_the_cluster_still_uses_the_service_it_created(tmp_path: Path) -> None:
+    # A fallback that won everywhere would repoint a production agent at
+    # someone's laptop. The derived URL must win wherever Curie hosts.
+    servers = derive_mcp_servers(_bundle(tmp_path, HOSTED_WITH_FALLBACK), **SCOPE)
+    assert "svc.cluster.local" in servers["grafana"]["url"]
+    assert "8765" not in servers["grafana"]["url"]
+
+
+def test_a_hosted_connector_without_a_fallback_still_mounts_nothing(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, HOSTED), release=None, agent=None, namespace=None
+    )
+    assert servers == {}
