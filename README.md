@@ -9,7 +9,7 @@ on your own Kubernetes cluster. Configure your model, so you can point an agent 
 OpenRouter, or a local model through Ollama. Get traces, evals, budgets, and git-flow deploys
 for free. One CLI, `curie`, drives all of it.
 
-New here? [`Quickstart`](#quickstart) gets you a first agent reply in about a minute.
+New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
 
 ## Why your agent breaks when it leaves your laptop
 
@@ -68,17 +68,27 @@ tree -a
 ```
 ```
 .
+├── .claude/
+│   └── skills/
+│       └── using-curie/
+│           └── SKILL.md
+├── .claude-plugin/
+│   └── plugin.json
+├── .gitignore
 ├── .mcp.json
-├── evals
+├── AGENTS.md
+├── evals/
 │   └── cases.json
-└── skills
-    └── my-agent
+└── skills/
+    └── my-agent/
         └── SKILL.md
 ```
 
 - `skills/my-agent/SKILL.md` - the agent's instructions: what it does, and when to use which tool.
 - `.mcp.json` - the MCP servers (tools) this agent can call.
 - `evals/cases.json` - the eval cases that grade this agent's behavior, at every tier.
+- `AGENTS.md` - the rules for a coding agent working in this bundle.
+- `.claude/skills/using-curie/SKILL.md` - a primer skill that teaches the agent to drive the Curie harness (same content as `curie guide`).
 
 This is the Claude Code plugin format, verbatim - see [`packages/plugin-format/README.md`](packages/plugin-format/README.md#format-surface)
 for the shape Curie validates against.
