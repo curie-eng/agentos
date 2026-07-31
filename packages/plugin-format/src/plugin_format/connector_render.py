@@ -184,13 +184,40 @@ def render_deployment(
         {"name": k, "value": substitute(v, subs)} for k, v in sorted(spec.env.items())
     ]
     # Declared secrets arrive by reference, never as literals in the manifest.
-    env += [
-        {
-            "name": s,
-            "valueFrom": {"secretKeyRef": {"name": secret_name, "key": s, "optional": False}},
-        }
-        for s in spec.secrets
-    ]
+    # A declared secret points either at the Secret Curie owns for this agent,
+    # or at one provisioned out of band (#1163). Both render the same shape --
+    # a secretKeyRef, never a literal -- so the container cannot tell them
+    # apart and nothing downstream needs to.
+    for declared in spec.secrets:
+        if isinstance(declared, str):
+            env.append(
+                {
+                    "name": declared,
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": secret_name,
+                            "key": declared,
+                            "optional": False,
+                        }
+                    },
+                }
+            )
+        else:
+            env.append(
+                {
+                    "name": declared.name,
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": declared.from_secret,
+                            "key": declared.secret_key(),
+                            # Not optional: a referenced Secret that does not
+                            # exist must stop the pod, not start it without the
+                            # credential and 401 on every call.
+                            "optional": False,
+                        }
+                    },
+                }
+            )
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",

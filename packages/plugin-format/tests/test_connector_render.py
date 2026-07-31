@@ -315,3 +315,57 @@ def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> Non
     hosted = r.mcp_entry("curie", "acme-dev", "curie", "grafana", spec)
     assert "svc.cluster.local" in hosted["url"]
     assert "8765" not in hosted["url"]
+
+
+# --------------------------------------------------------------------------- #
+# A referenced Secret renders the same shape as an owned one -- #1163
+# --------------------------------------------------------------------------- #
+def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
+    from plugin_format.connectors import SecretRef
+
+    spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="TOKEN", from_secret="grafana-mcp")])
+    dep = next(
+        o
+        for o in r.render("rel", "ag", "ns", "app", "g", spec, "curie-owned")
+        if o["kind"] == "Deployment"
+    )
+    entry = next(
+        e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "TOKEN"
+    )
+    ref = entry["valueFrom"]["secretKeyRef"]
+    assert ref["name"] == "grafana-mcp", "must point at the out-of-band Secret, not Curie's"
+    assert ref["key"] == "TOKEN"
+    assert "value" not in entry
+
+
+def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -> None:
+    # Both render a secretKeyRef and never a literal. The container cannot tell
+    # which is which, so nothing downstream needs to care.
+    from plugin_format.connectors import SecretRef
+
+    spec = ConnectorSpec(image="x:1", secrets=["OWNED", SecretRef(name="REFD", from_secret="ext")])
+    dep = next(
+        o
+        for o in r.render("rel", "ag", "ns", "app", "g", spec, "curie-owned")
+        if o["kind"] == "Deployment"
+    )
+    env = {e["name"]: e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["OWNED"]["valueFrom"]["secretKeyRef"]["name"] == "curie-owned"
+    assert env["REFD"]["valueFrom"]["secretKeyRef"]["name"] == "ext"
+    for name in ("OWNED", "REFD"):
+        assert "value" not in env[name], f"{name} must never be inlined"
+
+
+def test_a_referenced_secret_is_not_optional() -> None:
+    # A missing referenced Secret must stop the pod, not start it credential-less
+    # and 401 on every call -- which reads as "the tool is broken".
+    from plugin_format.connectors import SecretRef
+
+    spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="T", from_secret="ext")])
+    dep = next(
+        o for o in r.render("rel", "ag", "ns", "app", "g", spec, "s") if o["kind"] == "Deployment"
+    )
+    entry = next(
+        e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
+    )
+    assert entry["valueFrom"]["secretKeyRef"]["optional"] is False

@@ -110,44 +110,21 @@ pub fn object_names(manifests: &[Value]) -> Vec<String> {
         .collect()
 }
 
-/// The Secret name and credential keys the rendered Deployments reference.
+/// Keys whose VALUES this command must resolve, and the Secret to put them in.
 ///
-/// Read back off the manifests rather than re-derived from the bundle: the API
-/// decides the Secret's name and which keys a connector needs, so re-deriving
-/// here would be a second copy of that rule, free to drift from the one that
-/// actually rendered the `secretKeyRef`.
-pub fn referenced_secrets(manifests: &[Value]) -> Option<(String, Vec<String>)> {
-    let mut name: Option<String> = None;
-    let mut keys: Vec<String> = Vec::new();
-    for obj in manifests {
-        let containers = obj
-            .pointer("/spec/template/spec/containers")
-            .and_then(|c| c.as_array());
-        for c in containers.into_iter().flatten() {
-            for env in c
-                .get("env")
-                .and_then(|e| e.as_array())
-                .into_iter()
-                .flatten()
-            {
-                let Some(r) = env.pointer("/valueFrom/secretKeyRef") else {
-                    continue;
-                };
-                if let Some(n) = r.get("name").and_then(|n| n.as_str()) {
-                    name.get_or_insert_with(|| n.to_string());
-                }
-                if let Some(k) = r.get("key").and_then(|k| k.as_str()) {
-                    if !keys.iter().any(|e| e == k) {
-                        keys.push(k.to_string());
-                    }
-                }
-            }
-        }
+/// Taken from what the API DECLARED, not inferred from the manifests. Since
+/// #1163 a connector may reference a Secret provisioned out of band, and its
+/// key appears in the rendered `secretKeyRef` exactly like an owned one --
+/// indistinguishable by shape. Inferring would try to resolve a credential
+/// this caller may not have, and by design should not: the whole point of the
+/// reference form is that the deploy path never handles it.
+pub fn owned_secret(name: &str, keys: &[String]) -> Option<(String, Vec<String>)> {
+    if name.is_empty() || keys.is_empty() {
+        return None;
     }
-    name.map(|n| {
-        keys.sort();
-        (n, keys)
-    })
+    let mut keys = keys.to_vec();
+    keys.sort();
+    Some((name.to_string(), keys))
 }
 
 /// The Secret carrying resolved connector credentials.
@@ -283,26 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn secret_refs_are_read_back_off_the_rendered_manifests() {
-        // Re-deriving the Secret's name here would be a second copy of a rule
-        // the API already applied, free to drift from the secretKeyRef that was
-        // actually rendered -- and a mismatch means the pod never starts.
-        let dep = json!({"kind":"Deployment","spec":{"template":{"spec":{"containers":[{
-        "env":[
-            {"name":"GRAFANA_URL","value":"https://g"},
-            {"name":"TOKEN","valueFrom":{"secretKeyRef":{"name":"r-a-connector-secrets","key":"TOKEN"}}},
-            {"name":"OTHER","valueFrom":{"secretKeyRef":{"name":"r-a-connector-secrets","key":"OTHER"}}}
-        ]}]}}}});
-        let (name, keys) = referenced_secrets(&[dep]).unwrap();
-        assert_eq!(name, "r-a-connector-secrets");
-        assert_eq!(keys, vec!["OTHER".to_string(), "TOKEN".to_string()]);
+    fn only_curie_owned_keys_are_resolved_locally() {
+        // Since #1163 a referenced Secret's key appears in the rendered
+        // secretKeyRef exactly like an owned one. Resolving it here would try
+        // to read a credential this caller may not have -- and by design
+        // should not, since the reference form exists so the deploy path never
+        // handles it. The API says which keys are ours; we do not guess.
+        let (name, keys) = owned_secret("curie-owned", &["OWNED".to_string()]).unwrap();
+        assert_eq!(name, "curie-owned");
+        assert_eq!(keys, vec!["OWNED".to_string()]);
     }
 
     #[test]
-    fn a_connector_with_no_secrets_needs_no_secret_object() {
-        let dep = json!({"kind":"Deployment","spec":{"template":{"spec":{"containers":[{
-            "env":[{"name":"GRAFANA_URL","value":"https://g"}]}]}}}});
-        assert!(referenced_secrets(&[dep]).is_none());
+    fn a_connector_whose_secrets_are_all_referenced_needs_no_secret_object() {
+        // Every credential lives in a Secret someone else provisioned, so this
+        // deploy creates none -- which is the property that lets a reconciler
+        // apply the same connector without holding any credential (ADR-0090).
+        assert!(owned_secret("curie-owned", &[]).is_none());
+    }
+
+    #[test]
+    fn a_connector_with_no_secrets_at_all_needs_no_secret_object() {
+        assert!(owned_secret("", &[]).is_none());
     }
 
     #[test]
@@ -450,13 +429,15 @@ fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<S
 pub async fn sync(
     manifests: &[Value],
     mcp_entries: &std::collections::BTreeMap<String, Value>,
+    owned_secret_name: &str,
+    owned_secret_keys: &[String],
     namespace: &str,
     agent_name: &str,
 ) -> Result<ConnectorSync> {
     let ui = crate::ui::ui();
     let mut objects = Vec::new();
 
-    if let Some((secret_name, keys)) = referenced_secrets(manifests) {
+    if let Some((secret_name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
         if !keys.is_empty() {
             objects.push(render_secret(
                 &secret_name,

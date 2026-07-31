@@ -130,6 +130,8 @@ async fn sync_connectors(
     let synced = curie::connectors::sync(
         &rendered.manifests,
         &rendered.mcp_entries,
+        &rendered.owned_secret_name,
+        &rendered.owned_secret_keys,
         namespace,
         agent_name,
     )

@@ -960,6 +960,18 @@
             "additionalProperties": true,
             "title": "Mcp Entries",
             "type": "object"
+          },
+          "owned_secret_keys": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Owned Secret Keys",
+            "type": "array"
+          },
+          "owned_secret_name": {
+            "default": "",
+            "title": "Owned Secret Name",
+            "type": "string"
           }
         },
         "title": "ConnectorManifests",
