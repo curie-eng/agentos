@@ -2,7 +2,8 @@
 //!
 //! Seven files. The deployed bundle shape matches the frozen `plugin-format`
 //! package: a manifest at `.claude-plugin/plugin.json`, a genericized starter
-//! `skills/<name>/SKILL.md` with YAML frontmatter, a root `.mcp.json`, plus a
+//! `skills/<name>/SKILL.md` with YAML frontmatter, a root `.mcp.json`, an
+//! empty-but-documented `connectors.yaml` and `deploy.yaml`, plus a
 //! CLI-local `evals/cases.json` seed (a suite object
 //! `{name, cases: [{id, input, grader}]}`, hand-mirroring the frozen eval-case
 //! schema) for `curie skill eval` -- a single smoke case whose grader is
@@ -119,7 +120,7 @@ fn eval_cases(name: &str) -> String {
 /// current landmine list.
 fn agents_md(name: &str) -> String {
     format!(
-        "# Agent instructions: {name}\n\nThis is a Curie bundle (a Claude Code plugin shape). The full harness\nprimer is one command away and is the source of truth:\n\n    curie guide\n\n## The loop\n\n1. `curie skill up --fake-model` -- boot the runner offline, no credential.\n   The fake model is plumbing, not a subject under test: it answers every input\n   with the same canned reply, so nothing it says is evidence about behavior.\n2. Edit `skills/{name}/SKILL.md` (behavior) and `evals/cases.json` (the contract).\n3. `curie skill up --replace --fake-model` -- the runner executes an immutable\n   snapshot of the bundle taken at `skill up`, so a `SKILL.md` edit reaches it\n   ONLY after a restart. Skip this and step 4 grades the pre-edit bundle with\n   no sign anything is stale. (`evals/cases.json` is read live from source, so\n   the contract does not need the restart -- only the behavior does.) Confirm\n   what is loaded with `curie skill status --json` and its `bundle_digest`.\n4. `curie skill eval` under `--fake-model` reports `plumbing_ok` -- it proves\n   the turn completed, and grades nothing. Re-run it with a real credential to\n   grade the cases; that green is the promotion gate. Merging to main promotes.\n5. `curie skill down` when finished.\n\n## Rules\n\n- Verify before running: `curie schema` lists every real command; never\n  invoke one you have not confirmed.\n- The eval file is the promotion gate and never changes across tiers\n  (skill/local/cluster). Grading, and therefore green and red, is a\n  real-credential concept; never deploy on red.\n- Landmines: run `curie guide` (or read\n  `.claude/skills/using-curie/SKILL.md`) for the full, current list.\n- If a step here needs human sign-off, do NOT collect it in the skill. Call the\n  built-in `request_approval` tool and end the turn: the platform posts the card,\n  authorizes the resolver server-side, and resumes you with a turn beginning\n  `[approval resolved]`, which this skill must handle. `curie guide` has the\n  section; `docs/approvals.md` in the Curie repo has the full walkthrough.\n- The scaffolded eval is a starter smoke test: it only checks the agent named\n  itself, so it fails on an empty/errored turn but proves nothing about the\n  real work. Replace it with a FALSIFIABLE grader -- one a plausibly-broken\n  agent would fail -- as the first authoring step (ADR-0022).\n- A bare greeting (\"hey\", \"hi\") is answered by the real model by default --\n  a full sandbox claim and model turn for something a canned reply could\n  handle for free. If this agent gets greeted often, consider a `greeting`\n  behavior pack: `GET`/`PUT /agents/{{id}}/behavior-packs` (no CLI verb yet)\n  short-circuits a bare greeting/help request before the model ever runs.\n  See `docs/behavior-packs.md`.\n"
+        "# Agent instructions: {name}\n\nThis is a Curie bundle (a Claude Code plugin shape). The full harness\nprimer is one command away and is the source of truth:\n\n    curie guide\n\n## The loop\n\n1. `curie skill up --fake-model` -- boot the runner offline, no credential.\n   The fake model is plumbing, not a subject under test: it answers every input\n   with the same canned reply, so nothing it says is evidence about behavior.\n2. Edit `skills/{name}/SKILL.md` (behavior) and `evals/cases.json` (the contract).\n3. `curie skill up --replace --fake-model` -- the runner executes an immutable\n   snapshot of the bundle taken at `skill up`, so a `SKILL.md` edit reaches it\n   ONLY after a restart. Skip this and step 4 grades the pre-edit bundle with\n   no sign anything is stale. (`evals/cases.json` is read live from source, so\n   the contract does not need the restart -- only the behavior does.) Confirm\n   what is loaded with `curie skill status --json` and its `bundle_digest`.\n4. `curie skill eval` under `--fake-model` reports `plumbing_ok` -- it proves\n   the turn completed, and grades nothing. Re-run it with a real credential to\n   grade the cases; that green is the promotion gate. Merging to main promotes.\n5. `curie skill down` when finished.\n\n## What this bundle declares\n\n- `skills/{name}/SKILL.md` -- behavior. The main thing to edit.\n- `evals/cases.json` -- the promotion gate. Make it FALSIFIABLE.\n- `connectors.yaml` -- what this agent needs RUNNING (an MCP server Curie\n  hosts for it). Scaffolded empty and commented; Curie derives the Deployment,\n  Service, hardening, host allowlist, NetworkPolicy, and the URL the agent\n  dials, so none of that belongs in this repo. Never hand-write that URL: it\n  embeds the release, the agent, and the namespace, so it differs per agent.\n- `deploy.yaml` -- WHERE this bundle goes. `curie cluster deploy --target prod`\n  reads it, so routing is a reviewable diff instead of flags in CI. The bundle\n  is identical across targets; only the binding differs.\n\n## Rules\n\n- Verify before running: `curie schema` lists every real command; never\n  invoke one you have not confirmed.\n- The eval file is the promotion gate and never changes across tiers\n  (skill/local/cluster). Grading, and therefore green and red, is a\n  real-credential concept; never deploy on red.\n- Landmines: run `curie guide` (or read\n  `.claude/skills/using-curie/SKILL.md`) for the full, current list.\n- If a step here needs human sign-off, do NOT collect it in the skill. Call the\n  built-in `request_approval` tool and end the turn: the platform posts the card,\n  authorizes the resolver server-side, and resumes you with a turn beginning\n  `[approval resolved]`, which this skill must handle. `curie guide` has the\n  section; `docs/approvals.md` in the Curie repo has the full walkthrough.\n- The scaffolded eval is a starter smoke test: it only checks the agent named\n  itself, so it fails on an empty/errored turn but proves nothing about the\n  real work. Replace it with a FALSIFIABLE grader -- one a plausibly-broken\n  agent would fail -- as the first authoring step (ADR-0022).\n- A bare greeting (\"hey\", \"hi\") is answered by the real model by default --\n  a full sandbox claim and model turn for something a canned reply could\n  handle for free. If this agent gets greeted often, consider a `greeting`\n  behavior pack: `GET`/`PUT /agents/{{id}}/behavior-packs` (no CLI verb yet)\n  short-circuits a bare greeting/help request before the model ever runs.\n  See `docs/behavior-packs.md`.\n"
     )
 }
 
@@ -135,6 +136,66 @@ fn using_curie_skill() -> String {
 }
 
 const MCP_JSON: &str = "{\n  \"mcpServers\": {}\n}\n";
+
+/// Declared connectors (ADR-0086). Scaffolded COMMENTED OUT so the bundle
+/// validates as-is: an empty `connectors:` map is valid, and a half-filled one
+/// is not. The point of shipping it at all is discoverability -- before this,
+/// nothing in a fresh bundle mentioned the file, so an author had no way to
+/// learn that Curie will run a connector for them.
+const CONNECTORS_YAML: &str = r#"# What this agent needs running. Curie derives the Deployment, Service,
+# container hardening, host allowlist, sandbox-to-connector NetworkPolicy,
+# secret wiring, and the URL the agent dials -- so none of that lives here.
+#
+# Uncomment and edit to declare one:
+#
+# connectors:
+#   grafana:
+#     image: grafana/mcp-grafana:0.17.2
+#     args:
+#       - -t
+#       - streamable-http
+#       # Curie names the Service, so Curie supplies every name the sandbox may
+#       # dial. Hardcoding these breaks the moment a second agent runs this
+#       # bundle -- the names are per-agent.
+#       - -allowed-hosts
+#       - ${CURIE_ALLOWED_HOSTS}
+#     env:
+#       GRAFANA_URL: https://grafana.example.com
+#     # NAMES only. Values resolve at deploy time from your environment or
+#     # `curie secrets set <NAME>`; they never belong in this file.
+#     secrets:
+#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+#
+#     # Where to reach it on a tier that cannot host it -- `skill` hosts
+#     # nothing, so this is how local development reaches your own copy.
+#     unhosted_url: ${GRAFANA_MCP_URL}
+connectors: {}
+"#;
+
+/// Declared deploy targets (ADR-0089). Also commented out, and for a sharper
+/// reason than connectors: a target names a Slack channel and an agent, and a
+/// scaffolded placeholder that looked real would deploy somewhere nobody
+/// intended. An empty `targets:` map is valid and does nothing.
+const DEPLOY_YAML: &str = r#"# Where this bundle gets deployed. `curie cluster deploy --target prod` reads
+# this, so the routing is a reviewable diff in the repository instead of flags
+# scattered across whatever invokes the command.
+#
+# The BUNDLE is identical for every target -- only the binding differs, which
+# is what lets prod promote the exact artifact dev validated.
+#
+# Uncomment and edit. Use Slack channel IDs (starting with C), not #names:
+#
+# targets:
+#   dev:
+#     agent: my-agent-dev
+#     env: dev
+#     slack_channel: C0EXAMPLE1
+#   prod:
+#     agent: my-agent
+#     env: prod
+#     slack_channel: C0EXAMPLE2
+targets: {}
+"#;
 const GITIGNORE: &str = ".curie/\n";
 
 /// Create the bundle skeleton under `dir`; returns the created files.
@@ -147,6 +208,8 @@ pub fn scaffold(dir: &Path, name: &str) -> Result<Vec<PathBuf>> {
         (dir.join(".claude-plugin/plugin.json"), manifest(name)),
         (dir.join(format!("skills/{name}/SKILL.md")), skill_md(name)),
         (dir.join(".mcp.json"), MCP_JSON.to_string()),
+        (dir.join("connectors.yaml"), CONNECTORS_YAML.to_string()),
+        (dir.join("deploy.yaml"), DEPLOY_YAML.to_string()),
         (dir.join("evals/cases.json"), eval_cases(name)),
         (dir.join(".gitignore"), GITIGNORE.to_string()),
         (dir.join("AGENTS.md"), agents_md(name)),
@@ -449,7 +512,7 @@ mod tests {
     fn scaffolds_the_frozen_bundle_shape() {
         let dir = tempfile::tempdir().unwrap();
         let created = scaffold(dir.path(), "deal-desk").unwrap();
-        assert_eq!(created.len(), 7);
+        assert_eq!(created.len(), 9);
 
         let manifest: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join(".claude-plugin/plugin.json")).unwrap(),
@@ -473,6 +536,25 @@ mod tests {
             !skill.contains("weather") && !skill.contains("Weather"),
             "starter skill must be genericized, not weather"
         );
+
+        // connectors.yaml and deploy.yaml ship COMMENTED: a fresh bundle must
+        // validate as-is, and a half-filled connector or a placeholder Slack
+        // channel would not. They exist for discoverability -- before this,
+        // nothing in a scaffolded bundle mentioned either file.
+        for (name, key) in [
+            ("connectors.yaml", "connectors:"),
+            ("deploy.yaml", "targets:"),
+        ] {
+            let body = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            assert!(
+                body.contains(&format!("{key} {{}}")),
+                "{name} must scaffold empty so the bundle validates: {body}"
+            );
+            assert!(
+                body.lines().filter(|l| l.starts_with('#')).count() > 5,
+                "{name} must explain itself; it is the only place an author learns it exists"
+            );
+        }
 
         let mcp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap())
