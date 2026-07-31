@@ -10,11 +10,11 @@ capabilities change, a target changes when the deployment topology does.
       dev:
         agent: sre-dev
         env: dev
-        slack_channel: C0BLL2PK3PW
+        slack_channel: C0EXAMPLE2
       prod:
         agent: sre-bot
         env: prod
-        slack_channel: C0BL766QCR0
+        slack_channel: C0EXAMPLE1
 
     curie cluster deploy --target prod
 

@@ -75,7 +75,7 @@ next click rather than the next restart:
 {
   "approval_routes": {
     "finance": {
-      "channel": "C0BBG383GLF",
+      "channel": "C0EXAMPLE3",
       "approvers": { "group": "S0123ABCD" }
     }
   }
@@ -97,7 +97,7 @@ Bind one from the CLI rather than by hand. A write REPLACES the whole map, so na
 every route it should keep:
 
 ```bash
-curie local approvals my-agent --route finance=C0BBG383GLF \
+curie local approvals my-agent --route finance=C0EXAMPLE3 \
   --route-approvers finance=group:S0123ABCD
 
 curie local approvals my-agent --list-routes
@@ -191,7 +191,7 @@ a bare runner keeps no durable store
 curie local approvals my-agent --list
 
 # settle one as a named actor (must not be the requester)
-curie local approvals my-agent --resolve <id> --as U0MANAGER --actor-channel C0BBG383GLF --note "approved for Q3"
+curie local approvals my-agent --resolve <id> --as U0MANAGER --actor-channel C0EXAMPLE3 --note "approved for Q3"
 
 # reject instead
 curie local approvals my-agent --resolve <id> --as U0MANAGER --reject --note "discount too deep"

@@ -38,11 +38,11 @@ REAL = (
     "  dev:\n"
     "    agent: sre-dev\n"
     "    env: dev\n"
-    "    slack_channel: C0BLL2PK3PW\n"
+    "    slack_channel: C0EXAMPLE2\n"
     "  prod:\n"
     "    agent: sre-bot\n"
     "    env: prod\n"
-    "    slack_channel: C0BL766QCR0\n"
+    "    slack_channel: C0EXAMPLE1\n"
 )
 
 
@@ -50,8 +50,8 @@ def test_the_shape_the_adr_specifies_is_accepted() -> None:
     parsed, errors = validate_deploy_targets(
         {
             "targets": {
-                "dev": {"agent": "sre-dev", "env": "dev", "slack_channel": "C0BLL2PK3PW"},
-                "prod": {"agent": "sre-bot", "env": "prod", "slack_channel": "C0BL766QCR0"},
+                "dev": {"agent": "sre-dev", "env": "dev", "slack_channel": "C0EXAMPLE2"},
+                "prod": {"agent": "sre-bot", "env": "prod", "slack_channel": "C0EXAMPLE1"},
             }
         }
     )
