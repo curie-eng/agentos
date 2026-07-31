@@ -22,24 +22,24 @@ was built from, which are preserved in git history.
 
 ## Table of contents
 
-- [1. One-paragraph frame](#1-one-paragraph-frame)
-- [2. Component map](#2-component-map)
+- [Overview](#overview)
+- [Component map](#component-map)
   - [Directory ownership and language](#directory-ownership-and-language)
-- [3. Two runtime modes, one worker: the thin-shim thesis](#3-two-runtime-modes-one-worker-the-thin-shim-thesis)
-  - [3a. Substrate seam — `SandboxClient`](#3a-substrate-seam--sandboxclient)
-  - [3b. Slack seam — a per-turn reply endpoint and the CLI stub](#3b-slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub)
-- [4. Data flow: a Slack mention becomes a threaded reply](#4-data-flow-a-slack-mention-becomes-a-threaded-reply)
+- [Data flow: a Slack mention becomes a threaded reply](#data-flow-a-slack-mention-becomes-a-threaded-reply)
   - [The four kernel invariants](#the-four-kernel-invariants)
   - [The approval gate: a turn can end without a reply](#the-approval-gate-a-turn-can-end-without-a-reply)
-- [5. Data flow: a git push deploys a bundle and runs evals](#5-data-flow-a-git-push-deploys-a-bundle-and-runs-evals)
-- [6. The credential path](#6-the-credential-path)
-- [7. The observability pipeline](#7-the-observability-pipeline)
-- [8. UI: one wired build](#8-ui-one-wired-build)
-- [9. Frozen contracts](#9-frozen-contracts)
-- [10. Deployment, CI, and release](#10-deployment-ci-and-release)
-- [11. What is built vs deferred](#11-what-is-built-vs-deferred)
+- [Data flow: a git push deploys a bundle and runs evals](#data-flow-a-git-push-deploys-a-bundle-and-runs-evals)
+- [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
+  - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
+  - [Slack seam — a per-turn reply endpoint and the CLI stub](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub)
+- [The credential path](#the-credential-path)
+- [The observability pipeline](#the-observability-pipeline)
+- [The UI: always the real API, no demo mode](#the-ui-always-the-real-api-no-demo-mode)
+- [Frozen contracts](#frozen-contracts)
+- [Deployment, CI, and release](#deployment-ci-and-release)
+- [What is built vs deferred](#what-is-built-vs-deferred)
 
-## 1. One-paragraph frame
+## Overview
 
 What Curie does, in short:
 
@@ -55,10 +55,10 @@ frozen HTTP/NDJSON (Newline-Delimited JSON) protocol. The runner makes the real
 model call and streams the reply back. The worker edits that reply into the
 Slack placeholder. The same worker, unchanged, runs against a real Kubernetes
 cluster or a local Docker substrate. The CLI can stand in for Slack entirely.
-That substrate-agnosticism is the thin-shim thesis and it is the load-bearing
-design property of the whole system.
+That substrate-agnosticism is the load-bearing design property of the whole
+system — see [One worker, two hidden seams](#one-worker-two-hidden-seams-substrate-and-transport).
 
-## 2. Component map
+## Component map
 
 This is the static "who talks to whom." For the flows through it, read the
 focused diagram docs, each a single clean picture:
@@ -115,7 +115,7 @@ The reply travels back out the way it came in — sandbox to worker to the
 originating thread — kept off the diagram to avoid a tangle of return arrows.
 [The message-flow doc](docs/diagrams/message-flow.md) shows that round trip.
 Two substrate implementations sit behind the single `runner pod` box
-(Kubernetes for production, Docker for local). [§3](#3-two-runtime-modes-one-worker-the-thin-shim-thesis) covers that seam.
+(Kubernetes for production, Docker for local). [One worker, two hidden seams](#one-worker-two-hidden-seams-substrate-and-transport) covers that seam.
 
 The worker is not a pass-through between the queue and the sandbox. It is a hub
 with four outbound dependencies of its own:
@@ -135,7 +135,7 @@ The worker has **no** OTel dependency — the runner is the only emitter. The
 worker's telemetry edge is that eval-score write. The CLI likewise never calls
 the dispatcher: it `XADD`s the same `QueuedTurn` the dispatcher would produce
 onto the same stream (the `xadd` helper in [`cli/src/queue.rs`](cli/src/queue.rs)),
-which is what [§3b](#3b-slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) describes.
+which is what [the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) describes.
 
 ### Directory ownership and language
 
@@ -159,95 +159,11 @@ members from the root. See the repo [`CLAUDE.md`](CLAUDE.md) for verify commands
 - **the Claude Code plugin format verbatim** — the other, which ADR-0007 calls "the distribution wedge — do not invent a format"
 
 Curie builds **six** things around that spine: the API, the dispatcher, the
-worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([§10](#10-deployment-ci-and-release)). The
+worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, CI, and release](#deployment-ci-and-release)). The
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
-## 3. Two runtime modes, one worker: the thin-shim thesis
-
-The platform never learns which substrate it is running on, and the runner never
-learns whether the message came from Slack. Two seams make that true, and both
-are real code, not aspiration.
-
-**The system of record for the seams is the interface catalog**
-([`docs/interfaces.md`](docs/interfaces.md)), which enumerates them: one
-`INTERFACE.md` per seam under [`docs/interfaces/`](docs/interfaces). Each file
-carries:
-
-- the port
-- the implementations that exist today
-- the known leakage
-- a grade
-
-The catalog's seam table is generated from those files' front-matter and gated,
-so it cannot quietly drift from them. Read the count off that table rather than
-from prose here. Its governing restraint is **"the second implementation
-teaches the interface"**: a seam is documented where the code already draws the
-line, not written speculatively ahead of a real second implementation. That is
-why several seams honestly carry one implementation and a middling grade rather
-than a fictional adapter layer.
-
-The two seams below are **worked examples, not the list**. Substrate
-(`SandboxClient`) is the one with two real implementations, and Slack is the one
-whose leakage is most instructive. The rest — among them `StreamBroker`,
-`ApproverSet`/`ApprovalCreator`, `MemoryStore`, `TranscriptStore`, `Scorer`,
-`ObjectStore`, and `CliOutput` — live in the catalog. Read it there. This
-section does not duplicate it.
-
-### 3a. Substrate seam — `SandboxClient`
-
-The worker talks to a `SandboxClient` Protocol
-([`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient`](apps/worker/src/curie_worker/sandbox/types.py))
-whose methods are `create_claim`, `get_claim`, `delete_claim`, `list_claims`,
-`get_sandbox`, `set_sandbox_mode`. Two implementations satisfy it:
-
-- **`KubernetesSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient`](apps/worker/src/curie_worker/sandbox/k8s.py)) — creates `SandboxClaim` CRDs (Custom Resource Definitions) against the agent-sandbox controller. The claim references a `SandboxWarmPool` **by name** (`spec.warmPoolRef.name`), and the pod **cold-creates from the `SandboxTemplate`**. The shipped default is `replicas: 0`, meaning no pre-warmed pods. A real-model claim cold-creates regardless, because per-claim env injection cannot bind a pre-warmed pod (the `envVarsInjectionPolicy: Overrides` gotcha). The pool object must still exist — with it absent every claim fails `Ready=False reason=WarmPoolNotFound`. Pre-warming is a dev/fake-model fast path, not the production path ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)). This is the production path.
-- **`DockerSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`](apps/worker/src/curie_worker/sandbox/docker.py)) — runs the same runner image as a local Docker container. This is "middle mode": a full backend on a laptop with no Kubernetes.
-
-Everything above the protocol (the kernel, routing, budgets, kill switch, resume
-path) is identical across modes. The runner image, the ACI it speaks, and the
-plugin bundle it loads are also identical; only the thing that starts the
-container differs.
-
-### 3b. Slack seam — a per-turn reply endpoint and the CLI stub
-
-The worker reaches Slack through a **per-turn** reply target, not a single
-worker-global setting. `ReplyHandle.endpoint` on the queued turn carries the base
-URL of the channel API that this turn's reply is delivered through
-([`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`](packages/aci-protocol/src/aci_protocol/turn.py)).
-The sink builds (and caches) a client per endpoint
-([`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink`](apps/worker/src/curie_worker/slack_sink.py),
-behind the [`SlackSink`](apps/worker/src/curie_worker/slack_sink.py) port).
-The worker-global `SLACK_API_BASE_URL`
-([`apps/worker/src/curie_worker/config.py::WorkerConfig.slack_api_base_url`](apps/worker/src/curie_worker/config.py))
-is now the **fallback**: `endpoint = None` means "use the worker's configured
-default", i.e. real Slack. That is what routes a reply back to the ingress that
-enqueued the turn. As a result, a real Slack workspace and a no-Slack CLI stub
-can coexist on **one** worker rather than needing one worker per channel.
-
-The CLI's `curie local message` path does four things:
-
-- starts a local Slack Web API stub ([`cli/src/chat.rs`](cli/src/chat.rs))
-- mints the exact `QueuedTurn` the dispatcher would produce, with `endpoint` pointed at the stub
-- `XADD`s it onto the very same `curie:runs` stream the dispatcher uses ([`cli/src/queue.rs`](cli/src/queue.rs))
-- waits for the worker to finalize the turn by calling the stub's Slack API back
-
-The worker cannot distinguish the stub from Slack: same queue payload, same
-`chat.update` call. This is what lets D1/F1/I1 and most of E1 be verified with
-no Slack workspace at all.
-
-The honest limit: the **per-turn payload** is channel-neutral, but the binding
-surface is not. The catalog grades the channel/ingress seam `C` with one
-implementation. Slack vocabulary (channel ids, thread ts) still reaches the
-control plane — a deployment binds an agent by exact-match on `slack_channel`.
-"The system does not care which channel" is true of a turn in flight. It is not
-yet true of how an agent gets bound to one.
-
-Net effect: a developer can run the entire product loop — real model call
-included — on a laptop with Docker, no cluster, and no Slack. The code
-exercised is the code that runs in production.
-
-## 4. Data flow: a Slack mention becomes a threaded reply
+## Data flow: a Slack mention becomes a threaded reply
 
 ```mermaid
 sequenceDiagram
@@ -368,7 +284,7 @@ never assumed across a suspend. The `thread_ts -> sandbox_id` affinity store
 ([`apps/worker/src/curie_worker/sandbox/affinity.py`](apps/worker/src/curie_worker/sandbox/affinity.py))
 is what routes a thread back to its sandbox.
 
-## 5. Data flow: a git push deploys a bundle and runs evals
+## Data flow: a git push deploys a bundle and runs evals
 
 A push is verified with an HMAC (Hash-based Message Authentication Code)
 signature, archived, validated, and stored as an immutable versioned bundle.
@@ -418,10 +334,94 @@ sequenceDiagram
 
   The webhook receiver is at [`apps/api/src/curie_api/routers/github.py::github_webhook`](apps/api/src/curie_api/routers/github.py).
 - **Eval stream** `curie:evals` is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EVAL_STREAM`](apps/api/src/curie_api/evalqueue.py)) and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
-- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)). The endpoint is live. The UI matrix view has not yet been bound to it ([§8](#8-ui-one-wired-build)).
+- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)). The endpoint is live. The UI matrix view has not yet been bound to it ([the UI section](#the-ui-always-the-real-api-no-demo-mode)).
 - **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by git-flow all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
 
-## 6. The credential path
+## One worker, two hidden seams: substrate and transport
+
+The platform never learns which substrate it is running on, and the runner never
+learns whether the message came from Slack. Two seams make that true, and both
+are real code, not aspiration.
+
+**The system of record for the seams is the interface catalog**
+([`docs/interfaces.md`](docs/interfaces.md)), which enumerates them: one
+`INTERFACE.md` per seam under [`docs/interfaces/`](docs/interfaces). Each file
+carries:
+
+- the port
+- the implementations that exist today
+- the known leakage
+- a grade
+
+The catalog's seam table is generated from those files' front-matter and gated,
+so it cannot quietly drift from them. Read the count off that table rather than
+from prose here. Its governing restraint is **"the second implementation
+teaches the interface"**: a seam is documented where the code already draws the
+line, not written speculatively ahead of a real second implementation. That is
+why several seams honestly carry one implementation and a middling grade rather
+than a fictional adapter layer.
+
+The two seams below are **worked examples, not the list**. Substrate
+(`SandboxClient`) is the one with two real implementations, and Slack is the one
+whose leakage is most instructive. The rest — among them `StreamBroker`,
+`ApproverSet`/`ApprovalCreator`, `MemoryStore`, `TranscriptStore`, `Scorer`,
+`ObjectStore`, and `CliOutput` — live in the catalog. Read it there. This
+section does not duplicate it.
+
+### Substrate seam — `SandboxClient`
+
+The worker talks to a `SandboxClient` Protocol
+([`apps/worker/src/curie_worker/sandbox/types.py::SandboxClient`](apps/worker/src/curie_worker/sandbox/types.py))
+whose methods are `create_claim`, `get_claim`, `delete_claim`, `list_claims`,
+`get_sandbox`, `set_sandbox_mode`. Two implementations satisfy it:
+
+- **`KubernetesSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient`](apps/worker/src/curie_worker/sandbox/k8s.py)) — creates `SandboxClaim` CRDs (Custom Resource Definitions) against the agent-sandbox controller. The claim references a `SandboxWarmPool` **by name** (`spec.warmPoolRef.name`), and the pod **cold-creates from the `SandboxTemplate`**. The shipped default is `replicas: 0`, meaning no pre-warmed pods. A real-model claim cold-creates regardless, because per-claim env injection cannot bind a pre-warmed pod (the `envVarsInjectionPolicy: Overrides` gotcha). The pool object must still exist — with it absent every claim fails `Ready=False reason=WarmPoolNotFound`. Pre-warming is a dev/fake-model fast path, not the production path ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)). This is the production path.
+- **`DockerSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`](apps/worker/src/curie_worker/sandbox/docker.py)) — runs the same runner image as a local Docker container. This is "middle mode": a full backend on a laptop with no Kubernetes.
+
+Everything above the protocol (the kernel, routing, budgets, kill switch, resume
+path) is identical across modes. The runner image, the ACI it speaks, and the
+plugin bundle it loads are also identical; only the thing that starts the
+container differs.
+
+### Slack seam — a per-turn reply endpoint and the CLI stub
+
+The worker reaches Slack through a **per-turn** reply target, not a single
+worker-global setting. `ReplyHandle.endpoint` on the queued turn carries the base
+URL of the channel API that this turn's reply is delivered through
+([`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`](packages/aci-protocol/src/aci_protocol/turn.py)).
+The sink builds (and caches) a client per endpoint
+([`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink`](apps/worker/src/curie_worker/slack_sink.py),
+behind the [`SlackSink`](apps/worker/src/curie_worker/slack_sink.py) port).
+The worker-global `SLACK_API_BASE_URL`
+([`apps/worker/src/curie_worker/config.py::WorkerConfig.slack_api_base_url`](apps/worker/src/curie_worker/config.py))
+is now the **fallback**: `endpoint = None` means "use the worker's configured
+default", i.e. real Slack. That is what routes a reply back to the ingress that
+enqueued the turn. As a result, a real Slack workspace and a no-Slack CLI stub
+can coexist on **one** worker rather than needing one worker per channel.
+
+The CLI's `curie local message` path does four things:
+
+- starts a local Slack Web API stub ([`cli/src/chat.rs`](cli/src/chat.rs))
+- mints the exact `QueuedTurn` the dispatcher would produce, with `endpoint` pointed at the stub
+- `XADD`s it onto the very same `curie:runs` stream the dispatcher uses ([`cli/src/queue.rs`](cli/src/queue.rs))
+- waits for the worker to finalize the turn by calling the stub's Slack API back
+
+The worker cannot distinguish the stub from Slack: same queue payload, same
+`chat.update` call. This is what lets D1/F1/I1 and most of E1 be verified with
+no Slack workspace at all.
+
+The honest limit: the **per-turn payload** is channel-neutral, but the binding
+surface is not. The catalog grades the channel/ingress seam `C` with one
+implementation. Slack vocabulary (channel ids, thread ts) still reaches the
+control plane — a deployment binds an agent by exact-match on `slack_channel`.
+"The system does not care which channel" is true of a turn in flight. It is not
+yet true of how an agent gets bound to one.
+
+Net effect: a developer can run the entire product loop — real model call
+included — on a laptop with Docker, no cluster, and no Slack. The code
+exercised is the code that runs in production.
+
+## The credential path
 
 A model credential flows from a Helm Secret to the model env variable the SDK
 reads, without any application process brokering it:
@@ -472,7 +472,7 @@ to the real model and treats a missing credential as fail-closed rather than
 silently degrading to fake ([`apps/worker/src/curie_worker/binding.py::apply_model_env`](apps/worker/src/curie_worker/binding.py),
 [`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`](apps/worker/src/curie_worker/sandbox/docker.py)).
 
-## 7. The observability pipeline
+## The observability pipeline
 
 ```
 runner (OTLP spans, resource attr curie.session_id)
@@ -504,7 +504,7 @@ There is no Prometheus and no separate metrics store behind it. It prints URLs a
 opens nothing unless `--open` is passed, and `--json` never opens a browser — the
 agent-facing default is inert output.
 
-## 8. UI: one wired build
+## The UI: always the real API, no demo mode
 
 The UI is always backed by the live API — there is no fixture/demo world and no
 `isWired()` branch. Every view fetches from `apps/api` same-origin under `/api`
@@ -517,7 +517,7 @@ The former `acme-corp` fixture dataset and the `?state=N` / `?api=1` dual-world
 gate have been removed (#542). A single build serves the live product, and
 views degrade honestly (empty lists, zero metrics) when a workspace is fresh.
 
-## 9. Frozen contracts
+## Frozen contracts
 
 Two packages are **frozen interfaces**. Every lane compiles against them across
 three languages, so an unreviewed change in one silently breaks the others unless
@@ -536,7 +536,7 @@ full regenerate-and-compile sweep. CI enforces it as the `contracts-ts` job
 A task that needs either package to change **stops and escalates** rather than
 working around it — see [`CLAUDE.md`](CLAUDE.md).
 
-## 10. Deployment, CI, and release
+## Deployment, CI, and release
 
 **The chart** ([`charts/curie`](charts/curie)) is an umbrella that brings up:
 
@@ -559,7 +559,7 @@ Security rails are all chart defaults (ADR-0006,
   - the GitHub webhook secret
   - Slack tokens
 
-  **Per-agent connector secrets are deliberately a separate Secret** ([`charts/curie/templates/agent-connector-secrets.yaml`](charts/curie/templates/agent-connector-secrets.yaml)) — secrets isolation; see the per-agent connector secrets section in [§6](#6-the-credential-path) above.
+  **Per-agent connector secrets are deliberately a separate Secret** ([`charts/curie/templates/agent-connector-secrets.yaml`](charts/curie/templates/agent-connector-secrets.yaml)) — secrets isolation; see the per-agent connector secrets section in [The credential path](#the-credential-path) above.
 
 **Install verification status.** As of **v0.4.0-rc.3** the GHCR (GitHub
 Container Registry)-default install is proven end to end on a fresh k3s
@@ -618,11 +618,11 @@ job, which packages the **Helm chart** and releases the **compose** artifact.
 The chart and compose files are release artifacts in their own right: an
 operator installs from those, not from the images alone.
 
-## 11. What is built vs deferred
+## What is built vs deferred
 
 **Built and live-verified end to end.** This covers a real Slack conversation
 on a real model, a local middle-mode loop, and the GHCR-default install
-rehearsal on a fresh k3s cluster (see [§10](#10-deployment-ci-and-release) for the install-verification detail).
+rehearsal on a fresh k3s cluster (see [Deployment, CI, and release](#deployment-ci-and-release) for the install-verification detail).
 The following are built and verified:
 
 - the frozen contracts
@@ -638,7 +638,7 @@ The following are built and verified:
 
 **Deferred:**
 
-- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [§8](#8-ui-one-wired-build))
+- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
 - the Interview-Me onboarding compiler
 - automatic memory generation
@@ -650,8 +650,8 @@ Three things previously listed here have **shipped** and are called out
 because a stale Deferred list understates the product:
 
 - sandbox identity is surfaced ([`apps/api/src/curie_api/langfuse.py::hoist_sandbox_id`](apps/api/src/curie_api/langfuse.py))
-- the timed README-only cold-start rehearsal **passed at v0.4.0-rc.3** ([§10](#10-deployment-ci-and-release))
-- non-Anthropic providers are built — Zhipu, Moonshot, DeepSeek, and OpenRouter all route today, plus opt-in local Ollama ([§6](#6-the-credential-path))
+- the timed README-only cold-start rehearsal **passed at v0.4.0-rc.3** ([Deployment, CI, and release](#deployment-ci-and-release))
+- non-Anthropic providers are built — Zhipu, Moonshot, DeepSeek, and OpenRouter all route today, plus opt-in local Ollama ([The credential path](#the-credential-path))
 
 Only the OpenAI *wire format* is
 genuinely absent.

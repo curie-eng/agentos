@@ -33,7 +33,7 @@ Curie provides an environment guarantee while climbing the three tiers. It is no
 guarantee: production traffic can still behave differently than your test cases, and no platform can
 honestly promise otherwise.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md#2-component-map) for the platform architecture and how the pieces fit together.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) for the platform architecture and how the pieces fit together.
 See the [target table](#which-target-do-i-want) below for what each tier actually runs.
 
 ## Quickstart
@@ -239,7 +239,7 @@ walks through `skill`, `local`, and `cluster` end to end.
 The core spine is built, covered by CI, and was live-verified end to end
 against a real Slack workspace on a real model. For the precise, maintained
 built-vs-deferred split, see "What is built vs deferred" in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#11-what-is-built-vs-deferred) — this file
+[`ARCHITECTURE.md`](ARCHITECTURE.md#what-is-built-vs-deferred) — this file
 does not duplicate that list, which only drifts out of sync.
 
 Forward-looking work is planned and tracked in
@@ -264,7 +264,7 @@ requires it, and you are free to use Curie whether or not you do.
 
 ## Where do I go next?
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md#2-component-map) -- the component diagram, the
+- [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) -- the component diagram, the
 message-flow and deploy-flow sequence diagrams, and the built/in-progress
 split.
 - [docs/adr/](docs/adr/) -- the load-bearing architecture decisions (Agent
