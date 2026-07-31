@@ -8,17 +8,17 @@ capabilities change, a target changes when the deployment topology does.
     # deploy.yaml
     targets:
       dev:
-        agent: sre-dev
+        agent: acme-dev
         env: dev
         slack_channel: C0EXAMPLE2
       prod:
-        agent: sre-bot
+        agent: acme-bot
         env: prod
         slack_channel: C0EXAMPLE1
 
     curie cluster deploy --target prod
 
-Before this, routing lived in whatever invoked the command. For sre-bot that
+Before this, routing lived in whatever invoked the command. For acme-bot that
 was two GitHub Actions workflows describing a dev/prod split that did not
 exist: both resolved to the same agent, overwrote each other's active version,
 and contended for the one channel that agent can bind. Nothing reported it,

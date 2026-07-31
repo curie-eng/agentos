@@ -176,6 +176,11 @@ of a real thing, never its value.
 | an AWS account number | `000000000000` |
 | an EC2 instance id | `i-0123456789abcdef0` |
 | an internal hostname | `grafana.example.com` |
+| a real agent/deployment name | `acme-bot`, `acme-dev` |
+
+The last row is easy to overlook because a name is not a secret. It is still an
+identifier: `sre-bot` and `sre-dev` in a public docstring say what this company
+runs and what it is called. Use `acme-*` for examples.
 
 `example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
 names no real host, so both are fine.

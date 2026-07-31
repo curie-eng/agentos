@@ -4468,7 +4468,7 @@ mod tests {
     #[test]
     fn up_preserves_nothing_on_a_fresh_install_or_when_slack_was_never_set() {
         assert!(resolve_comms_values(None, &[]).is_empty());
-        let no_slack = serde_json::json!({"nameOverride": "sre-bot"});
+        let no_slack = serde_json::json!({"nameOverride": "acme-bot"});
         assert!(resolve_comms_values(Some(&no_slack), &[]).is_empty());
         // An empty string is what `comms --disconnect` writes; do not resurrect it.
         let disconnected = serde_json::json!({

@@ -215,24 +215,24 @@ mod tests {
 
     #[test]
     fn owner_label_is_stamped_without_dropping_existing_labels() {
-        let out = label_objects(&objs(), "sre-bot");
+        let out = label_objects(&objs(), "acme-bot");
         let dep = &out[1]["metadata"]["labels"];
-        assert_eq!(dep[OWNER_LABEL], "sre-bot");
+        assert_eq!(dep[OWNER_LABEL], "acme-bot");
         assert_eq!(dep["existing"], "kept", "renderer labels must survive");
     }
 
     #[test]
     fn objects_with_no_labels_map_still_get_the_owner() {
-        let out = label_objects(&objs(), "sre-bot");
-        assert_eq!(out[0]["metadata"]["labels"][OWNER_LABEL], "sre-bot");
+        let out = label_objects(&objs(), "acme-bot");
+        assert_eq!(out[0]["metadata"]["labels"][OWNER_LABEL], "acme-bot");
     }
 
     #[test]
     fn prune_is_scoped_to_this_agent_not_all_connectors() {
         // Selecting on the label alone would delete a concurrently-deploying
         // agent's objects -- both are "connector objects".
-        let args = prune_args("ns", "sre-bot", &[]);
-        assert!(args.contains(&format!("{OWNER_LABEL}=sre-bot")));
+        let args = prune_args("ns", "acme-bot", &[]);
+        assert!(args.contains(&format!("{OWNER_LABEL}=acme-bot")));
         assert!(!args.iter().any(|a| a == OWNER_LABEL));
     }
 
@@ -242,7 +242,7 @@ mod tests {
         // rest, so repeating the flag would exclude one object and prune the
         // others -- deleting the connectors this deploy just applied.
         let keep = vec!["a".to_string(), "b".to_string()];
-        let args = prune_args("ns", "sre-bot", &keep);
+        let args = prune_args("ns", "acme-bot", &keep);
         let selectors: Vec<&String> = args
             .iter()
             .filter(|a| a.starts_with("--field-selector"))
@@ -259,7 +259,7 @@ mod tests {
         // The connector was deleted from connectors.yaml: its Deployment,
         // Service, and NetworkPolicy must go, or a pod keeps running with a
         // credential mounted and nothing referencing it.
-        let args = prune_args("ns", "sre-bot", &[]);
+        let args = prune_args("ns", "acme-bot", &[]);
         assert!(!args.iter().any(|a| a.starts_with("--field-selector")));
         assert!(args.contains(&"deployment,service,networkpolicy,secret".to_string()));
     }
@@ -277,7 +277,7 @@ mod tests {
         // A Secret left behind is a live credential nothing references. Deleting
         // the Deployment but keeping its token is the leak this whole prune
         // exists to close, so `secret` must be in the kind list.
-        let args = prune_args("ns", "sre-bot", &[]);
+        let args = prune_args("ns", "acme-bot", &[]);
         let kinds = args.iter().find(|a| a.contains("deployment")).unwrap();
         assert!(kinds.contains("secret"), "kinds were: {kinds}");
     }

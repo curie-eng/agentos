@@ -20,11 +20,11 @@ def _bundle(root: Path, connectors_yaml: str | None = None) -> Path:
     inner = root / "b"
     (inner / ".claude-plugin").mkdir(parents=True, exist_ok=True)
     (inner / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({"name": "sre-bot", "version": "0.1.0", "description": "t"}), encoding="utf-8"
+        json.dumps({"name": "acme-bot", "version": "0.1.0", "description": "t"}), encoding="utf-8"
     )
-    (inner / "skills" / "sre-bot").mkdir(parents=True, exist_ok=True)
-    (inner / "skills" / "sre-bot" / "SKILL.md").write_text(
-        "---\nname: sre-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
+    (inner / "skills" / "acme-bot").mkdir(parents=True, exist_ok=True)
+    (inner / "skills" / "acme-bot" / "SKILL.md").write_text(
+        "---\nname: acme-bot\ndescription: t\n---\nhi\n", encoding="utf-8"
     )
     if connectors_yaml is not None:
         (inner / "connectors.yaml").write_text(connectors_yaml, encoding="utf-8")
@@ -41,14 +41,14 @@ HOSTED = (
 )
 
 
-def _render(root: Path, agent: str = "sre-bot") -> list[dict]:
+def _render(root: Path, agent: str = "acme-bot") -> list[dict]:
     return bundles.render_connector_manifests(
         bundles.read_connectors(root),
-        release="sre-bot",
+        release="acme-bot",
         agent=agent,
-        namespace="sre-bot",
-        app_name="sre-bot",
-        secret_name=f"sre-bot-{agent}-connectors",
+        namespace="acme-bot",
+        app_name="acme-bot",
+        secret_name=f"acme-bot-{agent}-connectors",
     )
 
 
@@ -84,7 +84,7 @@ def test_secret_is_referenced_not_inlined(tmp_path: Path) -> None:
     dep = next(o for o in _render(_bundle(tmp_path, HOSTED)) if o["kind"] == "Deployment")
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
     token = next(e for e in env if e["name"] == "GRAFANA_TOKEN")
-    assert token["valueFrom"]["secretKeyRef"]["name"] == "sre-bot-sre-bot-connectors"
+    assert token["valueFrom"]["secretKeyRef"]["name"] == "acme-bot-acme-bot-connectors"
     assert "value" not in token
 
 
@@ -99,7 +99,7 @@ def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
     root = _bundle(tmp_path, HOSTED)
     svc = next(o for o in _render(root) if o["kind"] == "Service")
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="sre-bot", agent="sre-bot", namespace="sre-bot"
+        bundles.read_connectors(root), release="acme-bot", agent="acme-bot", namespace="acme-bot"
     )
     assert svc["metadata"]["name"] in entries["grafana"]["url"]
 
@@ -108,7 +108,7 @@ def test_remote_connector_contributes_an_entry_but_no_objects(tmp_path: Path) ->
     root = _bundle(tmp_path, "connectors:\n  x:\n    url: https://mcp.internal/mcp\n")
     assert _render(root) == []
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="sre-bot", agent="sre-bot", namespace="sre-bot"
+        bundles.read_connectors(root), release="acme-bot", agent="acme-bot", namespace="acme-bot"
     )
     assert entries["x"]["url"] == "https://mcp.internal/mcp"
 
@@ -118,6 +118,6 @@ def test_two_agents_sharing_a_release_render_distinct_objects(tmp_path: Path) ->
     # Release-scoped naming made these identical, so deploying one silently
     # overwrote the other's Deployment and credential.
     root = _bundle(tmp_path, HOSTED)
-    dev = {o["metadata"]["name"] for o in _render(root, agent="sre-dev")}
+    dev = {o["metadata"]["name"] for o in _render(root, agent="acme-dev")}
     prod = {o["metadata"]["name"] for o in _render(root, agent="sre-prod")}
     assert not dev & prod, f"agents collide: {dev} vs {prod}"

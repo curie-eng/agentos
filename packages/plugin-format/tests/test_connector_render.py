@@ -25,8 +25,8 @@ HOSTED = ConnectorSpec(
 REMOTE = ConnectorSpec(url="https://mcp.internal/mcp", headers={"Authorization": "Bearer ${T}"})
 
 
-def _objs(release: str = "sre-bot", app: str = "sre-bot") -> list[dict]:
-    return r.render(release, "sre-bot", "sre-bot", app, "grafana", HOSTED, "conn-secrets")
+def _objs(release: str = "acme-bot", app: str = "acme-bot") -> list[dict]:
+    return r.render(release, "acme-bot", "acme-bot", app, "grafana", HOSTED, "conn-secrets")
 
 
 # --------------------------------------------------------------------------- #
@@ -51,11 +51,11 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
     # to every OTHER release's sandboxes in the namespace. Both fail silently.
     np = next(
         o
-        for o in r.render("relA", "a", "ns", "sre-bot", "g", HOSTED, "s")
+        for o in r.render("relA", "a", "ns", "acme-bot", "g", HOSTED, "s")
         if o["kind"] == "NetworkPolicy"
     )
     assert np["spec"]["podSelector"]["matchLabels"] == {
-        "app.kubernetes.io/name": "sre-bot",
+        "app.kubernetes.io/name": "acme-bot",
         "app.kubernetes.io/instance": "relA",
         "app.kubernetes.io/component": "runner-sandbox",
     }
@@ -83,17 +83,17 @@ def test_host_aliases_cover_every_name_the_sandbox_could_dial() -> None:
     # loopback, so an in-cluster caller reaching them by Service DNS gets
     # `forbidden: host not allowed`. Curie named the Service, so Curie can
     # supply the full set; an author would have to guess it.
-    aliases = r.host_aliases("sre-bot", "a", "grafana", "ns", 8000)
-    assert "sre-bot-a-mcp-grafana:8000" in aliases
-    assert "sre-bot-a-mcp-grafana.ns:8000" in aliases
-    assert "sre-bot-a-mcp-grafana.ns.svc.cluster.local:8000" in aliases
+    aliases = r.host_aliases("acme-bot", "a", "grafana", "ns", 8000)
+    assert "acme-bot-a-mcp-grafana:8000" in aliases
+    assert "acme-bot-a-mcp-grafana.ns:8000" in aliases
+    assert "acme-bot-a-mcp-grafana.ns.svc.cluster.local:8000" in aliases
 
 
 def test_injected_url_matches_the_service_that_was_rendered() -> None:
     # Hand-writing this URL is how a bundle ends up with an address that does
     # not resolve in the tier it is deployed to.
     svc = next(o for o in _objs() if o["kind"] == "Service")
-    url = r.mcp_entry("sre-bot", "sre-bot", "sre-bot", "grafana", HOSTED)["url"]
+    url = r.mcp_entry("acme-bot", "acme-bot", "acme-bot", "grafana", HOSTED)["url"]
     assert svc["metadata"]["name"] in url
     assert url.endswith("/mcp")
 
@@ -130,11 +130,11 @@ def test_plain_env_is_passed_through() -> None:
 # Remote connectors own no objects
 # --------------------------------------------------------------------------- #
 def test_remote_connector_renders_nothing_to_run() -> None:
-    assert r.render("sre-bot", "a", "ns", "app", "internal", REMOTE, "s") == []
+    assert r.render("acme-bot", "a", "ns", "app", "internal", REMOTE, "s") == []
 
 
 def test_remote_connector_keeps_its_own_url_and_headers() -> None:
-    entry = r.mcp_entry("sre-bot", "a", "ns", "internal", REMOTE)
+    entry = r.mcp_entry("acme-bot", "a", "ns", "internal", REMOTE)
     assert entry["url"] == "https://mcp.internal/mcp"
     assert entry["headers"]["Authorization"] == "Bearer ${T}"
 
@@ -155,7 +155,7 @@ def test_selector_matches_what_the_chart_actually_renders() -> None:
     if not chart.is_dir():  # package tested outside the monorepo
         pytest.skip("chart not present")
     out = subprocess.run(
-        ["helm", "template", "myrel", str(chart), "--set", "nameOverride=sre-bot"],
+        ["helm", "template", "myrel", str(chart), "--set", "nameOverride=acme-bot"],
         capture_output=True,
         text=True,
         check=True,
@@ -169,7 +169,7 @@ def test_selector_matches_what_the_chart_actually_renders() -> None:
         ):
             chart_selector = doc["spec"]["podSelector"]["matchLabels"]
     assert chart_selector, "could not find Rail 1's default-deny egress policy"
-    assert r.sandbox_selector("myrel", "sre-bot") == chart_selector
+    assert r.sandbox_selector("myrel", "acme-bot") == chart_selector
 
 
 # --------------------------------------------------------------------------- #
@@ -180,13 +180,13 @@ PROD = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", env={"GRAFANA_URL": "ht
 
 
 def test_two_agents_in_one_release_do_not_share_object_names() -> None:
-    # Curie runs many agents per release. Release-scoped names meant sre-dev and
+    # Curie runs many agents per release. Release-scoped names meant acme-dev and
     # sre-prod both rendered `curie-mcp-grafana`, so deploying prod silently
     # repointed the DEV agent at the prod endpoint -- and, because the Secret was
     # release-scoped too, handed it the prod token. Nothing errored.
     dev = [
         o["metadata"]["name"]
-        for o in r.render("curie", "sre-dev", "ns", "curie", "grafana", DEV, "s")
+        for o in r.render("curie", "acme-dev", "ns", "curie", "grafana", DEV, "s")
     ]
     prod = [
         o["metadata"]["name"]
@@ -200,7 +200,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
     # traffic to the other's pods even with distinct object names.
     dev = next(
         o
-        for o in r.render("curie", "sre-dev", "ns", "curie", "grafana", DEV, "s")
+        for o in r.render("curie", "acme-dev", "ns", "curie", "grafana", DEV, "s")
         if o["kind"] == "Service"
     )
     prod = next(
@@ -212,7 +212,7 @@ def test_two_agents_do_not_share_pod_labels() -> None:
 
 
 def test_each_agent_gets_its_own_url() -> None:
-    dev = r.mcp_entry("curie", "sre-dev", "ns", "grafana", DEV)["url"]
+    dev = r.mcp_entry("curie", "acme-dev", "ns", "grafana", DEV)["url"]
     prod = r.mcp_entry("curie", "sre-prod", "ns", "grafana", PROD)["url"]
     assert dev != prod
 
@@ -241,10 +241,10 @@ HOSTED_WITH_HOSTS = ConnectorSpec(
 )
 
 
-def _dep(agent: str = "sre-dev", spec: ConnectorSpec = HOSTED_WITH_HOSTS) -> dict:
+def _dep(agent: str = "acme-dev", spec: ConnectorSpec = HOSTED_WITH_HOSTS) -> dict:
     return next(
         o
-        for o in r.render("sre-bot", agent, "sre-bot", "sre-bot", "grafana", spec, "s")
+        for o in r.render("acme-bot", agent, "acme-bot", "acme-bot", "grafana", spec, "s")
         if o["kind"] == "Deployment"
     )
 
@@ -257,7 +257,7 @@ def test_allowed_hosts_expands_to_every_name_the_sandbox_could_dial() -> None:
     args = _dep()["spec"]["template"]["spec"]["containers"][0]["args"]
     value = args[args.index("-allowed-hosts") + 1]
     assert "${" not in value, "placeholder reached the container unsubstituted"
-    for alias in r.host_aliases("sre-bot", "sre-dev", "grafana", "sre-bot", 8000):
+    for alias in r.host_aliases("acme-bot", "acme-dev", "grafana", "acme-bot", 8000):
         assert alias in value
 
 
@@ -268,14 +268,14 @@ def test_each_agent_gets_its_own_allowlist() -> None:
         a = _dep(agent)["spec"]["template"]["spec"]["containers"][0]["args"]
         return a[a.index("-allowed-hosts") + 1]
 
-    assert hosts("sre-dev") != hosts("sre-prod")
+    assert hosts("acme-dev") != hosts("sre-prod")
 
 
 def test_placeholders_expand_in_env_too() -> None:
     spec = ConnectorSpec(image="x:1", env={"SELF_URL": "${CURIE_CONNECTOR_URL}"})
     env = _dep(spec=spec)["spec"]["template"]["spec"]["containers"][0]["env"]
     entry = next(e for e in env if e["name"] == "SELF_URL")
-    assert entry["value"].startswith("http://sre-bot-sre-dev-mcp-grafana.sre-bot")
+    assert entry["value"].startswith("http://acme-bot-acme-dev-mcp-grafana.acme-bot")
 
 
 def test_text_without_placeholders_is_untouched() -> None:
@@ -312,6 +312,6 @@ def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> Non
     # The whole point is that `cluster` keeps hosting it. A fallback that won
     # everywhere would silently repoint a production agent at someone's laptop.
     spec = ConnectorSpec(image="x:1", unhosted_url="http://host.docker.internal:8765/mcp")
-    hosted = r.mcp_entry("curie", "sre-dev", "curie", "grafana", spec)
+    hosted = r.mcp_entry("curie", "acme-dev", "curie", "grafana", spec)
     assert "svc.cluster.local" in hosted["url"]
     assert "8765" not in hosted["url"]

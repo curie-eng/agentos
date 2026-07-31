@@ -15,11 +15,11 @@ different hat.
 Where a bundle is deployed is currently expressed as flags at the call site:
 
 ```bash
-curie cluster deploy --plugin-dir . --namespace sre-bot --release sre-bot \
+curie cluster deploy --plugin-dir . --namespace acme-bot --release acme-bot \
   --slack-channel C0EXAMPLE1
 ```
 
-so the routing lives in whatever invoked the command. In sre-bot's case that is
+so the routing lives in whatever invoked the command. In acme-bot's case that is
 two GitHub Actions workflows, and the result is a dev/prod split that does not
 exist:
 
@@ -31,7 +31,7 @@ exist:
 Both resolve to the **same agent** — the name comes from `plugin.json` and
 nothing overrode it (#1166) — so the two branches overwrite each other's active
 version and contend for the one channel that agent can bind. Confirmed against
-the live cluster: one agent, four versions, no `sre-dev`.
+the live cluster: one agent, four versions, no `acme-dev`.
 
 Three properties are missing, and each is a repeat of a lesson the connector
 work already taught:
@@ -53,11 +53,11 @@ name.**
 # deploy.yaml
 targets:
   dev:
-    agent: sre-dev
+    agent: acme-dev
     env: dev
     slack_channel: C0EXAMPLE2
   prod:
-    agent: sre-bot
+    agent: acme-bot
     env: prod
     slack_channel: C0EXAMPLE1
 ```
