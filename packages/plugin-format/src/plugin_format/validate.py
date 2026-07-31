@@ -15,6 +15,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from .approval_policy import declared_mcp_server_names, effective_tool_prefix, grantable_routes
 from .connectors import ConnectorsFile, validate_connectors
+from .deploy_targets import validate_deploy_targets
 from .manifest import resolve_manifest
 from .models import (
     _TRIGGER_TYPES,
@@ -83,11 +84,35 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)
+        _validate_deploy_targets(root, c)
 
     return c.result()
 
 
 CONNECTORS_FILE = "connectors.yaml"
+DEPLOY_FILE = "deploy.yaml"
+
+
+def _validate_deploy_targets(root: Path, c: _Collector) -> None:
+    """Validate ``deploy.yaml`` if present (ADR-0089).
+
+    Optional: a bundle that passes routing as flags simply omits it. When
+    present it must parse, because every error it can raise is one that would
+    otherwise deploy SUCCESSFULLY to the wrong place -- a mistyped agent mints a
+    new agent, a mistyped channel binds a channel nobody watches, and neither
+    reports anything.
+    """
+
+    path = root / DEPLOY_FILE
+    if not path.is_file():
+        return
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        c.error("deploy.unreadable", f"{DEPLOY_FILE}: {exc}", DEPLOY_FILE)
+        return
+    for code, message in validate_deploy_targets(data)[1]:
+        c.error(code, message, DEPLOY_FILE)
 
 
 def _validate_connectors(root: Path, c: _Collector) -> None:
