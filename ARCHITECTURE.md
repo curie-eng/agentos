@@ -20,6 +20,25 @@ Decision Records) ([`docs/adr/`](docs/adr/)). This doc is the "what talks to
 what." It supersedes the pre-build plans that the MVP (Minimum Viable Product)
 was built from, which are preserved in git history.
 
+## Table of contents
+
+- [1. One-paragraph frame](#1-one-paragraph-frame)
+- [2. Component map](#2-component-map)
+  - [Directory ownership and language](#directory-ownership-and-language)
+- [3. Two runtime modes, one worker: the thin-shim thesis](#3-two-runtime-modes-one-worker-the-thin-shim-thesis)
+  - [3a. Substrate seam — `SandboxClient`](#3a-substrate-seam--sandboxclient)
+  - [3b. Slack seam — a per-turn reply endpoint and the CLI stub](#3b-slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub)
+- [4. Data flow: a Slack mention becomes a threaded reply](#4-data-flow-a-slack-mention-becomes-a-threaded-reply)
+  - [The four kernel invariants](#the-four-kernel-invariants)
+  - [The approval gate: a turn can end without a reply](#the-approval-gate-a-turn-can-end-without-a-reply)
+- [5. Data flow: a git push deploys a bundle and runs evals](#5-data-flow-a-git-push-deploys-a-bundle-and-runs-evals)
+- [6. The credential path](#6-the-credential-path)
+- [7. The observability pipeline](#7-the-observability-pipeline)
+- [8. UI: one wired build](#8-ui-one-wired-build)
+- [9. Frozen contracts](#9-frozen-contracts)
+- [10. Deployment, CI, and release](#10-deployment-ci-and-release)
+- [11. What is built vs deferred](#11-what-is-built-vs-deferred)
+
 ## 1. One-paragraph frame
 
 What Curie does, in short:
@@ -96,7 +115,7 @@ The reply travels back out the way it came in — sandbox to worker to the
 originating thread — kept off the diagram to avoid a tangle of return arrows.
 [The message-flow doc](docs/diagrams/message-flow.md) shows that round trip.
 Two substrate implementations sit behind the single `runner pod` box
-(Kubernetes for production, Docker for local). §3 covers that seam.
+(Kubernetes for production, Docker for local). [§3](#3-two-runtime-modes-one-worker-the-thin-shim-thesis) covers that seam.
 
 The worker is not a pass-through between the queue and the sandbox. It is a hub
 with four outbound dependencies of its own:
@@ -116,7 +135,7 @@ The worker has **no** OTel dependency — the runner is the only emitter. The
 worker's telemetry edge is that eval-score write. The CLI likewise never calls
 the dispatcher: it `XADD`s the same `QueuedTurn` the dispatcher would produce
 onto the same stream (the `xadd` helper in [`cli/src/queue.rs`](cli/src/queue.rs)),
-which is what §3b describes.
+which is what [§3b](#3b-slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) describes.
 
 ### Directory ownership and language
 
@@ -140,7 +159,7 @@ members from the root. See the repo [`CLAUDE.md`](CLAUDE.md) for verify commands
 - **the Claude Code plugin format verbatim** — the other, which ADR-0007 calls "the distribution wedge — do not invent a format"
 
 Curie builds **six** things around that spine: the API, the dispatcher, the
-worker+runner glue, the UI, the CLI, and the umbrella Helm chart (§10). The
+worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([§10](#10-deployment-ci-and-release)). The
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
@@ -399,7 +418,7 @@ sequenceDiagram
 
   The webhook receiver is at [`apps/api/src/curie_api/routers/github.py::github_webhook`](apps/api/src/curie_api/routers/github.py).
 - **Eval stream** `curie:evals` is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EVAL_STREAM`](apps/api/src/curie_api/evalqueue.py)) and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
-- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)). The endpoint is live. The UI matrix view has not yet been bound to it (§8).
+- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)). The endpoint is live. The UI matrix view has not yet been bound to it ([§8](#8-ui-one-wired-build)).
 - **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by git-flow all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
 
 ## 6. The credential path
@@ -540,7 +559,7 @@ Security rails are all chart defaults (ADR-0006,
   - the GitHub webhook secret
   - Slack tokens
 
-  **Per-agent connector secrets are deliberately a separate Secret** ([`charts/curie/templates/agent-connector-secrets.yaml`](charts/curie/templates/agent-connector-secrets.yaml)) — secrets isolation; see the per-agent connector secrets section in §6 above.
+  **Per-agent connector secrets are deliberately a separate Secret** ([`charts/curie/templates/agent-connector-secrets.yaml`](charts/curie/templates/agent-connector-secrets.yaml)) — secrets isolation; see the per-agent connector secrets section in [§6](#6-the-credential-path) above.
 
 **Install verification status.** As of **v0.4.0-rc.3** the GHCR (GitHub
 Container Registry)-default install is proven end to end on a fresh k3s
@@ -603,7 +622,7 @@ operator installs from those, not from the images alone.
 
 **Built and live-verified end to end.** This covers a real Slack conversation
 on a real model, a local middle-mode loop, and the GHCR-default install
-rehearsal on a fresh k3s cluster (see §10 for the install-verification detail).
+rehearsal on a fresh k3s cluster (see [§10](#10-deployment-ci-and-release) for the install-verification detail).
 The following are built and verified:
 
 - the frozen contracts
@@ -619,7 +638,7 @@ The following are built and verified:
 
 **Deferred:**
 
-- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, §8)
+- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [§8](#8-ui-one-wired-build))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
 - the Interview-Me onboarding compiler
 - automatic memory generation
@@ -631,8 +650,8 @@ Three things previously listed here have **shipped** and are called out
 because a stale Deferred list understates the product:
 
 - sandbox identity is surfaced ([`apps/api/src/curie_api/langfuse.py::hoist_sandbox_id`](apps/api/src/curie_api/langfuse.py))
-- the timed README-only cold-start rehearsal **passed at v0.4.0-rc.3** (§10)
-- non-Anthropic providers are built — Zhipu, Moonshot, DeepSeek, and OpenRouter all route today, plus opt-in local Ollama (§6)
+- the timed README-only cold-start rehearsal **passed at v0.4.0-rc.3** ([§10](#10-deployment-ci-and-release))
+- non-Anthropic providers are built — Zhipu, Moonshot, DeepSeek, and OpenRouter all route today, plus opt-in local Ollama ([§6](#6-the-credential-path))
 
 Only the OpenAI *wire format* is
 genuinely absent.
