@@ -38,6 +38,28 @@ from pydantic import BaseModel, ConfigDict, Field
 _NAME_MAX = 40
 
 
+class SecretRef(BaseModel):
+    """A credential that already exists in the cluster (#1163).
+
+    Curie renders a ``secretKeyRef`` at it and never reads the value, so the
+    deploy identity does not need access to the credential at all. Rotation
+    stops requiring a deploy: update the Secret, restart the connector.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The env var the connector reads.
+    name: str
+    # The Kubernetes Secret holding it, provisioned out of band.
+    from_secret: str
+    # The key within that Secret. Defaults to the env var name, which is the
+    # common case and saves repeating it.
+    key: str | None = None
+
+    def secret_key(self) -> str:
+        return self.key or self.name
+
+
 class ConnectorSpec(BaseModel):
     """One declared connector. Exactly one of ``image`` or ``url``.
 
@@ -76,7 +98,37 @@ class ConnectorSpec(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
     # -- both --
-    secrets: list[str] = Field(default_factory=list)
+    #
+    # Two forms, and the difference is WHO HOLDS THE CREDENTIAL.
+    #
+    #   secrets: [TOKEN]                      Curie resolves TOKEN at deploy
+    #                                         time and owns the Secret.
+    #   secrets:
+    #     - name: TOKEN                       Curie points at a Secret someone
+    #       from_secret: grafana-mcp          else provisioned and never sees
+    #       key: TOKEN                        the value.
+    #
+    # The second exists because the first forces every deploy identity to be
+    # able to read the credential -- CI, the operator, and anything driving a
+    # deploy. For a shared team token that is backwards, and it is what blocks
+    # an in-cluster reconciler from ever applying a connector (ADR-0090): a
+    # reconciler cannot hold every agent's credentials, but it can reference a
+    # Secret that already exists.
+    secrets: list[str | SecretRef] = Field(default_factory=list)
+
+    def secret_names(self) -> list[str]:
+        """Env var names this connector needs, either form."""
+
+        return [s if isinstance(s, str) else s.name for s in self.secrets]
+
+    def resolved_secrets(self) -> list[str]:
+        """Only the names Curie must resolve a VALUE for.
+
+        A referenced secret is excluded: the whole point is that nothing in the
+        deploy path handles it.
+        """
+
+        return [s for s in self.secrets if isinstance(s, str)]
 
     @property
     def is_hosted(self) -> bool:
@@ -191,6 +243,30 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "connector with `env` and `args` instead",
                 )
             )
+        for declared in spec.secrets:
+            if isinstance(declared, str):
+                continue
+            if not declared.from_secret.strip():
+                errors.append(
+                    (
+                        "connectors.empty_secret_ref",
+                        f"{where}: `{declared.name}` sets an empty `from_secret`. An empty "
+                        "reference renders a secretKeyRef at a Secret named '', which the "
+                        "API server rejects at apply -- long after the deploy looked fine.",
+                    )
+                )
+        seen_secret_names: set[str] = set()
+        for secret_name in spec.secret_names():
+            if secret_name in seen_secret_names:
+                errors.append(
+                    (
+                        "connectors.duplicate_secret",
+                        f"{where}: `{secret_name}` is declared twice. Two env entries with "
+                        "one name means the container silently gets whichever the renderer "
+                        "emitted last -- possibly the wrong Secret entirely.",
+                    )
+                )
+            seen_secret_names.add(secret_name)
         if not (1 <= spec.port <= 65535):
             errors.append(("connectors.bad_port", f"{where}: port {spec.port} is out of range"))
         for text in [*spec.args, *spec.env.values()]:

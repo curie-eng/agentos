@@ -140,6 +140,22 @@ def render_connector_manifests(
     return objects
 
 
+def owned_secret_keys(connectors: ConnectorsFile) -> list[str]:
+    """Declared secrets whose VALUE the caller must supply (#1163).
+
+    Excludes any that reference a Secret provisioned out of band: resolving
+    those would defeat the purpose, and the caller may well not have access to
+    them -- which is exactly why the reference form exists (ADR-0090).
+    """
+
+    keys: list[str] = []
+    for spec in connectors.connectors.values():
+        for name in spec.resolved_secrets():
+            if name not in keys:
+                keys.append(name)
+    return sorted(keys)
+
+
 def connector_mcp_entries(
     connectors: ConnectorsFile, *, release: str, agent: str, namespace: str
 ) -> dict[str, Any]:

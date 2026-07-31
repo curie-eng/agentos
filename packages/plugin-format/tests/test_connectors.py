@@ -256,3 +256,71 @@ def test_unhosted_url_on_a_remote_connector_is_rejected() -> None:
     assert "connectors.remote_has_unhosted_url" in _codes(
         {"connectors": {"g": {"url": "https://y/mcp", "unhosted_url": "http://z/mcp"}}}
     )
+
+
+# --------------------------------------------------------------------------- #
+# Referencing a Secret Curie did not create -- #1163
+# --------------------------------------------------------------------------- #
+def test_a_connector_may_reference_a_secret_provisioned_out_of_band() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "grafana": {
+                    "image": "x:1",
+                    "secrets": [{"name": "TOKEN", "from_secret": "grafana-mcp"}],
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["grafana"]
+    assert spec.secret_names() == ["TOKEN"]
+    # The property the whole change exists for: nothing in the deploy path
+    # needs to hold this credential, which is what lets a reconciler apply a
+    # connector without holding every agent's secrets (ADR-0090).
+    assert spec.resolved_secrets() == []
+
+
+def test_the_literal_form_still_needs_resolving() -> None:
+    parsed, _ = validate_connectors({"connectors": {"g": {"image": "x:1", "secrets": ["TOKEN"]}}})
+    assert parsed is not None
+    assert parsed.connectors["g"].resolved_secrets() == ["TOKEN"]
+
+
+def test_both_forms_can_be_mixed_on_one_connector() -> None:
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "g": {"image": "x:1", "secrets": ["OWNED", {"name": "REFD", "from_secret": "s"}]}
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["g"].secret_names() == ["OWNED", "REFD"]
+    assert parsed.connectors["g"].resolved_secrets() == ["OWNED"]
+
+
+def test_an_empty_from_secret_is_rejected() -> None:
+    # It renders a secretKeyRef at a Secret named '', which the API server
+    # rejects at APPLY -- long after the deploy looked like it worked.
+    assert "connectors.empty_secret_ref" in _codes(
+        {"connectors": {"g": {"image": "x:1", "secrets": [{"name": "T", "from_secret": ""}]}}}
+    )
+
+
+def test_the_same_env_name_declared_twice_is_rejected() -> None:
+    # Two env entries with one name means the container silently gets whichever
+    # the renderer emitted last -- possibly pointed at the wrong Secret.
+    assert "connectors.duplicate_secret" in _codes(
+        {"connectors": {"g": {"image": "x:1", "secrets": ["T", {"name": "T", "from_secret": "s"}]}}}
+    )
+
+
+def test_key_defaults_to_the_env_var_name() -> None:
+    parsed, _ = validate_connectors(
+        {"connectors": {"g": {"image": "x:1", "secrets": [{"name": "T", "from_secret": "s"}]}}}
+    )
+    assert parsed is not None
+    assert parsed.connectors["g"].secrets[0].secret_key() == "T"  # type: ignore[union-attr]

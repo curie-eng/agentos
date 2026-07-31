@@ -121,3 +121,34 @@ def test_two_agents_sharing_a_release_render_distinct_objects(tmp_path: Path) ->
     dev = {o["metadata"]["name"] for o in _render(root, agent="acme-dev")}
     prod = {o["metadata"]["name"] for o in _render(root, agent="sre-prod")}
     assert not dev & prod, f"agents collide: {dev} vs {prod}"
+
+
+REFERENCED = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    secrets:\n"
+    "      - name: GRAFANA_TOKEN\n"
+    "        from_secret: grafana-mcp\n"
+)
+
+
+def test_a_referenced_secret_is_not_something_the_caller_must_resolve(tmp_path: Path) -> None:
+    # The property ADR-0090 depends on: with every credential referenced, the
+    # deploy path handles none, so a reconciler holding no secrets can apply
+    # this connector.
+    declared = bundles.read_connectors(_bundle(tmp_path, REFERENCED))
+    assert bundles.owned_secret_keys(declared) == []
+
+
+def test_a_literal_secret_still_must_be_resolved(tmp_path: Path) -> None:
+    declared = bundles.read_connectors(_bundle(tmp_path, HOSTED))
+    assert bundles.owned_secret_keys(declared) == ["GRAFANA_TOKEN"]
+
+
+def test_a_referenced_secret_points_outside_curies_own_secret(tmp_path: Path) -> None:
+    dep = next(o for o in _render(_bundle(tmp_path, REFERENCED)) if o["kind"] == "Deployment")
+    env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+    ref = next(e for e in env if e["name"] == "GRAFANA_TOKEN")["valueFrom"]["secretKeyRef"]
+    assert ref["name"] == "grafana-mcp"
+    assert "value" not in next(e for e in env if e["name"] == "GRAFANA_TOKEN")

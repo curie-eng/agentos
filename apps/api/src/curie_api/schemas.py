@@ -508,6 +508,13 @@ class ConnectorManifests(BaseModel):
     """
 
     manifests: list[dict[str, Any]] = Field(default_factory=list)
+    # The Secret Curie owns for this agent, and the keys the CALLER must
+    # resolve values for. Stated explicitly because the caller cannot infer it
+    # from the manifests: since #1163 a connector may also reference a Secret
+    # provisioned out of band, and those keys must NOT be resolved -- the whole
+    # point is that the deploy path never handles them.
+    owned_secret_name: str = ""
+    owned_secret_keys: list[str] = Field(default_factory=list)
     # name -> the `.mcp.json` entry the agent should use. Derived from the
     # Service in `manifests`, so an author never hand-writes a URL that
     # resolves in one tier and not another.

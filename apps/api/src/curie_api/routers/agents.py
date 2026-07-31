@@ -277,6 +277,11 @@ async def read_version_connectors(
                 mcp_entries=bundles.connector_mcp_entries(
                     declared, release=release, agent=agent_name, namespace=namespace
                 ),
+                # Which keys the CALLER must resolve a value for. Stated rather
+                # than inferable: a referenced Secret's key renders an identical
+                # secretKeyRef, and resolving it would defeat the point (#1163).
+                owned_secret_name=secret_name,
+                owned_secret_keys=bundles.owned_secret_keys(declared),
             )
 
     return await run_in_threadpool(_render)

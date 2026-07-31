@@ -38,6 +38,14 @@ pub struct ResolvedTarget {
 pub struct ConnectorManifests {
     #[serde(default)]
     pub manifests: Vec<serde_json::Value>,
+    /// The Secret Curie owns, and the keys whose VALUES this caller must
+    /// resolve. Declared by the API rather than inferred from the manifests:
+    /// since #1163 a connector may reference a Secret provisioned out of band,
+    /// and resolving those keys locally would both fail and defeat the point.
+    #[serde(default)]
+    pub owned_secret_name: String,
+    #[serde(default)]
+    pub owned_secret_keys: Vec<String>,
     #[serde(default)]
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
 }
