@@ -118,5 +118,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Draft |
 | 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Draft |
 | 0089 | [Bundles declare their deploy targets](0089-bundles-declare-their-deploy-targets.md) | Accepted |
-| 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Draft |
+| 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Accepted |
 <!-- END GENERATED: adr-index -->
