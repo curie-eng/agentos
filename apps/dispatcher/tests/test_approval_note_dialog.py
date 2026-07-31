@@ -89,7 +89,7 @@ class ScriptedResolver:
 
 
 def _gated_history(gate: threading.Event) -> Callable[..., dict[str, Any]]:
-    """A ``conversations.history`` that blocks until the test releases ``gate``.
+    """A card read that blocks until the test releases ``gate``.
 
     How the ack-ordering tests turn "the ack did not wait on a Slack call" into a
     structural fact rather than a timing hope.
@@ -112,21 +112,21 @@ def _build(
 ) -> tuple[App, WebClient]:
     """Build the app under test.
 
-    ``history_side_effect`` is handed straight to the ``conversations.history``
+    ``history_side_effect`` is handed straight to the ``conversations.replies``
     mock, so a test picks the failure mode it needs: a callable that blocks (see
     ``_gated_history``) for a Slack call that is SLOW, or an exception instance
     for one that FAILS. ``slack_sdk`` 3.43.0 raises ``SlackApiError`` from
     ``WebClient`` whenever Slack answers ``ok: false``
     (``slack_sdk.web.base_client.BaseClient.api_call`` ends in
     ``validate_slack_response``), so that is the exception a real
-    ``conversations.history`` failure arrives as.
+    ``conversations.replies`` failure arrives as.
     """
 
     web_client = WebClient(token="xoxb-test")
     web_client.chat_postMessage = MagicMock(return_value={"ts": "555.000"})  # type: ignore[method-assign]
     web_client.chat_update = MagicMock(return_value={"ok": True})  # type: ignore[method-assign]
     web_client.chat_postEphemeral = MagicMock(return_value={"ok": True})  # type: ignore[method-assign]
-    web_client.conversations_history = MagicMock(  # type: ignore[method-assign]
+    web_client.conversations_replies = MagicMock(  # type: ignore[method-assign]
         side_effect=history_side_effect,
         return_value={"messages": [_CARD_MESSAGE]},
     )
@@ -534,7 +534,7 @@ def test_the_ack_lands_before_any_slack_call_on_the_submit_path(
     _drain(app)
 
     # The fetch still happens; it just happens after the ack.
-    web_client.conversations_history.assert_called_once()
+    web_client.conversations_replies.assert_called_once()
 
 
 def test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it(
@@ -582,7 +582,7 @@ def test_a_refused_submission_acks_before_the_card_read_and_still_refreshes_it(
     web_client.chat_update.assert_called_once()
 
 
-def test_a_failing_card_read_still_acks_and_still_stamps_the_card(
+def test_a_failing_card_read_still_acks_and_leaves_the_card_intact(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
     """The other half of the post-ack hazard: a Slack call that FAILS (#1077).
@@ -598,8 +598,15 @@ def test_a_failing_card_read_still_acks_and_still_stamps_the_card(
 
     That executor also SWALLOWS the exception, so calling the listener and
     checking that nothing propagated proves nothing. The observation that has
-    teeth is the socket's: the envelope was acked, and the card was still
-    stamped from the empty message the failed read falls back to.
+    teeth is the socket's: the envelope was acked.
+
+    #1073 changed what happens to the CARD here, and the change is the point.
+    This used to assert the verdict was stamped from the empty message a failed
+    read falls back to -- which is the wipe: it replaces the record of what was
+    approved with one line. An unread card is now left alone. The resolution
+    still stands (it happened before the ack), the ack still lands, and the only
+    cost is that the buttons stay up until the next click reports the record as
+    already resolved.
     """
 
     resolver = ScriptedResolver(
@@ -622,11 +629,122 @@ def test_a_failing_card_read_still_acks_and_still_stamps_the_card(
     )
     _drain(app)
 
-    web_client.conversations_history.assert_called_once()
-    # Fall forward: the read is best-effort, so the verdict still lands on the
-    # card built from an empty original rather than being dropped with the read.
-    web_client.chat_update.assert_called_once()
-    assert "shipping it" in web_client.chat_update.call_args.kwargs["text"]
+    web_client.conversations_replies.assert_called_once()
+    # The card is NOT stamped from an unread original (#1073): destroying the
+    # summary is a worse outcome than leaving a settled record looking clickable.
+    web_client.chat_update.assert_not_called()
+    # And the decision itself was never in doubt -- it landed before the ack.
+    assert len(resolver.calls) == 1
+    assert resolver.calls[0]["note"] == "shipping it"
+
+
+def test_an_unreadable_card_is_left_intact_rather_than_wiped(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """#1073's core regression, as the empty READ rather than a failing one.
+
+    ``conversations.history`` does not return thread replies, and the DEFAULT
+    card is one: with no route bound the card posts into the requesting thread.
+    So the read came back ``{"messages": []}`` for every unrouted approval, and
+    the stamp then wrote a card rebuilt from nothing -- header, summary and
+    "Requested by" all replaced by a single verdict line.
+
+    Two things now prevent that, and this pins the second: the read moved to
+    ``conversations.replies`` (which returns both card shapes), AND an unread
+    card is not stamped at all. The guard matters on its own because the whole
+    failure was invisible -- both assertions the shipped test made passed
+    identically against the wiped output.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    # The pre-#1073 symptom exactly: a read that succeeds and returns nothing.
+    web_client.conversations_replies = MagicMock(return_value={"messages": []})  # type: ignore[method-assign]
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-wipe", note="approved for Q3"))
+    _drain(app)
+
+    assert len(resolver.calls) == 1, "the decision must still land"
+    web_client.chat_update.assert_not_called()
+
+
+def test_the_card_read_asks_for_the_thread_not_the_channel_timeline(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The read must be ``conversations.replies`` keyed on the card's own ts.
+
+    The unrouted card is a thread REPLY. ``conversations.history`` walks the
+    channel timeline and never returns one, which is why it answered empty;
+    ``conversations.replies`` accepts a reply's own ts as well as a parent's, so
+    it reads both card shapes. Asserting the call SHAPE, not just the outcome,
+    because a later refactor back onto ``history`` would pass every
+    outcome-level assertion in this file against a stubbed client.
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-replies", note="ok"))
+    _drain(app)
+
+    web_client.conversations_replies.assert_called_once()
+    kwargs = web_client.conversations_replies.call_args.kwargs
+    assert kwargs["channel"] == CARD_CHANNEL
+    assert kwargs["ts"] == CARD_TS, "the card's OWN ts, not a parent's"
+
+
+def test_a_stamped_card_keeps_its_summary_in_blocks_and_in_the_fallback(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The positive half: a readable card keeps its body, and so does ``text``.
+
+    ``text`` is what notifications, previews and screen readers show, so a stamp
+    that kept the blocks but overwrote the fallback with the verdict alone still
+    loses the summary from all three (#1073's third AC).
+    """
+
+    resolver = ScriptedResolver(
+        ResolveOutcome(status_code=200, resolved_by="U_MANAGER", decision="approved")
+    )
+    app, web_client = _build(config, redis_client, resolver)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-keep", note="approved for Q3"))
+    _drain(app)
+
+    kwargs = web_client.chat_update.call_args.kwargs
+    rendered = list(kwargs["blocks"])
+    assert rendered[0]["type"] == "header", "the header must survive the stamp"
+    assert any(
+        "Discount for ACME" in (b.get("text") or {}).get("text", "") for b in rendered
+    ), f"the summary block must survive the stamp, got {rendered}"
+    assert not any(b.get("type") == "actions" for b in rendered), "buttons must go"
+    assert "Discount for ACME" in kwargs["text"], "the fallback must carry the summary"
+    assert "approved for Q3" in kwargs["text"]
+
+
+def test_a_claim_race_refresh_does_not_wipe_an_unreadable_card(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The 409 path runs the same rebuild, so it carries the same hazard
+    (#1073's second AC). A stale-button refresh is worth strictly less than the
+    card body it would cost."""
+
+    resolver = ScriptedResolver(ResolveOutcome(status_code=409, resolved_by="U_FIRST"))
+    app, web_client = _build(config, redis_client, resolver)
+    web_client.conversations_replies = MagicMock(return_value={"messages": []})  # type: ignore[method-assign]
+    handler = SocketModeHandler(app, app_token="xapp-test")
+
+    handler.handle(FakeSocketClient(), _note_submit("env-race-wipe", note="mine"))
+    _drain(app)
+
+    web_client.chat_update.assert_not_called()
 
 
 def test_a_conflict_from_another_approver_still_names_that_approver(
@@ -727,7 +845,7 @@ def test_a_discarded_outcome_does_not_read_the_card_at_all(
     handler.handle(FakeSocketClient(), _note_submit("env-403-no-fetch", note="please"))
     _drain(app)
 
-    web_client.conversations_history.assert_not_called()
+    web_client.conversations_replies.assert_not_called()
 
 
 def test_the_web_client_gives_up_inside_the_ack_budget(config: DispatcherConfig) -> None:
@@ -800,14 +918,27 @@ def test_an_over_long_note_cannot_break_the_card_stamp(
     _drain(app)
 
     web_client.chat_update.assert_called_once()
-    text = web_client.chat_update.call_args.kwargs["text"]
-    assert len(text) <= 2900
+    kwargs = web_client.chat_update.call_args.kwargs
+
+    # The capped object is the CONTEXT BLOCK's text, which is what Slack
+    # documents a limit for. Since #1073 the ``text=`` kwarg is the notification
+    # fallback and deliberately carries the card summary as well, so asserting
+    # the block cap there would be testing the wrong object.
+    verdict = kwargs["blocks"][-1]["elements"][0]["text"]
+    assert len(verdict) <= 2900
     # The note is what gets cut, never the attribution.
-    assert text.startswith("Approved by <@U_MANAGER>")
+    assert verdict.startswith("Approved by <@U_MANAGER>")
     # A single U+2026, not three periods: the marker is shared with the worker's
     # ``_truncate`` in ``curie_worker.blocks``, so the same Slack card surface
     # does not end truncated text two ways depending on which service stamped it.
-    assert text.endswith("…")
+    assert verdict.endswith("…")
+
+    # The fallback is bounded too, or a long body loses the edit entirely.
+    text = kwargs["text"]
+    assert len(text) <= 39000
+    assert text.startswith("Approved by <@U_MANAGER>")
+    # And it still carries the summary, which is the point of #1073's change.
+    assert "Discount for ACME" in text
     assert not any(
         b.get("type") == "actions" for b in web_client.chat_update.call_args.kwargs["blocks"]
     )

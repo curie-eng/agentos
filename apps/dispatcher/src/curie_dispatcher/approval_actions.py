@@ -78,6 +78,13 @@ _NOTE_MAX_LENGTH = 2000
 # therefore a deliberate margin under an inferred limit, not a documented one.
 _VERDICT_LINE_MAX = 2900
 
+# The ``chat_update`` ``text`` argument is the notification/preview/screen-reader
+# fallback, NOT a block text object, and Slack caps it far higher (the worker's
+# own renderer clamps at 39000 in ``curie_worker.blocks``). It gets its own bound
+# because #1073 made it carry the card summary as well as the verdict, so the
+# verdict's context-block clamp above no longer covers it.
+_FALLBACK_TEXT_MAX = 39000
+
 _APPROVAL_ACTION_IDS = frozenset(
     {
         APPROVE_ACTION_ID,
@@ -237,12 +244,69 @@ class ApprovalResolveClient:
         )
 
 
+def _card_is_readable(message: dict[str, Any]) -> bool:
+    """Whether ``message`` carries enough to stamp WITHOUT losing the card body.
+
+    The defense in depth behind the ``conversations.replies`` fix (#1073). That
+    fix makes the read work for both card shapes; this makes the failure mode
+    survivable if it ever stops working, because the two costs are wildly
+    asymmetric. Skipping a stamp leaves a settled record with live-looking
+    buttons, which the next click reports as already-resolved. Stamping from an
+    unread card DESTROYS the only Slack-side record of what was approved, and
+    the resumed run then streams over the thread's other copy of it.
+
+    So: no blocks, no stamp. A card with only its actions block is equally
+    unstampable -- filtering that leaves nothing but the verdict.
+    """
+
+    return any(b.get("type") != "actions" for b in message.get("blocks") or [])
+
+
+def _card_summary_text(message: dict[str, Any]) -> str:
+    """The card's body as plain text, for the ``chat_update`` ``text`` fallback.
+
+    ``text`` is what notifications, previews, and screen readers use, so
+    stamping with the verdict alone loses the summary from all three even when
+    the blocks keep it (#1073). Pulls the section blocks' text and leaves the
+    header and the context lines out: the header is a constant and the context
+    is the "requested by" line, neither of which is the thing being approved.
+    """
+
+    parts = [
+        text
+        for block in message.get("blocks") or []
+        if block.get("type") == "section"
+        for text in [(block.get("text") or {}).get("text")]
+        if text
+    ]
+    return "\n".join(parts)
+
+
+def _fallback_text(verdict: str, message: dict[str, Any]) -> str:
+    """The ``chat_update`` ``text`` for a settled card: verdict then summary.
+
+    Clamped as a whole. The verdict is already bounded by ``_VERDICT_LINE_MAX``,
+    but the summary appended after it is not, so the pair needs its own bound or
+    a long card body can push the fallback past what Slack accepts and lose the
+    edit entirely -- which would leave the live buttons up, the failure this
+    whole change exists to avoid.
+    """
+
+    combined = f"{verdict}\n{_card_summary_text(message)}".strip()
+    if len(combined) <= _FALLBACK_TEXT_MAX:
+        return combined
+    return combined[: _FALLBACK_TEXT_MAX - 1] + "\u2026"
+
+
 def _resolved_card_blocks(original: dict[str, Any], verdict: str) -> list[dict[str, Any]]:
     """The clicked card with its buttons replaced by the verdict line.
 
     Every non-actions block of the original message is kept (the summary stays
     readable in place); the actions block is swapped for a context line naming
     the decision and the resolver, so the card cannot be clicked twice.
+
+    Callers must gate this on ``_card_is_readable``: handed an unread message it
+    returns the verdict alone, which as a ``chat_update`` payload is a wipe.
     """
 
     blocks = [
@@ -547,15 +611,37 @@ def render_note_submission(
 def _fetch_card_message(
     web_client: WebClient, *, channel: str, card_ts: str, log: logging.Logger
 ) -> dict[str, Any]:
-    """The approval card's message, or an empty dict when it cannot be read."""
+    """The approval card's message, or an empty dict when it cannot be read.
+
+    ``conversations.replies``, not ``conversations.history`` (#1073). The default
+    card is a THREAD REPLY -- with no route bound the card posts into the
+    requesting thread -- and ``conversations.history`` walks the channel
+    timeline, which does not include thread replies. It answered with an empty
+    list for every unrouted card, and the caller then wrote a "settled" card
+    rebuilt from nothing, destroying the summary.
+
+    ``conversations.replies`` accepts either a thread parent's ts or a reply's
+    own ts, so it reads BOTH card shapes: the in-thread card of an unrouted
+    approval and the top-level card of a routed one (a top-level message is the
+    parent of its own, possibly empty, thread). Same history scope family as the
+    call it replaces (`channels:history` / `groups:history` / `im:history`), so
+    no manifest change.
+
+    The ts match is explicit rather than assumed. ``limit=1`` bounds the page,
+    but for a parent ts the first entry IS the parent, and returning the wrong
+    message would stamp a verdict onto someone else's post.
+    """
 
     try:
-        history = web_client.conversations_history(
-            channel=channel, latest=card_ts, oldest=card_ts, inclusive=True, limit=1
+        replies = web_client.conversations_replies(
+            channel=channel, ts=card_ts, inclusive=True, limit=1
         )
-        messages = history.get("messages") or []
-        if messages:
-            return dict(messages[0])
+        for message in replies.get("messages") or []:
+            if message.get("ts") == card_ts:
+                return dict(message)
+        log.warning(
+            "approval card %s not found in %s; leaving it unstamped", card_ts, channel
+        )
     except Exception as exc:  # noqa: BLE001 - the stamp is best-effort
         log.warning("could not read approval card %s in %s: %s", card_ts, channel, exc)
     return {}
@@ -666,16 +752,26 @@ def _render_outcome(
     if outcome.status_code == 200:
         verdict = _verdict_line(outcome.decision or decision, user, note)
         # Best-effort: the record is already resolved and the resume turn is
-        # enqueued; a failed card edit must not undo either.
-        try:
-            web_client.chat_update(
-                channel=channel,
-                ts=card_ts,
-                text=verdict,
-                blocks=_resolved_card_blocks(message, verdict),
+        # enqueued; a failed card edit must not undo either. And an UNREAD card
+        # is not stamped at all (#1073): writing the verdict over a body we
+        # could not read replaces the record of what was approved with a single
+        # line, which is worse than leaving the buttons looking live.
+        if _card_is_readable(message):
+            try:
+                web_client.chat_update(
+                    channel=channel,
+                    ts=card_ts,
+                    text=_fallback_text(verdict, message),
+                    blocks=_resolved_card_blocks(message, verdict),
+                )
+            except Exception as exc:  # noqa: BLE001 - render is best-effort
+                log.warning("approval card update failed for %s: %s", approval_id, exc)
+        else:
+            log.warning(
+                "approval %s resolved but its card could not be read; leaving it "
+                "unstamped rather than overwriting the summary",
+                approval_id,
             )
-        except Exception as exc:  # noqa: BLE001 - render is best-effort
-            log.warning("approval card update failed for %s: %s", approval_id, exc)
         log.info("approval %s %s by %s", approval_id, decision, user)
         return
 
@@ -763,11 +859,17 @@ def _refresh_settled_card(
     detail: str,
     log: logging.Logger,
 ) -> None:
+    # Same guard as the 200 path (#1073): a refresh exists to REMOVE stale
+    # buttons, and doing that at the cost of the card body is not a trade worth
+    # making on a race the winner has usually already settled.
+    if not _card_is_readable(message):
+        log.debug("settled-card refresh skipped: the card could not be read")
+        return
     try:
         web_client.chat_update(
             channel=channel,
             ts=card_ts,
-            text=detail,
+            text=_fallback_text(detail, message),
             blocks=_resolved_card_blocks(message, detail),
         )
     except Exception as exc:  # noqa: BLE001 - best-effort refresh
