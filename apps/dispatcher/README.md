@@ -3,8 +3,8 @@
 The Slack dispatcher: Slack Bolt for Python in Socket Mode.
 On an `app_mention` (channel) or direct `message` (DM) for the bot it acks the
 Socket Mode envelope fast, posts an in-thread placeholder reply, and enqueues a
-normalized job onto a Valkey Stream keyed by the Slack event id (idempotent),
-under reconnect supervision with graceful shutdown.
+normalized job onto a Valkey Stream keyed by the Slack event id (idempotent).
+All of this runs under reconnect supervision with graceful shutdown.
 
 It does exactly that and no more: routing, the finish-race, steer/interrupt, and
 run orchestration are the worker's job, not the dispatcher's.

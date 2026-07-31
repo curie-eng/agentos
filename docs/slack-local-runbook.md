@@ -35,11 +35,14 @@ subscriptions are correct from the start.
 1. Go to https://api.slack.com/apps, click **Create New App**, choose **From a
    manifest**, pick your workspace, and paste the contents of
    [`../apps/dispatcher/slack-app-manifest.yaml`](../apps/dispatcher/slack-app-manifest.yaml).
-   It encodes Socket Mode on, the bot scopes (`app_mentions:read`,
-   `chat:write`, `channels:history`, `groups:history`, `im:history`,
-   `im:read`, and `assistant:write`), the `app_mention` and `message.im` event
-   subscriptions, and interactivity on (so button and block-action clicks
-   arrive over Socket Mode).
+   It encodes:
+
+   - Socket Mode on
+   - the bot scopes (`app_mentions:read`, `chat:write`, `channels:history`,
+     `groups:history`, `im:history`, `im:read`, and `assistant:write`)
+   - the `app_mention` and `message.im` event subscriptions
+   - interactivity on (so button and block-action clicks arrive over Socket
+     Mode)
 2. Generate an **App-Level Token** with the `connections:write` scope (Basic
    Information -> App-Level Tokens). This `xapp-...` value is your
    `SLACK_APP_TOKEN`, used for the Socket Mode connection.

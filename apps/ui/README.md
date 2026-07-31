@@ -110,8 +110,8 @@ plainly what is not wired yet rather than showing fictional data.
   `X-API-Key`.
 - All calls go to the same-origin `/api` prefix. `vite.config.ts` proxies `/api`
   to `CURIE_API_TARGET` (default `http://localhost:8000`), stripping the
-  prefix. This avoids CORS: apps/api has no CORS middleware, so the browser must
-  reach it same-origin.
+  prefix. This avoids CORS (Cross-Origin Resource Sharing) issues: apps/api
+  has no CORS middleware, so the browser must reach it same-origin.
 
 **Client layer.** `src/api/`: `client.ts` (typed calls + `BundleValidationError`,
 the observability calls `getMetricsSummary`/`getMetricSeries`/`getRunnerLogs`,
@@ -135,8 +135,8 @@ apps/api on 8000:
 PW_INTEGRATION=1 CURIE_API_TARGET=http://localhost:8000 pnpm exec playwright test --project=integration
 ```
 
-The integration spec (`e2e/integration/`) seeds a real OTLP trace
-(`seed_trace.py`, run via `uv run`), drives create -> Deploy -> verifies the
+The integration spec (`e2e/integration/`) seeds a real OTLP (OpenTelemetry
+Protocol) trace (`seed_trace.py`, run via `uv run`), drives create -> Deploy -> verifies the
 version + stored bundle via the API, checks the malformed-skill.md validator
 error inline, and asserts the Runs list + span-tree drill-in. The default
 `pnpm exec playwright test` excludes it, so stackless CI stays green.
@@ -166,4 +166,5 @@ Config reference: `.env.example`.
   editor + Deploy), not the interview wizard (deferred).
 - The Observability Memory tab is wired to `GET/PUT/DELETE /agents/{id}/memory`
   (#869), reusing the `WiredAgentMemory` panel from the agent detail page behind
-  an agent selector. The ACI `memory_ref` seam stays in the contract.
+  an agent selector. The ACI (Agent Container Interface) `memory_ref` seam
+  stays in the contract.

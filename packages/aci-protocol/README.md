@@ -1,7 +1,8 @@
 # aci-protocol
 
 The frozen ACI (Agent Container Interface) contract: the
-session protocol and NDJSON event types that every lane compiles against. The
+session protocol and NDJSON (newline-delimited JSON) event types that every
+lane compiles against. The
 Pydantic models here are the single source of truth; the committed JSON Schema,
 the generated TypeScript, and the generated Rust are all derived from them.
 
@@ -15,12 +16,11 @@ change stops the task and lands as its own reviewed change (see the
 frozen-interface rule below). The wire contract is **strict producers, tolerant
 consumers**: constructing an event with an unknown field is an error, but a
 consumer decoding the wire ignores fields it does not model, so a new optional
-field is genuinely backward compatible. The version is **semver**: the decoder
-accepts any wire version compatible with this build's `PROTOCOL_VERSION` (same
-`major.minor` under 0.x, same `major` from 1.0 on) and raises
-`ProtocolVersionError` on an incompatible or malformed one, naming both
-versions. The `version` field is a semver-pattern string, not a `const`, so the
-compatibility range means something. Artifact sync is enforced by the
+field is genuinely backward compatible. The version is **semver**-compatible
+rather than an exact match -- see **Version policy is semver compatibility,
+not exact match** under [Decisions made under ambiguity](#decisions-made-under-ambiguity-section-0-was-underspecified-here)
+below for the compatibility rule and why the `version` field is a pattern
+string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
@@ -103,8 +103,8 @@ compiles the generated Rust (`cargo test`) and TypeScript (`tsc --noEmit`).
   the typed contract holds the reference string, not the secrets.
 - **`OtelConfig` captures a fixed subset.** `OTEL_EXPORTER_OTLP_*` is a wildcard
   in section 0; the typed view models the three standard fields the prototype
-  used (`endpoint`, `headers`, `protocol`). Other OTEL vars pass through the
-  environment untouched.
+  used (`endpoint`, `headers`, `protocol`). Other OTEL (OpenTelemetry) vars
+  pass through the environment untouched.
 - **`final` carries `status`; `error` carries `classification`.** The output
   contract lists `done / idle-awaiting-input / classified failure` as ambient
   status. `final.status` carries the terminal session status; a classified
