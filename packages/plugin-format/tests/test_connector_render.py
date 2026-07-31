@@ -283,3 +283,35 @@ def test_text_without_placeholders_is_untouched() -> None:
     c = _dep(spec=spec)["spec"]["template"]["spec"]["containers"][0]
     assert c["args"] == ["-t", "streamable-http"]
     assert {"name": "A", "value": "b"} in c["env"]
+
+
+# --------------------------------------------------------------------------- #
+# What an unhostable tier mounts -- #1160
+# --------------------------------------------------------------------------- #
+def test_a_hosted_connector_with_a_fallback_is_reachable_where_it_cannot_be_hosted() -> None:
+    spec = ConnectorSpec(image="x:1", unhosted_url="http://host.docker.internal:8765/mcp")
+    assert r.unhosted_mcp_entry(spec) == {
+        "type": "http",
+        "url": "http://host.docker.internal:8765/mcp",
+    }
+
+
+def test_a_hosted_connector_with_no_fallback_mounts_nothing_rather_than_a_dead_url() -> None:
+    # None is a real answer: "declared but not exercisable here" (#1093). A URL
+    # that resolves nowhere would turn that into a connection refused mid-turn.
+    assert r.unhosted_mcp_entry(ConnectorSpec(image="x:1")) is None
+
+
+def test_a_remote_connector_needs_no_fallback_to_stay_reachable() -> None:
+    entry = r.unhosted_mcp_entry(REMOTE)
+    assert entry is not None
+    assert entry["url"] == "https://mcp.internal/mcp"
+
+
+def test_the_fallback_never_displaces_the_derived_url_where_curie_hosts() -> None:
+    # The whole point is that `cluster` keeps hosting it. A fallback that won
+    # everywhere would silently repoint a production agent at someone's laptop.
+    spec = ConnectorSpec(image="x:1", unhosted_url="http://host.docker.internal:8765/mcp")
+    hosted = r.mcp_entry("curie", "sre-dev", "curie", "grafana", spec)
+    assert "svc.cluster.local" in hosted["url"]
+    assert "8765" not in hosted["url"]
