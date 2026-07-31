@@ -500,6 +500,74 @@ def test_approval_card_renders_allow_free_text_as_the_note_buttons() -> None:
     assert APPROVE_NOTE_ACTION_ID.startswith(APPROVE_ACTION_ID)
 
 
+def test_the_rebuilt_settled_card_matches_the_edited_one() -> None:
+    """The convergence #1084 asks for, asserted rather than asserted-in-prose.
+
+    Two paths settle a card from different inputs. The dispatcher holds the live
+    message and EDITS it; the worker's resume path holds only what it remembered
+    and REBUILDS. If those drift, a CLI resolve and a button click leave visibly
+    different cards behind for the same decision -- which is the whole reason
+    #1084 was filed rather than just "also stamp on the API path".
+
+    So: render a live card, settle it both ways, compare block for block.
+    """
+
+    from curie_dispatcher.approval_actions import _resolved_card_blocks, settled_verdict_line
+    from curie_worker.blocks import approval_card, resolved_approval_card
+
+    summary = "Give ACME a 20% discount"
+    requested_by = "U_AE"
+    _fallback, live = approval_card(
+        approval_id="appr-1",
+        summary=summary,
+        requested_by=requested_by,
+        allow_free_text=True,
+    )
+
+    verdict = settled_verdict_line(
+        decision="approved", resolver="U_MANAGER", note="approved for Q3"
+    )
+    edited = _resolved_card_blocks({"blocks": live}, verdict)
+    _rebuilt_text, rebuilt = resolved_approval_card(
+        summary=summary,
+        requested_by=requested_by,
+        decision="approved",
+        resolver="U_MANAGER",
+        note="approved for Q3",
+    )
+
+    assert rebuilt == edited, (
+        "the rebuilt settled card must be identical to the edited one, or a CLI "
+        f"resolve and a click leave different cards.\nedited:  {edited}\n"
+        f"rebuilt: {rebuilt}"
+    )
+    # And the thing that makes it a SETTLED card in the first place.
+    assert not any(b.get("type") == "actions" for b in rebuilt)
+
+
+def test_a_settled_card_without_a_remembered_requester_omits_the_line() -> None:
+    """A card remembered before #1084 carries no requester.
+
+    Those refs live in Valkey across a deploy, so the rebuild has to cope. It
+    omits the line rather than rendering "Requested by <@>", which reads as a
+    bug in a channel humans audit.
+    """
+
+    from curie_worker.blocks import resolved_approval_card
+
+    _text, blocks = resolved_approval_card(
+        summary="Refund order 42",
+        requested_by="",
+        decision="rejected",
+        resolver="U_MANAGER",
+        note=None,
+    )
+
+    assert not any("Requested by" in str(b) for b in blocks)
+    assert any("Refund order 42" in str(b) for b in blocks), "the summary still shows"
+    assert any("Rejected by <@U_MANAGER>" in str(b) for b in blocks)
+
+
 def test_approval_card_clamps_oversized_summary() -> None:
     from curie_worker.blocks import approval_card
 

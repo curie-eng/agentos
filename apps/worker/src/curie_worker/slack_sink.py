@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Protocol, TypeVar, cast
 
 import aiohttp
@@ -20,7 +21,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from .behaviorpacks import NavPack
-from .blocks import approval_card, expired_approval_card, render
+from .blocks import approval_card, expired_approval_card, render, resolved_approval_card
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,22 @@ _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
     aiohttp.ClientError,
     asyncio.TimeoutError,
 )
+
+
+@dataclass(frozen=True)
+class SettledCard:
+    """How an approval ended, channel-neutrally, for the settled-card render.
+
+    ``decision`` is None when nobody decided, which is the expiry case; a
+    non-None value is the resolved case and brings ``resolver`` with it. The
+    kernel builds this from the durable record, never from the platform-authored
+    resume prose, so the card states what the record says.
+    """
+
+    requested_by: str
+    decision: str | None = None
+    resolver: str | None = None
+    note: str | None = None
 
 
 class SlackSink(Protocol):
@@ -100,15 +117,24 @@ class SlackSink(Protocol):
         ts: str,
         message: OutboundMessage,
         endpoint: str | None = None,
+        settled: SettledCard | None = None,
     ) -> None:
-        """Edit an already-posted platform message in place (disabling the
-        expired approval card, #419).
+        """Edit an already-posted platform message in place (settling an
+        approval card: expired in #419, resolved in #1084).
 
         Like ``post``, the kernel hands a channel-neutral ``OutboundMessage``
-        (ADR-0020) and the adapter renders the settled form (Slack: the expired
-        approval card, its buttons gone). Distinct from ``update`` (which renders
-        streamed reply Markdown): this replaces a known platform message.
-        Best-effort at the call site."""
+        (ADR-0020) and the adapter renders the settled form. Distinct from
+        ``update`` (which renders streamed reply Markdown): this replaces a known
+        platform message. Best-effort at the call site.
+
+        ``settled`` carries the outcome semantically -- who asked, what was
+        decided, by whom, with what note -- and the adapter turns that into
+        whatever the channel's settled card looks like. ``None`` keeps #419's
+        behavior, the expired form, so an expiry caller needs no change.
+        Deliberately a parameter rather than fields smuggled into
+        ``OutboundMessage``: ``status`` there already means a rendered status
+        line, and overloading it would give one field two meanings depending on
+        which sink method received it."""
         ...
 
 
@@ -337,11 +363,24 @@ class AsyncSlackSink:
         ts: str,
         message: OutboundMessage,
         endpoint: str | None = None,
+        settled: SettledCard | None = None,
     ) -> None:
-        # Render the settled (expired) approval card HERE, below the seam
-        # (ADR-0020): the kernel hands the channel-neutral summary, the adapter
-        # rebuilds the buttonless expired form.
-        text, blocks = expired_approval_card(summary=message.text)
+        # Render the settled approval card HERE, below the seam (ADR-0020): the
+        # kernel hands the channel-neutral summary plus the semantic outcome, and
+        # the adapter picks the Slack form. No decision means nobody made one,
+        # which is the expiry form (#419); a decision means the resolved form
+        # (#1084), rendered by the SAME function the dispatcher's click path is
+        # pinned against, so an API resolve and a click settle a card alike.
+        if settled is None or settled.decision is None:
+            text, blocks = expired_approval_card(summary=message.text)
+        else:
+            text, blocks = resolved_approval_card(
+                summary=message.text,
+                requested_by=settled.requested_by,
+                decision=settled.decision,
+                resolver=settled.resolver or "",
+                note=settled.note,
+            )
 
         # A rejected Block Kit payload falls back to text-only, mirroring
         # ``post``/``update``: disabling the card is best-effort, but a plain-text

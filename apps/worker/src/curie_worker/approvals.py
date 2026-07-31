@@ -15,6 +15,7 @@ second pending record for one human decision.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -24,12 +25,16 @@ from aci_protocol import ApprovalRequest
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
 # lane-local mirror of the API's schema.
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "ApprovalBackendError",
     "ApprovalClient",
     "ApprovalCreator",
+    "ApprovalReader",
     "ApprovalRequest",
     "CreatedApproval",
+    "SettledApproval",
 ]
 
 
@@ -46,10 +51,35 @@ class ApprovalBackendError(Exception):
     than suspending a session no resolution could ever wake."""
 
 
+@dataclass(frozen=True)
+class SettledApproval:
+    """A resolved record's outcome, for stamping its card (#1084).
+
+    Read from the record rather than parsed out of the platform-authored resume
+    turn. That turn does carry all three facts in prose, and the kernel already
+    keys off its ``[approval expired]`` marker, but a marker is a stable literal
+    while "was approved by X. Note: Y." is a sentence -- reconstructing a
+    decision by regex over it would make the card's correctness depend on the
+    wording of a string built for a language model to read.
+    """
+
+    status: str
+    resolved_by: str | None
+    resolution_note: str | None
+
+
 class ApprovalCreator(Protocol):
     """The kernel-facing seam; tests supply a recording fake."""
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
+
+
+class ApprovalReader(Protocol):
+    """Read one settled record back. Separate from ``ApprovalCreator`` because
+    the kernel's pause path needs only the create half, and a fake for it should
+    not have to grow a method it never calls."""
+
+    async def get(self, approval_id: str) -> SettledApproval | None: ...
 
 
 class ApprovalClient:
@@ -76,3 +106,35 @@ class ApprovalClient:
             )
         body = response.json()
         return CreatedApproval(id=str(body["id"]), status=str(body["status"]))
+
+    async def get(self, approval_id: str) -> SettledApproval | None:
+        """The record's settled outcome, or None when it cannot be read (#1084).
+
+        Never raises. Its only caller is best-effort card teardown on a resume
+        turn: the resolution already happened and the session is already waking,
+        so a failed read costs a stamped card and nothing else. Raising here
+        would turn a cosmetic gap into a dead-lettered resume.
+        """
+
+        try:
+            response = await self._client.get(
+                f"{self._url}/{approval_id}", headers=self._headers
+            )
+        except httpx.HTTPError as exc:
+            logger.warning("approval read failed for %s: %s", approval_id, exc)
+            return None
+        if response.status_code != 200:
+            logger.warning(
+                "approval read failed for %s: HTTP %s", approval_id, response.status_code
+            )
+            return None
+        try:
+            body = response.json()
+            return SettledApproval(
+                status=str(body["status"]),
+                resolved_by=body.get("resolved_by"),
+                resolution_note=body.get("resolution_note"),
+            )
+        except (ValueError, KeyError) as exc:
+            logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
+            return None

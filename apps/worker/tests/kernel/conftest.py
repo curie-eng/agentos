@@ -44,7 +44,7 @@ from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, SandboxView
-from curie_worker.slack_sink import SlackSink
+from curie_worker.slack_sink import SettledCard, SlackSink
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 
@@ -121,12 +121,14 @@ class FakeSink(SlackSink):
         self.posts: list[
             tuple[str, OutboundMessage, str, str | None, str | None]
         ] = []
-        # In-place edits of an already-posted message (the expired approval card,
-        # #419): (channel, ts, message, endpoint) per update_message. Like posts,
-        # the recorded value is the channel-neutral message; the adapter renders
-        # the buttonless expired card below the seam.
+        # In-place edits of an already-posted message (settling the approval
+        # card: expired in #419, resolved in #1084):
+        # (channel, ts, message, endpoint, settled) per update_message. Like
+        # posts, the recorded value is the channel-neutral message; the adapter
+        # renders the buttonless settled card below the seam. ``settled`` is the
+        # semantic outcome and is what distinguishes the two forms.
         self.card_updates: list[
-            tuple[str, str, OutboundMessage, str | None]
+            tuple[str, str, OutboundMessage, str | None, SettledCard | None]
         ] = []
         # #708 test infra: endpoints whose HOST is dead (a CLI stub that exited).
         # A reply-delivery ``update`` to one models the pure-offline local loop --
@@ -187,8 +189,13 @@ class FakeSink(SlackSink):
         ts: str,
         message: OutboundMessage,
         endpoint: str | None = None,
+        settled: SettledCard | None = None,
     ) -> None:
-        self.card_updates.append((channel, ts, message, endpoint))
+        # ``settled`` is RECORDED, not accepted and dropped (#1084). It carries
+        # the whole difference between an expired card and a resolved one, so a
+        # fake that swallowed it would let the resolve path regress to rendering
+        # an expiry while every assertion in the suite stayed green.
+        self.card_updates.append((channel, ts, message, endpoint, settled))
 
     @property
     def last_text(self) -> str | None:
@@ -403,6 +410,7 @@ async def kernel_harness(
     binding: object | None = None,
     with_killswitch: bool = False,
     approvals: object | None = None,
+    approval_reader: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -447,6 +455,7 @@ async def kernel_harness(
         config=config,
         binding=binding,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
+        approval_reader=approval_reader,  # type: ignore[arg-type]
         card_store=card_store,
     )
     killswitch = None

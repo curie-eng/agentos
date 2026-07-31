@@ -85,6 +85,13 @@ _VERDICT_LINE_MAX = 2900
 # verdict's context-block clamp above no longer covers it.
 _FALLBACK_TEXT_MAX = 39000
 
+# The live card's header, shared with the settled rebuild so the two cannot
+# drift: a rebuild under a different heading is a visibly different card for the
+# same decision. ``curie_worker.blocks.approval_card`` imports this rather than
+# repeating the literal.
+_APPROVAL_CARD_HEADER = "Approval required"
+APPROVAL_CARD_HEADER = _APPROVAL_CARD_HEADER
+
 _APPROVAL_ACTION_IDS = frozenset(
     {
         APPROVE_ACTION_ID,
@@ -242,6 +249,68 @@ class ApprovalResolveClient:
             resolved_by=str(resolved) if resolved else None,
             decision=str(decided) if decided else None,
         )
+
+
+def settled_approval_card(
+    *, summary: str, requested_by: str, verdict: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """The approval card in its SETTLED form, rebuilt rather than edited (#1084).
+
+    Two paths settle a card and they have different inputs. The dispatcher holds
+    the live message and edits it (``_resolved_card_blocks``); the worker's
+    resume path holds only what it remembered at pause time and must rebuild.
+    Left to themselves those two produce different-looking cards for the same
+    decision, which is the divergence #1084 exists to prevent, so this renders
+    the rebuild to match the edit exactly: the same header, the same summary
+    section, the same requested-by context, the actions block gone, and the
+    verdict appended as a context line.
+
+    "Exactly" is asserted rather than asserted-in-a-docstring: a test renders a
+    live card through ``curie_worker.blocks.approval_card``, settles it both
+    ways, and compares. That test is the contract; this docstring only says why
+    it exists.
+
+    Lives here, not in the worker's renderer, because the dependency runs one
+    way: ``curie_worker.blocks`` already imports this module for the action ids,
+    for the same anti-drift reason, and the reverse import would be a cycle.
+    """
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": _APPROVAL_CARD_HEADER,
+                "emoji": True,
+            },
+        },
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+    ]
+    # Omitted rather than rendered empty when unknown: a card remembered before
+    # #1084 carries no requester, and "Requested by <@>" reads as a bug.
+    if requested_by:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Requested by <@{requested_by}>"}],
+            }
+        )
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": verdict}]})
+    fallback = f"{verdict}\n{summary}".strip()
+    if len(fallback) > _FALLBACK_TEXT_MAX:
+        fallback = fallback[: _FALLBACK_TEXT_MAX - 1] + "\u2026"
+    return fallback, blocks
+
+
+def settled_verdict_line(*, decision: str, resolver: str, note: str | None) -> str:
+    """The verdict line a settled card shows, for callers outside this module.
+
+    The public name for ``_verdict_line``: the worker needs the identical string
+    the click path stamps, and re-deriving it there is how the two surfaces would
+    start wording the same decision differently.
+    """
+
+    return _verdict_line(decision, resolver, note)
 
 
 def _card_is_readable(message: dict[str, Any]) -> bool:

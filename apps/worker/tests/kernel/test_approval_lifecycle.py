@@ -16,7 +16,12 @@ import aiohttp
 import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from channel_protocol import ConfirmIntent
-from curie_worker.approvals import ApprovalBackendError, ApprovalRequest, CreatedApproval
+from curie_worker.approvals import (
+    ApprovalBackendError,
+    ApprovalRequest,
+    CreatedApproval,
+    SettledApproval,
+)
 from curie_worker.sandbox.types import RouteState
 
 DONE = SessionStatus.DONE
@@ -35,6 +40,23 @@ class RecordingApprovals:
             raise ApprovalBackendError("approval API unavailable")
         self.requests.append(request)
         return CreatedApproval(id=f"appr-{len(self.requests)}", status="pending")
+
+
+class RecordingReader:
+    """An ApprovalReader fake: hands back one settled record, records the reads.
+
+    Separate from ``RecordingApprovals`` for the same reason the kernel takes two
+    parameters (#1084): most tests need only the create half, and a combined fake
+    would make every one of them carry a read they never exercise.
+    """
+
+    def __init__(self, record: SettledApproval | None) -> None:
+        self.record = record
+        self.reads: list[str] = []
+
+    async def get(self, approval_id: str) -> SettledApproval | None:
+        self.reads.append(approval_id)
+        return self.record
 
 
 def _qevent(
@@ -711,7 +733,10 @@ def test_expiry_resume_disables_the_approval_card(make_harness) -> None:
             # (no actions block, an expiry line) is the adapter's job below the
             # seam -- asserted in test_slack_sink.py.
             assert len(h.sink.card_updates) == 1
-            channel, ts, message, endpoint = h.sink.card_updates[0]
+            channel, ts, message, endpoint, settled = h.sink.card_updates[0]
+            # Expiry means nobody decided, so the settled outcome carries no
+            # decision and the adapter renders the expired form (#1084).
+            assert settled is not None and settled.decision is None
             assert (channel, ts) == ("C1", card_ts)
             assert endpoint is None
             assert message.text == "Give ACME a 20% discount"
@@ -725,15 +750,30 @@ def test_expiry_resume_disables_the_approval_card(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_resolve_resume_leaves_the_card_to_the_dispatcher(make_harness) -> None:
-    """#419: a RESOLVE resume (author is the resolver) must NOT edit the card --
-    the dispatcher already did from the click -- but it still consumes the
-    remembered card so no stale memory lingers into a later approval."""
+def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
+    """#1084: a RESOLVE resume settles the card, it no longer leaves it live.
+
+    This asserted the opposite until #1084, on the premise that "the dispatcher
+    already did from the click". That holds only when there WAS a click: a
+    resolution through ``POST /approvals/{id}/resolve`` or ``curie <tier>
+    approvals --resolve`` never touches Slack, so the card kept its buttons and
+    every later click earned a 409. The worker is the only component that still
+    knows where the card is, so settling it belongs here.
+
+    The verdict comes from the durable record, not from the platform-authored
+    resume prose -- that sentence is written for a model, and rebuilding a
+    decision out of it by regex is how the card would start lying after a
+    wording change.
+    """
 
     async def go() -> None:
-        approvals = RecordingApprovals()
+        reader = RecordingReader(
+            SettledApproval(
+                status="approved", resolved_by="U9", resolution_note="approved for Q3"
+            )
+        )
         thread = "th-resolve-card"
-        async with make_harness(approvals=approvals) as h:
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
             h.runner.default_script = _awaiting_script("Refund order 42")
             await h.kernel.process_event(_qevent("refund?", thread=thread))
             assert await h.async_redis.exists(h.config.approval_card_key(thread))
@@ -748,10 +788,89 @@ def test_resolve_resume_leaves_the_card_to_the_dispatcher(make_harness) -> None:
                 )
             )
 
-            # No worker-side card edit (the dispatcher owns the resolved card)...
-            assert h.sink.card_updates == []
-            # ...but the memory was cleaned up so a later approval cannot collide.
+            # The card was settled, with the outcome read off the record.
+            assert len(h.sink.card_updates) == 1
+            _channel, _ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert message.text == "Refund order 42", "the summary must survive"
+            assert settled is not None
+            assert settled.decision == "approved"
+            assert settled.resolver == "U9"
+            assert settled.note == "approved for Q3"
+            # And the requester the live card named is carried into the rebuild,
+            # so the settled card is not missing a line the original had.
+            # "U1" is the author `_qevent` stamps on the triggering turn, which
+            # is exactly what `approval_card` rendered as "Requested by".
+            assert settled.requested_by == "U1"
+
+            # The read was keyed off the resume turn's deterministic event id.
+            assert reader.reads == ["appr-1"]
+
+            # The memory is still consumed, so a later approval cannot collide.
             assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
+    make_harness,
+) -> None:
+    """No record, no stamp (#1084).
+
+    The kernel would have to invent a decision to render anything, and a card
+    stating a verdict nobody confirmed is worse than one still showing buttons:
+    the buttons are at least honest about the platform not having told Slack
+    yet, and the next click gets the real answer from the API.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(None)
+        thread = "th-unreadable-record"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            await h.kernel.process_event(_qevent("refund?", thread=thread))
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            assert h.sink.card_updates == []
+            # The memory is consumed either way: a ref left behind would be
+            # popped by an unrelated later approval on the same thread.
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_a_resolve_resume_with_no_reader_configured_still_resumes(make_harness) -> None:
+    """Progressive enhancement, per ADR-0020: a deployment with nothing to read
+    the record with settles no card and continues the run normally. The stamp is
+    an enrichment on a decision that already happened."""
+
+    async def go() -> None:
+        thread = "th-no-reader"
+        async with make_harness(approvals=RecordingApprovals()) as h:
+            h.runner.default_script = _awaiting_script("Refund order 42")
+            await h.kernel.process_event(_qevent("refund?", thread=thread))
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            assert h.sink.card_updates == []
+            # The run itself continued: the resumed reply was delivered.
+            assert h.sink.updates, "the resume must still produce a reply"
 
     asyncio.run(go())
 

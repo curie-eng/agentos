@@ -34,12 +34,20 @@ DEFAULT_CARD_TTL_S = 14 * 24 * 60 * 60
 
 @dataclass(frozen=True)
 class ApprovalCardRef:
-    """Where a posted approval card lives, enough to edit it in place later."""
+    """Where a posted approval card lives, enough to REBUILD it in place later.
+
+    ``requested_by`` joined the ref for #1084: the settled rebuild shows the
+    same "Requested by" line the live card did, and the worker has no other copy
+    of it once the sandbox is gone. Defaulted so an entry remembered before
+    #1084 still loads -- these live in Valkey across a deploy, and the settled
+    card simply omits the line rather than failing to render.
+    """
 
     channel: str
     ts: str
     summary: str
     endpoint: str | None = None
+    requested_by: str = ""
 
 
 class ApprovalCardStore:
@@ -60,9 +68,16 @@ class ApprovalCardStore:
         ts: str,
         summary: str,
         endpoint: str | None,
+        requested_by: str = "",
     ) -> None:
         payload = json.dumps(
-            {"channel": channel, "ts": ts, "summary": summary, "endpoint": endpoint}
+            {
+                "channel": channel,
+                "ts": ts,
+                "summary": summary,
+                "endpoint": endpoint,
+                "requested_by": requested_by,
+            }
         )
         await self._redis.set(
             self._config.approval_card_key(thread), payload, ex=self._ttl_s
@@ -86,6 +101,10 @@ class ApprovalCardStore:
                 ts=str(data["ts"]),
                 summary=str(data["summary"]),
                 endpoint=data.get("endpoint"),
+                # ``.get`` not ``[...]``: entries written before #1084 have no
+                # such key, and a KeyError here would be caught by the corrupt
+                # handler below and silently drop a perfectly usable card ref.
+                requested_by=str(data.get("requested_by") or ""),
             )
         except (ValueError, KeyError, TypeError):
             # A corrupt or shape-drifted entry must not break the resume; treat

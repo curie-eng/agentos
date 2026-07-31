@@ -53,7 +53,12 @@ from channel_protocol import (
 from pydantic import ValidationError
 
 from .approval_cards import ApprovalCardStore
-from .approvals import ApprovalBackendError, ApprovalCreator, ApprovalRequest
+from .approvals import (
+    ApprovalBackendError,
+    ApprovalCreator,
+    ApprovalReader,
+    ApprovalRequest,
+)
 from .behaviorpacks import (
     BehaviorPacks,
     NavPack,
@@ -69,7 +74,7 @@ from .markers import Markers
 from .runner_client import RunnerClient, RunnerError, TurnStream
 from .sandbox import SandboxSubstrate
 from .sandbox.types import SandboxError, SandboxHandle, SuspendedThreadError
-from .slack_sink import SlackSink
+from .slack_sink import SettledCard, SlackSink
 from .threadlock import ThreadLock
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,23 @@ RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
 # get its resolved card wrongly stamped expired. The marker is a stable
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
+
+
+def _approval_id_from_resume_event(event_id: str) -> str | None:
+    """The approval id inside a resume turn's deterministic event id (#1084).
+
+    The inverse of ``resumequeue.resume_event_id``: ``approval-<id>-resolved``,
+    a key the API documents as frozen because the worker's done-marker dedupes
+    on it, and which the expiry and resolve paths deliberately share. Reading
+    the id off it beats parsing the platform-authored prose, which is written
+    for a model rather than for a parser. Returns None on any other shape, so a
+    non-resume event never reaches the reader.
+    """
+
+    if not event_id.startswith("approval-") or not event_id.endswith("-resolved"):
+        return None
+    middle = event_id[len("approval-") : -len("-resolved")]
+    return middle or None
 
 # How long an operator-requested reset waits on the courtesy interrupt before
 # giving up and releasing anyway (#739). Deliberately seconds, not minutes: the
@@ -283,6 +305,11 @@ class Kernel:
         binding: BindingResolver | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
+        # Separate from ``approvals`` on purpose (#1084): the pause path needs
+        # only the create half, and a test fake for it should not have to grow a
+        # read method it never calls. In production both are the one
+        # ``ApprovalClient``.
+        approval_reader: ApprovalReader | None = None,
         card_store: ApprovalCardStore | None = None,
     ) -> None:
         self._substrate = substrate
@@ -300,6 +327,7 @@ class Kernel:
         # deployment without the API), an awaiting-approval run degrades to an
         # escalation instead of suspending a session nothing could ever resume.
         self._approvals = approvals
+        self._approval_reader = approval_reader
         # Remembers where each suspended thread's approval card was posted so an
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
@@ -345,12 +373,10 @@ class Kernel:
                 logger.info("event %s already done; skipping", event_id)
                 return
 
-            # If this is the resume turn of an EXPIRED approval, disable its live
-            # approval card before running the continuation (#419). Best-effort and
-            # gated to the platform-authored expiry resume, so it never touches a
-            # resolved card (the dispatcher edits that from the click) or an
-            # ordinary turn.
-            await self._finalize_expired_card(qevent)
+            # If this is an approval resume, settle its live card before running
+            # the continuation: expired (#419) or resolved (#1084). Best-effort,
+            # and gated on the resume event id so an ordinary turn pays nothing.
+            await self._finalize_settled_card(qevent)
 
             # Crash-safety: a prior attempt executed a side effect but never
             # reached done (worker died mid-run). Do not auto-retry the action.
@@ -886,46 +912,106 @@ class Kernel:
         # matching it here does not couple to a mutable string.
         return event_id.startswith("approval-") and event_id.endswith("-resolved")
 
-    async def _finalize_expired_card(self, qevent: QueuedTurn) -> None:
-        """Disable the approval card when an EXPIRED approval resumes (#419).
+    async def _finalize_settled_card(self, qevent: QueuedTurn) -> None:
+        """Settle the approval card when its approval resumes (#419, #1084).
 
-        The two expiry paths -- the #412 sweeper and a resolve attempt that
-        arrives past the SLA -- both flip the record to ``expired`` and enqueue a
-        platform-authored resume turn prefixed ``[approval expired]``; neither
-        ever touched the card, so its Approve/Reject buttons kept looking live.
-        Here the kernel, which owns the card surface, pops the card it remembered
-        at pause time and edits it into its settled ``expired`` form -- the expiry
-        mirror of the dispatcher's resolved-card edit.
+        Every terminal transition ends here, because the card outlives the
+        decision and nothing else in the system owns it. An EXPIRY (#419) has no
+        click at all: the #412 sweeper or a past-SLA resolve flips the record and
+        enqueues a ``[approval expired]`` turn, and the buttons would otherwise
+        keep looking live. A RESOLVE (#1084) has a click only sometimes -- a
+        resolution that arrived through ``POST /approvals/{id}/resolve`` or
+        ``curie <tier> approvals --resolve`` never touched Slack, so the card
+        stayed live there too, and every later click earned a 409.
 
-        A RESOLVE resume (``[approval resolved]``) only pops the memory to clean
-        it up; the dispatcher already edited that card from the click. The
-        expiry-vs-resolve discriminator is the platform-authored text marker, not
-        the turn author -- see ``_EXPIRY_RESUME_MARKER``. Fully best-effort: any
-        failure here must never fail the resume, and the cheap event-id check
-        gates the Valkey pop so ordinary turns pay nothing.
+        Both forms render through the SAME function the dispatcher's click path
+        is pinned against, so a CLI resolve and a button click leave the same
+        card behind. That convergence is the point of #1084; two renderers on one
+        surface is what it was filed to stop.
+
+        Idempotence, and why an unconditional re-stamp is safe: ``pop`` is
+        GETDEL, so exactly one resume turn per thread gets the ref, and a
+        redelivery finds nothing. Within that single pass the stamp may land on a
+        card the dispatcher already stamped from a click, which is a rewrite to
+        an equivalent card rather than a second verdict -- the shared renderer is
+        what makes "equivalent" true, and a test pins it. A card stamped here and
+        then clicked late gets the existing already-resolved refusal from the
+        API, unchanged.
+
+        Fully best-effort: nothing here may fail the resume, the cheap event-id
+        check gates the Valkey pop so ordinary turns pay nothing, and a record
+        that cannot be read leaves the card alone rather than stamping a verdict
+        the kernel had to guess.
         """
 
         if self._card_store is None or not self._is_approval_resume(qevent.event_id):
             return
         try:
             ref = await self._card_store.pop(qevent.conversation_id)
-            if ref is None or not qevent.text.startswith(_EXPIRY_RESUME_MARKER):
+            if ref is None:
                 return
-            # Emit the channel-neutral summary (ADR-0020); the adapter renders the
-            # settled, buttonless expired card below the seam.
+            # Expiry states only that nobody decided, so it needs no record read;
+            # a resolve states what was decided, and that comes from the record.
+            if qevent.text.startswith(_EXPIRY_RESUME_MARKER):
+                settled = SettledCard(requested_by=ref.requested_by)
+            else:
+                outcome = await self._settled_from_record(qevent)
+                if outcome is None:
+                    return
+                settled = SettledCard(
+                    requested_by=ref.requested_by,
+                    decision=outcome.decision,
+                    resolver=outcome.resolver,
+                    note=outcome.note,
+                )
+            # Emit the channel-neutral summary (ADR-0020) plus the semantic
+            # outcome; the adapter renders the buttonless settled card below the
+            # seam.
             await self._sink.update_message(
                 channel=ref.channel,
                 ts=ref.ts,
                 message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
                 endpoint=ref.endpoint,
+                settled=settled,
             )
-            logger.info("disabled expired approval card for thread %s", qevent.conversation_id)
+            logger.info("settled approval card for thread %s", qevent.conversation_id)
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
             logger.warning(
-                "expired approval card teardown failed for thread %s: %s",
+                "approval card teardown failed for thread %s: %s",
                 qevent.conversation_id,
                 exc,
             )
+
+    async def _settled_from_record(self, qevent: QueuedTurn) -> SettledCard | None:
+        """The resolved outcome to stamp, read from the durable record.
+
+        Read, not parsed. The resume turn does state the decision, the resolver
+        and the note, but it states them in a sentence written for a language
+        model; reconstructing them by regex would make the card's correctness
+        depend on that wording. The approval id comes out of the resume turn's
+        deterministic ``event_id`` instead, which is a frozen key shared with
+        ``resumequeue.resume_event_id``.
+
+        None means "do not stamp": no reader configured, an id that does not
+        parse, a record that could not be read, or a record that is somehow not
+        resolved. Leaving a live-looking card is a smaller wrong than stamping a
+        verdict nobody confirmed.
+        """
+
+        if self._approval_reader is None:
+            return None
+        approval_id = _approval_id_from_resume_event(qevent.event_id)
+        if approval_id is None:
+            return None
+        record = await self._approval_reader.get(approval_id)
+        if record is None or record.status not in ("approved", "rejected"):
+            return None
+        return SettledCard(
+            requested_by="",
+            decision=record.status,
+            resolver=record.resolved_by,
+            note=record.resolution_note,
+        )
 
     async def _pause_for_approval(
         self,
@@ -1135,6 +1221,10 @@ class Kernel:
                         ts=card_ts,
                         summary=summary,
                         endpoint=card_endpoint,
+                        # The settled rebuild shows the same "Requested by" line
+                        # the live card did, and once the sandbox is gone this
+                        # is the worker's only copy of it (#1084).
+                        requested_by=qevent.author,
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)

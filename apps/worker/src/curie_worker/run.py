@@ -176,6 +176,9 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
+    approval_client = ApprovalClient(
+        api_base_url=config.api_base_url, api_key=config.api_key, client=eval_http
+    )
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
@@ -191,9 +194,11 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
-        approvals=ApprovalClient(
-            api_base_url=config.api_base_url, api_key=config.api_key, client=eval_http
-        ),
+        approvals=approval_client,
+        # The same client, handed in twice under the two roles the kernel needs
+        # (#1084). Two parameters rather than one so a test can fake the create
+        # half without also implementing a read it never exercises.
+        approval_reader=approval_client,
         card_store=ApprovalCardStore(async_redis, config),
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
