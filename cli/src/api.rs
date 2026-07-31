@@ -420,6 +420,25 @@ fn agent_create_body(
     body
 }
 
+/// Is this 404 a MISSING ENDPOINT rather than a missing resource?
+///
+/// FastAPI answers an unrouted path with exactly `{"detail":"Not Found"}`,
+/// while a handler that ran and found nothing sets its own detail ("version
+/// not found"). That difference is the only signal available for "this CLI is
+/// newer than the platform it is talking to" -- and without it the operator
+/// sees a bare 404 and has no way to tell a stale release from a typo.
+///
+/// Both of the failures this guards against happened for real: a CLI with
+/// `--target` against an API that predated the resolver, and a CLI that
+/// applied connectors against an API that could not render them.
+fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(str::to_string))
+            .is_some_and(|d| d == "Not Found")
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -446,6 +465,15 @@ impl ApiClient {
         }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // An unrouted path means the platform is older than this CLI, which is
+        // a different problem from a missing resource and has a different fix.
+        // Saying so here covers every caller at once rather than one call site.
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
         bail!("{what} failed with {status}: {}", body.trim());
     }
 
@@ -856,6 +884,13 @@ impl ApiClient {
             .context("resolving the deploy target")?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            anyhow::bail!(
+                "this platform release has no deploy-target resolver, so `--target` cannot \
+                 work against it. The API predates ADR-0089. Upgrade the release, or drop \
+                 `--target` and pass `--agent`/`--env`/`--slack-channel` directly."
+            );
+        }
         if !status.is_success() {
             anyhow::bail!("resolving target `{target}` failed with {status}: {body}");
         }
@@ -1195,5 +1230,53 @@ mod tests {
         ] {
             assert!(is_insecure_endpoint(url), "expected {url} to warn");
         }
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    use super::is_unrouted;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn a_bare_fastapi_404_is_read_as_a_missing_endpoint() {
+        // This is exactly what an older platform returns for a path it does not
+        // route, and it is the only signal that the CLI is newer than the API.
+        assert!(is_unrouted(
+            StatusCode::NOT_FOUND,
+            r#"{"detail":"Not Found"}"#
+        ));
+    }
+
+    #[test]
+    fn a_handler_404_is_not_mistaken_for_a_missing_endpoint() {
+        // The endpoint exists and ran; the resource is absent. Telling the
+        // operator to upgrade here would send them down entirely the wrong path.
+        assert!(!is_unrouted(
+            StatusCode::NOT_FOUND,
+            r#"{"detail":"version not found"}"#
+        ));
+        assert!(!is_unrouted(
+            StatusCode::NOT_FOUND,
+            r#"{"detail":"no target named 'prod' in deploy.yaml. Declared: dev"}"#
+        ));
+    }
+
+    #[test]
+    fn other_statuses_are_never_a_skew_signal() {
+        for s in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(!is_unrouted(s, r#"{"detail":"Not Found"}"#));
+        }
+    }
+
+    #[test]
+    fn a_non_json_body_is_not_a_skew_signal() {
+        // A proxy or ingress can return an HTML 404 that means something else
+        // entirely; guessing "upgrade your platform" from it would be wrong.
+        assert!(!is_unrouted(StatusCode::NOT_FOUND, "<html>404</html>"));
     }
 }
