@@ -11,11 +11,13 @@ each area's own `CLAUDE.md` carries the rules specific to that directory.
 <!-- TODO(maintainer): Decision 1 (issue #635) - confirm whether outside pull
      requests are accepted and what scope is welcome. This guide is written
      assuming community PRs are welcome. If that holds, delete this comment and
-     the placeholder scope note below and state the accepted scope plainly
-     (for example: bug fixes and documentation freely; new connectors, CLI
-     verbs, or UI surfaces via an issue first; changes to the frozen contracts
-     never as a drive-by). If outside PRs are NOT accepted, say so here instead
-     and describe how to propose changes. -->
+     the placeholder scope note below and state the accepted scope plainly, for
+     example:
+     - Bug fixes and documentation: welcome freely.
+     - New connectors, CLI verbs, or UI surfaces: via an issue first.
+     - Changes to the frozen contracts: never as a drive-by.
+     If outside PRs are NOT accepted, say so here instead and describe how to
+     propose changes. -->
 
 ## Scope of contributions
 
@@ -87,9 +89,9 @@ uv run mypy             # type-check (strict)
 
 ```bash
 cd cli
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
+cargo fmt --check         # formatting
+cargo clippy -- -D warnings   # lint, warnings as errors
+cargo test                # unit + integration tests
 ```
 
 If `cargo fmt`/`clippy` report a missing component: `rustup component add
@@ -99,7 +101,11 @@ rustfmt clippy`.
 
 ```bash
 cd apps/ui
-pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e
+pnpm install             # once
+pnpm lint                # eslint
+pnpm typecheck           # tsc project check
+pnpm test                # unit tests
+pnpm e2e                 # Playwright e2e
 ```
 
 **Docs (interface catalog):** if you edit any doc under `docs/`, including the
@@ -117,23 +123,33 @@ the regenerated files.
 - Every behavior-bearing change must be verified end-to-end through the real
   product loop (the `curie` CLI, the compose services, or a real sandbox on a
   local `kind`/`k3s` cluster), not just by unit tests.
-- If you touch one side of a known parity seam (see the registry in AGENTS.md),
-  change the sibling in the same PR, route both through a shared helper, or name
-  the sibling in the PR body with a follow-up issue.
+- If you touch one side of a known parity seam (see the registry in
+  AGENTS.md), do one of:
+  - Change the sibling in the same PR.
+  - Route both through a shared helper.
+  - Name the sibling in the PR body with a follow-up issue.
 
 ## Frozen contracts: stop and escalate
 
 `packages/aci-protocol` and `packages/plugin-format` are frozen interfaces that
-every lane compiles against across three languages. If your change needs to
-modify either package, stop: do not work around it. Open an issue or raise it in
-your PR. A contract change must land as its own reviewed, backward-compatible
-change first, before dependent lanes proceed. The same applies when an adopted
-component cannot do what a spec claims: stop and raise it with evidence rather
-than silently diverging.
+every lane compiles against across three languages. See AGENTS.md's
+[Frozen contracts](AGENTS.md#frozen-contracts-stop-and-escalate) section for
+the full policy (the CI gates that enforce it and the semver rules for
+changing it).
+
+The short version: if your change needs to modify either package, stop and do
+not work around it. Open an issue or raise it in your PR -- a contract change
+must land as its own reviewed, backward-compatible change first, before
+dependent lanes proceed. The same applies when an adopted component cannot do
+what a spec claims: stop and raise it with evidence rather than silently
+diverging.
 
 ## Decisions: ADR vs GitHub issue
 
-Two different tools; do not conflate them.
+Two different tools; do not conflate them. See AGENTS.md's
+[Decisions: ADR vs. GitHub issue](AGENTS.md#decisions-adr-vs-github-issue)
+section for the full policy, including how to handle a rationale that claims
+observability, convergence, protection, or parity.
 
 - Write an **ADR** (`docs/adr/`, Michael Nygard style, see ADR-0001) only for a
   cross-cutting architectural decision that closes the door on alternatives. An
