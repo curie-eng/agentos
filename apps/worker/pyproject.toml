@@ -16,7 +16,7 @@ dependencies = [
     "httpx>=0.28",
     "sqlalchemy[asyncio]>=2.0.51",
     "asyncpg>=0.30",
-    "boto3>=1.43.55",
+    "boto3>=1.43.57",
 ]
 
 [build-system]

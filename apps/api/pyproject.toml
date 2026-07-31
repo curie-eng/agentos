@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Curie API server (FastAPI): agents/versions/deployments CRUD, auth, Langfuse proxy"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi>=0.139.2",
+    "fastapi>=0.140.13",
     "uvicorn[standard]>=0.51.0",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.30",
