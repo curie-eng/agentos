@@ -338,6 +338,7 @@ def approval_card(
     # Imported here (not module top) to keep the module importable in isolation;
     # the worker package already depends on the dispatcher for the queue seam.
     from curie_dispatcher.approval_actions import (
+        APPROVAL_CARD_HEADER,
         APPROVE_ACTION_ID,
         APPROVE_NOTE_ACTION_ID,
         REJECT_ACTION_ID,
@@ -354,7 +355,7 @@ def approval_card(
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": _truncate("Approval required", _HEADER_MAX),
+                "text": _truncate(APPROVAL_CARD_HEADER, _HEADER_MAX),
                 "emoji": True,
             },
         },
@@ -379,6 +380,34 @@ def approval_card(
         },
     ]
     return fallback, blocks
+
+
+def resolved_approval_card(
+    *, summary: str, requested_by: str, decision: str, resolver: str, note: str | None
+) -> tuple[str, list[dict[str, Any]]]:
+    """The approval card rebuilt in its RESOLVED form (#1084).
+
+    A thin adapter over ``curie_dispatcher.approval_actions.settled_approval_card``
+    and ``settled_verdict_line`` rather than a second renderer: the dispatcher's
+    click path settles the very same card, and two renderers on one surface is
+    exactly the divergence #1084 was filed to stop. Same import direction as the
+    action ids above, for the same reason.
+
+    Unlike ``expired_approval_card`` this needs the requester and the verdict,
+    because a resolved card states who decided and why, where an expired one
+    states only that nobody did.
+    """
+
+    from curie_dispatcher.approval_actions import (
+        settled_approval_card,
+        settled_verdict_line,
+    )
+
+    return settled_approval_card(
+        summary=_truncate(to_mrkdwn(summary), _APPROVAL_SUMMARY_MAX),
+        requested_by=requested_by,
+        verdict=settled_verdict_line(decision=decision, resolver=resolver, note=note),
+    )
 
 
 def expired_approval_card(*, summary: str) -> tuple[str, list[dict[str, Any]]]:
