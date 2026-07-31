@@ -62,3 +62,6 @@ agents/
 
 # generated CLI manifest module (apps/ui codegen)
 apps/ui/src/generated/
+
+# Cross-build output for the linux/arm64 CLI (docker buildx / rust image).
+cli/target-linux-*/

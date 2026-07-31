@@ -722,6 +722,9 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
     );
     deploy(DeployOpts {
         plugin_dir,
+        // deploy_named is the multi-agent-folder path: the folder IS the agent
+        // identity there, so there is nothing to override.
+        agent: None,
         api_url: opts.api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
@@ -2917,6 +2920,14 @@ pub fn resolve_cases_path(
 }
 
 pub struct DeployOpts {
+    /// Deploy under this agent name instead of the manifest's.
+    ///
+    /// One repository is otherwise structurally one agent (#1166): the name
+    /// comes from `plugin.json`, so a bundle cannot run as both a dev and a
+    /// prod agent. Overriding at deploy keeps the ARTIFACT identical -- the
+    /// bundle bytes are untouched, only the binding differs -- which is the
+    /// property that lets prod promote exactly what dev validated.
+    pub agent: Option<String>,
     pub plugin_dir: PathBuf,
     pub api_url: String,
     pub api_key: String,
@@ -3093,12 +3104,16 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         ));
     }
 
+    // The manifest name is the default, not the law (#1166). `plugin_name`
+    // stays the DISPLAY name so the log still says which bundle was deployed;
+    // `agent_name` is what the platform binds.
+    let agent_name = opts.agent.clone().unwrap_or_else(|| plugin_name.clone());
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let cl = ui.checklist();
-    let step = cl.step(&format!("deploying {plugin_name}"));
+    let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
     let outcome = match client
         .deploy(
-            &plugin_name,
+            &agent_name,
             opts.slack_channel.as_deref(),
             &label,
             &created_by,
@@ -5996,6 +6011,7 @@ mod tests {
         crate::scaffold::scaffold(dir.path(), "test-agent").unwrap();
         let hint = "kubectl -n curie port-forward svc/curie-api 8000:8000";
         let opts = super::DeployOpts {
+            agent: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
@@ -6067,6 +6083,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            agent: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
@@ -6100,6 +6117,7 @@ mod tests {
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 
         let opts = super::DeployOpts {
+            agent: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
