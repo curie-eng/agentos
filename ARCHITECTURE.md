@@ -24,11 +24,11 @@ was built from, which are preserved in git history.
 
 - [Overview](#overview)
 - [Component map](#component-map)
-  - [Directory ownership and language](#directory-ownership-and-language)
-- [Data flow: a Slack mention becomes a threaded reply](#data-flow-a-slack-mention-becomes-a-threaded-reply)
+  - [Adopted, not built](#adopted-not-built)
+- [Handling a Slack mention (message flow)](#handling-a-slack-mention-message-flow)
   - [The four kernel invariants](#the-four-kernel-invariants)
-  - [The approval gate: a turn can end without a reply](#the-approval-gate-a-turn-can-end-without-a-reply)
-- [Data flow: a git push deploys a bundle and runs evals](#data-flow-a-git-push-deploys-a-bundle-and-runs-evals)
+  - [Handling approvals (human in the loop)](#handling-approvals-human-in-the-loop)
+- [Pushing agent versions with git (deploy flow)](#pushing-agent-versions-with-git-deploy-flow)
 - [One worker, two hidden seams: substrate and transport](#one-worker-two-hidden-seams-substrate-and-transport)
   - [Substrate seam — `SandboxClient`](#substrate-seam--sandboxclient)
   - [Slack seam — a per-turn reply endpoint and the CLI stub](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub)
@@ -48,15 +48,13 @@ What Curie does, in short:
 - Deploy it as a bot identity.
 - Get traces, evals, budgets, and git-flow for free.
 
-The core loop: a Slack mention lands on the dispatcher, is enqueued on a Valkey
-stream, and is picked up by a worker kernel that owns one live session per
-thread. The kernel claims a sandbox and drives a runner inside it over a
-frozen HTTP/NDJSON (Newline-Delimited JSON) protocol. The runner makes the real
-model call and streams the reply back. The worker edits that reply into the
-Slack placeholder. The same worker, unchanged, runs against a real Kubernetes
-cluster or a local Docker substrate. The CLI can stand in for Slack entirely.
-That substrate-agnosticism is the load-bearing design property of the whole
-system — see [One worker, two hidden seams](#one-worker-two-hidden-seams-substrate-and-transport).
+The core loop: a Slack mention is queued, picked up by a worker that claims a
+sandboxed runner, and the runner's reply is edited back into the Slack thread.
+The same worker code runs unchanged against Kubernetes in production or Docker
+locally, and the CLI can stand in for Slack entirely for local testing — see
+[Handling a Slack mention](#handling-a-slack-mention-message-flow) for the full
+flow and [One worker, two hidden seams](#one-worker-two-hidden-seams-substrate-and-transport)
+for how that substrate-agnosticism is built.
 
 ## Component map
 
@@ -131,23 +129,16 @@ with four outbound dependencies of its own:
 - It writes eval scores straight to Langfuse
   ([`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`](apps/worker/src/curie_worker/eval/recorder.py)).
 
-The worker has **no** OTel dependency — the runner is the only emitter. The
-worker's telemetry edge is that eval-score write. The CLI likewise never calls
-the dispatcher: it `XADD`s the same `QueuedTurn` the dispatcher would produce
-onto the same stream (the `xadd` helper in [`cli/src/queue.rs`](cli/src/queue.rs)),
-which is what [the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) describes.
+The worker has **no** OTel dependency — the runner is the only emitter. Its one
+connection to observability is the eval-score write to Langfuse above. The CLI
+likewise never calls the dispatcher directly — see
+[the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) for
+how it enqueues a turn instead.
 
-### Directory ownership and language
+### Adopted, not built
 
-The per-package directory listing — path, language, and what each package owns —
-lives in the [README Component map](README.md#component-map). It is not duplicated
-here so the two cannot drift apart.
-
-The Python packages are one **uv workspace** (root
-[`pyproject.toml`](pyproject.toml)); ruff, mypy, and pytest run across all
-members from the root. See the repo [`CLAUDE.md`](CLAUDE.md) for verify commands.
-
-**Adopted, not built** (ADR-0007, [`docs/adr/0007-adopt-not-build-boundaries.md`](docs/adr/0007-adopt-not-build-boundaries.md)):
+Curie leans on these systems rather than building its own (ADR-0007,
+[`docs/adr/0007-adopt-not-build-boundaries.md`](docs/adr/0007-adopt-not-build-boundaries.md)):
 
 - Langfuse (traces + evals)
 - Kubernetes Agent Sandbox (interactive runtime)
@@ -163,7 +154,13 @@ worker+runner glue, the UI, the CLI, and the umbrella Helm chart ([Deployment, C
 chart is a built thing, not a packaging afterthought. The security rails are
 chart defaults, so the chart is where a rail either ships or does not.
 
-## Data flow: a Slack mention becomes a threaded reply
+The per-package directory listing — path, language, and what each package owns
+— lives in the [README Component map](README.md#component-map), not duplicated
+here so the two cannot drift apart. The Python packages are one **uv workspace**
+(root [`pyproject.toml`](pyproject.toml)); see [`CLAUDE.md`](CLAUDE.md) for
+verify commands.
+
+## Handling a Slack mention (message flow)
 
 ```mermaid
 sequenceDiagram
@@ -234,11 +231,12 @@ Each has an integration test under `apps/worker/tests/`:
 3. **No auto-retry after a side-effectful failure.** If a prior attempt flagged a side effect, the kernel escalates to a human instead of retrying ([`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py)).
 4. **Crash recovery.** Pending stream entries are reclaimed with `XAUTOCLAIM` ([`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`](apps/worker/src/curie_worker/stream_consumer.py)). The runs consumer group is created at `$`, so a cold worker never replays ancient backlog ([`apps/worker/src/curie_worker/consumer.py::Consumer.ensure_group`](apps/worker/src/curie_worker/consumer.py)).
 
-**Kill switch.** A Valkey pub/sub channel `curie:kill-events` plus per-agent
-kill keys gate and interrupt live runs for a killed agent
+Beyond these four invariants, a **kill switch** — a Valkey pub/sub channel
+`curie:kill-events` plus per-agent kill keys — gates and interrupts live runs
+for a killed agent
 ([`apps/worker/src/curie_worker/killswitch.py::KillSwitch`](apps/worker/src/curie_worker/killswitch.py)).
 
-### The approval gate: a turn can end without a reply
+### Handling approvals (human in the loop)
 
 A turn does not always terminate in an answer. When a gate fires, the turn
 terminates `AWAITING_APPROVAL`. The kernel persists a durable approval record,
@@ -260,6 +258,14 @@ resolution arrives later as its **own** queued turn
 mints it via `resume_turn_for`). Nothing holds a stream entry, a thread lock, or a
 worker slot across a human's lunch break.
 
+**Suspend/resume is a cold rehydrate, not a live hibernate** (ADR-0003,
+[`docs/adr/0003-stateless-first-rehydrate-on-resume.md`](docs/adr/0003-stateless-first-rehydrate-on-resume.md)):
+suspending a sandbox deletes its pod. Resume creates a fresh one and rehydrates
+from history. Prompt-cache warmth is real within one continuous claim and is
+never assumed across a suspend. The `thread_ts -> sandbox_id` affinity store
+([`apps/worker/src/curie_worker/sandbox/affinity.py`](apps/worker/src/curie_worker/sandbox/affinity.py))
+is what routes a thread back to its sandbox.
+
 Two TTLs, and the difference matters:
 
 - **`route_ttl_seconds: int = 3600`** — the live route, one hour ([`apps/worker/src/curie_worker/sandbox/types.py`](apps/worker/src/curie_worker/sandbox/types.py)).
@@ -276,15 +282,7 @@ Three properties keep an approval from becoming a standing permission:
 - The resumed sandbox boots with a scoped state token rather than the platform key (ADR-0033).
 - The post-approval allowance is one-shot and bound to the granting agent (ADR-0035), so an approval cannot be replayed into a standing permission.
 
-**Suspend/resume is a cold rehydrate, not a live hibernate** (ADR-0003,
-[`docs/adr/0003-stateless-first-rehydrate-on-resume.md`](docs/adr/0003-stateless-first-rehydrate-on-resume.md)):
-suspending a sandbox deletes its pod. Resume creates a fresh one and rehydrates
-from history. Prompt-cache warmth is real within one continuous claim and is
-never assumed across a suspend. The `thread_ts -> sandbox_id` affinity store
-([`apps/worker/src/curie_worker/sandbox/affinity.py`](apps/worker/src/curie_worker/sandbox/affinity.py))
-is what routes a thread back to its sandbox.
-
-## Data flow: a git push deploys a bundle and runs evals
+## Pushing agent versions with git (deploy flow)
 
 A push is verified with an HMAC (Hash-based Message Authentication Code)
 signature, archived, validated, and stored as an immutable versioned bundle.
@@ -334,7 +332,7 @@ sequenceDiagram
 
   The webhook receiver is at [`apps/api/src/curie_api/routers/github.py::github_webhook`](apps/api/src/curie_api/routers/github.py).
 - **Eval stream** `curie:evals` is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EVAL_STREAM`](apps/api/src/curie_api/evalqueue.py)) and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
-- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)). The endpoint is live. The UI matrix view has not yet been bound to it ([the UI section](#the-ui-always-the-real-api-no-demo-mode)).
+- **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)).
 - **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by git-flow all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
 
 ## One worker, two hidden seams: substrate and transport
@@ -343,30 +341,14 @@ The platform never learns which substrate it is running on, and the runner never
 learns whether the message came from Slack. Two seams make that true, and both
 are real code, not aspiration.
 
-**The system of record for the seams is the interface catalog**
-([`docs/interfaces.md`](docs/interfaces.md)), which enumerates them: one
-`INTERFACE.md` per seam under [`docs/interfaces/`](docs/interfaces). Each file
-carries:
-
-- the port
-- the implementations that exist today
-- the known leakage
-- a grade
-
-The catalog's seam table is generated from those files' front-matter and gated,
-so it cannot quietly drift from them. Read the count off that table rather than
-from prose here. Its governing restraint is **"the second implementation
-teaches the interface"**: a seam is documented where the code already draws the
-line, not written speculatively ahead of a real second implementation. That is
-why several seams honestly carry one implementation and a middling grade rather
-than a fictional adapter layer.
-
-The two seams below are **worked examples, not the list**. Substrate
-(`SandboxClient`) is the one with two real implementations, and Slack is the one
-whose leakage is most instructive. The rest — among them `StreamBroker`,
-`ApproverSet`/`ApprovalCreator`, `MemoryStore`, `TranscriptStore`, `Scorer`,
-`ObjectStore`, and `CliOutput` — live in the catalog. Read it there. This
-section does not duplicate it.
+These are two of several such seams tracked in the interface catalog
+([`docs/interfaces.md`](docs/interfaces.md), one `INTERFACE.md` per seam under
+[`docs/interfaces/`](docs/interfaces)) — the system of record for the full
+list, including `StreamBroker`, `ApproverSet`/`ApprovalCreator`, `MemoryStore`,
+`TranscriptStore`, `Scorer`, `ObjectStore`, and `CliOutput`. Substrate
+(`SandboxClient`) is a worked example here because it has two real
+implementations; Slack is one because its leakage is the most instructive.
+This section does not duplicate the catalog — read it there for the rest.
 
 ### Substrate seam — `SandboxClient`
 
@@ -375,7 +357,9 @@ The worker talks to a `SandboxClient` Protocol
 whose methods are `create_claim`, `get_claim`, `delete_claim`, `list_claims`,
 `get_sandbox`, `set_sandbox_mode`. Two implementations satisfy it:
 
-- **`KubernetesSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient`](apps/worker/src/curie_worker/sandbox/k8s.py)) — creates `SandboxClaim` CRDs (Custom Resource Definitions) against the agent-sandbox controller. The claim references a `SandboxWarmPool` **by name** (`spec.warmPoolRef.name`), and the pod **cold-creates from the `SandboxTemplate`**. The shipped default is `replicas: 0`, meaning no pre-warmed pods. A real-model claim cold-creates regardless, because per-claim env injection cannot bind a pre-warmed pod (the `envVarsInjectionPolicy: Overrides` gotcha). The pool object must still exist — with it absent every claim fails `Ready=False reason=WarmPoolNotFound`. Pre-warming is a dev/fake-model fast path, not the production path ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)). This is the production path.
+- **`KubernetesSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient`](apps/worker/src/curie_worker/sandbox/k8s.py)) — creates `SandboxClaim` CRDs (Custom Resource Definitions) against the agent-sandbox controller. This is the production path.
+  - The claim references a `SandboxWarmPool` **by name** (`spec.warmPoolRef.name`); the pool object must still exist, or every claim fails `Ready=False reason=WarmPoolNotFound`.
+  - The shipped default is `replicas: 0` (no pre-warmed pods), and a real-model claim **cold-creates from the `SandboxTemplate`** regardless, since per-claim env injection cannot bind a pre-warmed pod (the `envVarsInjectionPolicy: Overrides` gotcha). Pre-warming is a dev/fake-model fast path, not the production path ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)).
 - **`DockerSandboxClient`** ([`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`](apps/worker/src/curie_worker/sandbox/docker.py)) — runs the same runner image as a local Docker container. This is "middle mode": a full backend on a laptop with no Kubernetes.
 
 Everything above the protocol (the kernel, routing, budgets, kill switch, resume
@@ -407,7 +391,7 @@ The CLI's `curie local message` path does four things:
 - waits for the worker to finalize the turn by calling the stub's Slack API back
 
 The worker cannot distinguish the stub from Slack: same queue payload, same
-`chat.update` call. This is what lets D1/F1/I1 and most of E1 be verified with
+`chat.update` call. This is what lets most of the verification suite run with
 no Slack workspace at all.
 
 The honest limit: the **per-turn payload** is channel-neutral, but the binding
@@ -456,11 +440,6 @@ So "non-Anthropic providers" are supported. What is genuinely absent is the
 **native OpenAI wire format** — that is why a bare `sk-...` key raises
 `UnsupportedCredentialError` instead of being forwarded.
 
-**Per-agent connector secrets.** Beyond the model credential, an agent carries its own connector secrets (a GitHub token, a vendor API key), injected into the claim's boot env at [`apps/worker/src/curie_worker/binding.py::inject_connector_secrets`](apps/worker/src/curie_worker/binding.py) (ADR-0009, [`docs/adr/0009-per-agent-connector-auth.md`](docs/adr/0009-per-agent-connector-auth.md)). Two properties are load-bearing:
-
-- **A reserved-name policy fences agent-supplied env against platform boot vars.** Every secret is filtered through `is_reserved_boot_env_name` regardless of env ordering, so a connector secret named after an ACI contract key or a model credential (e.g. `ANTHROPIC_BASE_URL`) can never clobber it. A reserved name is dropped and logged rather than raising, since raising would crash a live claim. A dropped key never carries its value into the log or the injected-keys marker.
-- **These secrets live in their own Kubernetes Secret**, deliberately separate from the chart-managed platform Secret, so one agent's token is not readable by every component in the release. The isolation is the point, not an implementation detail.
-
 An explicit SDK credential already in the env always wins. The mapping is a
 no-op when `CURIE_CREDENTIALS` is unset.
 
@@ -472,7 +451,15 @@ to the real model and treats a missing credential as fail-closed rather than
 silently degrading to fake ([`apps/worker/src/curie_worker/binding.py::apply_model_env`](apps/worker/src/curie_worker/binding.py),
 [`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`](apps/worker/src/curie_worker/sandbox/docker.py)).
 
+**Per-agent connector secrets.** Beyond the model credential, an agent carries its own connector secrets (a GitHub token, a vendor API key), injected into the claim's boot env at [`apps/worker/src/curie_worker/binding.py::inject_connector_secrets`](apps/worker/src/curie_worker/binding.py) (ADR-0009, [`docs/adr/0009-per-agent-connector-auth.md`](docs/adr/0009-per-agent-connector-auth.md)). Two properties are load-bearing:
+
+- **A reserved-name policy fences agent-supplied env against platform boot vars.** Every secret is filtered through `is_reserved_boot_env_name` regardless of env ordering, so a connector secret named after an ACI contract key or a model credential (e.g. `ANTHROPIC_BASE_URL`) can never clobber it. A reserved name is dropped and logged rather than raising, since raising would crash a live claim. A dropped key never carries its value into the log or the injected-keys marker.
+- **These secrets live in their own Kubernetes Secret**, deliberately separate from the chart-managed platform Secret, so one agent's token is not readable by every component in the release. The isolation is the point, not an implementation detail.
+
 ## The observability pipeline
+
+The write path runs down; the read path (arrows reversed) runs back up from
+Langfuse to whoever's asking:
 
 ```
 runner (OTLP spans, resource attr curie.session_id)
@@ -581,30 +568,15 @@ two. Operational detail lives in [`docs/operations.md`](docs/operations.md).
 components at fixed host ports (see [`CLAUDE.md`](CLAUDE.md)). Every backend
 integration test and UI E2E runs against it.
 
-**CI** ([`.github/workflows/ci.yaml`](.github/workflows/ci.yaml)) does three
-things in sequence:
+**CI** ([`.github/workflows/ci.yaml`](.github/workflows/ci.yaml)) runs jobs
+across three areas — backend/frontend testing, image builds, and the parity
+ladder; see the workflow file for the complete, current list. Notable ones:
 
-- boots the full compose stack
-- runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py))
-- runs the whole workspace pytest suite against the live services
-
-It defines **ten** jobs:
-
-- `python`
-- `rust`
-- `contracts-ts`
-- `ui` (lint + vitest + build + headless Playwright)
-- `compose`
-- `images`
-- `worker-local-image`
-- `dispatcher-image-smoke`
-- `eval-falsifiability`
-- `e2e-ladder`
-
-Three of them (`images`, `worker-local-image`, `dispatcher-image-smoke`) are
-the image build gates. An operator reading this list to know what protects a
-release needs them named, since a green `python` says nothing about whether
-the images build.
+- `python` (ruff + mypy + pytest) — the one that boots the full compose stack, runs real Alembic migrations on a virgin Postgres (`version_table_schema=curie`, [`apps/api/alembic/env.py::do_run_migrations`](apps/api/alembic/env.py)), and runs the whole workspace pytest suite against those live services
+- `rust`, `rust-build` (the release binary), `contracts-ts`, `ui` (lint + vitest + build + headless Playwright)
+- `images`, `worker-local-image`, `dispatcher-image-smoke` — the **image build gates**. An operator reading this list to know what protects a release needs them named, since a green `python` says nothing about whether the images build.
+- `eval-falsifiability`, `commit-messages` (no AI attribution)
+- `e2e-ladder`, `e2e-ladder-release`, `e2e-ladder-cluster` — the parity ladder's three rungs, each its own job, gated by an internal `changes` path filter
 
 **Release** ([`.github/workflows/release.yaml`](.github/workflows/release.yaml))
 publishes `ghcr.io/curie-eng/curie-{runner,api,dispatcher,worker,ui}` as
@@ -634,11 +606,12 @@ The following are built and verified:
 - the eval plane
 - the chart with its security rails
 - the CLI
-- the wired UI (create/deploy, Runs, Metrics, Cost, Logs)
+- the wired UI ([see The UI section for the full surface list](#the-ui-always-the-real-api-no-demo-mode))
 
 **Deferred:**
 
 - ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
+- binding the UI's eval matrix view to the live `GET /evals/matrix` endpoint ([Pushing agent versions with git](#pushing-agent-versions-with-git-deploy-flow))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
 - the Interview-Me onboarding compiler
 - automatic memory generation
