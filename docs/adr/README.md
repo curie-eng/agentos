@@ -117,4 +117,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Accepted |
 | 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Draft |
 | 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Draft |
+| 0089 | [Bundles declare their deploy targets](0089-bundles-declare-their-deploy-targets.md) | Draft |
 <!-- END GENERATED: adr-index -->
