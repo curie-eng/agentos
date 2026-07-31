@@ -1137,6 +1137,14 @@ export const commandManifest = {
           "about": "Push the bundle to the local platform API and deploy it",
           "args": [
             {
+              "global": false,
+              "help": "Deploy under this agent name instead of the manifest's `name`",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
               "default_values": [
                 "."
               ],
@@ -2446,6 +2454,14 @@ export const commandManifest = {
         {
           "about": "Push the bundle to the platform API and deploy it",
           "args": [
+            {
+              "global": false,
+              "help": "Deploy under this agent name instead of the manifest's `name`",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
             {
               "default_values": [
                 "."

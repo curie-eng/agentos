@@ -908,6 +908,13 @@ enum LocalAction {
     },
     /// Push the bundle to the local platform API and deploy it.
     Deploy {
+        /// Deploy under this agent name instead of the manifest's `name`.
+        ///
+        /// The bundle is unchanged -- only which agent it binds to. This is how
+        /// one repository serves a dev agent and a prod agent from the same
+        /// artifact, so prod promotes exactly what dev validated (#1166).
+        #[arg(long)]
+        agent: Option<String>,
         /// Plugin bundle directory.
         #[arg(long, default_value = ".")]
         plugin_dir: PathBuf,
@@ -1372,6 +1379,13 @@ enum ClusterAction {
     },
     /// Push the bundle to the platform API and deploy it.
     Deploy {
+        /// Deploy under this agent name instead of the manifest's `name`.
+        ///
+        /// The bundle is unchanged -- only which agent it binds to. This is how
+        /// one repository serves a dev agent and a prod agent from the same
+        /// artifact, so prod promotes exactly what dev validated (#1166).
+        #[arg(long)]
+        agent: Option<String>,
         /// Plugin bundle directory.
         #[arg(long, default_value = ".")]
         plugin_dir: PathBuf,
@@ -2020,6 +2034,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             LocalAction::Deploy {
                 plugin_dir,
+                agent,
                 api_url,
                 api_key,
                 slack_channel,
@@ -2034,6 +2049,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     commands::deploy(DeployOpts {
                         plugin_dir,
+                        agent,
                         api_url,
                         api_key,
                         slack_channel,
@@ -2459,6 +2475,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             ClusterAction::Deploy {
                 plugin_dir,
+                agent,
                 api_url,
                 namespace,
                 release,
@@ -2552,6 +2569,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 };
                 let deployed = commands::deploy(DeployOpts {
                     plugin_dir,
+                    agent,
                     api_url: api_url.clone(),
                     api_key: api_key.clone(),
                     slack_channel,
