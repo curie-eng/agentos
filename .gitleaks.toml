@@ -155,3 +155,21 @@ stopwords = [
   "C0WRONG01",
   "C9999ZZZZ",
 ]
+
+# Historical commits that carry the four ids scrubbed from HEAD. Allowlisted
+# by COMMIT, deliberately, rather than by value: excusing the values would
+# mean the gate stays silent if anyone reintroduces them, which is exactly
+# the case it exists to catch. Excusing the commits leaves the past scannable-
+# but-known and the future protected.
+#
+# These entries are the record that the disclosure happened. Removing them
+# requires rewriting history, which is a maintainer decision -- until then
+# the values remain readable in the public log and should be treated as
+# disclosed.
+commits = [
+  "30c81f1d27ace4fb8dda2e284eddbd8834fed79f",  # plugin-format: deploy.yaml (mine -- ADR-0089 tests + docstring)
+  "46f694f4a9c7d90a94a32909ac05403623183344",  # ADR-0089 Draft (mine -- the worked example)
+  "5d8df34bdfd96fe531142ec81a37b3d52cf278bf",  # approval plane docs (predates this work)
+  "c958a3b90b87fe0c87019097e5086b5d8f7b7746",  # validate_slack_channel test (predates this work)
+  "ddd2cd8402ffc6da1e96eddbfa90e487385b68e2",  # approval note dialog (predates this work)
+]
