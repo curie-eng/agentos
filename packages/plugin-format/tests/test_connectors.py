@@ -195,3 +195,37 @@ def test_an_unreadable_mcp_config_does_not_add_a_confusing_second_error(tmp_path
     result = validate_bundle(str(root))
     assert not result.valid
     assert not any(e.code == "connectors.duplicate_server" for e in result.errors)
+
+
+def test_a_typo_in_a_placeholder_is_rejected() -> None:
+    # Unsubstituted text reaches the container verbatim, so the connector starts
+    # and rejects every call. Nothing catches that at runtime.
+    codes = _codes({"connectors": {"g": {"image": "x:1", "args": ["-h", "${CURIE_ALOWED_HOSTS}"]}}})
+    assert "connectors.unknown_placeholder" in codes
+
+
+def test_known_placeholders_are_accepted_in_args_and_env() -> None:
+    _, errors = validate_connectors(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "args": ["-h", "${CURIE_ALLOWED_HOSTS}", "-p", "${CURIE_CONNECTOR_PORT}"],
+                    "env": {"SELF": "${CURIE_CONNECTOR_URL}", "H": "${CURIE_CONNECTOR_HOST}"},
+                }
+            }
+        }
+    )
+    assert errors == []
+
+
+def test_the_validator_and_the_renderer_share_one_placeholder_list() -> None:
+    # Two lists would drift: the renderer would substitute something the
+    # validator rejects, or accept something that reaches the container raw.
+    from plugin_format.connector_render import PLACEHOLDERS
+
+    for name in PLACEHOLDERS:
+        _, errors = validate_connectors(
+            {"connectors": {"g": {"image": "x:1", "args": ["${" + name + "}"]}}}
+        )
+        assert errors == [], f"renderer substitutes ${{{name}}} but the validator rejects it"

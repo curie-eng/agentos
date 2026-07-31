@@ -127,11 +127,62 @@ def render_service(release: str, agent: str, connector: str, spec: ConnectorSpec
     }
 
 
+# Placeholders an author may write in `args`/`env`, substituted at render with
+# values only Curie can know. Declared here and re-exported for the validator,
+# so the accepted set and the substituted set cannot drift apart.
+PLACEHOLDERS = (
+    "CURIE_ALLOWED_HOSTS",
+    "CURIE_CONNECTOR_HOST",
+    "CURIE_CONNECTOR_PORT",
+    "CURIE_CONNECTOR_URL",
+)
+
+
+def substitutions(
+    release: str, agent: str, connector: str, namespace: str, port: int
+) -> dict[str, str]:
+    """What each ``${CURIE_*}`` placeholder expands to for this connector.
+
+    Every value here is one the AUTHOR cannot know: they are all derived from
+    the Service name Curie invents, which embeds the release, the agent, and
+    the namespace, and which differs per agent since #1116. A bundle deployed
+    as two agents needs two different answers from the same file.
+    """
+
+    short = object_name(release, agent, connector)
+    return {
+        # Servers that guard against DNS rebinding default their allowlist to
+        # loopback, so an in-cluster caller reaching them by Service DNS gets
+        # `forbidden: host not allowed` (ADR-0086). All three forms, because
+        # which one the sandbox dials depends on how the URL was written.
+        "CURIE_ALLOWED_HOSTS": ",".join(host_aliases(release, agent, connector, namespace, port)),
+        "CURIE_CONNECTOR_HOST": short,
+        "CURIE_CONNECTOR_PORT": str(port),
+        "CURIE_CONNECTOR_URL": f"http://{service_dns(release, agent, connector, namespace)}:{port}",
+    }
+
+
+def substitute(value: str, subs: dict[str, str]) -> str:
+    """Expand ``${CURIE_*}`` placeholders in one arg or env value."""
+
+    for key, replacement in subs.items():
+        value = value.replace(f"${{{key}}}", replacement)
+    return value
+
+
 def render_deployment(
-    release: str, agent: str, connector: str, spec: ConnectorSpec, secret_name: str
+    release: str,
+    agent: str,
+    namespace: str,
+    connector: str,
+    spec: ConnectorSpec,
+    secret_name: str,
 ) -> dict[str, Any]:
     name = object_name(release, agent, connector)
-    env: list[dict[str, Any]] = [{"name": k, "value": v} for k, v in sorted(spec.env.items())]
+    subs = substitutions(release, agent, connector, namespace, spec.port)
+    env: list[dict[str, Any]] = [
+        {"name": k, "value": substitute(v, subs)} for k, v in sorted(spec.env.items())
+    ]
     # Declared secrets arrive by reference, never as literals in the manifest.
     env += [
         {
@@ -161,7 +212,7 @@ def render_deployment(
                         {
                             "name": "server",
                             "image": spec.image,
-                            "args": list(spec.args),
+                            "args": [substitute(a, subs) for a in spec.args],
                             "env": env,
                             "ports": [{"name": "http", "containerPort": spec.port}],
                             "securityContext": {
@@ -225,7 +276,7 @@ def render(
         return []
     return [
         render_service(release, agent, connector, spec),
-        render_deployment(release, agent, connector, spec, secret_name),
+        render_deployment(release, agent, namespace, connector, spec, secret_name),
         render_networkpolicy(release, agent, app_name, connector, spec),
     ]
 

@@ -79,6 +79,25 @@ class ConnectorsFile(BaseModel):
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 
+# ``${CURIE_*}`` placeholders an author may write in args/env. The renderer
+# substitutes these with values only Curie can derive (the Service name it
+# invents, which embeds the release, agent, and namespace). Imported from the
+# renderer so the accepted set and the substituted set are one list.
+_PLACEHOLDER_RE = re.compile(r"\$\{(CURIE_[A-Z0-9_]*)\}")
+
+
+def _known_placeholders() -> frozenset[str]:
+    """The placeholder names the renderer substitutes.
+
+    Imported lazily to keep this module free of a render-time dependency; the
+    point is that there is exactly one list, so a placeholder the renderer
+    handles is always one the validator accepts and vice versa.
+    """
+
+    from .connector_render import PLACEHOLDERS
+
+    return frozenset(PLACEHOLDERS)
+
 
 def _is_valid_name(name: str) -> bool:
     """RFC 1123 label, capped: the name becomes a k8s object and a DNS label."""
@@ -151,6 +170,19 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
             )
         if not (1 <= spec.port <= 65535):
             errors.append(("connectors.bad_port", f"{where}: port {spec.port} is out of range"))
+        for text in [*spec.args, *spec.env.values()]:
+            for found in _PLACEHOLDER_RE.findall(text):
+                if found in _known_placeholders():
+                    continue
+                errors.append(
+                    (
+                        "connectors.unknown_placeholder",
+                        f"{where}: `${{{found}}}` is not a Curie placeholder. A typo here is "
+                        "not caught at runtime -- the literal text reaches the container, so "
+                        "the connector starts and then rejects every call. Known: "
+                        + ", ".join(f"${{{p}}}" for p in sorted(_known_placeholders())),
+                    )
+                )
         for key in spec.env:
             if not key.replace("_", "").isalnum() or key[:1].isdigit():
                 errors.append(
