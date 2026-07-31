@@ -16,7 +16,7 @@ Where a bundle is deployed is currently expressed as flags at the call site:
 
 ```bash
 curie cluster deploy --plugin-dir . --namespace sre-bot --release sre-bot \
-  --slack-channel C0BL766QCR0
+  --slack-channel C0EXAMPLE1
 ```
 
 so the routing lives in whatever invoked the command. In sre-bot's case that is
@@ -55,11 +55,11 @@ targets:
   dev:
     agent: sre-dev
     env: dev
-    slack_channel: C0BLL2PK3PW
+    slack_channel: C0EXAMPLE2
   prod:
     agent: sre-bot
     env: prod
-    slack_channel: C0BL766QCR0
+    slack_channel: C0EXAMPLE1
 ```
 
 ```bash

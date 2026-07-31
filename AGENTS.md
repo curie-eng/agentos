@@ -158,6 +158,38 @@ stack runs on the baked defaults without one). Load-bearing facts:
   authenticates on first boot with no manual key-minting. Read traces back via
   `curl -u pk-lf-curie-dev:sk-lf-curie-dev http://localhost:23000/api/public/...`. <!-- gitleaks:allow -->
 
+## This repo is PUBLIC: examples only, never real identifiers
+
+Everything here is world-readable. Credentials are the obvious hazard and
+gitleaks already catches them. The subtler one is **identifiers from real
+deployments** -- a Slack conversation id, an AWS account number, an EC2
+instance id, an internal hostname. Those are not secrets in the rotate-it
+sense, which is exactly what makes them worse: **you cannot rotate away a
+disclosure of where your infrastructure lives.**
+
+So: docs, ADRs, tests, and fixtures use PLACEHOLDER values. Describe the shape
+of a real thing, never its value.
+
+| instead of | write |
+|---|---|
+| a live Slack id (`C0…`) | `C0EXAMPLE1` |
+| an AWS account number | `000000000000` |
+| an EC2 instance id | `i-0123456789abcdef0` |
+| an internal hostname | `grafana.example.com` |
+
+`example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
+names no real host, so both are fine.
+
+This is enforced by `.gitleaks.toml`, which extends the default rules with
+identifier patterns and allowlists the placeholders above. If a check fires on
+something genuinely fake that the allowlist misses, add it to the allowlist with
+a reason -- do not annotate the line with `gitleaks:allow` to silence it, since
+that hides the next real one.
+
+**Why the rule exists:** an ADR and its tests were once written using a live
+workspace's Slack channel ids as the worked example, purely because those were
+the values in front of the author. It read as perfectly normal documentation.
+
 ## Frozen contracts: STOP and escalate
 
 `packages/aci-protocol` (the ACI session protocol + NDJSON events) and

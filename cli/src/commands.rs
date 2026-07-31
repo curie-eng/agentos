@@ -5778,7 +5778,7 @@ mod tests {
 
     #[test]
     fn accepts_channel_id() {
-        assert!(validate_slack_channel("C0BF2CL1U2F").is_ok());
+        assert!(validate_slack_channel("C0EXAMPLE4").is_ok());
     }
 
     #[test]
