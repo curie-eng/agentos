@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from plugin_format.connector_render import mcp_entry
+from plugin_format.connector_render import mcp_entry, unhosted_mcp_entry
 from plugin_format.connectors import ConnectorsFile, validate_connectors
 
 logger = logging.getLogger(__name__)
@@ -92,19 +92,27 @@ def derive_mcp_servers(
     if not (release and agent and namespace):
         # The scope is emitted as a set or not at all (BootEnv, ACI 0.2.8), so
         # this is "no scope", never a partial one.
-        if any(spec.is_hosted for spec in declared.connectors.values()):
+        stranded = sorted(
+            name
+            for name, spec in declared.connectors.items()
+            if spec.is_hosted and not spec.unhosted_url
+        )
+        if stranded:
             logger.info(
-                "connectors declared but no connector scope on the boot env; "
-                "hosted connectors are not exercisable in this tier (%s)",
-                ", ".join(sorted(declared.connectors)),
+                "no connector scope on the boot env and no unhosted_url; these are "
+                "declared but not exercisable in this tier (%s)",
+                ", ".join(stranded),
             )
-        # A remote connector carries its own absolute url, so it needs no scope
-        # and stays mountable in every tier.
-        return {
-            name: mcp_entry("", "", "", name, spec)
-            for name, spec in sorted(declared.connectors.items())
-            if not spec.is_hosted
-        }
+        # A remote connector carries its own absolute url, and a hosted one may
+        # declare where to reach it when Curie is not hosting it (#1160). Both
+        # stay mountable here; a hosted connector with neither mounts nothing,
+        # which is the honest answer rather than a URL resolving nowhere.
+        entries = {}
+        for name, spec in sorted(declared.connectors.items()):
+            entry = unhosted_mcp_entry(spec)
+            if entry is not None:
+                entries[name] = entry
+        return entries
 
     return {
         name: mcp_entry(release, agent, namespace, name, spec)
