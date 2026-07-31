@@ -152,9 +152,7 @@ def enforce_behavior_packs_size(config: BehaviorPacksConfig) -> None:
     byte length of the whole config, the unit ``behavior_packs_max_bytes`` is
     measured in (mirrors the durable-state ``_enforce_caps`` in state.py)."""
     limit = get_settings().behavior_packs_max_bytes
-    size = len(
-        json.dumps(config.model_dump(), separators=(",", ":")).encode("utf-8")
-    )
+    size = len(json.dumps(config.model_dump(), separators=(",", ":")).encode("utf-8"))
     if size > limit:
         raise HTTPException(
             413,
@@ -230,9 +228,7 @@ class _StoredWithoutNulls(BaseModel):
     """
 
     @model_serializer(mode="wrap")
-    def _dump_without_nulls(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, Any]:
+    def _dump_without_nulls(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         return {k: v for k, v in handler(self).items() if v is not None}
 
 
@@ -282,9 +278,7 @@ class ApprovalApprovers(_StoredWithoutNulls):
             # Neither "unset" (omit the key) nor "nobody may approve": as silent
             # config the latter is a footgun, since the approval could then only
             # ever expire.
-            raise ValueError(
-                "approvers users, when present, must contain at least one user ID"
-            )
+            raise ValueError("approvers users, when present, must contain at least one user ID")
         for user in value:
             if not _SLACK_USER_ID.match(user):
                 raise ValueError(
@@ -355,15 +349,9 @@ class AgentCreate(BaseModel):
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
 
-    _check_slack_channel = field_validator("slack_channel")(
-        _validate_slack_channel_id
-    )
-    _check_approval_tools = field_validator("approval_required_tools")(
-        _validate_tool_names
-    )
-    _check_approval_routes = field_validator("approval_routes")(
-        _validate_route_names
-    )
+    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
+    _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
+    _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
 
 
@@ -386,15 +374,9 @@ class AgentUpdate(BaseModel):
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
 
-    _check_slack_channel = field_validator("slack_channel")(
-        _validate_slack_channel_id
-    )
-    _check_approval_tools = field_validator("approval_required_tools")(
-        _validate_tool_names
-    )
-    _check_approval_routes = field_validator("approval_routes")(
-        _validate_route_names
-    )
+    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
+    _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
+    _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
 
 
@@ -493,6 +475,27 @@ class BundleFiles(BaseModel):
     """The readable text surfaces of a version's stored bundle."""
 
     files: list[BundleFile]
+
+
+class ResolveTargetRequest(BaseModel):
+    """A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).
+
+    The CLI sends the file CONTENT rather than parsing it, so there is exactly
+    one parser for this format. Two would be a drift hazard on a file whose
+    whole job is to be unambiguous about where a deploy lands -- and the Rust
+    YAML ecosystem has no maintained successor to serde_yaml to pick from.
+    """
+
+    content: str
+    target: str
+
+
+class ResolvedTarget(BaseModel):
+    """What a named target resolves to. Pure function of the file."""
+
+    agent: str | None = None
+    env: str = "dev"
+    slack_channel: str | None = None
 
 
 class ConnectorManifests(BaseModel):

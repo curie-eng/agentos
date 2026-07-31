@@ -282,9 +282,10 @@ enum Command {
         /// agent that already exists warns and changes nothing.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Target environment.
-        #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
-        env: DeployEnv,
+        /// Target environment. Defaults to dev; a `--target` supplies it
+        /// instead, and an explicit value here still wins over the target.
+        #[arg(long, value_enum)]
+        env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
         #[arg(long)]
         label: Option<String>,
@@ -908,6 +909,15 @@ enum LocalAction {
     },
     /// Push the bundle to the local platform API and deploy it.
     Deploy {
+        /// Resolve the agent, environment, and channel from a target declared
+        /// in the bundle's `deploy.yaml` (ADR-0089).
+        ///
+        /// Routing lives in the repository and is a reviewable diff, instead of
+        /// flags scattered across whatever invoked this command. Explicit
+        /// --agent/--env/--slack-channel still win, so a one-off deploy needs
+        /// no committed file.
+        #[arg(long, conflicts_with = "agent")]
+        target: Option<String>,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
         /// The bundle is unchanged -- only which agent it binds to. This is how
@@ -943,9 +953,10 @@ enum LocalAction {
         /// agent that already exists warns and changes nothing.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Target environment.
-        #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
-        env: DeployEnv,
+        /// Target environment. Defaults to dev; a `--target` supplies it
+        /// instead, and an explicit value here still wins over the target.
+        #[arg(long, value_enum)]
+        env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
         #[arg(long)]
         label: Option<String>,
@@ -1379,6 +1390,15 @@ enum ClusterAction {
     },
     /// Push the bundle to the platform API and deploy it.
     Deploy {
+        /// Resolve the agent, environment, and channel from a target declared
+        /// in the bundle's `deploy.yaml` (ADR-0089).
+        ///
+        /// Routing lives in the repository and is a reviewable diff, instead of
+        /// flags scattered across whatever invoked this command. Explicit
+        /// --agent/--env/--slack-channel still win, so a one-off deploy needs
+        /// no committed file.
+        #[arg(long, conflicts_with = "agent")]
+        target: Option<String>,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
         /// The bundle is unchanged -- only which agent it binds to. This is how
@@ -1421,9 +1441,10 @@ enum ClusterAction {
         /// agent that already exists warns and changes nothing.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Target environment.
-        #[arg(long, value_enum, default_value_t = DeployEnv::Dev)]
-        env: DeployEnv,
+        /// Target environment. Defaults to dev; a `--target` supplies it
+        /// instead, and an explicit value here still wins over the target.
+        #[arg(long, value_enum)]
+        env: Option<DeployEnv>,
         /// Version label; defaults to <manifest version>-<unix time>.
         #[arg(long)]
         label: Option<String>,
@@ -2035,6 +2056,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             LocalAction::Deploy {
                 plugin_dir,
                 agent,
+                target,
                 api_url,
                 api_key,
                 slack_channel,
@@ -2050,6 +2072,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     commands::deploy(DeployOpts {
                         plugin_dir,
                         agent,
+                        target,
                         api_url,
                         api_key,
                         slack_channel,
@@ -2476,6 +2499,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             ClusterAction::Deploy {
                 plugin_dir,
                 agent,
+                target,
                 api_url,
                 namespace,
                 release,
@@ -2570,6 +2594,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let deployed = commands::deploy(DeployOpts {
                     plugin_dir,
                     agent,
+                    target,
                     api_url: api_url.clone(),
                     api_key: api_key.clone(),
                     slack_channel,
@@ -2806,7 +2831,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                     api_key,
                     slack_channel,
                     repo,
-                    env,
+                    // deploy_named has no --target, so the historical default
+                    // applies here rather than deferring to a declared one.
+                    env: env.unwrap_or(commands::DeployEnv::Dev),
                     label,
                     secret,
                 },

@@ -725,11 +725,12 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
         agent: None,
+        target: None,
         api_url: opts.api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
-        env: opts.env,
+        env: Some(opts.env),
         label: opts.label,
         secret: opts.secret,
         secret_binding_supported: true,
@@ -2928,6 +2929,8 @@ pub struct DeployOpts {
     /// bundle bytes are untouched, only the binding differs -- which is the
     /// property that lets prod promote exactly what dev validated.
     pub agent: Option<String>,
+    /// Resolve agent/env/channel from a `deploy.yaml` target (ADR-0089).
+    pub target: Option<String>,
     pub plugin_dir: PathBuf,
     pub api_url: String,
     pub api_key: String,
@@ -2940,7 +2943,9 @@ pub struct DeployOpts {
     /// so omitting it here leaves the agent permanently unable to use git-flow
     /// (#1064). Ignored with a warning when the agent already exists.
     pub repo: Option<String>,
-    pub env: DeployEnv,
+    /// None means the caller did not pass --env, so a declared target may
+    /// supply it. An explicit flag still wins (ADR-0089).
+    pub env: Option<DeployEnv>,
     pub label: Option<String>,
     /// Per-agent connector secret NAMES to bind on deploy (ADR-0009, #429). Each
     /// value is resolved from the caller's env or the host secret vault and sent
@@ -3068,7 +3073,33 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         validate_slack_channel(channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
-    let env = opts.env.as_str();
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    // Resolve a declared target, if one was named (ADR-0089). The file is sent
+    // as TEXT and parsed server-side: one parser means the CLI and the
+    // validator cannot disagree about where this deploy lands.
+    let resolved = match &opts.target {
+        Some(name) => {
+            let path = plugin_dir.join("deploy.yaml");
+            let content = std::fs::read_to_string(&path).map_err(|err| {
+                crate::exit::usage(format!(
+                    "--target {name} needs a deploy.yaml in the bundle, but {} could not be \
+                     read: {err}",
+                    path.display()
+                ))
+            })?;
+            Some(client.resolve_deploy_target(&content, name).await?)
+        }
+        None => None,
+    };
+
+    // A target states its environment, which is the point: the flag's `dev`
+    // default is what let a prod workflow deploy to dev in silence (#1166).
+    let env_owned = opts
+        .env
+        .map(|e| e.as_str().to_string())
+        .or_else(|| resolved.as_ref().map(|r| r.env.clone()))
+        .unwrap_or_else(|| "dev".to_string());
+    let env = env_owned.as_str();
     ui.note(&format!(
         "deploying {plugin_name} ({} bytes) to {} [{env}]",
         archive.len(),
@@ -3106,15 +3137,21 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
 
     // The manifest name is the default, not the law (#1166). `plugin_name`
     // stays the DISPLAY name so the log still says which bundle was deployed;
-    // `agent_name` is what the platform binds.
-    let agent_name = opts.agent.clone().unwrap_or_else(|| plugin_name.clone());
-    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    // `agent_name` is what the platform binds. Explicit flags beat the target,
+    // so a one-off deploy never requires editing a committed file.
+    let agent_name = opts
+        .agent
+        .clone()
+        .or_else(|| resolved.as_ref().and_then(|r| r.agent.clone()))
+        .unwrap_or_else(|| plugin_name.clone());
     let cl = ui.checklist();
     let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
     let outcome = match client
         .deploy(
             &agent_name,
-            opts.slack_channel.as_deref(),
+            opts.slack_channel
+                .as_deref()
+                .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref())),
             &label,
             &created_by,
             env,
@@ -6012,13 +6049,14 @@ mod tests {
         let hint = "kubectl -n curie port-forward svc/curie-api 8000:8000";
         let opts = super::DeployOpts {
             agent: None,
+            target: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
-            env: super::DeployEnv::Dev,
+            env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: true,
@@ -6084,12 +6122,13 @@ mod tests {
 
         let opts = super::DeployOpts {
             agent: None,
+            target: None,
             plugin_dir: dir.path().to_path_buf(),
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
-            env: super::DeployEnv::Dev,
+            env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec!["GH_TOKEN".to_string()],
             secret_binding_supported: true,
@@ -6118,13 +6157,14 @@ mod tests {
 
         let opts = super::DeployOpts {
             agent: None,
+            target: None,
             plugin_dir: dir.path().to_path_buf(),
             // port 1 is reserved/closed -> deterministic connection refused
             api_url: "http://127.0.0.1:1".to_string(),
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
-            env: super::DeployEnv::Dev,
+            env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: false,
