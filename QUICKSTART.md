@@ -1,11 +1,13 @@
 # Curie quickstart
 
-Welcome. This gets you from nothing to your first agent reply in about a minute,
-with no credentials, no cluster, and no Slack. It runs the `skill` target: just
-the runner container on your host Docker daemon, talking straight to the agent.
-For the 30-second version, see the [README Quickstart](README.md#quickstart). To
-go further — a real local model, the full local/cluster runbooks, or working on
-Curie itself — see [Where to go next](#where-to-go-next).
+Welcome. This gets you a first agent reply in about a minute — no credentials,
+no cluster, no Slack. It runs the `skill` target only: just the runner
+container on your host Docker daemon, talking straight to the agent. For the
+full tour across all three tiers through to production, see the
+[README Quickstart](README.md#quickstart); this doc goes deeper on the `skill`
+path itself — configuring a real model, alternate providers, and example
+bundles. To go further still — a real local model, the full local/cluster
+runbooks, or working on Curie itself — see [Where to go next](#where-to-go-next).
 
 ## Before you start
 
@@ -25,6 +27,7 @@ Curie itself — see [Where to go next](#where-to-go-next).
   PATH (`CURIE_REQUIRE_COSIGN=1` requires it). To run the download-verify-install
   steps by hand instead, see
   [`docs/release-verification.md`](docs/release-verification.md#verify-the-cli-before-installing-it).
+
   Working on Curie itself? Run that same script from a source checkout and it
   builds the CLI instead of downloading it — see
   [Where to go next](#where-to-go-next).
@@ -58,12 +61,14 @@ Curie itself — see [Where to go next](#where-to-go-next).
    curie skill down
    ```
 
-That is the full loop. `curie skill up` starts the runner container,
+That is the full loop: `curie skill up` starts the runner container,
 `curie skill message` sends a synthetic event and streams the reply, and
-`curie skill down` stops it. Edit `skills/my-agent/SKILL.md` in the bundle
-and re-run steps 2 and 3 to see your change answer -- `skill up` runs an
-immutable snapshot of the bundle, so an edit only reaches a runner you have
-restarted (`curie skill up --replace` if one is still running).
+`curie skill down` stops it.
+
+Edit `skills/my-agent/SKILL.md` and re-run steps 2–3 to see your change
+answered — `skill up` runs an immutable snapshot of the bundle, so an edit
+only reaches a runner you've restarted (`curie skill up --replace` if one is
+still running).
 
 A committed first-party example lives at `examples/weather/`: `cd
 examples/weather && curie skill up` runs it from a clean clone. For the
@@ -86,14 +91,12 @@ curie skill message "What's the weather in Paris? Answer in one short sentence."
 curie skill down
 ```
 
-(`ANTHROPIC_API_KEY` or `CURIE_CREDENTIALS` work in place of
-`CLAUDE_CODE_OAUTH_TOKEN`, as noted above.)
-
 To use a different provider or model instead of the Anthropic default, bring
 your own model through OpenRouter on the same `skill` path. Set
-`CURIE_CREDENTIALS` to your OpenRouter key and name a model slug. It must
-arrive on that variable, not `ANTHROPIC_API_KEY`; here it selects OpenRouter
-specifically because it's paired with `--image`/`--model`:
+`CURIE_CREDENTIALS` to your OpenRouter key and name a model slug via
+`--model`. The credential must arrive on `CURIE_CREDENTIALS` specifically,
+not `ANTHROPIC_API_KEY` — that, paired with `--image`/`--model`, is what
+tells `curie` to route to OpenRouter instead of the Anthropic default:
 
 ```bash
 CURIE_CREDENTIALS="$OPENROUTER_TOKEN" curie skill up \
@@ -113,10 +116,10 @@ The `skill` loop is just the runner container. From here:
 - **A real local model, no Anthropic key** — the opt-in offline `--local-model`
   demo (a real model in a container over an Anthropic-compatible endpoint, model
   sizing, and gotchas): [`docs/local-model.md`](docs/local-model.md).
-- **Run your bundle on the full local platform** — the queue, worker, sandbox,
-  and traces, the same path a Slack mention takes, via docker compose
-  (`curie local up` → `local deploy` → `local message`). Walkthrough and the
-  ticket-verification loop in
+- **Run your bundle on the full local platform** — the queue, worker,
+  sandbox, and traces — the same path a Slack mention takes — via docker
+  compose (`curie local up` → `local deploy` → `local message`). Walkthrough
+  and the ticket-verification loop in
   [`docs/onboarding.md`](docs/onboarding.md#the-real-product-loop-with-local).
 - **Run it on Kubernetes** — the platform as a Helm release
   (`curie cluster up` → `cluster deploy` → `cluster message`). Full runbook,
