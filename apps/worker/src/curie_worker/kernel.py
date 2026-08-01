@@ -929,35 +929,117 @@ class Kernel:
         card behind. That convergence is the point of #1084; two renderers on one
         surface is what it was filed to stop.
 
-        Idempotence, and why an unconditional re-stamp is safe: ``pop`` is
-        GETDEL, so exactly one resume turn per thread gets the ref, and a
-        redelivery finds nothing. Within that single pass the stamp may land on a
-        card the dispatcher already stamped from a click, which is a rewrite to
-        an equivalent card rather than a second verdict -- the shared renderer is
-        what makes "equivalent" true, and a test pins it. A card stamped here and
-        then clicked late gets the existing already-resolved refusal from the
-        API, unchanged.
+        Idempotence, and why an unconditional re-stamp is safe: ``pop`` is a
+        GETDEL of the ref, the only pointer the platform still holds to the
+        posted card, so at most one turn holds it at a time; of the turns that
+        hold it, only the one whose approval the ref belongs to keeps it and
+        stamps, and every other holder puts it back. A redelivery after a stamp
+        finds nothing. Within the pass that does claim the ref, the stamp may
+        land on a card the dispatcher already stamped from a click, which is a
+        rewrite to an equivalent card rather than a second verdict -- the shared
+        renderer is what makes "equivalent" true, and a test pins it. A card
+        stamped here and then clicked late gets the existing already-resolved
+        refusal from the API, unchanged.
 
         Fully best-effort: nothing here may fail the resume, the cheap event-id
-        check gates the Valkey pop so ordinary turns pay nothing, and a record
-        that cannot be read leaves the card alone rather than stamping a verdict
-        the kernel had to guess.
+        check gates all of it so ordinary turns pay nothing, and a record that
+        cannot be read leaves BOTH the card and its ref alone rather than
+        stamping a verdict the kernel had to guess. That makes an unreadable
+        record a deferral instead of a permanent loss (#1199): ``ApprovalReader``
+        never raises, so before #1199 one transient blip stranded the card with
+        live-looking buttons forever. That closes a one-way door, but it is not
+        an unconditional later settle: this runs once per ``process_event``,
+        outside the retry loop, and an otherwise-healthy turn goes on to write
+        the done marker, after which every redelivery is skipped. The surviving
+        ref is therefore revisited only when that same delivery ALSO failed to
+        reach ``mark_done`` and the entry is reclaimed (ADR-0039, #505).
+
+        Two honest consequences. An approval-resume turn whose ref is already
+        gone now pays one record read before finding that out, a cost that lands
+        only on approval-resume turns. And a PERMANENT reason for no outcome (no
+        reader configured, an id that does not parse, a record somehow not
+        resolved) leaves the ref in Valkey until its TTL lapses or a later
+        approval on the same thread overwrites it, rather than being cleaned up
+        eagerly -- telling transient from permanent here would mean guessing.
+        That lingering ref is NOT harmless on its own: a later approval's resume
+        on the same thread would pop it and stamp on it. What makes it safe is
+        the pairing check below, not the entry being per-thread and TTL-bounded.
+
+        The pairing check, and why it puts the ref back: the entry is keyed by
+        thread, so ``remember`` carries the approval id (#1199) and a popped ref
+        whose id is not the one this resume is settling is not stamped -- that
+        card belongs to another, still-pending approval, and stamping it would
+        state this approval's verdict about that one. It is written back
+        conditionally (``ApprovalCardStore.restore``, a ``SET NX``), because
+        destroying it would strand that other approval's card with live buttons
+        nothing can ever settle: the same harm #1199 is about, arriving through
+        the refusal instead of through the record read, and terminal on the
+        expiry path where no click exists to heal it.
         """
 
         if self._card_store is None or not self._is_approval_resume(qevent.event_id):
             return
+        # Computed once, and the only thing the two forms disagree about. It is
+        # an explicit flag rather than "no outcome to stamp" because those two
+        # facts coincide only by way of the early return below: soften that
+        # return and an APPROVED card whose record blipped would render EXPIRED.
+        is_expiry = qevent.text.startswith(_EXPIRY_RESUME_MARKER)
         try:
+            # Expiry states only that nobody decided, so it needs no record read;
+            # a resolve states what was decided, and that comes from the record.
+            # The read is the only step that differs, so it is the only step
+            # inside the branch: the pop, the pairing check and its put-back
+            # below are written once and apply to both, because a check present
+            # on one path only is a wrong-card stamp on the other.
+            outcome: SettledCard | None = None
+            if not is_expiry:
+                # Read first, pop second (#1199). The read is the step that can
+                # come back empty for a reason that later passes could recover
+                # from, and the pop is irreversible; doing them in this order is
+                # what keeps a blip a deferral. The pop is still the GETDEL that
+                # makes the stamp exactly-once, just claimed one step later.
+                outcome = await self._settled_from_record(qevent)
+                if outcome is None:
+                    # Logged because a deliberate non-stamp otherwise looks
+                    # identical to there having been no card at all: nothing was
+                    # popped, so the ref is still there for a later pass.
+                    logger.info(
+                        "no readable approval outcome for thread %s -- "
+                        "leaving its card ref in place, not stamped",
+                        qevent.conversation_id,
+                    )
+                    return
             ref = await self._card_store.pop(qevent.conversation_id)
             if ref is None:
                 return
-            # Expiry states only that nobody decided, so it needs no record read;
-            # a resolve states what was decided, and that comes from the record.
-            if qevent.text.startswith(_EXPIRY_RESUME_MARKER):
+            # The ref is keyed by thread, so this is what tells "my card" from a
+            # card another approval on this thread posted -- either by
+            # overwriting the ref inside the record-read window above, or by
+            # leaving a stale one behind that this resume just popped. An EMPTY
+            # id is an entry remembered before #1199 (they outlive a deploy);
+            # it stamps exactly as it did then, because refusing there would
+            # strand every pre-upgrade card instead of protecting anything.
+            resume_approval_id = _approval_id_from_resume_event(qevent.event_id)
+            if ref.approval_id and ref.approval_id != resume_approval_id:
+                # Put back conditionally so the approval it really belongs to can
+                # still settle its own card; a newer entry, if one arrived, wins.
+                await self._card_store.restore(qevent.conversation_id, ref)
+                # Logged because a deliberate non-stamp otherwise looks
+                # identical to there having been no card at all.
+                logger.info(
+                    "approval card for thread %s belongs to approval %s, not %s -- not stamped",
+                    qevent.conversation_id,
+                    ref.approval_id,
+                    resume_approval_id,
+                )
+                return
+            if is_expiry:
+                # The branch above left the outcome unread, on purpose: an expiry
+                # says only that nobody decided.
                 settled = SettledCard(requested_by=ref.requested_by)
             else:
-                outcome = await self._settled_from_record(qevent)
-                if outcome is None:
-                    return
+                # The resolve branch returned above unless it read an outcome.
+                assert outcome is not None
                 settled = SettledCard(
                     requested_by=ref.requested_by,
                     decision=outcome.decision,
@@ -1221,6 +1303,15 @@ class Kernel:
                         ts=card_ts,
                         summary=summary,
                         endpoint=card_endpoint,
+                        # Pair the ref to the approval it belongs to (#1199).
+                        # The entry is keyed by thread, so this is the only
+                        # thing that lets the resume turn tell "my card" from a
+                        # card another approval on this thread left behind.
+                        # ``resumequeue.resume_event_id`` builds that turn's
+                        # event id as ``approval-<id>-resolved`` from this same
+                        # id, so this is exactly the string
+                        # ``_approval_id_from_resume_event`` recovers there.
+                        approval_id=str(created.id),
                         # The settled rebuild shows the same "Requested by" line
                         # the live card did, and once the sandbox is gone this
                         # is the worker's only copy of it (#1084).
