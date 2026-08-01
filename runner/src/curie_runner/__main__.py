@@ -18,6 +18,7 @@ from aiohttp import web
 
 from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
+    APPROVAL_SERVER_NAME,
     ApprovalPolicyError,
     build_approval_gate,
     build_approval_server,
@@ -25,7 +26,7 @@ from .approval import (
     resolve_approval_policy,
 )
 from .config import RunnerConfig
-from .connectors import derive_mcp_servers
+from .connectors import build_mcp_servers, derive_mcp_servers
 from .fake import FakeModelSession
 from .harness.contribution import HarnessContribution
 from .harness.registry import (
@@ -217,27 +218,31 @@ def build_runner(
             # shipping its own MCP server for it. The ``curie-state`` server
             # (#249) joins it whenever a state store is configured, so a skill
             # reads/writes durable state the same way -- no bundle-shipped server.
-            mcp_servers={
-                "curie": build_approval_server(approval_gate),
-                **(
-                    {STATE_SERVER_NAME: build_state_server(state_client)}
-                    if state_client is not None
-                    else {}
-                ),
+            mcp_servers=build_mcp_servers(
+                platform={
+                    APPROVAL_SERVER_NAME: build_approval_server(approval_gate),
+                    **(
+                        {STATE_SERVER_NAME: build_state_server(state_client)}
+                        if state_client is not None
+                        else {}
+                    ),
+                },
                 # Connectors the bundle DECLARED and Curie hosts (ADR-0086,
                 # #1118). Platform-supplied, exactly like the two above, so they
                 # ride the same channel -- nothing rewrites the read-only
                 # bundle. The URL derives from the Service Curie created via the
                 # same function that rendered it, so the two cannot disagree. A
-                # name clashing with the bundle's own MCP config is already a
-                # deploy-time error (#1149), so this cannot shadow it.
-                **derive_mcp_servers(
+                # name clashing with the bundle's own MCP config is a deploy-time
+                # error (#1118/#1149), a name clashing with a platform server is
+                # a deploy-time error (#1200), and build_mcp_servers resolves any
+                # residual collision toward the platform.
+                derived=derive_mcp_servers(
                     config.session.plugin_dir,
                     release=config.connector_release,
                     agent=config.connector_agent,
                     namespace=config.connector_namespace,
                 ),
-            },
+            ),
             can_use_tool=(
                 build_can_use_tool(approval_gate) if approval_gate is not None else None
             ),

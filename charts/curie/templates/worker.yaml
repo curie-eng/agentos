@@ -31,6 +31,36 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "patch"]
+{{- if .Values.worker.connectorReconciler.enabled }}
+{{/*
+ADR-0090: the connector reconciler converges each agent's connector objects
+toward its in-force bundle. Exactly the four kinds a connector is made of --
+the same list as CONNECTOR_KINDS in curie_worker/connector_k8s.py -- and
+exactly the verbs the three-verb ConnectorClient calls:
+  list_owned -> list            (scoped by the curie.dev/connector-owner label)
+  apply      -> patch + create  (server-side apply)
+  delete     -> delete
+`create` is NOT redundant next to `patch`. A server-side apply of an object
+that does not exist yet is authorized as a create, so a Role with only `patch`
+lets the reconciler update existing connectors while failing to create any --
+the first-run path, and the one most likely to be exercised. Verified with
+`kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
+it. No `get` (nothing reads a single object), no cluster scope, no other kinds.
+
+This is a genuine privilege increase over the CRD-only rules above -- it
+includes delete on Secrets -- which is why it renders only when the reconciler
+is actually enabled.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "secrets"]
+    verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "list", "patch", "delete"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

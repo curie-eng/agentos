@@ -23,9 +23,14 @@ and state servers -- platform-supplied servers, which is exactly what these are.
 Nothing rewrites ``.mcp.json``; the bundle stays the read-only artifact that was
 deployed.
 
-Name collisions cannot reach here: ``plugin_format`` rejects a bundle that
-declares one name in both ``connectors.yaml`` and its MCP config (#1118), so
-there is no precedence to resolve at runtime.
+Name collisions are rejected at validation on both axes: ``plugin_format``
+rejects a bundle that declares one name in both ``connectors.yaml`` and its own
+MCP config (#1118), and it rejects a name matching one of Curie's own platform
+servers -- ``curie``, ``curie-state`` -- via
+``plugin_format.connectors.RESERVED_CONNECTOR_NAMES`` (#1200). Precedence is
+nevertheless resolved here, by ``build_mcp_servers``, deliberately toward the
+platform, so a residual collision that somehow reaches the runtime fails safe
+rather than silently displacing the approval server.
 """
 
 from __future__ import annotations
@@ -118,3 +123,17 @@ def derive_mcp_servers(
         name: mcp_entry(release, agent, namespace, name, spec)
         for name, spec in sorted(declared.connectors.items())
     }
+
+
+def build_mcp_servers(platform: dict[str, Any], derived: dict[str, Any]) -> dict[str, Any]:
+    """Merge the platform's own MCP servers with the bundle's, platform winning.
+
+    The order is the safety property, not a style choice (#1200). Both maps are
+    plain dict keys on one channel, so on a collision somebody wins. Losing a
+    connector is a visible, diagnosable failure -- the agent's tool list is
+    missing something the bundle declared. Losing ``request_approval`` is a
+    silent one: a skill that calls it fails, or a self-imposed approval never
+    raises and the turn proceeds ungated. So the platform key wins.
+    """
+
+    return {**derived, **platform}

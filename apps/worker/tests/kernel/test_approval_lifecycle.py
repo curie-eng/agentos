@@ -10,6 +10,7 @@ Slack, the model, and the approval API (a recording fake at the
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 import aiohttp
@@ -43,20 +44,35 @@ class RecordingApprovals:
 
 
 class RecordingReader:
-    """An ApprovalReader fake: hands back one settled record, records the reads.
+    """An ApprovalReader fake: hands back settled records in order, records the reads.
+
+    Takes one or more responses and returns them in turn, the last one repeating
+    for every further read, so ``RecordingReader(record)`` is a fixed record and
+    ``RecordingReader(None, record)`` is a first read that came back empty and
+    then recovered.
+
+    That leading ``None`` is what a transient failure actually looks like at this
+    seam (#1199): ``ApprovalReader.get`` never raises -- on an ``httpx.HTTPError``
+    or a 503 it logs and hands back ``None`` -- so a blip is indistinguishable at
+    the call site from "no such record", and raising here would exercise a path
+    the production reader cannot produce.
 
     Separate from ``RecordingApprovals`` for the same reason the kernel takes two
     parameters (#1084): most tests need only the create half, and a combined fake
     would make every one of them carry a read they never exercise.
     """
 
-    def __init__(self, record: SettledApproval | None) -> None:
-        self.record = record
+    def __init__(self, *records: SettledApproval | None) -> None:
+        # Loud here rather than an IndexError on the first ``get``: with no
+        # records there is nothing to hand back, and ``RecordingReader(None)``
+        # is how you spell "the read came back empty".
+        assert records, "RecordingReader needs at least one record; use RecordingReader(None)"
+        self.records = records
         self.reads: list[str] = []
 
     async def get(self, approval_id: str) -> SettledApproval | None:
         self.reads.append(approval_id)
-        return self.record
+        return self.records[min(len(self.reads), len(self.records)) - 1]
 
 
 def _qevent(
@@ -84,6 +100,37 @@ def _awaiting_script(summary: str) -> list:
         TextDelta(text="Requesting sign-off"),
         Final(text="Requesting sign-off", status=AWAITING, approval_summary=summary),
     ]
+
+
+# The settled record a resolved approval reads back as: the one verdict the
+# card-stamping tests below all pin their assertions to.
+_APPROVED = SettledApproval(
+    status="approved", resolved_by="U9", resolution_note="approved for Q3"
+)
+
+
+async def _pause_awaiting_approval(h, thread: str) -> None:
+    """Run a turn to the approval pause on ``thread``.
+
+    The live card is posted and its location remembered -- the worker is the only
+    component that knows where it went -- which is the precondition every
+    card-settling test below starts from, hence the exists-assert on the ref.
+    """
+
+    h.runner.default_script = _awaiting_script("Refund order 42")
+    await h.kernel.process_event(_qevent("refund?", thread=thread))
+    assert await h.async_redis.exists(h.config.approval_card_key(thread))
+
+
+async def _peek_card_ref(h, thread: str) -> dict | None:
+    """The remembered card ref, read WITHOUT consuming it.
+
+    The store's own read is a GETDEL, so a test that wants to inspect a surviving
+    ref goes to the key directly.
+    """
+
+    raw = await h.async_redis.get(h.config.approval_card_key(thread))
+    return None if raw is None else json.loads(raw)
 
 
 def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
@@ -767,16 +814,10 @@ def test_resolve_resume_stamps_the_card_from_the_record(make_harness) -> None:
     """
 
     async def go() -> None:
-        reader = RecordingReader(
-            SettledApproval(
-                status="approved", resolved_by="U9", resolution_note="approved for Q3"
-            )
-        )
+        reader = RecordingReader(_APPROVED)
         thread = "th-resolve-card"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
-            h.runner.default_script = _awaiting_script("Refund order 42")
-            await h.kernel.process_event(_qevent("refund?", thread=thread))
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            await _pause_awaiting_approval(h, thread)
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -820,14 +861,16 @@ def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
     stating a verdict nobody confirmed is worse than one still showing buttons:
     the buttons are at least honest about the platform not having told Slack
     yet, and the next click gets the real answer from the API.
+
+    #1199 flipped the key assertion below: the ref must SURVIVE a pass that
+    stamped nothing.
     """
 
     async def go() -> None:
         reader = RecordingReader(None)
         thread = "th-unreadable-record"
         async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
-            h.runner.default_script = _awaiting_script("Refund order 42")
-            await h.kernel.process_event(_qevent("refund?", thread=thread))
+            await _pause_awaiting_approval(h, thread)
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -840,9 +883,13 @@ def test_a_resolve_resume_leaves_the_card_alone_when_the_record_cannot_be_read(
             )
 
             assert h.sink.card_updates == []
-            # The memory is consumed either way: a ref left behind would be
-            # popped by an unrelated later approval on the same thread.
-            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            # #1199: the ref SURVIVES, because nothing was stamped. It is the
+            # only pointer the platform still holds to the posted card, and a
+            # failed record read is routinely transient (a 503, a connection
+            # blip), so consuming it here would permanently strand a card with
+            # live-looking Approve/Reject buttons that no later pass can settle.
+            # The ref is only spent once a stamp is actually attempted.
+            assert await h.async_redis.exists(h.config.approval_card_key(thread))
 
     asyncio.run(go())
 
@@ -855,8 +902,7 @@ def test_a_resolve_resume_with_no_reader_configured_still_resumes(make_harness) 
     async def go() -> None:
         thread = "th-no-reader"
         async with make_harness(approvals=RecordingApprovals()) as h:
-            h.runner.default_script = _awaiting_script("Refund order 42")
-            await h.kernel.process_event(_qevent("refund?", thread=thread))
+            await _pause_awaiting_approval(h, thread)
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -888,9 +934,7 @@ def test_resolve_authored_by_a_system_named_actor_does_not_expire_the_card(
         approvals = RecordingApprovals()
         thread = "th-system-resolver"
         async with make_harness(approvals=approvals) as h:
-            h.runner.default_script = _awaiting_script("Refund order 42")
-            await h.kernel.process_event(_qevent("refund?", thread=thread))
-            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            await _pause_awaiting_approval(h, thread)
 
             h.runner.default_script = [Final(text="Refunded.", status=DONE)]
             await h.kernel.process_event(
@@ -903,9 +947,697 @@ def test_resolve_authored_by_a_system_named_actor_does_not_expire_the_card(
             )
 
             # Author is "system" but the text says RESOLVED: the card is left to
-            # the dispatcher, never stamped expired by the worker.
+            # the dispatcher, never stamped expired by the worker. That is the
+            # load-bearing assertion here.
             assert h.sink.card_updates == []
+            # #1199: no reader is configured, so no stamp was even attempted, so
+            # the ref survives. It is the only pointer to the posted card, and
+            # spending it on a pass that settled nothing would strand a card
+            # whose buttons still look live. (This asserted the opposite until
+            # #1199, when the pop moved behind the record read.)
+            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+# --- A transient record read must not destroy the card ref (#1199) ------------
+
+
+def test_a_transient_record_read_leaves_the_ref_for_a_later_pass(make_harness) -> None:
+    """#1199: the ref is spent only when a stamp is actually attempted.
+
+    ``ApprovalCardStore.pop`` is a GETDEL, so it is a one-shot destruction of the
+    only pointer the platform still holds to the posted Slack card. And
+    ``ApprovalReader.get`` never raises: on a transient ``httpx.HTTPError`` or a
+    503 it logs and returns ``None``. Popping before that read therefore lets a
+    momentary API blip permanently strand the card -- buttons still live, every
+    later click earning a 409, and no pass able to re-drive the stamp because the
+    ref is gone. Reading the record first makes the failure recoverable: the ref
+    outlives the bad pass, and the next pass settles the card -- but only when
+    that same delivery is reclaimed. There is no unconditional later pass: an
+    otherwise-healthy turn goes on to write the done marker and every redelivery
+    is then skipped, so the surviving ref is revisited only when the delivery
+    ALSO failed to reach ``mark_done`` and the entry is reclaimed (ADR-0039,
+    #505) -- which is exactly the state pass 2 below reproduces.
+
+    THE MUTATION THIS CATCHES: move the ``pop`` back above the record read in
+    ``Kernel._finalize_settled_card``. The first pass then destroys the ref, so
+    the second pass finds ``ref is None`` and ``card_updates`` stays empty.
+    """
+
+    async def go() -> None:
+        # The blip, then the recovery: one ``None`` read, then the real record.
+        reader = RecordingReader(None, _APPROVED)
+        thread = "th-transient-read"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+
+            resume = _resume_turn(
+                "[approval resolved] approved by U9",
+                thread=thread,
+                approval_id="appr-1",
+                author="U9",
+            )
+
+            # Pass 1: the record read comes back None (the blip).
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(resume)
+
+            # Nothing was stamped, which is correct: the kernel must not guess a
+            # verdict. But the ref SURVIVES, which is the whole point of #1199.
+            assert h.sink.card_updates == []
+            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+
+            # Pass 2 is the bounded-reclaim redelivery (ADR-0039, #505): the
+            # worker died before ``mark_done``, so the entry is redelivered and
+            # the kernel's done short-circuit does not fire. Clearing the done key
+            # reproduces that crash-before-done state; it is not a test shortcut
+            # around the idempotence guard, it IS the state reclaim delivers.
+            await h.async_redis.delete(h.config.done_key(resume.event_id))
+            await h.kernel.process_event(resume)
+
+            # The recovered pass settles the card, with the outcome read off the
+            # now-reachable record.
+            assert len(h.sink.card_updates) == 1
+            _channel, _ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert message.text == "Refund order 42", "the summary must survive"
+            assert settled is not None
+            assert settled.decision == "approved"
+            assert settled.resolver == "U9"
+            assert settled.note == "approved for Q3"
+            # "U1" is the author `_qevent` stamps on the triggering turn, which is
+            # what the live card rendered as "Requested by"; it rides the ref.
+            assert settled.requested_by == "U1"
+
+            # And NOW the ref is consumed, because a stamp was made.
             assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_a_redelivery_after_a_successful_stamp_still_finds_nothing(make_harness) -> None:
+    """#1199 must not weaken idempotence: one stamp per card, ever.
+
+    Deferring the pop behind the record read is only safe if the pop still
+    happens exactly once on the path that stamps. A genuine redelivery of an
+    already-settled resume turn re-reads a record that is still resolved, so
+    without the GETDEL it would re-edit the card on every reclaim pass.
+
+    THE MUTATION THIS CATCHES: dropping the pop (or making it a plain GET) while
+    moving the read earlier -- the redelivery then produces a second
+    ``card_updates`` entry.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-redelivered-stamp"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+
+            resume = _resume_turn(
+                "[approval resolved] approved by U9",
+                thread=thread,
+                approval_id="appr-1",
+                author="U9",
+            )
+
+            # The healthy pass: the card is settled and the ref is spent.
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(resume)
+            assert len(h.sink.card_updates) == 1
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+            # The redelivery, in the same crash-before-done shape the reclaim loop
+            # delivers, so the done short-circuit cannot mask the assertion.
+            await h.async_redis.delete(h.config.done_key(resume.event_id))
+            await h.kernel.process_event(resume)
+
+            # Nothing further happened to the card: exactly one stamp across both
+            # passes, and the ref stays absent.
+            assert len(h.sink.card_updates) == 1
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_a_ref_belonging_to_another_approval_is_never_stamped(make_harness) -> None:
+    """#1199: a popped ref is stamped only when it is THIS approval's card.
+
+    The ref is keyed by thread alone, so nothing in it tied the card to the
+    approval whose verdict is about to be written onto it. Under the old
+    pop-first order that pairing was correct by construction -- the pop was the
+    first I/O after the entry guard. Reading the record first opens a window (a
+    full HTTP round trip on a 30s client) in which another worker can pause the
+    SAME thread for a new approval and overwrite the ref: ``remember`` is a plain
+    overwriting SET, and this method holds no cross-worker lock. Stamping then
+    rewrites approval B's card -- one whose Approve/Reject buttons are live for a
+    still-pending request -- with approval A's verdict, and a human reads a
+    pending governance request as already approved. The same corruption arrives
+    by a second route: a ref left behind by a permanently unstampable pass
+    lingers for its 14-day TTL and is popped by a LATER approval's resume.
+
+    So the ref carries its approval id and a mismatch refuses to stamp, leaving
+    the mismatched card live with its buttons rather than having it state a
+    verdict about a different approval. The refusal also puts the ref back, so
+    the approval it really belongs to can still settle its own card -- pinned by
+    ``test_a_mismatched_ref_is_put_back_so_its_own_approval_can_settle`` below.
+
+    The reader here is healthy, so the pairing check is the ONLY thing between
+    this turn and a stamp -- that is what makes the test prove the pairing check
+    rather than some earlier guard.
+
+    THE MUTATION THIS CATCHES: delete the approval-id comparison from
+    ``Kernel._finalize_settled_card``. Approval B's live card is then rewritten
+    with approval A's "approved by U9" and ``card_updates`` stops being empty.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-mismatched-ref"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            # ``RecordingApprovals`` mints ids by request count, so this thread's
+            # remembered ref belongs to approval "appr-1".
+            await _pause_awaiting_approval(h, thread)
+
+            # A resume turn for a DIFFERENT approval on the same thread, which is
+            # what the overwrite window (and the stale-ref window) produce.
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-99",
+                    author="U9",
+                )
+            )
+
+            # The record read happened and came back healthy, so nothing earlier
+            # than the pairing check can explain the refusal below.
+            assert reader.reads == ["appr-99"]
+            # The wrong card was NOT stamped. This is the corruption prevented:
+            # approval appr-1's card still shows its live buttons instead of
+            # claiming appr-99's verdict.
+            assert h.sink.card_updates == []
+            # And the resume itself completed normally -- the whole method is
+            # best-effort and must never fail a resume.
+            assert h.sink.updates, "the resume must still produce a reply"
+
+    asyncio.run(go())
+
+
+def test_a_mismatched_ref_is_put_back_so_its_own_approval_can_settle(
+    make_harness,
+) -> None:
+    """#1199: a refusal must not destroy the OTHER approval's only pointer.
+
+    The popped ref belongs to a DIFFERENT, still-pending approval, so dropping
+    it on the floor strands that approval's card with live Approve/Reject
+    buttons that nothing will ever settle -- the #1199 harm class, reintroduced
+    through the refusal instead of through the record read. Putting the ref back
+    keeps the pairing honest AND keeps the card settleable: the approval the ref
+    actually belongs to pops it on its own resume, pairs, and stamps.
+
+    The put-back must not clobber a newer ref, so it is conditional: the pop
+    already closed the overwrite window, and the only way a conditional write
+    loses is that something newer arrived on the thread -- in which case not
+    writing is the correct outcome.
+
+    THE MUTATION THIS CATCHES: delete the put-back from the refusal path in
+    ``Kernel._finalize_settled_card``. The key is then gone after the mismatched
+    pass, so approval appr-1's own resume finds no ref and ``card_updates``
+    stays empty forever.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-putback-ref"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            # The pause posts appr-1's card and remembers where it lives.
+            await _pause_awaiting_approval(h, thread)
+
+            # A resume for a DIFFERENT approval pops appr-1's ref and refuses.
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-99",
+                    author="U9",
+                )
+            )
+            assert h.sink.card_updates == []
+
+            # The ref survives the refusal AND still describes appr-1's card --
+            # not merely surviving bytes, the same channel/ts/summary the live
+            # card was posted at, so a later stamp lands on the right message.
+            restored = await _peek_card_ref(h, thread)
+            assert restored is not None, "the mismatched ref was destroyed, not put back"
+            assert restored["approval_id"] == "appr-1"
+            assert restored["summary"] == "Refund order 42"
+            assert (restored["channel"], restored["ts"]) == ("C1", "posted-1")
+
+            # And that is what the put-back is FOR: appr-1's own resume now pops
+            # its ref, pairs, and settles its card. Without the put-back this
+            # half is unreachable.
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            assert len(h.sink.card_updates) == 1
+            _channel, ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert ts == "posted-1", "the stamp must land on appr-1's own card"
+            assert message.text == "Refund order 42"
+            assert settled is not None
+            assert settled.decision == "approved"
+            assert settled.resolver == "U9"
+            # The stamp spent the ref, so idempotence is unchanged by the
+            # put-back: one stamp per card, ever.
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_an_expiry_resume_for_another_approval_stamps_nothing_and_keeps_the_ref(
+    make_harness,
+) -> None:
+    """#1199: the pairing check and its put-back apply on the EXPIRY branch too.
+
+    The two branches differ only in whether they read the record, so the pop,
+    the pairing check and the put-back are written once and cover both -- a
+    check present on one path only is a wrong-card stamp on the other. The
+    expiry branch is where the residual bites hardest: a resolve leaves one heal
+    path (a human clicking the live buttons drives the dispatcher's payload-side
+    stamp), while an expiry has no click at all, so a destroyed ref there is
+    precisely the permanently-live card #419 exists to remove.
+
+    THE MUTATION THIS CATCHES: gate the pairing check (or its put-back) to the
+    resolve branch only -- e.g. ``if outcome is not None and ref.approval_id
+    != ...``. The expiry resume for appr-99 then stamps appr-1's card expired,
+    so ``card_updates`` stops being empty; gating only the put-back destroys the
+    ref, so the key stops existing.
+    """
+
+    async def go() -> None:
+        thread = "th-expiry-mismatched-ref"
+        # No reader is wired on purpose: the expiry branch reads no record, so
+        # nothing earlier than the pairing check can explain the refusal.
+        async with make_harness(approvals=RecordingApprovals()) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            await h.kernel.process_event(_qevent("please discount", thread=thread))
+            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+
+            # The #412 sweeper's expiry resume, but for a DIFFERENT approval --
+            # the shape the cross-worker overwrite window and a stale ref both
+            # produce.
+            h.runner.default_script = [Final(text="Acknowledged the expiry.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval expired] not approved in time",
+                    thread=thread,
+                    approval_id="appr-99",
+                    author="system",
+                )
+            )
+
+            # appr-1's card was NOT disabled by appr-99's expiry: its request is
+            # still pending and its buttons still mean something.
+            assert h.sink.card_updates == []
+            # And its ref survives, so appr-1's own terminal transition can still
+            # settle the card. On this branch there is no click to heal it.
+            surviving = await _peek_card_ref(h, thread)
+            assert surviving is not None, "the expiry refusal destroyed the other approval's ref"
+            assert surviving["approval_id"] == "appr-1"
+            # The resume itself still completed: the teardown is best-effort.
+            assert h.sink.last_text == "Acknowledged the expiry."
+
+    asyncio.run(go())
+
+
+def test_a_ref_remembered_before_the_pairing_existed_still_stamps(
+    make_harness,
+) -> None:
+    """#1199: an entry written by a pre-upgrade worker carries no approval id.
+
+    Refs live in Valkey for 14 days, so a deploy of the pairing check meets a
+    population of entries with no ``approval_id`` key at all. An empty id means
+    "cannot be paired", never "must be refused": refusing would strand EVERY
+    card in flight at the rollout hour, live buttons and all, with no click on
+    the CLI/API-resolve path to heal them. The window is one-shot and
+    unrepeatable -- by the time the symptom is noticed the refs are gone -- so
+    it gets exactly one chance to be right.
+
+    The legacy payload is written straight into Valkey rather than produced by
+    the harness, because the current ``remember`` cannot emit it: that shape no
+    longer exists in this codebase, only in a running deployment's Valkey.
+
+    THE MUTATION THIS CATCHES: drop the empty-id exemption from the pairing
+    check in ``Kernel._finalize_settled_card`` (compare the ids unconditionally).
+    Every legacy ref then mismatches and no pre-upgrade card is ever stamped.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-legacy-ref"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+
+            # Overwrite the entry with the exact shape the pre-#1199 worker
+            # wrote: same keys, no ``approval_id``.
+            await h.async_redis.set(
+                h.config.approval_card_key(thread),
+                json.dumps(
+                    {
+                        "channel": "C1",
+                        "ts": "posted-1",
+                        "summary": "Refund order 42",
+                        "endpoint": None,
+                        "requested_by": "U1",
+                    }
+                ),
+            )
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            # The legacy card IS stamped, exactly as it would have been before
+            # the pairing existed -- summary, requester and verdict all intact.
+            assert len(h.sink.card_updates) == 1
+            channel, ts, message, _endpoint, settled = h.sink.card_updates[0]
+            assert (channel, ts) == ("C1", "posted-1")
+            assert message.text == "Refund order 42"
+            assert settled is not None
+            assert settled.decision == "approved"
+            assert settled.resolver == "U9"
+            assert settled.requested_by == "U1"
+            # And the ref was consumed, because a stamp was made.
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+
+    asyncio.run(go())
+
+
+def test_a_present_but_null_approval_id_is_corrupt_not_pre_upgrade(
+    make_harness,
+) -> None:
+    """#1199: the pre-upgrade exemption belongs to an ABSENT key, not a falsy one.
+
+    The test above pins the exemption the rollout needs; this one pins its
+    boundary. "Written before the field existed" is a statement about the key
+    being ABSENT. A payload that carries ``"approval_id": null`` is a different
+    fact entirely -- a shape-drifted or partially-populated entry, the natural
+    output of any writer that models the field as optional, or of anyone with
+    write access to ``curie:approval-card:<thread>`` -- and the pre-#1199 worker
+    could not have produced it, because the key it wrote had no such member.
+
+    Treating the two alike is what makes the exemption unbounded: an empty id
+    short-circuits the pairing check entirely, so the entry becomes a guaranteed
+    stamp on whatever channel/ts it names, with whatever verdict the resuming
+    approval carries. ``pop`` already has the right answer for an entry it
+    cannot trust -- return None and let the click path heal the card -- and a
+    present-but-falsy id is exactly that case, not the rollout case.
+
+    THE MUTATION THIS CATCHES: keeping ``str(data.get("approval_id") or "")`` in
+    ``ApprovalCardStore.pop``. The ``or`` coalesces ``null`` (and ``0``,
+    ``false``, ``[]``) to ``""``, which is indistinguishable from a pre-upgrade
+    entry, so the ref pops, takes the exemption, and stamps appr-1's verdict on a
+    card nothing has paired it to.
+    """
+
+    async def go() -> None:
+        reader = RecordingReader(_APPROVED)
+        thread = "th-null-id-ref"
+        async with make_harness(approvals=RecordingApprovals(), approval_reader=reader) as h:
+            await _pause_awaiting_approval(h, thread)
+
+            # Every field ``remember`` writes, populated -- only the id is null.
+            # Written straight into Valkey because ``remember`` cannot emit this
+            # shape (and, per the store-level test below, must never learn to).
+            await h.async_redis.set(
+                h.config.approval_card_key(thread),
+                json.dumps(
+                    {
+                        "channel": "C1",
+                        "ts": "posted-1",
+                        "summary": "Refund order 42",
+                        "endpoint": None,
+                        "requested_by": "U1",
+                        "approval_id": None,
+                    }
+                ),
+            )
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            # Nothing was stamped: the entry is corrupt, so there is no ref, so
+            # there is no card the kernel can claim to be settling.
+            assert h.sink.card_updates == []
+            # And the refusal is the ENTRY's doing, not an unreadable record: the
+            # reader is healthy and was read for this very approval, so the only
+            # thing standing between that verdict and a stamp is the null id.
+            assert reader.reads == ["appr-1"]
+            # The run itself continued -- the teardown is best-effort.
+            assert h.sink.updates, "the resume must still produce a reply"
+
+    asyncio.run(go())
+
+
+def test_the_remembered_approval_id_matches_the_resume_events_approval_id() -> None:
+    """#1199: the two sides of the pairing must agree on the id STRING.
+
+    The check is a raw string comparison across the api/worker seam. The worker
+    remembers ``str(created.id)`` at the pause; the resuming id is the middle of
+    the API's ``resume_event_id(approval.id)``. Every other test in this file
+    fakes BOTH sides (``RecordingApprovals`` mints ``appr-<n>`` and
+    ``_resume_turn`` interpolates whatever string it is handed), so a drift in
+    either representation -- hex without dashes, a case change, a non-canonical
+    UUID rendering -- would refuse every card settle on every thread fleet-wide
+    while the whole suite stayed green, with a single ``logger.info`` as the
+    only signal.
+
+    This drives a real ``uuid.UUID`` through the API's builder and the worker's
+    parser, which is why it needs no harness: the seam IS the unit.
+
+    THE MUTATION THIS CATCHES: either side changing its id formatting -- e.g.
+    ``resumequeue.resume_event_id`` emitting ``approval_id.hex``, or the
+    worker's parser normalizing the middle it recovers.
+    """
+
+    from curie_api.resumequeue import resume_event_id
+    from curie_worker.kernel import _approval_id_from_resume_event
+
+    approval_id = uuid.UUID("6f1c8b3e-9c2a-4f5d-8a71-2b3c4d5e6f70")
+    assert _approval_id_from_resume_event(resume_event_id(approval_id)) == str(
+        approval_id
+    )
+    # Not a property of this one literal: a freshly minted id round-trips too.
+    minted = uuid.uuid4()
+    assert _approval_id_from_resume_event(resume_event_id(minted)) == str(minted)
+
+
+def test_a_resolve_with_no_reader_leaves_the_ref_and_stamps_nothing(
+    make_harness,
+) -> None:
+    """#1199: a PERMANENTLY unstampable resolve pass leaves the ref behind.
+
+    "No reader configured" can never recover within this deployment, yet the
+    #1199 ordering treats it like a transient blip: the record read returns
+    nothing, so the pop is never reached and the ref survives to its TTL. That is
+    the behavior the pairing check above has to be safe against, and it deserves
+    its own test -- it was pinned only as a side-assertion on
+    ``test_resolve_authored_by_a_system_named_actor_does_not_expire_the_card``,
+    whose real subject is the expiry-vs-resolve discriminator, so a change to
+    this ordering would have surfaced as a failure in a test named after
+    something else entirely.
+
+    THE MUTATION THIS CATCHES: move the ``pop`` back above the record read in
+    ``Kernel._finalize_settled_card`` (or give the no-reader arm its own eager
+    pop). The ref is then consumed by a pass that stamped nothing.
+    """
+
+    async def go() -> None:
+        thread = "th-permanent-no-reader"
+        async with make_harness(approvals=RecordingApprovals()) as h:  # no reader wired
+            await _pause_awaiting_approval(h, thread)
+
+            h.runner.default_script = [Final(text="Refunded.", status=DONE)]
+            await h.kernel.process_event(
+                _resume_turn(
+                    "[approval resolved] approved by U9",
+                    thread=thread,
+                    approval_id="appr-1",
+                    author="U9",
+                )
+            )
+
+            # Nothing was stamped: with no reader there is no verdict to state,
+            # and guessing one is worse than a card that still shows buttons.
+            assert h.sink.card_updates == []
+            # The ref survives, because the pop is claimed only when a stamp is
+            # actually attempted.
+            assert await h.async_redis.exists(h.config.approval_card_key(thread))
+            # The run continued regardless: the stamp is an enrichment.
+            assert h.sink.updates, "the resume must still produce a reply"
+
+    asyncio.run(go())
+
+
+def test_restore_declines_to_clobber_a_newer_card_but_still_puts_a_ref_back(
+    make_harness,
+) -> None:
+    """#1199: ``ApprovalCardStore.restore`` writes CONDITIONALLY, and it writes.
+
+    Deliberately a store-level test rather than a ``Kernel.process_event`` drive,
+    unlike every other test in this file: the property under test is the store's
+    write MODE, not a kernel decision, and the losing case needs a newer
+    ``remember`` landing between a ``pop`` and its put-back -- a window the kernel
+    cannot be made to open from the outside without inventing a concurrency
+    scenario it does not actually produce. The store is where the race is
+    constructible, so that is where it is pinned. Real Valkey throughout (the
+    harness's own store); a fake would be pinning the mock's write mode, not
+    Valkey's ``SET NX``.
+
+    The put-back exists because ``_finalize_settled_card`` has to pop before it
+    can tell whose ref it holds, so a ref belonging to a different, still-pending
+    approval has to go back. It is conditional because the ONLY way that write
+    loses is that a newer ``remember`` landed on the thread in between -- the pop
+    already emptied the key -- and then the newer entry is the one that must
+    survive. An unconditional put-back resurrects the older card's ref over it,
+    which is the wrong-card stamp this branch exists to close.
+
+    THE MUTATIONS THIS CATCHES:
+    -- flipping ``_write``'s ``nx`` default to True/False, or dropping ``nx=True``
+       from ``restore``: appr-A's stale ref clobbers appr-B's live one, and the
+       surviving entry describes the wrong card.
+    -- making ``restore`` a no-op (or deleting its write): the second half below
+       finds nothing to pop back, so the mismatched ref is destroyed after all.
+    """
+
+    async def go() -> None:
+        thread = "th-restore-conditional"
+        async with make_harness() as h:
+            store = h.card_store
+
+            # 1. Approval A's card is remembered, then popped exactly as
+            # ``_finalize_settled_card`` pops it -- the key is now empty and the
+            # caller holds A's ref.
+            await store.remember(
+                thread,
+                channel="C-alpha",
+                ts="ts-alpha",
+                summary="Refund order 42",
+                endpoint=None,
+                approval_id="appr-A",
+                requested_by="U1",
+            )
+            ref_a = await store.pop(thread)
+            assert ref_a is not None and ref_a.approval_id == "appr-A"
+
+            # 2. A NEWER approval lands on the same thread inside the window --
+            # a different card, in a different channel, at a different ts.
+            await store.remember(
+                thread,
+                channel="C-beta",
+                ts="ts-beta",
+                summary="Delete the prod bucket",
+                endpoint=None,
+                approval_id="appr-B",
+                requested_by="U2",
+            )
+
+            # 3. The put-back of A's ref must decline rather than overwrite B.
+            await store.restore(thread, ref_a)
+
+            surviving = await store.pop(thread)
+            assert surviving is not None, "the entry vanished; nothing is stampable"
+            assert surviving.approval_id == "appr-B", "A's stale ref clobbered the newer card"
+            assert (surviving.channel, surviving.ts) == ("C-beta", "ts-beta")
+            assert surviving.summary == "Delete the prod bucket"
+
+            # And the companion, without which a ``restore`` that wrote NOTHING
+            # would satisfy every assertion above: with nothing newer in the
+            # window, the put-back does put the ref back, whole.
+            await store.remember(
+                thread,
+                channel="C-gamma",
+                ts="ts-gamma",
+                summary="Rotate the signing key",
+                endpoint=None,
+                approval_id="appr-C",
+                requested_by="U3",
+            )
+            ref_c = await store.pop(thread)
+            assert ref_c is not None and ref_c.approval_id == "appr-C"
+            assert await store.pop(thread) is None, "the pop must leave the key empty"
+
+            await store.restore(thread, ref_c)
+            assert await store.pop(thread) == ref_c
+
+    asyncio.run(go())
+
+
+def test_remember_refuses_to_write_an_empty_approval_id(make_harness) -> None:
+    """#1199: today's code must be INCAPABLE of writing the compat sentinel.
+
+    The exemption for an unpairable ref is only defensible while ``""`` provably
+    means "written before the field existed". Every writer that can still emit it
+    keeps the exemption alive past the rollout it was granted for, and a
+    persisted empty id is not a benign one -- it is an entry the pairing check
+    waves through, aimed at whatever channel/ts it names. Refusing at the write
+    turns an unguardable entry into a loud failure at the moment it is produced,
+    instead of a silent stamp days later on someone else's card.
+
+    Deliberately a store-level test rather than a ``Kernel.process_event`` drive,
+    for the same reason as the ``restore`` test above: the input is not
+    constructible from the outside. The kernel remembers ``str(created.id)`` off
+    the approvals API response, and every creator in this suite mints a real id,
+    so reaching this guard through the kernel would mean inventing a fake that
+    returns ``{"id": ""}`` -- pinning the fake's shape, not the store's contract.
+    The guard lives on ``remember``, so that is where it is pinned.
+
+    THE MUTATION THIS CATCHES: deleting the empty-id guard from
+    ``ApprovalCardStore.remember``. The call then succeeds and leaves an entry in
+    Valkey whose id the pairing check cannot use, for the full 14-day TTL.
+    """
+
+    async def go() -> None:
+        thread = "th-remember-empty-id"
+        async with make_harness() as h:
+            with pytest.raises(ValueError, match="approval_id"):
+                await h.card_store.remember(
+                    thread,
+                    channel="C1",
+                    ts="posted-1",
+                    summary="Refund order 42",
+                    endpoint=None,
+                    approval_id="",
+                    requested_by="U1",
+                )
+
+            # Refused, not written-then-regretted: nothing reached the key, so
+            # there is no unpairable entry to pop and no partial write to reason
+            # about later.
+            assert not await h.async_redis.exists(h.config.approval_card_key(thread))
+            assert await h.card_store.pop(thread) is None
 
     asyncio.run(go())
 

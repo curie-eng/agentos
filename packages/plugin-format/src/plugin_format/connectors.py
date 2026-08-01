@@ -145,6 +145,32 @@ class ConnectorsFile(BaseModel):
 
 _NAME_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
 
+# The two keys Curie's own platform MCP servers occupy on
+# ``ClaudeAgentOptions.mcp_servers``: the approval server and the durable
+# state server. A connector declaring one of these names replaces a platform
+# server in the agent's session -- silently, since both ride the same map a
+# declared connector rides -- and the agent loses ``request_approval`` or the
+# state tools with nothing logged until a skill calls one.
+#
+# The fence is these two exact names, not the ``curie-`` prefix, so a
+# legitimate connector called ``curie-docs`` stays legal.
+#
+# The real owners are ``runner/src/curie_runner/approval.py``
+# ``APPROVAL_SERVER_NAME`` and ``runner/src/curie_runner/state.py``
+# ``STATE_SERVER_NAME``. ``runner`` depends on ``plugin-format``, never the
+# reverse, so this validator cannot import those constants and re-enumerates
+# them instead. ``runner/tests/test_connectors.py`` is the drift pin that
+# keeps this copy honest.
+#
+# What each reserved name would displace, keyed by name, so the reserved-name
+# error message and the reserved set share one source instead of two hand
+# maintained copies.
+_RESERVED_CONNECTOR_DISPLACES: dict[str, str] = {
+    "curie": "`request_approval`",
+    "curie-state": "the durable-state tools",
+}
+RESERVED_CONNECTOR_NAMES: frozenset[str] = frozenset(_RESERVED_CONNECTOR_DISPLACES)
+
 # ``${CURIE_*}`` placeholders an author may write in args/env. The renderer
 # substitutes these with values only Curie can derive (the Service name it
 # invents, which embeds the release, agent, and namespace). Imported from the
@@ -200,6 +226,17 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     f"{where}: a connector name becomes a Kubernetes object and DNS "
                     "label, so it must be lowercase alphanumeric or dashes, start and "
                     f"end alphanumeric, and be at most {_NAME_MAX} characters",
+                )
+            )
+        if name in RESERVED_CONNECTOR_NAMES:
+            lost = _RESERVED_CONNECTOR_DISPLACES[name]
+            errors.append(
+                (
+                    "connectors.reserved_name",
+                    f"{where}: `{name}` is reserved for Curie's own platform MCP server "
+                    "(the approval server / the durable state server), so a connector "
+                    "declaring it would replace that server in the agent's session and "
+                    f"the agent would lose {lost} -- rename the connector",
                 )
             )
         if spec.image and spec.url:
