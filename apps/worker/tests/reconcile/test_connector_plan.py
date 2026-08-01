@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from curie_worker.connector_reconcile import OWNER_LABEL, plan
+from curie_worker.connector_reconcile import OWNER_LABEL, plan, stamp_hash
 
 
 def obj(kind: str, name: str, owner: str | None = None, spec: Any = None) -> dict[str, Any]:
@@ -24,11 +24,16 @@ def obj(kind: str, name: str, owner: str | None = None, spec: Any = None) -> dic
 
 
 def live(o: dict[str, Any], **server_fields: Any) -> dict[str, Any]:
-    """The same object as the cluster would return it."""
+    """The same object as the cluster would return it after Curie applied it.
 
-    out = {k: v for k, v in o.items()}
+    Carries the digest, because everything the applier writes is stamped. An
+    object WITHOUT one is a different case -- something the CLI applier created
+    -- and reads as drift so the reconciler adopts it.
+    """
+
+    out = stamp_hash(o)
     out["metadata"] = {
-        **o["metadata"],
+        **out["metadata"],
         "uid": "abc-123",
         "resourceVersion": "4711",
         "creationTimestamp": "2026-07-31T00:00:00Z",
@@ -66,7 +71,7 @@ def test_another_agents_connector_is_never_pruned() -> None:
 def test_a_declared_object_that_does_not_exist_is_applied() -> None:
     want = obj("Service", "svc", owner="a")
     p = plan(desired=[want], live=[], agent="a")
-    assert p.apply == [want]
+    assert p.apply == [stamp_hash(want)]
     assert p.delete == []
 
 
@@ -94,7 +99,7 @@ def test_a_drifted_object_is_reapplied_and_reported_as_drift() -> None:
     want = obj("Deployment", "dep", owner="a", spec={"replicas": 1})
     edited = live(obj("Deployment", "dep", owner="a", spec={"replicas": 5}))
     p = plan(desired=[want], live=[edited], agent="a")
-    assert p.apply == [want]
+    assert p.apply == [stamp_hash(want)]
     assert p.drifted == [("Deployment", "dep")]
 
 
