@@ -324,3 +324,47 @@ def test_key_defaults_to_the_env_var_name() -> None:
     )
     assert parsed is not None
     assert parsed.connectors["g"].secrets[0].secret_key() == "T"  # type: ignore[union-attr]
+
+
+# --------------------------------------------------------------------------- #
+# Names Curie's own platform MCP servers occupy -- #1200
+# --------------------------------------------------------------------------- #
+RESERVED_NAMES = ["curie", "curie-state"]
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
+def test_a_reserved_platform_server_name_is_rejected(name: str) -> None:
+    # `curie` is the approval server and `curie-state` the durable state server.
+    # Both ride the same mcp_servers map a declared connector rides, so a
+    # connector claiming the name replaces the platform server in the agent's
+    # session -- the agent quietly loses request_approval or the state tools,
+    # with nothing logged and nothing failing until a skill calls one.
+    assert "connectors.reserved_name" in _codes({"connectors": {name: {"image": "x:1"}}})
+
+
+@pytest.mark.parametrize("name", RESERVED_NAMES)
+def test_bundle_rejects_a_reserved_connector_name(tmp_path: Path, name: str) -> None:
+    # The shape the issue reports as validating clean today: connectors.yaml
+    # declares the name, no .mcp.json exists, so the #1118 cross-check has
+    # nothing to compare against and the bundle sails through deploy.
+    root = _bundle(tmp_path, f"connectors:\n  {name}:\n    image: x:1\n")
+    result = validate_bundle(str(root))
+    assert not result.valid
+    offending = [e for e in result.errors if e.code == "connectors.reserved_name"]
+    assert offending, [e.code for e in result.errors]
+    assert name in offending[0].message
+
+
+def test_a_name_merely_starting_with_curie_is_accepted() -> None:
+    # The fence is the two exact names, not the `curie-` prefix. Fencing the
+    # prefix would reject a legitimate `curie-docs` connector, which is a worse
+    # accidental collision than the one being prevented.
+    assert _codes({"connectors": {"curie-docs": {"image": "x:1"}}}) == []
+
+
+def test_a_reserved_name_and_a_bad_shape_report_both() -> None:
+    # Every other check in this loop accumulates, so the author sees the whole
+    # file's problems in one pass rather than one rename per deploy attempt.
+    codes = _codes({"connectors": {"curie": {"secrets": ["T"]}}})
+    assert "connectors.reserved_name" in codes
+    assert "connectors.underspecified" in codes
