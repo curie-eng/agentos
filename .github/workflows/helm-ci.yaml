@@ -123,6 +123,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-secrets-assertions.sh
 
+      # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
+      # reconciler is off, and when on, exactly {create,list,patch,delete} on
+      # exactly the four kinds the client handles. `create` is load-bearing --
+      # a server-side apply of a missing object is authorized as a create, so
+      # dropping it breaks first-run while leaving updates working.
+      - name: helm render assertions (connector reconciler RBAC)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
+
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a
       # helper edit that weakens the lockdown -- or a container that skips it --
