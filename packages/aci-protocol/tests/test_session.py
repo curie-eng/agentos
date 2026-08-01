@@ -1,6 +1,6 @@
 import pytest
 from aci_protocol import BootEnv, Budget, EnvProducer, OtelConfig, SessionConfig
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 
 def _full_config() -> SessionConfig:
@@ -168,27 +168,80 @@ def _full_boot_env() -> BootEnv:
         model="claude-opus-4-6",
         fake_model=True,
         history_ref=_HISTORY_REF,
-        history_token="st-scoped-token",
-        memory_token="st-scoped-token",
+        history_token="st-history-token",
+        memory_token="st-memory-token",
         state_url="http://api:8000/agents/agent-abc/state",
-        state_token="st-scoped-token",
+        state_token="st-state-token",
         approval_required_tools=["Bash", "mcp__github__create_pr"],
         approval_grant_tool="Bash",
         approval_resumed_kind="policy",
+        approval_decision="approved",
         connector_secret_keys=["GITHUB_TOKEN", "LINEAR_API_KEY"],
+        connector_release="curie",
+        connector_agent="acme-dev",
+        connector_namespace="curie-prod",
         port=9090,
         base_url="http://litellm:4000",
+        api_backend="messages",
+        model_env_key="MY_PROVIDER_KEY",
         max_turns=50,
         history_max_turns=10,
         history_max_bytes=2048,
     )
 
 
+def _unpopulated_fields(model: BaseModel, prefix: str = "") -> list[str]:
+    """Every field on ``model`` still at its declared default, recursing into
+    nested models.
+
+    Enumerated at runtime off ``model_fields`` rather than from a hand-kept
+    list, so a field ADDED to the model tomorrow shows up here the moment the
+    fixture does not populate it. Compared against the field's own declared
+    default (via ``FieldInfo.get_default``), not a hardcoded ``None``, so a
+    future field defaulting to ``False``/``0``/``""`` is still caught. A
+    required field has no default (``get_default`` returns
+    ``PydanticUndefined``), which never equals a real value, so a populated
+    required field is never flagged. Nested lists or dicts of models are not
+    walked; no field on these models has that shape today.
+    """
+
+    unpopulated: list[str] = []
+    for name, field in type(model).model_fields.items():
+        value = getattr(model, name)
+        path = f"{prefix}{name}"
+        default = field.get_default(call_default_factory=True)
+        if value == default:
+            unpopulated.append(path)
+        elif isinstance(value, BaseModel):
+            unpopulated.extend(_unpopulated_fields(value, prefix=f"{path}."))
+    return unpopulated
+
+
 # --- Model shape -------------------------------------------------------------
 
 
 def test_boot_env_roundtrips_every_declared_field() -> None:
+    """The class-closing invariant: nothing ``to_env`` emits may fail to parse back.
+
+    A field that ``to_env`` writes but ``from_env`` never reads comes back
+    ``None``, and nothing errors: the runner boots fine with the feature
+    silently switched off. That is exactly how CURIE_CONNECTOR_RELEASE /
+    _AGENT / _NAMESPACE were lost (#1195), and it is a defect the whole model is
+    exposed to every time a field is added.
+
+    The population guard is what keeps this test from decaying into a
+    tautology. A newly added optional field left unset in the fixture would
+    round trip as ``None == None`` and prove nothing, so the guard fails first
+    and names the field, forcing whoever adds it to give it a real value here.
+    """
+
     boot = _full_boot_env()
+    unpopulated = _unpopulated_fields(boot)
+    assert not unpopulated, (
+        "the round-trip fixture leaves these fields at their declared default, so "
+        "the assertion below would pass over them vacuously; give each a distinct, "
+        f"non-default value in _full_boot_env: {', '.join(unpopulated)}"
+    )
     assert BootEnv.from_env(boot.to_env()) == boot
 
 
@@ -856,6 +909,29 @@ def test_connector_scope_is_emitted_as_a_set_or_not_at_all() -> None:
     assert full["CURIE_CONNECTOR_RELEASE"] == "curie"
     assert full["CURIE_CONNECTOR_AGENT"] == "acme-dev"
     assert full["CURIE_CONNECTOR_NAMESPACE"] == "curie"
+
+
+def test_connector_scope_survives_the_worker_render_and_the_consumer_parse() -> None:
+    # Emitting the scope is only half the contract: the runner is the single
+    # consumer, so a key the worker writes and `from_env` never reads is the
+    # same outcome as never writing it. The agent loses its connector tools and
+    # nothing errors (#1195).
+    #
+    # Three DISTINCT values, because the runner composes
+    # `<release>-<agent>-mcp-<connector>.<namespace>`: a parse that reads one
+    # env key into two fields, or drops one of the three, must not be able to
+    # pass here.
+    boot = BootEnv.from_env(
+        _worker_env(
+            connector_release="curie",
+            connector_agent="acme-dev",
+            connector_namespace="curie-prod",
+        )
+        | _SUBSTRATE_ENV
+    )
+    assert boot.connector_release == "curie"
+    assert boot.connector_agent == "acme-dev"
+    assert boot.connector_namespace == "curie-prod"
 
 
 def test_connector_scope_is_absent_by_default() -> None:
