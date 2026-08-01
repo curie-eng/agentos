@@ -580,6 +580,17 @@ worker:
   # (see templates/worker.yaml). Its token IS mounted (unlike the runner SA).
   serviceAccount:
     create: true
+  # Declarative connector hosting (ADR-0090): the worker converges each agent's
+  # connector Deployment/Service/Secret/NetworkPolicy toward what its in-force
+  # bundle declares, so an agent repo needs no CLI near the cluster.
+  #
+  # Off by default, and the RBAC is gated on this same flag rather than granted
+  # unconditionally. Enabling it widens the worker's Role from "read/patch two
+  # CRDs" to "create, update and DELETE Deployments, Services, Secrets and
+  # NetworkPolicies in this namespace" -- a real privilege increase that should
+  # not be handed to a component that is not using it.
+  connectorReconciler:
+    enabled: false
   # The SandboxWarmPool the substrate claims from. Empty -> derived as
   # `<release>-runner-pool` (the name templates/agent-sandbox.yaml gives it).
   warmPool: ""

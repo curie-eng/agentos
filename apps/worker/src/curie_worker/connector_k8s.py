@@ -1,0 +1,131 @@
+"""The `ConnectorClient` against a real cluster (ADR-0090).
+
+Four object kinds, three verbs, one namespace. Everything Kubernetes-shaped in
+the connector reconciler stops here; `connector_reconcile` and
+`connector_apply` never import this module, which is what lets the dangerous
+half be tested without a cluster.
+
+**Writes are server-side applies.** Not create-then-replace-on-409, which is
+where the obvious implementation goes wrong: a rendered Service declares no
+`clusterIP`, and replacing a live Service without one is rejected outright
+(`spec.clusterIP: Invalid value: "": field is immutable`). Server-side apply
+also removes a field we previously set and no longer declare, which a merge
+patch cannot express -- so dropping `hostAliases` from connectors.yaml actually
+drops it from the pod, rather than leaving it in place forever.
+
+**`force=True` is deliberate.** It means a field a human took ownership of with
+`kubectl edit` comes back to us. That IS the drift correction ADR-0090 asks
+for; without it, an edited field stays edited and the reconciler reports
+converged while the cluster disagrees with the declaration.
+
+**Reads go out as raw JSON, not typed models.** The rest of the reconciler
+compares against what the API rendered, which is camelCase; the generated
+models would hand back snake_case attributes and quietly compare unequal on
+every field. Asking for the wire format is what keeps the two halves speaking
+the same language.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from kubernetes import client as k8s_client
+from kubernetes import config as k8s_config
+
+from .connector_reconcile import OWNER_LABEL
+
+# Identifies this writer to the API server's field-ownership tracking. A stable
+# name matters: change it and the server treats every field as newly claimed by
+# a stranger, leaving the old manager's entries behind forever.
+FIELD_MANAGER = "curie-connector-reconciler"
+
+# The only kinds a connector is made of, and the only kinds the Role grants.
+# Adding one here without adding it to the chart's RBAC produces a reconciler
+# that silently fails to prune -- so they are listed in one place each and
+# asserted against each other in the chart tests.
+_KINDS: dict[str, tuple[type[Any], str, str]] = {
+    "Deployment": (k8s_client.AppsV1Api, "deployment", "apps/v1"),
+    "Service": (k8s_client.CoreV1Api, "service", "v1"),
+    "Secret": (k8s_client.CoreV1Api, "secret", "v1"),
+    "NetworkPolicy": (k8s_client.NetworkingV1Api, "network_policy", "networking.k8s.io/v1"),
+}
+
+CONNECTOR_KINDS = tuple(_KINDS)
+
+
+class UnsupportedKind(ValueError):
+    """A plan named an object kind connectors are not made of."""
+
+
+class KubernetesConnectorClient:
+    """ConnectorClient against a real cluster (in-cluster or kubeconfig auth)."""
+
+    def __init__(self, *, kubeconfig: str | None = None) -> None:
+        try:
+            k8s_config.load_incluster_config()
+        except k8s_config.ConfigException:
+            k8s_config.load_kube_config(config_file=kubeconfig)
+        self._apis: dict[str, Any] = {}
+
+    def _api(self, kind: str) -> tuple[Any, str]:
+        if kind not in _KINDS:
+            raise UnsupportedKind(f"{kind} is not a connector object kind")
+        api_cls, suffix, _ = _KINDS[kind]
+        if kind not in self._apis:
+            self._apis[kind] = api_cls()
+        return self._apis[kind], suffix
+
+    # -- reads ---------------------------------------------------------------
+
+    def list_owned(self, namespace: str, owner: str) -> list[dict[str, Any]]:
+        """Every connector object in the namespace labelled for this agent.
+
+        The label selector is the ownership boundary, and it is applied by the
+        API server rather than by us: a client-side filter over a wider list is
+        a filter that can be forgotten, and forgetting it here prunes another
+        agent's connectors (#1116).
+        """
+
+        found: list[dict[str, Any]] = []
+        for kind in _KINDS:
+            api, suffix = self._api(kind)
+            response = getattr(api, f"list_namespaced_{suffix}")(
+                namespace,
+                label_selector=f"{OWNER_LABEL}={owner}",
+                _preload_content=False,
+            )
+            for item in json.loads(response.data).get("items", []):
+                # Items inside a List carry no `kind` or `apiVersion` of their
+                # own -- the server states them once on the envelope. The plan
+                # identifies objects by (kind, name), so an unstamped item is an
+                # object with an empty kind that matches nothing and gets
+                # planned for deletion.
+                item["kind"] = kind
+                item["apiVersion"] = _KINDS[kind][2]
+                found.append(item)
+        return found
+
+    # -- writes --------------------------------------------------------------
+
+    def apply(self, namespace: str, obj: dict[str, Any]) -> None:
+        kind = str(obj.get("kind", ""))
+        api, suffix = self._api(kind)
+        getattr(api, f"patch_namespaced_{suffix}")(
+            obj["metadata"]["name"],
+            namespace,
+            obj,
+            field_manager=FIELD_MANAGER,
+            force=True,
+            _content_type="application/apply-patch+yaml",
+            _preload_content=False,
+        )
+
+    def delete(self, namespace: str, kind: str, name: str) -> None:
+        api, suffix = self._api(kind)
+        try:
+            getattr(api, f"delete_namespaced_{suffix}")(name, namespace, _preload_content=False)
+        except k8s_client.ApiException as exc:
+            # Already gone is the state we wanted. Anything else is real.
+            if exc.status != 404:
+                raise
