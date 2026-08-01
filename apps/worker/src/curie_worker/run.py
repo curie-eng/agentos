@@ -26,6 +26,7 @@ from .approvals import ApprovalClient
 from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
+from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
 from .consumer import Consumer
 from .dead_letter_alert import install_dead_letter_alerting
 from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
@@ -62,6 +63,10 @@ class Runtime:
     eval_redis: AsyncRedis
     eval_http: httpx.AsyncClient
     engine: AsyncEngine
+    # None unless the connector reconciler is enabled (ADR-0090, #1184). Held
+    # here so `_run` supervises it beside the consumers rather than letting it
+    # run unsupervised.
+    connector_loop: ConnectorReconcileLoop | None = None
 
 
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
@@ -104,9 +109,7 @@ def _sandbox_client(
     """
     substrate = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
     if substrate == "docker":
-        has_credential = bool(config.credentials) or any(
-            v in env for v in _MODEL_CREDENTIAL_ENV
-        )
+        has_credential = bool(config.credentials) or any(v in env for v in _MODEL_CREDENTIAL_ENV)
         has_local_model = bool(config.model_base_url)
         if not config.fake_model and not has_credential and not has_local_model:
             raise SystemExit(
@@ -182,9 +185,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
-        sink=AsyncSlackSink(
-            config.slack_bot_token, base_url=config.slack_api_base_url or None
-        ),
+        sink=AsyncSlackSink(config.slack_bot_token, base_url=config.slack_api_base_url or None),
         lock=ThreadLock(
             async_redis,
             ttl_ms=config.lock_ttl_ms,
@@ -246,6 +247,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         eval_redis=eval_redis,
         eval_http=eval_http,
         engine=engine,
+        connector_loop=_build_connector_loop(config, engine),
     )
 
 
@@ -284,6 +286,36 @@ async def _supervise(
                 pass
 
 
+def _build_connector_loop(
+    config: WorkerConfig, engine: AsyncEngine
+) -> ConnectorReconcileLoop | None:
+    """The connector reconcile loop, or None when it is switched off.
+
+    Constructed here rather than inside the loop so a bad kubeconfig fails at
+    boot, next to the flag that asked for it, instead of once per interval in a
+    background task nobody is watching.
+    """
+
+    if not config.connector_reconcile_enabled:
+        return None
+    from .connector_k8s import KubernetesConnectorClient
+
+    return ConnectorReconcileLoop(
+        engine=engine,
+        source=HttpManifestSource(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            release=config.connector_release,
+            namespace=config.connector_namespace,
+            app_name=config.connector_app_name,
+        ),
+        client=KubernetesConnectorClient(),
+        namespace=config.connector_namespace,
+        db_schema=config.db_schema,
+        interval_seconds=config.connector_reconcile_interval_s,
+    )
+
+
 async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
     rt = build(config, env)
 
@@ -313,10 +345,19 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
             _supervise("evals", rt.eval_consumer.run, shutdown),
             _supervise(
                 "heartbeat",
-                lambda: run_heartbeat(
-                    config.heartbeat_file, config.heartbeat_interval_s, shutdown
-                ),
+                lambda: run_heartbeat(config.heartbeat_file, config.heartbeat_interval_s, shutdown),
                 shutdown,
+            ),
+            *(
+                [
+                    _supervise(
+                        "connectors",
+                        lambda: rt.connector_loop.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                    )
+                ]
+                if rt.connector_loop is not None
+                else []
             ),
             return_exceptions=True,
         )

@@ -15,7 +15,7 @@
 #     not exist at all when the reconciler is switched off. A component that is
 #     not running should not hold delete-on-Secrets.
 #
-# Six assertions:
+# Eight assertions:
 #   (a) With the reconciler DISABLED (the default), the worker Role grants
 #       nothing on the four connector kinds.
 #   (b) Disabled render still grants the two agent-sandbox CRD rules, so the
@@ -28,6 +28,12 @@
 #       module's docstring claims this file enforces that; this is the claim.
 #   (f) Nothing the reconciler grants is cluster-scoped, and it never mentions
 #       pods.
+#   (g) The RBAC and the worker's env are switched by the SAME flag. Half the
+#       pair is the worst outcome: the grant without the env is unused
+#       authority, and the env without the grant is a loop that 403s forever.
+#   (h) The reconciler is pointed at the namespace and release the worker
+#       already tells the runner about, so the Service it creates is the one the
+#       agent dials.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the
 # assertion.
@@ -161,4 +167,19 @@ if grep -q "pods" <<<"$ENABLED_RULES"; then
   fail f "the connector Role mentions pods; it manages objects, never pods directly"
 fi
 
-echo "connector-reconciler-rbac-assertions: all six assertions passed"
+# (g) The RBAC and the env are switched by the SAME flag. Half of the pair is
+#     the worst outcome: the grant without the env is unused authority, and the
+#     env without the grant is a loop that 403s every pass forever.
+for required in CURIE_CONNECTOR_RECONCILE CURIE_CONNECTOR_APP_NAME CURIE_API_URL CURIE_API_KEY; do
+  grep -q "$required" <<<"$ENABLED" || fail g "enabling the reconciler did not render $required"
+  grep -q "$required" <<<"$DISABLED" &&
+    fail g "$required renders with the reconciler disabled; the env gate is not working"
+done
+
+# (h) The worker reconciles the namespace and release it already tells the
+#     runner about. Two settings could disagree, and the symptom would be a
+#     connector that exists and an agent that cannot reach it.
+grep -q "CURIE_NAMESPACE" <<<"$ENABLED" || fail h "CURIE_NAMESPACE is missing from the worker env"
+grep -q "CURIE_RELEASE" <<<"$ENABLED" || fail h "CURIE_RELEASE is missing from the worker env"
+
+echo "connector-reconciler-rbac-assertions: all eight assertions passed"
