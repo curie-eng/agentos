@@ -27,7 +27,8 @@ from plugin_format import (
     validate_bundle,
 )
 from plugin_format.connectors import ConnectorsFile, validate_connectors
-from plugin_format.validate import CONNECTORS_FILE
+from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
+from plugin_format.validate import CONNECTORS_FILE, DEPLOY_FILE
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -110,6 +111,23 @@ def read_connectors(root: Path) -> ConnectorsFile:
     parsed, errors = validate_connectors(yaml.safe_load(path.read_text(encoding="utf-8")))
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return ConnectorsFile()
+    return parsed
+
+
+def read_deploy_targets(root: Path) -> DeployTargetsFile | None:
+    """Parse a validated bundle's ``deploy.yaml``, or None when it declares none.
+
+    None is not an error. A bundle without ``deploy.yaml`` predates ADR-0089
+    and still deploys to the single agent its repository binds -- the caller
+    must keep working for it, not reject it.
+    """
+
+    path = bundle_root(root) / DEPLOY_FILE
+    if not path.is_file():
+        return None
+    parsed, errors = validate_deploy_targets(yaml.safe_load(path.read_text(encoding="utf-8")))
+    if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
+        return None
     return parsed
 
 

@@ -16,16 +16,20 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
+from collections.abc import Sequence
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from aci_protocol import EvalJob
+from plugin_format.deploy_targets import DeployTargetsFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from . import bundles, crud, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
-from .models import Environment
+from .models import Agent, AgentVersion, Environment
 from .schemas import WebhookResult
 from .storage import ObjectStore
 
@@ -273,9 +277,7 @@ def clone_and_archive(
                 timeout=120,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise GitFlowError(
-                f"could not archive {sha[:12]}: {_git_failure_detail(exc)}"
-            ) from exc
+            raise GitFlowError(f"could not archive {sha[:12]}: {_git_failure_detail(exc)}") from exc
         return archived.stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -306,11 +308,64 @@ async def process_push(
     if not isinstance(full_name, str) or not isinstance(clone_url, str):
         return WebhookResult(status="ignored")
 
-    agent = await crud.get_agent_by_repo(session, full_name)
+    # Every agent built from this repository (ADR-0091). A repository binds
+    # several on purpose: a dev bot and a prod bot are the same bundle on two
+    # channels. Which one THIS push deploys to comes from the bundle's
+    # deploy.yaml, so the bundle has to be fetched before the agent is known.
+    repo_agents = await crud.get_agents_by_repo(session, full_name)
     # The second clause is unreachable in practice (the lookup's predicate is
     # `Agent.repo_full_name == full_name` with a non-None argument); it exists
     # solely to narrow `str | None` to `str` for the origin derivation below.
-    if agent is None or agent.repo_full_name is None:
+    repo_agents = [a for a in repo_agents if a.repo_full_name is not None]
+    if not repo_agents:
+        return WebhookResult(status="ignored")
+
+    # The trust model does not move (ADR-0091). The origin is still derived from
+    # what the DATABASE holds, never the payload -- and with several agents it
+    # stays unambiguous, because every agent bound to a repository carries the
+    # same repo_full_name, so the derived origin is identical whichever row is
+    # read. The clone is authorized by the repository binding; the target only
+    # decides which agent receives the resulting Version.
+    trusted_repo_full_name = str(repo_agents[0].repo_full_name)
+
+    try:
+        archive = await run_in_threadpool(
+            clone_and_archive,
+            clone_url,
+            after,
+            settings,
+            repo_full_name=trusted_repo_full_name,
+        )
+        extension, content_type = deploy.validate_archive(archive, settings)
+    except CloneOriginMismatch as exc:
+        return WebhookResult(
+            status="rejected", errors=[{"code": "git.origin_mismatch", "message": str(exc)}]
+        )
+    except GitFlowError as exc:
+        return WebhookResult(
+            status="rejected", errors=[{"code": "git.archive_failed", "message": str(exc)}]
+        )
+    except bundles.UnsupportedArchive as exc:
+        return WebhookResult(
+            status="rejected", errors=[{"code": "bundle.unsupported", "message": str(exc)}]
+        )
+    except deploy.BundleInvalid as exc:
+        return WebhookResult(status="rejected", errors=exc.errors)
+
+    targets = await run_in_threadpool(_read_targets, archive, settings)
+    named = _target_agent_name(targets, environment)
+    named_elsewhere = (
+        await crud.get_agent_by_name(session, named)
+        if named and not any(a.name == named for a in repo_agents)
+        else None
+    )
+    try:
+        agent = resolve_target_agent(targets, environment, repo_agents, named_elsewhere)
+    except TargetUnresolved as exc:
+        return WebhookResult(status="rejected", errors=[{"code": exc.code, "message": str(exc)}])
+    if agent is None:
+        # A branch this bundle declares no target for. Silently doing nothing is
+        # correct and is what an unmatched branch already does.
         return WebhookResult(status="ignored")
 
     version = await crud.get_version_by_commit(session, agent.id, after)
@@ -322,38 +377,6 @@ async def process_push(
     # version must not enqueue a second job for the same version.
     bundle_built = version is None or version.bundle_ref is None
     if bundle_built:
-        try:
-            # The stored binding, never the payload's full_name: AC1 says the
-            # origin is derived from what the database holds.
-            data = await run_in_threadpool(
-                clone_and_archive,
-                clone_url,
-                after,
-                settings,
-                repo_full_name=agent.repo_full_name,
-            )
-            extension, content_type = deploy.validate_archive(data, settings)
-        # CloneOriginMismatch is a GitFlowError subclass, so it must be caught
-        # first or its clause is dead code. An operator has to be able to tell a
-        # forged push apart from a network failure.
-        except CloneOriginMismatch as exc:
-            return WebhookResult(
-                status="rejected",
-                errors=[{"code": "git.origin_mismatch", "message": str(exc)}],
-            )
-        except GitFlowError as exc:
-            return WebhookResult(
-                status="rejected",
-                errors=[{"code": "git.archive_failed", "message": str(exc)}],
-            )
-        except bundles.UnsupportedArchive as exc:
-            return WebhookResult(
-                status="rejected",
-                errors=[{"code": "bundle.unsupported", "message": str(exc)}],
-            )
-        except deploy.BundleInvalid as exc:
-            return WebhookResult(status="rejected", errors=exc.errors)
-
         if version is None:
             version = await crud.create_version_row(
                 session,
@@ -362,9 +385,21 @@ async def process_push(
                 created_by="git-flow",
                 commit_sha=after,
             )
-        await deploy.store_bundle(
-            store, session, agent.id, version, data, extension, content_type
-        )
+        # Bundle-once, bind-many (ADR-0091). A sibling agent in this repository
+        # may already hold this exact commit -- the dev push that ran minutes
+        # ago. Reuse its stored object rather than uploading the same bytes
+        # again: prod then promotes not merely an identical artifact but the
+        # SAME one, which is what makes "promote what you validated" a property
+        # of the schema rather than of discipline.
+        sibling = await _sibling_bundle(session, repo_agents, agent.id, after)
+        if sibling is not None:
+            version = await crud.attach_bundle(
+                session, version, str(sibling.bundle_ref), str(sibling.bundle_sha256)
+            )
+        else:
+            await deploy.store_bundle(
+                store, session, agent.id, version, archive, extension, content_type
+            )
 
     # Either the version pre-existed with a bundle, or the block above created
     # or repaired it; it is non-None from here on.
@@ -416,3 +451,122 @@ async def process_push(
         deployment_id=deployment.id,
         commit_sha=after,
     )
+
+
+class TargetUnresolved(Exception):
+    """A push cannot be routed to an agent, with an operator-facing reason."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def resolve_target_agent(
+    targets: "DeployTargetsFile | None",
+    environment: Environment,
+    repo_agents: "Sequence[Agent]",
+    named_elsewhere: "Agent | None",
+) -> "Agent | None":
+    """Which agent this push deploys to (ADR-0091).
+
+    Returns None when the push should be ignored -- a branch with no matching
+    target, exactly as an unmatched branch is ignored today. Raises
+    ``TargetUnresolved`` when it should be REJECTED, which is a different thing:
+    the author declared a target and it cannot be honoured, so silence would
+    look like a deploy that worked.
+
+    ``named_elsewhere`` is the agent the target names IF it exists but is bound
+    to a different repository. That case is the sharpest edge in ADR-0091 and
+    the reason this function takes an argument for it: without the check, one
+    repository's push deploys over another repository's agent. It is refused.
+    """
+
+    if targets is None:
+        # A bundle predating ADR-0089. It deploys where it always did: to the
+        # single agent this repository binds. With several bound there is no
+        # basis to choose, and guessing would deploy to the wrong bot silently.
+        if len(repo_agents) == 1:
+            return repo_agents[0]
+        raise TargetUnresolved(
+            "deploy.no_targets",
+            f"{len(repo_agents)} agents are built from this repository but the "
+            "bundle declares no deploy.yaml, so there is nothing to say which "
+            "one this branch deploys to. Add deploy.yaml (ADR-0089).",
+        )
+
+    matching = [t for t in targets.targets.values() if t.env == environment.value]
+    if not matching:
+        # Not an error: a repository may deploy only prod from main and leave
+        # dev to the CLI. Ignoring matches how an unmatched branch behaves.
+        return None
+    if len(matching) > 1:
+        raise TargetUnresolved(
+            "deploy.ambiguous_env",
+            f"deploy.yaml declares {len(matching)} targets with env "
+            f"{environment.value!r} ({', '.join(sorted(str(t.agent) for t in matching))}); "
+            "one branch cannot deploy to two agents in one push.",
+        )
+
+    wanted = matching[0].agent
+    for agent in repo_agents:
+        if agent.name == wanted:
+            return agent
+
+    if named_elsewhere is not None:
+        # One repository's push would otherwise deploy over another's agent.
+        raise TargetUnresolved(
+            "deploy.agent_bound_elsewhere",
+            f"deploy.yaml names agent {wanted!r}, which is built from a "
+            "different repository. Refusing: a push must not deploy over an "
+            "agent another repository owns.",
+        )
+    raise TargetUnresolved(
+        "deploy.unknown_agent",
+        f"deploy.yaml names agent {wanted!r}, which does not exist. Create it "
+        "once (`curie cluster deploy`, or the console) so the push has "
+        "something to deploy to; a webhook does not mint agents.",
+    )
+
+
+def _read_targets(archive: bytes, settings: Settings) -> DeployTargetsFile | None:
+    """Read ``deploy.yaml`` out of an already-validated archive.
+
+    Extracted to a temp dir because that is the only way to read one file out
+    of the bundle, and run in a threadpool by the caller since it is blocking.
+    """
+
+    with tempfile.TemporaryDirectory() as tmp:
+        bundles.extract_and_validate(
+            archive,
+            Path(tmp),
+            max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
+            max_compression_ratio=settings.bundle_max_compression_ratio,
+            max_members=settings.bundle_max_members,
+        )
+        return bundles.read_deploy_targets(Path(tmp))
+
+
+def _target_agent_name(targets: DeployTargetsFile | None, environment: Environment) -> str | None:
+    """The agent name this environment's target names, if exactly one does."""
+
+    if targets is None:
+        return None
+    matching = [t for t in targets.targets.values() if t.env == environment.value]
+    return str(matching[0].agent) if len(matching) == 1 else None
+
+
+async def _sibling_bundle(
+    session: AsyncSession,
+    repo_agents: "Sequence[Agent]",
+    agent_id: uuid.UUID,
+    commit_sha: str,
+) -> "AgentVersion | None":
+    """A version another agent of this repo already stored for this commit."""
+
+    for sibling in repo_agents:
+        if sibling.id == agent_id:
+            continue
+        existing = await crud.get_version_by_commit(session, sibling.id, commit_sha)
+        if existing is not None and existing.bundle_ref:
+            return existing
+    return None

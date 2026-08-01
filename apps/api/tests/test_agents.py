@@ -14,9 +14,7 @@ def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
     return client.post("/agents", json=fields, headers=headers)
 
 
-def test_duplicate_name_is_409(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_duplicate_name_is_409(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     first = _create(client, auth_headers, name="dup-name", slack_channel="C0AAAAAA1")
     assert first.status_code == 201, first.text
 
@@ -25,9 +23,18 @@ def test_duplicate_name_is_409(
     assert dup.json()["detail"] == "an agent with that name already exists"
 
 
-def test_duplicate_repo_is_409(
+def test_two_agents_may_share_one_repository(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
+    """ADR-0091: one repository builds many agents.
+
+    This asserted a 409 until migration 0018. That constraint is what forced a
+    repo wanting a dev bot AND a prod bot -- the same bundle on two channels,
+    which is what a dev/prod split IS -- to create the second one out of band
+    and carry deploy workflows to do it. Which agent a push deploys to is now
+    answered by the bundle's `deploy.yaml`, not by the schema.
+    """
+
     first = _create(
         client,
         auth_headers,
@@ -37,15 +44,42 @@ def test_duplicate_repo_is_409(
     )
     assert first.status_code == 201, first.text
 
-    dup = _create(
+    second = _create(
         client,
         auth_headers,
         name="repo-agent-b",
         slack_channel="C0DDDDDD4",
         repo_full_name="octo/shared-repo",
     )
-    assert dup.status_code == 409, dup.text
-    assert dup.json()["detail"] == "an agent for that repository already exists"
+    assert second.status_code == 201, second.text
+    assert second.json()["repo_full_name"] == "octo/shared-repo"
+
+
+def test_two_agents_may_not_share_one_channel(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The deliberate asymmetry (#38). Sharing a repo is intended; sharing a
+    channel is the silent-shadowing bug -- the worker resolves a channel to one
+    agent, so the loser is deployed, healthy-looking, and never answering."""
+
+    assert (
+        _create(
+            client,
+            auth_headers,
+            name="chan-agent-a",
+            slack_channel="C0EEEEEE5",
+            repo_full_name="octo/one-repo",
+        ).status_code
+        == 201
+    )
+    clash = _create(
+        client,
+        auth_headers,
+        name="chan-agent-b",
+        slack_channel="C0EEEEEE5",
+        repo_full_name="octo/other-repo",
+    )
+    assert clash.status_code == 409, clash.text
 
 
 def test_duplicate_slack_channel_is_409(
@@ -314,9 +348,7 @@ def test_agent_approval_routes_rejects_bad_approvers(
             json={
                 "name": f"bad-approvers-{index}",
                 "slack_channel": "C000000C01",
-                "approval_routes": {
-                    "managers": {"channel": "C000000C02", "approvers": approvers}
-                },
+                "approval_routes": {"managers": {"channel": "C000000C02", "approvers": approvers}},
             },
             headers=auth_headers,
         )
@@ -403,9 +435,7 @@ def test_agent_approval_routes_patch_rejects_bad_approvers(
     patched = client.patch(
         f"/agents/{created.json()['id']}",
         json={
-            "approval_routes": {
-                "managers": {"channel": "C000000D02", "approvers": {"users": []}}
-            }
+            "approval_routes": {"managers": {"channel": "C000000D02", "approvers": {"users": []}}}
         },
         headers=auth_headers,
     )

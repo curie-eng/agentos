@@ -25,9 +25,7 @@ from ..schemas import (
     enforce_behavior_packs_size,
 )
 
-router = APIRouter(
-    prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)]
-)
+router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(require_api_key)])
 
 # Postgres SQLSTATE for a unique_violation. asyncpg exposes it (and the
 # violated constraint's name) as plain attributes on the wrapped driver
@@ -39,7 +37,16 @@ _UNIQUE_VIOLATION = "23505"
 # generic message.
 _UNIQUE_CONSTRAINT_MESSAGES = {
     "agents_name_key": "an agent with that name already exists",
-    "ix_agents_repo_full_name": "an agent for that repository already exists",
+    # ix_agents_repo_full_name stopped being unique in 0018 (ADR-0091): one
+    # repository builds many agents now. The mapping is kept because a
+    # pre-0018 database still has the unique index, and an operator hitting it
+    # deserves the actionable message rather than the generic fallback. It
+    # names the fix, since the constraint is no longer intended behaviour.
+    "ix_agents_repo_full_name": (
+        "an agent for that repository already exists. One repository may build "
+        "several agents (ADR-0091) -- run `alembic upgrade head` to apply "
+        "migration 0018, which drops this constraint"
+    ),
     # #38: one agent per channel. Without this the create succeeded and the
     # second agent was silently shadowed by the worker's resolver at runtime.
     "agents_slack_channel_key": (
@@ -122,9 +129,7 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 
 @router.patch("/{agent_id}", response_model=AgentOut)
-async def update_agent(
-    agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep
-) -> AgentOut:
+async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep) -> AgentOut:
     # Lets a redeploy move an existing agent's Slack channel (the CLI only sends
     # this when --slack-channel was passed explicitly). An omitted field is a
     # no-op so the agent's current channel is preserved.
@@ -151,9 +156,7 @@ async def update_agent(
         agent = await crud.update_agent_model(session, agent, data.model)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
-        agent = await crud.update_agent_approval_tools(
-            session, agent, data.approval_required_tools
-        )
+        agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)
     if data.approval_routes is not None:
         # Omitted leaves the bindings unchanged; an explicit {} clears them (#247).
         agent = await crud.update_agent_approval_routes(
@@ -161,6 +164,10 @@ async def update_agent(
             agent,
             {name: b.model_dump() for name, b in data.approval_routes.items()},
         )
+    if data.repo_full_name is not None:
+        # Binds this agent to a repository so git-flow can route pushes to it
+        # (ADR-0091). Several agents may share one, so this cannot collide.
+        agent = await crud.update_agent_repo(session, agent, data.repo_full_name)
     if data.secrets is not None:
         # Omitted leaves the secrets unchanged; an explicit {} clears them (#429).
         agent = await crud.update_agent_secrets(session, agent, data.secrets)
@@ -199,18 +206,14 @@ async def create_version(
 
 
 @router.get("/{agent_id}/versions", response_model=list[VersionOut])
-async def list_versions(
-    agent_id: uuid.UUID, session: SessionDep
-) -> list[VersionOut]:
+async def list_versions(agent_id: uuid.UUID, session: SessionDep) -> list[VersionOut]:
     if await crud.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
     versions = await crud.list_versions(session, agent_id)
     return [VersionOut.model_validate(v) for v in versions]
 
 
-@router.get(
-    "/{agent_id}/versions/{version_id}/connectors", response_model=ConnectorManifests
-)
+@router.get("/{agent_id}/versions/{version_id}/connectors", response_model=ConnectorManifests)
 async def read_version_connectors(
     agent_id: uuid.UUID,
     version_id: uuid.UUID,
@@ -237,9 +240,7 @@ async def read_version_connectors(
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     if version.bundle_ref is None:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "no bundle stored for this version"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no bundle stored for this version")
     # Object names are scoped to the agent, not just the release (#1116). Curie
     # runs many agents per release, so a release-scoped name lets two agents
     # that each declare `grafana` overwrite one another's Deployment, Service,
@@ -287,9 +288,7 @@ async def read_version_connectors(
     return await run_in_threadpool(_render)
 
 
-@router.get(
-    "/{agent_id}/versions/{version_id}/files", response_model=BundleFiles
-)
+@router.get("/{agent_id}/versions/{version_id}/files", response_model=BundleFiles)
 async def read_version_files(
     agent_id: uuid.UUID,
     version_id: uuid.UUID,
@@ -304,9 +303,7 @@ async def read_version_files(
     if version is None or version.agent_id != agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
     if version.bundle_ref is None:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND, "no bundle stored for this version"
-        )
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no bundle stored for this version")
     data = await store.get(version.bundle_ref)
     settings = get_settings()
     read = functools.partial(

@@ -89,11 +89,12 @@ def test_classifies_name_unique_violation() -> None:
 
 
 def test_classifies_repo_full_name_unique_violation() -> None:
+    # Kept after 0018 dropped the constraint (ADR-0091): a pre-0018 database
+    # still carries it, and that operator deserves the fix, not the fallback.
     exc = _integrity_error(_UNIQUE_VIOLATION, "ix_agents_repo_full_name")
-    assert classify_integrity_error(exc) == (
-        409,
-        "an agent for that repository already exists",
-    )
+    code, message = classify_integrity_error(exc)
+    assert code == 409
+    assert "several agents" in message and "0018" in message
 
 
 def test_classifies_unrecognized_unique_violation_with_generic_message() -> None:
@@ -134,7 +135,6 @@ def test_classifies_name_unique_violation_via_cause_chain() -> None:
 
 def test_classifies_repo_full_name_unique_violation_via_cause_chain() -> None:
     exc = _layered_integrity_error(_UNIQUE_VIOLATION, "ix_agents_repo_full_name")
-    assert classify_integrity_error(exc) == (
-        409,
-        "an agent for that repository already exists",
-    )
+    code, message = classify_integrity_error(exc)
+    assert code == 409
+    assert "several agents" in message
