@@ -125,8 +125,13 @@ def test_an_agent_whose_credential_was_never_provisioned_is_skipped() -> None:
     outcome = run(source, client)
 
     assert outcome.skipped is not None
-    assert SECRET_NAME in outcome.skipped
-    assert "GRAFANA_TOKEN" in outcome.skipped, "the message must say what to provision"
+    assert "curie cluster deploy" in outcome.skipped, "the message must say what to do"
+    # Deliberately NOT the Secret's name or its keys. Both are identifiers
+    # rather than values, but they are of no use here -- the operator's action
+    # is the same either way -- and leaving them out keeps a credential name out
+    # of a log stream that may be shipped somewhere less protected.
+    assert SECRET_NAME not in outcome.skipped
+    assert "GRAFANA_TOKEN" not in outcome.skipped
     assert client.applied == [] and client.deleted == []
 
 
