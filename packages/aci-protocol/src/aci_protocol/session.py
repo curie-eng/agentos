@@ -669,6 +669,9 @@ class BootEnv(_AciModel):
             approval_resumed_kind=_stripped_or_none(env.get("CURIE_APPROVAL_RESUMED_KIND")),
             approval_decision=_stripped_or_none(env.get("CURIE_APPROVAL_DECISION")),
             connector_secret_keys=_list_or_none(env.get("CURIE_CONNECTOR_SECRET_KEYS")),
+            connector_release=_str_or_none(env.get("CURIE_CONNECTOR_RELEASE")),
+            connector_agent=_str_or_none(env.get("CURIE_CONNECTOR_AGENT")),
+            connector_namespace=_str_or_none(env.get("CURIE_CONNECTOR_NAMESPACE")),
             port=_required_int(env.get("CURIE_RUNNER_PORT")),
             base_url=_str_or_none(env.get("ANTHROPIC_BASE_URL")),
             # Empty is "not declared" for both, matching sdk_auth's own
