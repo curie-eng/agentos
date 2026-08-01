@@ -122,19 +122,23 @@ def reconcile_agent(
             # Reconciling now would create Deployments referencing a Secret that
             # does not exist. Pods would stay stuck rather than fail loudly, and
             # the cause would be several layers from the symptom.
+            #
+            # The message deliberately names neither the Secret nor its keys.
+            # Both are identifiers rather than values -- `kubectl get secret`
+            # shows them -- but they are also of no use here: the operator's
+            # action is the same either way, and `curie cluster deploy` is what
+            # reports a key it cannot resolve. Leaving them out keeps a credential
+            # name out of a log stream that may be shipped somewhere less
+            # protected than the cluster.
             reason = (
-                f"connector credentials are operator-supplied and "
-                f"{rendered.owned_secret_name} is not provisioned; "
-                f"deploy once with the CLI (keys: {', '.join(rendered.owned_secret_keys)})"
+                "connector credentials are operator-supplied and not yet "
+                "provisioned in this namespace; run `curie cluster deploy` once "
+                "for this agent, or move the connector to a referenced secret"
             )
-            logger.warning("connector reconcile skipped agent=%s reason=%s", agent, reason)
+            logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
             return AgentOutcome(agent=agent, skipped=reason)
 
-        logger.debug(
-            "connector reconcile agent=%s protecting operator-supplied secret %s",
-            agent,
-            rendered.owned_secret_name,
-        )
+        logger.debug("connector reconcile agent=%s protecting its operator-supplied secret", agent)
 
     # Hidden from the plan rather than filtered out of its result: the plan's job
     # is "own it and no longer declare it -> delete it", and that judgement is
