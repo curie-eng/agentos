@@ -3,12 +3,13 @@
 
 mod support;
 
-use curie::api::{ApiClient, ChannelOutcome};
+use curie::api::{ApiClient, ChannelOutcome, DeployOutcome};
 use curie::bundle::pack_tar_gz;
 use curie::scaffold::scaffold;
-use support::{serve, Response};
+use support::{serve, MockServer, Response};
 
 const AGENT_ID: &str = "11111111-1111-1111-1111-111111111111";
+const AGENT_NAME: &str = "deal-desk";
 const VERSION_ID: &str = "22222222-2222-2222-2222-222222222222";
 const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 
@@ -155,33 +156,89 @@ fn deploy_tail(method: &str, path: &str) -> Option<Response> {
     }
 }
 
-fn existing_agent(channel: &str) -> Response {
-    Response::json(
-        200,
-        &format!(
-            r#"[{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"{channel}","created_at":"2026-07-05T00:00:00Z"}}]"#
-        ),
+/// One agent's wire JSON. `repo` emits the `repo_full_name` key only when the
+/// agent is bound, so an unbound agent travels as an ABSENT key and exercises
+/// the field's real `#[serde(default)]` path rather than an explicit null.
+fn agent_json(id: &str, name: &str, channel: &str, repo: Option<&str>) -> String {
+    let bound = match repo {
+        Some(repo) => format!(r#","repo_full_name":"{repo}""#),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"id":"{id}","name":"{name}","slack_channel":"{channel}","created_at":"2026-07-05T00:00:00Z"{bound}}}"#
     )
 }
 
-async fn run_deploy(client: &ApiClient, channel: Option<&str>) -> ChannelOutcome {
+/// The `GET /agents` listing that resolution reads: the one agent under test,
+/// as the platform would report it.
+fn existing_agents(agent: &str) -> Response {
+    Response::json(200, &format!("[{agent}]"))
+}
+
+/// The `PATCH /agents/{id}` response: the agent as the API stored it. The
+/// deploy must report THIS row, never a locally patched copy of the listed one,
+/// or the CLI can claim a binding the API never took.
+fn patched_agent(channel: &str, repo: Option<&str>) -> Response {
+    Response::json(200, &agent_json(AGENT_ID, AGENT_NAME, channel, repo))
+}
+
+/// Every recorded `PATCH /agents/{id}` body, parsed. The body on the wire is
+/// the contract under test: what the CLI SENT, not what it decided internally.
+fn patch_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+    server
+        .recorded()
+        .into_iter()
+        .filter(|r| r.method == "PATCH" && r.path == format!("/agents/{AGENT_ID}"))
+        .map(|r| serde_json::from_slice(&r.body).expect("PATCH body should be JSON"))
+        .collect()
+}
+
+/// Assert that the deploy issued no `PATCH /agents/{id}` at all.
+///
+/// This assertion is only load-bearing because the no-PATCH tests ANSWER an
+/// unexpected PATCH instead of panicking on it. The mock records a request
+/// only AFTER its handler returns (`cli/tests/support/mod.rs`), so a handler
+/// that panics on a PATCH means the PATCH is never recorded: the check then
+/// runs over a list that could not contain the thing it looks for and passes
+/// no matter what the CLI did. Such a test goes red only through the socket
+/// error the unwound handler thread causes, which is red for the wrong reason
+/// and is equally red for unrelated breakage. Answering keeps the request in
+/// the recording, so "the CLI sent a PATCH it must not send" is what fails,
+/// and the offending body is the failure message.
+fn assert_no_patch(server: &MockServer) {
+    let patches: Vec<String> = server
+        .recorded()
+        .iter()
+        .filter(|r| r.method == "PATCH")
+        .map(|r| format!("{} {}", r.path, String::from_utf8_lossy(&r.body)))
+        .collect();
+    assert!(
+        patches.is_empty(),
+        "no PATCH should have been issued, got {patches:?}"
+    );
+}
+
+async fn run_deploy(
+    client: &ApiClient,
+    channel: Option<&str>,
+    repo: Option<&str>,
+) -> DeployOutcome {
     let dir = tempfile::tempdir().unwrap();
-    scaffold(dir.path(), "deal-desk").unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
     let archive = pack_tar_gz(dir.path()).unwrap();
     client
         .deploy(
-            "deal-desk",
+            AGENT_NAME,
             channel,
             "0.1.0-1",
             "tester",
             "dev",
             archive,
             &std::collections::BTreeMap::new(),
-            None,
+            repo,
         )
         .await
         .unwrap()
-        .channel
 }
 
 #[tokio::test]
@@ -189,20 +246,15 @@ async fn redeploy_with_explicit_channel_patches_the_existing_agent() {
     // An existing agent on #old + `--slack-channel #new` must PATCH the agent to
     // move the channel (the audit MAJOR: the channel was silently ignored).
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/agents") => existing_agent("#old"),
-        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
-            200,
-            &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#new","created_at":"2026-07-05T00:00:00Z"}}"##
-            ),
-        ),
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent("#new", None),
         (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
     });
     let client = ApiClient::new(&server.base_url, "k").unwrap();
 
-    let outcome = run_deploy(&client, Some("#new")).await;
+    let outcome = run_deploy(&client, Some("#new"), None).await;
     assert_eq!(
-        outcome,
+        outcome.channel,
         ChannelOutcome::Updated {
             from: "#old".to_string(),
             to: "#new".to_string(),
@@ -224,23 +276,247 @@ async fn redeploy_without_channel_does_not_patch() {
     // Omitting `--slack-channel` on a redeploy must leave the agent's channel
     // untouched: no PATCH is issued at all.
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/agents") => existing_agent("#old"),
-        ("PATCH", _) => panic!("redeploy without --slack-channel must not PATCH"),
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        // Answered, never panicked, so the PATCH would be RECORDED and
+        // `assert_no_patch` is what fails. See its doc comment.
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent("#old", None),
         (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
     });
     let client = ApiClient::new(&server.base_url, "k").unwrap();
 
-    let outcome = run_deploy(&client, None).await;
+    let outcome = run_deploy(&client, None, None).await;
     assert_eq!(
-        outcome,
+        outcome.channel,
         ChannelOutcome::Unchanged {
             channel: "#old".to_string(),
             passed: false,
         }
     );
+    assert_no_patch(&server);
+}
+
+#[tokio::test]
+async fn deploy_binds_an_unbound_agents_repo() {
+    // An agent that already exists with NO repo binding is bound by this
+    // deploy, not told to recreate itself: `AgentUpdate` has carried
+    // `repo_full_name` since ADR-0091 / #1194, and until #1212 the CLI kept
+    // behaving as though it did not.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            patched_agent("#old", Some("acme/bundle"))
+        }
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, None, Some("acme/bundle")).await;
+
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "expected exactly one PATCH, got {patches:?}"
+    );
+    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
     assert!(
-        server.recorded().iter().all(|r| r.method != "PATCH"),
-        "no PATCH should have been issued"
+        patches[0].get("slack_channel").is_none(),
+        "no channel was passed, so the PATCH must not carry one: {}",
+        patches[0]
+    );
+    assert!(
+        outcome.repo_note.is_none(),
+        "a binding that was applied must not warn: {:?}",
+        outcome.repo_note
+    );
+    // Read back from the PATCH response, so the CLI cannot report a binding
+    // the API never stored.
+    assert_eq!(outcome.agent.repo_full_name.as_deref(), Some("acme/bundle"));
+}
+
+#[tokio::test]
+async fn deploy_binds_the_repo_while_also_moving_the_channel() {
+    // The channel move and the repo bind travel in ONE PATCH. The old code
+    // returned early out of the channel-updated branch, so a fix applied only
+    // to the channel-unchanged branch would move the channel and silently drop
+    // the binding on exactly this path.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            patched_agent("#new", Some("acme/bundle"))
+        }
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, Some("#new"), Some("acme/bundle")).await;
+
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "one PATCH carries both changes: {patches:?}"
+    );
+    assert_eq!(patches[0]["slack_channel"], "#new");
+    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    assert_eq!(
+        outcome.channel,
+        ChannelOutcome::Updated {
+            from: "#old".to_string(),
+            to: "#new".to_string(),
+        }
+    );
+    assert_eq!(outcome.agent.repo_full_name.as_deref(), Some("acme/bundle"));
+    assert!(
+        outcome.repo_note.is_none(),
+        "a binding that was applied must not warn: {:?}",
+        outcome.repo_note
+    );
+}
+
+#[tokio::test]
+async fn deploy_warns_when_the_platform_drops_the_repo_binding() {
+    // A platform older than `AgentUpdate.repo_full_name` (#1194) answers this
+    // PATCH 200 with the unknown key IGNORED: the agent comes back still
+    // unbound. `AgentUpdate` declares no `extra="forbid"`, so there is no 4xx
+    // and no unrouted-path 404 for the skew detector to key on -- the only
+    // evidence is the row that came back. Reporting a clean success here is
+    // exactly the failure #1064 exists to prevent: the operator believes the
+    // binding took, and git-flow never routes a push.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent("#old", None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, None, Some("acme/bundle")).await;
+
+    // The CLI did its half: the key went out on the wire.
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "expected exactly one PATCH, got {patches:?}"
+    );
+    assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    // And it reports the row the API returned, not the one it asked for.
+    assert_eq!(outcome.agent.repo_full_name, None);
+    let note = outcome
+        .repo_note
+        .expect("a binding the platform did not store must warn");
+    assert!(note.contains("acme/bundle"), "note was: {note}");
+    // The load-bearing half of this test is the `expect` above (no warning at
+    // all is the defect); these two pin that the note is about the PLATFORM
+    // dropping it, not about a declined rebind.
+    assert!(note.contains("platform"), "note was: {note}");
+    assert!(
+        !note.contains("already bound"),
+        "this is version skew, not a declined rebind: {note}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_does_not_rebind_an_agent_bound_elsewhere() {
+    // Moving a live binding reroutes which repository's pushes deploy the
+    // agent, which is ADR-0091's whole threat model. A routine deploy declines
+    // and says so instead.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(
+            AGENT_ID,
+            AGENT_NAME,
+            "#old",
+            Some("other/repo"),
+        )),
+        // Answered, never panicked, so a rebinding PATCH would be RECORDED and
+        // `assert_no_patch` is what fails. See its doc comment.
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            patched_agent("#old", Some("other/repo"))
+        }
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, None, Some("acme/bundle")).await;
+
+    assert_no_patch(&server);
+    let note = outcome.repo_note.expect("a declined --repo must warn");
+    assert!(note.contains("other/repo"), "note was: {note}");
+    assert!(note.contains("acme/bundle"), "note was: {note}");
+    // The binding CAN be changed now; a deploy just refuses to be the thing
+    // that changes it. The old wording sent operators off to recreate the
+    // agent, which is the false claim #1212 exists to retire.
+    assert!(!note.contains("cannot be changed"), "note was: {note}");
+    assert!(!note.contains("recreate"), "note was: {note}");
+}
+
+#[tokio::test]
+async fn deploy_with_a_matching_repo_does_not_patch() {
+    // Already bound to exactly what was asked for. A no-op PATCH would add a
+    // write to every routine redeploy and buy nothing.
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(
+            AGENT_ID,
+            AGENT_NAME,
+            "#old",
+            Some("acme/bundle"),
+        )),
+        // Answered, never panicked, so a no-op PATCH would be RECORDED and
+        // `assert_no_patch` is what fails. See its doc comment.
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            patched_agent("#old", Some("acme/bundle"))
+        }
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, None, Some("acme/bundle")).await;
+
+    assert_no_patch(&server);
+    assert!(
+        outcome.repo_note.is_none(),
+        "nothing was declined, so nothing to warn about: {:?}",
+        outcome.repo_note
+    );
+}
+
+#[tokio::test]
+async fn deploy_without_repo_never_sends_the_field() {
+    // Omission is the wire spelling for "leave the binding alone". An explicit
+    // null would read as omitted at the router today, but absence is the
+    // contract we actually want on the wire (#1071).
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(
+            AGENT_ID,
+            AGENT_NAME,
+            "#old",
+            Some("acme/bundle"),
+        )),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            patched_agent("#new", Some("acme/bundle"))
+        }
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    let outcome = run_deploy(&client, Some("#new"), None).await;
+
+    let patches = patch_bodies(&server);
+    assert_eq!(
+        patches.len(),
+        1,
+        "expected exactly one PATCH, got {patches:?}"
+    );
+    assert_eq!(patches[0]["slack_channel"], "#new");
+    assert!(
+        patches[0].get("repo_full_name").is_none(),
+        "the key must be ABSENT, not null: {}",
+        patches[0]
+    );
+    assert!(
+        outcome.repo_note.is_none(),
+        "no --repo was passed, so nothing to warn about: {:?}",
+        outcome.repo_note
     );
 }
 

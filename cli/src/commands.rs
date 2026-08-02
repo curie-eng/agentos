@@ -745,10 +745,11 @@ pub struct DeployNamedOpts {
     pub api_url: String,
     pub api_key: String,
     pub slack_channel: Option<String>,
-    /// `owner/name` to bind at agent CREATION so pushes to that repo deploy this
-    /// agent (ADR-0014). Identity, not config: it cannot be changed afterwards,
-    /// so omitting it here leaves the agent permanently unable to use git-flow
-    /// (#1064). Ignored with a warning when the agent already exists.
+    /// `owner/name` binding the repository whose pushes deploy this agent
+    /// (ADR-0014). Bound when the agent is created, or on a later deploy if the
+    /// agent has no binding yet (#1194). An agent already bound to a DIFFERENT
+    /// repository is left alone and warned about, because a deploy does not
+    /// reroute an existing binding.
     pub repo: Option<String>,
     pub env: DeployEnv,
     pub label: Option<String>,
@@ -2938,10 +2939,11 @@ pub struct DeployOpts {
     /// leaves an existing agent's channel untouched instead of masking intent
     /// with a default.
     pub slack_channel: Option<String>,
-    /// `owner/name` to bind at agent CREATION so pushes to that repo deploy this
-    /// agent (ADR-0014). Identity, not config: it cannot be changed afterwards,
-    /// so omitting it here leaves the agent permanently unable to use git-flow
-    /// (#1064). Ignored with a warning when the agent already exists.
+    /// `owner/name` binding the repository whose pushes deploy this agent
+    /// (ADR-0014). Bound when the agent is created, or on a later deploy if the
+    /// agent has no binding yet (#1194). An agent already bound to a DIFFERENT
+    /// repository is left alone and warned about, because a deploy does not
+    /// reroute an existing binding.
     pub repo: Option<String>,
     /// None means the caller did not pass --env, so a declared target may
     /// supply it. An explicit flag still wins (ADR-0089).
@@ -3174,10 +3176,24 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         }
     };
 
-    // A --repo that could not be applied is a silent no-op otherwise: the deploy
-    // succeeds, the agent looks fine, and git-flow never fires (#1064).
+    // A declined --repo is otherwise silent: the deploy succeeds, the agent
+    // looks fine, and the operator believes the rebind took (#1064, #1212).
     if let Some(note) = &outcome.repo_note {
         ui.warn(note);
+    }
+
+    // An APPLIED --repo was equally silent: writing the field that decides
+    // which repository's pushes deploy this agent produced no output at all.
+    // The value read here is the one the API stored, not the one asked for, so
+    // a bind the platform dropped falls to the warning above instead (#1212).
+    let bound_repo = opts
+        .repo
+        .as_deref()
+        .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
+    if let Some(repo) = bound_repo {
+        ui.note(&format!(
+            "repo binding: git-flow pushes to {repo} deploy this agent"
+        ));
     }
 
     let channel = match &outcome.channel {

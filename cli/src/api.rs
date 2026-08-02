@@ -55,9 +55,10 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub slack_channel: String,
-    /// The repository whose pushes deploy this agent (ADR-0014). Identity, set
-    /// only at creation -- `AgentUpdate` deliberately excludes it -- so the CLI
-    /// must send it up front or the agent can never reach git-flow (#1064).
+    /// The repository whose pushes deploy this agent (ADR-0014). Set at
+    /// creation via `--repo`, or bound later by PATCH since `AgentUpdate`
+    /// carries the field (#1194). ADR-0091 dropped the unique index, so
+    /// several agents may share one repository.
     #[serde(default)]
     pub repo_full_name: Option<String>,
     /// Tool names gated behind human approval (#245). Present on `AgentOut`;
@@ -362,9 +363,12 @@ pub struct DeployOutcome {
     pub bundle: Bundle,
     pub deployment: Deployment,
     pub channel: ChannelOutcome,
-    /// Set when `--repo` could not be applied because the agent already exists
-    /// and its repo binding is immutable. Surfaced so the operator learns it
-    /// silently did nothing (#1064).
+    /// The warning about what `--repo` did, if any: either the binding was
+    /// declined because the agent is already bound to a different repository,
+    /// or a bind was requested and the platform's response did not carry it
+    /// back. `None` on a successful bind or when `--repo` was not passed.
+    /// Surfaced so the operator never believes a binding that is not there
+    /// (#1064, #1212).
     pub repo_note: Option<String>,
 }
 
@@ -414,14 +418,39 @@ fn warn_if_insecure(base_url: &str) {
 
 /// The `POST /agents` body. Pure so the shape is testable without a live API.
 ///
-/// `repo_full_name` is sent only when asked: it is UNIQUE per agent, so an
-/// unsolicited value would 409 against whichever agent already owns that repo.
+/// `repo_full_name` is sent only when asked, because a value the caller did not
+/// pass is not a binding the caller intended. Since ADR-0091 and migration 0018
+/// the column is no longer unique, so an unsolicited value would silently bind
+/// the new agent to that repository rather than 409, which is worse.
 fn agent_create_body(
     name: &str,
     slack_channel: &str,
     repo_full_name: Option<&str>,
 ) -> serde_json::Value {
     let mut body = json!({"name": name, "slack_channel": slack_channel});
+    if let Some(repo) = repo_full_name {
+        body["repo_full_name"] = json!(repo);
+    }
+    body
+}
+
+/// The `PATCH /agents/{id}` body for the fields deploy reconciles. Pure so the
+/// shape is testable without a live API.
+///
+/// Each key appears only when its argument is `Some`: omission is the wire
+/// spelling for "leave this field unchanged". Neither key is ever emitted as an
+/// explicit JSON `null`, because the router guards both behind `is not None`
+/// and Pydantic decodes a `null` and an absent key to the same `None`, so a
+/// `null` would read as "omitted" while looking on the wire like an intent to
+/// clear (#1071, the same trap documented on [`ApiClient::set_approval_routes`]).
+fn agent_update_body(
+    slack_channel: Option<&str>,
+    repo_full_name: Option<&str>,
+) -> serde_json::Value {
+    let mut body = json!({});
+    if let Some(channel) = slack_channel {
+        body["slack_channel"] = json!(channel);
+    }
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
     }
@@ -534,16 +563,19 @@ impl ApiClient {
         self.create_agent(name, slack_channel, None).await
     }
 
-    pub async fn update_agent_channel(&self, agent_id: &str, slack_channel: &str) -> Result<Agent> {
+    /// `PATCH /agents/{id}` with a body the caller already built (see
+    /// [`agent_update_body`]). The returned `Agent` is the row as the API
+    /// stored it, so callers report what took rather than what they intended.
+    pub async fn update_agent(&self, agent_id: &str, body: &serde_json::Value) -> Result<Agent> {
         let resp = self
             .http
             .patch(format!("{}/agents/{agent_id}", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({"slack_channel": slack_channel}))
+            .json(body)
             .send()
             .await
             .context("PATCH /agents/{id}")?;
-        Self::expect_ok(resp, "updating the agent channel")
+        Self::expect_ok(resp, "updating the agent")
             .await?
             .json()
             .await
@@ -573,11 +605,16 @@ impl ApiClient {
             .context("decoding updated agent")
     }
 
-    /// Find the agent by name (or create it), reconciling its Slack channel with
-    /// an explicitly-passed `--slack-channel`. A new agent binds to the passed
-    /// channel (or the default); an existing agent's channel is moved via PATCH
-    /// only when a channel was passed and differs -- an omitted channel never
-    /// silently overwrites what is already set.
+    /// Find the agent by name (or create it), reconciling its Slack channel and
+    /// its repo binding with an explicitly-passed `--slack-channel`/`--repo`.
+    ///
+    /// A new agent binds to the passed channel (or the default); an existing
+    /// agent's channel is moved via PATCH only when a channel was passed and
+    /// differs -- an omitted channel never silently overwrites what is already
+    /// set. An existing agent with no repo binding is bound to `--repo` in that
+    /// same PATCH; one already bound elsewhere is left alone. The third return
+    /// value is the operator note, set when the repo binding did not end up
+    /// where `--repo` asked and left `None` when it did.
     async fn resolve_agent(
         &self,
         name: &str,
@@ -591,36 +628,65 @@ impl ApiClient {
             .find(|a| a.name == name);
         match existing {
             Some(agent) => {
-                // The repo binding is identity: `AgentUpdate` excludes it, so a
-                // PATCH would return 200 and change nothing. Say so plainly
-                // rather than let the operator believe it took (#1064).
-                let repo_note = match (repo_full_name, agent.repo_full_name.as_deref()) {
-                    (Some(want), Some(have)) if want == have => None,
-                    (Some(want), Some(have)) => Some(format!(
-                        "agent is already bound to {have}; --repo {want} was NOT applied \
-                         (the repo binding is set at creation and cannot be changed)"
-                    )),
-                    (Some(want), None) => Some(format!(
-                        "agent exists with no repo binding; --repo {want} was NOT applied \
-                         (the binding is set at creation only, so this agent cannot use \
-                         git-flow -- recreate it to bind one)"
-                    )),
-                    (None, _) => None,
+                // `AgentUpdate` has carried `repo_full_name` since ADR-0091 and
+                // #1194, so an agent with no binding is bound right here rather
+                // than sent away to be built again from scratch (#1212). An
+                // agent already bound elsewhere is NOT moved: a deploy must not
+                // silently reroute which repository's pushes reach it.
+                let channel_move = slack_channel.filter(|c| *c != agent.slack_channel.as_str());
+                let current_repo = agent.repo_full_name.as_deref();
+                let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
+                    (Some(want), None) => (Some(want), None),
+                    (Some(want), Some(have)) if want != have => (
+                        None,
+                        Some(format!(
+                            "agent is already bound to {have}; --repo {want} was NOT \
+                             applied. A deploy does not move an existing repo binding, \
+                             because that reroutes which repository's pushes deploy this \
+                             agent. To rebind deliberately, PATCH repo_full_name on \
+                             /agents/{id} against the platform API.",
+                            id = agent.id
+                        )),
+                    ),
+                    _ => (None, None),
                 };
-                let outcome = match slack_channel {
-                    Some(channel) if channel != agent.slack_channel => {
-                        let from = agent.slack_channel.clone();
-                        let updated = self.update_agent_channel(&agent.id, channel).await?;
-                        let to = updated.slack_channel.clone();
-                        return Ok((updated, ChannelOutcome::Updated { from, to }, repo_note));
-                    }
-                    other => {
-                        let channel = agent.slack_channel.clone();
-                        ChannelOutcome::Unchanged {
-                            channel,
-                            passed: other.is_some(),
-                        }
-                    }
+                // One request rather than two removes the client-side window
+                // where the channel moved and a second call then failed, and
+                // the channel-uniqueness 409 aborts before repo_full_name is
+                // reached. The server still commits per field, so the two
+                // fields are not applied atomically.
+                let previous_channel = channel_move.map(|_| agent.slack_channel.clone());
+                let agent = if channel_move.is_some() || repo_bind.is_some() {
+                    let body = agent_update_body(channel_move, repo_bind);
+                    self.update_agent(&agent.id, &body).await?
+                } else {
+                    agent
+                };
+                // `AgentUpdate` ignores unknown keys, so a platform older than
+                // #1194 answers the bind with 200 and stores nothing. The
+                // response is the only place that shows up: without this check
+                // the deploy reports a binding the platform never made, which
+                // is the exact failure #1064 put an operator warning here for.
+                let bound = agent.repo_full_name.as_deref();
+                if let Some(want) = repo_bind.filter(|&w| bound != Some(w)) {
+                    repo_note = Some(format!(
+                        "--repo {want} was sent but the platform did not apply it (the agent \
+                         reports {stored}). That usually means the platform release predates \
+                         the AgentUpdate.repo_full_name field (#1194) and ignored the key. \
+                         git-flow will not route pushes to this agent until the platform is \
+                         upgraded or the binding is set another way.",
+                        stored = bound.unwrap_or("no binding")
+                    ));
+                }
+                let outcome = match previous_channel {
+                    Some(from) => ChannelOutcome::Updated {
+                        from,
+                        to: agent.slack_channel.clone(),
+                    },
+                    None => ChannelOutcome::Unchanged {
+                        channel: agent.slack_channel.clone(),
+                        passed: slack_channel.is_some(),
+                    },
                 };
                 Ok((agent, outcome, repo_note))
             }
@@ -1189,12 +1255,13 @@ impl ApiClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_create_body, is_insecure_endpoint};
+    use super::{agent_create_body, agent_update_body, is_insecure_endpoint};
 
     #[test]
     fn create_agent_body_omits_repo_unless_asked() {
-        // repo_full_name is UNIQUE per agent, so sending an unsolicited value
-        // would 409 against whichever agent already owns that repo.
+        // A value the caller did not pass is not a binding the caller intended.
+        // The column is no longer unique (ADR-0091, migration 0018), so an
+        // unsolicited value would silently bind rather than 409.
         let body = agent_create_body("bot", "C123", None);
         assert_eq!(body["name"], "bot");
         assert_eq!(body["slack_channel"], "C123");
@@ -1203,10 +1270,40 @@ mod tests {
 
     #[test]
     fn create_agent_body_binds_the_repo_when_asked() {
-        // Creation is the ONLY chance: AgentUpdate excludes repo_full_name, so
-        // an agent created without it can never reach git-flow (#1064).
+        // Creation is the first chance to bind, and the only one that needs no
+        // second request: AgentUpdate carries repo_full_name too (#1194).
         let body = agent_create_body("bot", "C123", Some("acme/bundle"));
         assert_eq!(body["repo_full_name"], "acme/bundle");
+    }
+
+    #[test]
+    fn agent_update_body_omits_both_when_neither_is_asked() {
+        // Omission is how the wire says "leave this alone", so a PATCH with
+        // nothing to change carries nothing at all.
+        let body = agent_update_body(None, None);
+        assert!(
+            body.as_object().expect("an object").is_empty(),
+            "was {body}"
+        );
+    }
+
+    #[test]
+    fn agent_update_body_carries_only_what_was_asked() {
+        // Each absent key must be ABSENT, never an explicit null: the router
+        // guards both fields behind `is not None`, and Pydantic decodes a null
+        // and an omitted key identically, so a null would read as "omitted"
+        // while looking on the wire like an intent to clear (#1071).
+        let channel = agent_update_body(Some("C123"), None);
+        assert_eq!(channel["slack_channel"], "C123");
+        assert!(channel.get("repo_full_name").is_none(), "was {channel}");
+
+        let repo = agent_update_body(None, Some("acme/bundle"));
+        assert_eq!(repo["repo_full_name"], "acme/bundle");
+        assert!(repo.get("slack_channel").is_none(), "was {repo}");
+
+        let both = agent_update_body(Some("C123"), Some("acme/bundle"));
+        assert_eq!(both["slack_channel"], "C123");
+        assert_eq!(both["repo_full_name"], "acme/bundle");
     }
 
     #[test]

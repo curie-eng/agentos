@@ -277,11 +277,12 @@ enum Command {
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
-        /// The binding is IDENTITY, not config: the platform sets it only when
-        /// the agent is created and `AgentUpdate` cannot change it. Deploying
-        /// without it creates an agent that can never use git-flow, and the
-        /// only remedy is recreating the agent (#1064). Passing it for an
-        /// agent that already exists warns and changes nothing.
+        /// A new agent is created bound to it, and an existing agent with no
+        /// binding is bound now (#1194 made `repo_full_name` PATCHable and
+        /// ADR-0091 dropped the uniqueness, so one repository can build several
+        /// agents). An agent already bound to a DIFFERENT repository is NOT
+        /// moved, because that would reroute which repository's pushes deploy
+        /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
         /// Target environment. Defaults to dev; a `--target` supplies it
@@ -948,11 +949,12 @@ enum LocalAction {
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
-        /// The binding is IDENTITY, not config: the platform sets it only when
-        /// the agent is created and `AgentUpdate` cannot change it. Deploying
-        /// without it creates an agent that can never use git-flow, and the
-        /// only remedy is recreating the agent (#1064). Passing it for an
-        /// agent that already exists warns and changes nothing.
+        /// A new agent is created bound to it, and an existing agent with no
+        /// binding is bound now (#1194 made `repo_full_name` PATCHable and
+        /// ADR-0091 dropped the uniqueness, so one repository can build several
+        /// agents). An agent already bound to a DIFFERENT repository is NOT
+        /// moved, because that would reroute which repository's pushes deploy
+        /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
         /// Target environment. Defaults to dev; a `--target` supplies it
@@ -1436,11 +1438,12 @@ enum ClusterAction {
         /// Bind this agent to a GitHub repository (`owner/name`) so pushes to
         /// its dev/prod branches deploy it (ADR-0014).
         ///
-        /// The binding is IDENTITY, not config: the platform sets it only when
-        /// the agent is created and `AgentUpdate` cannot change it. Deploying
-        /// without it creates an agent that can never use git-flow, and the
-        /// only remedy is recreating the agent (#1064). Passing it for an
-        /// agent that already exists warns and changes nothing.
+        /// A new agent is created bound to it, and an existing agent with no
+        /// binding is bound now (#1194 made `repo_full_name` PATCHable and
+        /// ADR-0091 dropped the uniqueness, so one repository can build several
+        /// agents). An agent already bound to a DIFFERENT repository is NOT
+        /// moved, because that would reroute which repository's pushes deploy
+        /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
         /// Target environment. Defaults to dev; a `--target` supplies it
