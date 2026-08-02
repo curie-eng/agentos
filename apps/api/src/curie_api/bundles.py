@@ -115,11 +115,13 @@ def read_connectors(root: Path) -> ConnectorsFile:
 
 
 def read_deploy_targets(root: Path) -> DeployTargetsFile | None:
-    """Parse a validated bundle's ``deploy.yaml``, or None when it declares none.
+    """Parse a validated bundle's ``deploy.yaml``, or None when the file is ABSENT.
 
     None is not an error. A bundle without ``deploy.yaml`` predates ADR-0089
     and still deploys to the single agent its repository binds -- the caller
-    must keep working for it, not reject it.
+    must keep working for it, not reject it. A present file that declares no
+    targets is a different case: it returns a non null ``DeployTargetsFile``
+    with an empty ``targets`` map, not None.
     """
 
     path = bundle_root(root) / DEPLOY_FILE
