@@ -100,6 +100,37 @@ async def test_a_skipped_agent_is_counted_separately_from_a_failure() -> None:
     assert summary.failed == 0
 
 
+async def test_a_skipped_agents_deletes_are_counted(caplog) -> None:
+    # #1214: an unprovisioned-Secret agent no longer early-returns -- it still
+    # runs a delete-only plan, so a skipped outcome can carry a report with
+    # real deletes. The `continue` on `outcome.skipped` drops that report on
+    # the floor: a pass that pruned three objects would claim zero deletes, in
+    # the summary and in the pass log operators actually read.
+    skipped = AgentOutcome(
+        agent="a",
+        skipped="credentials not provisioned",
+        report=ApplyReport(deleted=[("Service", "d0"), ("Service", "d1"), ("Service", "d2")]),
+    )
+    with caplog.at_level("INFO", logger="curie_worker.connector_loop"):
+        summary = await Loop([target("a")], {"a": skipped}).one_pass()
+    assert summary.skipped == 1
+    assert summary.deleted == 3
+    assert any("3 deleted" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_failed_delete_on_a_skipped_agent_still_counts_as_a_failure() -> None:
+    # Same gap, the failure side: a delete that errors on a skipped agent must
+    # not vanish from `summary.failed` along with the rest of its report.
+    skipped = AgentOutcome(
+        agent="a",
+        skipped="credentials not provisioned",
+        report=ApplyReport(failures=[("Service", "d0", "forbidden")]),
+    )
+    summary = await Loop([target("a")], {"a": skipped}).one_pass()
+    assert summary.skipped == 1
+    assert summary.failed == 1
+
+
 async def test_no_agents_is_a_clean_pass() -> None:
     summary = await Loop([], {}).one_pass()
     assert summary == PassSummary()

@@ -117,7 +117,13 @@ class HttpManifestSource:
 
 @dataclass
 class PassSummary:
-    """What one sweep did. Reported so a pass is auditable without a debugger."""
+    """What one sweep did. Reported so a pass is auditable without a debugger.
+
+    Counters are per-event, not a partition of agents -- a skipped agent whose
+    delete-only prune still ran can add to both ``skipped`` and ``deleted``,
+    or to both ``skipped`` and ``failed`` if that prune errored. Do not expect
+    them to sum to ``reconciled``.
+    """
 
     reconciled: int = 0
     applied: int = 0
@@ -193,7 +199,10 @@ class ConnectorReconcileLoop:
 
             if outcome.skipped:
                 summary.skipped += 1
-                continue
+                # A skip means "no operator-supplied Secret", not "nothing
+                # happened": #1214 still runs a delete-only prune in that case,
+                # so the report below (if any) can carry real deletes or a
+                # real failure that must not vanish along with the skip.
             if outcome.report is not None:
                 summary.applied += len(outcome.report.applied)
                 summary.deleted += len(outcome.report.deleted)

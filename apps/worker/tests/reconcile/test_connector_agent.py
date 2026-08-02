@@ -132,7 +132,108 @@ def test_an_agent_whose_credential_was_never_provisioned_is_skipped() -> None:
     # of a log stream that may be shipped somewhere less protected.
     assert SECRET_NAME not in outcome.skipped
     assert "GRAFANA_TOKEN" not in outcome.skipped
+    # Vacuous on the delete half: this FakeClient starts with nothing live, so
+    # deleted == [] proves nothing about pruning. The delete-half assertion
+    # that would actually catch a regression lives in
+    # test_an_unprovisioned_agent_still_prunes_what_it_no_longer_declares below.
     assert client.applied == [] and client.deleted == []
+
+
+def test_an_unprovisioned_agent_still_prunes_what_it_no_longer_declares() -> None:
+    # #1214: the skip above exists to stop a Deployment being applied with a
+    # secretKeyRef pointing at nothing. It does NOT need to stop a delete --
+    # removing an object is never harmed by a missing Secret. The old
+    # `return AgentOutcome(agent=agent, skipped=reason)` stopped both, so an
+    # agent that removed a connector while also missing its operator secret
+    # leaked that connector's objects until someone happened to run
+    # `curie cluster deploy` for an unrelated reason. `kept` stays declared
+    # (so the still-owed pass must leave it alone); `new_dep` is declared but
+    # not yet live, so if applies were not actually suppressed it would show
+    # up in `client.applied` -- proving the suppression rather than assuming it.
+    kept = manifest("Deployment", "kept-dep")
+    new_dep = manifest("Deployment", "new-dep")
+    stale_dep = live_copy(manifest("Deployment", "stale-dep"))
+    stale_netpol = live_copy(manifest("NetworkPolicy", "stale-netpol"))
+    stale_svc = live_copy(manifest("Service", "stale-svc"))
+    client = FakeClient([live_copy(kept), stale_dep, stale_netpol, stale_svc])
+    source = Source(
+        RenderedConnectors(
+            manifests=[kept, new_dep],
+            owned_secret_name=SECRET_NAME,
+            owned_secret_keys=["TOKEN"],
+        )
+    )
+
+    outcome = run(source, client)
+
+    assert outcome.skipped is not None
+    assert "curie cluster deploy" in outcome.skipped
+    assert SECRET_NAME not in outcome.skipped and "TOKEN" not in outcome.skipped
+
+    assert outcome.report is not None
+    assert outcome.report.applied == []
+    assert outcome.report.deleted == [
+        ("Deployment", "stale-dep"),
+        ("NetworkPolicy", "stale-netpol"),
+        ("Service", "stale-svc"),
+    ]
+    assert client.applied == [], "no values exist for the missing secret -- applying stays off"
+    assert ("Deployment", "kept-dep") not in client.deleted, "still declared, not this pass's job"
+
+
+def test_no_secret_of_any_name_is_pruned_on_the_unprovisioned_branch() -> None:
+    # Why no Secret of any name is manageable here: the `connector_agent` module
+    # docstring. `stale-svc` keeps the test honest -- pruning still happens on
+    # this branch (#1214), it is Secrets specifically that are held back.
+    stale_secret = live_copy(
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "old-connector-secret"}}
+    )
+    stale_svc = live_copy(manifest("Service", "stale-svc"))
+    client = FakeClient([stale_secret, stale_svc])
+    source = Source(
+        RenderedConnectors(manifests=[], owned_secret_name=SECRET_NAME, owned_secret_keys=["TOKEN"])
+    )
+
+    outcome = run(source, client)
+
+    assert outcome.skipped is not None
+    pruned = client.deleted
+    assert [d for d in pruned if d[0] == "Secret"] == [], "no Secret may be pruned on this branch"
+    assert ("Service", "stale-svc") in pruned, "non-Secret objects must still prune (#1214)"
+
+
+def test_a_failed_prune_on_the_skip_path_is_reported_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The skip branch runs deletes, so it can FAIL deletes -- a finalizer or an
+    # RBAC gap leaves the object live and the same failure recurs every pass.
+    # Returning straight off `execute()` makes that invisible: the only record
+    # of the pass is the skip reason, which names neither the object nor the
+    # error, so the operator sees a routine skip while a prune silently never
+    # lands. It stays a skip and it stays non-raising -- one agent's stuck
+    # delete must not abort the pass for the rest.
+    class ExplodingDelete(FakeClient):
+        def delete(self, namespace: str, kind: str, name: str) -> None:
+            raise RuntimeError("apiserver refused: forbidden")
+
+    stale_svc = live_copy(manifest("Service", "stale-svc"))
+    client = ExplodingDelete([stale_svc])
+    source = Source(
+        RenderedConnectors(manifests=[], owned_secret_name=SECRET_NAME, owned_secret_keys=["TOKEN"])
+    )
+
+    with caplog.at_level("WARNING", logger="curie_worker.connector_agent"):
+        outcome = run(source, client)
+
+    assert outcome.skipped is not None, "a failed prune does not turn the skip into a normal pass"
+    assert outcome.report is not None and outcome.report.failures
+    assert not outcome.ok
+    assert any(
+        "Service" in r.getMessage()
+        and "stale-svc" in r.getMessage()
+        and "apiserver refused: forbidden" in r.getMessage()
+        for r in caplog.records
+    ), "the failing object and its error must reach a log stream, not just the outcome"
 
 
 def test_a_reference_form_bundle_has_no_exception_at_all() -> None:
@@ -158,6 +259,29 @@ def test_a_stale_secret_is_still_pruned_when_no_keys_are_owned() -> None:
 
     run(source, client)
     assert client.deleted == [("Secret", "stale")]
+
+
+def test_the_secret_exclusion_does_not_reach_the_provisioned_path() -> None:
+    # Pins the SCOPE of the by-kind exclusion, which the test above cannot: that
+    # one has no owned keys, so `needs_operator_credentials` is False and
+    # widening the guard to `unprovisioned or rendered.needs_operator_credentials`
+    # survives it. Here the render-named Secret IS live, so the branch is not
+    # taken and a stale-named owned Secret is ordinary garbage that must still
+    # go -- under the widened guard it would be held back and leak forever.
+    keeper = live_copy({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": SECRET_NAME}})
+    stale = live_copy(
+        {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "old-connector-secret"}}
+    )
+    client = FakeClient([keeper, stale])
+    source = Source(
+        RenderedConnectors(manifests=[], owned_secret_name=SECRET_NAME, owned_secret_keys=["TOKEN"])
+    )
+
+    outcome = run(source, client)
+
+    assert outcome.skipped is None, "the render-named Secret is live -- this is the normal path"
+    # Exact list: the stale name went, and the render-named one did not.
+    assert client.deleted == [("Secret", "old-connector-secret")]
 
 
 # --------------------------------------------------------------------------- #

@@ -20,11 +20,24 @@ object is owned, it is genuinely undeclared, and pruning it is exactly what the
 plan is supposed to do. Nothing downstream can catch this; it has to be handled
 here.
 
-So an agent's owned Secret is protected: never applied (we have no values) and
-never pruned (someone else owns its lifecycle). And if it is protected but
-absent, the agent is skipped entirely rather than reconciled -- applying a
-Deployment whose secretKeyRef points at a Secret that does not exist produces
-pods that never start, which is worse than not acting.
+So the owned Secret THE CURRENT RENDER NAMES is protected: never applied (we
+have no values) and never pruned (someone else owns its lifecycle). And if it is
+protected but absent, the pass suppresses every apply -- applying a Deployment
+whose secretKeyRef points at a Secret that does not exist produces pods that
+never start, which is worse than not acting. It still prunes: objects the
+in-force version no longer declares are deleted as usual, because removing an
+object is never harmed by a missing Secret. Holding those deletes back only left
+a withdrawn connector running for as long as the agent stayed unprovisioned
+(#1214).
+
+That prune has one exclusion, and only on that branch: no Secret of ANY name is
+manageable there. The branch is entered because the named Secret is absent, so
+an owner-labelled Secret still live at that moment is by construction one whose
+name the render no longer matches -- and the name is release-scoped, so a
+re-release, or drift between the worker's `CURIE_RELEASE` and the CLI's
+`--release`, is enough to produce exactly that. It is the operator's real
+credential under a stale name, not garbage, and it is unrecoverable. On the
+normal path a stale-named owned Secret is still pruned as usual.
 
 Connectors using the reference form (`secrets: [{from_secret: ...}]`, #1163)
 have no owned keys at all, so they reconcile with no exception. That is the
@@ -72,7 +85,9 @@ class ManifestSource(Protocol):
 
 @dataclass(frozen=True)
 class AgentOutcome:
-    """What reconciling one agent did, or why it did nothing."""
+    """What reconciling one agent did. `skipped` names a suppressed apply half,
+    not an inert pass -- it still carries the deletes that ran and any failures.
+    """
 
     agent: str
     skipped: str | None = None
@@ -116,40 +131,77 @@ def reconcile_agent(
     live = client.list_owned(namespace, agent)
 
     protected: set[tuple[str, str]] = set()
+    unprovisioned = False
     if rendered.needs_operator_credentials and rendered.owned_secret_name:
         protected.add(("Secret", rendered.owned_secret_name))
-        if not any(identity(obj) in protected for obj in live):
-            # Reconciling now would create Deployments referencing a Secret that
-            # does not exist. Pods would stay stuck rather than fail loudly, and
-            # the cause would be several layers from the symptom.
-            #
-            # The message deliberately names neither the Secret nor its keys.
-            # Both are identifiers rather than values -- `kubectl get secret`
-            # shows them -- but they are also of no use here: the operator's
-            # action is the same either way, and `curie cluster deploy` is what
-            # reports a key it cannot resolve. Leaving them out keeps a credential
-            # name out of a log stream that may be shipped somewhere less
-            # protected than the cluster.
-            reason = (
-                "connector credentials are operator-supplied and not yet "
-                "provisioned in this namespace; run `curie cluster deploy` once "
-                "for this agent, or move the connector to a referenced secret"
+        unprovisioned = not any(identity(obj) in protected for obj in live)
+        if not unprovisioned:
+            logger.debug(
+                "connector reconcile agent=%s protecting its operator-supplied secret", agent
             )
-            logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
-            return AgentOutcome(agent=agent, skipped=reason)
-
-        logger.debug("connector reconcile agent=%s protecting its operator-supplied secret", agent)
 
     # Hidden from the plan rather than filtered out of its result: the plan's job
     # is "own it and no longer declare it -> delete it", and that judgement is
     # correct. What is wrong is calling this object ours to begin with.
     manageable = [obj for obj in live if identity(obj) not in protected]
 
-    computed = plan(desired, manageable, agent=agent)
-    if computed.is_noop:
-        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport())
+    if unprovisioned:
+        # Widened past `protected` (only THIS render's Secret name) for the
+        # reason the module docstring gives. Kind is the safe discriminator
+        # here, and only here: on this branch no Secret is ours.
+        manageable = [obj for obj in manageable if identity(obj)[0] != "Secret"]
 
-    report = execute(client, computed, namespace=namespace, agent=agent)
+    computed = plan(desired, manageable, agent=agent)
+
+    skipped: str | None = None
+    if unprovisioned:
+        # Applying now would create Deployments referencing a Secret that does
+        # not exist. Pods would stay stuck rather than fail loudly, and the
+        # cause would be several layers from the symptom. So the applies are
+        # dropped and only the delete half runs -- an object being removed does
+        # not care whether a credential exists. `computed.delete` is decided
+        # against the FULL render, so a still-declared connector's objects are
+        # never in it, and no Secret of any name reaches it (above).
+        #
+        # A RENAMED connector, or a changed release name, is the case this does
+        # not spare: its old objects are undeclared and get pruned while their
+        # replacements are apply-suppressed, so the pass ends with no connector
+        # where before it kept the stale one. Accepted, deliberately. The old
+        # connector is already gone from the agent's MCP config, which is
+        # rendered from the same in-force version, so those objects were
+        # unreachable rather than working -- and leaving them live is exactly the
+        # leak #1214 exists to close. Do NOT gate the prune on `computed.apply`
+        # being empty to dodge this: a never-yet-deployed agent has every object
+        # pending apply, so that gate suppresses pruning in the common case.
+        #
+        # The message deliberately names neither the Secret nor its keys.
+        # Both are identifiers rather than values -- `kubectl get secret`
+        # shows them -- but they are also of no use here: the operator's
+        # action is the same either way, and `curie cluster deploy` is what
+        # reports a key it cannot resolve. Leaving them out keeps a credential
+        # name out of a log stream that may be shipped somewhere less
+        # protected than the cluster.
+        reason = (
+            "connector credentials are operator-supplied and not yet "
+            "provisioned in this namespace; run `curie cluster deploy` once "
+            "for this agent, or move the connector to a referenced secret"
+        )
+        logger.warning("connector reconcile skipped agent=%s: %s", agent, reason)
+        skipped = reason
+        # The plan carried is the one actually executed, not the one computed --
+        # reporting applies that were never attempted would make the outcome
+        # describe a pass that did not happen.
+        carried = ReconcilePlan(delete=computed.delete)
+    elif computed.is_noop:
+        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport())
+    else:
+        carried = computed
+
+    report = execute(client, carried, namespace=namespace, agent=agent)
+    # Shared with the skip branch on purpose: that branch deletes, so it can fail
+    # deletes, and a finalizer or an RBAC gap there recurs every pass. Returning
+    # straight off `execute()` left the object name and the error in no log
+    # stream at all -- `connector_apply` does not log delete failures either.
     if not report.ok:
         logger.warning(
             "connector reconcile agent=%s had %d failure(s): %s",
@@ -157,4 +209,4 @@ def reconcile_agent(
             len(report.failures),
             "; ".join(f"{kind}/{name}: {err}" for kind, name, err in report.failures),
         )
-    return AgentOutcome(agent=agent, plan=computed, report=report)
+    return AgentOutcome(agent=agent, skipped=skipped, plan=carried, report=report)
