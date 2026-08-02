@@ -204,7 +204,7 @@
         "type": "object"
       },
       "AgentUpdate": {
-        "description": "Partial update of mutable agent fields. slack_channel, model, and\napproval_required_tools are updatable (name and repo binding are identity);\nan omitted field is left unchanged.",
+        "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
         "properties": {
           "approval_required_tools": {
             "anyOf": [
@@ -244,6 +244,17 @@
               }
             ],
             "title": "Model"
+          },
+          "repo_full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
           },
           "secrets": {
             "anyOf": [

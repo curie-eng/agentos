@@ -38,9 +38,7 @@ VALID_FILES = {
 
 
 @pytest.fixture
-def trusted_clone_base(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> Iterator[Path]:
+def trusted_clone_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     """Point `GITHUB_CLONE_BASE` at a per-test `file://` base and yield it.
 
     `routers/github.py` calls `get_settings()` per request rather than through a
@@ -77,9 +75,7 @@ def _git(*args: str, cwd: Path | None = None) -> str:
     return out.stdout.strip()
 
 
-def _build_bare_repo(
-    base_dir: Path, repo_full_name: str, files: dict[str, str]
-) -> tuple[str, str]:
+def _build_bare_repo(base_dir: Path, repo_full_name: str, files: dict[str, str]) -> tuple[str, str]:
     """Create a bare repo at `<base_dir>/<repo_full_name>.git`. Returns (url, sha).
 
     The returned URL is byte-identical to the origin the API derives from
@@ -103,9 +99,7 @@ def _build_bare_repo(
     return f"file://{bare}", sha
 
 
-def _post(
-    client: Any, event: str, payload: dict[str, Any], secret: str = SECRET
-) -> Any:
+def _post(client: Any, event: str, payload: dict[str, Any], secret: str = SECRET) -> Any:
     body = json.dumps(payload).encode()
     sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return client.post(
@@ -180,14 +174,10 @@ def test_dev_push_deploys_dev_bot(
     assert body["commit_sha"] == sha
 
     # The version was built from the commit and its bundle is stored + fetchable.
-    version = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()[0]
+    version = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()[0]
     assert version["commit_sha"] == sha
     assert version["bundle_ref"] is not None
-    bundle = client.get(
-        f"/agents/{agent_id}/versions/{version['id']}/bundle", headers=auth_headers
-    )
+    bundle = client.get(f"/agents/{agent_id}/versions/{version['id']}/bundle", headers=auth_headers)
     assert bundle.status_code == 200
     assert len(bundle.content) > 0
 
@@ -208,12 +198,8 @@ def test_main_push_promotes_and_reuses_the_built_version(
     agent_id = _register_agent(client, auth_headers)
     clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
 
-    dev = _post(
-        client, "push", _push_payload("refs/heads/dev", sha, clone_url)
-    ).json()
-    prod = _post(
-        client, "push", _push_payload("refs/heads/main", sha, clone_url)
-    ).json()
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
 
     assert prod["status"] == "promoted"
     assert prod["environment"] == "prod"
@@ -243,9 +229,7 @@ def test_partial_version_is_rebuilt_not_reused(
     assert resp.status_code == 200
     assert resp.json()["status"] == "deployed"
 
-    versions = client.get(
-        f"/agents/{agent_id}/versions", headers=auth_headers
-    ).json()
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
     # The partial row was repaired in place (no duplicate) and now has a bundle.
     assert len(versions) == 1
     assert versions[0]["commit_sha"] == sha
@@ -267,9 +251,7 @@ def test_invalid_signature_is_401(
     assert resp.status_code == 401
 
 
-def test_ping_event_pongs(
-    client: Any, auth_headers: dict[str, str], clean_db: None
-) -> None:
+def test_ping_event_pongs(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
     resp = _post(client, "ping", {"zen": "hi"})
     assert resp.status_code == 200
     assert resp.json()["status"] == "pong"
@@ -296,9 +278,7 @@ def test_non_deploy_branch_is_ignored(
 ) -> None:
     _register_agent(client, auth_headers)
     clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
-    resp = _post(
-        client, "push", _push_payload("refs/heads/feature-x", sha, clone_url)
-    )
+    resp = _post(client, "push", _push_payload("refs/heads/feature-x", sha, clone_url))
     assert resp.status_code == 200
     assert resp.json()["status"] == "ignored"
 
@@ -345,9 +325,7 @@ def test_signed_push_with_a_foreign_clone_url_is_rejected(
     resp = _post(
         client,
         "push",
-        _push_payload(
-            "refs/heads/dev", sha, f"https://evil.example/{REPO}.git"
-        ),
+        _push_payload("refs/heads/dev", sha, f"https://evil.example/{REPO}.git"),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -358,10 +336,7 @@ def test_signed_push_with_a_foreign_clone_url_is_rejected(
     # Nothing was built and nothing was deployed.
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
     assert (
-        client.get(
-            "/deployments", params={"agent_id": agent_id}, headers=auth_headers
-        ).json()
-        == []
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json() == []
     )
 
 
@@ -430,8 +405,142 @@ def test_signed_push_with_a_foreign_url_fallback_is_rejected(
 
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
     assert (
-        client.get(
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json() == []
+    )
+
+
+# --------------------------------------------------------------------------- #
+# One repository, two agents (ADR-0091, #1070)
+# --------------------------------------------------------------------------- #
+DEPLOY_YAML = """
+targets:
+  dev:
+    agent: two-agent-dev
+    env: dev
+    slack_channel: C000000D01
+  prod:
+    agent: two-agent-prod
+    env: prod
+    slack_channel: C000000E01
+"""
+
+TWO_TARGET_FILES = {**VALID_FILES, "deploy.yaml": DEPLOY_YAML}
+
+
+def _register(client: Any, headers: dict[str, str], name: str, channel: str) -> str:
+    resp = client.post(
+        "/agents",
+        json={"name": name, "slack_channel": channel, "repo_full_name": REPO},
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    return str(resp.json()["id"])
+
+
+def test_one_repo_binds_two_agents(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Before 0018 the second create was a 409 from the unique index, which is
+    # what forced sre-bot to make its second agent out of band.
+    _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    _register(client, auth_headers, "two-agent-prod", "C000000E01")
+
+
+def test_dev_push_and_main_push_reach_different_agents(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """The thing #1070 is for: dev -> the dev bot, main -> the prod bot."""
+
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    assert dev["agent_id"] == dev_id, "a dev push must reach the dev agent"
+
+    prod = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert prod["status"] == "promoted", prod
+    assert prod["agent_id"] == prod_id, "a main push must reach the prod agent"
+
+    # Each agent holds exactly its own deployment, in its own environment.
+    for agent_id, expected in ((dev_id, "dev"), (prod_id, "prod")):
+        deployments = client.get(
             "/deployments", params={"agent_id": agent_id}, headers=auth_headers
         ).json()
+        assert [d["environment"] for d in deployments] == [expected]
+
+
+def test_prod_promotes_the_exact_artifact_dev_validated(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # Bundle-once, bind-many. The two agents get their own Version ROWS (the
+    # worker's binding join requires a version to belong to its agent), but both
+    # rows point at the SAME stored object -- so prod promotes not merely
+    # identical bytes but the same artifact, by construction rather than by
+    # discipline.
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    _post(client, "push", _push_payload("refs/heads/main", sha, clone_url))
+
+    def only_version(agent_id: str) -> dict[str, Any]:
+        versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+        assert len(versions) == 1, versions
+        return dict(versions[0])
+
+    dev_version, prod_version = only_version(dev_id), only_version(prod_id)
+    assert dev_version["id"] != prod_version["id"], "each agent owns its own version row"
+    assert dev_version["bundle_ref"] == prod_version["bundle_ref"], (
+        "prod must promote the artifact dev validated, not a re-upload of it"
+    )
+    assert dev_version["commit_sha"] == prod_version["commit_sha"] == sha
+
+
+def test_a_target_naming_another_repos_agent_is_rejected_end_to_end(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # ADR-0091's sharpest edge, through the real webhook: `foreign-bot` belongs
+    # to somebody else's repository, so this push must not deploy over it.
+    _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    client.post(
+        "/agents",
+        json={
+            "name": "foreign-bot",
+            "slack_channel": "C000000F01",
+            "repo_full_name": "someone-else/their-repo",
+        },
+        headers=auth_headers,
+    )
+    files = {
+        **VALID_FILES,
+        "deploy.yaml": (
+            "targets:\n  prod:\n    agent: foreign-bot\n"
+            "    env: prod\n    slack_channel: C000000F01\n"
+        ),
+    }
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+    assert body["status"] == "rejected", body
+    assert body["errors"][0]["code"] == "deploy.agent_bound_elsewhere"
+
+    # And nothing was deployed to the foreign agent.
+    foreign = next(
+        a for a in client.get("/agents", headers=auth_headers).json() if a["name"] == "foreign-bot"
+    )
+    assert (
+        client.get("/deployments", params={"agent_id": foreign["id"]}, headers=auth_headers).json()
         == []
     )

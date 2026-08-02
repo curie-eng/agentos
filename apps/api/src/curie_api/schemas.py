@@ -356,9 +356,11 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
-    """Partial update of mutable agent fields. slack_channel, model, and
-    approval_required_tools are updatable (name and repo binding are identity);
-    an omitted field is left unchanged."""
+    """Partial update of mutable agent fields. An omitted field is unchanged.
+
+    The repo binding stopped being identity in ADR-0091: one repository builds
+    many agents now, so binding is a routing fact, not a name.
+    """
 
     slack_channel: str | None = None
     # New per-agent model id (#254). Omitted (None) leaves the current model
@@ -373,6 +375,12 @@ class AgentUpdate(BaseModel):
     # New connector secrets (#429). Omitted (None) leaves current secrets
     # unchanged; an explicit empty dict clears them.
     secrets: dict[str, str] | None = None
+    # Which repository's pushes deploy this agent (ADR-0091). PATCHable because
+    # an agent created before its repo existed -- or, until migration 0018, the
+    # SECOND agent of a repo, which the unique index forbade from carrying it --
+    # has no other way to be bound. Without this, git-flow cannot find that
+    # agent and a target naming it is rejected as unknown.
+    repo_full_name: str | None = None
 
     _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
