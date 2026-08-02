@@ -119,6 +119,16 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # into a sandbox: what the runner receives is the derived connector
         # scope (CURIE_CONNECTOR_RELEASE), which IS a declared BootEnv key.
         "CURIE_RELEASE",
+        # The connector reconciler's own switches (ADR-0090, #1184), read from
+        # the WORKER's env by WorkerConfig and consumed by the reconcile loop in
+        # the worker process. Nothing here reaches a sandbox: the reconciler
+        # writes Kubernetes objects, and what the runner learns about connectors
+        # is the derived scope built from CURIE_RELEASE/CURIE_NAMESPACE above.
+        # CURIE_CONNECTOR_APP_NAME is the chart's nameOverride, needed only to
+        # match the pod selector the connector NetworkPolicy uses.
+        "CURIE_CONNECTOR_RECONCILE",
+        "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",

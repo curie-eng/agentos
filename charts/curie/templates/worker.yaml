@@ -132,6 +132,28 @@ spec:
             # name is knowable only here.
             - name: CURIE_RELEASE
               value: {{ .Release.Name | quote }}
+{{- if .Values.worker.connectorReconciler.enabled }}
+            # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
+            # and CURIE_RELEASE above deliberately: the runner dials a connector
+            # Service by the name those two produce, and the reconciler creates
+            # it by the same name. Two separate settings could disagree, and the
+            # symptom would be a connector that exists and an agent that cannot
+            # reach it.
+            - name: CURIE_CONNECTOR_RECONCILE
+              value: "true"
+            # The chart's nameOverride, which appears in the pod selector the
+            # connector NetworkPolicy matches on. The worker cannot derive it.
+            - name: CURIE_CONNECTOR_APP_NAME
+              value: {{ include "curie.name" . | quote }}
+            - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
+              value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
+            # The reconciler fetches rendered objects from the API rather than
+            # re-deriving them (ADR-0090), so it needs to reach it. Included only
+            # on this branch: wiring it unconditionally would also switch on the
+            # worker's eval reporting, which is unwired today, and that is a
+            # behaviour change this flag did not ask for.
+            {{- include "curie.env.api" . | nindent 12 }}
+{{- end }}
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
             - name: CURIE_RUNNER_PORT

@@ -591,6 +591,11 @@ worker:
   # not be handed to a component that is not using it.
   connectorReconciler:
     enabled: false
+    # How often a pass runs. The steady state is "nothing changed", and a
+    # converged pass is one list call per object kind per agent, so this is
+    # cheap -- but it is also the worst-case delay between a push landing and
+    # its connectors existing, so do not raise it far without reason.
+    intervalSeconds: 60
   # The SandboxWarmPool the substrate claims from. Empty -> derived as
   # `<release>-runner-pool` (the name templates/agent-sandbox.yaml gives it).
   warmPool: ""

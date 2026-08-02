@@ -67,9 +67,7 @@ Bool = Annotated[bool, BeforeValidator(_parse_bool)]
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
-    model_config = SettingsConfigDict(
-        frozen=True, populate_by_name=True, extra="ignore"
-    )
+    model_config = SettingsConfigDict(frozen=True, populate_by_name=True, extra="ignore")
 
     @classmethod
     def settings_customise_sources(
@@ -114,9 +112,7 @@ class WorkerConfig(BaseSettings):
     # Deployment-to-runtime binding. The plugin dir is the local path the runner
     # reads; sandbox provisioning fetches CURIE_BUNDLE_REF into it. Platform
     # default budget applies when an agent's budget columns are NULL.
-    bundle_plugin_dir: str = Field(
-        default="/bundles/current", validation_alias="CURIE_PLUGIN_DIR"
-    )
+    bundle_plugin_dir: str = Field(default="/bundles/current", validation_alias="CURIE_PLUGIN_DIR")
     default_max_usd_per_day: float = 10.0
     default_max_output_tokens_per_run: int = 100000
 
@@ -224,9 +220,7 @@ class WorkerConfig(BaseSettings):
     # Empty means "derive ``<stream>:dead``" at the use site; a static Field
     # default cannot reference ``self.stream``. An explicit override equal to
     # ``stream`` is rejected outright -- see ``_reject_self_targeting_graveyard``.
-    dead_letter_stream: str = Field(
-        default="", validation_alias=DEAD_LETTER_STREAM_ENV
-    )
+    dead_letter_stream: str = Field(default="", validation_alias=DEAD_LETTER_STREAM_ENV)
     # The graveyard is capped with an approximate MAXLEN on every XADD. The
     # unparseable-poison path dead-letters per INBOUND entry, so a wire-format
     # drift that makes entries unparseable en masse would otherwise grow the
@@ -256,6 +250,37 @@ class WorkerConfig(BaseSettings):
                 "CURIE_DEAD_LETTER_STREAM must not equal CURIE_STREAM "
                 f"({self.stream!r}): dead-lettering onto the source stream "
                 "re-queues failures forever"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _connector_reconciler_knows_where_it_is(self) -> WorkerConfig:
+        """Fail at construction if the reconciler is on but unaddressed.
+
+        Connector object names are built from the release name and the app name
+        (`<release>-<agent>-mcp-<connector>`). With either missing, every name
+        the reconciler renders differs from the names that actually exist: it
+        would find nothing of its own in the namespace, create a parallel set
+        under wrong names, and leave the real connectors unmanaged. That is
+        silent and looks like it is working, so it is rejected at boot instead.
+        """
+
+        if not self.connector_reconcile_enabled:
+            return self
+        missing = [
+            env
+            for env, value in (
+                ("CURIE_NAMESPACE", self.connector_namespace),
+                ("CURIE_RELEASE", self.connector_release),
+                ("CURIE_CONNECTOR_APP_NAME", self.connector_app_name),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"CURIE_CONNECTOR_RECONCILE is on but {', '.join(missing)} "
+                "is unset; connector object names are derived from these, so "
+                "the reconciler would manage a parallel set under wrong names"
             )
         return self
 
@@ -311,9 +336,7 @@ class WorkerConfig(BaseSettings):
 
     # Eval stream (F3): a separate consumer group on curie:evals runs eval
     # suites and reports results to the platform API and Langfuse.
-    eval_stream: str = Field(
-        default=EVAL_STREAM_DEFAULT, validation_alias="CURIE_EVAL_STREAM"
-    )
+    eval_stream: str = Field(default=EVAL_STREAM_DEFAULT, validation_alias="CURIE_EVAL_STREAM")
     eval_consumer_group: str = Field(
         default=EVAL_CONSUMER_GROUP_DEFAULT,
         validation_alias="CURIE_EVAL_CONSUMER_GROUP",
@@ -386,10 +409,31 @@ class WorkerConfig(BaseSettings):
     # wires neither CURIE_API_URL nor this on the worker, so its runner state
     # refs are the same localhost gap in the opposite substrate, out of #678's
     # docker scope -- see runner_facing_api_base_url.
-    runner_api_base_url: str = Field(
-        default="", validation_alias="CURIE_RUNNER_API_URL"
-    )
+    runner_api_base_url: str = Field(default="", validation_alias="CURIE_RUNNER_API_URL")
     api_key: str = Field(default="curie-dev-key", validation_alias=API_KEY_ENV)
+    # ---------------------------------------------------------------------
+    # Connector reconciler (ADR-0090, #1184). Off by default: enabling it is
+    # what makes the worker's Role grant create/patch/delete on Deployments,
+    # Services, Secrets and NetworkPolicies, and the chart gates that grant on
+    # the same flag. A worker that is not reconciling should not hold it.
+    # ---------------------------------------------------------------------
+    connector_reconcile_enabled: bool = Field(
+        default=False, validation_alias="CURIE_CONNECTOR_RECONCILE"
+    )
+    connector_reconcile_interval_s: float = Field(
+        default=60.0, gt=0, validation_alias="CURIE_CONNECTOR_RECONCILE_INTERVAL_S"
+    )
+    # The reconciler reuses `connector_release` / `connector_namespace` above --
+    # deliberately the same two values the runner's connector scope is built
+    # from. They must agree: the runner dials a Service by the name those
+    # produce, and the reconciler creates the Service by the same name. Two
+    # separate settings could disagree, and the symptom would be a connector
+    # that exists and an agent that cannot reach it.
+    #
+    # `app_name` is the one thing neither of them already needs: it is the
+    # chart's nameOverride, and it appears only in the pod selector the
+    # NetworkPolicy matches on.
+    connector_app_name: str = Field(default="", validation_alias="CURIE_CONNECTOR_APP_NAME")
     report_max_attempts: int = 3
     report_backoff_base_s: float = Field(default=0.5, gt=0)
     # Langfuse for recording eval scores (the matrix reads them back by version).
@@ -403,9 +447,7 @@ class WorkerConfig(BaseSettings):
         default="/tmp/curie-worker.heartbeat",
         validation_alias=HEARTBEAT_FILE_ENV,
     )
-    heartbeat_interval_s: float = Field(
-        default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV
-    )
+    heartbeat_interval_s: float = Field(default=10.0, validation_alias=HEARTBEAT_INTERVAL_ENV)
 
     key_prefix: str = "curie:worker"
 
