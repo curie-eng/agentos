@@ -32,9 +32,7 @@ class Settings(BaseSettings):
 
     # Postgres (async driver). Dedicated `curie` schema keeps our tables clear
     # of Langfuse's own tables on the same database.
-    database_url: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
-    )
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     db_schema: str = "curie"
 
     # Single shared API key. Dev-only default; override in any shared deployment.
@@ -96,6 +94,22 @@ class Settings(BaseSettings):
     # http.extraheader, never embedded in the clone URL.
     github_api_url: str = "https://api.github.com"
     github_token: str = ""
+    # GitHub App identity (ADR-0092). When both are set the platform mints a
+    # one-hour token scoped to the single repository being cloned, instead of
+    # using the org-wide `github_token` above. Nothing to rotate, no human
+    # owner, and repository access is administered on the App's installation
+    # page rather than by re-issuing a credential.
+    #
+    # `github_token` is NOT deprecated by this: it remains the fallback for a
+    # GitHub Enterprise or air-gapped install with no App, and for a first-run
+    # operator proving the flow works before registering one. Neither set is
+    # also valid -- a public repository clones with no credential.
+    github_app_id: str = ""
+    # The App's PEM private key, whole. It can mint tokens for every repository
+    # in the installation, so it is the most sensitive value here: never log it,
+    # never place it in argv.
+    github_app_private_key: str = ""
+    github_app_timeout_seconds: float = 15.0
     # The one git origin this installation deploys from. The webhook payload's
     # `clone_url` is compared against `<base>/<repo_full_name>.git` and a
     # mismatch is rejected before any subprocess starts; git is then handed the
@@ -153,9 +167,7 @@ class Settings(BaseSettings):
     # graveyard watcher tracks the SAME stream the worker dead-letters to. Empty
     # derives `<runs_stream>:dead`. DISTINCT from `resume_dead_letter_stream` below
     # (the narrower ResumeQueue-only override); this is the general graveyard name.
-    dead_letter_stream: str = Field(
-        default="", validation_alias=DEAD_LETTER_STREAM_ENV
-    )
+    dead_letter_stream: str = Field(default="", validation_alias=DEAD_LETTER_STREAM_ENV)
 
     def dead_letter_stream_name(self) -> str:
         return derive_dead_letter_stream_name(self.runs_stream, self.dead_letter_stream)
@@ -252,9 +264,7 @@ class Settings(BaseSettings):
     def valkey_dsn(self) -> str:
         if self.valkey_url:
             return self.valkey_url
-        return (
-            f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
-        )
+        return f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":

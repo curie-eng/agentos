@@ -15,6 +15,7 @@ use curie::commands::{
 };
 use curie::comms::{self, CommsOpts, LocalCommsOpts};
 use curie::docker;
+use curie::github_app as crate_github_app;
 use curie::local::{self, LocalDownOpts, LocalOpts};
 use curie::message::{self, MessageOpts};
 use curie::ops::{self, CommonOpts, DownOpts, UpOpts};
@@ -1247,6 +1248,34 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Give the platform its own GitHub identity so agent repos need no deploy workflow (ADR-0092).
+    GithubApp {
+        /// The App's numeric id, from its GitHub settings page.
+        #[arg(long, default_value = "")]
+        app_id: String,
+        /// Path to the App's PEM private key file. The path is passed to helm
+        /// with --set-file, so the key's contents never enter argv.
+        #[arg(long, default_value = "")]
+        private_key: String,
+        /// Where the platform clones from. Change only for GitHub Enterprise.
+        #[arg(long, default_value = crate_github_app::DEFAULT_CLONE_BASE)]
+        clone_base: String,
+        /// Clear the App credentials, falling back to api.githubToken.
+        #[arg(long)]
+        disconnect: bool,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Print the helm command that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Drive the deployed Kubernetes release end to end with zero Slack contact.
     Message {
         /// The user message text.
@@ -2333,6 +2362,42 @@ async fn run(command: Option<Command>) -> Result<()> {
                         bot_token,
                         disconnect,
                     })
+                    .await?,
+                )
+            }
+            ClusterAction::GithubApp {
+                app_id,
+                private_key,
+                clone_base,
+                disconnect,
+                namespace,
+                release,
+                chart,
+                dry_run,
+            } => {
+                let resolved = artifacts::resolve_chart(
+                    chart.as_deref(),
+                    artifacts::Channel::current(),
+                    artifacts::version(),
+                    artifacts::cache_root,
+                    std::path::Path::new("charts/curie").is_dir(),
+                )?;
+                let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                emit(
+                    crate_github_app::github_app(
+                        crate_github_app::GithubAppOpts {
+                            common: CommonOpts {
+                                namespace,
+                                release,
+                                dry_run,
+                            },
+                            chart,
+                            app_id,
+                            private_key_path: private_key,
+                            disconnect,
+                        },
+                        &clone_base,
+                    )
                     .await?,
                 )
             }
