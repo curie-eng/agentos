@@ -121,4 +121,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Accepted |
 | 0091 | [Git-flow resolves deploy targets, so one repo serves many agents](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md) | Accepted |
 | 0092 | [A GitHub App gives the platform its own repository identity](0092-a-github-app-gives-the-platform-its-own-repository-identity.md) | Accepted |
+| 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Draft |
 <!-- END GENERATED: adr-index -->
