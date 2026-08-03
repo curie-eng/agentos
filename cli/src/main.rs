@@ -512,6 +512,12 @@ enum SkillAction {
             conflicts_with = "model"
         )]
         local_model: Option<String>,
+        /// Allow --local-model to DOWNLOAD its assets on this run. Without it,
+        /// `up` refuses when the pinned Ollama image (~8.9 GB) or the requested
+        /// model is not already on the machine, rather than fetching them
+        /// implicitly (ADR 0093).
+        #[arg(long, requires = "local_model")]
+        pull_model: bool,
         /// Forward an environment variable BY NAME into the runner sandbox, so a
         /// bundle's authed MCP server can read a secret (e.g. an API token) the
         /// same way model credentials are forwarded: the value is read from your
@@ -703,6 +709,12 @@ enum LocalAction {
             default_missing_value = commands::DEFAULT_LOCAL_MODEL
         )]
         local_model: Option<String>,
+        /// Allow --local-model to DOWNLOAD its assets on this run. Without it,
+        /// `up` refuses when the pinned Ollama image (~8.9 GB) or the requested
+        /// model is not already on the machine, rather than fetching them
+        /// implicitly (ADR 0093).
+        #[arg(long, requires = "local_model")]
+        pull_model: bool,
         /// Also start the optional Slack dispatcher (adds --profile slack).
         #[arg(long)]
         slack: bool,
@@ -1784,6 +1796,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 budget,
                 model,
                 local_model,
+                pull_model,
                 secret,
                 env_file,
                 replace,
@@ -1804,6 +1817,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     budget,
                     model,
                     local_model,
+                    pull_model,
                     secret,
                     env_file,
                     replace,
@@ -1893,6 +1907,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 dry_run,
                 minimal,
                 local_model,
+                pull_model,
                 slack,
                 env_file,
             } => {
@@ -1903,6 +1918,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                         minimal,
                         local_model,
+                        pull_model,
                         slack,
                         model_mode: local::model_mode_from_env(),
                         env_file,
@@ -1927,6 +1943,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                             minimal,
                             local_model,
+                            pull_model: false,
                             slack,
                             model_mode: local::model_mode_from_env(),
                             env_file,
@@ -1950,6 +1967,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                             minimal: false,
                             local_model: None,
+                            pull_model: false,
                             slack: false,
                             model_mode: local::ModelMode::DefaultFake,
                             env_file: None,
@@ -1968,6 +1986,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                         minimal: false,
                         local_model: None,
+                        pull_model: false,
                         slack: false,
                         model_mode: local::ModelMode::DefaultFake,
                         env_file: None,

@@ -256,6 +256,193 @@ pub fn ollama_volume(container: &str) -> String {
     format!("{container}-data")
 }
 
+// ---------------------------------------------------------------------------
+// Local-model preflight (ADR 0093, issue #1183)
+// ---------------------------------------------------------------------------
+
+/// The download `--local-model` used to trigger implicitly for the pinned image.
+/// Stated in the preflight failure so the operator sees the bill before paying
+/// it; `DEFAULT_OLLAMA_IMAGE`'s tag is what this measures.
+pub const OLLAMA_IMAGE_DOWNLOAD_SIZE: &str = "~8.9 GB";
+
+/// Where Ollama stores a model's manifest inside its data directory, relative
+/// to `/root/.ollama`. Presence of this path is what "the model is already
+/// pulled" means on disk.
+///
+/// Mirrors Ollama's own naming: a bare `qwen3:4b` is the `library` namespace on
+/// the default registry, `ns/name` names a namespace, and three or more
+/// segments carry their own registry host. A ref with no tag is `latest`, the
+/// same default `ollama pull` applies.
+///
+/// Args:
+///   model: an Ollama model reference, e.g. `qwen3:4b` or `hf.co/org/repo:q4`.
+///
+/// Returns:
+///   The manifest path relative to the Ollama data root, with no leading slash.
+pub fn model_manifest_path(model: &str) -> String {
+    // Split the tag off the LAST colon so a registry host keeps any port it has.
+    let (name, tag) = match model.rsplit_once(':') {
+        // A colon inside the final path segment is the tag; one before a `/` is
+        // a host port and belongs to the name.
+        Some((n, t)) if !t.contains('/') => (n, t),
+        _ => (model, "latest"),
+    };
+    let segments: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+    let qualified = match segments.len() {
+        0 | 1 => format!(
+            "registry.ollama.ai/library/{}",
+            segments.first().unwrap_or(&"")
+        ),
+        2 => format!("registry.ollama.ai/{}", segments.join("/")),
+        _ => segments.join("/"),
+    };
+    format!("models/manifests/{qualified}/{tag}")
+}
+
+/// Whether an image is already in the local image cache. Offline and fast
+/// (measured at ~32ms); a missing image is a clean `false`, not an error, since
+/// `docker image inspect` exits nonzero for exactly that case.
+pub async fn image_present(image: &str) -> Result<bool> {
+    let (status, _out, _err) =
+        docker_capture_with_env(&["image".into(), "inspect".into(), image.to_string()], &[])
+            .await?;
+    Ok(status.success())
+}
+
+/// Whether a named volume exists. A volume that was never created cannot hold a
+/// model, so this settles the cold case without starting anything.
+pub async fn volume_present(volume: &str) -> Result<bool> {
+    let (status, _out, _err) = docker_capture_with_env(
+        &["volume".into(), "inspect".into(), volume.to_string()],
+        &[],
+    )
+    .await?;
+    Ok(status.success())
+}
+
+/// Whether `model` is already pulled into `volume`.
+///
+/// Reads the volume through a throwaway container built from `image` -- the
+/// Ollama image the caller has just established is present -- so the probe pulls
+/// nothing and needs no second image. On Docker Desktop a volume's host
+/// mountpoint lives inside the VM, so mounting it is the only way to look.
+///
+/// Args:
+///   volume: the Docker volume mounted at Ollama's `/root/.ollama`.
+///   image: an Ollama image known to be present locally.
+///   model: the model reference to look for.
+///
+/// Returns:
+///   `true` when the model's manifest is on disk in that volume.
+pub async fn model_present_in_volume(volume: &str, image: &str, model: &str) -> Result<bool> {
+    if !volume_present(volume).await? {
+        return Ok(false);
+    }
+    let probe = format!("test -e /root/.ollama/{}", model_manifest_path(model));
+    let (status, _out, _err) = docker_capture_with_env(
+        &[
+            "run".into(),
+            "--rm".into(),
+            "-v".into(),
+            format!("{volume}:/root/.ollama"),
+            "--entrypoint".into(),
+            "/bin/sh".into(),
+            image.to_string(),
+            "-c".into(),
+            probe,
+        ],
+        &[],
+    )
+    .await?;
+    Ok(status.success())
+}
+
+/// The operator-facing refusal when `--local-model` is asked for assets that are
+/// not on the machine (ADR 0093). Pure so its wording is testable: this text is
+/// the ONLY place the download is disclosed before it would be spent, which is
+/// what makes it load-bearing rather than decoration.
+///
+/// Args:
+///   image: the pinned Ollama image, named when it is the missing one.
+///   image_missing: whether the image has to be downloaded.
+///   model: the requested model reference, named when it is the missing one.
+///   model_missing: whether the model has to be downloaded.
+///   fetch_hint: the exact `curie` command that fetches what is missing.
+///
+/// Returns:
+///   A multi-line message naming each missing asset, its cost, and the fix.
+pub fn missing_local_model_assets_message(
+    image: &str,
+    image_missing: bool,
+    model: &str,
+    model_missing: bool,
+    fetch_hint: &str,
+) -> String {
+    let mut lines = vec![
+        "local model assets are not on this machine, and curie does not download them implicitly:"
+            .to_string(),
+    ];
+    if image_missing {
+        lines.push(format!(
+            "  - docker image  {image}  ({OLLAMA_IMAGE_DOWNLOAD_SIZE})"
+        ));
+    }
+    if model_missing {
+        lines.push(format!(
+            "  - model         {model}  (size depends on the model; the qwen3:4b default is ~2.5 GB)"
+        ));
+    }
+    lines.push(format!("fetch them now with:\n  {fetch_hint}"));
+    lines.push(
+        "a first fetch can take ~30 min on a 50 Mbit/s link; once both are cached a re-up is seconds".to_string(),
+    );
+    lines.join("\n")
+}
+
+/// Refuse a `--local-model` run whose assets are not already on the machine
+/// (ADR 0093). Shared by `skill up` and `local up` so the two tiers answer the
+/// verb the same way (ADR 0041); only the volume and the fix hint differ.
+///
+/// Escalates only as far as it must: the image check settles the 8.9 GB half in
+/// milliseconds, and the volume probe is reached only once the image is known to
+/// be present -- so a fully cold machine never pays for it. Strictly offline.
+///
+/// Args:
+///   image: the pinned Ollama image this tier boots.
+///   volume: the Docker volume holding this tier's Ollama model cache.
+///   model: the requested model reference.
+///   fetch_hint: the exact `curie` command that provisions what is missing.
+///
+/// Returns:
+///   `Ok(())` when both assets are present; otherwise an error whose message is
+///   `missing_local_model_assets_message`.
+pub async fn preflight_local_model(
+    image: &str,
+    volume: &str,
+    model: &str,
+    fetch_hint: &str,
+) -> Result<()> {
+    let image_missing = !image_present(image).await?;
+    // Without the image there is no container to read the volume WITH, so the
+    // model is reported as missing too rather than probed. That is also the
+    // honest answer: a machine with neither asset needs both.
+    let model_missing = if image_missing {
+        true
+    } else {
+        !model_present_in_volume(volume, image, model).await?
+    };
+    if image_missing || model_missing {
+        bail!(missing_local_model_assets_message(
+            image,
+            image_missing,
+            model,
+            model_missing,
+            fetch_hint
+        ));
+    }
+    Ok(())
+}
+
 /// The `docker run` argument vector (after the `docker` executable) that boots
 /// the ollama container. A named volume for `/root/.ollama` keeps the pulled
 /// model cached across teardown; Docker auto-creates it on first use.
@@ -777,6 +964,130 @@ mod tests {
         assert!(joined.contains("-v curie-ollama-data:/root/.ollama"));
         assert_eq!(args.last().unwrap(), "ollama/ollama:0.24.0");
         assert_eq!(ollama_volume("curie-ollama"), "curie-ollama-data");
+    }
+
+    // ADR 0093. The manifest path IS the "is this model already pulled" test, so
+    // getting the naming wrong would report a cached model as missing (a false
+    // refusal) or a missing one as cached (the implicit download this closes).
+    // Verified against a real volume: qwen3:4b lives at
+    // models/manifests/registry.ollama.ai/library/qwen3/4b.
+    #[test]
+    fn model_manifest_path_mirrors_ollama_layout() {
+        assert_eq!(
+            model_manifest_path("qwen3:4b"),
+            "models/manifests/registry.ollama.ai/library/qwen3/4b"
+        );
+        assert_eq!(
+            model_manifest_path("qwen3-coder:30b"),
+            "models/manifests/registry.ollama.ai/library/qwen3-coder/30b"
+        );
+        // No tag is `latest`, the same default `ollama pull` applies.
+        assert_eq!(
+            model_manifest_path("qwen3"),
+            "models/manifests/registry.ollama.ai/library/qwen3/latest"
+        );
+        // A namespace displaces `library`, not the registry.
+        assert_eq!(
+            model_manifest_path("myorg/mymodel:v1"),
+            "models/manifests/registry.ollama.ai/myorg/mymodel/v1"
+        );
+        // Three or more segments carry their own registry host.
+        assert_eq!(
+            model_manifest_path("hf.co/org/repo:q4"),
+            "models/manifests/hf.co/org/repo/q4"
+        );
+    }
+
+    // A colon in a registry host's PORT is not a tag. Splitting on the first
+    // colon instead of the last would silently look for a model named after the
+    // host, always miss, and refuse a machine that has the model.
+    #[test]
+    fn model_manifest_path_does_not_mistake_a_host_port_for_a_tag() {
+        assert_eq!(
+            model_manifest_path("localhost:5000/org/repo"),
+            "models/manifests/localhost:5000/org/repo/latest"
+        );
+        assert_eq!(
+            model_manifest_path("localhost:5000/org/repo:v2"),
+            "models/manifests/localhost:5000/org/repo/v2"
+        );
+    }
+
+    // The refusal message is the ONLY place the download is disclosed before it
+    // would be spent (ADR 0093), which makes its content load-bearing: each
+    // missing asset named separately, the size stated, and a runnable fix. A
+    // present asset must NOT be listed, or the operator fetches more than needed.
+    #[test]
+    fn missing_assets_message_names_only_what_is_missing_and_how_to_get_it() {
+        let both = missing_local_model_assets_message(
+            "ollama/ollama:0.24.0",
+            true,
+            "qwen3:4b",
+            true,
+            "curie local up --local-model qwen3:4b --pull-model",
+        );
+        assert!(both.contains("does not download them implicitly"), "{both}");
+        assert!(both.contains("ollama/ollama:0.24.0"), "{both}");
+        assert!(both.contains(OLLAMA_IMAGE_DOWNLOAD_SIZE), "{both}");
+        assert!(both.contains("qwen3:4b"), "{both}");
+        assert!(
+            both.contains("curie local up --local-model qwen3:4b --pull-model"),
+            "{both}"
+        );
+
+        // Image cached, model not: the image line must be absent so the operator
+        // is not told to re-fetch 8.9 GB they already have.
+        let model_only = missing_local_model_assets_message(
+            "ollama/ollama:0.24.0",
+            false,
+            "qwen3-coder:30b",
+            true,
+            "curie local up --local-model qwen3-coder:30b --pull-model",
+        );
+        assert!(!model_only.contains("docker image"), "{model_only}");
+        assert!(
+            !model_only.contains(OLLAMA_IMAGE_DOWNLOAD_SIZE),
+            "{model_only}"
+        );
+        assert!(model_only.contains("qwen3-coder:30b"), "{model_only}");
+
+        // And the mirror case: image missing, model already cached.
+        let image_only = missing_local_model_assets_message(
+            "ollama/ollama:0.24.0",
+            true,
+            "qwen3:4b",
+            false,
+            "curie skill up --local-model qwen3:4b --pull-model --name demo",
+        );
+        assert!(image_only.contains("docker image"), "{image_only}");
+        assert!(
+            !image_only.contains("size depends on the model"),
+            "{image_only}"
+        );
+    }
+
+    // The remediation must be a `curie` command. CLAUDE.md's single-surface rule
+    // forbids sending an operator to a raw docker invocation, and this message is
+    // the most tempting place in the codebase to break it.
+    #[test]
+    fn missing_assets_message_never_hands_out_a_raw_docker_command() {
+        let msg = missing_local_model_assets_message(
+            "ollama/ollama:0.24.0",
+            true,
+            "qwen3:4b",
+            true,
+            "curie local up --local-model qwen3:4b --pull-model",
+        );
+        let fix = msg
+            .lines()
+            .find(|l| l.trim_start().starts_with("curie ") || l.trim_start().starts_with("docker "))
+            .expect("the message must offer a runnable fix");
+        assert!(
+            fix.trim_start().starts_with("curie "),
+            "the fix must be a curie command, got: {fix}"
+        );
+        assert!(!msg.contains("docker pull"), "{msg}");
+        assert!(!msg.contains("docker run"), "{msg}");
     }
 
     #[test]
