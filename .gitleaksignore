@@ -10,6 +10,8 @@ eba9315b76cda2c258f3f7d2223dd5383f0e7fa4:apps/ui/src/views/obs/RealMetrics.tsx:g
 b92e955c86e199c23c7ae47697e3949cb6b41a29:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:11
 
 # Dummy placeholder Slack tokens in a Rust test (xapp-123456789 / xoxb-123456789).
+# The current line on main carries its own inline gitleaks:allow marker; this
+# fingerprint stays because the old commit is still reachable in full history.
 7a7d2bd42b286326c1ffd87fcf6b08d7af9e65e5:cli/src/comms.rs:generic-api-key:347
 
 # Documented dev-default Langfuse bootstrap keys (pk-lf-curie-dev /

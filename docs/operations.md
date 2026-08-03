@@ -57,6 +57,8 @@ curie cluster up
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
 | `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. Present -> installs live (forwarded through masked `--set` machinery, so `--dry-run` never prints it). Absent -> installs sealed (canned replies). |
 | `--fake-model` | Force a sealed install even when a credential is present (a dev/CI escape hatch). |
+| `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
+| `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
 | `--allow-egress-host <provider>` (repeatable) | Open runner egress on TCP 443 to a named model provider (`anthropic` or `openrouter`). |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
 
@@ -198,6 +200,18 @@ promote:
    silently from GitHub's side. The default covers github.com with no extra setup; set
    `GITHUB_CLONE_BASE` (or the chart's `api.githubCloneBase`) if your repos
    live elsewhere, such as GitHub Enterprise Server.
+
+**Deploying a PRIVATE repo needs one more thing: a clone credential.**
+Without it, git-flow can only deploy a public repository. A private one
+fails with `git.archive_failed` (#1058). Supply the API's GitHub credential
+with `--github-token` on `curie cluster up` (or, to keep it out of your
+shell history and `ps`, the `CURIE_GITHUB_TOKEN` environment variable
+instead; see the flag reference above for how it's kept out of the helm
+command line too). A later plain `cluster up` that passes neither preserves
+whatever the release already has, so you only set it once. Changing or
+clearing it (`--clear-github-token`) does not restart the API pod
+automatically; `cluster up` prints the exact restart command to run, and
+until you run it the API keeps using the old value.
 
 Once wired, a push to the agent's dev branch builds and deploys under its
 dev bot identity; a push or merge to its prod branch promotes that same

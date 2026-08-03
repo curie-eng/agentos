@@ -558,6 +558,40 @@ mod tests {
         assert!(!line.contains("xoxb-"), "{line}");
     }
 
+    #[test]
+    fn comms_upgrade_does_not_drop_the_github_token() {
+        // #1124 AC3, armed through the SIBLING verb only. `cluster comms` is one
+        // of only three `helm upgrade` sites on this release, and #1067's whole
+        // lesson is that a sibling upgrade verb can silently destroy another
+        // verb's recorded values. Both comms arms pass `--reuse-values`, which
+        // helm documents as "existing values will be merged with any values set
+        // via --values/-f or --set flags. Priority is given to new values"
+        // (`helm upgrade --help`, helm v3) -- so a value neither arm re-passes,
+        // `api.githubToken` among them, survives the upgrade untouched. `up`, by
+        // contrast, does a FULL upgrade, which is why it needs its own preserve.
+        let opts = |disconnect| CommsOpts {
+            common: common(),
+            chart: "charts/curie".into(),
+            app_token: "xapp-123456789".into(),
+            bot_token: "xoxb-123456789".into(), // gitleaks:allow -- dummy placeholder Slack token, not real (moved from line 347; see .gitleaksignore)
+            disconnect,
+        };
+        for (label, cmds) in [
+            ("connect", connect_commands(&opts(false))),
+            ("disconnect", disconnect_commands(&opts(true))),
+        ] {
+            let argv = cmds[0].argv().join(" ");
+            assert!(
+                argv.contains("--reuse-values"),
+                "{label} must keep --reuse-values or it would drop api.githubToken: {argv}"
+            );
+            assert!(
+                !argv.contains("api.githubToken"),
+                "{label} must not re-pass or clear the GitHub credential: {argv}"
+            );
+        }
+    }
+
     fn local_comms_opts(disconnect: bool, mode: ModelMode) -> LocalCommsOpts {
         local_comms_opts_with(disconnect, mode, false)
     }
