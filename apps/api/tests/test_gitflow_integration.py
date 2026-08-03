@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from curie_api import crud
+from curie_api import bundles, crud
 from curie_api.config import get_settings
+from curie_test_support.scaffold import scaffolded_deploy_yaml
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 SECRET = get_settings().github_webhook_secret
@@ -647,3 +648,51 @@ def test_a_target_naming_another_repos_agent_is_rejected_end_to_end(
         client.get("/deployments", params={"agent_id": foreign["id"]}, headers=auth_headers).json()
         == []
     )
+
+
+# --------------------------------------------------------------------------- #
+# A scaffolded deploy.yaml declares nothing (#1210)
+# --------------------------------------------------------------------------- #
+# `curie init` writes a commented-out example plus a literal empty map, so the
+# value below is the payload a fresh repository actually pushes, read from
+# `DEPLOY_YAML` in cli/src/scaffold.rs rather than restated here.
+SCAFFOLDED_DEPLOY_YAML = scaffolded_deploy_yaml()
+
+SCAFFOLD_FILES = {**VALID_FILES, "deploy.yaml": SCAFFOLDED_DEPLOY_YAML}
+
+
+def test_a_scaffolded_deploy_yaml_still_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    # #1210 through the real webhook: `curie init` scaffolds `targets: {}`, so
+    # every first push from a scaffolded repository carried a deploy.yaml that
+    # declared no routing, and the resolver ignored the push instead of
+    # deploying to the one agent the repository binds. The unit tests reproduce
+    # the deploy.yaml read by hand; this one runs the production read path
+    # (gitflow._read_targets -> bundles.read_deploy_targets).
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, SCAFFOLD_FILES)
+
+    body = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert body["status"] == "deployed", body
+    assert body["deployment_id"] is not None
+    assert body["agent_id"] == agent_id
+
+
+def test_a_scaffolded_deploy_yaml_reads_back_as_an_empty_map(tmp_path: Path) -> None:
+    # The premise the whole of #1210 rests on, pinned directly. None from
+    # `read_deploy_targets` means the file is ABSENT; a non-null file whose
+    # `targets` map is empty means it is PRESENT and declares nothing.
+    # Conflating the two is the bug: had a scaffolded deploy.yaml read back as
+    # None, the old `if targets is None:` gate would already have deployed it.
+    for rel, content in SCAFFOLD_FILES.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    targets = bundles.read_deploy_targets(tmp_path)
+    assert targets is not None, "a present deploy.yaml must not read back as absent"
+    assert targets.targets == {}

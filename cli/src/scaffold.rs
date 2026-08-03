@@ -175,13 +175,18 @@ connectors: {}
 /// Declared deploy targets (ADR-0089). Also commented out, and for a sharper
 /// reason than connectors: a target names a Slack channel and an agent, and a
 /// scaffolded placeholder that looked real would deploy somewhere nobody
-/// intended. An empty `targets:` map is valid and does nothing.
+/// intended. An empty `targets:` map declares no routing, so a git flow push
+/// falls back to the single agent this repository binds (#1210); with
+/// several agents bound the push is refused rather than guessed.
 const DEPLOY_YAML: &str = r#"# Where this bundle gets deployed. `curie cluster deploy --target prod` reads
 # this, so the routing is a reviewable diff in the repository instead of flags
 # scattered across whatever invokes the command.
 #
 # The BUNDLE is identical for every target -- only the binding differs, which
 # is what lets prod promote the exact artifact dev validated.
+#
+# Left empty, a push deploys to the single agent this repository binds.
+# Declare targets once the repository binds more than one.
 #
 # Uncomment and edit. Use Slack channel IDs (starting with C), not #names:
 #

@@ -479,19 +479,28 @@ def resolve_target_agent(
     to a different repository. That case is the sharpest edge in ADR-0091 and
     the reason this function takes an argument for it: without the check, one
     repository's push deploys over another repository's agent. It is refused.
+
+    What decides the fallback is whether any target is DECLARED, not whether a
+    ``deploy.yaml`` exists: a bundle with no such file and a bundle whose
+    ``targets:`` map is empty say exactly the same thing about routing (#1210).
     """
 
-    if targets is None:
-        # A bundle predating ADR-0089. It deploys where it always did: to the
-        # single agent this repository binds. With several bound there is no
-        # basis to choose, and guessing would deploy to the wrong bot silently.
+    if targets is None or not targets.targets:
+        # An empty map is what `curie init` scaffolds, so it is the ordinary
+        # case rather than the legacy one (#1210). With several agents bound,
+        # nothing says which, and guessing deploys to the wrong bot silently.
         if len(repo_agents) == 1:
             return repo_agents[0]
+        missing = (
+            "the bundle has no deploy.yaml"
+            if targets is None
+            else "the bundle's deploy.yaml declares an empty `targets:` map"
+        )
         raise TargetUnresolved(
             "deploy.no_targets",
-            f"{len(repo_agents)} agents are built from this repository but the "
-            "bundle declares no deploy.yaml, so there is nothing to say which "
-            "one this branch deploys to. Add deploy.yaml (ADR-0089).",
+            f"{len(repo_agents)} agents are built from this repository but "
+            f"{missing}, so there is nothing to say which one this branch "
+            "deploys to. Declare a target (ADR-0089).",
         )
 
     matching = [t for t in targets.targets.values() if t.env == environment.value]

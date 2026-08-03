@@ -17,6 +17,7 @@ import uuid
 import pytest
 from curie_api.gitflow import TargetUnresolved, resolve_target_agent
 from curie_api.models import Agent, Environment
+from curie_test_support.scaffold import scaffolded_deploy_yaml
 from plugin_format.deploy_targets import validate_deploy_targets
 
 REPO = "curie-eng/sre-bot"
@@ -135,4 +136,54 @@ def test_a_bundle_without_deploy_yaml_and_several_agents_is_refused() -> None:
     with pytest.raises(TargetUnresolved) as caught:
         resolve_target_agent(None, Environment.prod, [agent("a"), agent("b")], None)
     assert caught.value.code == "deploy.no_targets"
-    assert "deploy.yaml" in str(caught.value)
+    assert "the bundle has no deploy.yaml" in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# Bundles WITH deploy.yaml that declare no targets (#1210)
+# --------------------------------------------------------------------------- #
+def test_an_empty_targets_map_still_deploys_its_single_agent() -> None:
+    # `curie init` scaffolds `targets: {}`. Gating the fallback on the FILE's
+    # presence instead of its CONTENT made every push from a scaffolded bundle
+    # a silent no-op -- no deploy, no log line, no rejection.
+    only = agent("sre-bot")
+    assert resolve_target_agent(targets("targets: {}\n"), Environment.dev, [only], None) is only
+
+
+def test_an_empty_targets_map_with_several_agents_is_refused() -> None:
+    # Same reason the no-deploy.yaml case is refused: nothing declares which of
+    # the two this branch deploys to, and guessing deploys to the wrong bot.
+    with pytest.raises(TargetUnresolved) as caught:
+        resolve_target_agent(
+            targets("targets: {}\n"), Environment.dev, [agent("a"), agent("b")], None
+        )
+    assert caught.value.code == "deploy.no_targets"
+    assert "the bundle's deploy.yaml declares an empty `targets:` map" in str(caught.value)
+
+
+def test_a_deploy_yaml_of_only_comments_still_deploys_its_single_agent() -> None:
+    # Broader than the literal `targets: {}` key: a file whose every line is
+    # commented out parses to None, which validates to the same empty map. The
+    # operator sees a deploy.yaml full of guidance and a push that does nothing.
+    only = agent("sre-bot")
+    commented = "# targets:\n#   dev:\n#     agent: sre-bot-dev\n#     env: dev\n"
+    parsed = targets(commented)
+    assert parsed.targets == {}
+    assert resolve_target_agent(parsed, Environment.dev, [only], None) is only
+
+
+def test_the_scaffolded_deploy_yaml_is_valid_and_declares_no_targets() -> None:
+    # The premise the routing test below rests on, asserted separately so a
+    # reshaped scaffold fails HERE, naming the shape that changed, rather than
+    # deep inside a routing assertion that would look like a routing bug.
+    parsed = targets(scaffolded_deploy_yaml())
+    assert parsed.targets == {}, "the scaffold is expected to ship no declared targets"
+
+
+def test_the_scaffolded_deploy_yaml_deploys_the_repositorys_single_agent() -> None:
+    # The regression as an operator meets it: `curie init`, push, nothing
+    # happens. Pinned against the scaffold's real bytes so a change to what
+    # ships lands here.
+    only = agent("sre-bot")
+    parsed = targets(scaffolded_deploy_yaml())
+    assert resolve_target_agent(parsed, Environment.dev, [only], None) is only
