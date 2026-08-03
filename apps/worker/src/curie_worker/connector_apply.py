@@ -44,7 +44,12 @@ class ConnectorClient(Protocol):
     """
 
     def list_owned(self, namespace: str, owner: str) -> list[dict[str, Any]]:
-        """Every connector object labelled for this owner."""
+        """Every connector object labelled for this owner.
+
+        Every returned object must carry ``kind`` and ``metadata.name``:
+        ``identity()`` keys ownership and every prune decision on that pair, so
+        an object missing either is invisible to those checks.
+        """
 
     def apply(self, namespace: str, obj: dict[str, Any]) -> None:
         """Create or update one object."""
