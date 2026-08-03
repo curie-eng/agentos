@@ -27,17 +27,60 @@ Ollama, without Langfuse or the UI:
 curie local up --minimal --local-model
 ```
 
+## First run: the assets are not downloaded for you
+
+At the `skill` and `local` tiers, `--local-model` needs two things on the machine
+before it can run anything, and **it will not fetch either one implicitly**
+([ADR 0093](adr/0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md)):
+
+| asset | size | where it is cached |
+|---|---|---|
+| the `ollama/ollama:0.24.0` image | **~8.9 GB** | the Docker image cache |
+| the model weights | see the table below (`qwen3:4b` is ~2.5 GB) | a Docker volume |
+
+If either is missing, `up` stops **before bringing anything up** and tells you
+what is absent, how large it is, and the command that fetches it:
+
+```console
+$ curie local up --local-model
+Error: local model assets are not on this machine, and curie does not download them implicitly:
+  - docker image  ollama/ollama:0.24.0  (~8.9 GB)
+  - model         qwen3:4b  (size depends on the model; the qwen3:4b default is ~2.5 GB)
+fetch them now with:
+  curie local up --local-model qwen3:4b --pull-model
+a first fetch can take ~30 min on a 50 Mbit/s link; once both are cached a re-up is seconds
+```
+
+Add `--pull-model` to accept that download for this run:
+
+```bash
+curie local up --local-model --pull-model     # first time only
+curie local up --local-model                  # every time after
+```
+
+The reason for the refusal is that the two fetches are ~11.4 GB together and
+neither used to be announced: the command looked identical whether it was going
+to take 18 seconds or half an hour, and an operator had no way to tell a long
+download from a wedged one (issue #1183). Once both assets are cached the flag is
+never needed again and `up` is unchanged — measured at **17.9s warm**, against
+**232s** for the same command on a cold machine over a fast link.
+
+`cluster up --local-model` is unaffected: it has no host-side Ollama to
+provision, so there is nothing to preflight and no `--pull-model` flag.
+
 ## How it runs
 
 `skill up` and `local up` run the model in a Docker container and point spawned
-runners at that endpoint. Both the `skill up --local-model` and compose paths
-persist the pulled model in a Docker volume, so a re-up is fast and does not
-re-download the model; the skill-path volume is named `<container>-ollama-data`
-(the compose path uses `ollama_data`) and can be reclaimed with
-`docker volume rm <volume>`. `cluster up` uses the in-chart inference Deployment;
-the chart renders the Ollama Service and Deployment, opens the runner egress
-carve-out automatically, and bakes `ANTHROPIC_BASE_URL` plus the inference model
-into the runner template.
+runners at that endpoint. Both persist the pulled model in a Docker volume, so a
+re-up is fast and does not re-download the model; the skill-path volume is named
+`<container>-ollama-data` and the compose path uses `curie_ollama_data`
+(compose's `ollama_data` under the pinned `curie` project name). Either can be
+reclaimed with `docker volume rm <volume>` — after which the next
+`--local-model` run refuses again until you re-supply the model.
+
+`cluster up` uses the in-chart inference Deployment; the chart renders the Ollama
+Service and Deployment, opens the runner egress carve-out automatically, and
+bakes `ANTHROPIC_BASE_URL` plus the inference model into the runner template.
 
 ## Choosing a model
 

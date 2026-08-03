@@ -77,6 +77,10 @@ pub struct StartOpts {
     pub budget: String,
     pub model: Option<String>,
     pub local_model: Option<String>,
+    /// Opt in to downloading the `--local-model` assets this run (ADR 0093).
+    /// Without it, `up` refuses when the pinned Ollama image or the requested
+    /// model is not already on the machine. From `skill up --pull-model`.
+    pub pull_model: bool,
     /// Extra env var NAMES to forward by name into the runner sandbox, for a
     /// bundle's authed MCP server to read a secret. Forwarded exactly like the
     /// model credentials (docker reads the value from the caller's env; the
@@ -1298,6 +1302,21 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // `<name>-ollama` is the same wedge one step over (#747). Preflight it
         // before creating anything, and let --replace cover it too.
         let ollama = format!("{}-ollama", opts.name);
+        // ADR 0093: the same refusal `local up` gives, so both tiers answer
+        // `--local-model` identically (ADR 0041). The skill tier's model cache
+        // is the sidecar's own volume, not compose's.
+        if !opts.pull_model {
+            docker::preflight_local_model(
+                DEFAULT_OLLAMA_IMAGE,
+                &docker::ollama_volume(&ollama),
+                local_model,
+                &format!(
+                    "curie skill up --local-model {local_model} --pull-model --name {}",
+                    opts.name
+                ),
+            )
+            .await?;
+        }
         // No host port on the sidecar, so the remedy never offers --port.
         docker::ensure_container_name_free(
             &ollama,

@@ -206,6 +206,18 @@
             },
             {
               "global": false,
+              "help": "Allow --local-model to DOWNLOAD its assets on this run. Without it, `up` refuses when the pinned Ollama image (~8.9 GB) or the requested model is not already on the machine, rather than fetching them implicitly (ADR 0093)",
+              "id": "pull_model",
+              "long": "pull-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Forward an environment variable BY NAME into the runner sandbox, so a bundle's authed MCP server can read a secret (e.g. an API token) the same way model credentials are forwarded: the value is read from your environment by docker and never placed in argv. Repeatable. Example: `--secret GITHUB_PERSONAL_ACCESS_TOKEN` with that var exported",
               "id": "secret",
               "long": "secret",
@@ -618,6 +630,18 @@
                 "min": 0
               },
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow --local-model to DOWNLOAD its assets on this run. Without it, `up` refuses when the pinned Ollama image (~8.9 GB) or the requested model is not already on the machine, rather than fetching them implicitly (ADR 0093)",
+              "id": "pull_model",
+              "long": "pull-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {

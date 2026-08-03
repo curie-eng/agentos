@@ -17,6 +17,13 @@ use crate::ops::{plain, require_on_path, run_capture, run_step, OpsCommand};
 /// Dev-channel local-candidate filename probed by the artifact resolver.
 pub const DEFAULT_COMPOSE_FILE: &str = "compose.dev.yaml";
 
+/// The Docker volume holding this tier's Ollama model cache: compose's
+/// `ollama_data` under the pinned `curie` project name that `up_command`
+/// injects as `COMPOSE_PROJECT_NAME`. Hardcoded to match the compose file, the
+/// same way `ENDPOINTS` is, and guarded by
+/// `compose_ollama_volume_and_image_match_the_compose_file`.
+pub const COMPOSE_OLLAMA_VOLUME: &str = "curie_ollama_data";
+
 /// The service endpoints the dev stack exposes, as committed in
 /// `compose.dev.yaml`'s port mappings. Printed after `local up` so the operator
 /// has the URLs in hand. Hardcoded to match the compose file (see the
@@ -223,6 +230,10 @@ pub struct LocalOpts {
     /// with no `set -a; source .env` step. `None` means no file is read. Only
     /// `up` consumes it; the other verbs set `None`.
     pub env_file: Option<std::path::PathBuf>,
+    /// Opt in to downloading the `--local-model` assets this run (ADR 0093).
+    /// Without it, `up` refuses rather than fetching ~11.4 GB implicitly. Only
+    /// `up` consumes it; the other verbs set `false`.
+    pub pull_model: bool,
 }
 
 pub struct LocalDownOpts {
@@ -504,6 +515,20 @@ pub async fn up(mut o: LocalOpts) -> Result<LocalUpOutput> {
         }));
     }
     require_on_path("docker")?;
+    // ADR 0093: `--local-model` never downloads its ~11.4 GB of assets
+    // implicitly. Refuse before anything is brought up, unless the operator
+    // asked for the fetch on this invocation.
+    if let Some(model) = &o.local_model {
+        if !o.pull_model {
+            docker::preflight_local_model(
+                crate::commands::DEFAULT_OLLAMA_IMAGE,
+                COMPOSE_OLLAMA_VOLUME,
+                model,
+                &format!("curie local up --local-model {model} --pull-model"),
+            )
+            .await?;
+        }
+    }
     let cl = ui.checklist();
     run_step(&cl, "starting dev stack", "up", &cmd).await?;
     // `--local-model` is its own live path (routes to ollama); the shell-credential
@@ -793,6 +818,7 @@ mod tests {
             dry_run: false,
             minimal: false,
             local_model: None,
+            pull_model: false,
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
@@ -805,6 +831,7 @@ mod tests {
             dry_run: false,
             minimal: false,
             local_model: Some(model.into()),
+            pull_model: false,
             slack: false,
             model_mode: ModelMode::DefaultFake,
             env_file: None,
@@ -1452,6 +1479,46 @@ mod tests {
             console.1.contains("api=1"),
             "Curie Console endpoint must be the wired ?api=1 URL, got {}",
             console.1
+        );
+    }
+
+    // ADR 0093's preflight reads compose's model cache and inspects compose's
+    // ollama image, but names both from Rust -- two sibling definitions of the
+    // same fact, the drift shape this repo keeps getting bitten by. If the
+    // compose file renames the volume or bumps the image tag without this
+    // constant following, the preflight probes an empty volume and refuses a
+    // machine that has the model, or inspects an image compose never runs and
+    // waves through a machine that does not. Same guard shape as
+    // `endpoints_match_compose_file` directly above.
+    #[test]
+    fn compose_ollama_volume_and_image_match_the_compose_file() {
+        let compose = read_compose("compose.dev.yaml");
+        // `up_command` pins COMPOSE_PROJECT_NAME=curie, so compose's declared
+        // `ollama_data` volume is created as `curie_ollama_data`.
+        assert!(
+            compose.contains("\n  ollama_data:"),
+            "compose.dev.yaml no longer declares the `ollama_data` volume that {COMPOSE_OLLAMA_VOLUME} names"
+        );
+        assert!(
+            compose.contains("- ollama_data:/root/.ollama"),
+            "compose.dev.yaml no longer mounts ollama_data at /root/.ollama, which is the path the preflight probes"
+        );
+        assert_eq!(
+            COMPOSE_OLLAMA_VOLUME, "curie_ollama_data",
+            "the volume name is <COMPOSE_PROJECT_NAME>_<declared volume>, and up_command pins the project to `curie`"
+        );
+        let project_pinned = up_command(&opts_with_local_model(DEFAULT_COMPOSE_FILE, "qwen3:4b"))
+            .env
+            .contains(&(String::from("COMPOSE_PROJECT_NAME"), String::from("curie")));
+        assert!(
+            project_pinned,
+            "COMPOSE_OLLAMA_VOLUME's `curie_` prefix depends on up_command pinning the project name"
+        );
+        // The image the preflight inspects must be the image compose runs.
+        assert!(
+            compose.contains(&format!("image: {}", crate::commands::DEFAULT_OLLAMA_IMAGE)),
+            "compose.dev.yaml no longer runs {}, so the preflight would inspect an image the stack never uses",
+            crate::commands::DEFAULT_OLLAMA_IMAGE
         );
     }
 
