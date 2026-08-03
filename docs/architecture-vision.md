@@ -90,14 +90,21 @@ ingest is HTTP-only). On the read side the UI consumes only our API's schemas
 
 **Current adapter:** `apps/api/src/curie_api/langfuse.py` (trace list, tree
 reconstruction from `parentObservationId`, metrics queries) plus
-`apps/api/src/curie_api/metrics.py`. Vendor glue lives where an adapter's
-glue should: the model-pricing seed Job is a chart hook
+`apps/api/src/curie_api/metrics.py`. Langfuse is MIT at its core, with its
+`ee/` directories under a separate commercial enterprise license. Vendor glue
+lives where an adapter's glue should: the model-pricing seed Job is a chart hook
 (`charts/curie/templates/langfuse-model-pricing.yaml`), config owned by the
 adapter, not code in the core.
 
-**Swap (candidates: Arize Phoenix, any OTLP-compatible trace backend):**
+**Swap (candidates: Jaeger, Arize Phoenix, any OTLP-compatible trace backend):**
 repoint one collector exporter block and rewrite the read
-adapter behind the same API DTOs. The tree-building and metrics logic in
+adapter behind the same API DTOs. License is part of the swap cost here:
+Jaeger is Apache-2.0 and ingests OTLP natively, while Arize Phoenix is under
+the Elastic License 2.0, source-available rather than OSI open source, and its
+terms forbid providing the software to third parties as a hosted or managed
+service; that is fine for an operator self-hosting Curie for its own use and a
+problem for anyone running Curie's observability tier on someone else's behalf. The
+tree-building and metrics logic in
 `langfuse.py` is Langfuse-API-shaped (client-side substring scan, the Metrics
 API query object) and would be rewritten, not ported.
 
@@ -123,13 +130,20 @@ endpoint turning a rollup into a GitHub commit status.
 **Current adapter:** `apps/worker/src/curie_worker/eval/recorder.py` posts one Langfuse trace plus an
 `eval_pass` score per case via the public ingestion API, tagged
 `version:<v>` / `suite:<s>`; the matrix endpoint reads the grid back by those
-tags through the same `LangfuseClient`.
+tags through the same `LangfuseClient`. It is the same MIT-cored Langfuse
+deployment job 2 uses, so no additional license applies.
 
-**Swap (candidates: Arize, other eval stores; scorer libraries such as
+**Swap (candidates: Arize Phoenix, other eval stores; scorer libraries such as
 autoevals slot in above this port, changing how `passed` is computed, not
 where results are stored):** reimplement the recorder and the matrix read
-against the new store. The tag convention (`version:`/`suite:`) is our schema
-expressed in Langfuse's tag mechanism, so it translates, but it is
+against the new store. Arize Phoenix is Elastic License 2.0, source-available
+rather than OSI open source, with the same restriction on offering it to third
+parties as a hosted service. The store side is only two call sites, the
+recorder write and the matrix read, so any backend reachable from those two
+works, including the MIT-cored Langfuse already deployed; the permissively
+licensed names in this space, promptfoo (MIT) and DeepEval (Apache-2.0), are
+scorer frameworks that sit above this port rather than stores. The tag convention (`version:`/`suite:`) is our
+schema expressed in Langfuse's tag mechanism, so it translates, but it is
 convention, not a frozen contract.
 
 **Leakage:** the eval-case format is now converged and frozen
@@ -148,7 +162,7 @@ read-side mirror (`apps/worker/src/curie_worker/bundle_store.py`). On
 Kubernetes the chart's bundle-fetch init container fetches with `mc`
 (`charts/curie/templates/agent-sandbox.yaml`), also pure S3 protocol.
 
-**Current adapter:** MinIO, deployed by the chart
+**Current adapter:** MinIO (AGPL-3.0), deployed by the chart
 (`charts/curie/templates/minio.yaml`).
 
 **Swap:** AWS S3, Cloudflare R2, or any S3-compatible store is config only
@@ -169,7 +183,8 @@ backend would touch all three.
 schema centers on agents, agent_versions, and deployments.
 
 **Current adapter:** the chart's Postgres
-(`charts/curie/templates/postgres.yaml`); locally, the compose stack.
+(`charts/curie/templates/postgres.yaml`), under the permissive PostgreSQL
+License; locally, the compose stack.
 
 **Swap:** any managed Postgres (RDS, Cloud SQL, Neon) is a connection-string
 change, and that is the realistic swap. A different SQL engine is a small
@@ -257,12 +272,12 @@ flowchart TB
 
     subgraph obs["Job 2: observability store"]
         Collector["OTel Collector"]
-        Langfuse["Langfuse (today) or Arize Phoenix"]
+        Langfuse["Langfuse MIT core (today), Jaeger Apache-2.0, or Arize Phoenix ELv2"]
         Collector --> Langfuse
     end
 
     subgraph evals["Job 3: evals"]
-        EvalStore["Langfuse scores (today) or Arize"]
+        EvalStore["Langfuse scores MIT core (today) or Arize Phoenix ELv2"]
     end
 
     subgraph blob["Job 4: blob storage"]
