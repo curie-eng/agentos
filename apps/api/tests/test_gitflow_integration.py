@@ -189,6 +189,109 @@ def test_dev_push_deploys_dev_bot(
     assert deployments[0]["environment"] == "dev"
 
 
+def test_patched_repo_binding_routes_a_push(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A binding applied by PATCH must actually route that repository's pushes.
+
+    Before migration 0018, create-time was the only place `repo_full_name`
+    could ever be set, so an agent bound after creation had no way to become
+    reachable by git-flow. This drives the push through the single-agent
+    fallback in `resolve_target_agent` (no `deploy.yaml` in the pushed files,
+    exactly one agent bound to the repository), which is the path an agent
+    bound entirely by PATCH depends on.
+
+    Asserting that `AgentUpdate` has the field proves none of that. Only a real
+    signed push landing a deployment on the patched agent does.
+    """
+
+    created = client.post(
+        "/agents",
+        json={"name": "patched-agent", "slack_channel": "C000000G02"},
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    assert created.json()["repo_full_name"] is None, "created deliberately unbound"
+
+    patched = client.patch(
+        f"/agents/{agent_id}",
+        json={"repo_full_name": REPO},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["repo_full_name"] == REPO
+
+    # Read back through a separate request, so the assertion cannot be satisfied
+    # by the PATCH response echoing its own input.
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["repo_full_name"] == REPO
+
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "deployed", body
+    assert body["environment"] == "dev"
+    assert body["commit_sha"] == sha
+
+    # The push reached THIS agent, which is the whole point of the binding: a
+    # push succeeding somewhere else would prove nothing.
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, deployments
+    assert deployments[0]["environment"] == "dev"
+
+
+def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """A PATCH that omits repo_full_name must leave an existing binding alone.
+
+    This is the guarantee a channel-only redeploy PATCH depends on: the CLI
+    sends slack_channel by itself whenever --repo was not passed, and that
+    must never wipe the repository the agent is already bound to.
+    """
+
+    created = client.post(
+        "/agents",
+        json={
+            "name": "omit-repo-agent",
+            "slack_channel": "C0EXAMPLE3",
+            "repo_full_name": REPO,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = str(created.json()["id"])
+    assert created.json()["repo_full_name"] == REPO, "bound at creation"
+
+    patched = client.patch(
+        f"/agents/{agent_id}",
+        json={"slack_channel": "C0EXAMPLE4"},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 200, patched.text
+
+    # Read back through a separate request, so the assertion cannot be
+    # satisfied by the PATCH response echoing stale input.
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["repo_full_name"] == REPO, (
+        "omitting repo_full_name from the PATCH must leave the binding unchanged"
+    )
+    assert fetched.json()["slack_channel"] == "C0EXAMPLE4", (
+        "the channel PATCH must still take effect"
+    )
+
+
 def test_main_push_promotes_and_reuses_the_built_version(
     client: Any,
     auth_headers: dict[str, str],

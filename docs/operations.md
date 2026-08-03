@@ -165,12 +165,16 @@ promote:
 
 1. **The agent's repo is set.** The webhook resolves which agent a push
    belongs to by matching the payload's `repo.full_name` (owner/name)
-   against that agent's `repo_full_name`. This field is set when the agent
-   is created (console or Curie API); `curie cluster deploy` only pushes a
-   bundle to an agent that already exists and does not set this field. The
-   match is case sensitive, so the stored `repo_full_name` must match
-   GitHub's canonical owner and repository casing exactly, or the lookup
-   finds no agent, the push is silently ignored, and (unlike a rejection)
+   against that agent's `repo_full_name`. This field is set when the
+   agent is created (`curie <tier> deploy --repo owner/name`, or the
+   Curie API), and a later `curie <tier> deploy --repo owner/name` binds
+   an agent that has none yet. If the agent is already bound to a
+   different repository, the deploy declines to rebind it and prints a
+   warning naming the repository it kept, so `--repo` never silently
+   reroutes which repository's pushes deploy an agent. The match is
+   case sensitive, so the stored `repo_full_name` must match GitHub's
+   canonical owner and repository casing exactly, or the lookup finds
+   no agent, the push is silently ignored, and (unlike a rejection)
    nothing is logged, so the only symptom is a green delivery in GitHub
    with nothing deployed.
 2. **GitHub can reach the Curie API.** Add a webhook, in the repo's GitHub

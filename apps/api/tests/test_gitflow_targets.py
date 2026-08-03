@@ -136,23 +136,3 @@ def test_a_bundle_without_deploy_yaml_and_several_agents_is_refused() -> None:
         resolve_target_agent(None, Environment.prod, [agent("a"), agent("b")], None)
     assert caught.value.code == "deploy.no_targets"
     assert "deploy.yaml" in str(caught.value)
-
-
-# --------------------------------------------------------------------------- #
-# Binding an existing agent to a repository
-# --------------------------------------------------------------------------- #
-def test_repo_full_name_is_patchable() -> None:
-    """Without this, ADR-0091 is unreachable for the repos that need it most.
-
-    A repository's SECOND agent could not carry `repo_full_name` before
-    migration 0018 -- the unique index forbade it -- so it exists today bound to
-    nothing. `AgentUpdate` had no field for it, and create-time was the only
-    place it could ever be set. Git-flow would therefore never find that agent,
-    and a `deploy.yaml` naming it would be rejected as unknown.
-    """
-
-    from curie_api.schemas import AgentUpdate
-
-    assert "repo_full_name" in AgentUpdate.model_fields
-    assert AgentUpdate().repo_full_name is None, "omitted must leave the binding unchanged"
-    assert AgentUpdate(repo_full_name="octo/x").repo_full_name == "octo/x"
