@@ -1429,16 +1429,58 @@ fn is_connectivity_failure(stderr: &str) -> bool {
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
+/// A usage-block header, e.g. docker's `Usage:  docker [OPTIONS] COMMAND ...`.
+/// Matched on the `usage:` prefix only: a diagnosis line that happens to talk
+/// about usage (`usage limit exceeded`) never starts with the colon form, while
+/// every CLI that renders help on a bad invocation does.
+fn is_usage_header(line: &str) -> bool {
+    line.len() >= 6 && line[..6].eq_ignore_ascii_case("usage:")
+}
+
+/// A trailing help pointer a CLI appends instead of, or after, a usage block --
+/// docker's `Run 'docker --help' for more information`, kubectl's
+/// `See 'kubectl get --help' for usage.`. Matched on SHAPE (a `Run '`/`See '`
+/// opener that mentions `--help`), not on a tool name, so this does not need a
+/// new marker per tool.
+fn is_help_pointer(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let opens = ["run '", "run \"", "see '", "see \""]
+        .iter()
+        .any(|opener| lower.starts_with(opener));
+    opens && lower.contains("--help")
+}
+
 /// One-line reason drawn from a captured stderr: the last non-empty trimmed
-/// line, or a short default when the stderr is empty. Pure standalone sibling of
-/// the `run_step` failure line, so a failing teardown's Display message names
-/// WHY it failed instead of dropping the stderr to `--debug` plumbing.
+/// line that is part of the DIAGNOSIS, or a short default when the stderr is
+/// empty. The single implementation behind both a failing teardown's Display
+/// message and the `run_step` failure line, so neither drops the stderr to
+/// `--debug` plumbing and the two cannot drift apart.
+///
+/// Last-non-empty is the base rule because `helm` and `kubectl` print warnings
+/// BEFORE their `Error:` line, so the tail is where their diagnosis lives. What
+/// #1230 fixed is that a CLI rejecting its own invocation inverts that: the
+/// diagnosis comes first and a usage block comes last, so the raw base rule
+/// surfaced `Run 'docker --help' for more information` and threw away
+/// `unknown flag: --profile`. Trailing help text is therefore cut before the
+/// base rule is applied.
+///
+/// Safety property: a stderr that is ONLY help text has no diagnosis to
+/// recover, so the cut falls back to the base rule's answer rather than to an
+/// empty string. This can improve the surfaced reason, never blank it.
 fn failure_reason(stderr: &str) -> &str {
-    stderr
-        .lines()
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let base = lines.iter().rev().find(|l| !l.is_empty()).copied();
+    // Everything from the last usage header on is the tool's own help text.
+    let diagnosis_end = lines
+        .iter()
+        .rposition(|l| is_usage_header(l))
+        .unwrap_or(lines.len());
+    lines[..diagnosis_end]
+        .iter()
         .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
+        .find(|l| !l.is_empty() && !is_help_pointer(l))
+        .copied()
+        .or(base)
         .unwrap_or("command failed")
 }
 
@@ -1658,12 +1700,9 @@ pub(crate) async fn run_step(
         ui.plumbing(line);
     }
     if !ok {
-        let reason = err
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("command failed");
+        // One implementation, shared with the teardown Display message (#1230):
+        // an inline second copy of this rule is how the two drifted before.
+        let reason = failure_reason(&err);
         ui.failure(&format!("`{}` failed: {reason}", cmd.program));
         bail!("`{}` exited nonzero", cmd.program);
     }
@@ -4148,6 +4187,72 @@ mod tests {
         assert!(!is_connectivity_failure(
             "dial tcp: lookup bad-host on 127.0.0.53:53: no such host"
         ));
+    }
+
+    // #1230: a CLI that rejects its invocation prints the diagnosis FIRST and
+    // its usage block last, so "last non-empty line" surfaces the boilerplate
+    // and drops the only actionable line. This is the transcript that provoked
+    // the issue -- `curie local up` reported "Run 'docker --help' for more
+    // information" while the real cause sat four lines above it.
+    #[test]
+    fn failure_reason_skips_a_trailing_usage_block() {
+        let stderr = "unknown flag: --profile\n\
+                      \n\
+                      Usage:  docker [OPTIONS] COMMAND [ARG...]\n\
+                      \n\
+                      Run 'docker --help' for more information\n";
+        assert_eq!(failure_reason(stderr), "unknown flag: --profile");
+    }
+
+    // The same shape without a usage block: some rejections print only the
+    // diagnosis plus a bare help pointer.
+    #[test]
+    fn failure_reason_skips_a_bare_help_pointer() {
+        let stderr = "docker: 'compos' is not a docker command.\nSee 'docker --help'\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "docker: 'compos' is not a docker command."
+        );
+        let kubectl = "error: unknown flag: --foo\nSee 'kubectl get --help' for usage.\n";
+        assert_eq!(failure_reason(kubectl), "error: unknown flag: --foo");
+    }
+
+    // REGRESSION GUARD, and the reason the naive inverse ("take the first
+    // line") is wrong: helm prints warnings BEFORE its `Error:` line, so the
+    // last line is the right answer there and must stay the right answer.
+    #[test]
+    fn failure_reason_keeps_the_last_line_when_a_warning_precedes_the_error() {
+        let stderr = "WARNING: Kubernetes configuration file is group-readable\n\
+                      Error: INSTALLATION FAILED: cannot re-use a name that is still in use\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "Error: INSTALLATION FAILED: cannot re-use a name that is still in use"
+        );
+    }
+
+    // The unchanged base cases: one line is that line, nothing is the default.
+    #[test]
+    fn failure_reason_is_unchanged_for_single_line_and_empty_stderr() {
+        assert_eq!(
+            failure_reason("Error: release: not found\n"),
+            "Error: release: not found"
+        );
+        assert_eq!(failure_reason(""), "command failed");
+        assert_eq!(failure_reason("   \n\n  \n"), "command failed");
+    }
+
+    // The safety property: stripping must never blank the reason. A stderr that
+    // is ONLY a usage block has no diagnosis to recover, so the result falls
+    // back to today's last-line answer rather than to an empty string.
+    #[test]
+    fn failure_reason_falls_back_rather_than_blanking_on_a_pure_usage_block() {
+        let stderr = "Usage:  docker [OPTIONS] COMMAND [ARG...]\n\
+                      \n\
+                      Run 'docker --help' for more information\n";
+        assert_eq!(
+            failure_reason(stderr),
+            "Run 'docker --help' for more information"
+        );
     }
 
     // Both teardown steps completed: success, release present.
