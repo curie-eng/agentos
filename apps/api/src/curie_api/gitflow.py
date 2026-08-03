@@ -19,6 +19,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from aci_protocol import EvalJob
@@ -29,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 from . import bundles, crud, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
+from .github_app import credentials_for
 from .models import Agent, AgentVersion, Environment
 from .schemas import WebhookResult
 from .storage import ObjectStore
@@ -144,7 +146,9 @@ def _origins_match(requested: str, trusted: str) -> bool:
         return False
 
 
-def _clone_credential_env(trusted_url: str, settings: Settings) -> dict[str, str]:
+def _clone_credential_env(
+    trusted_url: str, settings: Settings, *, repo_full_name: str, credentials: Any = None
+) -> dict[str, str]:
     """Git config env that authenticates the clone, or empty if not applicable.
 
     Private repositories are the norm for a bundle -- it names internal hosts and
@@ -163,7 +167,12 @@ def _clone_credential_env(trusted_url: str, settings: Settings) -> dict[str, str
     deploys from (#1122).
     """
 
-    token = settings.github_token
+    # Which credential, per ADR-0092: a GitHub App installation token scoped to
+    # this one repository when an App is configured, otherwise the PAT. Only the
+    # SOURCE of the token varies -- `x-access-token` below is the username both
+    # kinds authenticate with, so nothing downstream changes.
+    resolver = credentials if credentials is not None else credentials_for(settings)
+    token = resolver.token_for(repo_full_name)
     if not token or not trusted_url.startswith("https://"):
         return {}
     host = urlsplit(trusted_url).netloc
@@ -196,7 +205,12 @@ def _git_failure_detail(exc: BaseException) -> str:
 
 
 def clone_and_archive(
-    clone_url: str, sha: str, settings: Settings, *, repo_full_name: str
+    clone_url: str,
+    sha: str,
+    settings: Settings,
+    *,
+    repo_full_name: str,
+    credentials: Any = None,
 ) -> bytes:
     """Mirror-clone the repo and return a tar of the tree at ``sha``.
 
@@ -240,7 +254,9 @@ def clone_and_archive(
         **os.environ,
         "GIT_ALLOW_PROTOCOL": "file:https:http",
         "GIT_TERMINAL_PROMPT": "0",
-        **_clone_credential_env(trusted_url, settings),
+        **_clone_credential_env(
+            trusted_url, settings, repo_full_name=repo_full_name, credentials=credentials
+        ),
     }
     try:
         try:

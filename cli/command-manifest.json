@@ -2138,6 +2138,100 @@
           "name": "comms"
         },
         {
+          "about": "Give the platform its own GitHub identity so agent repos need no deploy workflow (ADR-0092)",
+          "args": [
+            {
+              "default_values": [
+                ""
+              ],
+              "global": false,
+              "help": "The App's numeric id, from its GitHub settings page",
+              "id": "app_id",
+              "long": "app-id",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                ""
+              ],
+              "global": false,
+              "help": "Path to the App's PEM private key file. The path is passed to helm with --set-file, so the key's contents never enter argv",
+              "id": "private_key",
+              "long": "private-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "https://github.com"
+              ],
+              "global": false,
+              "help": "Where the platform clones from. Change only for GitHub Enterprise",
+              "id": "clone_base",
+              "long": "clone-base",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the App credentials, falling back to api.githubToken",
+              "id": "disconnect",
+              "long": "disconnect",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Helm chart. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds. Pass a path or ref to override",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the helm command that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "github-app"
+        },
+        {
           "about": "Drive the deployed Kubernetes release end to end with zero Slack contact",
           "args": [
             {

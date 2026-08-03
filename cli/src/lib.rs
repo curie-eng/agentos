@@ -17,6 +17,7 @@ pub mod docker;
 pub mod eval_init;
 pub mod evals;
 pub mod exit;
+pub mod github_app;
 pub mod guide;
 pub mod interactive;
 pub mod local;

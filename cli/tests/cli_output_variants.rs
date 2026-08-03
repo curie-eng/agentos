@@ -40,6 +40,7 @@ use curie::commands::{
     ResumeOutput, SkillApprovalsOutput, VersionsOutput,
 };
 use curie::comms::CommsOutput;
+use curie::github_app::GithubAppOutput;
 use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
@@ -299,6 +300,13 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => CommsOutput::DryRun(plan()),
             "Done" => CommsOutput::Done { connected: true },
+        ],
+    );
+    m.insert(
+        "GithubAppOutput",
+        samples![
+            "DryRun" => GithubAppOutput::DryRun(plan()),
+            "Done" => GithubAppOutput::Done { configured: true },
         ],
     );
     m.insert(

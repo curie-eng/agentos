@@ -16,6 +16,9 @@ dependencies = [
     "boto3-stubs[s3]>=1.43.57",
     "python-multipart>=0.0.18",
     "kubernetes>=36.0.3",
+    # GitHub App JWT signing (ADR-0092). Present transitively today; declared
+    # because this package imports it directly.
+    "pyjwt[crypto]>=2.10",
     "redis>=5.0",
     "plugin-format",
     "aci-protocol",

@@ -464,6 +464,18 @@ api:
   # to helm, but a token typed on the command line is still in curie's own
   # argv, so it does reach your shell history and the process table.
   githubToken: ""
+  # GitHub App identity (ADR-0092). The scalable alternative to githubToken
+  # above: the platform mints a one-hour token scoped to the single repository
+  # being cloned, so there is nothing to rotate, no human owner, and adding the
+  # next agent repository is a checkbox on the App's installation page rather
+  # than a re-issued credential.
+  #
+  # Set both, or neither. githubToken remains supported and is the right choice
+  # for a GitHub Enterprise or air-gapped install, or to prove the flow before
+  # registering an App. `curie cluster github-app` sets these for you.
+  githubAppId: ""
+  # The App's PEM private key, whole (including the BEGIN/END lines).
+  githubAppPrivateKey: ""
   # The one git origin the API clones from for git-flow. A pushed repository
   # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server

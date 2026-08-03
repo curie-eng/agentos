@@ -4,63 +4,9 @@
   "discovery": "These schema files are bundled into released `curie` CLI binaries and printed on demand: `curie schema-index` emits this index, `curie schema-index <name>` emits a named schema. In a source checkout they live at cli/schema/.",
   "results": [
     {
-      "result": "CheckOutput",
+      "result": "ApprovalsOutput",
       "kind": "CliOutput",
-      "schema": "check.schema.json",
-      "version": 1
-    },
-    {
-      "result": "InitOutput",
-      "kind": "CliOutput",
-      "schema": "init.schema.json",
-      "version": 1
-    },
-    {
-      "result": "ListAgentsOutput",
-      "kind": "CliOutput",
-      "schema": "list-agents.schema.json",
-      "version": 1
-    },
-    {
-      "result": "BumpVersionOutput",
-      "kind": "CliOutput",
-      "schema": "bump-version.schema.json",
-      "version": 1
-    },
-    {
-      "result": "StatusOutput",
-      "kind": "CliOutput",
-      "schema": "status.schema.json",
-      "version": 1
-    },
-    {
-      "result": "SkillMessageOutput",
-      "kind": "CliOutput",
-      "schema": "skill-message.schema.json",
-      "version": 1
-    },
-    {
-      "result": "EvalOutput",
-      "kind": "CliOutput",
-      "schema": "eval.schema.json",
-      "version": 1
-    },
-    {
-      "result": "DeployOutput",
-      "kind": "CliOutput",
-      "schema": "deploy.schema.json",
-      "version": 1
-    },
-    {
-      "result": "KillOutput",
-      "kind": "CliOutput",
-      "schema": "kill.schema.json",
-      "version": 1
-    },
-    {
-      "result": "ResumeOutput",
-      "kind": "CliOutput",
-      "schema": "resume.schema.json",
+      "schema": "approvals.schema.json",
       "version": 1
     },
     {
@@ -70,45 +16,33 @@
       "version": 1
     },
     {
-      "result": "ResetThreadOutput",
+      "result": "BumpVersionOutput",
       "kind": "CliOutput",
-      "schema": "reset-thread.schema.json",
+      "schema": "bump-version.schema.json",
       "version": 1
     },
     {
-      "result": "DeleteOutput",
+      "result": "CheckOutput",
       "kind": "CliOutput",
-      "schema": "delete.schema.json",
+      "schema": "check.schema.json",
       "version": 1
     },
     {
-      "result": "VersionsOutput",
+      "result": "ClusterDownOutput",
       "kind": "CliOutput",
-      "schema": "versions.schema.json",
+      "schema": "cluster-down.schema.json",
       "version": 1
     },
     {
-      "result": "MemoryOutput",
+      "result": "ClusterStatusOutput",
       "kind": "CliOutput",
-      "schema": "memory.schema.json",
+      "schema": "cluster-status.schema.json",
       "version": 1
     },
     {
-      "result": "ApprovalsOutput",
+      "result": "ClusterUpOutput",
       "kind": "CliOutput",
-      "schema": "approvals.schema.json",
-      "version": 1
-    },
-    {
-      "result": "SkillApprovalsOutput",
-      "kind": "CliOutput",
-      "schema": "skill-approvals.schema.json",
-      "version": 1
-    },
-    {
-      "result": "SecretsListOutput",
-      "kind": "CliOutput",
-      "schema": "secrets.schema.json",
+      "schema": "cluster-up.schema.json",
       "version": 1
     },
     {
@@ -118,33 +52,63 @@
       "version": 1
     },
     {
+      "result": "DeleteOutput",
+      "kind": "CliOutput",
+      "schema": "delete.schema.json",
+      "version": 1
+    },
+    {
+      "result": "DeployOutput",
+      "kind": "CliOutput",
+      "schema": "deploy.schema.json",
+      "version": 1
+    },
+    {
+      "result": "DryRunPlan",
+      "kind": "CliOutput",
+      "schema": "dry-run.schema.json",
+      "version": 1
+    },
+    {
+      "result": "EvalOutput",
+      "kind": "CliOutput",
+      "schema": "eval.schema.json",
+      "version": 1
+    },
+    {
+      "result": "GithubAppOutput",
+      "kind": "CliOutput",
+      "schema": "github-app.schema.json",
+      "version": 1
+    },
+    {
       "result": "GuideOutput",
       "kind": "CliOutput",
       "schema": "guide.schema.json",
       "version": 1
     },
     {
-      "result": "ObservabilityOutput",
+      "result": "InitOutput",
       "kind": "CliOutput",
-      "schema": "observability.schema.json",
+      "schema": "init.schema.json",
       "version": 1
     },
     {
-      "result": "MessageDryRunOutput",
+      "result": "KillOutput",
       "kind": "CliOutput",
-      "schema": "message.schema.json",
+      "schema": "kill.schema.json",
       "version": 1
     },
     {
-      "result": "MessageOutcomeOutput",
+      "result": "ListAgentsOutput",
       "kind": "CliOutput",
-      "schema": "message.schema.json",
+      "schema": "list-agents.schema.json",
       "version": 1
     },
     {
-      "result": "LocalUpOutput",
+      "result": "LocalDownOutput",
       "kind": "CliOutput",
-      "schema": "local-up.schema.json",
+      "schema": "local-down.schema.json",
       "version": 1
     },
     {
@@ -160,57 +124,87 @@
       "version": 1
     },
     {
-      "result": "LocalDownOutput",
+      "result": "LocalUpOutput",
       "kind": "CliOutput",
-      "schema": "local-down.schema.json",
+      "schema": "local-up.schema.json",
       "version": 1
     },
     {
-      "result": "ClusterUpOutput",
+      "result": "MemoryOutput",
       "kind": "CliOutput",
-      "schema": "cluster-up.schema.json",
+      "schema": "memory.schema.json",
       "version": 1
     },
     {
-      "result": "ClusterStatusOutput",
+      "result": "MessageDryRunOutput",
       "kind": "CliOutput",
-      "schema": "cluster-status.schema.json",
+      "schema": "message.schema.json",
       "version": 1
     },
     {
-      "result": "ClusterDownOutput",
+      "result": "MessageOutcomeOutput",
       "kind": "CliOutput",
-      "schema": "cluster-down.schema.json",
+      "schema": "message.schema.json",
       "version": 1
     },
     {
-      "result": "DryRunPlan",
+      "result": "ObservabilityOutput",
       "kind": "CliOutput",
-      "schema": "dry-run.schema.json",
+      "schema": "observability.schema.json",
       "version": 1
     },
     {
-      "result": "status_json",
-      "kind": "builder",
+      "result": "ResetThreadOutput",
+      "kind": "CliOutput",
+      "schema": "reset-thread.schema.json",
+      "version": 1
+    },
+    {
+      "result": "ResumeOutput",
+      "kind": "CliOutput",
+      "schema": "resume.schema.json",
+      "version": 1
+    },
+    {
+      "result": "SecretsListOutput",
+      "kind": "CliOutput",
+      "schema": "secrets.schema.json",
+      "version": 1
+    },
+    {
+      "result": "SkillApprovalsOutput",
+      "kind": "CliOutput",
+      "schema": "skill-approvals.schema.json",
+      "version": 1
+    },
+    {
+      "result": "SkillMessageOutput",
+      "kind": "CliOutput",
+      "schema": "skill-message.schema.json",
+      "version": 1
+    },
+    {
+      "result": "StatusOutput",
+      "kind": "CliOutput",
       "schema": "status.schema.json",
+      "version": 1
+    },
+    {
+      "result": "VersionsOutput",
+      "kind": "CliOutput",
+      "schema": "versions.schema.json",
+      "version": 1
+    },
+    {
+      "result": "error_json",
+      "kind": "builder",
+      "schema": "error.schema.json",
       "version": 1
     },
     {
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": 1
-    },
-    {
-      "result": "message_reply_json",
-      "kind": "builder",
-      "schema": "message.schema.json",
-      "version": 1
-    },
-    {
-      "result": "message_timeout_json",
-      "kind": "builder",
-      "schema": "message.schema.json",
       "version": 1
     },
     {
@@ -232,9 +226,21 @@
       "version": 1
     },
     {
-      "result": "error_json",
+      "result": "message_reply_json",
       "kind": "builder",
-      "schema": "error.schema.json",
+      "schema": "message.schema.json",
+      "version": 1
+    },
+    {
+      "result": "message_timeout_json",
+      "kind": "builder",
+      "schema": "message.schema.json",
+      "version": 1
+    },
+    {
+      "result": "status_json",
+      "kind": "builder",
+      "schema": "status.schema.json",
       "version": 1
     },
     {
