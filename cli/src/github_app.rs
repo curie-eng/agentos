@@ -42,7 +42,14 @@ pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsComman
             plain("-n"),
             plain(&opts.common.namespace),
             plain("--reuse-values"),
-            plain("--set"),
+            // --set-string, NOT --set. A numeric App ID round-trips through
+            // helm's stored values as a float64, and `| quote` then renders it
+            // in scientific notation: app id 4475970 reaches the API as
+            // "4.47597e+06", the JWT's `iss` claim is wrong, and GitHub answers
+            // 401 on every call. Found on a live cluster; a chart-render test
+            // cannot see it, because it only appears once a real numeric value
+            // has been through a --reuse-values round trip.
+            plain("--set-string"),
             plain(format!("api.githubAppId={}", opts.app_id)),
             // The key's CONTENTS never enter argv; helm reads the file itself.
             plain("--set-file"),
@@ -227,6 +234,22 @@ mod tests {
 
     fn argv(cmd: &OpsCommand) -> Vec<String> {
         cmd.argv()
+    }
+
+    #[test]
+    fn the_app_id_is_set_as_a_string() {
+        // helm's `--set` parses a bare number, and a --reuse-values round trip
+        // turns it into a float64. App id 4475970 then renders as
+        // "4.47597e+06", the JWT's `iss` claim is wrong, and EVERY GitHub call
+        // answers 401. Found on a live cluster -- a chart-render test cannot
+        // see it, because it only appears once a real numeric value has been
+        // through helm's stored values.
+        let cmds = connect_commands(&opts(false), DEFAULT_CLONE_BASE);
+        let flat = argv(&cmds[0]).join(" ");
+        assert!(
+            flat.contains("--set-string api.githubAppId="),
+            "app id must use --set-string, not --set: {flat}"
+        );
     }
 
     #[test]
