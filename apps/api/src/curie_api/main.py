@@ -12,9 +12,11 @@ import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI
 
+from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
 from .evalqueue import EvalQueue
+from .github_app import credentials_for
 from .github_checks import GitHubStatusReporter
 from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
@@ -146,6 +148,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.graveyard_watcher_task = asyncio.create_task(watcher.run_forever())
     else:
         app.state.graveyard_watcher_task = None
+    # Commit polling (#1239): the deploy path for a cluster that cannot receive
+    # a GitHub webhook. Interval <= 0 disables it, which is the default -- an
+    # install whose webhook works needs nothing here, and polling would only
+    # add GitHub API calls. It reuses the credential resolver and the ordinary
+    # process_push, so it cannot disagree with the webhook about what a push
+    # means.
+    if settings.commit_poll_interval_s > 0:
+        poller = CommitPoller(
+            session_factory=app.state.sessionmaker,
+            store=app.state.store,
+            settings=settings,
+            eval_queue=app.state.eval_queue,
+            tips=GitHubBranchTip(settings, credentials_for(settings)),
+            interval_seconds=settings.commit_poll_interval_s,
+        )
+        app.state.commit_poller = poller
+        app.state.commit_poller_task = asyncio.create_task(poller.run_forever())
+    else:
+        app.state.commit_poller_task = None
     try:
         yield
     finally:
@@ -175,6 +196,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             watcher_task.cancel()
             try:
                 await watcher_task
+            except asyncio.CancelledError:
+                pass
+        # Cancelled before engine.dispose(): a poll pass mid-deploy holds a
+        # session, and disposing the engine underneath it would raise on the
+        # way out rather than shutting down cleanly.
+        poller_task = getattr(app.state, "commit_poller_task", None)
+        if poller_task is not None:
+            poller_task.cancel()
+            try:
+                await poller_task
             except asyncio.CancelledError:
                 pass
         await valkey.aclose()

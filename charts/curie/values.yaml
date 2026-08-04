@@ -486,6 +486,17 @@ api:
   # External Secrets or Sealed Secrets. Wins over githubAppPrivateKey when set.
   githubAppExistingSecret: ""
   githubAppExistingSecretKey: privateKey
+  # Commit polling (issue #1239), in seconds; 0 disables it.
+  #
+  # Turn this on when the cluster cannot receive GitHub webhooks -- behind a
+  # firewall or NAT, which is the common case for a self-hosted install. The
+  # API then asks GitHub whether the branches deploy.yaml names have moved.
+  # Outbound works where inbound does not.
+  #
+  # The webhook remains the fast path wherever it reaches; polling is the
+  # floor. A poll for a push the webhook already handled does nothing, so
+  # running both is safe. 60 is a reasonable starting interval.
+  commitPollIntervalSeconds: 0
   # The one git origin the API clones from for git-flow. A pushed repository
   # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server

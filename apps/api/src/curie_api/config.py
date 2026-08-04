@@ -110,6 +110,15 @@ class Settings(BaseSettings):
     # never place it in argv.
     github_app_private_key: str = ""
     github_app_timeout_seconds: float = 15.0
+    # Commit polling (issue #1239). A self-hosted cluster that accepts no
+    # inbound traffic cannot receive a GitHub webhook, so without this it has
+    # no push-to-deploy at all. Outbound always works, so the API asks GitHub
+    # whether the deploy branches moved.
+    #
+    # 0 disables it. The webhook stays the fast path wherever it can reach;
+    # this is the floor, not a replacement, and a poll after a webhook already
+    # handled the push is a no-op.
+    commit_poll_interval_s: float = 0.0
     # The one git origin this installation deploys from. The webhook payload's
     # `clone_url` is compared against `<base>/<repo_full_name>.git` and a
     # mismatch is rejected before any subprocess starts; git is then handed the
