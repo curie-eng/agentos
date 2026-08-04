@@ -8,9 +8,12 @@ every push or a dead token served until restart.
 
 from __future__ import annotations
 
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
+import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -157,13 +160,119 @@ def test_a_second_push_reuses_the_cached_token(private_key: str, github: Recorde
 
 
 def test_a_near_expiry_token_is_reminted(private_key: str, monkeypatch) -> None:
-    # Serving a token that dies mid-clone is the failure this margin prevents.
-    recorder = Recorder(expires_at="1971-01-01T00:00:00Z")
+    """A token inside the refresh margin is re-minted before it can expire.
+
+    This used `1971-01-01`, already long past, so it proved only that an
+    EXPIRED token is replaced -- deleting the 300s margin entirely left it
+    green (#1263). The margin exists for a token that is still valid now and
+    will not be by the time a clone finishes, so the expiry has to sit in the
+    future and inside the margin for the assertion to mean anything.
+    """
+
+    from curie_api.github_app import _TOKEN_REFRESH_MARGIN_SECONDS
+
+    soon = datetime.now(UTC) + timedelta(seconds=_TOKEN_REFRESH_MARGIN_SECONDS / 2)
+    recorder = Recorder(expires_at=soon.strftime("%Y-%m-%dT%H:%M:%SZ"))
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
     creds = GitHubCredentials(settings=app_settings(private_key))
     creds.token_for(REPO)
     creds.token_for(REPO)
     assert recorder.minted == 2
+
+
+def test_a_token_comfortably_outside_the_margin_is_reused(private_key: str, monkeypatch) -> None:
+    """The other side of the margin: still-fresh tokens are NOT re-minted.
+
+    Without this, "re-mint whenever asked" also passes the test above, and the
+    cache stops being a cache.
+    """
+
+    from curie_api.github_app import _TOKEN_REFRESH_MARGIN_SECONDS
+
+    later = datetime.now(UTC) + timedelta(seconds=_TOKEN_REFRESH_MARGIN_SECONDS * 4)
+    recorder = Recorder(expires_at=later.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds.token_for(REPO)
+    creds.token_for(REPO)
+    assert recorder.minted == 1
+
+
+def test_an_unparseable_expiry_is_not_treated_as_immortal(private_key: str, monkeypatch) -> None:
+    """A garbled expiry must fall back to an hour, not to forever.
+
+    Caching a token as never-expiring fails every clone after it dies, until
+    someone restarts the pod -- and the log says "authentication", not
+    "expired". Treating it as immortal survived the suite (#1263).
+    """
+
+    recorder = Recorder(expires_at="not-a-timestamp")
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
+    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds.token_for(REPO)
+    cached = creds._tokens[REPO]
+    assumed = cached.expires_at - time.time()
+    assert 3000 < assumed < 4200, f"expected the documented ~1h fallback, got {assumed:.0f}s"
+
+
+# --------------------------------------------------------------------------- #
+# The JWT itself -- GitHub rejects a malformed one with a bare 401
+# --------------------------------------------------------------------------- #
+def _decode(token: str, private_key: str) -> dict[str, Any]:
+    """Verify and decode, the way GitHub does."""
+    from cryptography.hazmat.primitives import serialization as ser
+
+    public = ser.load_pem_private_key(private_key.encode(), password=None).public_key()
+    return jwt.decode(token, public, algorithms=["RS256"], options={"verify_aud": False})
+
+
+def test_the_jwt_names_this_app_as_the_issuer(private_key: str) -> None:
+    # `iss` is how GitHub knows which App is calling. Replacing it with "0"
+    # survived every test (#1263); the symptom is a 401 naming nothing.
+    creds = GitHubCredentials(settings=app_settings(private_key))
+    assert _decode(creds._app_jwt(), private_key)["iss"] == "12345"
+
+
+def test_the_jwt_is_backdated_and_not_yet_expired(private_key: str) -> None:
+    """`iat` in the past, `exp` in the future, both within GitHub's bounds.
+
+    GitHub rejects a JWT whose `iat` is in its future -- ordinary clock skew
+    does it -- and one whose `exp` is more than 10 minutes out. Pushing `iat`
+    600s forward, or setting `exp` already-past, both survived (#1263), and
+    both produce a 401 that says nothing about time.
+    """
+
+    creds = GitHubCredentials(settings=app_settings(private_key))
+    now = time.time()
+    claims = _decode(creds._app_jwt(), private_key)
+    assert claims["iat"] < now, "iat must be backdated for clock skew"
+    assert claims["exp"] > now, "exp must be in the future"
+    assert claims["exp"] - claims["iat"] <= 600, "exp must stay inside GitHub's 10-minute cap"
+
+
+# --------------------------------------------------------------------------- #
+# The shared-resolver cache key
+# --------------------------------------------------------------------------- #
+def test_rotating_the_private_key_gets_a_new_resolver(private_key: str) -> None:
+    """The cache key includes the key, so a rotation is not served stale.
+
+    Dropping the private key from the key survived (#1263): after a rotation
+    the old resolver -- and its cached tokens minted with the retired key --
+    would be handed back until the process restarted.
+    """
+
+    from curie_api.github_app import credentials_for
+
+    first = credentials_for(app_settings(private_key))
+    assert credentials_for(app_settings(private_key)) is first, "same config, same resolver"
+
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    rotated = other.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    assert credentials_for(app_settings(rotated)) is not first
 
 
 def test_two_repositories_do_not_share_a_token(private_key: str, github: Recorder) -> None:
