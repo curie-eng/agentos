@@ -506,6 +506,23 @@ class ResolvedTarget(BaseModel):
     slack_channel: str | None = None
 
 
+class NamedTarget(ResolvedTarget):
+    """A resolved target plus the name it is declared under."""
+
+    name: str
+
+
+class ListedTargets(BaseModel):
+    """Every target a ``deploy.yaml`` declares, dev before prod.
+
+    Ordered so a caller onboarding a repository deploys dev first. A run that
+    fails part-way then leaves prod BEHIND rather than ahead of a dev that
+    never landed -- recoverable in one direction, not the other.
+    """
+
+    targets: list[NamedTarget] = []
+
+
 class ConnectorManifests(BaseModel):
     """Kubernetes objects derived from a version's ``connectors.yaml``.
 

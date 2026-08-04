@@ -10,12 +10,35 @@ agent to create.
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, status
-from plugin_format.deploy_targets import validate_deploy_targets
+from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
 
 from ..auth import require_api_key
-from ..schemas import ResolvedTarget, ResolveTargetRequest
+from ..schemas import ListedTargets, NamedTarget, ResolvedTarget, ResolveTargetRequest
 
 router = APIRouter(tags=["deploy-targets"], dependencies=[Depends(require_api_key)])
+
+
+def _parse(content: str) -> DeployTargetsFile:
+    """Parse and validate ``deploy.yaml``, or raise the operator-facing 400.
+
+    Shared by both endpoints so `list` and `resolve` cannot disagree about
+    whether a file is valid -- which would be a second parser by the back door,
+    the exact thing ADR-0089 put this in the API to prevent.
+    """
+
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"deploy.yaml is unparseable: {exc}"
+        ) from exc
+
+    parsed, errors = validate_deploy_targets(data)
+    if errors:
+        detail = "; ".join(f"{code}: {message}" for code, message in errors)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+    assert parsed is not None
+    return parsed
 
 
 @router.post("/deploy-targets/resolve", response_model=ResolvedTarget)
@@ -34,18 +57,7 @@ async def resolve_deploy_target(body: ResolveTargetRequest) -> ResolvedTarget:
     agent, environment, or channel.
     """
 
-    try:
-        data = yaml.safe_load(body.content)
-    except yaml.YAMLError as exc:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, f"deploy.yaml is unparseable: {exc}"
-        ) from exc
-
-    parsed, errors = validate_deploy_targets(data)
-    if errors:
-        detail = "; ".join(f"{code}: {message}" for code, message in errors)
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
-    assert parsed is not None
+    parsed = _parse(body.content)
 
     target = parsed.targets.get(body.target)
     if target is None:
@@ -55,3 +67,30 @@ async def resolve_deploy_target(body: ResolveTargetRequest) -> ResolvedTarget:
             f"no target named {body.target!r} in deploy.yaml. Declared: {known}",
         )
     return ResolvedTarget(agent=target.agent, env=target.env, slack_channel=target.slack_channel)
+
+
+@router.post("/deploy-targets/list", response_model=ListedTargets)
+async def list_deploy_targets(body: ResolveTargetRequest) -> ListedTargets:
+    """Every target a ``deploy.yaml`` declares (ADR-0089).
+
+    The sibling of `resolve` above, and here for the same reason: onboarding a
+    repository means deploying ALL its targets, and a caller that had to parse
+    the file to enumerate them would be the second parser this endpoint exists
+    to prevent.
+
+    ``target`` on the request is ignored -- the shape is shared so the CLI has
+    one request type for both calls.
+
+    Ordered dev before prod. A caller deploying in sequence that fails part-way
+    then leaves prod on its previous version rather than ahead of a dev that
+    never landed; recoverable one way and not the other.
+    """
+
+    parsed = _parse(body.content)
+    order = {"dev": 0, "prod": 1}
+    named = [
+        NamedTarget(name=name, agent=t.agent, env=t.env, slack_channel=t.slack_channel)
+        for name, t in parsed.targets.items()
+    ]
+    named.sort(key=lambda t: (order.get(t.env, 2), t.name))
+    return ListedTargets(targets=named)

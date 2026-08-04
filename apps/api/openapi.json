@@ -1669,6 +1669,21 @@
         "title": "KillState",
         "type": "object"
       },
+      "ListedTargets": {
+        "description": "Every target a ``deploy.yaml`` declares, dev before prod.\n\nOrdered so a caller onboarding a repository deploys dev first. A run that\nfails part-way then leaves prod BEHIND rather than ahead of a dev that\nnever landed -- recoverable in one direction, not the other.",
+        "properties": {
+          "targets": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/NamedTarget"
+            },
+            "title": "Targets",
+            "type": "array"
+          }
+        },
+        "title": "ListedTargets",
+        "type": "object"
+      },
       "LoadPackConfig": {
         "description": "Rotating \"working...\" load lines for one agent. Mirrors the worker's\ncurie_worker.behaviorpacks.LoadPack (packs ride on agent config, not the\nfrozen ACI contract, so the shape is duplicated across the layers the way\nBudgetConfig mirrors the ACI Budget).",
         "properties": {
@@ -1910,6 +1925,47 @@
           "error_rate"
         ],
         "title": "MetricsSummary",
+        "type": "object"
+      },
+      "NamedTarget": {
+        "description": "A resolved target plus the name it is declared under.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent"
+          },
+          "env": {
+            "default": "dev",
+            "title": "Env",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slack_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Slack Channel"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "NamedTarget",
         "type": "object"
       },
       "NavPackConfig": {
@@ -5113,6 +5169,66 @@
         "summary": "Get Config",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/deploy-targets/list": {
+      "post": {
+        "description": "Every target a ``deploy.yaml`` declares (ADR-0089).\n\nThe sibling of `resolve` above, and here for the same reason: onboarding a\nrepository means deploying ALL its targets, and a caller that had to parse\nthe file to enumerate them would be the second parser this endpoint exists\nto prevent.\n\n``target`` on the request is ignored -- the shape is shared so the CLI has\none request type for both calls.\n\nOrdered dev before prod. A caller deploying in sequence that fails part-way\nthen leaves prod on its previous version rather than ahead of a dev that\nnever landed; recoverable one way and not the other.",
+        "operationId": "list_deploy_targets_deploy_targets_list_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveTargetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListedTargets"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Deploy Targets",
+        "tags": [
+          "deploy-targets"
         ]
       }
     },

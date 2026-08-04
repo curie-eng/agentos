@@ -1464,6 +1464,14 @@ enum ClusterAction {
         /// no committed file.
         #[arg(long, conflicts_with = "agent")]
         target: Option<String>,
+        /// Deploy EVERY target `deploy.yaml` declares, dev before prod.
+        ///
+        /// Onboarding a repository otherwise means one invocation per target,
+        /// and forgetting one leaves an agent that exists and never updates.
+        /// Ordered dev-first so a run that fails part-way leaves prod on its
+        /// previous version rather than ahead of a dev that never landed.
+        #[arg(long, conflicts_with_all = ["target", "agent", "env", "slack_channel"])]
+        all_targets: bool,
         /// Deploy under this agent name instead of the manifest's `name`.
         ///
         /// The bundle is unchanged -- only which agent it binds to. This is how
@@ -2156,7 +2164,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         // `local deploy` offers `--secret`, so enforce the
                         // declared-secrets policy gate (#464).
                         secret_binding_supported: true,
-                        connect_hint,
+                        connect_hint: connect_hint.clone(),
                     })
                     .await?,
                 )
@@ -2619,6 +2627,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 plugin_dir,
                 agent,
                 target,
+                all_targets,
                 api_url,
                 namespace,
                 release,
@@ -2710,45 +2719,90 @@ async fn run(command: Option<Command>) -> Result<()> {
                         "the platform API at {api_url} (from --api-url/CURIE_API_URL) is unreachable. `cluster deploy` dialed it directly with no port-forward; confirm that URL is reachable and the release is healthy with `curie cluster status`, or omit --api-url to self-plumb a loopback port-forward to svc/{release}-api."
                     )
                 };
-                let deployed = commands::deploy(DeployOpts {
-                    plugin_dir,
-                    agent,
-                    target,
-                    api_url: api_url.clone(),
-                    api_key: api_key.clone(),
-                    slack_channel,
-                    repo,
-                    env,
-                    label,
-                    // Cluster connector-secret delivery is deferred to #440; no
-                    // `--secret` flag on `cluster deploy` (see the note above).
-                    secret: Vec::new(),
-                    // Secret binding is not wired on cluster until #440, so the
-                    // declared-secrets policy gate (#464) is skipped here: it
-                    // would otherwise hard-fail every secrets-declaring bundle
-                    // with a `--secret <NAME>` remediation this tier lacks.
-                    secret_binding_supported: false,
-                    connect_hint,
-                })
-                .await?;
+                // --all-targets onboards a repository in one invocation.
+                // The list comes from the API, not a Rust YAML parse: ADR-0089
+                // keeps exactly one parser for this file, and a second could
+                // disagree with it about where a deploy lands.
+                let targets: Vec<Option<String>> = if all_targets {
+                    let path = plugin_dir.join("deploy.yaml");
+                    let content = std::fs::read_to_string(&path).map_err(|err| {
+                        curie::exit::usage(format!(
+                            "--all-targets needs a deploy.yaml in the bundle, but {} could \
+                             not be read: {err}",
+                            path.display()
+                        ))
+                    })?;
+                    let listed = api::ApiClient::new(&api_url, &api_key)?
+                        .list_deploy_targets(&content)
+                        .await?;
+                    if listed.targets.is_empty() {
+                        bail!(
+                            "deploy.yaml declares no targets, so --all-targets has nothing to \
+                             deploy. Declare at least one (ADR-0089), or drop the flag and pass \
+                             --agent/--env/--slack-channel."
+                        );
+                    }
+                    ui::ui().note(&format!(
+                        "onboarding {} target(s): {}",
+                        listed.targets.len(),
+                        listed
+                            .targets
+                            .iter()
+                            .map(|t| t.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    listed.targets.into_iter().map(|t| Some(t.name)).collect()
+                } else {
+                    vec![target]
+                };
 
-                // Stand up whatever the bundle's connectors.yaml declares
-                // (ADR-0086, #1063). After the deploy, so the objects exist
-                // before the next turn reaches for them; the credentials here
-                // are the CONNECTOR's, resolved locally and written straight to
-                // a K8s Secret, which is a different path from the sandbox
-                // secret delivery #440 tracks.
-                sync_connectors(
-                    &api_url,
-                    &api_key,
-                    &namespace,
-                    &release,
-                    &deployed.agent_id,
-                    &deployed.agent_name,
-                    &deployed.version_id,
-                )
-                .await?;
-                emit(deployed)
+                // Emits the LAST deploy, so `--json` still yields one object
+                // (cli/CLAUDE.md: a verb emits exactly one). The per-target
+                // progress is on the note above.
+                let mut last_deployed = None;
+                for target in targets {
+                    let deployed = commands::deploy(DeployOpts {
+                        plugin_dir: plugin_dir.clone(),
+                        agent: agent.clone(),
+                        target,
+                        api_url: api_url.clone(),
+                        api_key: api_key.clone(),
+                        slack_channel: slack_channel.clone(),
+                        repo: repo.clone(),
+                        env,
+                        label: label.clone(),
+                        // Cluster connector-secret delivery is deferred to #440; no
+                        // `--secret` flag on `cluster deploy` (see the note above).
+                        secret: Vec::new(),
+                        // Secret binding is not wired on cluster until #440, so the
+                        // declared-secrets policy gate (#464) is skipped here: it
+                        // would otherwise hard-fail every secrets-declaring bundle
+                        // with a `--secret <NAME>` remediation this tier lacks.
+                        secret_binding_supported: false,
+                        connect_hint: connect_hint.clone(),
+                    })
+                    .await?;
+
+                    // Stand up whatever the bundle's connectors.yaml declares
+                    // (ADR-0086, #1063). After the deploy, so the objects exist
+                    // before the next turn reaches for them; the credentials here
+                    // are the CONNECTOR's, resolved locally and written straight to
+                    // a K8s Secret, which is a different path from the sandbox
+                    // secret delivery #440 tracks.
+                    sync_connectors(
+                        &api_url,
+                        &api_key,
+                        &namespace,
+                        &release,
+                        &deployed.agent_id,
+                        &deployed.agent_name,
+                        &deployed.version_id,
+                    )
+                    .await?;
+                    last_deployed = Some(deployed);
+                }
+                emit(last_deployed.expect("the target list is never empty"))
             }
             ClusterAction::Kill {
                 agent,
