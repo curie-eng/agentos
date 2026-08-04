@@ -791,6 +791,31 @@ pub fn model_egress_status_lines(
 /// into `ps` or shell history.
 const COMMS_MANAGED_KEYS: &[&str] = &["dispatcher.slack.appToken", "dispatcher.slack.botToken"];
 
+/// The chart values `cluster github-app` records (ADR-0092), preserved across a
+/// plain `cluster up` for exactly the reason [`COMMS_MANAGED_KEYS`] is.
+///
+/// A plain `up` does a FULL upgrade and drops anything it does not re-pass, so
+/// an operator who wired the App and later ran `up` to change something
+/// unrelated silently lost it: `githubAppPrivateKey` back to `""`,
+/// `GITHUB_APP_ID` back to empty. The platform then falls through to the PAT
+/// path or to no credential at all, and every private-repo deploy 404s -- with
+/// nothing in the diff mentioning the App (#1256).
+///
+/// The chart's `lookup` preserve pattern does not cover these: the private key
+/// renders with no guard, and the other two are plain Deployment env values
+/// where no lookup is possible. So it has to happen here.
+///
+/// The private key is preserved the same way a bot token is -- read back from
+/// the release and re-supplied through the private 0600 values file, never
+/// argv, so it cannot reach `ps` or shell history.
+const GITHUB_APP_MANAGED_KEYS: &[&str] = &[
+    "api.githubAppId",
+    "api.githubAppPrivateKey",
+    "api.githubAppExistingSecret",
+    "api.githubAppExistingSecretKey",
+    "api.githubCloneBase",
+];
+
 const REQUIRED_SECRETS: &[(&str, usize)] = &[
     ("postgres.auth.password", 24),
     ("valkey.password", 24),
@@ -925,6 +950,46 @@ fn resolve_comms_values(
             preserved_value(existing, key).map(|current| ((*key).to_string(), current))
         })
         .collect()
+}
+
+/// Re-supply the [`GITHUB_APP_MANAGED_KEYS`] a previous `cluster github-app` recorded.
+///
+/// Same contract as [`resolve_comms_values`]: an operator `--set` wins, a key
+/// helm has no record of is left alone. Preserves, never invents -- inventing
+/// an App id would be worse than dropping one.
+fn resolve_github_app_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let overridden = operator_set_keys(operator_sets);
+    GITHUB_APP_MANAGED_KEYS
+        .iter()
+        .filter(|key| !overridden.contains(**key))
+        .filter_map(|key| {
+            preserved_value(existing, key).map(|current| ((*key).to_string(), current))
+        })
+        .collect()
+}
+
+/// Every value a plain `cluster up` must carry forward, in one place.
+///
+/// `up` does a FULL upgrade and drops anything it does not re-pass, so each
+/// family of keys recorded by a SIBLING verb has to be re-supplied here or it
+/// is silently reverted -- Slack tokens by `comms` (#1067), the GitHub App by
+/// `github-app` (#1256). Both failures looked identical to the operator:
+/// something that had been working stopped, with nothing in the diff naming
+/// it.
+///
+/// Composed rather than called separately from `up`, so a test can assert the
+/// whole set. Unit-testing each family in isolation left the WIRING uncovered:
+/// deleting the call from `up` kept every test green.
+fn resolve_preserved_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let mut all = resolve_comms_values(existing, operator_sets);
+    all.extend(resolve_github_app_values(existing, operator_sets));
+    all
 }
 
 /// Resolve [`GITHUB_TOKEN_KEY`] for this run.
@@ -1808,10 +1873,11 @@ pub async fn up(
     if !opts.dev {
         let fresh = existing.is_none();
         opts.secrets = resolve_generated_secrets(existing.as_ref(), &opts.set)?;
-        let preserved = resolve_comms_values(existing.as_ref(), &opts.set);
+        let preserved = resolve_preserved_values(existing.as_ref(), &opts.set);
         if !preserved.is_empty() {
             ui.note(&format!(
-                "preserving {} value(s) set by `cluster comms`; run comms again only to change them",
+                "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; \
+                 re-run those verbs only to change them",
                 preserved.len()
             ));
             opts.secrets.extend(preserved);
@@ -4924,6 +4990,94 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn up_carries_forward_both_families_of_sibling_verb_values() {
+        // The wiring, not the helpers. Testing each family in isolation left
+        // this uncovered: deleting the call from `up` kept every test green,
+        // which is how #1256 shipped in the first place.
+        let existing = serde_json::json!({
+            "dispatcher": {"slack": {"appToken": "xapp-x", "botToken": "xoxb-x"}},
+            "api": {"githubAppId": "1234567", "githubAppPrivateKey": "FAKEKEY"},
+        });
+        let keys: Vec<String> = resolve_preserved_values(Some(&existing), &[])
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(
+            keys.contains(&"dispatcher.slack.botToken".to_string()),
+            "lost the Slack tokens (#1067): {keys:?}"
+        );
+        assert!(
+            keys.contains(&"api.githubAppPrivateKey".to_string()),
+            "lost the GitHub App (#1256): {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_up_preserves_the_github_app_recorded_by_github_app() {
+        // A full upgrade drops anything it does not re-pass. An operator who
+        // wired the App and later ran `up` for something unrelated silently
+        // lost it, and every private-repo deploy 404d with nothing in the diff
+        // mentioning the App (#1256).
+        let existing = serde_json::json!({
+            "api": {
+                "githubAppId": "1234567",
+                "githubAppPrivateKey": "FAKEKEY",
+                "githubCloneBase": "https://github.example.com",
+            }
+        });
+        let preserved = resolve_github_app_values(Some(&existing), &[]);
+        assert_eq!(
+            preserved,
+            vec![
+                ("api.githubAppId".to_string(), "1234567".to_string()),
+                ("api.githubAppPrivateKey".to_string(), "FAKEKEY".to_string()),
+                (
+                    "api.githubCloneBase".to_string(),
+                    "https://github.example.com".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_byo_secret_reference_is_preserved_too() {
+        // The recommended path (#1236) records a Secret NAME rather than the
+        // key. Dropping that reference reverts the API to the chart's own
+        // Secret, whose default is empty -- the same silent revocation.
+        let existing = serde_json::json!({
+            "api": {
+                "githubAppId": "1234567",
+                "githubAppExistingSecret": "curie-github-app",
+                "githubAppExistingSecretKey": "privateKey",
+            }
+        });
+        let keys: Vec<String> = resolve_github_app_values(Some(&existing), &[])
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(keys.contains(&"api.githubAppExistingSecret".to_string()));
+        assert!(keys.contains(&"api.githubAppExistingSecretKey".to_string()));
+    }
+
+    #[test]
+    fn an_operator_set_wins_over_the_recorded_app_value() {
+        // Preserve, never override. `--set` is the operator saying they own it.
+        let existing = serde_json::json!({"api": {"githubAppId": "1234567"}});
+        let preserved =
+            resolve_github_app_values(Some(&existing), &["api.githubAppId=999".to_string()]);
+        assert!(preserved.is_empty());
+    }
+
+    #[test]
+    fn nothing_is_invented_when_no_app_was_ever_configured() {
+        // Preserving must not fabricate. An invented App id is worse than a
+        // dropped one: it fails auth in a way that reads as a permissions
+        // problem rather than a missing credential.
+        assert!(resolve_github_app_values(None, &[]).is_empty());
+        assert!(resolve_github_app_values(Some(&serde_json::json!({})), &[]).is_empty());
     }
 
     #[test]
