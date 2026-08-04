@@ -39,7 +39,7 @@ KEYS=(
   postgresPassword
   valkeyPassword
   clickhousePassword
-  minioRootPassword
+  rustfsSecretKey
   langfuseSalt
   langfuseEncryptionKey
   langfuseNextauthSecret
@@ -50,7 +50,7 @@ declare -A DEFAULTS=(
   [postgresPassword]="postgres"
   [valkeyPassword]="valkeypass"
   [clickhousePassword]="clickhouse"
-  [minioRootPassword]="miniosecret"
+  [rustfsSecretKey]="miniosecret"
   [langfuseSalt]="dev-salt-change-me"
   [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
   [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
@@ -299,7 +299,7 @@ echo "  ok: misspelled runner env name is rejected (the assert can fail)"
 
 echo "=== Assertion 8: priorityClassName on every control-plane pod + the sandbox controller + the sandbox (ADR-0059 decision 5, #759, #816) ==="
 # The control plane (worker, api, dispatcher, data tier: postgres, valkey,
-# clickhouse, minio) must outrank sandbox pods for node-pressure eviction, so
+# clickhouse, rustfs) must outrank sandbox pods for node-pressure eviction, so
 # the components that supervise, drain, and reclaim a sandbox are never
 # themselves preferred for eviction over the sandboxes they manage. Render with
 # the dispatcher enabled (it needs both Slack tokens to render at all) so every
@@ -336,7 +336,7 @@ import yaml
 rendered, platform_name, sandbox_name = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # Deployment/StatefulSet name suffix -> expected priorityClassName. The data
-# tier (postgres/valkey/clickhouse/minio) and the three first-party services
+# tier (postgres/valkey/clickhouse/rustfs) and the three first-party services
 # (worker, api, dispatcher) are all control plane per ADR-0059 decision 5;
 # langfuse/ui/inference/otel are deliberately out of scope (not named in the
 # decision).
@@ -347,7 +347,7 @@ EXPECTED = {
     "-postgres": platform_name,
     "-valkey": platform_name,
     "-clickhouse": platform_name,
-    "-minio": platform_name,
+    "-rustfs": platform_name,
 }
 
 # Exact name, not a suffix match: `agent-sandbox-controller-extensions` and
