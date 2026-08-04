@@ -1266,6 +1266,34 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         ))
     })?;
 
+    // The sidecar's container name, derived once here so the preflight probe
+    // below and the sidecar setup after the teardown derive their volume from
+    // one name and cannot drift.
+    let ollama = format!("{}-ollama", opts.name);
+
+    // ADR 0093: preflight --local-model before ANY teardown below, since
+    // refusing is free but replacing tears down a live runner (the #747
+    // invariant above). This is the same refusal `local up` gives, so both
+    // tiers answer `--local-model` identically (ADR 0041). The skill tier's
+    // model cache is the sidecar's own volume, not compose's -- and
+    // stop_recorded explicitly keeps that volume, so this preflight returns
+    // the identical answer whether it runs here or after the teardown;
+    // moving it earlier is purely about ordering, not about its verdict.
+    if let Some(local_model) = &opts.local_model {
+        if !opts.pull_model {
+            docker::preflight_local_model(
+                DEFAULT_OLLAMA_IMAGE,
+                &docker::ollama_volume(&ollama),
+                local_model,
+                &format!(
+                    "curie skill up --local-model {local_model} --pull-model --name {}",
+                    opts.name
+                ),
+            )
+            .await?;
+        }
+    }
+
     // The replacement itself, once every cheap validation has passed. Tearing
     // down the record means EVERYTHING it describes -- container, ollama sidecar,
     // network, then the file -- because clearing the record while its runner is
@@ -1299,24 +1327,10 @@ pub async fn start(opts: StartOpts) -> Result<()> {
 
     if let Some(local_model) = &opts.local_model {
         // The sidecar is derived from the same --name, so a leftover
-        // `<name>-ollama` is the same wedge one step over (#747). Preflight it
-        // before creating anything, and let --replace cover it too.
-        let ollama = format!("{}-ollama", opts.name);
-        // ADR 0093: the same refusal `local up` gives, so both tiers answer
-        // `--local-model` identically (ADR 0041). The skill tier's model cache
-        // is the sidecar's own volume, not compose's.
-        if !opts.pull_model {
-            docker::preflight_local_model(
-                DEFAULT_OLLAMA_IMAGE,
-                &docker::ollama_volume(&ollama),
-                local_model,
-                &format!(
-                    "curie skill up --local-model {local_model} --pull-model --name {}",
-                    opts.name
-                ),
-            )
-            .await?;
-        }
+        // `<name>-ollama` is the same wedge one step over (#747). Catch it
+        // before creating anything, and let --replace cover it too. (The
+        // --local-model preflight itself, when --pull-model is absent, already
+        // ran above the teardown against this same binding.)
         // No host port on the sidecar, so the remedy never offers --port.
         docker::ensure_container_name_free(
             &ollama,
