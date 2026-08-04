@@ -173,7 +173,11 @@ This release stores credentials in Kubernetes Secrets. Kubernetes Secrets are
 base64-encoded, NOT encrypted, unless your cluster encrypts them at rest.
 Curie cannot detect this from inside the cluster -- please verify it yourself:
 
-  k3s      k3s secrets-encrypt status          (enable: k3s secrets-encrypt enable)
+  k3s      k3s secrets-encrypt status
+           To ENABLE, the server must first be started with
+           `secrets-encryption: true` in /etc/rancher/k3s/config.yaml --
+           running `secrets-encrypt enable` without it half-succeeds and
+           leaves the cluster in an inconsistent state (see #1243).
   kubeadm  --encryption-provider-config on kube-apiserver
   EKS      aws eks describe-cluster --name <c> --query cluster.encryptionConfig
   GKE      on by default (application-layer secrets encryption for db etcd)
