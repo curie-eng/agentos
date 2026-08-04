@@ -1433,8 +1433,14 @@ fn is_connectivity_failure(stderr: &str) -> bool {
 /// Matched on the `usage:` prefix only: a diagnosis line that happens to talk
 /// about usage (`usage limit exceeded`) never starts with the colon form, while
 /// every CLI that renders help on a bad invocation does.
+///
+/// Checked over bytes rather than `&str` slicing: a fixed byte index is not
+/// guaranteed to fall on a char boundary, which panicked on third-party
+/// stderr containing multi-byte characters (#1251).
 fn is_usage_header(line: &str) -> bool {
-    line.len() >= 6 && line[..6].eq_ignore_ascii_case("usage:")
+    line.as_bytes()
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"usage:"))
 }
 
 /// A trailing help pointer a CLI appends instead of, or after, a usage block --
@@ -4505,6 +4511,88 @@ mod tests {
         assert!(
             shown.contains("forbidden"),
             "the determining permanent sweep reason must be surfaced: {shown}"
+        );
+    }
+
+    // #1251: `is_usage_header` slices `line[..6]` guarded only by a BYTE length
+    // check, but the char-boundary requirement is not a byte count -- a
+    // diagnosis line where the 7th byte lands inside a multi-byte character
+    // panics with "byte index 6 is not a char boundary" instead of returning a
+    // reason. Reverting the fix turns this RED.
+    #[test]
+    fn failure_reason_does_not_panic_on_multibyte_diagnosis_line() {
+        let stderr = "abcdeé: dépôt manquant\n";
+        assert_eq!(failure_reason(stderr), "abcdeé: dépôt manquant");
+    }
+
+    // #1251, the exact production path: `run_capture` decodes subprocess
+    // stderr with `String::from_utf8_lossy`, so an invalid byte from a real
+    // CLI becomes a U+FFFD replacement character (3 bytes) rather than a
+    // valid multi-byte character typed by hand. Built via the same lossy
+    // conversion so the test documents the real path instead of hardcoding
+    // the glyph. Reverting the fix turns this RED (this is the transcript
+    // from the issue: `printf "abcde\xe9fghij\n"` on a fake docker stderr).
+    #[test]
+    fn failure_reason_does_not_panic_on_lossy_replacement_character() {
+        let stderr = String::from_utf8_lossy(b"abcde\xe9fghij\n").into_owned();
+        let expected = stderr.trim().to_string();
+        assert_eq!(failure_reason(&stderr), expected);
+    }
+
+    // Guard that the fix does not also break detection: a genuine `Usage:`
+    // header, followed by multi-byte content the header wraps, must still be
+    // recognized and cut so the diagnosis above it is what gets returned.
+    #[test]
+    fn failure_reason_still_cuts_a_multibyte_usage_header() {
+        let stderr = "erreur: dépôt manquant\n\
+                      Usage: café [OPTIONS] COMMAND\n\
+                      Run 'café --help' for more information\n";
+        assert_eq!(failure_reason(stderr), "erreur: dépôt manquant");
+    }
+
+    // Guard that the fix does not also break detection: a line shorter than
+    // six bytes is excluded by the length check outright, and a line that is
+    // exactly six bytes but is not the `usage:` prefix must not be
+    // misclassified as a usage header either. The candidate line sits above a
+    // real diagnosis line so a misclassification is observable through the
+    // cut: an always-true predicate would treat the candidate as the usage
+    // header, truncate the diagnosis after it, and return the candidate line
+    // instead of the diagnosis.
+    #[test]
+    fn failure_reason_does_not_misclassify_short_or_nonmatching_multibyte_lines() {
+        // "café!" is exactly six bytes but is not the usage prefix, so it must not
+        // truncate the diagnosis that follows it.
+        assert_eq!(
+            failure_reason("café!\nerreur: dépôt manquant\n"),
+            "erreur: dépôt manquant"
+        );
+        assert_eq!(
+            failure_reason("café\nerreur: dépôt manquant\n"),
+            "erreur: dépôt manquant"
+        );
+    }
+
+    // #1251, same defect class via `teardown_result`: `helm_err`/`sweep_err`
+    // come from `run_capture`'s lossy stderr too, so a failed helm step whose
+    // stderr trips the same byte-boundary case must return a result carrying
+    // a reason rather than panicking through `teardown_result` ->
+    // `failure_reason`. Reverting the fix turns this RED.
+    #[test]
+    fn teardown_result_helm_failure_with_multibyte_stderr_does_not_panic() {
+        let o = common_distinct_release();
+        let helm_err = String::from_utf8_lossy(b"abcde\xe9fghij\n").into_owned();
+        let err = teardown_result(
+            HelmOutcome::Failed,
+            SweepOutcome::Removed,
+            &helm_err,
+            "",
+            &o,
+        )
+        .expect_err("a failed helm step is an incomplete teardown");
+        let shown = err.to_string();
+        assert!(
+            shown.contains(helm_err.trim()),
+            "the message must surface the helm stderr reason: {shown}"
         );
     }
 
