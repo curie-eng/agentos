@@ -252,15 +252,44 @@ mod tests {
         );
     }
 
+    /// A real file holding a PEM-shaped body, so "the contents never reach
+    /// argv" is checked against contents that exist.
+    ///
+    /// The previous version pointed at `/tmp/app.pem`, which was never created.
+    /// Inlining `read_to_string(path)` into argv therefore stayed green -- it
+    /// read `""` -- so the assertion guarded a literal `BEGIN` and not the
+    /// realistic regression (#1263).
+    fn key_fixture() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.pem");
+        std::fs::write(
+            &path,
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtestkeymaterial\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .expect("write fixture");
+        let as_str = path.to_string_lossy().into_owned();
+        (dir, as_str)
+    }
+
     #[test]
     fn the_private_key_contents_never_reach_argv() {
         // The whole reason for --set-file. A PEM in argv is readable by `ps`
         // and can be echoed by a subprocess error.
-        let cmds = connect_commands(&opts(false), DEFAULT_CLONE_BASE);
-        let flat = argv(&cmds[0]).join(" ");
-        assert!(flat.contains("--set-file"));
-        assert!(flat.contains("api.githubAppPrivateKey=/tmp/app.pem"));
-        assert!(!flat.contains("BEGIN"));
+        let (_dir, path) = key_fixture();
+        let body = std::fs::read_to_string(&path).expect("fixture readable");
+        let mut o = opts(false);
+        o.private_key_path = path.clone();
+
+        let flat = argv(&connect_commands(&o, DEFAULT_CLONE_BASE)[0]).join(" ");
+        assert!(flat.contains("--set-file"), "{flat}");
+        assert!(
+            flat.contains(&format!("api.githubAppPrivateKey={path}")),
+            "{flat}"
+        );
+        // The real assertion: no line of the file's CONTENT appears anywhere.
+        for line in body.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(!flat.contains(line), "key material reached argv: {line}");
+        }
     }
 
     #[test]
@@ -273,10 +302,51 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_clone_base_is_honoured() {
+        // Passing DEFAULT_CLONE_BASE and asserting the default appears also
+        // passes when the parameter is ignored entirely (#1263). A GitHub
+        // Enterprise install would silently get github.com and every clone
+        // would fail an origin check.
+        let flat = argv(&connect_commands(&opts(false), "https://ghe.example.com")[0]).join(" ");
+        assert!(
+            flat.contains("api.githubCloneBase=https://ghe.example.com"),
+            "the supplied clone base was ignored: {flat}"
+        );
+    }
+
+    #[test]
+    fn the_upgrade_reuses_existing_values() {
+        // Dropping --reuse-values resets every other value to chart defaults:
+        // Slack tokens, the model credential, the connector reconciler flag.
+        // Silent, destructive, and uncaught (#1263).
+        for cmds in [
+            connect_commands(&opts(false), DEFAULT_CLONE_BASE),
+            disconnect_commands(&opts(true)),
+        ] {
+            let flat = argv(&cmds[0]).join(" ");
+            assert!(
+                flat.contains("--reuse-values"),
+                "would reset other values: {flat}"
+            );
+        }
+    }
+
+    #[test]
     fn disconnect_clears_both_app_fields_and_touches_nothing_else() {
-        let flat = argv(&disconnect_commands(&opts(true))[0]).join(" ");
-        assert!(flat.contains("api.githubAppId="));
-        assert!(flat.contains("api.githubAppPrivateKey="));
+        // Asserted as whole argv entries, not with `contains` on the joined
+        // string: `contains("api.githubAppId=")` is also satisfied by
+        // `api.githubAppId=999`, so it checked for the presence of a prefix
+        // rather than for clearing (#1263).
+        let args = argv(&disconnect_commands(&opts(true))[0]);
+        assert!(
+            args.iter().any(|a| a == "api.githubAppId="),
+            "the App id was not cleared to empty: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "api.githubAppPrivateKey="),
+            "the private key was not cleared to empty: {args:?}"
+        );
+        let flat = args.join(" ");
         // The PAT fallback must survive: clearing the App is how an operator
         // goes back to it.
         assert!(!flat.contains("api.githubToken"));

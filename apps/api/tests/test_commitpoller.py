@@ -12,6 +12,7 @@ without running the real lifespan.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -128,16 +129,24 @@ def test_the_payload_is_shaped_like_a_real_webhook() -> None:
     assert payload["repository"]["clone_url"] == CLONE
 
 
-def test_the_payload_carries_the_derived_clone_url() -> None:
-    # gitflow rejects a push whose clone_url does not match the one derived
-    # from configuration. The poller supplies that derived URL, so a polled
-    # deploy passes the origin check by construction -- not by coincidence.
+@pytest.mark.anyio
+async def test_poll_once_sends_the_derived_clone_url_not_an_arbitrary_one(
+    monkeypatch,
+) -> None:
+    """The origin check must hold for what poll_once ACTUALLY sends.
+
+    This asserted the property against a hand-built `Move`, so replacing the
+    real derivation inside poll_once with `https://evil.example/x.git` left it
+    green (#1263). It was named for a security property and tested a
+    constructor. Driving poll_once is the only version that means anything.
+    """
+
     from curie_api.config import Settings
     from curie_api.gitflow import trusted_clone_url
 
+    seen = await _capture_pushes(monkeypatch)
     derived = trusted_clone_url(REPO, Settings(github_clone_base="https://github.com"))
-    payload = Move(REPO, derived, "dev", "abc123").as_push_payload()
-    assert payload["repository"]["clone_url"] == derived
+    assert [p["repository"]["clone_url"] for p in seen] == [derived]
 
 
 @pytest.mark.parametrize("branches", [(), ("dev",), ("dev", "main")])
@@ -189,7 +198,28 @@ def test_the_lifespan_wires_the_poller_to_the_bundle_store(clean_db: None) -> No
 # --------------------------------------------------------------------------- #
 # Rejections are reported, not called "deployed" (#1268)
 # --------------------------------------------------------------------------- #
-async def _run_poll_once(monkeypatch, result) -> None:
+async def _capture_pushes(monkeypatch, *, deployed=None, tips=None) -> list[dict]:
+    """Run one real poll_once and return every payload it handed the deploy path.
+
+    The point of driving the real method: every mutation the battery found
+    living in poll_once -- a swapped branch mapping, ignored deployed-state, a
+    forged clone_url, deploying nothing at all -- is invisible to a test that
+    builds a Move by hand (#1263).
+    """
+
+    seen: list[dict] = []
+
+    async def capture(session, store, settings, eval_queue, payload):
+        from curie_api.schemas import WebhookResult
+
+        seen.append(payload)
+        return WebhookResult(status="deployed")
+
+    await _run_poll_once(monkeypatch, None, on_push=capture, deployed=deployed, tips=tips)
+    return seen
+
+
+async def _run_poll_once(monkeypatch, result, *, on_push=None, deployed=None, tips=None) -> None:
     """Drive the real poll_once with a stubbed deploy that returns `result`."""
     from contextlib import asynccontextmanager
 
@@ -203,9 +233,11 @@ async def _run_poll_once(monkeypatch, result) -> None:
 
     class Session:
         async def execute(self, stmt):
-            # First query lists repos, second lists deployed shas. Returning
-            # one repo and nothing deployed makes exactly one move.
-            return Rows([(REPO,)]) if "FROM curie.agents" in str(stmt) else Rows([])
+            # First query lists repos, second lists (repo, environment, sha)
+            # already deployed. Both come from the real SQL in the module.
+            if "FROM curie.agents" in str(stmt):
+                return Rows([(REPO,)])
+            return Rows(deployed or [])
 
     @asynccontextmanager
     async def factory():
@@ -214,13 +246,13 @@ async def _run_poll_once(monkeypatch, result) -> None:
     async def fake_process_push(session, store, settings, eval_queue, payload):
         return result
 
-    monkeypatch.setattr(gitflow, "process_push", fake_process_push)
+    monkeypatch.setattr(gitflow, "process_push", on_push or fake_process_push)
     poller = CommitPoller(
         session_factory=factory,
         store=object(),
         settings=Settings(github_clone_base="https://github.com"),
         eval_queue=object(),
-        tips=Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
+        tips=tips or Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
         interval_seconds=60,
     )
     await poller.poll_once()
@@ -398,3 +430,134 @@ def test_a_throttled_repository_does_not_stop_the_others(monkeypatch) -> None:
         [target("dev", repo="octo/slow"), target("dev", repo="octo/fine")], Throttled(), {}
     )
     assert [m.repo_full_name for m in moves] == ["octo/fine"]
+
+
+# --------------------------------------------------------------------------- #
+# poll_once, driven for real (#1263)
+# --------------------------------------------------------------------------- #
+@pytest.mark.anyio
+async def test_poll_once_actually_deploys_something(monkeypatch) -> None:
+    # The floor. "deploys nothing at all" survived the whole suite, because
+    # nothing drove the method.
+    assert await _capture_pushes(monkeypatch), "poll_once handed the deploy path nothing"
+
+
+@pytest.mark.anyio
+async def test_poll_once_maps_dev_to_the_dev_branch(monkeypatch) -> None:
+    # Swapping the dev/prod branch mapping survived (#1263). The consequence is
+    # the worst kind: a dev push deploying to the prod agent, reported as
+    # success.
+    seen = await _capture_pushes(monkeypatch)
+    assert [p["ref"] for p in seen] == ["refs/heads/dev"]
+
+
+@pytest.mark.anyio
+async def test_poll_once_skips_a_commit_already_deployed(monkeypatch) -> None:
+    """Ignoring already-deployed state survived, and is a redeploy loop.
+
+    Every pass would redeploy every agent at the poll interval -- forever, with
+    each one logged as a success.
+    """
+
+    seen = await _capture_pushes(monkeypatch, deployed=[(REPO, "dev", "abc123")])
+    assert seen == [], f"redeployed a commit already recorded: {seen}"
+
+
+@pytest.mark.anyio
+async def test_poll_once_deploys_when_the_recorded_sha_differs(monkeypatch) -> None:
+    # The other half: "skip everything" must not pass the test above.
+    seen = await _capture_pushes(monkeypatch, deployed=[(REPO, "dev", "OLD0000")])
+    assert [p["after"] for p in seen] == ["abc123"]
+
+
+@pytest.mark.anyio
+async def test_run_forever_stops_when_cancelled() -> None:
+    """Shutdown cancels this task and awaits it; it must actually end.
+
+    Scope, stated honestly: this proves the loop is cancellable. It does NOT
+    prove that a CancelledError handler swallowing the cancellation would be
+    caught -- an idle poller spends nearly all its time in the interval sleep,
+    which sits outside the try, so cancellation there propagates whatever any
+    handler does. A version of this test that cancelled mid-pass could catch
+    that, but only by creating a task that ignores cancellation, which cannot
+    then be stopped and hangs the suite instead of failing it.
+
+    What protects that property is structural instead: run_forever has no
+    CancelledError handler at all, because CancelledError derives from
+    BaseException and the `except Exception` below cannot catch it. There is no
+    live code path to test -- which is why the guard was deleted rather than
+    covered with an assertion it would not earn (#1263).
+    """
+
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.config import Settings
+
+    class Boom:
+        def sha_for(self, repo: str, branch: str) -> str | None:
+            raise RuntimeError("every pass fails; the loop must still be cancellable")
+
+    poller = CommitPoller(
+        session_factory=None,
+        store=None,
+        settings=Settings(),
+        eval_queue=None,
+        tips=Boom(),
+        interval_seconds=0.01,
+    )
+    task = asyncio.create_task(poller.run_forever())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    _, pending = await asyncio.wait([task], timeout=2.0)
+    assert not pending, "run_forever did not stop when cancelled"
+    assert task.cancelled()
+
+
+# --------------------------------------------------------------------------- #
+# GitHubBranchTip's HTTP behaviour (#1263)
+# --------------------------------------------------------------------------- #
+def _tip(monkeypatch, handler, token: str = "ghs_tok"):
+    from curie_api.commitpoller import GitHubBranchTip
+    from curie_api.config import Settings
+
+    real = httpx.Client
+    monkeypatch.setattr(
+        "curie_api.commitpoller.httpx.Client",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler)),
+    )
+
+    class Creds:
+        def token_for(self, repo: str) -> str:
+            return token
+
+    return GitHubBranchTip(Settings(), Creds())
+
+
+def test_the_tip_reader_authenticates(monkeypatch) -> None:
+    # Never sending Authorization survived (#1263). On a private repo that is a
+    # 404 -- which this code treats as "branch does not exist" -- so the agent
+    # silently stops deploying and nothing reports an auth problem.
+    seen: dict[str, str | None] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"sha": "abc123"})
+
+    _tip(monkeypatch, handler).sha_for(REPO, "dev")
+    assert seen["auth"] == "Bearer ghs_tok"
+
+
+def test_a_server_error_is_raised_not_read_as_a_missing_branch(monkeypatch) -> None:
+    # Treating every status as OK survived (#1263). A 500 would parse as an
+    # empty body, yield no sha, and look exactly like a branch that does not
+    # exist -- so an outage reads as "nothing to deploy".
+    tip = _tip(monkeypatch, lambda r: httpx.Response(500, json={}))
+    with pytest.raises(httpx.HTTPStatusError):
+        tip.sha_for(REPO, "dev")
+
+
+def test_a_404_is_still_a_missing_branch(monkeypatch) -> None:
+    # The deliberate exception: a deploy.yaml may name a branch a repo has not
+    # created. This must stay non-fatal, or the test above would be satisfied
+    # by raising on everything.
+    tip = _tip(monkeypatch, lambda r: httpx.Response(404, json={}))
+    assert tip.sha_for(REPO, "nope") is None

@@ -293,8 +293,13 @@ class CommitPoller:
         while True:
             try:
                 await self.poll_once()
-            except asyncio.CancelledError:
-                raise
+            # No `except CancelledError: raise` here, deliberately.
+            # CancelledError derives from BaseException, not Exception, so the
+            # handler below never catches it and cancellation propagates on its
+            # own. The clause that used to sit here was dead code that only
+            # looked protective -- and a mutation replacing its `raise` with
+            # `continue` was a real shutdown hang that no test could kill,
+            # because a task ignoring cancellation cannot be stopped (#1263).
             except Exception:
                 # A poll pass must never kill the loop: the next one may well
                 # succeed, and a dead poller on an unreachable cluster means no
