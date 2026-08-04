@@ -475,7 +475,17 @@ api:
   # registering an App. `curie cluster github-app` sets these for you.
   githubAppId: ""
   # The App's PEM private key, whole (including the BEGIN/END lines).
+  #
+  # Prefer githubAppExistingSecret below for anything but a quick trial: a value
+  # set here is stored in the Helm release itself, so it is copied into every
+  # retained revision and `helm get values` can print it.
   githubAppPrivateKey: ""
+  # BYO secret (the same idiom every backing store here uses). Name a Secret you
+  # created yourself and the chart only REFERENCES it -- the key never passes
+  # through helm values, never lands in release history, and can be managed by
+  # External Secrets or Sealed Secrets. Wins over githubAppPrivateKey when set.
+  githubAppExistingSecret: ""
+  githubAppExistingSecretKey: privateKey
   # The one git origin the API clones from for git-flow. A pushed repository
   # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server

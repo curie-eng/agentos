@@ -123,6 +123,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-secrets-assertions.sh
 
+      # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
+      # as digits (a float renders as "4.47597e+06" and 401s every call), and a
+      # BYO existingSecret is REFERENCED rather than copied into helm's stored
+      # values, where it would land in every retained release revision.
+      - name: helm render assertions (github app credential)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/github-app-credential-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --

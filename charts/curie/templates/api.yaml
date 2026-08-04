@@ -95,8 +95,17 @@ spec:
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
+                  {{- /* BYO: the key never passes through helm values, so it
+                         is not copied into every retained release revision and
+                         `helm get values` cannot print it. Create the Secret
+                         with kubectl, External Secrets, or Sealed Secrets. */}}
+                  {{- if .Values.api.githubAppExistingSecret }}
+                  name: {{ .Values.api.githubAppExistingSecret | quote }}
+                  key: {{ .Values.api.githubAppExistingSecretKey | quote }}
+                  {{- else }}
                   name: {{ include "curie.secretName" . }}
                   key: githubAppPrivateKey
+                  {{- end }}
             - name: ENVIRONMENT
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
