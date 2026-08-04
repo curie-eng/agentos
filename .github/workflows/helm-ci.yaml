@@ -123,6 +123,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-secrets-assertions.sh
 
+      # Prove the API ingress (issue #1238): opt-in, fails loudly without a
+      # host rather than matching every request, and honours tls.enabled and
+      # api.service.port. The API is the one endpoint reached from outside the
+      # cluster, and X-API-Key crosses it on every authenticated call.
+      - name: helm render assertions (api ingress)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/api-ingress-assertions.sh
+
       # Prove the GitHub App credential (ADR-0092): the App ID reaches the API
       # as digits (a float renders as "4.47597e+06" and 401s every call), and a
       # BYO existingSecret is REFERENCED rather than copied into helm's stored
