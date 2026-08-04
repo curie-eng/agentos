@@ -561,3 +561,93 @@ def test_a_404_is_still_a_missing_branch(monkeypatch) -> None:
     # by raising on everything.
     tip = _tip(monkeypatch, lambda r: httpx.Response(404, json={}))
     assert tip.sha_for(REPO, "nope") is None
+
+
+# Not re-cloning a commit that already settled (#1267)
+# --------------------------------------------------------------------------- #
+async def _passes(monkeypatch, result, n: int = 2) -> int:
+    """Run n consecutive poll_once passes; return how many reached the deploy path.
+
+    Reaching the deploy path is what costs a full mirror clone -- the clone
+    lives inside process_push -- so this counts exactly the thing #1267 is
+    about.
+    """
+    from contextlib import asynccontextmanager
+
+    from curie_api import gitflow
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.config import Settings
+
+    calls = {"n": 0}
+
+    async def counting(session, store, settings, eval_queue, payload):
+        calls["n"] += 1
+        return result
+
+    class Session:
+        async def execute(self, stmt):
+            return [(REPO,)] if "FROM curie.agents" in str(stmt) else []
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    monkeypatch.setattr(gitflow, "process_push", counting)
+    poller = CommitPoller(
+        session_factory=factory,
+        store=object(),
+        settings=Settings(github_clone_base="https://github.com"),
+        eval_queue=object(),
+        tips=Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
+        interval_seconds=60,
+    )
+    for _ in range(n):
+        await poller.poll_once()
+    return calls["n"]
+
+
+@pytest.mark.anyio
+async def test_an_ignored_branch_is_not_recloned_every_pass(monkeypatch) -> None:
+    """AC2. A branch deploy.yaml has no target for is a blessed configuration.
+
+    The poller's memory is the Deployment table, which records only successes,
+    so an ignored push looked never-attempted and was re-cloned on every
+    interval -- roughly 1,440 full mirror clones a day at the recommended 60s.
+    """
+
+    from curie_api.schemas import WebhookResult
+
+    assert await _passes(monkeypatch, WebhookResult(status="ignored")) == 1
+
+
+@pytest.mark.anyio
+async def test_a_permanently_rejected_commit_is_not_recloned(monkeypatch) -> None:
+    # A deploy.yaml naming an unknown agent fails identically next minute.
+    from curie_api.schemas import WebhookResult
+
+    rejected = WebhookResult(status="rejected", errors=[{"code": "deploy.unknown_agent"}])
+    assert await _passes(monkeypatch, rejected) == 1
+
+
+@pytest.mark.anyio
+async def test_a_transient_clone_failure_IS_retried(monkeypatch) -> None:
+    """The other side: remembering must not make a network blip permanent.
+
+    An unreachable remote is the one rejection that says nothing about the
+    commit, so suppressing its retry would strand a repository until the API
+    restarted.
+    """
+
+    from curie_api.schemas import WebhookResult
+
+    transient = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
+    assert await _passes(monkeypatch, transient) == 2
+
+
+@pytest.mark.anyio
+async def test_a_successful_deploy_leaves_the_database_in_charge(monkeypatch) -> None:
+    # After a real deploy the Deployment row is the memory. Keeping a private
+    # copy too would mean two sources disagreeing after a rollback.
+    from curie_api.schemas import WebhookResult
+
+    assert await _passes(monkeypatch, WebhookResult(status="deployed")) == 2
