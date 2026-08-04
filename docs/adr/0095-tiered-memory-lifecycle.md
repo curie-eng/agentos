@@ -1,13 +1,16 @@
-# 95. Channel-scoped memory: one surface-agnostic lifecycle for bootstrap, injection, and update
+# 95. One tiered memory lifecycle for agent and channel memory
 
 Date: 2026-08-04
 
 Status: Draft
 
-Extends [ADR-0025](0025-memory-port-and-first-loader.md) (per-agent memory over
-the durable state store) and [ADR-0029](0029-conversation-history-port-and-first-loader.md)
-(per-thread transcripts over the same store) with a third scope: the place a
-conversation happens in. Designed against
+Supersedes [ADR-0025](0025-memory-port-and-first-loader.md) (the per-agent
+memory port and first loader) **upon acceptance**: agent memory becomes one
+tier of the lifecycle defined here rather than a separate system, and
+ADR-0025's status flips to Superseded with a back link at that point, per
+ADR-0045/0085. Composes with [ADR-0029](0029-conversation-history-port-and-first-loader.md)
+(per-thread transcripts), which remains its own port: the thread tier of the
+context hierarchy is conversation replay, not managed memory. Designed against
 [ADR-0020](0020-message-port-rendering-free-channel-interface.md) (the
 rendering-free channel port) and [ADR-0012](0012-substrate-and-channel-agnostic-core.md)
 (the runner never learns its channel), and sequenced behind
@@ -15,41 +18,56 @@ rendering-free channel port) and [ADR-0012](0012-substrate-and-channel-agnostic-
 new event kind), whose `source` field and placeholder-less output path this
 lifecycle builds on. Distinct from [ADR-0030](0030-proactive-within-episode-memory-agent.md)
 (within-episode memory), which addresses behavioral decay inside one run; this
-ADR addresses context continuity across runs in one place. Supersedes none.
+ADR addresses context continuity across runs.
 
 ## Context
 
 Threaded work is the product's unit of execution: every mention boots a fresh
-session (ADR-0003, stateless-first) whose context today is the agent's
-cross-session lessons (ADR-0025), the thread's own transcript (ADR-0029), and
-the bundle's `systemPrompt`. Nothing carries what the *channel* knows: the
-running projects, conventions, decisions, and people that every thread in that
-channel implicitly assumes. A new thread either lacks that context or would
-have to re-read the channel backlog per turn, which does not scale in tokens
-or latency. The fix used by every comparable product is a per-place memory
-document: consume the channel once, keep a condensed durable note, inject it
-into every thread.
+session (ADR-0003, stateless-first). The context a session should carry forms
+a hierarchy of scopes, narrowest to broadest:
+
+- **thread context**: this conversation (the transcript, ADR-0029);
+- **channel context**: what the place knows, running projects, conventions,
+  decisions, people;
+- **agent context**: lessons the agent carries across every channel it works
+  in;
+
+with the bundle `systemPrompt` above all of them as the authored identity.
+Today the hierarchy is incomplete and inconsistent. The thread tier works
+(transcript replay). The agent tier is partially built: ADR-0025 landed the
+`MemoryStore` port, the state-store loader, the boot preamble, and the
+explicit `remember()` write path (#264, with the inspection UI of #267), but
+the automatic extraction it deferred never landed and its consolidation
+pipeline (`runner/src/curie_runner/memory.py`) has no trigger, so in practice
+agent memory is a write-rarely append log. The channel tier does not exist at
+all: nothing carries what the channel knows into a new thread, so a thread
+either lacks that context or would have to re-read the channel backlog per
+turn, which does not scale in tokens or latency.
+
+These are not two problems. Channel memory and agent memory are the same
+concept at different scopes, and building the channel tier as a second,
+separate system would double the record shapes, the update stories, and the
+namespaces for one idea. The fix used by every comparable product is a
+per-scope memory document with one lifecycle: consume a backlog once where
+one exists, keep a condensed durable note, inject it into every session,
+update it continuously, and compact it periodically.
 
 Three facts about the current system shape the design:
 
 1. **The seams already exist.** Runner boot composes preambles in one place
-   (`runner/src/curie_runner/__main__.py`, `_compose_system_prompt`: agent
-   memory, then conversation, then the bundle prompt). The worker mints
-   memory and history refs in one place (`binding.py`, `boot_env`). Storage is
-   the durable state store (`WorkflowStateEntry`: agent-scoped, namespaced,
-   size-capped, CAS-versioned) with reserved namespaces `memory` and
-   `transcript`. A consolidation pipeline (dedup, provenance union, replace)
-   already exists in `runner/src/curie_runner/memory.py` but has no trigger;
-   this lifecycle gives its shape a caller.
+   (`runner/src/curie_runner/__main__.py`, `_compose_system_prompt`). The
+   worker mints memory and history refs in one place (`binding.py`,
+   `boot_env`). Storage is the durable state store (`WorkflowStateEntry`:
+   agent-scoped, namespaced, size-capped, CAS-versioned) with reserved
+   namespaces `memory` and `transcript`.
 
 2. **"Per channel" and "per agent" are the same granularity today.** An agent
-   binds exactly one Slack channel (`agents.slack_channel`, 1:1; the
-   channel-ingress interface doc flags this as the largest remaining
-   Slack-shaped surface, and multi-channel is deliberately deferred to epic
-   #27). The scope key must nevertheless be the channel, not the agent, so
-   that the stored artifacts survive into a multi-channel world; the limits
-   the 1:1 binding still imposes are named in Consequences rather than
-   papered over.
+   binds exactly one Slack channel (`agents.slack_channel`, 1:1; multi-channel
+   is deliberately deferred to epic #27). The tiers must nevertheless be
+   distinct now, because they diverge the moment an agent has two channels:
+   channel memory stays behind the place's access boundary, agent memory
+   travels with the agent. The limits the 1:1 binding still imposes are named
+   in Consequences rather than papered over.
 
 3. **There is no custom-instructions concept and no batch-job infrastructure.**
    The only model-facing instruction surface is the bundle `systemPrompt`,
@@ -74,9 +92,9 @@ the closest comparable product, Claude in Slack, is a direct precedent:
   (better recall, no hot-path latency). OpenAI and Letta independently shipped
   idle-time consolidation and both named it "dreaming".
 - **Scope follows the access boundary.** "Memory follows places the same way
-  access does": channel-scoped, never attached to an individual. Claude in
-  Slack keeps memory by channel, shares public-channel memory upward, isolates
-  private channels, and orphans a private channel's memory if it goes public
+  access does": channel memory is scoped to the channel, never attached to an
+  individual. Claude in Slack keeps memory by channel, isolates private
+  channels, and orphans a private channel's memory if it goes public
   (fail-closed over continuity).
 - **Standing instructions outrank learned memory.** Claude in Slack layers
   operator-authored custom instructions above channel memory explicitly,
@@ -89,11 +107,14 @@ the closest comparable product, Claude in Slack, is a direct precedent:
 
 ## Decision
 
-**Channel memory is a third scope over the durable state store, defined by a
-surface-agnostic lifecycle with three platform-owned components (bootstrap,
-injection, update) and one narrow obligation on each surface adapter.** Slack
-is the first implementing surface; nothing below names Slack except its
-adapter section.
+**Memory is one tiered system: a single lifecycle (bootstrap where a backlog
+exists, injection, hybrid update with scheduled compaction) applied per
+scope, with an agent tier and a channel tier over the existing `memory`
+namespace of the durable state store.** The thread tier of the context
+hierarchy remains the transcript port (ADR-0029), replayed rather than
+curated; the bundle `systemPrompt` remains the authored layer above
+everything. Slack is the first surface implementing the channel tier; nothing
+below names Slack except its adapter section.
 
 ### The surface obligation (the interface)
 
@@ -111,77 +132,88 @@ A surface adapter owes the platform exactly two things, and nothing else:
    memory starts empty and accretes through the update path. Bootstrap is an
    optimization, not a requirement of the interface.
 
-Injection, budget enforcement, and compaction are platform machinery and are
-identical across surfaces.
+The agent tier needs neither: its scope is the agent itself, it has no
+backlog, and it participates in the lifecycle from injection onward.
 
 ### Storage
 
-- A new reserved state-store namespace, `channel-memory`, joins `memory` and
-  `transcript` in `RESERVED_NAMESPACES` (both the API and runner mirrors, per
-  the warning in `routers/state.py`). Per scope it holds four keys:
+- **Everything lives under the existing reserved `memory` namespace.** No new
+  namespace: tiers are key prefixes, mirroring how `transcript/<thread_key>`
+  scopes threads. Per tier and scope the keys are:
+  - `agent/document`, `agent/notes`, `agent/watermark` for the agent tier;
+  - `channel/<scope_key>/document`, `.../notes`, `.../instructions`,
+    `.../watermark` for the channel tier.
+- The key roles, identical across tiers:
   - the **document**: one curated markdown profile, the always-injected core.
     It is rewritten in place only by the bootstrap and compaction turns,
     always under compare-and-set;
   - the **notes log**: an append log of provenance-stamped records
-    (ADR-0025's `MemoryRecord` shape) written by in-turn saves. Notes are
-    injected after the document until compaction folds them in;
-  - the **instructions**: an operator-authored plain-text note, editable at
-    runtime through the API/console (extending the memory inspection UI of
-    #267). **Writable with the platform key only**: the state router refuses
-    writes to this key from `state`-scoped and app tokens, so no sandbox
-    credential can author it. This restriction is enforced API-side and
-    mirrored in the runner's reserved-namespace table like the namespace
-    itself;
+    (ADR-0025's `MemoryRecord` shape, which this ADR carries forward).
+    In-turn saves append here; notes are injected after the document until
+    compaction folds them in;
+  - the **instructions** (channel tier only): an operator-authored plain-text
+    note, editable at runtime through the API/console (extending the memory
+    inspection UI of #267), never written by the agent. **Writable with the
+    platform key only**: the state router refuses writes to this key from
+    `state`-scoped and app tokens, so no sandbox credential can author it.
+    This restriction is enforced API-side and mirrored in the runner's
+    reserved-namespace table;
   - the **watermark**: the last-compacted position, its own machine-read key,
     never embedded in the prose document.
-- Keys are scoped by `scope_key`, mirroring `transcript/<thread_key>`.
-  Storage remains agent-scoped (`WorkflowStateEntry` has no channel table),
+- **Migration from ADR-0025 is a rename, not a rewrite.** The existing
+  agent-memory log key becomes `agent/notes` with an empty `agent/document`;
+  the first compaction pass folds the accumulated records into the document.
+  No record shape changes and no provenance is lost.
+- Storage remains agent-scoped (`WorkflowStateEntry` has no channel table),
   so the scope key buys forward compatibility for the artifacts, not
   channel-portability across agents; see Consequences for the rebinding and
   multi-channel limits.
 - The state store's per-value and per-namespace caps and scoped-token auth
-  (ADR-0033) apply unchanged, and the namespace-count cap accounting (#852)
-  gains one namespace. **Concurrency is explicit, not inherited**: CAS in the
-  state store is opt-in, so this ADR requires it. Document rewrites carry
-  `expected_version` and, on conflict, re-read and re-merge (or re-enqueue
-  the compaction turn). In-turn saves only append to the notes log, never
-  rewrite the document, so an explicit user save can never be discarded by a
-  concurrent compaction; compaction clears only the notes it consumed, and a
-  note landing mid-compaction survives to the next pass.
+  (ADR-0033) apply unchanged. **Concurrency is explicit, not inherited**: CAS
+  in the state store is opt-in, so this ADR requires it. Document rewrites
+  carry `expected_version` and, on conflict, re-read and re-merge (or
+  re-enqueue the compaction turn). In-turn saves only append to the notes
+  log, never rewrite the document, so an explicit user save can never be
+  discarded by a concurrent compaction; compaction clears only the notes it
+  consumed, and a note landing mid-compaction survives to the next pass.
+- The `MemoryStore` port generalizes from ADR-0025's two methods to a
+  tier-scoped load/append/replace; the dormant consolidation helpers
+  (`consolidate_records`, `SupportsReplace.replace`) become the compaction
+  turn's write-back shape.
 
 ### Injection
 
-- The worker mints a `CURIE_CHANNEL_MEMORY_REF` in `binding.boot_env`,
-  alongside the existing memory and history refs. `boot_env` gains the scope
-  key (the kernel already holds it as `reply_handle.channel`; today only
-  `thread_key` is threaded through, so the signature widens by one opaque
-  string).
-- At runner boot the ref resolves like the other two (URL-shaped, scoped
-  token, transient failure degrades to "no channel memory" without blocking
-  boot), and `_compose_system_prompt` gains the channel block. Composition
-  order: **custom instructions, channel memory (document then unfolded
-  notes), agent memory, conversation preamble, bundle `systemPrompt`**, each
-  under a labeled header. The authority ladder is stated in the rendered
-  headers: the bundle prompt and custom instructions are authored guidance
-  and outrank channel memory; channel memory is learned context, not
-  instruction. Instructions and memory are read once at session boot; a
-  running thread keeps the set it booted with.
+- The worker mints one `CURIE_MEMORY_REF` (the namespace root, as today) in
+  `binding.boot_env`, and `boot_env` gains the scope key so the runner can
+  resolve both tiers (the kernel already holds it as `reply_handle.channel`;
+  today only `thread_key` is threaded through, so the signature widens by one
+  opaque string).
+- At runner boot the ref resolves as today (URL-shaped, scoped token,
+  transient failure degrades to "no memory" without blocking boot), and
+  `_compose_system_prompt` composes the hierarchy, one labeled block per
+  tier: **channel instructions, channel memory (document then unfolded
+  notes), agent memory (document then unfolded notes), conversation
+  preamble, bundle `systemPrompt`**. The authority ladder is stated in the
+  rendered headers: the bundle prompt and custom instructions are authored
+  guidance and outrank learned memory at every tier; memory is learned
+  context, not instruction. Instructions and memory are read once at session
+  boot; a running thread keeps the set it booted with.
 - **The injected tier has a hard budget, enforced at the API state router on
-  every write.** The document and notes log are measured against a fixed
-  combined cap (Claude Code's 200-line / 25KB class of limit; exact numbers
-  are implementation). Near the cap, the write succeeds and the response
-  carries a warning instructing consolidation; over the cap, the write is
-  refused with an error instructing a rewrite. Enforcement lives in the API,
-  not the runner, so console edits and any future writer pass through the
-  same gate; the cap is a platform decision, not a model judgment, because
-  injection bloat degrades every thread in the channel at once.
+  every write.** Each tier's document and notes log are measured against a
+  fixed per-tier cap (Claude Code's 200-line / 25KB class of limit; exact
+  numbers are implementation). Near the cap, the write succeeds and the
+  response carries a warning instructing consolidation; over the cap, the
+  write is refused with an error instructing a rewrite. Enforcement lives in
+  the API, not the runner, so console edits and any future writer pass
+  through the same gate; the cap is a platform decision, not a model
+  judgment, because injection bloat degrades every session at once.
 - **Sibling paths are disposed of, not discovered**: eval runs stay hermetic
-  (ADR-0051's fresh-conversation default), so an eval session gets no
-  channel-memory ref, or a fresh throwaway scope when a case explicitly
-  exercises memory. The `curie local` CLI stub channel mints a stub scope
-  key and accretes memory like any scope, which is desirable for testing and
-  confined to the local store. The fake tier remains plumbing-only and
-  injects nothing.
+  (ADR-0051's fresh-conversation default), so an eval session gets no memory
+  ref, or a fresh throwaway scope when a case explicitly exercises memory.
+  The `curie local` CLI stub channel mints a stub scope key and accretes
+  channel memory like any scope, which is desirable for testing and confined
+  to the local store. The fake tier remains plumbing-only and injects
+  nothing.
 
 ### The memory turns and their kernel obligations
 
@@ -211,7 +243,7 @@ sacred-kernel, single-owner work:
   an approval gate. If a memory turn requests an approval, that is a bug,
   and the kernel fails the turn rather than parking it.
 
-### Bootstrap
+### Bootstrap (channel tier only)
 
 - **Triggers, concretely.** The common case is control-plane, not Slack: an
   agent is bound to a channel when `agents.slack_channel` is set at
@@ -234,27 +266,31 @@ sacred-kernel, single-owner work:
   closest-comparable product chose caution here, and the poisoning
   taxonomy's compaction-channel attacks argue the same way.)
 
-### Update
+### Update (both tiers)
 
 The lifecycle is a hybrid, matching the convergent industry pattern:
 
 - **In-turn writes land immediately.** An explicit user ask ("remember for
-  this channel: ...") and agent-initiated saves during work append
-  provenance-stamped notes through the state API mid-session, durable and
-  injected for the next thread the moment they land. Every write passes the
-  budget gate above.
+  this channel: ..." or "remember this everywhere: ...") and agent-initiated
+  saves during work append provenance-stamped notes to the addressed tier
+  through the state API mid-session, durable and injected for the next
+  session the moment they land. Every write passes the budget gate above.
+  The channel tier is the default destination; the agent tier is for lessons
+  that should travel across channels.
 - **Compaction is a scheduled background turn, not new infrastructure.** An
   API-side scheduler loop (the expiry sweeper's wait-first template,
   including its multi-replica single-writer guard so two API replicas cannot
   double-enqueue) walks scopes on an interval (nightly by default) and, for
-  each scope with new transcript activity or unfolded notes since its
-  watermark, enqueues a `memory_compaction` turn. The turn reads the scope's
-  transcripts since the watermark, the notes log, and the current document,
+  each scope, in either tier, with new transcript activity or unfolded notes
+  since its watermark, enqueues a `memory_compaction` turn. The turn reads
+  the scope's inputs since the watermark (transcripts and notes for the
+  channel tier; notes for the agent tier), plus the current document,
   rewrites the document in place (fold notes in, merge duplicates, correct
   stale facts, resolve conflicts newest-wins, union provenance, drop what
   the work has outgrown), clears the consumed notes, and advances the
   watermark, all under CAS as specified in Storage. A scope with no new
   activity is skipped, so cost is bounded by real usage, not channel count.
+  This is the trigger ADR-0025 deferred and never grew.
 
 ### Trust posture
 
@@ -264,14 +300,18 @@ The lifecycle is a hybrid, matching the convergent industry pattern:
   [ADR-0056](0056-operator-opt-in-for-policy-gate-grantability.md)) remain
   the enforcement surface, unaffected by memory content.
 - Every memory write carries provenance back to the session and traces it was
-  learned from; the document is human-readable and operator-editable through
-  the console (the #267 surface), so audit and correction are first-class.
+  learned from; the documents are human-readable and operator-editable
+  through the console (the #267 surface), so audit and correction are
+  first-class.
 - The poisoning exposure is named and accepted with mitigations, not ignored:
   the bootstrap and compaction prompts distill toward stable facts under
   scope-limited write criteria, provenance identifies the contaminating
   session when poisoning is suspected, and the instructions layer (which no
   sandbox credential can write, enforced at the state router as specified in
-  Storage) outranks the memory layer (which the agent can write).
+  Storage) outranks the memory tiers (which the agent can write). The agent
+  tier deserves particular care in the compaction prompt: it is the tier a
+  poisoned channel could try to escape into, so promotion of a fact from
+  channel to agent scope must be conservative.
 
 ### Validation gate (before maintainer acceptance)
 
@@ -284,23 +324,29 @@ API enforcement point (warn near, refuse over) and on the CAS conflict path;
 (4) one red-team case from the poisoning taxonomy (a backlog or thread
 message that instructs the agent to write an instruction-shaped memory)
 showing the write lands, is visible with provenance in the console, and
-cannot reach the instructions key.
+cannot reach the instructions key; (5) a migration check proving an existing
+ADR-0025 agent-memory log is still injected, unmodified, after the rename to
+`agent/notes` and before any compaction runs.
 
 ## Alternatives considered
 
-- **Extend ADR-0025's per-agent memory instead of adding a scope.** Rejected:
-  the two differ in authorship, lifecycle, and meaning. Agent memory is
-  cross-place lessons the agent carries everywhere; channel memory is
-  place-scoped shared context that must stay behind the place's access
-  boundary. Conflating them is exactly what the 1:1 binding makes tempting
-  today and what multi-channel (#27) would force apart with a migration
-  later.
-- **A retrieval layer (vector store or knowledge graph) instead of a curated
-  document.** Rejected: the unit is one bounded document per channel, well
+- **Build channel memory as a second system beside ADR-0025's agent memory.**
+  Rejected, and this ADR's supersession of ADR-0025 is the point: the two
+  are one concept at different scopes, and two systems means two record
+  shapes, two update stories, and namespace sprawl. The first draft of this
+  ADR took the two-system shape (a new `channel-memory` namespace beside
+  `memory`) and review moved it here.
+- **Fold the thread tier under managed memory too.** Rejected: the
+  transcript is replay of what was said, not a curated distillation, with
+  its own lifecycle (append per turn, windowed at boot, ADR-0029) and no
+  compaction semantics. It is the hierarchy's narrowest tier but not a
+  memory store; the compaction turn consumes it as input instead.
+- **A retrieval layer (vector store or knowledge graph) instead of curated
+  documents.** Rejected: the unit is one bounded document per scope, well
   within a context window; the surveyed industry trajectory is away from
-  vector stores for this job; and the state store gives durability,
-  scoping, caps, and audit for free. A retrieval tier over past transcripts
-  can be added later without changing this decision.
+  vector stores for this job; and the state store gives durability, scoping,
+  caps, and audit for free. A retrieval tier over past transcripts can be
+  added later without changing this decision.
 - **Real-time-only updates (no compaction job).** Rejected: accretion without
   consolidation produces the documented staleness and bloat failure modes,
   and the budget gate alone would then force the model to consolidate during
@@ -328,6 +374,13 @@ cannot reach the instructions key.
 
 ## Consequences
 
+- **ADR-0025 is superseded upon acceptance.** Its state-store namespace, its
+  `MemoryRecord` provenance shape, its boot-preamble delivery, and its
+  boot-resilience rules all carry forward into this lifecycle; what changes
+  is the storage layout (document plus notes per tier instead of one log),
+  the generalized port, and the arrival of the update lifecycle it deferred.
+  The migration is the key rename in Storage plus the first compaction pass.
+  ADR-0029 is untouched.
 - **Sequencing.** ADR-0079 is Accepted but its contract and kernel side are
   unimplemented (`QueuedTurn` today carries no `source`, and the placeholder
   is required). This ADR sequences behind that work and adds to it: the turn
@@ -336,34 +389,36 @@ cannot reach the instructions key.
   single-owner review rule. Per the contract rules in `packages/`, a new
   kind enum is a breaking change (minor under 0.x); the optional fields are
   patches.
-- `binding.boot_env` widens to carry the scope key; `RESERVED_NAMESPACES`
-  grows by one entry in both mirrors, and the platform-key-only rule on the
-  instructions key is a new, key-granular restriction the state router does
-  not have today. The runner gains one preamble and one ref resolver, both
-  copies of existing patterns.
+- `binding.boot_env` widens to carry the scope key. `RESERVED_NAMESPACES` is
+  unchanged (the `memory` namespace already exists), but the
+  platform-key-only rule on the instructions key is a new, key-granular
+  restriction the state router does not have today. The runner's memory
+  resolver grows tier awareness; the composition seam gains one block per
+  tier.
 - The Slack adapter gains a `member_joined_channel` subscription, three read
   scopes, and a backlog fetch path: a deliberate, confined widening of its
   "ack, dedupe, placeholder, enqueue" discipline. The new OAuth scopes are a
   reinstall/consent event for existing workspaces.
 - Cost is one bootstrap turn per channel ever, plus one compaction turn per
-  active scope per interval, skipped for idle scopes. Both are attributable
-  per agent through existing observability.
-- **Rebinding orphans memory, by choice.** Channel memory is stored under
-  the agent that learned it; rebinding that agent to a different channel
-  strands the old scope's artifacts (readable to operators, injected
-  nowhere), and the new channel bootstraps fresh. This is the fail-closed
-  choice the Claude in Slack private-to-public rule models; a platform-level
-  memory move is future work, as is any handling of a Slack channel's own
-  privacy transitions.
-- **Multi-channel (#27) has a named prerequisite here.** The channel-memory
-  namespace itself needs no migration (it is already keyed by scope), but
+  active scope per interval (agent tiers included), skipped for idle scopes.
+  Both are attributable per agent through existing observability.
+- **Rebinding orphans channel memory, by choice.** Channel memory is stored
+  under the agent that learned it; rebinding that agent to a different
+  channel strands the old scope's artifacts (readable to operators, injected
+  nowhere), and the new channel bootstraps fresh. Agent-tier memory, by
+  contrast, follows the agent through a rebinding: that is the difference
+  between the tiers doing its job. A platform-level memory move is future
+  work, as is any handling of a Slack channel's own privacy transitions.
+- **Multi-channel (#27) has a named prerequisite here.** The tiered key
+  layout needs no migration (channel keys already carry the scope key), but
   transcript keys carry only the thread ts, so "this scope's transcripts
   since the watermark" is computable only while the 1:1 binding makes agent
   and scope coincide. Attributing transcripts to a scope key is #27 work.
 - Custom instructions become a product concept for the first time. The v1
   editing surface is the state API and console; richer scoping (workspace or
   org tiers above the channel, as Claude in Slack layers them) is future
-  work and does not change the storage or injection shape.
+  work and slots into the hierarchy as additional tiers without changing
+  the storage or injection shape.
 - The email surface (and any backlog-less surface) is served by the same
   lifecycle minus bootstrap: memory starts empty and accretes through
   in-turn writes and compaction. Its scope-key mapping is deliberately
