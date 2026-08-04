@@ -15,6 +15,7 @@ of shipping an unattested artifact.
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,14 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "release" / "integrity.py"
 
 VERSION = "1.2.3"
-BINARIES = (
-    "curie-x86_64-unknown-linux-gnu",
-    "curie-aarch64-unknown-linux-gnu",
-    "curie-aarch64-apple-darwin",
-)
-CHART = f"curie-{VERSION}.tgz"
-COMPOSE = "compose.release.yaml"
-ASSETS = (*BINARIES, CHART, COMPOSE)
 
 
 def load_module():
@@ -45,6 +38,15 @@ def load_module():
 
 
 integrity = load_module()
+
+# Read from integrity.py rather than restated. A second copy drifts silently:
+# the release that failed on an undeclared arm64 binary had the workflow matrix
+# and integrity.py disagreeing, and a test with its own third list could not
+# have noticed.
+BINARIES = integrity.BINARY_ASSETS
+CHART = f"curie-{VERSION}.tgz"
+COMPOSE = "compose.release.yaml"
+ASSETS = (*BINARIES, CHART, COMPOSE)
 
 
 def write_sbom(path: Path, subject: str) -> None:
@@ -259,9 +261,7 @@ class TestVerify:
 
 class TestCli:
     def run(self, *args):
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), *args], capture_output=True, text=True
-        )
+        return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
 
     def test_manifest_writes_the_file_and_exits_zero(self, tmp_path):
         dist = make_dist(tmp_path)
@@ -296,3 +296,40 @@ class TestCli:
 
         assert done.returncode == 1
         assert "SBOM" in done.stderr
+
+
+def test_declared_binaries_match_the_workflow_matrix() -> None:
+    """The declaration and the build matrix cannot drift apart.
+
+    v0.6.0's first release build failed at the very last job -- after every
+    image, binary and SBOM had been built -- with:
+
+        ERROR: file(s) staged for release but not declared in integrity.py:
+        curie-aarch64-unknown-linux-gnu
+
+    The arm64 Linux target had been added to the workflow matrix and not to
+    `BINARY_ASSETS`. A comment said "keep in lockstep with its matrix", and a
+    comment is not a check: nothing compared the two until a tagged release
+    tried to publish, which is the most expensive possible moment to find out.
+
+    This reads both and fails in milliseconds instead.
+    """
+
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release.yaml").read_text()
+    # The matrix entries, e.g. "- target: aarch64-unknown-linux-gnu". Anchored
+    # to the list-item form so a `target:` appearing in prose or another job
+    # does not count as a build target.
+    matrix = {
+        f"curie-{m}" for m in re.findall(r"^\s*-\s*target:\s*([A-Za-z0-9_.-]+)\s*$", workflow, re.M)
+    }
+    assert matrix, "found no build targets in release.yaml; the pattern has drifted"
+
+    declared = set(integrity.BINARY_ASSETS)
+    assert declared == matrix, (
+        "release.yaml's matrix and integrity.py's BINARY_ASSETS disagree.\n"
+        f"  built but not declared: {sorted(matrix - declared)}\n"
+        f"  declared but not built: {sorted(declared - matrix)}\n"
+        "A target added to one and not the other fails the release at its last "
+        "job. Add it to BINARY_ASSETS (and give it an SBOM) or drop it from the "
+        "matrix."
+    )
