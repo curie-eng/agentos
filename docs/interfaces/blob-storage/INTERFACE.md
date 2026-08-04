@@ -83,4 +83,4 @@ both an async and a sync implementation.
 
 - **Epic(s):** #83 — vision epic for the blob-storage seam (extract a port only when a non-S3 backend lands).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 4 (Blob storage), grade B+
-- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries (MinIO adopted, AGPLv3, "offer BYO-S3")
+- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries (RustFS adopted under Apache 2.0, "offer BYO-S3")

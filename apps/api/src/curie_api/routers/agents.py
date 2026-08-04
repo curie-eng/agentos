@@ -177,7 +177,7 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
 @router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent(agent_id: uuid.UUID, session: SessionDep) -> None:
     # Deleting an agent cascades its versions and deployments rows (bundle
-    # objects in MinIO are left as-is, out of scope). Refuse while a deployment
+    # objects in RustFS are left as-is, out of scope). Refuse while a deployment
     # is still active so a live agent cannot be pulled out from under Slack
     # traffic; the caller must stop it (kill/undeploy) first.
     agent = await crud.get_agent(session, agent_id)

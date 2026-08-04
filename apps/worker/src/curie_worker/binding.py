@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # on one side would leave the sandbox booting fine with the feature silently
 # dropped. ``env_key`` raises on an unknown field, so a typo fails at import.
 #
-# CURIE_BUNDLE_REF is the MinIO object key sandbox provisioning fetches into
+# CURIE_BUNDLE_REF is the RustFS object key sandbox provisioning fetches into
 # CURIE_PLUGIN_DIR (a runner/chart handoff); the rest are the frozen ACI
 # SessionConfig env.
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")

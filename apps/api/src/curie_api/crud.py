@@ -81,7 +81,7 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # Remove child rows first, then the agent. Bulk deletes bypass the ORM
     # relationship cascade (which would emit an async lazy-load during flush) and
     # match the FK ondelete=CASCADE already declared on both child tables. Bundle
-    # objects in MinIO are intentionally left in place (out of scope).
+    # objects in RustFS are intentionally left in place (out of scope).
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))

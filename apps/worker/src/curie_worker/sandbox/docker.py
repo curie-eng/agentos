@@ -22,7 +22,7 @@ missing.
 Model mapping. Docker has no warm pool, no separate Sandbox object, and no init
 containers, so one container is simultaneously the "claim" and the "sandbox"
 (claim name == container name == sandbox name), and there is no bundle-fetch init
-pair -- the worker fetches the plugin bundle from MinIO and bind-mounts it. The
+pair -- the worker fetches the plugin bundle from RustFS and bind-mounts it. The
 host-process worker reaches each runner over a loopback-bound, Docker-assigned
 host port (``docker port <name> 8080``) -- but only when it can actually reach
 that host loopback. A worker running as a host-net *container* on Docker Desktop
@@ -107,7 +107,7 @@ _SDK_PASSTHROUGH_ENV = (
 _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # Env keys the worker sets explicitly or forwards specially, so the generic
 # value loop must not also emit them: the plugin dir and sandbox id are set
-# explicitly, the bundle ref named a MinIO object the worker already fetched
+# explicitly, the bundle ref named a RustFS object the worker already fetched
 # (the runner never fetches), and the credential is forwarded by name (never as
 # a value in the argv).
 _WORKER_OWNED_ENV = frozenset(

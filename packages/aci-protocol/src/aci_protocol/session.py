@@ -283,7 +283,7 @@ class BootEnv(_AciModel):
 
     session: SessionConfig
 
-    # The MinIO object key sandbox provisioning fetches into CURIE_PLUGIN_DIR.
+    # The RustFS object key sandbox provisioning fetches into CURIE_PLUGIN_DIR.
     bundle_ref: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_BUNDLE_REF", "worker")
     )

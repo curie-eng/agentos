@@ -5,7 +5,7 @@ JSON (the dispatcher seam convention). This consumer runs a distinct consumer
 group (``curie-eval-workers``) so it does not compete with the runs consumer.
 For each entry it:
 
-  1. fetches the version's immutable bundle from MinIO by ``bundle_ref`` and loads
+  1. fetches the version's immutable bundle from RustFS by ``bundle_ref`` and loads
      the suite from the bundle's own ``evals/cases.json`` (the same shape the CLI's
      ``curie skill eval`` reads); the ``suite`` field names it and tags Langfuse;
   2. runs the suite against the runner: ``target_url`` if given (the dev/test

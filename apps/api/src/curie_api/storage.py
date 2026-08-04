@@ -1,4 +1,4 @@
-"""Immutable bundle storage: the object-store port and its S3/MinIO backing.
+"""Immutable bundle storage: the object-store port and its S3/RustFS backing.
 
 Bundles are written once per (agent, version) under a deterministic key and never
 mutated (B2 constraint: immutability = write-once key, no dedup/GC/signing). boto3
@@ -10,7 +10,7 @@ loop free.
 ``ObjectStore`` (this module) is the storage port: the five operations the bundle
 pipeline needs, plus the **write-once/no-mutation key discipline** promoted here
 from convention into the contract (see the Protocol docstring). ``BundleStore``
-is the one concrete backing today, the S3/MinIO client. Consumers
+is the one concrete backing today, the S3/RustFS client. Consumers
 (``deps``/``gitflow``/``deploy``) type against ``ObjectStore``, so a future
 non-S3 backend (GCS-native, Azure Blob) is a drop-in that satisfies the Protocol
 rather than a rewrite of every call site. The GCS/Azure adapter itself is
@@ -83,7 +83,7 @@ def build_s3_client(settings: Settings) -> "S3Client":
 
 
 class BundleStore:
-    """S3/MinIO backing for the ``ObjectStore`` port (the one impl today)."""
+    """S3/RustFS backing for the ``ObjectStore`` port (the one impl today)."""
 
     def __init__(self, settings: Settings) -> None:
         self._bucket = settings.bundle_bucket
