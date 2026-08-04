@@ -545,7 +545,8 @@ def test_one_repo_binds_two_agents(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     # Before 0018 the second create was a 409 from the unique index, which is
-    # what forced sre-bot to make its second agent out of band.
+    # what forced the first adopting agent repo to make its second agent out of
+    # band.
     _register(client, auth_headers, "two-agent-dev", "C000000D01")
     _register(client, auth_headers, "two-agent-prod", "C000000E01")
 

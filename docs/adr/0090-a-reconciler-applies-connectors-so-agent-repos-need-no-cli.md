@@ -24,7 +24,7 @@ needs a `kubectl`-capable CLI near the cluster **at a version matching the
 platform**, the first agent repository to adopt connectors grew a Curie version
 pin, a cross-compilation workflow, an artifact staging step, and a remote
 install step — roughly 185 lines in a repository whose subject is answering SRE
-questions (curie-eng/sre-bot#19).
+questions, tracked in that repository's own pinning issue.
 
 That is the same shape as the 184 lines of hand-written Kubernetes
 `connectors.yaml` replaced, reintroduced one layer up. It also produced two
@@ -74,8 +74,9 @@ connector should look like — only about when it is applied.
 **Ownership stays label-based.** The reconciler prunes exactly what the CLI
 prunes, keyed on `curie.dev/connector-owner`, so an object created by one and
 reconciled by the other is not a special case. An object without the label was
-not created by Curie and is never touched — the property that let sre-bot's
-hand-written connector survive alongside a Curie-managed one during migration.
+not created by Curie and is never touched — the property that let the first
+adopting repo's hand-written connector survive alongside a Curie-managed one
+during migration.
 
 ## Consequences
 
@@ -85,7 +86,7 @@ credentials, no knowledge that Curie has versions at all. Push to `dev` and the
 dev agent updates; push to `main` and prod does.
 
 **The test of this decision is that an agent repo deletes code.** If an
-implementation leaves sre-bot with a `.curie-version` and a provisioning
+implementation leaves that agent repo with a `.curie-version` and a provisioning
 workflow, it has not achieved the thing this ADR is for. That is a
 falsifiable acceptance criterion and should be treated as one.
 
@@ -122,7 +123,8 @@ in the cluster, and the CLI remains the path for the rest.
   worth the most effort to avoid. Convenience is not a sufficient argument
   against a stated security boundary.
 - **Keep the CLI path and make version pinning ergonomic.** Rejected: it is
-  what curie-eng/sre-bot#19 does, and the objection is not ergonomics but
+  what the first adopting repo's pinning issue does, and the objection is not
+  ergonomics but
   scale. A better pin is still a pin in every agent repository.
 - **Have the worker apply connectors on a turn.** Rejected: the worker runs
   when someone messages the agent, so a connector would appear only on first

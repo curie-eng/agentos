@@ -14,9 +14,9 @@ Two properties this must never violate, both learned the hard way on the CLI
 path (#1063):
 
 - **Never touch an object Curie did not create.** Ownership is the
-  ``curie.dev/connector-owner`` label. sre-bot ran a hand-written connector
-  beside a Curie-managed one through its whole migration; an unlabelled object
-  is someone else's and is invisible here.
+  ``curie.dev/connector-owner`` label. The first adopting agent repo ran a
+  hand-written connector beside a Curie-managed one through its whole
+  migration; an unlabelled object is someone else's and is invisible here.
 - **Never prune across agents.** Ownership is scoped to the agent name, not to
   "is a connector". Two agents in one release each declare `grafana`, and one
   removing it must not delete the other's (#1116).

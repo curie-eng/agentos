@@ -11,7 +11,8 @@ Issue #1070, and the last thing standing between
 and its own acceptance test.
 
 ADR 0090 said an agent repository should contain only agent logic, and gave a
-falsifiable criterion: sre-bot must be able to delete `.curie-version`, its
+falsifiable criterion: the first adopting agent repository must be able to
+delete `.curie-version`, its
 provisioning workflow, and both deploy workflows. A reconciler removes the need
 for a CLI near the cluster. It does not remove the need for those workflows,
 because git-flow cannot express what they express.
@@ -27,8 +28,9 @@ async def get_agent_by_repo(session, repo_full_name) -> Agent | None:
 op.create_index("ix_agents_repo_full_name", "agents", ["repo_full_name"], unique=True)
 ```
 
-sre-bot has two agents on purpose — `sre-bot` on the prod channel, `sre-bot-dev`
-on the dev channel — because that is what a dev/prod split of a Slack bot is.
+That repository has two agents on purpose — `acme-bot` on the prod channel,
+`acme-dev` on the dev channel — because that is what a dev/prod split of a Slack
+bot is.
 Deleting its deploy workflows today would collapse them back into one, undoing
 the separation [ADR 0089](0089-bundles-declare-their-deploy-targets.md) exists
 to provide. So the repo keeps its workflows, keeps its version pin, and ADR
@@ -75,7 +77,7 @@ construction, not by discipline.
 
 ## Consequences
 
-sre-bot can delete `.curie-version`, `provision-curie.yml`, `deploy.yml`, and
+That repository can delete `.curie-version`, `provision-curie.yml`, `deploy.yml`, and
 `deploy-dev.yml` — roughly 400 lines, none of which is about answering SRE
 questions. That deletion is ADR 0090's acceptance test and this is what makes it
 reachable.
@@ -112,7 +114,7 @@ alone.
   and it is what ADR 0090's acceptance criterion exists to eliminate. A repo
   that must carry deploy plumbing to have two environments has not been freed of
   platform concerns.
-- **Encode the agent in the branch name** (`deploy/sre-bot-dev`). Rejected: it
+- **Encode the agent in the branch name** (`deploy/acme-dev`). Rejected: it
   puts routing in a branch-naming convention, which is neither reviewable nor
   validated — the same objection ADR 0089 made to routing living in CI.
 - **A per-repo mapping held by the platform** rather than in `deploy.yaml`.

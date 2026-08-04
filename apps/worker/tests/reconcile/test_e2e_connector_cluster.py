@@ -194,8 +194,9 @@ def test_one_agent_never_prunes_anothers_connector(client, namespace) -> None:
 
 
 def test_a_handwritten_object_is_never_touched(client, namespace) -> None:
-    # sre-bot ran a hand-written connector beside a Curie-managed one through
-    # its whole migration. An unlabelled object must be invisible.
+    # The first adopting agent repo ran a hand-written connector beside a
+    # Curie-managed one through its whole migration. An unlabelled object must
+    # be invisible.
     kubectl("-n", namespace, "create", "service", "clusterip", "handwritten", "--tcp=8080:8080")
     reconcile(client, namespace, [], AGENT)
     assert kubectl("-n", namespace, "get", "svc", "handwritten", "-o", "name")

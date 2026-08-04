@@ -53,6 +53,60 @@ description = "Internal hostname -- use example.com in docs and tests"
 regex = '''\b[a-z0-9][a-z0-9.-]*\.(curie-tech\.net|curie-tech\.com)\b'''
 tags = ["identifier", "hostname"]
 
+[[rules]]
+id = "downstream-repo-slug"
+description = "Downstream repository slug -- describe the repo's role, do not name it"
+# This repo is the platform; the repos that USE it are somebody's private
+# deployment. A slug in our own org is the case that actually happened: three
+# Accepted ADRs cited a private agent repository by `org/repo` and by
+# `org/repo#123`, which reads as ordinary sourcing and resolves to a 404 for
+# every reader but us.
+#
+# Deliberately scoped to OUR org rather than any `org/repo`: docs link to
+# upstream projects constantly, and a rule that fires on every third-party
+# GitHub link is a rule someone disables. RE2 has no lookahead, so "not our own
+# repo" is expressed as the rule allowlist below rather than in the pattern.
+#
+# The slug must END on an alphanumeric so the match is the repo name and
+# nothing else. Without that, `curie-eng/curie.` (sentence-final) and
+# `ghcr.io/curie-eng/curie-{runner,api}` (brace expansion) match with a
+# trailing `.` or `-`, which then fails an anchored allowlist and fires on this
+# repo's own name -- the noisy-rule failure mode the aws-account-id comment
+# above describes.
+regex = '''\bcurie-eng/[A-Za-z0-9._-]*[A-Za-z0-9]'''
+tags = ["identifier", "repo"]
+
+  [rules.allowlist]
+  description = "This repo itself, under both its names"
+  regexTarget = "match"
+  # `curie-eng/agentos` is this repo's former name, so it names the same public
+  # repository. Both forms take the `-*` suffix because that is the published
+  # image repos (curie-api, curie-runner, curie-worker-local, ...), which the
+  # full-history scan meets under the pre-rename name across 26 commits.
+  regexes = [
+    '''^curie-eng/curie(-[A-Za-z0-9._-]+)?$''',
+    '''^curie-eng/agentos(-[A-Za-z0-9._-]+)?$''',
+  ]
+
+[[rules]]
+id = "cross-repo-issue-ref"
+description = "Cross-repo issue reference -- cite this repo's issues, or describe the finding"
+# A bare `#123` is this repo's own issue tracker and is used everywhere on
+# purpose; the owner-qualified form points somewhere else, which for this repo
+# has only ever meant a private downstream repository.
+#
+# The owner must start with a LETTER, which is what separates an owner from a
+# number. GitHub owners cannot begin with a digit anyway, and without the
+# constraint the prose `#456/PR#503` -- two of this repo's own references,
+# written back to back -- parses as owner `456`, repo `PR`, issue `503`.
+regex = '''\b[A-Za-z][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[0-9]+\b'''
+tags = ["identifier", "repo"]
+
+  [rules.allowlist]
+  description = "This repo's own issues, written in the qualified form"
+  regexTarget = "match"
+  regexes = ['''^curie-eng/(curie|agentos)#[0-9]+$''']
+
 [allowlist]
 description = "Placeholder values this repo uses deliberately, plus generated artifacts"
 
@@ -156,7 +210,7 @@ stopwords = [
   "C9999ZZZZ",
 ]
 
-# Historical commits that carry the four ids scrubbed from HEAD. Allowlisted
+# Historical commits that carry an identifier scrubbed from HEAD. Allowlisted
 # by COMMIT, deliberately, rather than by value: excusing the values would
 # mean the gate stays silent if anyone reintroduces them, which is exactly
 # the case it exists to catch. Excusing the commits leaves the past scannable-
@@ -172,4 +226,10 @@ commits = [
   "5d8df34bdfd96fe531142ec81a37b3d52cf278bf",  # approval plane docs (predates this work)
   "c958a3b90b87fe0c87019097e5086b5d8f7b7746",  # validate_slack_channel test (predates this work)
   "ddd2cd8402ffc6da1e96eddbfa90e487385b68e2",  # approval note dialog (predates this work)
+  # The downstream-repo slug, scrubbed from HEAD alongside the agent names it
+  # travelled with. Same disclosure posture as the Slack ids above: the slug
+  # stays readable in the public log until history is rewritten, so treat the
+  # repository's existence and name as disclosed.
+  "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
+  "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
 ]

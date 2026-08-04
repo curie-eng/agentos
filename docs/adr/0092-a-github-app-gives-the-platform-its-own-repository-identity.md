@@ -10,7 +10,8 @@ Status: Accepted
 said an agent repository should contain only agent logic, and
 [ADR 0091](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md)
 made git-flow able to route one repository's pushes to several agents. Together
-they let sre-bot delete `.curie-version`, `provision-curie.yml`, `deploy.yml`
+they let the first adopting agent repository delete `.curie-version`,
+`provision-curie.yml`, `deploy.yml`
 and `deploy-dev.yml` — 464 lines of deploy plumbing.
 
 Deleting them exposed a dependency nobody had had to think about, because it had
@@ -35,7 +36,7 @@ after: push -> webhook (a doorbell: a commit sha, no code, no credential)
 ```
 
 `clone_and_archive` already assumes a credential exists — `settings.github_token`
-— and on the sre-bot cluster that setting has always been empty. This was
+— and on that agent's cluster that setting has always been empty. This was
 invisible because git-flow had never once run there: of 12 versions, **zero**
 carry a `commit_sha`. Every deploy came from the workflow path.
 

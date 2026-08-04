@@ -81,7 +81,7 @@ def test_a_channel_name_instead_of_an_id_is_rejected() -> None:
 def test_a_malformed_agent_name_is_rejected() -> None:
     # The failure this prevents: a typo does not error, it MINTS A NEW AGENT and
     # the deploy reports success against it.
-    assert "deploy.bad_agent_name" in _codes({"targets": {"p": {"agent": "Sre_Bot"}}})
+    assert "deploy.bad_agent_name" in _codes({"targets": {"p": {"agent": "Acme_Bot"}}})
 
 
 def test_env_defaults_to_dev_so_a_target_must_opt_in_to_prod() -> None:

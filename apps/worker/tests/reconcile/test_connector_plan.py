@@ -47,11 +47,11 @@ def live(o: dict[str, Any], **server_fields: Any) -> dict[str, Any]:
 # Never touch what Curie did not create
 # --------------------------------------------------------------------------- #
 def test_an_unlabelled_object_is_invisible() -> None:
-    # sre-bot ran a hand-written connector beside a Curie-managed one through
-    # its entire migration. Deleting it would have taken the bot's only working
-    # Grafana path with it.
+    # The first adopting agent repo ran a hand-written connector beside a
+    # Curie-managed one through its entire migration. Deleting it would have
+    # taken the bot's only working Grafana path with it.
     handwritten = obj("Deployment", "grafana-mcp")  # no owner label
-    p = plan(desired=[], live=[handwritten], agent="sre-bot")
+    p = plan(desired=[], live=[handwritten], agent="acme-bot")
     assert p.delete == []
     assert p.is_noop
 
@@ -59,10 +59,10 @@ def test_an_unlabelled_object_is_invisible() -> None:
 def test_another_agents_connector_is_never_pruned() -> None:
     # Two agents in one release each declare `grafana` (#1116). One removing it
     # must not delete the other's.
-    mine = obj("Deployment", "rel-sre-bot-mcp-grafana", owner="sre-bot")
-    theirs = obj("Deployment", "rel-sre-dev-mcp-grafana", owner="sre-dev")
-    p = plan(desired=[], live=[live(mine), live(theirs)], agent="sre-bot")
-    assert p.delete == [("Deployment", "rel-sre-bot-mcp-grafana")]
+    mine = obj("Deployment", "rel-acme-bot-mcp-grafana", owner="acme-bot")
+    theirs = obj("Deployment", "rel-acme-dev-mcp-grafana", owner="acme-dev")
+    p = plan(desired=[], live=[live(mine), live(theirs)], agent="acme-bot")
+    assert p.delete == [("Deployment", "rel-acme-bot-mcp-grafana")]
 
 
 # --------------------------------------------------------------------------- #
