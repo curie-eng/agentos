@@ -6,7 +6,7 @@
 #
 #   (a) The App ID must reach the API as the DIGITS. helm's `--set` parses a
 #       bare number and a --reuse-values round trip turns it into a float64, so
-#       app id 4475970 renders as "4.47597e+06", the JWT's `iss` claim is wrong,
+#       app id 1234567 renders as "1.234567e+06", the JWT's `iss` claim is wrong,
 #       and every GitHub call answers 401. The chart must quote whatever it is
 #       given rather than emit a bare number, and the CLI must use --set-string.
 #   (b) A BYO `githubAppExistingSecret` must make the chart REFERENCE a Secret
@@ -32,16 +32,16 @@ PY
 }
 
 # (a) The App ID is emitted as a quoted string, never a bare number.
-OUT="$(render --set-string api.githubAppId=4475970 --set api.githubAppPrivateKey=X)"
+OUT="$(render --set-string api.githubAppId=1234567 --set api.githubAppPrivateKey=X)"
 grep -q 'name: GITHUB_APP_ID' <<<"$OUT" || fail a "GITHUB_APP_ID is missing"
 python3 - "$OUT" <<'PY' || exit 1
 import sys, yaml
 doc = [d for d in yaml.safe_load_all(sys.argv[1]) if d and d.get("kind") == "Deployment"][0]
 env = {e["name"]: e for e in doc["spec"]["template"]["spec"]["containers"][0]["env"]}
 value = env["GITHUB_APP_ID"].get("value")
-if value != "4475970":
-    print(f"FAIL [a] GITHUB_APP_ID rendered as {value!r}, expected '4475970'. "
-          "A float here becomes '4.47597e+06' and every GitHub call 401s.",
+if value != "1234567":
+    print(f"FAIL [a] GITHUB_APP_ID rendered as {value!r}, expected '1234567'. "
+          "A float here becomes '1.234567e+06' and every GitHub call 401s.",
           file=sys.stderr)
     sys.exit(1)
 PY

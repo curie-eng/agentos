@@ -44,8 +44,8 @@ pub fn connect_commands(opts: &GithubAppOpts, clone_base: &str) -> Vec<OpsComman
             plain("--reuse-values"),
             // --set-string, NOT --set. A numeric App ID round-trips through
             // helm's stored values as a float64, and `| quote` then renders it
-            // in scientific notation: app id 4475970 reaches the API as
-            // "4.47597e+06", the JWT's `iss` claim is wrong, and GitHub answers
+            // in scientific notation: app id 1234567 reaches the API as
+            // "1.234567e+06", the JWT's `iss` claim is wrong, and GitHub answers
             // 401 on every call. Found on a live cluster; a chart-render test
             // cannot see it, because it only appears once a real numeric value
             // has been through a --reuse-values round trip.
@@ -239,8 +239,8 @@ mod tests {
     #[test]
     fn the_app_id_is_set_as_a_string() {
         // helm's `--set` parses a bare number, and a --reuse-values round trip
-        // turns it into a float64. App id 4475970 then renders as
-        // "4.47597e+06", the JWT's `iss` claim is wrong, and EVERY GitHub call
+        // turns it into a float64. App id 1234567 then renders as
+        // "1.234567e+06", the JWT's `iss` claim is wrong, and EVERY GitHub call
         // answers 401. Found on a live cluster -- a chart-render test cannot
         // see it, because it only appears once a real numeric value has been
         // through helm's stored values.
