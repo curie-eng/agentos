@@ -1,0 +1,266 @@
+"""Notice new commits without being told (issue #1239).
+
+Curie is self-hosted: adopters run it in their own cluster, and many of those
+clusters accept no inbound traffic. A GitHub webhook cannot reach such a
+cluster, so today those installs have no push-to-deploy at all -- not a
+degraded one, none.
+
+Outbound always works. So this asks GitHub, on an interval, whether the
+branches an agent's ``deploy.yaml`` targets have moved, and runs the ordinary
+deploy when they have.
+
+**It does not reimplement deploying.** It synthesizes the same push payload the
+webhook would have delivered and hands it to ``gitflow.process_push``. Two
+deploy paths that could disagree about what a push means would be worse than
+one path that sometimes runs late -- and the webhook remains the fast path
+wherever it can reach.
+
+Three properties worth stating, because each is a way this could go wrong:
+
+- **It polls per REPOSITORY, not per agent.** Several agents share one
+  repository (ADR-0091), so per-agent polling would make N identical API calls
+  and race N deploys of the same commit against each other.
+- **It never deploys a commit it has already deployed.** The check is the
+  ``commit_sha`` already recorded for that repository, so a restart does not
+  redeploy the current HEAD, and a webhook that already handled a push makes
+  the next poll a no-op.
+- **One failing repository does not stop the others.** A repo whose credential
+  has been revoked, or that has been deleted, must not silently halt polling
+  for every other agent on the cluster.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import httpx
+
+from .config import Settings
+
+logger = logging.getLogger(__name__)
+
+
+class BranchTip(Protocol):
+    """Reads the current sha of a branch. Narrow so tests need no HTTP."""
+
+    def sha_for(self, repo_full_name: str, branch: str) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class PollTarget:
+    """One repository and the branches worth watching on it."""
+
+    repo_full_name: str
+    clone_url: str
+    branches: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Move:
+    """A branch that has moved to a commit we have not deployed."""
+
+    repo_full_name: str
+    clone_url: str
+    branch: str
+    sha: str
+
+    def as_push_payload(self) -> dict[str, Any]:
+        """The webhook payload this would have arrived as.
+
+        Deliberately the same shape `process_push` already parses, so polling
+        and the webhook cannot diverge on what a push means. The clone_url is
+        the one derived from configuration, which is also what the origin check
+        compares against -- so a polled deploy passes that check by
+        construction rather than by coincidence.
+        """
+
+        return {
+            "ref": f"refs/heads/{self.branch}",
+            "after": self.sha,
+            "repository": {"full_name": self.repo_full_name, "clone_url": self.clone_url},
+        }
+
+
+def moves_to_deploy(
+    targets: Sequence[PollTarget],
+    tips: BranchTip,
+    already_deployed: dict[tuple[str, str], str],
+) -> list[Move]:
+    """Which branches have moved since we last deployed them.
+
+    Pure: no HTTP, no database. ``already_deployed`` maps
+    ``(repo_full_name, branch)`` to the sha last deployed from it.
+    """
+
+    moves: list[Move] = []
+    for target in targets:
+        for branch in target.branches:
+            try:
+                sha = tips.sha_for(target.repo_full_name, branch)
+            except Exception as exc:
+                # One unreachable or unauthorized repository must not stop the
+                # rest. Logged per repo/branch so the cause is attributable.
+                logger.warning(
+                    "commit poll failed repo=%s branch=%s: %s",
+                    target.repo_full_name,
+                    branch,
+                    exc,
+                )
+                continue
+            if not sha:
+                continue
+            if already_deployed.get((target.repo_full_name, branch)) == sha:
+                continue
+            moves.append(
+                Move(
+                    repo_full_name=target.repo_full_name,
+                    clone_url=target.clone_url,
+                    branch=branch,
+                    sha=sha,
+                )
+            )
+    return moves
+
+
+class GitHubBranchTip:
+    """Reads a branch tip from the GitHub API, using the platform credential."""
+
+    def __init__(self, settings: Settings, credentials: Any, timeout: float = 15.0) -> None:
+        self._settings = settings
+        self._credentials = credentials
+        self._timeout = timeout
+
+    def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+        token = self._credentials.token_for(repo_full_name)
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = f"{self._settings.github_api_url.rstrip('/')}/repos/{repo_full_name}/commits/{branch}"
+        with httpx.Client(timeout=self._timeout) as client:
+            response = client.get(url, headers=headers)
+        if response.status_code == 404:
+            # A branch a deploy.yaml names but the repository does not have is
+            # normal -- a repo may deploy only prod from main. Not an error.
+            return None
+        response.raise_for_status()
+        sha = response.json().get("sha")
+        return str(sha) if isinstance(sha, str) else None
+
+
+# The last commit deployed per (repository, environment). Environment rather
+# than branch because that is what a Deployment records; the caller maps
+# environments back to branch names via Settings, the same mapping
+# `environment_for_ref` uses in the other direction.
+_DEPLOYED_SQL = """
+SELECT DISTINCT ON (a.repo_full_name, d.environment)
+       a.repo_full_name AS repo_full_name,
+       d.environment    AS environment,
+       d.commit_sha     AS commit_sha
+FROM {schema}.deployments d
+JOIN {schema}.agents a ON a.id = d.agent_id
+WHERE a.repo_full_name IS NOT NULL AND d.commit_sha IS NOT NULL
+ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
+"""
+
+# Every repository that has at least one agent bound to it. DISTINCT because
+# several agents legitimately share one repository (ADR-0091), and polling it
+# once per agent would race N deploys of the same commit.
+_REPOS_SQL = """
+SELECT DISTINCT repo_full_name
+FROM {schema}.agents
+WHERE repo_full_name IS NOT NULL AND repo_full_name <> ''
+"""
+
+
+class CommitPoller:
+    """Asks GitHub whether the deploy branches moved, and deploys when they did.
+
+    Runs in the API rather than the worker because the deploy path, the bundle
+    store and the credential resolver all already live here. Its only job is to
+    notice; ``gitflow.process_push`` does the deploying.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: Any,
+        store: Any,
+        settings: Settings,
+        eval_queue: Any,
+        tips: BranchTip,
+        interval_seconds: float,
+    ) -> None:
+        self._session_factory = session_factory
+        self._store = store
+        self._settings = settings
+        self._eval_queue = eval_queue
+        self._tips = tips
+        self._interval = interval_seconds
+
+    async def run_forever(self) -> None:
+        logger.info("commit poller started interval=%ss", self._interval)
+        while True:
+            try:
+                await self.poll_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A poll pass must never kill the loop: the next one may well
+                # succeed, and a dead poller on an unreachable cluster means no
+                # deploys at all with nothing saying so.
+                logger.exception("commit poll pass failed; continuing")
+            await asyncio.sleep(self._interval)
+
+    async def poll_once(self) -> list[Move]:
+        from sqlalchemy import text
+
+        from . import gitflow
+
+        schema = self._settings.db_schema
+        branch_for_env = {
+            "dev": self._settings.dev_branch,
+            "prod": self._settings.prod_branch,
+        }
+
+        async with self._session_factory() as session:
+            repos = [
+                str(r) for (r,) in (await session.execute(text(_REPOS_SQL.format(schema=schema))))
+            ]
+            deployed: dict[tuple[str, str], str] = {}
+            for repo, env, sha in await session.execute(text(_DEPLOYED_SQL.format(schema=schema))):
+                branch = branch_for_env.get(str(env))
+                if branch:
+                    deployed[(str(repo), branch)] = str(sha)
+
+        targets = [
+            PollTarget(
+                repo_full_name=repo,
+                clone_url=gitflow.trusted_clone_url(repo, self._settings),
+                branches=tuple(branch_for_env.values()),
+            )
+            for repo in repos
+        ]
+        # to_thread because the tip reader is sync httpx: a blocking call in
+        # the event loop would stall every request the API is serving.
+        moves: list[Move] = await asyncio.to_thread(moves_to_deploy, targets, self._tips, deployed)
+
+        for move in moves:
+            async with self._session_factory() as session:
+                result = await gitflow.process_push(
+                    session, self._store, self._settings, self._eval_queue, move.as_push_payload()
+                )
+            logger.info(
+                "commit poll deployed repo=%s branch=%s sha=%s status=%s",
+                move.repo_full_name,
+                move.branch,
+                move.sha[:8],
+                result.status,
+            )
+        return moves

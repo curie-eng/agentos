@@ -110,6 +110,8 @@ spec:
               value: {{ .Values.api.environment | quote }}
             - name: ORG_NAME
               value: {{ .Values.api.orgName | quote }}
+            - name: COMMIT_POLL_INTERVAL_S
+              value: {{ .Values.api.commitPollIntervalSeconds | quote }}
             - name: GITHUB_CLONE_BASE
               value: {{ .Values.api.githubCloneBase | quote }}
             - name: LANGFUSE_HOST
