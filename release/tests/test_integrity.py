@@ -25,7 +25,24 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "release" / "integrity.py"
 
 VERSION = "1.2.3"
-BINARIES = ("curie-x86_64-unknown-linux-gnu", "curie-aarch64-apple-darwin")
+
+
+def _binary_assets() -> tuple[str, ...]:
+    """Read BINARY_ASSETS from the script under test.
+
+    Mirrored rather than restated, so a target added to the release matrix
+    cannot leave these fixtures behind. That drift is what let v0.6.0 fail at
+    the integrity gate after every image had already been built and pushed.
+    """
+
+    spec = importlib.util.spec_from_file_location("_release_integrity_consts", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return tuple(module.BINARY_ASSETS)
+
+
+BINARIES = _binary_assets()
 CHART = f"curie-{VERSION}.tgz"
 COMPOSE = "compose.release.yaml"
 ASSETS = (*BINARIES, CHART, COMPOSE)
@@ -255,9 +272,7 @@ class TestVerify:
 
 class TestCli:
     def run(self, *args):
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), *args], capture_output=True, text=True
-        )
+        return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
 
     def test_manifest_writes_the_file_and_exits_zero(self, tmp_path):
         dist = make_dist(tmp_path)
@@ -292,3 +307,36 @@ class TestCli:
 
         assert done.returncode == 1
         assert "SBOM" in done.stderr
+
+
+def test_binary_assets_match_the_workflow_matrix() -> None:
+    """The declaration and the build matrix must agree, automatically.
+
+    `BINARY_ASSETS` carries the comment "Keep in lockstep with its matrix", and
+    a comment is not a mechanism: the matrix gained aarch64-unknown-linux-gnu,
+    the tuple did not, and the mismatch surfaced only when v0.6.0 reached the
+    integrity gate at the very end of a release build --
+
+        ERROR: file(s) staged for release but not declared in integrity.py:
+        curie-aarch64-unknown-linux-gnu
+
+    The gate did its job. It just fired as late as possible, on a tag, after
+    every image had been built and pushed. This asserts the same thing at unit
+    speed, so the next added target fails in seconds instead.
+    """
+
+    import re
+    from pathlib import Path
+
+    from release.integrity import BINARY_ASSETS
+
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/release.yaml"
+    matrix = set(re.findall(r"^\s+- target: (\S+)", workflow.read_text(), re.M))
+    assert matrix, "could not read the cli-binaries matrix out of release.yaml"
+
+    declared = {name.removeprefix("curie-") for name in BINARY_ASSETS}
+    assert declared == matrix, (
+        f"BINARY_ASSETS and the release.yaml matrix disagree.\n"
+        f"  built but not declared: {sorted(matrix - declared)}\n"
+        f"  declared but not built: {sorted(declared - matrix)}"
+    )
