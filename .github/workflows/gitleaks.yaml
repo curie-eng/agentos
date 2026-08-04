@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   gitleaks:
-    name: gitleaks (full history)
+    name: gitleaks
     runs-on: ubuntu-latest
     env:
       GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
@@ -31,9 +31,9 @@ jobs:
         with:
           persist-credentials: false
           # fetch-depth: 0 pulls the entire history so `gitleaks detect` scans
-          # every commit, not just the tip. This doubles as the one-time
-          # full-history sweep the issue asks for (confirming the earlier history
-          # rewrite left no secrets behind) and re-runs it on every push/PR/cron.
+          # every commit, not just the tip. Pull request scans use an explicit
+          # base to head range below; push, scheduled, and manual scans remain
+          # full history.
           fetch-depth: 0
       # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
       # third-party dependency (a tool binary, an image, a registry session, a
@@ -70,6 +70,10 @@ jobs:
           done
           echo "gitleaks image pull failed after 2 attempts"
           exit 1
+      - name: Scope gitleaks to pull request commits
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "GITLEAKS_LOG_OPTS=--log-opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
       # Run gitleaks from its official public image rather than the marketplace
       # action: the action requires a paid GITLEAKS_LICENSE for organization
       # accounts, while the CLI/image is MIT-licensed and free. Pinned to an
@@ -86,4 +90,5 @@ jobs:
         run: |
           docker run --rm -v "${{ github.workspace }}:/repo" \
             "$GITLEAKS_IMAGE" \
-            detect --source /repo --redact --verbose --exit-code 1
+            detect --source /repo --redact --verbose --exit-code 1 \
+            ${GITLEAKS_LOG_OPTS:+"$GITLEAKS_LOG_OPTS"}

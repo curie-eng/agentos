@@ -131,9 +131,10 @@ admins maintain (issue #632).
 
 ### Enforced in the tree (CI)
 
-- **Secret scanning on every push and PR, plus a weekly full-history sweep.** The
-  `Secret Scan` workflow runs gitleaks over the entire history; its scanner image
-  is pinned to an immutable digest so this sensitive path cannot change under us.
+- **Secret scanning on pushes to main and pull requests targeting main, plus a weekly full-history sweep.** The
+  `Secret Scan` workflow scans pull request commits from base to head, and full
+  history on pushes, scheduled runs, and manual runs. Its scanner image is pinned
+  to an immutable digest so this sensitive path cannot change under us.
 - **Dependency vulnerability audits per ecosystem.** The `Dependency Audit`
   workflow runs `cargo audit` (Rust), `pip-audit` (the uv/Python workspace), and
   `pnpm audit` (the `apps/ui` JavaScript workspace) as advisory checks.
