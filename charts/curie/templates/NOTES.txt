@@ -157,3 +157,33 @@ The nodePort is pinned in values (langfuse.web.service.nodePort) so it survives 
 App services send OTLP traces to the collector, NOT directly to Langfuse:
   {{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.grpcPort }} (gRPC) / :{{ .Values.otelCollector.service.httpPort }} (HTTP)
 {{- end }}
+
+{{/*
+Curie holds real credentials in Kubernetes Secrets -- the model credential, the
+Slack tokens, the GitHub App key, and every agent's connector secrets. Whether
+those are encrypted at rest is a property of the CLUSTER, not of this chart,
+and it is invisible from inside: a pod cannot read etcd or the apiserver's
+EncryptionConfiguration, so there is no honest preflight for it. An install-time
+notice is the most this chart can truthfully do.
+*/}}
+─────────────────────────────────────────────────────────────────────────────
+SECRETS AT REST
+
+This release stores credentials in Kubernetes Secrets. Kubernetes Secrets are
+base64-encoded, NOT encrypted, unless your cluster encrypts them at rest.
+Curie cannot detect this from inside the cluster -- please verify it yourself:
+
+  k3s      k3s secrets-encrypt status          (enable: k3s secrets-encrypt enable)
+  kubeadm  --encryption-provider-config on kube-apiserver
+  EKS      aws eks describe-cluster --name <c> --query cluster.encryptionConfig
+  GKE      on by default (application-layer secrets encryption for db etcd)
+
+For the most sensitive value -- the GitHub App private key, which can mint read
+tokens for every repository the App is installed on -- prefer a Secret you
+manage yourself, so it never passes through helm values or release history:
+
+  api.githubAppExistingSecret: my-github-app
+
+  Create it with kubectl, External Secrets, or Sealed Secrets. See
+  charts/curie/README.md#secrets-at-rest.
+─────────────────────────────────────────────────────────────────────────────
