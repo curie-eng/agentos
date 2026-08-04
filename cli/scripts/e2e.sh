@@ -147,7 +147,32 @@ fi
 if [[ -n "${CURIE_E2E_OTEL:-}" ]]; then
     START_ARGS+=(--otel-endpoint "$CURIE_E2E_OTEL")
 fi
-"$BIN" skill up "${START_ARGS[@]}"
+UP_OUTPUT="$("$BIN" skill up "${START_ARGS[@]}" 2>&1)"
+printf '%s\n' "$UP_OUTPUT"
+
+# The boot panel must NAME the model path it resolved. `skill up` picks the
+# credential at boot (commands::select_passthrough_env) but used to say nothing
+# about it, so a first-run user with nothing exported got a clean panel and then
+# `model-credential-rejected` from the very command that panel recommends -- one
+# command after the CLI already knew. Asserted on the real run, not just in a
+# unit test, because the failure mode being guarded is the row going missing
+# from the panel rather than the summary function returning the wrong string.
+if [[ "$LIVE" == "1" ]]; then
+    EXPECT_MODEL='Model.*(CURIE_CREDENTIALS|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)'
+else
+    EXPECT_MODEL='Model.*fake \(offline'
+fi
+if ! printf '%s' "$UP_OUTPUT" | grep -qE "$EXPECT_MODEL"; then
+    echo "error: \`skill up\` did not report the resolved model path in its boot panel." >&2
+    echo "expected a 'Model' row matching /$EXPECT_MODEL/; see commands::model_credential_summary." >&2
+    exit 1
+fi
+# ...and must not cry wolf: a credential IS resolved on both paths here, so the
+# missing-credential warning appearing would make the real warning worthless.
+if printf '%s' "$UP_OUTPUT" | grep -q "no model credential resolved"; then
+    echo "error: \`skill up\` warned about a missing model credential on a run that has one." >&2
+    exit 1
+fi
 
 echo
 echo "=== curie skill status ==="
