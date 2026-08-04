@@ -592,10 +592,38 @@ Verify it for your distribution:
 
 | | |
 |---|---|
-| k3s | `k3s secrets-encrypt status` — enable with `k3s secrets-encrypt enable` |
+| k3s | `k3s secrets-encrypt status` — see the note below before enabling |
 | kubeadm | `--encryption-provider-config` on kube-apiserver |
 | EKS | `aws eks describe-cluster --name <c> --query cluster.encryptionConfig` |
 | GKE | on by default |
+
+#### Enabling it on k3s
+
+The order matters, and getting it wrong leaves a half-configured cluster.
+
+The server must be started with the flag **before** `enable` is run:
+
+```yaml
+# /etc/rancher/k3s/config.yaml
+secrets-encryption: true
+```
+
+Then `systemctl restart k3s`, then `k3s secrets-encrypt enable`, then restart
+again, then `k3s secrets-encrypt reencrypt` to rewrite existing Secrets.
+
+Running `enable` first, on a server started without the flag, half-succeeds:
+it writes a config the server never loads, and reports
+`missing annotation on node` followed by
+`Encryption Status: Disabled, no configuration file found`.
+
+On k3s v1.36.2 `enable` fails outright with
+`Put ".../v1-k3s/encrypt/config": EOF` even when the prerequisite is met
+(issue #1243). Hand-writing an `aescbc` EncryptionConfiguration does work —
+the apiserver runs with `--encryption-provider-config-automatic-reload=true`,
+so no restart is needed — but understand the hazard first: **if that file is
+ever reverted to identity-only, every Secret written while encryption was
+active becomes permanently undecryptable.** Prefer keeping the most sensitive
+values out of etcd entirely, as below.
 
 ### The GitHub App private key
 
