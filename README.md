@@ -181,6 +181,13 @@ fail-closed by default (skill/local aren't).
 
 See [`docs/operations.md`](docs/operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster) for cluster prerequisites and the full egress model.
 
+This first cluster is disposable. For production, keep durable data outside the cluster: set
+`postgres.deploy: false` for managed Postgres and `minio.deploy: false` for an S3 compatible object
+store, then supply their credentials through existing Kubernetes Secrets. The chart redirects its
+consumers to those stores, including bundle fetches. See the
+[`charts/curie` production storage configuration](charts/curie/README.md#values-surface-and-the-byo-idiom)
+for the complete backing store settings.
+
 Then continue this conversation thread
 
 ```bash
