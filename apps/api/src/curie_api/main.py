@@ -18,7 +18,7 @@ from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import create_engine, create_sessionmaker
 from .evalqueue import EvalQueue
-from .github_app import credentials_for
+from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
@@ -247,6 +247,9 @@ def configure_logging(level: str | None = None) -> logging.Logger:
 
 def create_app() -> FastAPI:
     configure_logging()
+    # Which credential the platform will clone with (ADR-0092, #1262). One
+    # line, no secret, and a warning when the App is set up only halfway.
+    log_credential_path(get_settings())
     app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health", tags=["health"])
