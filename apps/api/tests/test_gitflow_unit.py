@@ -78,9 +78,7 @@ def test_clone_and_archive_refuses_disallowed_scheme() -> None:
     # asserting the error is not a CloneOriginMismatch pins that ordering.
     settings = _local_settings()
     with pytest.raises(GitFlowError) as err:
-        clone_and_archive(
-            "ext::sh -c whoami", "0" * 40, settings, repo_full_name=_REPO
-        )
+        clone_and_archive("ext::sh -c whoami", "0" * 40, settings, repo_full_name=_REPO)
     assert not isinstance(err.value, CloneOriginMismatch)
     assert "scheme" in str(err.value)
 
@@ -132,9 +130,7 @@ def test_clone_and_archive_accepts_valid_hex_and_inserts_dash_dash(
     settings = _local_settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(
-            _ALLOWED_URL, good_sha, settings, repo_full_name=_REPO
-        )
+        result = clone_and_archive(_ALLOWED_URL, good_sha, settings, repo_full_name=_REPO)
 
     assert result == b"tar-bytes"
 
@@ -210,9 +206,7 @@ def test_clone_refuses_every_mismatch_dimension_before_any_subprocess(
     settings = Settings(github_token="ghs-secret-token")
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         with pytest.raises(CloneOriginMismatch):
-            clone_and_archive(
-                payload_url, _VALID_SHA1, settings, repo_full_name=_REPO
-            )
+            clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
     run.assert_not_called()
 
 
@@ -240,9 +234,7 @@ def test_clone_accepts_the_registered_origin_in_its_equivalent_forms(
     settings = Settings()
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(
-            payload_url, _VALID_SHA1, settings, repo_full_name=_REPO
-        )
+        result = clone_and_archive(payload_url, _VALID_SHA1, settings, repo_full_name=_REPO)
 
     assert result == b"tar-bytes"
     assert _GITHUB_URL in run.call_args_list[0].args[0]
@@ -331,9 +323,7 @@ def test_clone_argv_inserts_dash_dash_before_the_url() -> None:
         run.return_value = _completed(b"tar-bytes")
         clone_and_archive(_GITHUB_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
 
-    clone_argv = next(
-        call.args[0] for call in run.call_args_list if "clone" in call.args[0]
-    )
+    clone_argv = next(call.args[0] for call in run.call_args_list if "clone" in call.args[0])
     assert "--" in clone_argv, clone_argv
     dash_index = clone_argv.index("--")
     assert clone_argv[dash_index + 1] == _GITHUB_URL, clone_argv
@@ -349,9 +339,7 @@ def test_clone_accepts_a_well_formed_https_base() -> None:
     settings = Settings(github_clone_base=base)
     with mock.patch("curie_api.gitflow.subprocess.run") as run:
         run.return_value = _completed(b"tar-bytes")
-        result = clone_and_archive(
-            derived, _VALID_SHA1, settings, repo_full_name=_REPO
-        )
+        result = clone_and_archive(derived, _VALID_SHA1, settings, repo_full_name=_REPO)
 
     assert result == b"tar-bytes"
     assert derived in run.call_args_list[0].args[0]
@@ -480,9 +468,7 @@ def test_clone_failure_reports_git_stderr_not_the_exit_code() -> None:
     )
     with mock.patch("curie_api.gitflow.subprocess.run", side_effect=failure):
         with pytest.raises(GitFlowError) as err:
-            clone_and_archive(
-                _ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO
-            )
+            clone_and_archive(_ALLOWED_URL, _VALID_SHA1, settings, repo_full_name=_REPO)
     assert "Repository not found" in str(err.value)
 
 
@@ -490,7 +476,9 @@ def test_rejected_push_is_logged_loudly() -> None:
     # A rejected push still returns 200 -- GitHub would retry a non-2xx and the
     # push will not succeed on a retry. The cost is that every dashboard reports
     # success while nothing was deployed, so the platform must say so itself.
-    from curie_api.routers.github import _log_outcome
+    # Moved from the webhook router into gitflow (#1268) so the polling lane
+    # shares it. Same behaviour; the lane is now named in the record.
+    from curie_api.gitflow import log_push_outcome
     from curie_api.schemas import WebhookResult
 
     result = WebhookResult(
@@ -502,8 +490,8 @@ def test_rejected_push_is_logged_loudly() -> None:
         "after": _VALID_SHA1,
         "repository": {"full_name": "acme/private-bundle"},
     }
-    with mock.patch("curie_api.routers.github.logger") as log:
-        _log_outcome(result, payload)
+    with mock.patch("curie_api.gitflow.logger") as log:
+        log_push_outcome(result, payload, source="github webhook")
     log.warning.assert_called_once()
     rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
     assert "acme/private-bundle" in rendered
@@ -511,10 +499,12 @@ def test_rejected_push_is_logged_loudly() -> None:
 
 
 def test_successful_push_does_not_warn() -> None:
-    from curie_api.routers.github import _log_outcome
+    # Moved from the webhook router into gitflow (#1268) so the polling lane
+    # shares it. Same behaviour; the lane is now named in the record.
+    from curie_api.gitflow import log_push_outcome
     from curie_api.schemas import WebhookResult
 
-    with mock.patch("curie_api.routers.github.logger") as log:
-        _log_outcome(WebhookResult(status="deployed"), {})
-        _log_outcome(WebhookResult(status="ignored"), {})
+    with mock.patch("curie_api.gitflow.logger") as log:
+        log_push_outcome(WebhookResult(status="deployed"), {}, source="github webhook")
+        log_push_outcome(WebhookResult(status="ignored"), {}, source="github webhook")
     log.warning.assert_not_called()

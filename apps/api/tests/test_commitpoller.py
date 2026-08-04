@@ -12,8 +12,10 @@ without running the real lifespan.
 
 from __future__ import annotations
 
+import logging
 import os
 
+import httpx
 import pytest
 from curie_api.commitpoller import Move, PollTarget, moves_to_deploy
 from curie_api.config import get_settings
@@ -182,3 +184,217 @@ def test_the_lifespan_wires_the_poller_to_the_bundle_store(clean_db: None) -> No
         else:
             os.environ["COMMIT_POLL_INTERVAL_S"] = prior
         get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Rejections are reported, not called "deployed" (#1268)
+# --------------------------------------------------------------------------- #
+async def _run_poll_once(monkeypatch, result) -> None:
+    """Drive the real poll_once with a stubbed deploy that returns `result`."""
+    from contextlib import asynccontextmanager
+
+    from curie_api import gitflow
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.config import Settings
+
+    class Rows(list):
+        def __iter__(self):  # noqa: D105 - the two queries both iterate
+            return super().__iter__()
+
+    class Session:
+        async def execute(self, stmt):
+            # First query lists repos, second lists deployed shas. Returning
+            # one repo and nothing deployed makes exactly one move.
+            return Rows([(REPO,)]) if "FROM curie.agents" in str(stmt) else Rows([])
+
+    @asynccontextmanager
+    async def factory():
+        yield Session()
+
+    async def fake_process_push(session, store, settings, eval_queue, payload):
+        return result
+
+    monkeypatch.setattr(gitflow, "process_push", fake_process_push)
+    poller = CommitPoller(
+        session_factory=factory,
+        store=object(),
+        settings=Settings(github_clone_base="https://github.com"),
+        eval_queue=object(),
+        tips=Tips({(REPO, "dev"): "abc123", (REPO, "main"): None}),
+        interval_seconds=60,
+    )
+    await poller.poll_once()
+
+
+@pytest.mark.anyio
+async def test_a_rejected_polled_deploy_warns_from_the_poller(monkeypatch, caplog) -> None:
+    # AC3: driven through poll_once, not by calling the logger directly. An
+    # earlier version of this test called log_push_outcome itself and passed
+    # even with the poller's call deleted -- it proved the logger worked, not
+    # that the poller used it.
+    from curie_api.schemas import WebhookResult
+
+    rejected = WebhookResult(
+        status="rejected", errors=[{"code": "deploy.unknown_agent", "message": "no such agent"}]
+    )
+    with caplog.at_level(logging.WARNING):
+        await _run_poll_once(monkeypatch, rejected)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a rejected polled deploy must warn"
+    text = " ".join(r.getMessage() for r in warnings)
+    assert "deploy.unknown_agent" in text, f"codes must be in the record: {text}"
+    assert "commit poll" in text, f"the lane must be identifiable: {text}"
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+def test_a_rejected_polled_deploy_warns_with_its_codes(caplog) -> None:
+    # The poller reported every outcome as "deployed" at INFO and discarded
+    # result.errors. That is #1066 again -- the system reporting success for
+    # work it did not do -- on the lane with no GitHub delivery UI to fall back
+    # on, because polling exists for clusters GitHub cannot reach.
+    from curie_api.gitflow import log_push_outcome
+    from curie_api.schemas import WebhookResult
+
+    rejected = WebhookResult(
+        status="rejected", errors=[{"code": "deploy.unknown_agent", "message": "no such agent"}]
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_api.gitflow"):
+        log_push_outcome(
+            rejected, Move(REPO, CLONE, "dev", "abc123").as_push_payload(), source="commit poll"
+        )
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a rejected polled deploy must warn"
+    text = warnings[0].getMessage()
+    assert "deploy.unknown_agent" in text, f"the codes must be in the record: {text}"
+    assert "commit poll" in text, f"the lane must be identifiable: {text}"
+
+
+def test_a_successful_deploy_does_not_warn(caplog) -> None:
+    from curie_api.gitflow import log_push_outcome
+    from curie_api.schemas import WebhookResult
+
+    with caplog.at_level(logging.WARNING, logger="curie_api.gitflow"):
+        log_push_outcome(
+            WebhookResult(status="deployed"),
+            Move(REPO, CLONE, "dev", "abc").as_push_payload(),
+            source="commit poll",
+        )
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_both_lanes_use_the_same_reporter() -> None:
+    # AC2: shared, not duplicated, so the two cannot drift. The webhook router
+    # must call the same function rather than keep its own copy.
+    from pathlib import Path
+
+    router = Path("apps/api/src/curie_api/routers/github.py").read_text()
+    assert "log_push_outcome" in router
+    assert "def _log_outcome" not in router, "the router kept a private copy"
+
+
+# --------------------------------------------------------------------------- #
+# Throttling backs off instead of re-asking (#1269)
+# --------------------------------------------------------------------------- #
+def _tip_reader(handler):
+    """A GitHubBranchTip whose HTTP is answered by `handler`."""
+    from curie_api.commitpoller import GitHubBranchTip
+    from curie_api.config import Settings
+
+    real = httpx.Client
+
+    class Creds:
+        def token_for(self, repo: str) -> str:
+            return ""
+
+    tip = GitHubBranchTip(Settings(), Creds())
+    tip._client_factory = lambda **kw: real(transport=httpx.MockTransport(handler))  # type: ignore[attr-defined]
+    return tip
+
+
+def test_a_429_with_retry_after_is_respected_on_the_next_attempt(monkeypatch) -> None:
+    # GitHub documents Retry-After (seconds) on a secondary rate limit, under
+    # "Rate limits for the REST API". The failure this prevents: re-requesting
+    # at the next interval, which is what turns a brief throttle into a
+    # sustained one. An unauthenticated caller gets 60 requests/hour.
+    from curie_api.commitpoller import GitHubBranchTip, RateLimited
+    from curie_api.config import Settings
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(429, headers={"Retry-After": "120"}, json={})
+
+    real = httpx.Client
+    monkeypatch.setattr(
+        "curie_api.commitpoller.httpx.Client",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler)),
+    )
+
+    class Creds:
+        def token_for(self, repo: str) -> str:
+            return ""
+
+    tip = GitHubBranchTip(Settings(), Creds())
+    with pytest.raises(RateLimited) as first:
+        tip.sha_for(REPO, "dev")
+    assert first.value.retry_after_s == pytest.approx(120, abs=2)
+
+    # The second attempt must not reach GitHub at all.
+    with pytest.raises(RateLimited):
+        tip.sha_for(REPO, "dev")
+    assert calls["n"] == 1, "a throttled repo was re-requested instead of backing off"
+
+
+def test_sustained_throttling_is_reported_above_a_per_branch_warning(monkeypatch, caplog) -> None:
+    # AC2 of #1269: one 429 is routine, several rounds running means the deploy
+    # lane has stopped and must be findable as that rather than as a blip.
+    from curie_api.commitpoller import GitHubBranchTip, RateLimited
+    from curie_api.config import Settings
+
+    real = httpx.Client
+    monkeypatch.setattr(
+        "curie_api.commitpoller.httpx.Client",
+        lambda *a, **kw: real(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(429, headers={"Retry-After": "0"}, json={})
+            )
+        ),
+    )
+
+    class Creds:
+        def token_for(self, repo: str) -> str:
+            return ""
+
+    tip = GitHubBranchTip(Settings(), Creds())
+    with caplog.at_level(logging.WARNING, logger="curie_api.commitpoller"):
+        for _ in range(3):
+            with pytest.raises(RateLimited):
+                tip.sha_for(REPO, "dev")
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "sustained throttling must escalate above a per-branch warning"
+    assert "NOT happening" in errors[0].getMessage()
+
+
+def test_a_throttled_repository_does_not_stop_the_others(monkeypatch) -> None:
+    # RateLimited is an exception, and moves_to_deploy catches per repo/branch.
+    # If that ever changed, one throttled repo would halt every other agent.
+    from curie_api.commitpoller import RateLimited
+
+    class Throttled:
+        def sha_for(self, repo: str, branch: str) -> str | None:
+            if repo == "octo/slow":
+                raise RateLimited(repo, 120)
+            return "abc123"
+
+    moves = moves_to_deploy(
+        [target("dev", repo="octo/slow"), target("dev", repo="octo/fine")], Throttled(), {}
+    )
+    assert [m.repo_full_name for m in moves] == ["octo/fine"]

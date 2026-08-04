@@ -11,6 +11,7 @@ GitHub API.
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import shutil
@@ -34,6 +35,8 @@ from .github_app import credentials_for
 from .models import Agent, AgentVersion, Environment
 from .schemas import WebhookResult
 from .storage import ObjectStore
+
+logger = logging.getLogger(__name__)
 
 _ZERO_SHA = "0" * 40
 # A full lowercase-hex git object id: SHA-1 (40) or SHA-256 (64).
@@ -297,6 +300,45 @@ def clone_and_archive(
         return archived.stdout
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, source: str) -> None:
+    """Log a rejected push loudly, whichever lane delivered it (#1066, #1268).
+
+    A rejected push is still acknowledged with 200, because GitHub retries and
+    redelivers on a non-2xx and the push is not going to succeed on a retry. The
+    cost is that every dashboard reports success: GitHub shows a green delivery,
+    the access log shows "POST /github/webhook 200 OK", and no agent, version, or
+    deployment appears. The reason exists only in the response body, which
+    nothing surfaces.
+
+    That combination made a broken deploy indistinguishable from a working one
+    until someone thought to open the delivery payload in GitHub's UI. Logging
+    the rejection is what makes it findable from the platform side (#1066).
+
+    It lives here, not in the webhook router, because the POLLING lane needs it
+    more and had it less (#1268). A polled push has no HTTP response body to
+    carry the errors and no GitHub delivery UI to fall back on -- polling exists
+    precisely for clusters GitHub cannot reach. Its only output named the
+    outcome "deployed" at INFO and discarded `result.errors` entirely, which is
+    #1066 again on the one path with no fallback. Shared rather than copied so
+    the two lanes cannot drift.
+    """
+
+    if result.status != "rejected":
+        return
+    repo = payload.get("repository")
+    full_name = repo.get("full_name") if isinstance(repo, dict) else None
+    codes = [e.get("code", "?") for e in (result.errors or [])]
+    logger.warning(
+        "%s rejected push: repo=%s ref=%s sha=%s codes=%s errors=%s",
+        source,
+        full_name,
+        payload.get("ref"),
+        str(payload.get("after"))[:12],
+        ",".join(codes) or "none",
+        result.errors,
+    )
 
 
 async def process_push(
