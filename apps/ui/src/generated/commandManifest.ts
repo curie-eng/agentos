@@ -2608,6 +2608,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Deploy EVERY target `deploy.yaml` declares, dev before prod",
+              "id": "all_targets",
+              "long": "all-targets",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Deploy under this agent name instead of the manifest's `name`",
               "id": "agent",
               "long": "agent",

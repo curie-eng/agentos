@@ -34,6 +34,21 @@ pub struct ResolvedTarget {
     pub slack_channel: Option<String>,
 }
 
+/// One target plus the name it is declared under (ADR-0089).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NamedTarget {
+    pub name: String,
+    pub agent: Option<String>,
+    pub env: String,
+    pub slack_channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ListedTargets {
+    #[serde(default)]
+    pub targets: Vec<NamedTarget>,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ConnectorManifests {
     #[serde(default)]
@@ -969,6 +984,39 @@ impl ApiClient {
             anyhow::bail!("resolving target `{target}` failed with {status}: {body}");
         }
         serde_json::from_str(&body).context("decoding the resolved deploy target")
+    }
+
+    /// Every target a `deploy.yaml` declares, dev before prod.
+    ///
+    /// The file CONTENT goes to the API rather than being parsed here, for the
+    /// same reason `resolve_deploy_target` does: ADR-0089 keeps exactly one
+    /// parser for this format, and a second in Rust could disagree with it
+    /// about where a deploy lands.
+    pub async fn list_deploy_targets(&self, content: &str) -> Result<ListedTargets> {
+        let resp = self
+            .http
+            .post(format!("{}/deploy-targets/list", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json(&serde_json::json!({"content": content, "target": ""}))
+            .send()
+            .await
+            .context("listing the deploy targets")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // Same skew guard as `resolve_deploy_target`: a platform predating this
+        // endpoint answers with FastAPI's bare 404 body, which is otherwise
+        // indistinguishable from a real error and sends an operator hunting.
+        if is_unrouted(status, &body) {
+            anyhow::bail!(
+                "this platform release cannot list deploy targets, so onboarding every \
+                 target at once will not work against it. Upgrade the release, or deploy \
+                 each target with `cluster deploy --target <name>`."
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!("listing the deploy targets failed ({status}): {body}");
+        }
+        serde_json::from_str(&body).context("decoding the deploy target list")
     }
 
     pub async fn version_connectors(

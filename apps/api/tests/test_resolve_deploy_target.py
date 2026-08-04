@@ -92,3 +92,69 @@ def test_unparseable_yaml_is_a_400_naming_the_problem(
     r = _resolve(client, auth_headers, "targets:\n  p:\n   env: [unclosed\n", "p")
     assert r.status_code == 400
     assert "unparseable" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# Listing every target (onboarding)
+# --------------------------------------------------------------------------- #
+_TWO_TARGETS = """
+targets:
+  prod: { agent: my-bot,     env: prod, slack_channel: C000000A01 }
+  dev:  { agent: my-bot-dev, env: dev,  slack_channel: C000000A02 }
+"""
+
+
+def test_list_returns_every_target(client: TestClient, auth_headers: dict) -> None:
+    # Onboarding a repository means deploying ALL its targets. A caller that
+    # had to parse deploy.yaml to enumerate them would be the second parser
+    # ADR-0089 put this endpoint here to prevent.
+    r = client.post(
+        "/deploy-targets/list",
+        json={"content": _TWO_TARGETS, "target": "ignored"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert {t["agent"] for t in r.json()["targets"]} == {"my-bot", "my-bot-dev"}
+
+
+def test_list_orders_dev_before_prod(client: TestClient, auth_headers: dict) -> None:
+    # A sequential onboarding run that fails part-way must leave prod BEHIND,
+    # not ahead of a dev that never landed. The file declares prod first, so
+    # this is ordering rather than luck.
+    r = client.post(
+        "/deploy-targets/list", json={"content": _TWO_TARGETS, "target": ""}, headers=auth_headers
+    )
+    assert [t["env"] for t in r.json()["targets"]] == ["dev", "prod"]
+
+
+def test_list_carries_the_declared_name(client: TestClient, auth_headers: dict) -> None:
+    r = client.post(
+        "/deploy-targets/list", json={"content": _TWO_TARGETS, "target": ""}, headers=auth_headers
+    )
+    assert {t["name"] for t in r.json()["targets"]} == {"dev", "prod"}
+
+
+def test_list_and_resolve_agree_on_an_invalid_file(client: TestClient, auth_headers: dict) -> None:
+    # Both go through one parser. If they diverged, a file could list cleanly
+    # and resolve as broken -- a second parser by the back door.
+    bad = "targets: {dev: {agent: x, env: nonsense, slack_channel: C000000B01}}"
+    a = client.post(
+        "/deploy-targets/list", json={"content": bad, "target": "dev"}, headers=auth_headers
+    )
+    b = client.post(
+        "/deploy-targets/resolve", json={"content": bad, "target": "dev"}, headers=auth_headers
+    )
+    assert a.status_code == b.status_code == 400
+    assert a.json()["detail"] == b.json()["detail"]
+
+
+def test_list_of_an_empty_file_is_empty_not_an_error(
+    client: TestClient, auth_headers: dict
+) -> None:
+    # Nothing declared is a legitimate state for a bundle that predates
+    # deploy.yaml; the caller decides what to do about it.
+    r = client.post(
+        "/deploy-targets/list", json={"content": "targets: {}", "target": ""}, headers=auth_headers
+    )
+    assert r.status_code == 200
+    assert r.json()["targets"] == []
