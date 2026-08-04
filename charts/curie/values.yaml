@@ -507,6 +507,34 @@ api:
   service:
     type: ClusterIP
     port: 8000
+  # TLS for the API (issue #1238). Off by default because it cannot be
+  # defaulted honestly -- it needs an ingress controller, a hostname, and a
+  # certificate source, none of which the chart can invent. Rendering an
+  # Ingress with no controller present would look configured and do nothing.
+  #
+  # Turn this on for anything reachable from outside the cluster. Without it,
+  # the `X-API-Key` header crosses the network in cleartext on every
+  # authenticated call, and the GitHub webhook delivery is readable and
+  # replayable.
+  ingress:
+    enabled: false
+    # Required when enabled; the chart fails the render rather than producing
+    # a host-less Ingress that matches every request reaching the controller.
+    host: ""
+    className: ""
+    path: /
+    pathType: Prefix
+    # Annotations for your controller and certificate issuer, e.g.
+    #   cert-manager.io/cluster-issuer: letsencrypt-prod
+    #   nginx.ingress.kubernetes.io/proxy-body-size: 25m   # matches the
+    #     webhook body cap (github_webhook_max_body_bytes); a smaller proxy
+    #     limit rejects a large push before the API can apply its own.
+    annotations: {}
+    tls:
+      enabled: true
+      # A Secret you supply, or one cert-manager creates from the annotation
+      # above. Empty means "use the controller's default certificate".
+      secretName: ""
   # Run `alembic upgrade head` in an init container before the server starts, so
   # a fresh Postgres gets the `curie` schema + tables. Disable only when an
   # external migration step owns the DB.

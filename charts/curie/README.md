@@ -576,6 +576,40 @@ to install only the control plane + backing stores without the runner substrate.
 - Traces flow to `<release>-otel-collector:4318` (HTTP), per the collector
   rule above; the env block is omitted when `otelCollector.deploy: false`.
 
+## Serving the API over TLS
+
+The API is the only endpoint reached from outside the cluster. Two things cross
+it in the clear without TLS: the `X-API-Key` header, on every authenticated
+call, and the GitHub webhook delivery, whose HMAC protects integrity but not
+confidentiality.
+
+Off by default, because it cannot be defaulted honestly — an ingress needs a
+controller, a hostname, and a certificate source, none of which the chart can
+invent. A default-on Ingress with no controller renders an object that silently
+does nothing.
+
+```yaml
+api:
+  ingress:
+    enabled: true
+    host: curie.example.com
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      # Match the webhook body cap; a smaller proxy limit rejects a large push
+      # before the API can apply its own bound.
+      nginx.ingress.kubernetes.io/proxy-body-size: 25m
+    tls:
+      enabled: true
+      secretName: curie-api-tls     # empty = the controller's default cert
+```
+
+Then point the GitHub webhook at `https://curie.example.com/github/webhook`.
+
+Set `tls.enabled: false` only when something upstream already terminates TLS —
+it renders the routing rules without a `tls` block, rather than silently
+keeping one.
+
 ## Secrets at rest
 
 Curie holds real credentials in Kubernetes Secrets: the model credential, the

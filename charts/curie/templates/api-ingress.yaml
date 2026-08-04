@@ -1,0 +1,57 @@
+{{- if and .Values.api.deploy .Values.api.ingress.enabled }}
+{{/*
+TLS for the platform API (issue #1238).
+
+Two things reach this endpoint from outside the cluster, and both are exposed
+without it:
+
+  - Every authenticated call carries `X-API-Key` as a plain header. Over a
+    NodePort on a public IP -- how a k3s install is typically reached -- that
+    key crosses the internet in cleartext on every request.
+  - The GitHub webhook. Its HMAC protects integrity, not confidentiality, and a
+    captured delivery can be replayed.
+
+This is opt-in rather than default-on because it cannot be defaulted honestly:
+it needs an ingress controller, a hostname, and a certificate source, none of
+which the chart can invent. A default-on ingress with no controller renders an
+object that silently does nothing, which is the "looks configured, isn't"
+failure the NetworkPolicy probe exists to prevent elsewhere in this chart.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "curie.fullname" . }}-api
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  {{- with .Values.api.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.api.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.api.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ required "api.ingress.host is required when the ingress is enabled" .Values.api.ingress.host | quote }}
+      {{- /* An empty secretName is meaningful: it tells the controller to use
+             its own default certificate. Rendering `secretName: ""` would make
+             it look for a Secret literally named "", so it is omitted. */}}
+      {{- with .Values.api.ingress.tls.secretName }}
+      secretName: {{ . | quote }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ required "api.ingress.host is required when the ingress is enabled" .Values.api.ingress.host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.api.ingress.path }}
+            pathType: {{ .Values.api.ingress.pathType }}
+            backend:
+              service:
+                name: {{ include "curie.fullname" . }}-api
+                port:
+                  number: {{ .Values.api.service.port }}
+{{- end }}
