@@ -5,12 +5,20 @@ is tested without HTTP or a database. What matters is not that it spots a moved
 branch; that is one comparison. It is that it does not deploy the same commit
 twice, does not stop polling when one repository breaks, and hands the deploy
 path a payload indistinguishable from a real webhook.
+One test, the one that runs the real lifespan (#1250), is the exception and is
+deliberate: the wiring the poller receives from the lifespan cannot be checked
+without running the real lifespan.
 """
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from curie_api.commitpoller import Move, PollTarget, moves_to_deploy
+from curie_api.config import get_settings
+from curie_api.main import create_app
+from fastapi.testclient import TestClient
 
 REPO = "octo/agent-bot"
 CLONE = "https://github.com/octo/agent-bot.git"
@@ -135,3 +143,42 @@ def test_no_targets_or_no_branches_is_quiet(branches: tuple[str, ...]) -> None:
     tips = Tips({})
     assert moves_to_deploy([target(*branches)], tips, {}) == []
     assert moves_to_deploy([], tips, {}) == []
+
+
+# --------------------------------------------------------------------------- #
+# The wiring the lifespan hands it (#1250)
+# --------------------------------------------------------------------------- #
+def test_the_lifespan_wires_the_poller_to_the_bundle_store(clean_db: None) -> None:
+    # The poller was constructed with `store=app.state.store`, an attribute
+    # nothing assigns, so enabling it crashed the API at startup and the feature
+    # never ran once. mypy cannot see it (State.__getattr__ returns Any) and no
+    # test built the poller, so the only thing that catches it is running the
+    # real lifespan with the interval on. The identity assertion is the point:
+    # `is not None` would pass against a poller wired to the wrong object.
+    #
+    # clean_db (not _disposable_db) is load-bearing, not a style choice: on
+    # entering the TestClient's `with` block, run_forever calls poll_once
+    # immediately, before its first sleep, and poll_once queries curie.agents
+    # for rows with a repo_full_name. If an agent row from an earlier test
+    # survived, this pass would call GitHubBranchTip.sha_for and issue a real
+    # httpx request to the GitHub API. clean_db's TRUNCATE is the only reason
+    # that pass is a no-op; do not weaken this to _disposable_db.
+    prior = os.environ.get("COMMIT_POLL_INTERVAL_S")
+    os.environ["COMMIT_POLL_INTERVAL_S"] = "3600"
+    get_settings.cache_clear()
+    try:
+        with TestClient(create_app()) as client:
+            assert client.app.state.commit_poller_task is not None
+            poller = client.app.state.commit_poller
+            assert poller._store is client.app.state.bundle_store
+            # Pins the actual defect: a "fix" that leaves store=app.state.store
+            # in place and adds app.state.store = bundle_store as an alias would
+            # satisfy the identity assertion above while reintroducing the
+            # compatibility path this codebase forbids. Exactly one store name.
+            assert not hasattr(client.app.state, "store")
+    finally:
+        if prior is None:
+            os.environ.pop("COMMIT_POLL_INTERVAL_S", None)
+        else:
+            os.environ["COMMIT_POLL_INTERVAL_S"] = prior
+        get_settings.cache_clear()

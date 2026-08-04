@@ -494,8 +494,15 @@ api:
   # Outbound works where inbound does not.
   #
   # The webhook remains the fast path wherever it reaches; polling is the
-  # floor. A poll for a push the webhook already handled does nothing, so
-  # running both is safe. 60 is a reasonable starting interval.
+  # floor. Each pass costs one API call per repository per branch -- repos x
+  # 2 calls per interval. A branch is skipped only when its tip matches the
+  # sha already recorded as deployed, a snapshot taken at the START of the
+  # pass, before that pass's clone, archive, validate and upload run -- so a
+  # webhook handling the SAME push concurrently can still deploy it twice.
+  # A push gitflow.process_push ignores or rejects is never recorded, so a
+  # stuck branch re-clones and re-archives every pass until fixed (#1267);
+  # raise the interval to reduce that cost meanwhile. 60 is a reasonable
+  # starting interval.
   commitPollIntervalSeconds: 0
   # The one git origin the API clones from for git-flow. A pushed repository
   # whose clone URL does not resolve to `<githubCloneBase>/<repo_full_name>.git`
