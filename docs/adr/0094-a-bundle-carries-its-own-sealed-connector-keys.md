@@ -11,7 +11,8 @@ Issue #1240, and the last manual step in onboarding an agent.
 [ADR 0090](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md),
 [ADR 0091](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md)
 and [ADR 0092](0092-a-github-app-gives-the-platform-its-own-repository-identity.md)
-together got an agent repository down to agent logic. sre-bot now holds skills,
+together got an agent repository down to agent logic. The first adopting agent
+repository now holds skills,
 `connectors.yaml`, `deploy.yaml` and evals — 464 lines of deploy plumbing and
 an AWS role that could run shell on the cluster node are gone.
 
@@ -19,12 +20,12 @@ One thing still is not in the repository: the credential a connector needs.
 
 `connectors.yaml` can name a secret, but the VALUE has to be put on the cluster
 out of band, by an operator running `curie cluster deploy`. Observed live on
-both sre-bot agents:
+both of that repository's agents:
 
 ```
-sre-bot      operator-credential connector : True
-             protected from pruning : [('Secret', 'sre-bot-sre-bot-connector-secrets')]
-sre-bot-dev  operator-credential connector : True
+acme-bot     operator-credential connector : True
+             protected from pruning : [('Secret', 'acme-bot-acme-bot-connector-secrets')]
+acme-dev     operator-credential connector : True
 ```
 
 That protection is not a feature. `connector_agent.reconcile_agent` has to
@@ -97,8 +98,8 @@ it, and the agent comes up with its tools working. That is the whole arc of
 0090 through 0092 finished.
 
 The prune-protection special case in `reconcile_agent` can eventually go, once
-no agent relies on an operator-supplied secret. Not immediately — both sre-bot
-agents do today — but the code path stops being permanent.
+no agent relies on an operator-supplied secret. Not immediately — both of that
+repository's agents do today — but the code path stops being permanent.
 
 **A sealed blob is only as good as the key rotation story, and rotation here is
 worse than for the GitHub App.** An App holds several keys at once, so rotation
