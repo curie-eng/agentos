@@ -133,17 +133,17 @@ spec:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
 {{- end }}
-{{- if and .Values.minio.deploy .Values.agentSandbox.runner.bundleFetch.enabled }}
+{{- if and .Values.rustfs.deploy .Values.agentSandbox.runner.bundleFetch.enabled }}
 ---
 {{/* Allow the runner's bundle-fetch init container to reach THIS release's
-     in-chart MinIO for the plugin-bundle object. Mirrors the collector carve-out
+     in-chart RustFS for the plugin bundle object. Mirrors the collector carve out
      above: without it, rail 1's default-deny blocks the S3 fetch and every bound
-     sandbox fails closed. BYO S3 (minio.deploy=false) is an external host, so it
+     sandbox fails closed. BYO S3 with rustfs.deploy=false is an external host, so it
      goes through the operator's allowedEgress list instead. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "curie.fullname" . }}-runner-allow-minio
+  name: {{ include "curie.fullname" . }}-runner-allow-rustfs
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
@@ -159,7 +159,7 @@ spec:
               kubernetes.io/metadata.name: {{ .Release.Namespace }}
           podSelector:
             matchLabels:
-              {{- include "curie.selectorLabels" (dict "root" . "component" "minio") | nindent 14 }}
+              {{- include "curie.selectorLabels" (dict "root" . "component" "rustfs") | nindent 14 }}
       ports:
         - { protocol: TCP, port: 9000 }
 {{- end }}

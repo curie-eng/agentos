@@ -455,7 +455,7 @@ rung_local_release() {
     # must already exist locally under the tag the generator pinned, or `local
     # up` will try to pull a private GHCR image with no credentials. Check only
     # the core profile's images (--minimal is what this rung brings up) and
-    # only the curie-owned ones: postgres/valkey/minio are public and pulled
+    # only the curie-owned ones: postgres/valkey/rustfs are public and pulled
     # on demand same as rung_local already assumes.
     local missing=0 image
     while IFS= read -r image; do

@@ -1,7 +1,7 @@
 ---
-seam: Blob storage (S3/MinIO)
+seam: Blob storage (S3/RustFS)
 kind: CLEAN
-impls: 1 backend (S3/MinIO) behind the ObjectStore port
+impls: 1 backend (S3/RustFS) behind the ObjectStore port
 grade: B+
 vision_row: Blob storage
 epics:
@@ -9,12 +9,12 @@ epics:
 order: 9
 ---
 
-# INTERFACE: Blob storage (S3/MinIO)
+# INTERFACE: Blob storage (S3/RustFS)
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 backend (S3/MinIO) behind the ObjectStore port &nbsp;·&nbsp; **Swap-readiness grade:** B+
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 backend (S3/RustFS) behind the ObjectStore port &nbsp;·&nbsp; **Swap-readiness grade:** B+
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -25,7 +25,7 @@ Immutable plugin bundles are addressed by a deterministic `(agent, version)` key
 an object store, behind the **`ObjectStore` port** (`apps/api/src/curie_api/storage.py`,
 #282 / ADR-0026): `ensure_bucket` / `exists` / `put` / `get`, with the
 write-once/no-mutation key discipline promoted from convention **into the port's
-contract**. The one backing today is S3/MinIO (`BundleStore`); a future non-S3
+contract**. The one backing today is S3/RustFS (`BundleStore`); a future non-S3
 backend (GCS-native, Azure Blob) is a drop-in that satisfies the Protocol. The
 GCS/Azure adapter itself is deliberately **not built** — it stays gated on a real
 non-S3 customer (ADR-0007), so only the *port* is extracted now, not a speculative
@@ -36,8 +36,8 @@ second implementation.
 The **`ObjectStore` port itself does not require S3**: its docstring
 (`apps/api/src/curie_api/storage.py::ObjectStore`) states a second backend (GCS-native,
 Azure Blob) satisfies the Protocol without being boto3/S3. What speaks boto3 S3 is the one
-backing today, and a config-only swap that stays *within* the S3-compatible family (AWS S3,
-Cloudflare R2, MinIO) needs no code, only env/settings:
+backing today, and a config-only swap that stays *within* the S3-compatible family (AWS S3 or
+Cloudflare R2) needs no code, only env/settings:
 
 - **Env/settings** (`apps/api/src/curie_api/config.py::Settings`): `s3_endpoint_url`,
   `s3_access_key`, `s3_secret_key`, `s3_region`, `bundle_bucket` (env vars
@@ -50,24 +50,24 @@ Cloudflare R2, MinIO) needs no code, only env/settings:
 
 ## Implementations today
 
-One backend (S3/MinIO) behind the port, plus the chart's `mc` init:
+One backend (S3/RustFS) behind the port, plus the chart's AWS CLI init:
 
 - **`ObjectStore` port** — `apps/api/src/curie_api/storage.py` (`Protocol`: the
   five ops + the write-once contract). Consumers (`deps`/`gitflow`/`deploy`) type
   against it, so a second backend is a drop-in.
-- **API writer** — `apps/api/src/curie_api/storage.py::BundleStore`, the S3/MinIO backing
+- **API writer** — `apps/api/src/curie_api/storage.py::BundleStore`, the S3/RustFS backing
   (async-offloaded boto3); client built by the shared `build_s3_client` factory.
 - **Worker reader** — `apps/worker/src/curie_worker/bundle_store.py::BundleReader`: a local `BundleReader`
   Protocol (the read-only slice of the port; the worker does not import the API
-  package) with `BundleStore` as its S3/MinIO backing.
+package) with `BundleStore` as its S3/RustFS backing.
 - **Chart bundle-fetch init** — `charts/curie/templates/agent-sandbox.yaml`
-  uses the `mc` CLI, still a third dialect of the same S3 protocol (left as-is).
+  uses the AWS CLI, still a third dialect of the same S3 protocol.
 
 ## Known leakage
 
 The port now names the contract, but two physically separate S3 clients remain
-(API/worker) plus the chart's `mc` init — fully unifying the client construction
-(and the `mc` path) is left for when a second, non-S3 backend actually lands, at
+(API/worker) plus the chart's AWS CLI init. Fully unifying the client construction
+and the AWS CLI path is left for when a second, non-S3 backend actually lands, at
 which point the adapter is a drop-in `ObjectStore`/`BundleReader` rather than a
 three-site sweep. Building that adapter ahead of a real non-S3 customer is still
 out of scope (ADR-0007, ADR-0026).
@@ -83,4 +83,4 @@ both an async and a sync implementation.
 
 - **Epic(s):** #83 — vision epic for the blob-storage seam (extract a port only when a non-S3 backend lands).
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 4 (Blob storage), grade B+
-- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries (MinIO adopted, AGPLv3, "offer BYO-S3")
+- **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md) — Adopt-not-build boundaries (RustFS adopted under Apache 2.0, "offer BYO-S3")

@@ -1,6 +1,6 @@
 # apps/api
 
-FastAPI server backed by Postgres and MinIO/S3 from the dev compose stack. It
+FastAPI server backed by Postgres and RustFS/S3 from the dev compose stack. It
 provides:
 
 - agents/versions/deployments CRUD (Create, Read, Update, Delete)

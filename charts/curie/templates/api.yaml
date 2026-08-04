@@ -124,14 +124,14 @@ spec:
                   name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
                   key: langfuseInitProjectSecretKey
             - name: S3_ENDPOINT_URL
-              value: http://{{ include "curie.minio.host" . }}:{{ .Values.minio.port }}
+              value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
             - name: S3_ACCESS_KEY
-              value: {{ .Values.minio.auth.rootUser | quote }}
+              value: {{ .Values.rustfs.auth.accessKey | quote }}
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.minio.existingSecret | default (include "curie.secretName" .) }}
-                  key: minioRootPassword
+                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  key: rustfsSecretKey
             # Immutable plugin-bundle bucket. Single source of truth with the
             # runner sandbox's bundle-fetch init container: the API writes each
             # uploaded bundle here, the fetcher reads it from the same bucket, so

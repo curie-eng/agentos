@@ -3,7 +3,7 @@
 FastAPI server: agents/versions/deployments CRUD, auth, the plugin bundle
 pipeline, the GitHub git-flow engine, and the Langfuse/pod-log observability
 proxies. See `../../ARCHITECTURE.md` for how this service fits between the
-worker, Postgres, MinIO/S3, Langfuse, and GitHub.
+worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 
 ## Load-bearing invariants
 
@@ -81,7 +81,7 @@ compose DB once your revision is merged to main.
 ## Config surface
 
 `Settings` (`config.py`, env-driven) covers the Postgres DSN, the bundle
-store (MinIO/S3 endpoint + bucket), the Langfuse public API base + keys, the
+store (RustFS/S3 endpoint + bucket), the Langfuse public API base + keys, the
 GitHub webhook secret, `api_key`, `kube_config_path` (empty = no cluster
 configured, the 503 case above), and `metrics_default_window_hours`.
 
@@ -96,6 +96,6 @@ uv run python -m curie_api.export_openapi   # regenerate committed openapi.json;
 `test_openapi_drift.py` fails if the committed OpenAPI spec is stale --
 regenerate it after any router signature change, don't hand-edit the JSON.
 Integration tests (`test_gitflow_integration.py`, `test_langfuse_integration.py`,
-`test_metrics_integration.py`) run against the real Postgres/MinIO from
+`test_metrics_integration.py`) run against the real Postgres/RustFS from
 `compose.dev.yaml`; only Langfuse's own API responses and the GitHub webhook
 sender are faked.

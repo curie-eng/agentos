@@ -51,7 +51,7 @@ product overview and the fastest path to a running system, and
 Bring up the backing stack and install the workspace:
 
 ```bash
-# Backing stack (Postgres + Valkey + Langfuse v3 + ClickHouse + MinIO + OTel).
+# Backing stack (Postgres + Valkey + Langfuse v3 + ClickHouse + RustFS + OTel).
 # Runs on baked defaults; copy .env.example to the gitignored .env only to override.
 cp .env.example .env    # optional
 docker compose --profile full -f compose.dev.yaml up -d

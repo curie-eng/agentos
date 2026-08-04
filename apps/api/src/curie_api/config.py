@@ -47,10 +47,10 @@ class Settings(BaseSettings):
     langfuse_public_key: str = "pk-lf-curie-dev"
     langfuse_secret_key: str = "sk-lf-curie-dev"
 
-    # MinIO / S3 for immutable plugin bundles (compose stack MinIO on 29000).
+    # RustFS / S3 for immutable plugin bundles (compose stack RustFS on 29000).
     s3_endpoint_url: str = "http://localhost:29000"
-    s3_access_key: str = "minio"
-    s3_secret_key: str = "miniosecret"
+    s3_access_key: str = "rustfs"
+    s3_secret_key: str = "rustfssecret"
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
     # Bundle ingestion bounds (ADR-0059 decision 3). Three independent caps:

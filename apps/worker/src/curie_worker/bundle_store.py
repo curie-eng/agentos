@@ -1,8 +1,8 @@
-"""Read-only access to plugin bundles in MinIO/S3 (mirrors the API's BundleStore).
+"""Read-only access to plugin bundles in RustFS/S3 (mirrors the API's BundleStore).
 
 The eval consumer fetches a version's immutable bundle by its bundle_ref key and
 extracts it to read the bundle's own eval suite (evals/cases.json). Uses boto3
-with path-style addressing (MinIO), the same construction the API's write path
+with path-style addressing (RustFS), the same construction the API's write path
 uses, so the env names line up.
 
 ``extract_bundle`` is the Docker-substrate counterpart to the Kubernetes
@@ -51,7 +51,7 @@ class BundleReader(Protocol):
 
 
 class BundleStore:
-    """S3/MinIO backing for the worker's ``BundleReader`` slice of the port.
+    """S3/RustFS backing for the worker's ``BundleReader`` slice of the port.
 
     Mirrors the API's ``ObjectStore`` construction (path-style addressing) so the
     env names line up; a second backend is a drop-in ``BundleReader``.

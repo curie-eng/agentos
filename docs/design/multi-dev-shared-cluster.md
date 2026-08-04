@@ -37,7 +37,7 @@ The single-operator assumptions that break at team scale, grounded in the code:
   or multiple deployed agents as an error (`message.rs`). With N devs each
   deploying an agent, "which agent" is ambiguous by construction.
 - **One of everything.** One namespace, one Slack app, one model credential, one
-  API key, one MinIO bucket, one Langfuse project (ADR-0008 context). The compute
+  API key, one RustFS bucket, one Langfuse project (ADR-0008 context). The compute
   sandbox is already hard-siloed (default-deny egress, gVisor, non-root,
   per-run budgets — ADR-0006); the gap is the **control plane**, exactly as
   ADR-0008 frames it.
@@ -74,7 +74,7 @@ that ADR-0008's tenant work can later subsume rather than contradict: a `dev`/
 **Recommendation: one shared platform install, per-dev agent deployments.**
 
 - **Deployed once (by a cluster admin/CI, not per dev):** the platform Helm
-  release — API, worker, dispatcher, Valkey, Postgres, MinIO, Langfuse, the
+  release — API, worker, dispatcher, Valkey, Postgres, RustFS, Langfuse, the
   Agent Sandbox controller + warm pool, and the ingress/LoadBalancer. This is the
   "run against a running cluster you did **not** install" experience (Q4): a dev
   *connects* to it, they do not `helm install` their own.

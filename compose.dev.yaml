@@ -1,6 +1,6 @@
 # Curie local dev stack.
 #
-# Postgres + Valkey + Langfuse v3 (web + worker + ClickHouse) + MinIO + OTel
+# Postgres + Valkey + Langfuse v3 (web + worker + ClickHouse) + RustFS + OTel
 # Collector, on a single node (~2.3 GB at light load). Every backend integration
 # test and UI E2E runs against this stack; it mirrors the Helm dev profile
 # (same components, same pinned versions).
@@ -9,7 +9,7 @@
 # Bring up core:  OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d
 # otel-collector is full-profile only; a core-only stack must blank the endpoint
 # or every span pays a synchronous DNS retry against an absent collector.
-# core = postgres, valkey, minio, minio-init, curie-migrate, curie-api, curie-worker
+# core = postgres, valkey, rustfs-perms, rustfs, rustfs-init, curie-migrate, curie-api, curie-worker
 # full = core + clickhouse, langfuse-web, langfuse-worker, otel-collector, curie-ui
 # The CLI `curie local up` wraps these compose profile invocations.
 # Tear down:  docker compose -f compose.dev.yaml down        (keeps volumes; fast restart)
@@ -23,7 +23,7 @@
 #   Postgres .......... localhost:25432
 #   Valkey ............ localhost:26379
 #   ClickHouse HTTP ... localhost:28123   (native TCP localhost:29009)
-#   MinIO S3 API ...... localhost:29000   (console localhost:29001)
+#   RustFS S3 API ..... localhost:29000   (console localhost:29001)
 #   OTel Collector .... localhost:24317 (gRPC) / localhost:24318 (HTTP)
 #
 # ClickHouse is pinned to :24.8 on purpose. Newer ClickHouse requires AVX and
@@ -49,16 +49,16 @@ x-langfuse-env: &langfuse-env
   REDIS_AUTH: ${VALKEY_PASSWORD:-valkeypass}
   LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
   LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
-  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
-  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
-  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: rustfs
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: rustfssecret
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://rustfs:9000
   LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
   LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
   LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
   LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
-  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
-  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
-  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: rustfs
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: rustfssecret
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://rustfs:9000
   LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
   LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
 
@@ -124,38 +124,69 @@ services:
       retries: 12
       start_period: 10s
 
-  minio:
-    image: minio/minio
+  # RustFS runs as UID 10001. Its named volumes are prepared by rustfs-perms
+  # before this service starts, matching RustFS's documented Compose pattern.
+  rustfs:
+    image: rustfs/rustfs:1.0.0-beta.12
     profiles: *core_profiles
-    command: ["server", "/data", "--console-address", ":9001"]
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
     environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: miniosecret
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_ACCESS_KEY: rustfs
+      RUSTFS_SECRET_KEY: rustfssecret
+      RUSTFS_OBS_LOG_DIRECTORY: /logs
     ports:
       - "29000:9000"
       - "29001:9001"
     volumes:
-      - minio_data:/data
+      - rustfs_data:/data
+      - rustfs_logs:/logs
     healthcheck:
-      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 12
-      start_period: 5s
+      start_period: 10s
 
-  # Creates the langfuse bucket so the web/worker never race a missing bucket.
-  minio-init:
-    image: minio/mc
+  # Creates the Langfuse bucket so the web and worker never race a missing bucket.
+  rustfs-init:
+    image: amazon/aws-cli:2.32.6
     profiles: *core_profiles
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minio miniosecret &&
-      mc mb --ignore-existing local/langfuse &&
-      echo 'bucket ready'
-      "
+    environment:
+      AWS_ACCESS_KEY_ID: rustfs
+      AWS_SECRET_ACCESS_KEY: rustfssecret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        aws configure set default.s3.addressing_style path
+        if ! aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket langfuse >/dev/null 2>&1; then
+          aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket langfuse
+        fi
+        echo 'bucket ready'
+    restart: "no"
+
+  # RustFS mounts are initialized as root, but the server runs as UID 10001.
+  # This one shot helper makes both named volumes writable before RustFS boots.
+  rustfs-perms:
+    image: rustfs/rustfs:1.0.0-beta.12
+    profiles: *core_profiles
+    user: "0"
+    volumes:
+      - rustfs_data:/data
+      - rustfs_logs:/logs
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 10001:10001 /data /logs"]
     restart: "no"
 
   ollama:
@@ -198,11 +229,11 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_healthy
-      # Wait for the langfuse bucket to exist. This also makes `up --wait`
-      # treat minio-init's exit as expected success rather than a failure.
-      minio-init:
+      # Wait for the Langfuse bucket to exist. This also makes `up --wait`
+      # treat rustfs-init's exit as expected success rather than a failure.
+      rustfs-init:
         condition: service_completed_successfully
     environment:
       <<: *langfuse-env
@@ -218,9 +249,9 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_healthy
-      minio-init:
+      rustfs-init:
         condition: service_completed_successfully
     ports:
       - "23000:3000"
@@ -301,7 +332,7 @@ services:
       DB_SCHEMA: curie
     restart: "no"
 
-  # The platform API. On the compose network, reaching Postgres/Valkey/MinIO by
+  # The platform API. On the compose network, reaching Postgres, Valkey, and RustFS by
   # service name. Published on host 28000 for the CLI (`curie local deploy`, and the
   # `curie local message` channel lookup).
   curie-api:
@@ -315,19 +346,19 @@ services:
     # core-profile always-up service, it also guarantees the curie_runner
     # network exists even for a `--minimal` (core-only) stack, so the worker's
     # `--network curie_runner` always resolves. The data tier
-    # (postgres/valkey/minio/clickhouse) is deliberately NOT on this network.
+    # (postgres/valkey/rustfs/clickhouse) is deliberately NOT on this network.
     networks: [default, curie_runner]
     depends_on:
       postgres:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_healthy
       # Adopt the one-shot bucket bootstrap in the core profile too. This also
-      # makes `up --wait` treat minio-init's clean exit as expected success
+      # makes `up --wait` treat rustfs-init's clean exit as expected success
       # rather than a failure when langfuse (the full-profile adopter) is absent.
-      minio-init:
+      rustfs-init:
         condition: service_completed_successfully
       curie-migrate:
         condition: service_completed_successfully
@@ -338,9 +369,9 @@ services:
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_ACCESS_KEY: minio
-      S3_SECRET_KEY: miniosecret
+      S3_ENDPOINT_URL: http://rustfs:9000
+      S3_ACCESS_KEY: rustfs
+      S3_SECRET_KEY: rustfssecret
       BUNDLE_BUCKET: curie-bundles
       LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: pk-lf-curie-dev
@@ -439,7 +470,7 @@ services:
         condition: service_healthy
       valkey:
         condition: service_healthy
-      minio:
+      rustfs:
         condition: service_healthy
       curie-migrate:
         condition: service_completed_successfully
@@ -455,7 +486,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Shared bundle staging dir. The worker fetches each plugin bundle from
-      # MinIO and bind-mounts it into the runner container it spawns; because the
+      # RustFS and bind-mounts it into the runner container it spawns; because the
       # runner runs on the HOST daemon, that bind source must resolve on the host
       # at the SAME absolute path the worker used. An identical host:container
       # path plus TMPDIR pointed here makes the worker's tempdir host-resolvable.
@@ -470,8 +501,8 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:25432/postgres
       - DB_SCHEMA=curie
       - S3_ENDPOINT_URL=http://localhost:29000
-      - S3_ACCESS_KEY=minio
-      - S3_SECRET_KEY=miniosecret
+      - S3_ACCESS_KEY=rustfs
+      - S3_SECRET_KEY=rustfssecret
       - BUNDLE_BUCKET=curie-bundles
       - CURIE_API_URL=http://localhost:28000
       # The worker runs host-net, so it self-dials the API at the published
@@ -501,7 +532,7 @@ services:
       # http://otel-collector:4318), so a plain `curie local up` traces with no
       # manual flags. curie_runner carries only the runner's documented
       # dependencies -- otel-collector (telemetry), ollama (--local-model), and
-      # curie-api (state) -- NOT the data tier (postgres/valkey/minio), so a
+      # curie-api (state) -- NOT the data tier (postgres/valkey/rustfs), so a
       # trusted-but-buggy bundle cannot reach the stores' embedded credentials.
       # The collector join is also what lets --local-model resolve ollama by name.
       # Both are overridable from the shell.
@@ -569,7 +600,7 @@ services:
 networks:
   # The dedicated runner network (#631). Spawned runner containers join THIS
   # (CURIE_DOCKER_NETWORK=curie_runner), never the default network that
-  # carries the data tier (postgres/valkey/minio/clickhouse). Only the runner's
+  # carries the data tier (postgres/valkey/rustfs/clickhouse). Only the runner's
   # documented dependencies are multi-homed onto it -- otel-collector
   # (telemetry), ollama (--local-model), and curie-api (state) -- so a
   # trusted-but-buggy bundle cannot reach the stores' embedded credentials, and a
@@ -584,5 +615,6 @@ volumes:
   valkey_data:
   clickhouse_data:
   clickhouse_logs:
-  minio_data:
+  rustfs_data:
+  rustfs_logs:
   ollama_data:

@@ -26,7 +26,7 @@ global:
 
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the control plane -- worker, api,
-# dispatcher, and the data tier (postgres, valkey, clickhouse, minio) -- above
+# dispatcher, and the data tier (postgres, valkey, clickhouse, rustfs) -- above
 # sandbox pods for node-pressure eviction, so the components that supervise,
 # drain, and reclaim a sandbox are never themselves preferred for eviction over
 # the sandboxes they manage. Priority is a ranking and preemption lever, not
@@ -56,7 +56,7 @@ priorityClasses:
 
 # ---------------------------------------------------------------------------
 # Langfuse app (web + worker). The observability + eval backbone. Its backing
-# stores (Postgres, ClickHouse, Valkey, MinIO) are the separate blocks below so
+# stores (Postgres, ClickHouse, Valkey, RustFS) are the separate blocks below so
 # each can be toggled or BYO'd independently.
 # ---------------------------------------------------------------------------
 langfuse:
@@ -307,37 +307,40 @@ clickhouse:
     minAvailable: 1
 
 # ---------------------------------------------------------------------------
-# MinIO. Langfuse object storage (events, media, exports). BYO real S3 in prod:
-# deploy=false + host/port/auth (existingSecret key minioRootPassword).
+# RustFS. Langfuse object storage for events, media, and exports. Use a real S3
+# service in production with deploy=false plus host, port, auth, and an
+# existingSecret containing rustfsSecretKey.
 # ---------------------------------------------------------------------------
-minio:
+rustfs:
   deploy: true
-  image: minio/minio
-  mcImage: minio/mc
+  image: rustfs/rustfs:1.0.0-beta.12
+  awsCliImage: amazon/aws-cli:2.32.6
   host: ""
   port: 9000
   consolePort: 9001
   bucket: langfuse
   auth:
-    rootUser: minio
-    rootPassword: miniosecret
+    accessKey: rustfs
+    secretKey: rustfssecret
   existingSecret: ""
-  # fsGroup that owns the mounted data volume. Defaults to the minio image's
-  # user (1000); parameterized for BYO images with a different UID.
+  # RustFS runs as uid 10001. The matching group owns the mounted data volume.
+  # Operators using another image can override both security context blocks.
   podSecurityContext:
-    fsGroup: 1000
+    fsGroup: 10001
   persistence:
     enabled: true
     size: 3Gi
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
-  # Container securityContext (issue #67). Safe subset only -- the MinIO image
-  # defaults to running as root; forcing runAsNonRoot / capabilities.drop here
-  # without a validated uid + writable data dir on a real cluster risks breaking
-  # startup. See postgres.containerSecurityContext for the full rationale.
+  # RustFS supports a fixed nonroot identity when fsGroup owns the data volume.
   containerSecurityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
     allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
     seccompProfile:
       type: RuntimeDefault
   # Optional PodDisruptionBudget for this single-replica store. OFF by default:
@@ -975,20 +978,20 @@ agentSandbox:
         requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
         limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi }
     # --- Bundle-fetch provisioning ---
-    # CURIE_BUNDLE_REF is a MinIO object key the substrate injects per-claim
+    # CURIE_BUNDLE_REF is an S3 object key the substrate injects per claim.
     # (bound sandboxes carry it; warm/unbound pods do not). Before the runner
     # starts, an init pair fetches that object and extracts it into the shared
     # bundle volume at <mountPath>/current, which the worker points
     # CURIE_PLUGIN_DIR at. Fail-closed: a set-but-unfetchable ref fails the pod
     # rather than booting the wrong (empty) capability set; a clean no-op (empty
     # plugin dir) when the ref is unset. Two images because no stock image ships
-    # both an authenticated S3 client and archive tools: mc fetches, busybox
-    # extracts (.tar.gz / .tar / .zip). The S3 endpoint + creds come from the
-    # minio block (BYO S3 via minio.deploy=false + minio.host).
+    # both an authenticated S3 client and archive tools. AWS CLI fetches and
+    # BusyBox extracts tar.gz, tar, and zip archives. The endpoint and
+    # credentials come from the rustfs block, including BYO S3 configuration.
     bundleFetch:
       enabled: true
       bucket: curie-bundles
-      fetchImage: minio/mc
+      fetchImage: amazon/aws-cli:2.32.6
       extractImage: busybox:1.36
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
       # worker injects (CURIE_PLUGIN_DIR=/bundles/current) is `<mountPath>/current`.
@@ -1003,10 +1006,10 @@ agentSandbox:
       # pair it with the `runner.resources` `ephemeral-storage` request/limit
       # (ADR-0059 decision 1, tracked in #755) for the scheduling-time bound.
       sizeLimit: 2Gi
-      # Ceiling on the init-only `mc-config` volume, which holds nothing but
-      # the mc credential file written by the bundle-fetch init container.
-      # Small and fixed since nothing else is ever written there.
-      mcConfigSizeLimit: 16Mi
+      # Ceiling on the init only AWS configuration volume. The path addressing
+      # setting lives here. Credentials remain environment variables and are
+      # never written to this volume or the shared bundle volume.
+      awsConfigSizeLimit: 16Mi
     # ephemeral-storage alongside cpu/memory (ADR-0059 decision 1): this same
     # block is reused for the runner container AND both bundle init containers
     # (bundle-fetch, bundle-extract), matching how cpu/memory already work here.
@@ -1059,14 +1062,14 @@ agentSandbox:
     # below -- the effective pod runtimeClassName is computed from that tri-state,
     # not set here.
     # Pod DNS policy for sandbox pods. Defaults to ClusterFirst because the
-    # bundle-fetch init container resolves the in-chart MinIO by Service name and
+    # bundle-fetch init container resolves the in-chart RustFS by Service name and
     # the runner exports OTLP to the in-chart collector by Service name -- both
     # need cluster DNS. Left unset, the agent-sandbox controller injects a
     # public-resolver default (8.8.8.8/1.1.1.1) that cannot resolve those names,
     # so the bundle-fetch init fails and bound sandboxes never bind. ClusterFirst
     # queries CoreDNS (which the runner-allow-dns NetworkPolicy permits) and still
     # forwards external names upstream, so real-model egress is unaffected. Set to
-    # "" only with fully external (BYO) MinIO + collector reached by IP/allowlist.
+    # "" only with fully external S3 and a collector reached by IP or allowlist.
     dnsPolicy: ClusterFirst
     # Rail 2: the runner ServiceAccount. Least privilege: no secret list/get on
     # its own. The per-agent secret Role (resourceNames-scoped to that agent's
@@ -1111,7 +1114,7 @@ security:
     # namespace only. Egress policies do not affect ingress; this adds the lock.
     lockIngress: true
   # Rail: default-deny ingress + scoped-allow around the data tier (Postgres,
-  # MinIO, ClickHouse, Valkey). The backing stores hold every credential and all
+  # RustFS, ClickHouse, Valkey). The backing stores hold every credential and all
   # trace/app data; by default any pod in a NetworkPolicy-enforcing cluster can
   # open Postgres:5432 and exfiltrate. This restricts ingress to each deployed
   # store's ports to THIS release's app pods only (by name+instance label).
@@ -1191,7 +1194,7 @@ security:
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
   # no-override `helm install` GENERATES a strong random per release for the nine
-  # chart-owned credentials (postgres/valkey/clickhouse/minio passwords, the
+  # chart-owned credentials (postgres, valkey, clickhouse, and RustFS secrets, the
   # Langfuse salt/encryptionKey/nextauthSecret, and the api/webhook keys) instead
   # of shipping the published dev defaults. Generated values are persisted via a
   # `lookup` of the release Secret, so `helm upgrade` re-uses them and never

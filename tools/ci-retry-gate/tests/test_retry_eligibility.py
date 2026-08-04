@@ -747,10 +747,10 @@ def test_run_retry_construct_detects_every_constructed_shape() -> None:
         # commands instead, and these two are not the same command.
         "the Start dev stack shape: similar commands over backslash continuations": (
             "docker compose -f compose.dev.yaml up -d \\\n"
-            "  postgres valkey clickhouse minio minio-init \\\n"
+            "  postgres valkey clickhouse rustfs rustfs-init \\\n"
             "  langfuse-web langfuse-worker otel-collector\n"
             "docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \\\n"
-            "  postgres valkey clickhouse minio \\\n"
+            "  postgres valkey clickhouse rustfs \\\n"
             "  langfuse-web langfuse-worker otel-collector"
         ),
         # Splitting on `||` cuts inside `$(... || true)` too, leaving a tail

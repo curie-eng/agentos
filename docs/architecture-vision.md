@@ -153,17 +153,17 @@ reads the bundle's evals/cases.json as a suite object `{name, cases:[{id, input,
 (`apps/worker/src/curie_worker/eval/stream.py`), both building to one committed schema
 (`apps/worker/schema/eval-cases.schema.json`) kept honest by a drift gate.
 
-### 4. Blob storage (MinIO today)
+### 4. Blob storage (RustFS today)
 
 **Port:** the S3 protocol. Both writers and readers construct plain boto3 S3
 clients with an `endpoint_url` and path-style addressing: the API's immutable
 bundle store (`apps/api/src/curie_api/storage.py`) and the worker's
 read-side mirror (`apps/worker/src/curie_worker/bundle_store.py`). On
-Kubernetes the chart's bundle-fetch init container fetches with `mc`
+Kubernetes the chart's bundle-fetch init container fetches with the AWS CLI
 (`charts/curie/templates/agent-sandbox.yaml`), also pure S3 protocol.
 
-**Current adapter:** MinIO (AGPL-3.0), deployed by the chart
-(`charts/curie/templates/minio.yaml`).
+**Current adapter:** RustFS (Apache-2.0), deployed by the chart
+(`charts/curie/templates/rustfs.yaml`).
 
 **Swap:** AWS S3, Cloudflare R2, or any S3-compatible store is config only
 (endpoint, keys, region). GCS is a real decision: either rely on its
@@ -281,7 +281,7 @@ flowchart TB
     end
 
     subgraph blob["Job 4: blob storage"]
-        S3["MinIO (today), S3, GCS"]
+        S3["RustFS (today), S3, GCS"]
     end
 
     subgraph db["Job 5: relational database"]
@@ -307,7 +307,7 @@ flowchart TB
 | Harness / runtime | Frozen ACI protocol (`packages/aci-protocol`), tri-language, CI-guarded | claude-agent-sdk runner | A-: strongest seam in the system; docked for the plugin-format entanglement and SDK-shaped resume | Write the "implement an ACI server" guide from the conformance suite so the port is documented, not just enforced |
 | Observability | OTLP to collector (write), API DTOs (read) | Langfuse behind `langfuse.py` | B+: write side clean but for three vendor span attributes (`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`); read side spans several API modules plus routers | Map the three `langfuse.*` attributes to neutral names in the collector; rename the `/langfuse/*` API routes |
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
-| Blob storage | S3 protocol (boto3 + mc, path-style, endpoint-configurable) | MinIO | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
+| Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
 | Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; two Postgres-isms in models | Leave as is; note the `postgresql.UUID` and schema-scoped enum as the two things a non-Postgres target would touch |
 | Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + `SlackSink` | Slack (Bolt + chat.update) | C: the ingress payload is now the channel-neutral `QueuedTurn` (#7), but egress still assumes Slack's edit-in-place `chat.update` reply shape; service swappable (CLI stub), egress protocol not | Route replies per turn (#19) and define a channel-neutral `ReplySink` post/update port so a second channel can coexist |
 

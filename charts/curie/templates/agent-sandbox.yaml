@@ -187,7 +187,7 @@ spec:
       # The agent-sandbox controller injects a public-resolver DNS default
       # (8.8.8.8/1.1.1.1) when the pod template leaves dnsPolicy unset, which
       # cannot resolve in-cluster Service names -- breaking the bundle-fetch
-      # init container's reach to the in-chart MinIO and the runner's OTLP
+      # init container's reach to the in-chart RustFS and the runner's OTLP
       # export to the in-chart collector. Setting it here wins over that default.
       dnsPolicy: {{ $runner.dnsPolicy }}
       {{- end }}
@@ -229,13 +229,12 @@ spec:
         - name: bundles
           emptyDir:
             sizeLimit: {{ $bf.sizeLimit | quote }}
-        # mc writes the MinIO credential in cleartext to its config dir. Keep
-        # that dir on an init-only volume the runner never mounts, so untrusted
-        # agent code cannot read the store credential off the shared bundles
-        # volume.
-        - name: mc-config
+        # AWS CLI stores only its path addressing setting here. Credentials are
+        # environment variables, and the runner never mounts this init only
+        # volume or receives the storage credential.
+        - name: aws-config
           emptyDir:
-            sizeLimit: {{ $bf.mcConfigSizeLimit | quote }}
+            sizeLimit: {{ $bf.awsConfigSizeLimit | quote }}
         {{- end }}
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
@@ -252,10 +251,10 @@ spec:
       Bundle provisioning. CURIE_BUNDLE_REF is injected per-claim (the
       substrate's Overrides policy); baked empty here so a warm/unbound pod
       no-ops. Split in two because no single stock image carries both an
-      authenticated S3 client and archive tools: mc fetches the object,
-      busybox extracts it. Fail-closed -- a ref that is set but cannot be
+      authenticated S3 client and archive tools. AWS CLI fetches the object and
+      BusyBox extracts it. A ref that is set but cannot be
       fetched/extracted fails the pod instead of booting an empty plugin dir.
-      Egress to MinIO is opened by the runner NetworkPolicy carve-out.
+      Egress to RustFS is opened by the runner NetworkPolicy carve out.
       */}}
       initContainers:
         - name: bundle-fetch
@@ -265,8 +264,8 @@ spec:
           # Same container-level lockdown as the runner: these init containers
           # run an authenticated S3 fetch and archive extract of operator-supplied
           # input in the untrusted pod, so they must not run looser than it. Every
-          # write targets a mounted emptyDir (the fetched archive to `bundles`, mc's
-          # config to the dedicated `mc-config` volume via MC_CONFIG_DIR), so a
+          # write targets a mounted emptyDir. The fetched archive goes to
+          # `bundles` and AWS config goes to the dedicated `aws-config` volume, so a
           # read-only rootfs is safe.
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
           {{- end }}
@@ -280,29 +279,38 @@ spec:
                 echo "no CURIE_BUNDLE_REF; skipping bundle fetch"
                 exit 0
               fi
-              export MC_CONFIG_DIR=/mc-config/.mc
-              mc alias set src "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY"
-              mc cp "src/${BUNDLE_BUCKET}/${REF}" {{ $bf.mountPath }}/.bundle-archive
+              export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
+              export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
+              aws configure set default.s3.addressing_style path
+              aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://${BUNDLE_BUCKET}/${REF}" {{ $bf.mountPath }}/.bundle-archive
               echo "fetched bundle '$REF' from ${BUNDLE_BUCKET}"
           env:
             - name: CURIE_BUNDLE_REF
               value: ""
             - name: S3_ENDPOINT
-              value: http://{{ include "curie.minio.host" . }}:{{ .Values.minio.port }}
+              value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
             - name: S3_ACCESS_KEY
-              value: {{ .Values.minio.auth.rootUser | quote }}
+              value: {{ .Values.rustfs.auth.accessKey | quote }}
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.minio.existingSecret | default (include "curie.secretName" .) }}
-                  key: minioRootPassword
+                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+                  key: rustfsSecretKey
             - name: BUNDLE_BUCKET
               value: {{ $bf.bucket | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_CONFIG_FILE
+              value: /aws-config/config
+            - name: AWS_SHARED_CREDENTIALS_FILE
+              value: /aws-config/credentials
+            - name: HOME
+              value: /aws-config
           volumeMounts:
             - name: bundles
               mountPath: {{ $bf.mountPath }}
-            - name: mc-config
-              mountPath: /mc-config
+            - name: aws-config
+              mountPath: /aws-config
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
         - name: bundle-extract

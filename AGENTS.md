@@ -101,8 +101,8 @@ delivery cap is a bug.
 ## The dev stack: compose.dev.yaml
 
 The compose stack now has two profiles. `full` brings up the whole backing
-stack (Postgres + Valkey + Langfuse v3 + ClickHouse + MinIO + OTel Collector).
-`core` brings up the smaller local product loop (Postgres + Valkey + MinIO +
+stack (Postgres + Valkey + Langfuse v3 + ClickHouse + RustFS + OTel Collector).
+`core` brings up the smaller local product loop (Postgres + Valkey + RustFS +
 API + worker). Every backend integration test and UI E2E runs against `full`.
 
 ```bash
@@ -140,7 +140,7 @@ Host ports (non-default host ports to avoid local collisions):
 | Postgres | localhost:25432 |
 | Valkey | localhost:26379 |
 | ClickHouse | HTTP 28123, native 29009 |
-| MinIO | S3 29000, console 29001 |
+| RustFS | S3 29000, console 29001 |
 | OTel Collector | gRPC 24317, HTTP 24318 |
 
 Config lives in `.env.example` (copy to the gitignored `.env` to override; the

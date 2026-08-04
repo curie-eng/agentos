@@ -1,6 +1,6 @@
 """The ObjectStore port: an in-memory backing conforms, and BundleStore does too.
 
-These are pure unit tests -- no MinIO/S3 required. They pin the extracted port
+These are pure unit tests -- no RustFS/S3 required. They pin the extracted port
 (#282, ADR-0026): a second, non-S3 implementation is a drop-in as long as it
 satisfies the Protocol, and the existing BundleStore already does.
 """
@@ -57,8 +57,8 @@ def test_in_memory_round_trip_and_write_once() -> None:
 def _settings() -> Settings:
     return Settings(
         s3_endpoint_url="http://localhost:29000",
-        s3_access_key="minioadmin",
-        s3_secret_key="minioadmin",
+        s3_access_key="rustfs",
+        s3_secret_key="rustfssecret",
         s3_region="us-east-1",
         bundle_bucket="bundles",
     )
@@ -72,6 +72,6 @@ def test_bundle_store_satisfies_port() -> None:
 
 def test_build_s3_client_is_path_style() -> None:
     client = build_s3_client(_settings())
-    # Path-style addressing is the alignment MinIO requires; assert the shared
+    # Path-style addressing is the alignment RustFS requires; assert the shared
     # factory pins it so a second S3-backed site cannot silently drift.
     assert client.meta.config.s3["addressing_style"] == "path"

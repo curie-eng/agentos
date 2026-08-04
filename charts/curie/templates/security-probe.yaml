@@ -161,7 +161,7 @@ spec:
 {{- $dt := list -}}
 {{- if .Values.security.dataTierNetworkPolicy.enabled -}}
 {{- if .Values.postgres.deploy }}{{- $dt = append $dt (printf "%s:5432" (include "curie.postgres.host" .)) -}}{{- end }}
-{{- if .Values.minio.deploy }}{{- $dt = append $dt (printf "%s:9000" (include "curie.minio.host" .)) -}}{{- end }}
+{{- if .Values.rustfs.deploy }}{{- $dt = append $dt (printf "%s:9000" (include "curie.rustfs.host" .)) -}}{{- end }}
 {{- if .Values.clickhouse.deploy }}{{- $dt = append $dt (printf "%s:8123" (include "curie.clickhouse.host" .)) -}}{{- end }}
 {{- if .Values.valkey.deploy }}{{- $dt = append $dt (printf "%s:6379" (include "curie.valkey.host" .)) -}}{{- end }}
 {{- end -}}

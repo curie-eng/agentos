@@ -3,7 +3,7 @@ name: curie
 description: >-
   Curie (Relay) umbrella chart. Installs the whole self-hosted stack on a
   single node: Langfuse v3 (web + worker) plus its ClickHouse, Valkey, Postgres,
-  and MinIO backing stores, and the OTel Collector that adapts app traces into
+  and RustFS backing stores, and the OTel Collector that adapts app traces into
   Langfuse. Every backing store is condition-gated with a bring-your-own block,
   and two install-time preflights ship baked in: a CPU-AVX / ClickHouse-pin
   check and a NetworkPolicy-enforcement probe.

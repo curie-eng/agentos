@@ -234,10 +234,10 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Eval stream
     assert config.eval_stream == "curie:evals"
     assert config.eval_consumer_group == "curie-eval-workers"
-    # MinIO / S3
+    # RustFS / S3
     assert config.s3_endpoint_url == "http://localhost:29000"
-    assert config.s3_access_key == "minio"
-    assert config.s3_secret_key == "miniosecret"
+    assert config.s3_access_key == "rustfs"
+    assert config.s3_secret_key == "rustfssecret"
     assert config.s3_region == "us-east-1"
     assert config.bundle_bucket == "curie-bundles"
     # Platform API

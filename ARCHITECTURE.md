@@ -82,7 +82,7 @@ flowchart TB
     Anthropic["Model<br/>(Anthropic default)"]
 
     UI["ui console"]
-    Store[("MinIO / S3<br/>skill bundles")]
+    Store[("RustFS / S3<br/>skill bundles")]
     PG[("Postgres<br/>agents · versions · deployments")]
 
     subgraph obs["Observability"]
@@ -296,7 +296,7 @@ sequenceDiagram
     participant GH as GitHub
     participant API as apps/api (gitflow.py)
     participant PF as plugin-format validator
-    participant S3 as MinIO / S3
+    participant S3 as RustFS / S3
     participant PG as Postgres
     participant V as Valkey (curie:evals)
     participant W as Worker eval consumer
@@ -527,7 +527,7 @@ working around it — see [`CLAUDE.md`](CLAUDE.md).
 
 **The chart** ([`charts/curie`](charts/curie)) is an umbrella that brings up:
 
-- Postgres, Valkey, Langfuse, ClickHouse, MinIO, and the OTel Collector
+- Postgres, Valkey, Langfuse, ClickHouse, RustFS, and the OTel Collector
 - Deployments/Services for api/dispatcher/worker/ui (the dispatcher has no inbound port and so no Service)
 
 Templates live under [`charts/curie/templates/`](charts/curie/templates).
@@ -537,7 +537,7 @@ Security rails are all chart defaults (ADR-0006,
 - **Default-deny egress NetworkPolicy** with an explicit `except: 169.254.169.254/32` carve-out so the cloud metadata endpoint stays blocked ([`charts/curie/templates/security-networkpolicy.yaml`](charts/curie/templates/security-networkpolicy.yaml)).
 - **gVisor RuntimeClass** option on the runner, plus a preflight Job that runs under the class and fails if the kernel is not gVisor ([`charts/curie/templates/preflight-gvisor.yaml`](charts/curie/templates/preflight-gvisor.yaml)).
 - **AVX (a CPU instruction-set extension)/ClickHouse preflight** — a blocking pre-install hook that fails when the CPU lacks AVX and the ClickHouse tag is not the SSE4.2-safe pin ([`charts/curie/templates/preflight-avx.yaml`](charts/curie/templates/preflight-avx.yaml)). It is the productized form of the `:24.8` pin documented in [`CLAUDE.md`](CLAUDE.md).
-- **Bundle-fetch init containers** on the sandbox template, fail-closed if a bundle ref is set but no archive is fetched ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)), with a MinIO egress carve-out.
+- **Bundle-fetch init containers** on the sandbox template, fail-closed if a bundle ref is set but no archive is fetched ([`charts/curie/templates/agent-sandbox.yaml`](charts/curie/templates/agent-sandbox.yaml)), with a RustFS egress carve-out.
 - **A chart-managed platform Secret** ([`charts/curie/templates/secrets.yaml`](charts/curie/templates/secrets.yaml)) carries:
   - backing-store passwords
   - Langfuse keys

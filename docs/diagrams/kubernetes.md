@@ -22,7 +22,7 @@ flowchart TB
     subgraph backing["Backing stores"]
         PG[("Postgres")]
         Valkey[("Valkey")]
-        MinIO[("MinIO / S3")]
+        RustFS[("RustFS / S3")]
         LF["Langfuse + ClickHouse"]
         OTel["OTel Collector"]
     end
@@ -36,13 +36,13 @@ flowchart TB
 
     UI --> API
     API --> PG
-    API --> MinIO
+    API --> RustFS
     Disp --> Valkey
     Disp -- "GET /health preflight" --> API
     Worker --> Valkey
     Worker -- "create SandboxClaim" --> Pod
     Pool -. "referenced by warmPoolRef;<br/>pre-warms pods only at replicas > 0" .-> Tmpl
-    Pod -- "bundle-fetch init" --> MinIO
+    Pod -- "bundle-fetch init" --> RustFS
     Worker --> OTel
     Pod --> OTel
     OTel --> LF
@@ -60,7 +60,7 @@ flowchart LR
     Claim["SandboxClaim CRD<br/>spec.warmPoolRef.name"]
     Pool["SandboxWarmPool<br/>must exist; replicas 0 by default"]
     Tmpl["SandboxTemplate<br/>the runner pod spec"]
-    Init["init: bundle-fetch<br/>pull skill from MinIO"]
+    Init["init: bundle-fetch<br/>pull skill from RustFS"]
     Runner["Runner container<br/>Claude Code + skill + credential"]
 
     Worker -- "1. claim(thread)" --> Claim
@@ -83,7 +83,7 @@ flowchart LR
    no pre-warmed pods, so the claim **cold-creates a sandbox from the
    `SandboxTemplate`** — the normal path.
 4. The pod's **`bundle-fetch` init container** pulls the skill bundle for this
-   channel from MinIO before the runner starts. It is **fail-closed**: if a
+   channel from RustFS before the runner starts. It is **fail-closed**: if a
    bundle ref is set but the archive cannot be fetched, the pod does not start.
 5. The runner comes up as a ready agent and the worker drives it over
    [the ACI](aci.md).
@@ -106,7 +106,7 @@ that thread gets a fresh pod.
 These are on by default, not opt-in (ADR-0006):
 
 - **Default-deny egress** NetworkPolicy, with a carve-out that keeps the cloud
-  metadata endpoint (`169.254.169.254`) blocked and a narrow allow for the MinIO
+  metadata endpoint (`169.254.169.254`) blocked and a narrow allow for the RustFS
   bundle fetch. [`security-networkpolicy.yaml`](../../charts/curie/templates/security-networkpolicy.yaml)
 - **gVisor RuntimeClass** on the runner, plus a preflight Job that fails the
   install if the kernel is not gVisor.

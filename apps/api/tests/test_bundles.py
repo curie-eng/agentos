@@ -1,6 +1,6 @@
-"""Plugin bundle pipeline: intake unit tests + real MinIO/Postgres round trip.
+"""Plugin bundle pipeline: intake unit tests + real RustFS/Postgres round trip.
 
-Nothing is mocked: the round-trip test uploads to real MinIO and records to real
+Nothing is mocked: the round-trip test uploads to real RustFS and records to real
 Postgres from the compose stack (per B2 constraints).
 """
 
@@ -47,7 +47,7 @@ def _zip(files: dict[str, str]) -> bytes:
     return buf.getvalue()
 
 
-# --- pure intake tests (no MinIO/Postgres) -------------------------------
+# --- pure intake tests (no RustFS/Postgres) -------------------------------
 
 
 def test_valid_tar_gz_passes_validation(tmp_path: Path) -> None:
@@ -102,7 +102,7 @@ def test_non_archive_is_rejected(tmp_path: Path) -> None:
     raise AssertionError("expected UnsupportedArchive")
 
 
-# --- full round trip against real MinIO + Postgres -----------------------
+# --- full round trip against real RustFS + Postgres -----------------------
 
 
 def _create_version(client: Any, headers: dict[str, str]) -> tuple[str, str]:
@@ -197,7 +197,7 @@ def test_fetch_missing_bundle_is_404(
 def test_read_version_files_returns_bundle_text_surfaces(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # After a real upload to MinIO, the files endpoint returns the bundle's text
+    # After a real upload to RustFS, the files endpoint returns the bundle's text
     # surfaces (manifest + skill docs) with bundle-relative paths and content, so
     # the UI can render the authored bundle without pulling the raw archive.
     agent_id, version_id = _create_version(client, auth_headers)

@@ -6,8 +6,8 @@
 # ---------------
 # `helm lint` and `helm template` render manifests but NEVER run a container.
 # They cannot catch a bug that only manifests when an init container executes --
-# e.g. issue #56, where the bundle-fetch init container ran `mc alias set`, which
-# writes the MinIO ROOT credential in cleartext to MC_CONFIG_DIR/config.json,
+# for example issue #56, where the bundle fetch client wrote the S3 credential
+# in cleartext to a config file,
 # and that dir sat on the `bundles` emptyDir the untrusted `runner` container
 # also mounts. The acceptance criterion is a RUNTIME exec:
 #   kubectl exec <sandbox> -c runner -- find /bundles -name config.json   # empty
@@ -15,8 +15,8 @@
 #
 # THE PATTERN (reusable -- this is NOT a #56 one-off)
 # ---------------------------------------------------
-# 1. Install a trimmed chart slice on k8scratch (MinIO + agent-sandbox only).
-# 2. Seed a real bundle object into MinIO.
+# 1. Install a trimmed chart slice on k8scratch with RustFS and agent sandbox.
+# 2. Seed a real bundle object into RustFS.
 # 3. Render the SandboxTemplate.spec.podTemplate into a BOUND sandbox Pod
 #    (CURIE_BUNDLE_REF pointing at the seeded object) and apply it -- so the
 #    real bundle-fetch/bundle-extract init containers actually run.
@@ -50,7 +50,7 @@ usage() {
 Usage: scripts/chart-runtime-e2e.sh [options]
 
 Stands up a trimmed Curie chart slice on the k8scratch cluster, seeds a real
-bundle into MinIO, renders a bound agent-sandbox Pod, runs its bundle-fetch/
+bundle into RustFS, renders a bound agent-sandbox Pod, runs its bundle-fetch/
 extract init containers, and execs the runner to assert the #56 credential is
 NOT readable off the shared bundle volume (and the bundle really was provisioned).
 
@@ -103,10 +103,10 @@ else
   FULLNAME="$RELEASE-curie"
 fi
 SANDBOX_TEMPLATE="$FULLNAME-runner"
-MINIO_SVC="$FULLNAME-minio"
+RUSTFS_SVC="$FULLNAME-rustfs"
 SECRET_NAME="$FULLNAME-secrets"
-MINIO_BUCKET="curie-bundles"
-MINIO_USER="minio"
+RUSTFS_BUCKET="curie-bundles"
+RUSTFS_ACCESS_KEY="rustfs"
 # Ownership label stamped on any namespace THIS script creates. The script only
 # ever deletes a namespace carrying this label, so pointing --namespace at a
 # pre-existing namespace (e.g. `default`) can never destroy it.
@@ -318,13 +318,13 @@ run_assertions() {
     fail "bundle not provisioned (no plugin.json under /bundles/current); test inconclusive"
   fi
 
-  # SECURITY ASSERTION (#56): the MinIO credential must NOT be readable off the
+  # SECURITY ASSERTION (#56): the RustFS credential must not be readable off the
   # shared bundle volume from the runner's view.
-  exec_echo "security: mc config.json on shared volume" \
-    -c runner -- find /bundles -name config.json
+  exec_echo "security: S3 client credential files on shared volume" \
+    -c runner -- sh -c "find /bundles \\( -name config.json -o -name credentials \\)"
   local config_hits="$EXEC_OUT"
-  exec_echo "security: cleartext credential on shared volume" \
-    -c runner -- sh -c 'grep -rl miniosecret /bundles 2>/dev/null || true'
+  exec_echo "security: persisted AWS credential fields on shared volume" \
+    -c runner -- sh -c "grep -rEl 'aws_(access_key_id|secret_access_key)' /bundles 2>/dev/null || true"
   local cred_hits="$EXEC_OUT"
 
   local exposed=0
@@ -347,7 +347,7 @@ run_assertions() {
       echo "security assertion clean: no config.json and no cleartext credential on shared volume"
       RESULT="PASS"
     else
-      echo "security assertion FAILED: MinIO credential is readable off the shared bundle volume"
+      echo "security assertion FAILED: RustFS credential is readable off the shared bundle volume"
       RESULT="FAIL"
     fi
   fi
@@ -395,21 +395,21 @@ if ! install_chart; then
 fi
 
 # --------------------------------------------------------------------------
-# 2. Wait for MinIO Running (gate on the pod, not helm release status)
+# 2. Wait for RustFS Running. Gate on the pod, not Helm release status.
 # --------------------------------------------------------------------------
-banner "WAIT MinIO Running"
+banner "WAIT RustFS Running"
 if ! kubectl wait --for=condition=Ready pod \
-    -l app.kubernetes.io/component=minio \
+    -l app.kubernetes.io/component=rustfs \
     -n "$NAMESPACE" --timeout=180s; then
   kubectl get pods -n "$NAMESPACE" || true
-  kubectl describe pod -l app.kubernetes.io/component=minio -n "$NAMESPACE" || true
-  fail "MinIO pod did not become Ready"
+  kubectl describe pod -l app.kubernetes.io/component=rustfs -n "$NAMESPACE" || true
+  fail "RustFS pod did not become Ready"
 fi
 
 # --------------------------------------------------------------------------
-# 3. Seed a real bundle into MinIO
+# 3. Seed a real bundle into RustFS
 # --------------------------------------------------------------------------
-banner "SEED bundle into MinIO"
+banner "SEED bundle into RustFS"
 # Build a VALID tar.gz (bundle-extract runs `set -eu; tar -xzf`, so a malformed
 # archive fails the pod). Layout: myplugin/.claude-plugin/plugin.json.
 SEED_DIR="$(mktemp -d /tmp/e2e-bundle.XXXXXX)"
@@ -420,8 +420,8 @@ JSON
 tar -czf "$SEED_DIR/probe.tgz" -C "$SEED_DIR" myplugin
 PROBE_B64="$(base64 -w0 "$SEED_DIR/probe.tgz" 2>/dev/null || base64 "$SEED_DIR/probe.tgz" | tr -d '\n')"
 
-# ConfigMap carrying the archive (binaryData is base64), plus a one-shot mc Job
-# that creates the bucket and uploads the object.
+# ConfigMap carrying the archive plus a one shot AWS CLI Job that creates the
+# bucket and uploads the object using path addressing.
 cat <<EOF | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: ConfigMap
@@ -437,27 +437,40 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+        app.kubernetes.io/instance: $RELEASE
     spec:
       restartPolicy: Never
       containers:
         - name: seed
-          image: minio/mc
+          image: amazon/aws-cli:2.32.6
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
             - -c
             - |
               set -eu
-              mc alias set src "http://$MINIO_SVC:9000" "$MINIO_USER" "\$PW"
-              mc mb -p "src/$MINIO_BUCKET"
-              mc cp /data/probe.tgz "src/$MINIO_BUCKET/$BUNDLE_REF"
+              mkdir -p /tmp/aws
+              aws configure set default.s3.addressing_style path
+              endpoint="http://$RUSTFS_SVC:9000"
+              aws --endpoint-url "\$endpoint" s3api head-bucket --bucket "$RUSTFS_BUCKET" >/dev/null 2>&1 || \
+                aws --endpoint-url "\$endpoint" s3api create-bucket --bucket "$RUSTFS_BUCKET"
+              aws --endpoint-url "\$endpoint" s3 cp /data/probe.tgz "s3://$RUSTFS_BUCKET/$BUNDLE_REF"
               echo "seeded $BUNDLE_REF"
           env:
-            - name: PW
+            - name: AWS_ACCESS_KEY_ID
+              value: $RUSTFS_ACCESS_KEY
+            - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: $SECRET_NAME
-                  key: minioRootPassword
+                  key: rustfsSecretKey
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_CONFIG_FILE
+              value: /tmp/aws/config
           volumeMounts:
             - name: bundle
               mountPath: /data

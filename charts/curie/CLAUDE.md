@@ -1,6 +1,6 @@
 # CLAUDE.md - charts/curie
 
-The umbrella Helm chart: Langfuse + Postgres + Valkey + ClickHouse + MinIO +
+The umbrella Helm chart: Langfuse + Postgres + Valkey + ClickHouse + RustFS +
 OTel Collector, plus the Agent Sandbox substrate and its security rails. Full
 component and rail detail in `charts/curie/README.md`.
 

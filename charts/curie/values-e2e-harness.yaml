@@ -6,11 +6,11 @@
 #     -f charts/curie/values-e2e-harness.yaml
 #
 # Purpose: stand up the SMALLEST slice of the chart that can exercise the
-# agent-sandbox bundle-fetch init pair against a real MinIO -- the runtime path
+# agent-sandbox bundle-fetch init pair against real RustFS, the runtime path
 # the #56 credential-isolation fix lives in. It disables every backing store and
 # app service that the bundle-fetch/runner path does not need (langfuse,
 # postgres, valkey, clickhouse, inference, otel collector, api, dispatcher,
-# worker, ui) and both install-time preflights, keeping ONLY MinIO (the bundle
+# worker, ui) and both install-time preflights, keeping only RustFS (the bundle
 # store) and the agent-sandbox substrate (the SandboxTemplate whose podTemplate
 # the harness renders into a bound Pod).
 #
@@ -51,9 +51,9 @@ preflights:
   networkPolicyProbe:
     enabled: false
 
-# MinIO is the bundle store under test. Keep it deployed; drop the PVC so the
+# RustFS is the bundle store under test. Keep it deployed and drop the PVC so the
 # pod schedules instantly on a scratch node with no storage provisioning wait.
-minio:
+rustfs:
   deploy: true
   persistence:
     enabled: false

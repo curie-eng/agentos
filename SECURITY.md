@@ -37,7 +37,7 @@ The rails are the actual control. Every agent runs inside them:
   runner-sandbox pods is fail-closed: an empty `allowedEgress` means the sandbox
   can resolve DNS and ship traces, but reach nothing else. Arbitrary internet
   and the cloud metadata endpoint `169.254.169.254` are denied. Only
-  explicitly-declared egress is permitted: DNS, the in-chart collector, MinIO,
+  explicitly-declared egress is permitted: DNS, the in-chart collector, RustFS,
   and inference when deployed, plus the operator's declared model API and MCP
   hosts via `allowedEgress`.
 - **gVisor kernel isolation** via a RuntimeClass (`security.gvisor.mode`).
@@ -72,7 +72,7 @@ and `$HOME` only), **all Linux capabilities dropped**, **no-new-privileges**, th
 Docker **default seccomp profile**, and **bounded pids/memory/cpu**, and it joins
 a **dedicated `curie_runner` network** that carries only its documented
 dependencies (telemetry collector, local model, and the API state endpoint) --
-never the data tier (Postgres/Valkey/MinIO) and never the Docker daemon socket
+never the data tier (Postgres/Valkey/RustFS) and never the Docker daemon socket
 (which only the worker holds). These controls reduce blast radius; they are not a
 substitute for the Kubernetes boundary.
 

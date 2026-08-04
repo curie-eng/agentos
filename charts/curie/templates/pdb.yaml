@@ -6,7 +6,7 @@
   once you have raised replicas or want drains to require operator
   acknowledgement. See README "High availability and PodDisruptionBudgets".
 */}}
-{{- range $store := (list "postgres" "valkey" "clickhouse" "minio") }}
+{{- range $store := (list "postgres" "valkey" "clickhouse" "rustfs") }}
 {{- $cfg := index $.Values $store }}
 {{- if and $cfg.deploy $cfg.podDisruptionBudget.enabled }}
 ---

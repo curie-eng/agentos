@@ -1,8 +1,8 @@
-"""The one path-style S3/MinIO client construction (#501).
+"""The one path-style S3/RustFS client construction (#501).
 
 The API's write path (`curie_api.storage.BundleStore`) and the worker's read
 path (`curie_worker.bundle_store.BundleStore`) must build their boto3 client
-identically -- same endpoint, credentials, region, and (load-bearing for MinIO)
+identically -- same endpoint, credentials, region, and (load-bearing for RustFS)
 path-style addressing. That construction used to be hand-copied in each app (and a
 third time in a worker test fixture), a seam the blob-storage INTERFACE flagged as
 "hand-aligned client sites". This is the single builder both import so the
@@ -31,7 +31,7 @@ def build_s3_client(
 ) -> S3Client:
     """Construct the path-style S3 client shared by every S3-backed store.
 
-    Path-style addressing is required for MinIO and works with AWS S3, so it is
+    Path-style addressing is required for RustFS and works with AWS S3, so it is
     fixed here. Callers pass their resolved config values as keyword primitives.
     """
     import boto3

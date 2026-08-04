@@ -112,7 +112,7 @@ The worker owns **one live session per thread**. For a new thread it starts a
 bare runner (Claude Code). The pod is assembled at request time:
 
 - pull the **runner** image (Claude Code),
-- inject the **skill bundle** for this channel, fetched from MinIO (blob store),
+- inject the **skill bundle** for this channel, fetched from RustFS (blob store),
 - inject the **credential** and the **thread history**.
 
 That assembled environment is the agent. It runs, emits an answer, and the

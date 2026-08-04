@@ -79,10 +79,10 @@ jobs:
       - name: Wire tolerance gate (_AciModel model_validate call sites)
         run: bash scripts/check-wire-tolerance.sh
       # Integration tests dial the real dev stack (Postgres 25432, Valkey 26379,
-      # MinIO 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
+      # RustFS 29000, Langfuse 23000 + ClickHouse + OTel Collector). Boot it after
       # ruff/mypy so cheap failures stay fast. The first up starts the one-shot
-      # minio-init that creates the langfuse bucket alongside the long-lived
-      # services; the second --waits only on the long-lived ones (minio-init is
+      # rustfs-init that creates the Langfuse bucket alongside the long-lived
+      # services; the second --waits only on the long-lived ones (rustfs-init is
       # kept out of the wait set because --wait treats its exit(0) as a failure).
       # The app services (curie-api, curie-migrate) are deliberately NOT
       # started: the suite runs the app in-process via uv and migrates the shared
@@ -91,10 +91,10 @@ jobs:
       - name: Start dev stack
         run: |
           docker compose -f compose.dev.yaml up -d \
-            postgres valkey clickhouse minio minio-init \
+            postgres valkey clickhouse rustfs rustfs-init \
             langfuse-web langfuse-worker otel-collector
           docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
-            postgres valkey clickhouse minio \
+            postgres valkey clickhouse rustfs \
             langfuse-web langfuse-worker otel-collector
       # Langfuse web has no compose healthcheck, so --wait returns once its
       # container is merely running. Poll its public health endpoint until it is
@@ -310,14 +310,14 @@ jobs:
       # `curie local up` the `full` profile; assert the release stack renders
       # exactly those service counts so a profile regression cannot silently
       # start the wrong set.
-      - name: Core profile renders 7 services
+      - name: Core profile renders 8 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile core config --services | wc -l)
-          [ "$count" -eq 7 ] || { echo "core profile must render 7 services, got $count" >&2; exit 1; }
-      - name: Full profile renders 12 services
+          [ "$count" -eq 8 ] || { echo "core profile must render 8 services, got $count" >&2; exit 1; }
+      - name: Full profile renders 13 services
         run: |
           count=$(docker compose -f compose.release.yaml --profile full config --services | wc -l)
-          [ "$count" -eq 12 ] || { echo "full profile must render 12 services, got $count" >&2; exit 1; }
+          [ "$count" -eq 13 ] || { echo "full profile must render 13 services, got $count" >&2; exit 1; }
 
   # Build the first-party images on every PR/push -- build only, never push --
   # so a Dockerfile break is caught here instead of only at release time. This

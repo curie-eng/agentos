@@ -1,4 +1,4 @@
-"""Git-flow end to end against real Postgres + MinIO with local bare repos.
+"""Git-flow end to end against real Postgres + RustFS with local bare repos.
 
 No github.com and no network: the "remote" is a local bare repository and the
 webhook payloads are HMAC-signed exactly as GitHub signs them. This exercises

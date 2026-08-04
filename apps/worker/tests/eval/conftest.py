@@ -2,10 +2,10 @@
 with a scripted per-input output, dialed by the real RunnerClient. Only the model
 behind the runner is faked; the eval runner and grading are exercised for real.
 
-The F3 eval-stream consumer tests additionally use a real MinIO bundle (uploaded
+The F3 eval-stream consumer tests additionally use a real RustFS bundle (uploaded
 via ``bundles``) and, for the provisioned-runner path, the real G1 substrate wired
 to a fake Kubernetes client whose sandbox resolves to the in-process fake runner.
-Only the report HTTP POST is mocked (the external-service rule); Valkey, MinIO,
+Only the report HTTP POST is mocked (the external-service rule); Valkey, RustFS,
 and Langfuse are always real."""
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ def eval_cases_example_path() -> Path:
     return EVAL_CASES_EXAMPLE_PATH
 
 
-_MINIO: dict[str, object] = {
+_RUSTFS: dict[str, object] = {
     "s3_endpoint_url": os.environ.get("TEST_S3_ENDPOINT_URL", "http://localhost:29000"),
-    "s3_access_key": os.environ.get("TEST_S3_ACCESS_KEY", "minio"),
-    "s3_secret_key": os.environ.get("TEST_S3_SECRET_KEY", "miniosecret"),
+    "s3_access_key": os.environ.get("TEST_S3_ACCESS_KEY", "rustfs"),
+    "s3_secret_key": os.environ.get("TEST_S3_SECRET_KEY", "rustfssecret"),
     "s3_region": "us-east-1",
     "bundle_bucket": os.environ.get("TEST_BUNDLE_BUCKET", "curie-bundles"),
 }
@@ -188,7 +188,7 @@ def make_eval_harness() -> Callable[
     return factory
 
 
-# --- Real MinIO bundle fixtures (the consumer loads suites from the bundle) ----
+# --- Real RustFS bundle fixtures (the consumer loads suites from the bundle) ----
 
 
 def bundle_zip(suite: EvalSuite) -> bytes:
@@ -203,8 +203,8 @@ def bundle_zip(suite: EvalSuite) -> bytes:
 @pytest.fixture
 def bundles() -> Iterator[tuple[BundleStore, Callable[[EvalSuite | bytes], str]]]:
     """A real read-only ``BundleStore`` plus an ``upload(suite_or_bytes) -> key``
-    helper. Uploaded objects are deleted on teardown; skips if MinIO is down."""
-    cfg = WorkerConfig(**_MINIO)  # type: ignore[arg-type]
+    helper. Uploaded objects are deleted on teardown; skips if RustFS is down."""
+    cfg = WorkerConfig(**_RUSTFS)  # type: ignore[arg-type]
     store = BundleStore(cfg)
     client = build_s3_client(
         endpoint_url=cfg.s3_endpoint_url,
@@ -214,8 +214,8 @@ def bundles() -> Iterator[tuple[BundleStore, Callable[[EvalSuite | bytes], str]]
     )
     try:
         client.head_bucket(Bucket=cfg.bundle_bucket)
-    except Exception as exc:  # noqa: BLE001 - any S3 failure means MinIO is unusable
-        pytest.skip(f"MinIO bundle bucket not reachable: {exc}")
+    except Exception as exc:  # noqa: BLE001 - any S3 failure means RustFS is unusable
+        pytest.skip(f"RustFS bundle bucket not reachable: {exc}")
     keys: list[str] = []
 
     def upload(suite: EvalSuite | bytes) -> str:

@@ -1,11 +1,11 @@
 {{- if .Values.security.dataTierNetworkPolicy.enabled }}
 {{/*
-Rail: default-deny ingress + scoped-allow around the data tier (Postgres, MinIO,
+Rail: default-deny ingress + scoped-allow around the data tier (Postgres, RustFS,
 ClickHouse, Valkey).
 
 The backing stores hold every credential and all trace/app data. Without an
 ingress restriction, any co-tenant pod in a NetworkPolicy-enforcing cluster can
-open Postgres:5432 (or MinIO:9000, ClickHouse:8123, Valkey:6379) and read or
+open Postgres:5432 (or RustFS:9000, ClickHouse:8123, Valkey:6379) and read or
 exfiltrate the whole store. This rail selects each DEPLOYED in-chart store's pods
 by their component selector labels and, per store, emits two policies that
 compose into: (a) a default-deny that blocks ALL ingress by construction, and
@@ -30,7 +30,7 @@ exists to catch exactly that.
      $dt probe-target list in security-probe.yaml (Claim 5). */}}
 {{- $stores := list
     (dict "component" "postgres"   "deploy" .Values.postgres.deploy   "ports" (list 5432))
-    (dict "component" "minio"      "deploy" .Values.minio.deploy      "ports" (list 9000 9001))
+    (dict "component" "rustfs"     "deploy" .Values.rustfs.deploy     "ports" (list 9000 9001))
     (dict "component" "clickhouse" "deploy" .Values.clickhouse.deploy "ports" (list 8123 9000))
     (dict "component" "valkey"     "deploy" .Values.valkey.deploy     "ports" (list 6379))
 -}}

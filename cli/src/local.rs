@@ -1,5 +1,5 @@
 //! `curie local <up|down|status>`: wrap the repo's local dev stack
-//! (`compose.dev.yaml`: Postgres + Valkey + Langfuse + ClickHouse + MinIO +
+//! (`compose.dev.yaml`: Postgres + Valkey + Langfuse + ClickHouse + RustFS +
 //! OTel) the same way `ops.rs` wraps Helm -- a deliberately thin CLI over
 //! `docker compose`, which stays the source of truth. Each verb builds its
 //! command line as a pure function returning an [`OpsCommand`]; the executor
@@ -50,8 +50,8 @@ const ENDPOINTS: &[(&str, &str, bool)] = &[
     ("Postgres", "localhost:25432", true),
     ("Valkey", "localhost:26379", true),
     ("ClickHouse HTTP", "localhost:28123", false),
-    ("MinIO S3", "localhost:29000", true),
-    ("MinIO console", "localhost:29001", true),
+    ("RustFS S3", "localhost:29000", true),
+    ("RustFS console", "localhost:29001", true),
     ("OTel gRPC", "localhost:24317", false),
     ("OTel HTTP", "localhost:24318", false),
 ];
@@ -297,7 +297,7 @@ pub fn up_command(o: &LocalOpts) -> OpsCommand {
             ("CURIE_MODEL".into(), model.clone()),
             // Spawned runners join the dedicated, data-tier-free runner network
             // (#631). ollama is multi-homed onto it, so `--local-model` resolves
-            // `ollama` by name without exposing postgres/valkey/minio.
+            // `ollama` by name without exposing postgres/valkey/rustfs.
             ("CURIE_DOCKER_NETWORK".into(), "curie_runner".into()),
             // Pin the compose project name so the default network is always
             // `curie_default`, regardless of the working-directory basename
@@ -767,12 +767,12 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     }
     if o.wipe {
         ui.warn(&format!(
-            "this destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, MinIO, Valkey data)",
+            "this destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, RustFS, Valkey data)",
             o.common.file
         ));
         if !o.yes
             && !crate::ops::confirm(&format!(
-                "This destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, MinIO, Valkey data). Continue? [y/N] ",
+                "This destroys all volumes for the '{}' dev stack (Postgres, ClickHouse, RustFS, Valkey data). Continue? [y/N] ",
                 o.common.file
             ))?
         {
@@ -1454,8 +1454,8 @@ mod tests {
             ("Postgres", "25432"),
             ("Valkey", "26379"),
             ("ClickHouse HTTP", "28123"),
-            ("MinIO S3", "29000"),
-            ("MinIO console", "29001"),
+            ("RustFS S3", "29000"),
+            ("RustFS console", "29001"),
             ("OTel gRPC", "24317"),
             ("OTel HTTP", "24318"),
         ] {
@@ -1522,12 +1522,13 @@ mod tests {
         );
     }
 
-    /// The 7 services that must carry `profiles: *core_profiles`.
+    /// The 8 services that must carry `profiles: *core_profiles`.
     const CORE_SERVICES: &[&str] = &[
         "postgres",
         "valkey",
-        "minio",
-        "minio-init",
+        "rustfs-perms",
+        "rustfs",
+        "rustfs-init",
         "curie-migrate",
         "curie-api",
         "curie-worker",
@@ -1563,7 +1564,7 @@ mod tests {
         &rest[..end]
     }
 
-    /// Assert the shared core(7)/full(5) profile binding in a compose file:
+    /// Assert the shared core(8)/full(5) profile binding in a compose file:
     /// the anchors are declared, the counts hold, AND each service block carries
     /// the anchor it should (so swapping a service's profile fails the test).
     fn assert_core_full_bindings(compose: &str, file: &str) {
@@ -1577,7 +1578,7 @@ mod tests {
         );
         assert_eq!(
             compose.matches("profiles: *core_profiles").count(),
-            7,
+            8,
             "{file} core-profile count"
         );
         assert_eq!(
@@ -1625,8 +1626,8 @@ mod tests {
                 "Curie API",
                 "Postgres",
                 "Valkey",
-                "MinIO S3",
-                "MinIO console",
+                "RustFS S3",
+                "RustFS console",
             ]
         );
     }
