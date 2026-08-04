@@ -157,7 +157,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.commit_poll_interval_s > 0:
         poller = CommitPoller(
             session_factory=app.state.sessionmaker,
-            store=app.state.store,
+            store=app.state.bundle_store,
             settings=settings,
             eval_queue=app.state.eval_queue,
             tips=GitHubBranchTip(settings, credentials_for(settings)),
