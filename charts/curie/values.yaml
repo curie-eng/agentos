@@ -525,6 +525,10 @@ api:
   # limit becomes a false denial of a legitimate approver, so 0 suits low-volume
   # or strict-revocation deployments.
   slackUsergroupCacheTtlSeconds: 60
+  # Level for the API's own loggers (#1270). INFO surfaces the operator-facing
+  # records -- connector drift corrected, polled deploys, webhook outcomes --
+  # which were silently dropped before. WARNING to quieten it.
+  logLevel: INFO
   service:
     type: ClusterIP
     port: 8000

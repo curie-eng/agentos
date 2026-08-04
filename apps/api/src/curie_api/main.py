@@ -5,6 +5,8 @@ startup and stored on app.state; dependencies (deps.py) read them per request.
 """
 
 import asyncio
+import logging
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -213,7 +215,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await engine.dispose()
 
 
+def configure_logging(level: str | None = None) -> logging.Logger:
+    """Give this service's loggers a level and a handler (#1270).
+
+    `uvicorn curie_api.main:app` configures only the `uvicorn*` loggers and no
+    root entry, so `curie_api.*` has an effective level of WARNING and no
+    handler -- every INFO record in the service is dropped by the last-resort
+    handler. That is production, not a local artifact: the Dockerfile runs bare
+    uvicorn.
+
+    Scoped to the `curie_api` logger rather than root, and `propagate` is off:
+    configuring root would fight uvicorn's own dictConfig and anything the OTel
+    wiring later attaches, and leaving propagation on would double-emit every
+    record through whatever root ends up with.
+
+    Idempotent. Tests construct many apps in one process, and a handler added
+    per construction would multiply every line.
+    """
+
+    resolved = (level or get_settings().log_level).upper()
+    logger = logging.getLogger("curie_api")
+    logger.setLevel(resolved)
+    logger.propagate = False
+    if not any(getattr(h, "_curie_api_handler", False) for h in logger.handlers):
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s: %(name)s: %(message)s"))
+        handler._curie_api_handler = True  # type: ignore[attr-defined]
+        logger.addHandler(handler)
+    return logger
+
+
 def create_app() -> FastAPI:
+    configure_logging()
     app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health", tags=["health"])
