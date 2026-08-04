@@ -3643,7 +3643,7 @@ export const commandManifest = {
           "name": "e2e-ladder"
         },
         {
-          "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into MinIO, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
+          "about": "Runtime E2E the Helm chart on a local cluster: install a trimmed slice, seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and exec-assert the runner's view -- the one-command way to satisfy a chart/sandbox runtime acceptance criterion static checks cannot (#199, `bash scripts/chart-runtime-e2e.sh`)",
           "hidden": false,
           "name": "chart-runtime-e2e"
         },
