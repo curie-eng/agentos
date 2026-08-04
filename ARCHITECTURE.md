@@ -2,7 +2,9 @@
 
 Curie (codename **Relay**) turns a Slack thread into a conversation with a
 versioned, sandboxed AI agent, and turns a git push into a deployment of that
-agent. This document is the as-built map. It covers:
+agent. Slack is the only wired channel today; the dispatcher sits behind a
+channel-agnostic message port ([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)),
+so additional channels are additive, not a rewrite. This document is the as-built map. It covers:
 
 - the components
 - the two runtime modes and what is identical between them
