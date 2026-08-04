@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
     org_name: str = "Curie"
 
+    # Level for this service's own loggers (#1270). The API has no entry point
+    # of its own -- uvicorn imports the app -- and uvicorn configures only its
+    # own three loggers with no root entry, so without this every
+    # `curie_api.*` INFO record is discarded by the last-resort handler.
+    log_level: str = "INFO"
+
     # Langfuse proxy target (the dev project keys baked into compose.dev.yaml).
     langfuse_host: str = "http://localhost:23000"
     langfuse_public_key: str = "pk-lf-curie-dev"
