@@ -364,11 +364,11 @@ class WorkerConfig(BaseSettings):
     eval_stream_max_age_hours: int = Field(
         default=24, validation_alias="CURIE_EVAL_STREAM_MAX_AGE_HOURS"
     )
-    # MinIO / S3 for plugin bundles (mirrors the API's env names). The consumer
+    # RustFS / S3 for plugin bundles (mirrors the API's env names). The consumer
     # fetches a version's bundle by bundle_ref and loads its evals/ suite.
     s3_endpoint_url: str = "http://localhost:29000"
-    s3_access_key: str = "minio"
-    s3_secret_key: str = "miniosecret"
+    s3_access_key: str = "rustfs"
+    s3_secret_key: str = "rustfssecret"
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
     # Bundle extraction bounds (ADR-0059 decision 3), applied by the Docker

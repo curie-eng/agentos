@@ -2,7 +2,7 @@
 
 The umbrella Helm chart that installs the whole Curie (Relay) stack on a
 single node. It installs the backing-store stack (Langfuse + Postgres + Valkey +
-ClickHouse + MinIO + OTel Collector, dev profile, BYO (bring-your-own)
+ClickHouse + RustFS + OTel Collector, dev profile, BYO (bring-your-own)
 toggles, the two preflights) plus the security rails as chart defaults.
 
 The chart is a direct port of the proven `compose.dev.yaml` dev stack: same
@@ -134,7 +134,7 @@ straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:
 | Postgres | `postgres:16-alpine` | Langfuse transactional store + app state. StatefulSet. |
 | Valkey | `valkey/valkey:8-alpine` | Langfuse cache/queue + dispatcher Streams queue. |
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
-| MinIO | `minio/minio` (+ `minio/mc` init) | Langfuse object storage; BYO real S3 in prod. |
+| RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | OTLP (gRPC+HTTP) -> Langfuse over HTTP. |
 
 ## Publishing and pulling images
@@ -216,7 +216,7 @@ postgres:
 ```
 
 Toggles (all default `true`): `langfuse.deploy`, `postgres.deploy`,
-`valkey.deploy`, `clickhouse.deploy`, `minio.deploy`, `otelCollector.deploy`.
+`valkey.deploy`, `clickhouse.deploy`, `rustfs.deploy`, `otelCollector.deploy`.
 Flipping any to `false` removes its resources from the render; consumers
 (Langfuse env, the collector config) repoint at the BYO host automatically.
 
@@ -291,7 +291,7 @@ comfortable headroom for integration and soak testing.
 
 ## High availability and PodDisruptionBudgets
 
-Every backing store (Postgres, Valkey, ClickHouse, MinIO) ships as a
+Every backing store (Postgres, Valkey, ClickHouse, RustFS) ships as a
 single-replica StatefulSet -- correct for the single-node dev footprint, but it
 means a node drain evicts the store with no budget guarding it. Two levers move
 this toward production HA:
@@ -335,7 +335,7 @@ explicit `sizeLimit`:
 | Volume | Values key | Default |
 |---|---|---|
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
-| `mc-config` (init-only mc credential dir) | `agentSandbox.runner.bundleFetch.mcConfigSizeLimit` | `16Mi` |
+| `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
 | One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
 
 **This is a backstop, not an instantaneous cap.** `sizeLimit` is enforced by
@@ -366,7 +366,7 @@ sandbox and renders whenever an in-chart store is deployed.
 | 2. Per-agent secret isolation | Least-privilege runner ServiceAccount (no secret get/list, token not mounted). The per-agent `resourceNames`-scoped Role is bound by the control plane per agent. | `agentSandbox.runner.serviceAccount.*` |
 | 3. Non-root / read-only rootfs | Pod + container securityContext on the runner: `runAsNonRoot`, uid 1000, `readOnlyRootFilesystem`, drop ALL caps, no privilege escalation, RuntimeDefault seccomp, plus writable emptyDir scratch (`/tmp`, `/home/runner`) and `HOME`. | `agentSandbox.runner.hardening.*` |
 | 4. gVisor kernel isolation | `runtimeClassName` on runner pods, driven by the `security.gvisor.mode` tri-state (`auto`/`require`/`off`) + a preflight that fails the install if the RuntimeClass is missing or downgraded, firing in `require` (always) and in `auto` for real-model runs + an optional RuntimeClass object. | `security.gvisor.*`, `security.gvisorPreflight.*` |
-| 5. Data-tier ingress isolation | Per deployed store (Postgres, MinIO, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
+| 5. Data-tier ingress isolation | Per deployed store (Postgres, RustFS, ClickHouse, Valkey): a default-deny-ingress NetworkPolicy plus a scoped-allow that permits ingress on the store's ports ONLY from this release's app pods (`name`+`instance` label). Blocks any co-tenant pod from opening `Postgres:5432` etc. | `security.dataTierNetworkPolicy.*` |
 | 6. Tenant capacity ceiling | A `ResourceQuota` bounding aggregate cpu/memory and sandbox pod count (scoped to the sandbox PriorityClass; a scoped quota cannot constrain ephemeral-storage, so per-pod disk is bounded by the `LimitRange`/pod limits times the pod-count cap), plus a `LimitRange` supplying per-container defaults so a sandbox pod created outside this chart's own templates still inherits a ceiling. Renders whenever `agentSandbox.deploy: true`. | `resourceQuota.*`, `limitRange.*` |
 
 **Fail-closed egress.** `security.networkPolicy.allowedEgress` is EMPTY by

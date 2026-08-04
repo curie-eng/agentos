@@ -1,7 +1,7 @@
-"""F3 eval-stream consumer against real Valkey + real MinIO + real Langfuse, with
+"""F3 eval-stream consumer against real Valkey + real RustFS + real Langfuse, with
 only the platform-report HTTP POST mocked (the external-service rule).
 
-The consumer reads ``curie:evals``, loads the suite from the version's MinIO
+The consumer reads ``curie:evals``, loads the suite from the version's RustFS
 bundle, runs it against either the payload's ``target_url`` (the dev/test shortcut)
 or a runner it provisions via the G1 substrate, records per-case scores to
 Langfuse, POSTs a summary to the platform API, and only then acks. These tests
@@ -293,7 +293,7 @@ def test_eval_read_loop_demotes_idle_timeout_to_debug(make_eval_harness, bundles
 
 def test_seam_full_consume_eval_report_cycle(make_eval_harness, bundles) -> None:
     """XADD the exact stream payload -> one full consume->eval->report cycle: the
-    suite is loaded from the real MinIO bundle, run against target_url, scored to
+    suite is loaded from the real RustFS bundle, run against target_url, scored to
     Langfuse keyed by version, reported with resolved repo + counts, and acked."""
     store, upload = bundles
 
@@ -533,7 +533,7 @@ def test_over_cap_eval_is_dead_lettered_and_never_re_run(make_eval_harness, bund
 
 
 def test_missing_bundle_is_a_reported_failed_run(make_eval_harness, bundles) -> None:
-    """A bundle_ref that does not exist in MinIO is an unresolvable suite: a failed
+    """A bundle_ref that does not exist in RustFS is an unresolvable suite: a failed
     run (0/0) is reported and the entry acked, never a consumer crash."""
     store, _upload = bundles
 
@@ -794,7 +794,7 @@ RUNNER_TOKEN_ENV = "CURIE_RUNNER_TOKEN"
 
 def _suite_bundle(suite: EvalSuite) -> bytes:
     """A minimal tar.gz carrying evals/cases.json, so the real
-    load_suite_from_bundle returns a real suite (the MinIO fetch is the only
+    load_suite_from_bundle returns a real suite (the RustFS fetch is the only
     faked boundary)."""
     payload = suite.model_dump_json().encode("utf-8")
     buf = io.BytesIO()
@@ -1199,7 +1199,7 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     # The token surfaced from the provisioned handle must be threaded into the
     # eval turn driver so a token-enforcing sandbox does not 401 the eval. The
     # only faked boundary is the run_eval_suite seam (captured, not the code
-    # under test) and the MinIO bundle fetch.
+    # under test) and the RustFS bundle fetch.
     from curie_worker.eval import stream as stream_module
 
     captured: dict[str, Any] = {}

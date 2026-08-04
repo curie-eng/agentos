@@ -2,7 +2,7 @@
 #
 # Render-assertion test for issue #756 (ADR-0059 decision 2). Every writable
 # `emptyDir` volume in the sandbox pod -- the shared `bundles` volume, the
-# init-only `mc-config` volume, and one volume per `hardening.writablePaths`
+# init only `aws-config` volume, and one volume per `hardening.writablePaths`
 # entry -- must carry an explicit `sizeLimit` so a pod that overruns is
 # evicted on its own account instead of exhausting node disk and taking every
 # co-scheduled pod down with it (node-wide `DiskPressure`). This test pins
@@ -27,7 +27,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 DEFAULT="$TMP/default.yaml"
 EXTRA_PATH="$TMP/extra-path.yaml"
 
-echo "=== Rendering SandboxTemplate (defaults: bundles, mc-config, /tmp, /home/runner) ==="
+echo "=== Rendering SandboxTemplate (defaults: bundles, aws-config, /tmp, /home/runner) ==="
 helm template rel "$CHART" --show-only "$TPL" > "$DEFAULT"
 
 echo "=== Rendering SandboxTemplate (a third writablePaths entry appended) ==="
@@ -89,16 +89,16 @@ def check(path, expected_names, expected_size_limit=None):
     print(f"  ok: {sorted(names)} all carry a non-empty sizeLimit")
 
 
-# Default render: bundles, mc-config, and one writable-N per default
+# Default render: bundles, aws-config, and one writable-N per default
 # writablePaths entry (/tmp, /home/runner -> writable-0, writable-1).
-check(sys.argv[1], {"bundles", "mc-config", "writable-0", "writable-1"})
+check(sys.argv[1], {"bundles", "aws-config", "writable-0", "writable-1"})
 
 # A third writablePaths entry must ALSO get a sizeLimit -- proves the
 # mechanism is generic over the list, not hardcoded to two hand-picked paths
 # -- and the overridden writablePathSizeLimit must apply to every one of them.
 check(
     sys.argv[2],
-    {"bundles", "mc-config", "writable-0", "writable-1", "writable-2"},
+    {"bundles", "aws-config", "writable-0", "writable-1", "writable-2"},
     expected_size_limit="256Mi",
 )
 PY
@@ -109,4 +109,4 @@ fi
 echo "$out"
 
 echo
-echo "PASS: every emptyDir volume in the rendered sandbox pod (bundles, mc-config, and one per hardening.writablePaths entry, including a lengthened list) carries an explicit, operator-overridable sizeLimit."
+echo "PASS: every emptyDir volume in the rendered sandbox pod (bundles, aws-config, and one per hardening.writablePaths entry, including a lengthened list) carries an explicit, operator-overridable sizeLimit."

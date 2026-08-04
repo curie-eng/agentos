@@ -47,7 +47,7 @@ clickhouse:
     requests: { cpu: 200m, memory: 512Mi }
     limits: { cpu: "2", memory: 1536Mi }
 
-minio:
+rustfs:
   persistence:
     size: 3Gi
   resources:

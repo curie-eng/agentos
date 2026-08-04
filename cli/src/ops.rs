@@ -795,7 +795,7 @@ const REQUIRED_SECRETS: &[(&str, usize)] = &[
     ("postgres.auth.password", 24),
     ("valkey.password", 24),
     ("clickhouse.auth.password", 24),
-    ("minio.auth.rootPassword", 24),
+    ("rustfs.auth.rootPassword", 24),
     ("langfuse.salt", 16),
     ("langfuse.encryptionKey", 32),
     ("langfuse.nextauthSecret", 24),

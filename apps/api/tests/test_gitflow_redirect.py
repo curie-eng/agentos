@@ -1,7 +1,7 @@
 """AC4 proof by execution: a cross-host redirect gets no request from the clone.
 
 A separate file because this pair needs a REAL `git` subprocess and two loopback
-HTTP servers, and needs neither Postgres nor MinIO. `test_gitflow_unit.py` mocks
+HTTP servers, and needs neither Postgres nor RustFS. `test_gitflow_unit.py` mocks
 `subprocess.run` as its contract, and `test_gitflow_integration.py` requires the
 database fixtures and declares "no github.com and no network" in its header.
 Everything here binds 127.0.0.1 only; nothing leaves the box.

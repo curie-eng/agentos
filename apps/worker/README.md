@@ -15,13 +15,13 @@ Prod wins over dev, then most recent. The kernel claims the sandbox with a boot
 env built from the resolution: `CURIE_BUDGET` (the agent's
 `max_usd_per_day`/`max_output_tokens_per_run`, platform defaults when NULL),
 `CURIE_SESSION_ID`, `CURIE_PLUGIN_DIR`, and
-`CURIE_BUNDLE_REF` (the MinIO key). An unmapped channel is a polite placeholder
+`CURIE_BUNDLE_REF` (the RustFS key). An unmapped channel is a polite placeholder
 edit and drop, never a crash. The claim env also carries a per-sandbox
 `CURIE_RUNNER_TOKEN` (minted with `secrets.token_urlsafe`) that the `RunnerClient`
 sends as an `Authorization: Bearer` header on every ACI call to that sandbox
 (issue #63).
 
-> Handoff: `CURIE_BUNDLE_REF` is a MinIO object key; the runner reads
+> Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
 > bundle key into the plugin dir is sandbox provisioning (an init container in the
 > sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker. Per-channel
@@ -93,7 +93,7 @@ code.
 ```
 XREADGROUP curie:evals            EvalStreamConsumer (own consumer group)
    -> payload: EvalJob JSON            one stream field `payload` (dispatcher seam)
-   -> BundleStore.get(bundle_ref)      MinIO GET, extract, load evals/cases.json
+   -> BundleStore.get(bundle_ref)      RustFS GET, extract, load evals/cases.json
    -> run_eval_suite(target)           target_url shortcut, else provision a runner
    -> LangfuseEvalRecorder.record      per-case eval_pass scores, tagged version:<sha>
    -> POST /evals/report               platform API (repo, sha, passed_count, total)
@@ -104,13 +104,13 @@ Stream seam (the exact producer contract): each entry carries one field `payload
 holding an `EvalJob` JSON object (the shared `aci_protocol.EvalJob` model) with
 `agent_id`, `version_id`, `sha`, `suite`
 (the suite NAME, used to select/tag, not the cases themselves), `bundle_ref` (the
-MinIO object key), optional `target_url`, and `requested_at` (ISO-8601 UTC). The
+RustFS object key), optional `target_url`, and `requested_at` (ISO-8601 UTC). The
 cases come FROM the bundle's own `evals/cases.json` (the `EvalSuite` JSON shape the
 eval lane's loader reads), never from the stream.
 
 Runtime rules (each has a provoking integration test in `tests/eval/test_stream.py`):
 
-- **Suite loads from the bundle.** MinIO GET `bundle_ref` from bucket
+- **Suite loads from the bundle.** RustFS GET `bundle_ref` from bucket
   `curie-bundles`, extract, load `evals/cases.json`; the `suite` field renames it
   and tags Langfuse. A missing/corrupt bundle or missing evals dir is a **failed run**
   (0/0) reported and acked, never a crash.
@@ -127,14 +127,14 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
   not a consumer crash.
 
 Config surface (read by `WorkerConfig`): `CURIE_EVAL_STREAM` /
-`CURIE_EVAL_CONSUMER_GROUP`; MinIO/S3 `S3_ENDPOINT_URL` / `S3_ACCESS_KEY` /
+`CURIE_EVAL_CONSUMER_GROUP`; RustFS/S3 `S3_ENDPOINT_URL` / `S3_ACCESS_KEY` /
 `S3_SECRET_KEY` / `S3_REGION` / `BUNDLE_BUCKET` (mirroring the API's env names); the
 platform API `CURIE_API_URL` (deprecated alias `CURIE_API_BASE_URL`) / `CURIE_API_KEY` for `POST /evals/report`; and
 `LANGFUSE_HOST` / `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` for score recording.
 The consumer is wired into `python -m curie_worker` alongside the runs consumer and
 the kill switch.
 
-Tests (`apps/worker/tests/eval/test_stream.py`, real Valkey + real MinIO bundle + real
+Tests (`apps/worker/tests/eval/test_stream.py`, real Valkey + real RustFS bundle + real
 Langfuse, only the report POST mocked): the seam cycle (XADD the exact payload ->
 one consume->eval->report), the poison-pill drop, a missing-bundle failed run,
 ack-after-report even when the report terminally fails, and a provisioned-runner

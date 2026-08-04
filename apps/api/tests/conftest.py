@@ -147,7 +147,7 @@ def clean_db(migrated: None) -> None:
 @pytest.fixture
 def client(_disposable_db: Any) -> Any:
     # Depends on _disposable_db so the app engine is built against the disposable
-    # DB (the app lifespan already requires the compose stack: MinIO, Valkey).
+    # DB (the app lifespan already requires the compose stack: RustFS, Valkey).
     with TestClient(create_app()) as test_client:
         yield test_client
 

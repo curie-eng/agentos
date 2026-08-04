@@ -10,7 +10,7 @@ default is namespace-wide, not sandbox-scoped.
 
 This is safe for the N=1 self-host control plane because every first-party
 component in this chart (api, worker, dispatcher, ui, postgres, valkey,
-clickhouse, minio, langfuse, the otel collector, the preflight/probe jobs, and
+clickhouse, rustfs, langfuse, the otel collector, the preflight/probe jobs, and
 the runner-prewarm DaemonSet) already declares BOTH a cpu and a memory
 request+limit of its own in values.yaml -- so this LimitRange's cpu/memory
 default/defaultRequest never overrides an already-set value for any of them;

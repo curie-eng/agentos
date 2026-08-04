@@ -146,11 +146,11 @@ def test_curie_images_pinned_non_curie_untouched():
 
 
 def test_rustfs_and_aws_bucket_bootstrap_preserve_the_s3_consumer_contract():
-    """The bundled store is RustFS; clients speak generic S3, never MinIO APIs."""
+    """The bundled store is RustFS and clients speak generic S3 APIs."""
     for label, doc in compose_docs():
         services = doc["services"]
-        assert "minio" not in services, f"{label} still exposes the retired MinIO server"
-        assert "minio-init" not in services, f"{label} still exposes the retired MinIO client"
+        assert "minio" not in services, f"{label} still exposes the retired object store"
+        assert "minio-init" not in services, f"{label} still exposes the retired bootstrap client"
 
         rustfs = services.get("rustfs")
         assert rustfs is not None, f"{label} must expose the bundled RustFS server"
@@ -173,7 +173,10 @@ def test_rustfs_and_aws_bucket_bootstrap_preserve_the_s3_consumer_contract():
         bootstrap = services.get("rustfs-init")
         assert bootstrap is not None, f"{label} must bootstrap the Langfuse bucket through RustFS"
         assert bootstrap.get("image") == "amazon/aws-cli:2.32.6"
-        assert bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition") == "service_healthy"
+        assert (
+            bootstrap.get("depends_on", {}).get("rustfs", {}).get("condition")
+            == "service_healthy"
+        )
         bootstrap_command = str(bootstrap.get("entrypoint", ""))
         assert "aws " in bootstrap_command and "s3" in bootstrap_command
         assert "http://rustfs:9000" in bootstrap_command
@@ -193,7 +196,7 @@ def test_invariants_preserved_from_dev():
 
     assert "x-core-profiles: &core_profiles [core, full]" in out
     assert "x-full-profiles: &full_profiles [full]" in out
-    assert out.count("profiles: *core_profiles") == 7
+    assert out.count("profiles: *core_profiles") == 8
     assert out.count("profiles: *full_profiles") == 5
 
     # No service is added or dropped by the transforms.
@@ -309,7 +312,7 @@ def test_runner_network_excludes_data_tier():
 
     A hardened runner joins `curie_runner` (CURIE_DOCKER_NETWORK). Membership
     of that network is the local mirror of the K8s data-tier NetworkPolicy: the
-    stores (postgres/valkey/minio/clickhouse) must NOT be on it, so a
+    stores (postgres/valkey/rustfs/clickhouse) must NOT be on it, so a
     trusted-but-buggy bundle cannot reach their embedded credentials by service
     name, while otel-collector (telemetry), ollama (local model), and curie-api
     (state) must be, so the documented flows still resolve.

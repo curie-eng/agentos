@@ -401,7 +401,7 @@ enum DevAction {
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
     /// Runtime E2E the Helm chart on a local cluster: install a trimmed slice,
-    /// seed a bundle into MinIO, run the sandbox bundle-fetch init pair, and
+    /// seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and
     /// exec-assert the runner's view -- the one-command way to satisfy a
     /// chart/sandbox runtime acceptance criterion static checks cannot (#199,
     /// `bash scripts/chart-runtime-e2e.sh`).

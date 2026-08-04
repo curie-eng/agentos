@@ -19,10 +19,10 @@ Components deployed:
 {{- else }}
   - ClickHouse: BYO at {{ .Values.clickhouse.host }}
 {{- end }}
-{{- if .Values.minio.deploy }}
-  - MinIO ({{ .Values.minio.image }})
+{{- if .Values.rustfs.deploy }}
+  - RustFS ({{ .Values.rustfs.image }})
 {{- else }}
-  - MinIO / S3: BYO at {{ .Values.minio.host }}:{{ .Values.minio.port }}
+  - S3: BYO at {{ .Values.rustfs.host }}:{{ .Values.rustfs.port }}
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
   - OTel Collector ({{ .Values.otelCollector.image }})

@@ -54,8 +54,8 @@ flowchart TB
     Runner --> HistP --> HistImpl["StateApiTranscriptStore"]
     Worker --> ApprP --> ApprImpl["3 approver sets<br/>behind one authorizer"]
     Worker --> ScoreP --> ScoreImpl["GraderScorer<br/>TrajectoryScorer"]
-    API --> ObjP --> MinIO["MinIO / S3"]
-    Worker --> BundP --> MinIO
+    API --> ObjP --> RustFS["RustFS / S3"]
+    Worker --> BundP --> RustFS
     Worker --> DBP --> PG["Postgres"]
     Runner --> OTelP --> Coll["OTel Collector -> Langfuse"]
 ```
@@ -75,8 +75,8 @@ on that table.
 | Channel / ingress | [`interfaces/channel-ingress`](../interfaces/channel-ingress/INTERFACE.md) | Slack, CLI stub | **C, 1 impl.** The weakest line here. `QueuedTurn` is channel-neutral; egress is not. |
 | `SlackSink` | [`slack_sink.py`](../../apps/worker/src/curie_worker/slack_sink.py) | Slack `chat.update` | Egress assumes edit-in-place. A channel-neutral post/update sink is the open work. |
 | `StreamBroker` | [`broker.py`](../../apps/worker/src/curie_worker/broker.py) | redis-py / Valkey | **CLEAN, 1 impl.** Thin port at a non-sacred seam; second broker deferred by decision (ADR-0027). |
-| `ObjectStore` | [`storage.py`](../../apps/api/src/curie_api/storage.py) | MinIO / S3 | **B+.** The API's port: read + write. The non-S3 adapter is deferred until real demand (ADR-0026). |
-| `BundleReader` | [`bundle_store.py`](../../apps/worker/src/curie_worker/bundle_store.py) | MinIO / S3 | The worker's own read-only slice (`get(key) -> bytes`), a **local Protocol** — the worker deliberately does not import the API package. Two adapters hit the same backend; a second backend must satisfy both. |
+| `ObjectStore` | [`storage.py`](../../apps/api/src/curie_api/storage.py) | RustFS / S3 | **B+.** The API's port: read + write. The non-S3 adapter is deferred until real demand (ADR-0026). |
+| `BundleReader` | [`bundle_store.py`](../../apps/worker/src/curie_worker/bundle_store.py) | RustFS / S3 | The worker's own read-only slice (`get(key) -> bytes`), a **local Protocol** — the worker deliberately does not import the API package. Two adapters hit the same backend; a second backend must satisfy both. |
 | Relational DB | [`interfaces/relational-db`](../interfaces/relational-db/INTERFACE.md) | Postgres | **A-.** The swap is a DSN change, minus two Postgres-isms. |
 | `ApprovalCreator` / `ApproverSet` | [`approvals.py`](../../apps/worker/src/curie_worker/approvals.py), [`approvers.py`](../../apps/api/src/curie_api/approvers.py) | 3 approver sets, one authorizer | **CLEAN.** The governance seam ([the approval branch](message-flow.md)). |
 | `MemoryStore` | [`runner/src/curie_runner/memory.py`](../../runner/src/curie_runner/memory.py) | `StateApiMemoryStore` | **CLEAN, 1 loader.** |

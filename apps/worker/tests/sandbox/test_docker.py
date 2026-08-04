@@ -1,7 +1,7 @@
 """DockerSandboxClient: the local (no-Kubernetes) SandboxClient.
 
 The ``docker`` CLI is the one external dependency, so it is captured/stubbed; the
-argv construction, the MinIO bundle fetch + B2-aligned unwrap, and the inspect
+argv construction, the RustFS bundle fetch + B2-aligned unwrap, and the inspect
 parsing (port + operating mode) are exercised for real.
 """
 
@@ -88,7 +88,7 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
     assert mode == "ro"
     # Unwrapped: the manifest sits at the mount root, not under the wrapper dir.
     assert (Path(host_dir) / ".claude-plugin" / "plugin.json").is_file()
-    # The MinIO object key itself is not forwarded into the container env.
+    # The RustFS object key itself is not forwarded into the container env.
     assert all("CURIE_BUNDLE_REF" not in e for e in _flag_values(client.calls[0], "-e"))
 
 

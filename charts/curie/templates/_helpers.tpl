@@ -93,11 +93,11 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
-{{- define "curie.minio.host" -}}
-{{- if .Values.minio.deploy -}}
-{{- printf "%s-minio" (include "curie.fullname" .) -}}
+{{- define "curie.rustfs.host" -}}
+{{- if .Values.rustfs.deploy -}}
+{{- printf "%s-rustfs" (include "curie.fullname" .) -}}
 {{- else -}}
-{{- required "minio.deploy is false: set minio.host to your external S3-compatible endpoint" .Values.minio.host -}}
+{{- required "rustfs.deploy is false: set rustfs.host to your external S3-compatible endpoint" .Values.rustfs.host -}}
 {{- end -}}
 {{- end -}}
 
@@ -354,35 +354,35 @@ livenessProbe:
       name: {{ include "curie.secretName" . }}
       key: valkeyPassword
 - name: LANGFUSE_S3_EVENT_UPLOAD_BUCKET
-  value: {{ .Values.minio.bucket | quote }}
+  value: {{ .Values.rustfs.bucket | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_REGION
   value: auto
 - name: LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID
-  value: {{ .Values.minio.auth.rootUser | quote }}
+  value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
-      key: minioRootPassword
+      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      key: rustfsSecretKey
 - name: LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.minio.host" . }}:{{ .Values.minio.port }}
+  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 - name: LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_EVENT_UPLOAD_PREFIX
   value: events/
 - name: LANGFUSE_S3_MEDIA_UPLOAD_BUCKET
-  value: {{ .Values.minio.bucket | quote }}
+  value: {{ .Values.rustfs.bucket | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_REGION
   value: auto
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID
-  value: {{ .Values.minio.auth.rootUser | quote }}
+  value: {{ .Values.rustfs.auth.accessKey | quote }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ include "curie.secretName" . }}
-      key: minioRootPassword
+      name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
+      key: rustfsSecretKey
 - name: LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT
-  value: http://{{ include "curie.minio.host" . }}:{{ .Values.minio.port }}
+  value: http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 - name: LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE
   value: "true"
 - name: LANGFUSE_S3_MEDIA_UPLOAD_PREFIX

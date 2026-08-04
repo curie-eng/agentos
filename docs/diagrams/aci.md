@@ -40,7 +40,7 @@ flowchart LR
         direction TB
         Runner["Runner<br/>ACI server"]
         SDK["claude-agent-sdk<br/>(the harness)"]
-        Skill["skill bundle<br/>(fetched from MinIO)"]
+        Skill["skill bundle<br/>(fetched from RustFS)"]
         Cred["credential"]
         Runner --> SDK
         Skill -. loaded .-> SDK
