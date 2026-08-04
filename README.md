@@ -28,8 +28,10 @@ the same plugin bundle climbs three tiers.
 An environment difference then shows up as a bug while progressing through these tiers, not a surprise
 your users hit - letting you iterate fast locally and ship with confidence.
 
-`local` and `cluster` run immutable versioned bundles; `skill` bind mounts its working directory instead,
-so you can edit and iterate fast while building the plugin bundle.
+All three tiers run an immutable bundle snapshot: `local` and `cluster` assign that snapshot a
+version, while `skill` identifies it by its content digest. What makes `skill` the fast loop is that
+it packs and boots that snapshot straight from your working directory in one command, with no
+platform in front.
 
 Curie provides an environment guarantee while climbing the three tiers. It is not a behavior
 guarantee: production traffic can still behave differently than your test cases, and no platform can
@@ -100,8 +102,9 @@ curie skill up
 curie skill message "hello, are you there?"
 ```
 
-A real reply streams back: no Slack, no platform yet. Edit `skills/my-agent/SKILL.md` and re-run to see your
-change answered. When done run the following command
+A real reply streams back: no Slack, no platform yet. `skill up` runs an immutable snapshot of the
+bundle, so after you edit `skills/my-agent/SKILL.md` the change only reaches a running runner once you
+restart it with `curie skill up --replace`. When done run the following command
 
 ```bash
 curie skill down
@@ -158,9 +161,16 @@ Then:
 
 ```bash
 curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
-curie cluster deploy --plugin-dir .
+curie cluster deploy --plugin-dir . --repo <owner>/<name>
 curie cluster message "hello, are you there?"
 ```
+
+`--repo` binds this agent to the GitHub repository you will push this bundle to in step 4. A push
+is matched to an agent by its repo binding, so a push for an agent deployed without the binding
+matches nothing and is answered `ignored`, never becoming a version. That binding is set only when
+the agent is first created and cannot be changed afterwards, so substitute your own `owner/name`
+before running it: getting it wrong means deleting the agent and recreating it. See
+[`cli/README.md`](cli/README.md) for the lifecycle verbs.
 
 `--set security.gvisor.mode=off` skips gVisor's extra kernel isolation, which a real-model install
 otherwise requires and minikube doesn't ship by default - drop it on a cluster that has `runsc`
@@ -170,6 +180,13 @@ installed.
 fail-closed by default (skill/local aren't).
 
 See [`docs/operations.md`](docs/operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster) for cluster prerequisites and the full egress model.
+
+This first cluster is disposable. For production, keep durable data outside the cluster: set
+`postgres.deploy: false` for managed Postgres and `minio.deploy: false` for an S3 compatible object
+store, then supply their credentials through existing Kubernetes Secrets. The chart redirects its
+consumers to those stores, including bundle fetches. See the
+[`charts/curie` production storage configuration](charts/curie/README.md#values-surface-and-the-byo-idiom)
+for the complete backing store settings.
 
 Then continue this conversation thread
 
@@ -185,7 +202,10 @@ curie cluster down --yes
 
 **4. Ship it: your CI/CD**
 
-Connect this bundle's repo once (see [`docs/operations.md`](docs/operations.md#automatically-with-git-flow)), then:
+Git-flow needs the agent created with `--repo`, as step 3 showed. If you tore the cluster down at the
+end of step 3, bring it back up and re-run that same `cluster deploy` line before pushing, because the
+binding lives in the release's database. What is left is exposing the Curie API to GitHub and wiring
+the webhook and its secret (see [`docs/operations.md`](docs/operations.md#automatically-with-git-flow)), then:
 
 ```bash
 git push origin dev
@@ -222,11 +242,13 @@ in [`cli/README.md`](cli/README.md).
 | Target    | What runs                                                                                                    | Slack    | Kubernetes | Verbs                                   | Reach for it to                                                                                                                                    |
 | --------- | ------------------------------------------------------------------------------------------------------------ | -------- | ---------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `skill`   | Just the runner container on the host Docker daemon. No platform, no queue, no API, no Slack. Fully offline. | none     | none       | `up` `down` `status` `message` `eval`   | Iterate a plugin/skill against a local runner, the fastest development loop.                                                                                   |
-| `local`   | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker).                          | none     | none       | `up` `down` `status` `message` `deploy` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
-| `cluster` | The platform on Kubernetes (a Helm release).                                                                 | optional | yes        | `up` `down` `status` `message` `deploy` | Operate and drive a deployed cluster release.                                                                                                      |
+| `local`   | The full platform via docker compose (Postgres + Valkey + Langfuse + API + worker).                          | none     | none       | `up` `down` `status` `message` `eval` `deploy` | Exercise the real queue -> worker -> sandbox -> reply product loop with zero Slack and zero Kubernetes. Its API is published on host port `28000`. |
+| `cluster` | The platform on Kubernetes (a Helm release).                                                                 | optional | yes        | `up` `down` `status` `message` `eval` `deploy` | Operate and drive a deployed cluster release.                                                                                                      |
 
-The universal quartet `up`/`down`/`status`/`message` is on all three targets;
-`skill` adds `eval`, and `local`/`cluster` add `deploy`. Parity does not mean
+The table lists the verbs it covers, not every verb a target has: the universal
+quartet `up`/`down`/`status`/`message` is on all three targets, and so is
+`eval`, while `local`/`cluster` add `deploy`. See
+[`cli/README.md`](cli/README.md) for each target's verbs. Parity does not mean
 every capability is implemented at every tier: every verb is answered at every
 tier, with unsupported concepts returning a deterministic reason and an
 alternative, as defined in
@@ -293,4 +315,3 @@ an agent using Curie, not one working in this repo.
 working in this repo: the verify commands, the dev stack, the
 frozen-contract escalation rule, and the build gotchas. Each top-level
 directory also has its own scoped `CLAUDE.md` with rules specific to that area.
-
