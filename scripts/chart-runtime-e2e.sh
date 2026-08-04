@@ -437,6 +437,10 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: curie
+        app.kubernetes.io/instance: $RELEASE
     spec:
       restartPolicy: Never
       containers:
