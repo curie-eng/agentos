@@ -575,3 +575,61 @@ to install only the control plane + backing stores without the runner substrate.
   rather than a pre-warmed one; the fast path (no env) binds warm.
 - Traces flow to `<release>-otel-collector:4318` (HTTP), per the collector
   rule above; the env block is omitted when `otelCollector.deploy: false`.
+
+## Secrets at rest
+
+Curie holds real credentials in Kubernetes Secrets: the model credential, the
+Slack tokens, the GitHub App private key, and every agent's connector secrets.
+
+**Kubernetes Secrets are base64-encoded, not encrypted**, unless the cluster
+encrypts them at rest. That is a property of the cluster, not of this chart, and
+it is not detectable from inside one — a pod can read neither etcd nor the
+apiserver's `EncryptionConfiguration`. There is therefore no preflight for it,
+deliberately: a check that cannot fail correctly is worse than none, because it
+reports a pass it did not earn. The install notice says so instead.
+
+Verify it for your distribution:
+
+| | |
+|---|---|
+| k3s | `k3s secrets-encrypt status` — enable with `k3s secrets-encrypt enable` |
+| kubeadm | `--encryption-provider-config` on kube-apiserver |
+| EKS | `aws eks describe-cluster --name <c> --query cluster.encryptionConfig` |
+| GKE | on by default |
+
+### The GitHub App private key
+
+This is the most sensitive value the chart handles: it can mint read tokens for
+every repository the App is installed on. Two ways to supply it.
+
+**Recommended — a Secret you manage.** The chart only references it, so the key
+never passes through helm values and never lands in release history (helm
+retains 10 revisions by default, and `helm get values` can print them):
+
+```yaml
+api:
+  githubAppId: "1234567"
+  githubAppExistingSecret: my-github-app
+  githubAppExistingSecretKey: privateKey    # the default
+```
+
+Create that Secret however you like — `kubectl create secret generic`, External
+Secrets Operator against AWS Secrets Manager or Vault, or Sealed Secrets. This
+is the same bring-your-own idiom every backing store in this chart uses.
+
+**Quick trial — let the chart hold it.** `curie cluster github-app --app-id …
+--private-key …` puts the PEM in the chart's own Secret. Fine to prove the flow
+works; move to `githubAppExistingSecret` before you rely on it.
+
+### Rotating the key
+
+A GitHub App can hold several private keys at once, so rotation has no downtime
+and needs no coordination with any repository:
+
+1. Generate a second private key on the App's settings page — both are now valid
+2. Deploy the new one (update your Secret, or re-run `curie cluster github-app`)
+3. Delete the first key on GitHub
+
+Installations, permissions, and the App ID are untouched. This is a real
+advantage over a personal access token, where rotation means re-issuing the
+credential *and* re-authorizing what it could reach.
