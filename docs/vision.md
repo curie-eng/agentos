@@ -11,8 +11,9 @@ serve the vision below, it needs a very good reason to exist.
 The open source platform for building, running, and operating production AI
 agents. A developer authors an agent locally, tests it in a loop identical to
 production, and ships it through git flow: a pull request opens a dev agent, a
-merge promotes it to prod. Agents answer in Slack, run in isolated sandboxes,
-and get observability and evals out of the box. One command brings the whole
+merge promotes it to prod. Agents answer in Slack today — the channel is a
+swappable seam, with email and Teams next — run in isolated sandboxes, and
+get observability and evals out of the box. One command brings the whole
 thing up, locally or on any cluster.
 
 If Supabase is the box that tells a developer they need auth, storage, and a
