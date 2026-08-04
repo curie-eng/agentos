@@ -41,6 +41,7 @@ SBOM_SUFFIX = ".spdx.json"
 # The CLI targets built by the `cli-binaries` job. Keep in lockstep with its matrix.
 BINARY_ASSETS = (
     "curie-x86_64-unknown-linux-gnu",
+    "curie-aarch64-unknown-linux-gnu",
     "curie-aarch64-apple-darwin",
 )
 COMPOSE_ASSET = "compose.release.yaml"

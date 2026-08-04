@@ -25,7 +25,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "release" / "integrity.py"
 
 VERSION = "1.2.3"
-BINARIES = ("curie-x86_64-unknown-linux-gnu", "curie-aarch64-apple-darwin")
+BINARIES = (
+    "curie-x86_64-unknown-linux-gnu",
+    "curie-aarch64-unknown-linux-gnu",
+    "curie-aarch64-apple-darwin",
+)
 CHART = f"curie-{VERSION}.tgz"
 COMPOSE = "compose.release.yaml"
 ASSETS = (*BINARIES, CHART, COMPOSE)
