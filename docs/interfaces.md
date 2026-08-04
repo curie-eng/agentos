@@ -28,7 +28,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
-| Triggers | SOFT | 2 hardcoded (Slack, GH push) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
+| Triggers | SOFT | 3 hardcoded (Slack, GH push, commit poll) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
 | CLI output (agent-facing `--json`) | CLEAN | 9 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 

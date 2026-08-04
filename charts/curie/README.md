@@ -576,6 +576,34 @@ to install only the control plane + backing stores without the runner substrate.
 - Traces flow to `<release>-otel-collector:4318` (HTTP), per the collector
   rule above; the env block is omitted when `otelCollector.deploy: false`.
 
+## Deploying without inbound access
+
+A deploy is normally triggered by a GitHub webhook — an *inbound* request. A
+cluster behind a firewall or NAT cannot receive one, so on those installs
+push-to-deploy does not work at all. That is the common case for self-hosted.
+
+Outbound always works, so the API can ask instead:
+
+```yaml
+api:
+  commitPollIntervalSeconds: 60     # 0 disables it (the default)
+```
+
+It asks GitHub whether `dev_branch` and `prod_branch` have moved, for every
+repository an agent is bound to, and hands any new commit to the same
+`process_push` the webhook calls — so the two lanes cannot disagree about what a
+push means. `deploy.yaml` still decides which *agent* the push lands on.
+
+The webhook stays the fast path wherever it reaches; polling is the floor.
+Running both is safe: a poll for a push the webhook already handled is a no-op.
+
+Polling is per *repository*, not per agent — several agents share one repository
+(ADR-0091), and per-agent polling would race N deploys of the same commit.
+
+Give the platform a credential even if every repository is public: an
+unauthenticated caller gets 60 GitHub requests an hour, which a handful of
+repositories on a 60s interval exhausts in minutes.
+
 ## Serving the API over TLS
 
 The API is the only endpoint reached from outside the cluster. Two things cross
@@ -633,31 +661,81 @@ Verify it for your distribution:
 
 #### Enabling it on k3s
 
-The order matters, and getting it wrong leaves a half-configured cluster.
+Order matters, and getting it wrong leaves a half-configured cluster.
 
-The server must be started with the flag **before** `enable` is run:
+**1. Start the server with the flag.** This must come *before* `enable`:
 
 ```yaml
 # /etc/rancher/k3s/config.yaml
 secrets-encryption: true
 ```
 
-Then `systemctl restart k3s`, then `k3s secrets-encrypt enable`, then restart
-again, then `k3s secrets-encrypt reencrypt` to rewrite existing Secrets.
+```bash
+systemctl restart k3s
+```
 
-Running `enable` first, on a server started without the flag, half-succeeds:
-it writes a config the server never loads, and reports
-`missing annotation on node` followed by
-`Encryption Status: Disabled, no configuration file found`.
+Running `enable` first, on a server started without the flag, half-succeeds: it
+writes a config the server never loads, and reports `missing annotation on node`
+followed by `Encryption Status: Disabled, no configuration file found`.
 
-On k3s v1.36.2 `enable` fails outright with
-`Put ".../v1-k3s/encrypt/config": EOF` even when the prerequisite is met
-(issue #1243). Hand-writing an `aescbc` EncryptionConfiguration does work —
-the apiserver runs with `--encryption-provider-config-automatic-reload=true`,
-so no restart is needed — but understand the hazard first: **if that file is
-ever reverted to identity-only, every Secret written while encryption was
-active becomes permanently undecryptable.** Prefer keeping the most sensitive
-values out of etcd entirely, as below.
+**2. Try k3s's own command.**
+
+```bash
+k3s secrets-encrypt enable && systemctl restart k3s && k3s secrets-encrypt reencrypt
+k3s secrets-encrypt status     # expect: Encryption Status: Enabled
+```
+
+On **v1.36.2** this fails with `Put ".../v1-k3s/encrypt/config": EOF`, even with
+step 1 done (issue #1243). If it succeeded, you are finished — skip step 3.
+
+**3. If step 2 failed, write the configuration directly.**
+
+Read the hazard below first. Generate a key and write the file k3s already
+points the API server at:
+
+```bash
+head -c 32 /dev/urandom | base64          # the key; keep a copy somewhere safe
+
+cat > /var/lib/rancher/k3s/server/cred/encryption-config.json <<'JSON'
+{
+  "kind": "EncryptionConfiguration",
+  "apiVersion": "apiserver.config.k8s.io/v1",
+  "resources": [
+    {
+      "resources": ["secrets"],
+      "providers": [
+        { "aescbc": { "keys": [ { "name": "key1", "secret": "PASTE_THE_BASE64_KEY" } ] } },
+        { "identity": {} }
+      ]
+    }
+  ]
+}
+JSON
+chmod 600 /var/lib/rancher/k3s/server/cred/encryption-config.json
+```
+
+No restart is needed — k3s runs the API server with
+`--encryption-provider-config-automatic-reload=true`, which you can confirm with
+`journalctl -u k3s | grep encryption-provider-config`.
+
+`aescbc` first means new writes are encrypted; `identity` second means Secrets
+already stored in plaintext are still readable. Re-encrypt the existing ones by
+rewriting them:
+
+```bash
+kubectl get secrets -A -o json | kubectl replace -f -
+```
+
+> **Hazard, before you do this.** Once anything is written under `aescbc`, that
+> file is the only way to read it back. If it is lost, reverted to
+> identity-only, or the key changes, **every Secret written while encryption was
+> active becomes permanently undecryptable** — including the ones holding your
+> Slack tokens and model credential. Back up both the file and the key, and do
+> not let a config-management tool overwrite it.
+
+If that risk is not one you want to carry on a single-node cluster, a reasonable
+alternative is to leave encryption off and keep the most sensitive value out of
+etcd entirely, as below.
 
 ### The GitHub App private key
 
