@@ -20,7 +20,7 @@ from curie_api.models import Agent, Environment
 from curie_test_support.scaffold import scaffolded_deploy_yaml
 from plugin_format.deploy_targets import validate_deploy_targets
 
-REPO = "curie-eng/sre-bot"
+REPO = "acme-corp/acme-bot"
 
 
 def agent(name: str, repo: str | None = REPO) -> Agent:
@@ -38,11 +38,11 @@ def targets(text: str):
 DEV_AND_PROD = """
 targets:
   dev:
-    agent: sre-bot-dev
+    agent: acme-dev
     env: dev
     slack_channel: C000000A01
   prod:
-    agent: sre-bot
+    agent: acme-bot
     env: prod
     slack_channel: C000000A02
 """
@@ -54,10 +54,10 @@ targets:
 def test_a_target_naming_another_repositorys_agent_is_refused() -> None:
     # Without this, anyone who can push to repo A deploys over repo B's bot by
     # naming it in their deploy.yaml.
-    foreign = agent("sre-bot", repo="someone-else/their-bot")
+    foreign = agent("acme-bot", repo="someone-else/their-bot")
     with pytest.raises(TargetUnresolved) as caught:
         resolve_target_agent(
-            targets(DEV_AND_PROD), Environment.prod, [agent("sre-bot-dev")], foreign
+            targets(DEV_AND_PROD), Environment.prod, [agent("acme-dev")], foreign
         )
     assert caught.value.code == "deploy.agent_bound_elsewhere"
     assert "another repository" in str(caught.value)
@@ -67,7 +67,7 @@ def test_an_unknown_agent_is_refused_rather_than_created() -> None:
     # A webhook does not mint agents. Creating one would let a push conjure a
     # bot on a channel of its choosing.
     with pytest.raises(TargetUnresolved) as caught:
-        resolve_target_agent(targets(DEV_AND_PROD), Environment.prod, [agent("sre-bot-dev")], None)
+        resolve_target_agent(targets(DEV_AND_PROD), Environment.prod, [agent("acme-dev")], None)
     assert caught.value.code == "deploy.unknown_agent"
     assert "does not exist" in str(caught.value)
 
@@ -77,10 +77,10 @@ def test_an_unknown_agent_is_refused_rather_than_created() -> None:
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     ("environment", "expected"),
-    [(Environment.dev, "sre-bot-dev"), (Environment.prod, "sre-bot")],
+    [(Environment.dev, "acme-dev"), (Environment.prod, "acme-bot")],
 )
 def test_each_branch_reaches_its_own_agent(environment, expected) -> None:
-    both = [agent("sre-bot"), agent("sre-bot-dev")]
+    both = [agent("acme-bot"), agent("acme-dev")]
     resolved = resolve_target_agent(targets(DEV_AND_PROD), environment, both, None)
     assert resolved is not None and resolved.name == expected
 
@@ -89,7 +89,7 @@ def test_the_two_targets_resolve_to_different_agents() -> None:
     # The whole point of #1070. Before this, both branches resolved to whichever
     # single agent the repository row named, so a dev merge and a main merge
     # overwrote each other's active version.
-    both = [agent("sre-bot"), agent("sre-bot-dev")]
+    both = [agent("acme-bot"), agent("acme-dev")]
     dev = resolve_target_agent(targets(DEV_AND_PROD), Environment.dev, both, None)
     prod = resolve_target_agent(targets(DEV_AND_PROD), Environment.prod, both, None)
     assert dev is not None and prod is not None
@@ -103,9 +103,9 @@ def test_a_branch_with_no_matching_target_is_ignored_not_rejected() -> None:
     # A repo may deploy only prod from main and leave dev to the CLI. Ignoring
     # matches how an unmatched branch already behaves.
     prod_only = targets(
-        "targets:\n  prod:\n    agent: sre-bot\n    env: prod\n    slack_channel: C000000A02\n"
+        "targets:\n  prod:\n    agent: acme-bot\n    env: prod\n    slack_channel: C000000A02\n"
     )
-    assert resolve_target_agent(prod_only, Environment.dev, [agent("sre-bot")], None) is None
+    assert resolve_target_agent(prod_only, Environment.dev, [agent("acme-bot")], None) is None
 
 
 def test_two_targets_for_one_environment_are_refused() -> None:
@@ -113,11 +113,11 @@ def test_two_targets_for_one_environment_are_refused() -> None:
     # to an agent the author did not intend half the time.
     ambiguous = targets(
         "targets:\n"
-        "  a:\n    agent: sre-bot\n    env: prod\n    slack_channel: C000000B01\n"
+        "  a:\n    agent: acme-bot\n    env: prod\n    slack_channel: C000000B01\n"
         "  b:\n    agent: other-bot\n    env: prod\n    slack_channel: C000000B02\n"
     )
     with pytest.raises(TargetUnresolved) as caught:
-        resolve_target_agent(ambiguous, Environment.prod, [agent("sre-bot")], None)
+        resolve_target_agent(ambiguous, Environment.prod, [agent("acme-bot")], None)
     assert caught.value.code == "deploy.ambiguous_env"
 
 
@@ -126,7 +126,7 @@ def test_two_targets_for_one_environment_are_refused() -> None:
 # --------------------------------------------------------------------------- #
 def test_a_bundle_without_deploy_yaml_still_deploys_its_single_agent() -> None:
     # Back-compat. Every repo that worked before ADR-0089 must keep working.
-    only = agent("sre-bot")
+    only = agent("acme-bot")
     assert resolve_target_agent(None, Environment.prod, [only], None) is only
 
 
@@ -146,7 +146,7 @@ def test_an_empty_targets_map_still_deploys_its_single_agent() -> None:
     # `curie init` scaffolds `targets: {}`. Gating the fallback on the FILE's
     # presence instead of its CONTENT made every push from a scaffolded bundle
     # a silent no-op -- no deploy, no log line, no rejection.
-    only = agent("sre-bot")
+    only = agent("acme-bot")
     assert resolve_target_agent(targets("targets: {}\n"), Environment.dev, [only], None) is only
 
 
@@ -165,8 +165,8 @@ def test_a_deploy_yaml_of_only_comments_still_deploys_its_single_agent() -> None
     # Broader than the literal `targets: {}` key: a file whose every line is
     # commented out parses to None, which validates to the same empty map. The
     # operator sees a deploy.yaml full of guidance and a push that does nothing.
-    only = agent("sre-bot")
-    commented = "# targets:\n#   dev:\n#     agent: sre-bot-dev\n#     env: dev\n"
+    only = agent("acme-bot")
+    commented = "# targets:\n#   dev:\n#     agent: acme-dev\n#     env: dev\n"
     parsed = targets(commented)
     assert parsed.targets == {}
     assert resolve_target_agent(parsed, Environment.dev, [only], None) is only
@@ -184,6 +184,6 @@ def test_the_scaffolded_deploy_yaml_deploys_the_repositorys_single_agent() -> No
     # The regression as an operator meets it: `curie init`, push, nothing
     # happens. Pinned against the scaffold's real bytes so a change to what
     # ships lands here.
-    only = agent("sre-bot")
+    only = agent("acme-bot")
     parsed = targets(scaffolded_deploy_yaml())
     assert resolve_target_agent(parsed, Environment.dev, [only], None) is only

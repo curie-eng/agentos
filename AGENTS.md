@@ -177,10 +177,36 @@ of a real thing, never its value.
 | an EC2 instance id | `i-0123456789abcdef0` |
 | an internal hostname | `grafana.example.com` |
 | a real agent/deployment name | `acme-bot`, `acme-dev` |
+| a downstream repo or its issues | "the first adopting agent repo" |
 
-The last row is easy to overlook because a name is not a secret. It is still an
-identifier: `sre-bot` and `sre-dev` in a public docstring say what this company
-runs and what it is called. Use `acme-*` for examples.
+The last two rows are easy to overlook because a name is not a secret. It is
+still an identifier: a real bot name in a public docstring says what this
+company runs and what it is called, and a real repo slug says where. Use
+`acme-*` for names and `acme-corp/acme-bot` when a fixture needs a repo slug.
+
+**Name no downstream repository in committed files.** This repo is the
+platform; the repos that *use* it are somebody's private deployment, including
+our own. So no owner-qualified repo slug, no owner-qualified issue link, no
+branch or workflow path that only exists over there -- not in prose, not in a
+citation, not in a test fixture. A bare `#123` is this repo's own tracker and is
+fine.
+
+**Scope: tracked file content, and nothing else.** Cross-repo references are
+how you *operate* a downstream deployment -- an issue that says which repo it
+came from, a PR that links the two, a commit message that names the branch it
+fixes. That is normal practice and this rule does not touch it. gitleaks only
+reads file content in diffs; it does not scan commit messages, issue bodies, or
+PR descriptions, so nothing here gates that workflow. (Those surfaces are
+world-readable too on a public repo, so the same judgment applies -- but it is
+judgment, not a gate, and cross-repo linking is often worth it.) What this rule
+protects is the checked-in corpus: the docs, ADRs, and fixtures a stranger
+clones and reads years from now.
+
+When an ADR or a comment needs to cite that history as evidence, describe the
+role and keep the finding: "the first adopting agent repo ran a hand-written
+connector through its whole migration" carries the same weight the slug did,
+and a public reader can actually use it. The only repository this one names is
+itself (`curie-eng/curie`, and `curie-eng/agentos`, its former name).
 
 `example.com` is reserved for documentation (RFC 2606) and `*.svc.cluster.local`
 names no real host, so both are fine.
@@ -191,9 +217,37 @@ something genuinely fake that the allowlist misses, add it to the allowlist with
 a reason -- do not annotate the line with `gitleaks:allow` to silence it, since
 that hides the next real one.
 
+**Redacting an identifier is a permitted edit to an Accepted ADR.**
+[ADR 0045](docs/adr/0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
+otherwise freezes an Accepted ADR's body, and that rule stands: a stale symbol
+name or an overtaken claim stays. A real identifier is the exception, for the
+same reason clause 3 permits a pointer repair -- swapping a live name for a
+placeholder does not change what the sentence asserts, and the disclosure
+cannot be rotated away once it is public. Redact in place, keep the sentence's
+meaning, change nothing else.
+
 **Why the rule exists:** an ADR and its tests were once written using a live
 workspace's Slack channel ids as the worked example, purely because those were
 the values in front of the author. It read as perfectly normal documentation.
+The agent-name and repo-slug rows have a sharper history, and it is the reason
+they now have a gate instead of only a paragraph. The morning of 2026-07-31 a
+commit swept real agent names out of nine files and added the `acme-*` row
+above. **Five hours later** an ADR drafted that same afternoon cited the
+downstream repo by slug and issue number, and three hours after that a test
+fixture hard-coded the slug again. The rule was not stale or unknown -- it had
+just been applied, by the same hands, that day.
+
+Two things let that happen, and both are fixed above. The agent-name row was
+the only row in the table with no gitleaks rule behind it: Slack ids, AWS
+accounts, EC2 ids and hostnames were all gated, names were prose. And a repo
+slug was not in the table at all, so a pass that scrubbed *names* had no reason
+to look at `owner/repo`.
+
+The deeper trap is that a slug in an ADR does not feel like a leaked value. It
+feels like **sourcing** -- "this decision is justified because that repo had to
+do X" -- and an author writing a citation does not think the placeholder rule
+is addressed to them. It is. A citation only a maintainer can open is not
+evidence to a public reader anyway; it is a 404 with a repo name attached.
 
 ## Frozen contracts: STOP and escalate
 

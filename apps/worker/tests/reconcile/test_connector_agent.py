@@ -17,9 +17,9 @@ from curie_worker.connector_agent import (
 )
 from curie_worker.connector_reconcile import OWNER_LABEL, stamp_hash
 
-AGENT = "sre-bot"
+AGENT = "acme-bot"
 NS = "curie"
-SECRET_NAME = "curie-sre-bot-connector-secrets"
+SECRET_NAME = "curie-acme-bot-connector-secrets"
 
 
 def manifest(kind: str, name: str) -> dict[str, Any]:
@@ -78,7 +78,7 @@ def test_it_never_prunes_the_operator_supplied_secret() -> None:
     # declare it -> delete it" pass therefore deletes the credential, and every
     # connector pod fails on its next restart.
     secret = live_copy({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": SECRET_NAME}})
-    dep = manifest("Deployment", "curie-sre-bot-mcp-grafana")
+    dep = manifest("Deployment", "curie-acme-bot-mcp-grafana")
     client = FakeClient([secret, live_copy(dep)])
     source = Source(
         RenderedConnectors(

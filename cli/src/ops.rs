@@ -6232,7 +6232,7 @@ mod tests {
             resolve_github_token(None, &[], None, false),
             GithubTokenPlan::Untouched
         );
-        let no_token = serde_json::json!({"nameOverride": "sre-bot"});
+        let no_token = serde_json::json!({"nameOverride": "acme-bot"});
         assert_eq!(
             resolve_github_token(Some(&no_token), &[], None, false),
             GithubTokenPlan::Untouched
