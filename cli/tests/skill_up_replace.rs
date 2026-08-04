@@ -139,3 +139,41 @@ fn replacing_a_recorded_local_model_run_tears_down_its_sidecar_and_network() {
         "the record is cleared once what it described is gone"
     );
 }
+
+/// The ADR-0093 local-model asset preflight is exactly the kind of cheap abort
+/// the CLI's own ordering invariant (commands.rs, #747) describes: it never
+/// touches the network, only `docker image inspect` and a throwaway probe
+/// container against a volume this test guarantees cannot exist. So a refusal
+/// here must be free, the same as the `--budget` bail above, and the recorded
+/// runner must never be torn down to reach it.
+///
+/// The fabricated model reference is pid-unique so no host can ever have it
+/// pulled, and the sidecar volume name is derived from the pid-unique
+/// `--name`, so it cannot exist either: the preflight is guaranteed to refuse
+/// regardless of what is already cached on the machine running this test.
+#[test]
+fn a_local_model_preflight_refusal_leaves_the_recorded_runner_on_record() {
+    let (dir, recorded) = bundle_with_recorded_runner(false);
+    let absent_model = format!("curie-1252-absent-model-{}:latest", std::process::id());
+    let out = skill_up(&dir, &recorded, &["--local-model", &absent_model]);
+    let stderr = err_str(&out);
+
+    assert!(
+        !out.status.success(),
+        "missing local-model assets must fail the run, got success"
+    );
+    assert!(
+        stderr.contains(
+            "local model assets are not on this machine, and curie does not download them implicitly"
+        ),
+        "expected the ADR-0093 asset refusal, got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tearing down the recorded runner"),
+        "the preflight is a cheap abort and must run before any teardown; got stderr: {stderr}"
+    );
+    let still_recorded = state::load(&dir.path().join("bundle"))
+        .expect("load state")
+        .expect("--replace must not clear the record before the local-model preflight can still abort it");
+    assert_eq!(still_recorded.container_name, recorded.container_name);
+}
