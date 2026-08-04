@@ -180,7 +180,10 @@ Curie cannot detect this from inside the cluster -- please verify it yourself:
            leaves the cluster in an inconsistent state (see #1243).
   kubeadm  --encryption-provider-config on kube-apiserver
   EKS      aws eks describe-cluster --name <c> --query cluster.encryptionConfig
-  GKE      on by default (application-layer secrets encryption for db etcd)
+  GKE      etcd is encrypted at rest by default, but that is Google's own
+           storage-layer encryption. APPLICATION-layer encryption with your own
+           Cloud KMS key is separate and OFF unless you enabled it:
+             gcloud container clusters describe <c> --format='value(databaseEncryption)'
 
 For the most sensitive value -- the GitHub App private key, which can mint read
 tokens for every repository the App is installed on -- prefer a Secret you

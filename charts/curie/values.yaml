@@ -493,8 +493,13 @@ api:
   #
   # Turn this on when the cluster cannot receive GitHub webhooks -- behind a
   # firewall or NAT, which is the common case for a self-hosted install. The
-  # API then asks GitHub whether the branches deploy.yaml names have moved.
-  # Outbound works where inbound does not.
+  # API then asks GitHub whether dev_branch and prod_branch have moved, for
+  # every repository an agent is bound to. Outbound works where inbound does
+  # not.
+  #
+  # Those are the platform's two branch names, the same ones the webhook path
+  # maps -- not per-bundle names read from deploy.yaml. deploy.yaml still
+  # decides which AGENT a push lands on, downstream.
   #
   # The webhook remains the fast path wherever it reaches; polling is the
   # floor. Each pass costs one API call per repository per branch -- repos x

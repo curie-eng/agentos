@@ -290,6 +290,14 @@ A **dev-branch** push builds the artifact and fans out its eval suite as a CI
 check. A **prod-branch** push promotes that same artifact without rebuilding.
 One diagram, both branches:
 
+There are **two ways a push reaches this flow**, and they converge immediately.
+The webhook below is the fast path. The second is a timer: `CommitPoller` in the
+API asks GitHub whether the deploy branches moved and hands any new commit to
+the same `process_push`, so the two cannot disagree about what a push means. It
+is off unless `api.commitPollIntervalSeconds` is set, and it exists because a
+webhook is an INBOUND request -- a self-hosted cluster behind a firewall cannot
+receive one, while outbound always works (#1239).
+
 ```mermaid
 sequenceDiagram
     participant Dev as Developer

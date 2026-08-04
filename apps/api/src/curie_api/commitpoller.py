@@ -5,9 +5,16 @@ clusters accept no inbound traffic. A GitHub webhook cannot reach such a
 cluster, so today those installs have no push-to-deploy at all -- not a
 degraded one, none.
 
-Outbound always works. So this asks GitHub, on an interval, whether the
-branches an agent's ``deploy.yaml`` targets have moved, and runs the ordinary
-deploy when they have.
+Outbound always works. So this asks GitHub, on an interval, whether the deploy
+branches moved, and runs the ordinary deploy when they have.
+
+**Which branches: the platform's two, not the bundle's targets.** It polls
+``settings.dev_branch`` and ``settings.prod_branch`` for every bound repository
+-- the same two names ``environment_for_ref`` maps on the webhook path, so both
+lanes watch exactly the same refs. It does NOT read each bundle's
+``deploy.yaml`` to decide what to watch; ``deploy.yaml`` still decides which
+AGENT a push deploys to, downstream, inside ``process_push``. An earlier
+version of this docstring claimed otherwise (#1264).
 
 **It does not reimplement deploying.** It synthesizes the same push payload the
 webhook would have delivered and hands it to ``gitflow.process_push``. Two

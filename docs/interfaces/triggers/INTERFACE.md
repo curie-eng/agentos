@@ -1,7 +1,7 @@
 ---
 seam: Triggers
 kind: SOFT
-impls: 2 hardcoded (Slack, GH push)
+impls: 3 hardcoded (Slack, GH push, commit poll)
 grade: not separately graded
 epics:
   - "#29"
@@ -13,7 +13,7 @@ order: 17
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 2 hardcoded (Slack, GH push) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 3 hardcoded (Slack, GH push, commit poll) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -44,8 +44,17 @@ another hardcoded handler. The two that exist:
   `x_github_event`; a `"push"` event is handed to `process_push(...)`,
   everything else is `"ignored"`.
 
-The two share no abstraction: one is a Slack Bolt event listener, the other a FastAPI
-route with GitHub HMAC auth. They converge only downstream (both end up enqueuing work).
+- **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
+  a timer in the API asks GitHub whether the deploy branches moved and hands any
+  new commit to the same `process_push(...)`. Off unless
+  `api.commitPollIntervalSeconds` is set. It exists because the webhook above is
+  an INBOUND request, and a self-hosted cluster behind a firewall cannot receive
+  one at all -- outbound always works (#1239).
+
+The three share no abstraction: a Slack Bolt event listener, a FastAPI route with
+GitHub HMAC auth, and an asyncio timer. The last two converge one step earlier than
+the others -- both call `process_push`, deliberately, so the two deploy ingresses
+cannot disagree about what a push means.
 
 **Two further wake paths the inventory omitted.** Beyond the two external triggers, two
 platform-internal paths also turn an event into a run on the same `curie:runs` stream,
@@ -72,10 +81,14 @@ shape; it does not yet wire a live wake-up.
 
 ## Implementations today
 
-Two external triggers, both hardcoded, in two different processes:
+Three external triggers, all hardcoded, in two different processes:
 
 1. Slack `app_mention` in the dispatcher (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`).
 2. GitHub `push` webhook in the API (`apps/api/src/curie_api/routers/github.py::github_webhook`).
+3. Commit poll in the API (`apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`),
+   opt-in via `api.commitPollIntervalSeconds`. Timer-driven wake is therefore no longer
+   entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
+   not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
 
 Plus two platform-internal wake paths that also enqueue a run: the Slack block-action
 handler (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`) and the
