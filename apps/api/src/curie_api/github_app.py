@@ -72,6 +72,24 @@ def credentials_for(settings: Settings) -> GitHubCredentials:
     return existing
 
 
+def log_credential_path(settings: Settings) -> None:
+    """Say once, at startup, which credential the platform will clone with.
+
+    ADR-0092 said this line existed. It did not (#1262): `describe()` was never
+    called from anywhere, so an operator had no way to tell an App install from
+    a PAT install from one that will 404 on every private clone -- and two
+    tests covered the dead method, which is worse than none.
+    """
+
+    credentials = credentials_for(settings)
+    logger.info("github credential path: %s", credentials.describe())
+    warning = credentials.half_configured()
+    if warning:
+        # Above INFO deliberately: this is the state that looks configured and
+        # is not, and it is the DEFAULT shape of a partly-applied BYO Secret.
+        logger.warning("github app is half-configured: %s", warning)
+
+
 class GitHubAppError(RuntimeError):
     """The App is configured but could not produce a token."""
 
@@ -102,13 +120,47 @@ class GitHubCredentials:
         return bool(self.settings.github_app_id and self.settings.github_app_private_key)
 
     def describe(self) -> str:
-        """Which path is in use, for one startup log line. Names no secret."""
+        """Which path is in use, for one startup log line. Names no secret.
+
+        Called by `log_credential_path` below. ADR-0092 promised this line and
+        it was never emitted -- two tests covered a method nothing invoked
+        (#1262).
+        """
 
         if self.app_configured:
             return f"github app (app_id={self.settings.github_app_id})"
         if self.settings.github_token:
             return "personal access token"
         return "none (public repositories only)"
+
+    def half_configured(self) -> str | None:
+        """The App is partly set up, so the platform silently used something else.
+
+        `app_configured` needs BOTH the id and the key, and the chart always
+        renders GITHUB_APP_PRIVATE_KEY from a secretKeyRef whose default is
+        empty -- so present-but-empty is the DEFAULT state, not an absent one.
+        An operator whose external-secrets sync is still in flight, or who
+        typo'd the key name against a Secret that carries it empty, gets a
+        PAT-or-nothing platform and a 404 on the private clone. The 404 handler
+        writes a good message, but it is unreachable: the App path was never
+        entered (#1262).
+        """
+
+        if self.app_configured:
+            return None
+        if self.settings.github_app_id and not self.settings.github_app_private_key:
+            return (
+                f"github_app_id is set (app_id={self.settings.github_app_id}) but the "
+                "private key is EMPTY, so the App is not in use. A BYO Secret that "
+                "exists but is unpopulated looks exactly like this -- check the key "
+                "name and whether the sync has completed."
+            )
+        if self.settings.github_app_private_key and not self.settings.github_app_id:
+            return (
+                "a GitHub App private key is set but github_app_id is empty, "
+                "so the App is not in use."
+            )
+        return None
 
     def token_for(self, repo_full_name: str) -> str:
         """A credential able to read ``owner/repo``, or "" if none is configured.

@@ -8,6 +8,7 @@ every push or a dead token served until restart.
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -334,3 +335,64 @@ def test_a_different_configuration_gets_a_different_resolver(private_key: str) -
     assert credentials_for(app_settings(private_key)) is not credentials_for(
         Settings(github_token="ghp_other")
     )
+
+
+# --------------------------------------------------------------------------- #
+# Saying which credential is live (#1262)
+# --------------------------------------------------------------------------- #
+def test_the_startup_line_names_the_credential_path(caplog) -> None:
+    """AC1/AC3. ADR-0092 promised this line and it was never emitted.
+
+    `describe()` had two tests and no caller, so an operator could not tell an
+    App install from a PAT install from one that 404s on every private clone.
+    Removing the call from create_app must turn this red.
+    """
+
+    from curie_api.main import create_app
+
+    with caplog.at_level(logging.INFO, logger="curie_api"):
+        create_app()
+    assert any("github credential path" in r.getMessage() for r in caplog.records), (
+        "no startup line names the credential path"
+    )
+
+
+def test_a_half_configured_app_warns_rather_than_looking_unconfigured(caplog) -> None:
+    """AC2. ID set, key empty -- the DEFAULT shape of a partly-applied Secret.
+
+    `app_configured` needs both, and the chart always renders the key from a
+    secretKeyRef defaulting to empty. So a sync still in flight, or a typo'd
+    key name, silently yields a PAT-or-nothing platform and a 404 on the
+    private clone -- with nothing in the log distinguishing it from an install
+    that never configured an App at all.
+    """
+
+    from curie_api.github_app import log_credential_path
+
+    settings = Settings(github_app_id="1234567", github_app_private_key="", github_token="ghp_x")
+    with caplog.at_level(logging.INFO, logger="curie_api"):
+        log_credential_path(settings)
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a half-configured App must not look like an unconfigured one"
+    assert "1234567" in warnings[0].getMessage()
+    assert "EMPTY" in warnings[0].getMessage()
+
+
+def test_a_fully_configured_app_does_not_warn(private_key: str, caplog) -> None:
+    # Otherwise "always warn" satisfies the test above and the line becomes noise.
+    from curie_api.github_app import log_credential_path
+
+    with caplog.at_level(logging.INFO, logger="curie_api"):
+        log_credential_path(app_settings(private_key))
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_the_startup_line_carries_no_secret(private_key: str, caplog) -> None:
+    from curie_api.github_app import log_credential_path
+
+    with caplog.at_level(logging.INFO, logger="curie_api"):
+        log_credential_path(app_settings(private_key, github_token="ghp_supersecret"))
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "PRIVATE KEY" not in text
+    assert "ghp_supersecret" not in text
