@@ -260,6 +260,14 @@ WHERE a.repo_full_name IS NOT NULL AND d.commit_sha IS NOT NULL
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
+# Rejection codes worth retrying. Everything else `process_push` returns is a
+# property of the commit -- a deploy.yaml naming an unknown agent, an
+# unsupported archive, a branch with no target -- and will fail identically
+# next minute. A clone failure is the exception: the remote was unreachable,
+# not wrong.
+_TRANSIENT_REJECTIONS = frozenset({"git.archive_failed"})
+
+
 # Every repository that has at least one agent bound to it. DISTINCT because
 # several agents legitimately share one repository (ADR-0091), and polling it
 # once per agent would race N deploys of the same commit.
@@ -294,6 +302,13 @@ class CommitPoller:
         self._eval_queue = eval_queue
         self._tips = tips
         self._interval = interval_seconds
+        # (repo, branch) -> sha whose outcome was terminal and NOT a
+        # Deployment. The database cannot answer this: it records successes, so
+        # an ignored or rejected push is indistinguishable from one never
+        # attempted, and the poller re-clones it every interval forever
+        # (#1267). In memory only -- a restart re-attempting once is cheap, and
+        # persisting it would mean a schema for something a process can forget.
+        self._settled: dict[tuple[str, str], str] = {}
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -346,6 +361,11 @@ class CommitPoller:
         # to_thread because the tip reader is sync httpx: a blocking call in
         # the event loop would stall every request the API is serving.
         moves: list[Move] = await asyncio.to_thread(moves_to_deploy, targets, self._tips, deployed)
+        # Drop anything that already settled without producing a Deployment.
+        # This must happen BEFORE process_push, because the mirror clone is
+        # inside it -- at the recommended 60s interval an unchanged
+        # non-deploying branch is roughly 1,440 full clones a day (#1267).
+        moves = [m for m in moves if self._settled.get((m.repo_full_name, m.branch)) != m.sha]
 
         for move in moves:
             async with self._session_factory() as session:
@@ -356,6 +376,29 @@ class CommitPoller:
             # rejection as "deployed" at INFO is #1066 again, and this is the
             # lane with no GitHub delivery UI to fall back on.
             gitflow.log_push_outcome(result, move.as_push_payload(), source="commit poll")
+
+            if result.status in ("deployed", "promoted"):
+                # A Deployment row exists now, so the database is the memory
+                # and this must not keep a second copy that a rollback would
+                # not clear.
+                self._settled.pop((move.repo_full_name, move.branch), None)
+            elif result.status == "rejected" and any(
+                (e.get("code") or "") in _TRANSIENT_REJECTIONS for e in (result.errors or [])
+            ):
+                # The remote was unreachable, not wrong. Worth another pass --
+                # suppressing this would strand a repository on a network blip
+                # until the API restarted.
+                logger.info(
+                    "commit poll will retry repo=%s branch=%s sha=%s (transient)",
+                    move.repo_full_name,
+                    move.branch,
+                    move.sha[:8],
+                )
+            else:
+                # ignored, or rejected for a reason this commit will keep
+                # having. Remember it, or the next pass clones again (#1267).
+                self._settled[(move.repo_full_name, move.branch)] = move.sha
+
             if result.status != "rejected":
                 logger.info(
                     "commit poll deployed repo=%s branch=%s sha=%s status=%s",
