@@ -143,6 +143,7 @@ def test_unrestricted_scan_finds_secret_in_main_history(tmp_path: Path) -> None:
 
 def test_workflow_limits_log_range_to_pull_requests() -> None:
     job = _gitleaks_job()
+    assert job["name"] == "gitleaks (full history)"
     steps = job["steps"]
     assert isinstance(steps, list)
 
