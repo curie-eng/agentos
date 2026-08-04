@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -126,15 +127,75 @@ def moves_to_deploy(
     return moves
 
 
+class RateLimited(RuntimeError):
+    """GitHub asked us to wait. Carries when it is worth asking again."""
+
+    def __init__(self, repo_full_name: str, retry_after_s: float) -> None:
+        super().__init__(f"{repo_full_name}: rate limited, retry in {retry_after_s:.0f}s")
+        self.repo_full_name = repo_full_name
+        self.retry_after_s = retry_after_s
+
+
+# How many consecutive throttled passes before this stops reading like a blip.
+# A single 429 is routine; a repository throttled this many rounds running is a
+# deploy lane that has silently stopped, and must be findable as one (#1269).
+_SUSTAINED_THROTTLE_ROUNDS = 3
+
+
 class GitHubBranchTip:
-    """Reads a branch tip from the GitHub API, using the platform credential."""
+    """Reads a branch tip from the GitHub API, using the platform credential.
+
+    Honours GitHub's throttling rather than re-asking every interval (#1269).
+    An unauthenticated caller gets 60 requests/hour, so a handful of
+    repositories on a 60s interval exhausts the budget in minutes -- and the
+    naive reaction, asking again next tick, is what turns a brief throttle into
+    a permanent one.
+    """
 
     def __init__(self, settings: Settings, credentials: Any, timeout: float = 15.0) -> None:
         self._settings = settings
         self._credentials = credentials
         self._timeout = timeout
+        # Per repository: when it is worth asking again, and how many rounds in
+        # a row it has been throttled.
+        self._retry_at: dict[str, float] = {}
+        self._throttled_rounds: dict[str, int] = {}
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float:
+        """Seconds to wait, from GitHub's documented throttling headers.
+
+        GitHub sends `Retry-After` (seconds) on a secondary-rate-limit 403/429,
+        and on a primary limit sends `x-ratelimit-remaining: 0` with
+        `x-ratelimit-reset` as a UTC epoch second. Both are documented under
+        "Rate limits for the REST API"; this reads whichever is present.
+        """
+
+        raw = response.headers.get("retry-after")
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        if response.headers.get("x-ratelimit-remaining") == "0":
+            reset = response.headers.get("x-ratelimit-reset")
+            if reset:
+                try:
+                    return max(0.0, float(reset) - time.time())
+                except ValueError:
+                    pass
+        # Throttled but unparseable: wait a bounded default rather than
+        # hammering, and rather than backing off forever on a bad header.
+        return 60.0
 
     def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+        now = time.time()
+        wait_until = self._retry_at.get(repo_full_name, 0.0)
+        if now < wait_until:
+            # Still inside the window GitHub asked for. Skipping quietly is the
+            # point: re-requesting is what extends a throttle.
+            raise RateLimited(repo_full_name, wait_until - now)
+
         token = self._credentials.token_for(repo_full_name)
         headers = {
             "Accept": "application/vnd.github+json",
@@ -145,6 +206,29 @@ class GitHubBranchTip:
         url = f"{self._settings.github_api_url.rstrip('/')}/repos/{repo_full_name}/commits/{branch}"
         with httpx.Client(timeout=self._timeout) as client:
             response = client.get(url, headers=headers)
+        if response.status_code in (403, 429):
+            # Not `or 60.0`: `Retry-After: 0` is a legitimate "ask again now"
+            # and is falsy, so that idiom silently turns it into a minute --
+            # and the resulting window then suppresses the round counting
+            # below. Caught by the sustained-throttling test.
+            delay = self._retry_after_seconds(response)
+            self._retry_at[repo_full_name] = time.time() + delay
+            rounds = self._throttled_rounds.get(repo_full_name, 0) + 1
+            self._throttled_rounds[repo_full_name] = rounds
+            if rounds >= _SUSTAINED_THROTTLE_ROUNDS:
+                # Per-branch warnings read as transient. This one says the lane
+                # has stopped, which is what an operator needs to find (#1269).
+                logger.error(
+                    "commit poll throttled by GitHub for %d consecutive rounds repo=%s; "
+                    "deploys from this repository are NOT happening. Configure a GitHub "
+                    "App or token -- an unauthenticated caller gets 60 requests/hour.",
+                    rounds,
+                    repo_full_name,
+                )
+            raise RateLimited(repo_full_name, delay)
+
+        self._throttled_rounds.pop(repo_full_name, None)
+        self._retry_at.pop(repo_full_name, None)
         if response.status_code == 404:
             # A branch a deploy.yaml names but the repository does not have is
             # normal -- a repo may deploy only prod from main. Not an error.
@@ -256,11 +340,16 @@ class CommitPoller:
                 result = await gitflow.process_push(
                     session, self._store, self._settings, self._eval_queue, move.as_push_payload()
                 )
-            logger.info(
-                "commit poll deployed repo=%s branch=%s sha=%s status=%s",
-                move.repo_full_name,
-                move.branch,
-                move.sha[:8],
-                result.status,
-            )
+            # Shared with the webhook lane, not copied (#1268). Reporting a
+            # rejection as "deployed" at INFO is #1066 again, and this is the
+            # lane with no GitHub delivery UI to fall back on.
+            gitflow.log_push_outcome(result, move.as_push_payload(), source="commit poll")
+            if result.status != "rejected":
+                logger.info(
+                    "commit poll deployed repo=%s branch=%s sha=%s status=%s",
+                    move.repo_full_name,
+                    move.branch,
+                    move.sha[:8],
+                    result.status,
+                )
         return moves

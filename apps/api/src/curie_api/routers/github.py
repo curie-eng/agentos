@@ -12,7 +12,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from ..config import get_settings
 from ..deps import EvalQueueDep, SessionDep, StoreDep
-from ..gitflow import process_push, verify_signature
+from ..gitflow import log_push_outcome, process_push, verify_signature
 from ..schemas import WebhookResult
 
 logger = logging.getLogger(__name__)
@@ -86,35 +86,5 @@ async def github_webhook(
         ) from exc
 
     result = await process_push(session, store, settings, eval_queue, payload)
-    _log_outcome(result, payload)
+    log_push_outcome(result, payload, source="github webhook")
     return result
-
-
-def _log_outcome(result: WebhookResult, payload: dict[str, object]) -> None:
-    """Log a rejected push loudly. A 200 is not evidence that anything happened.
-
-    A rejected push is still acknowledged with 200, because GitHub retries and
-    redelivers on a non-2xx and the push is not going to succeed on a retry. The
-    cost is that every dashboard reports success: GitHub shows a green delivery,
-    the access log shows "POST /github/webhook 200 OK", and no agent, version, or
-    deployment appears. The reason exists only in the response body, which
-    nothing surfaces.
-
-    That combination made a broken deploy indistinguishable from a working one
-    until someone thought to open the delivery payload in GitHub's UI. Logging
-    the rejection is what makes it findable from the platform side (#1066).
-    """
-
-    if result.status != "rejected":
-        return
-    repo = payload.get("repository")
-    full_name = repo.get("full_name") if isinstance(repo, dict) else None
-    codes = [e.get("code", "?") for e in (result.errors or [])]
-    logger.warning(
-        "github webhook rejected push: repo=%s ref=%s sha=%s codes=%s errors=%s",
-        full_name,
-        payload.get("ref"),
-        str(payload.get("after"))[:12],
-        ",".join(codes) or "none",
-        result.errors,
-    )
