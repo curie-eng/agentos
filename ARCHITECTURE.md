@@ -48,7 +48,7 @@ What Curie does, in short:
 - Connect Slack.
 - Author a Claude-Code-format plugin (skills + tools + MCP) in the browser or a repo.
 - Deploy it as a bot identity.
-- Get traces, evals, budgets, and git-flow for free.
+- Get traces, evals, budgets, and git-driven deploys for free.
 
 The core loop: a Slack mention is queued, picked up by a worker that claims a
 sandboxed runner, and the runner's reply is edited back into the Slack thread.
@@ -77,7 +77,7 @@ flowchart TB
         Dispatcher["dispatcher<br/>ingress + dedupe"]
         Queue["Valkey<br/>queue + routing"]
         Worker["worker kernel<br/>one session per thread"]
-        API["api<br/>git-flow · bundles · read proxy"]
+        API["api<br/>git-driven deploy · bundles · read proxy"]
     end
 
     Sandbox["runner pod<br/>Claude Code + skill"]
@@ -343,7 +343,7 @@ sequenceDiagram
   The webhook receiver is at [`apps/api/src/curie_api/routers/github.py::github_webhook`](apps/api/src/curie_api/routers/github.py).
 - **Eval stream** `curie:evals` is produced by the API ([`apps/api/src/curie_api/evalqueue.py::EVAL_STREAM`](apps/api/src/curie_api/evalqueue.py)) and consumed by the worker's eval consumer, which is a **separate** consumer group from the runs kernel ([`apps/worker/src/curie_worker/eval/stream.py::EvalStreamConsumer`](apps/worker/src/curie_worker/eval/stream.py)). It POSTs results to `/evals/report` ([`apps/worker/src/curie_worker/eval/stream.py::EvalReporter`](apps/worker/src/curie_worker/eval/stream.py)).
 - **The eval matrix endpoint** `GET /evals/matrix` reads pass/fail from Langfuse trace tags/metadata, not a scores join ([`apps/api/src/curie_api/routers/evals.py::eval_matrix`](apps/api/src/curie_api/routers/evals.py)).
-- **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by git-flow all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
+- **The manual path** (`GET /agents`, `/agents/{id}/versions`, `/agents/{id}/versions/{vid}/bundle`) and the webhook path terminate at the same `Version`/`Deployment` tables and the same `plugin_format.validate_bundle`. As a result, a plugin authored in the browser, pushed by `curie local deploy`, or promoted by a git push all go through one pipeline. Bundle store/fetch at [`apps/api/src/curie_api/storage.py::BundleStore`](apps/api/src/curie_api/storage.py) and [`apps/api/src/curie_api/routers/bundles.py::download_bundle`](apps/api/src/curie_api/routers/bundles.py).
 
 ## One worker, two hidden seams: substrate and transport
 
@@ -608,7 +608,7 @@ rehearsal on a fresh k3s cluster (see [Deployment, CI, and release](#deployment-
 The following are built and verified:
 
 - the frozen contracts
-- the API (agents/versions/deployments, git-flow, evals, Langfuse proxy, bundle pipeline)
+- the API (agents/versions/deployments, git-driven deploys, evals, Langfuse proxy, bundle pipeline)
 - the runner
 - the dispatcher
 - the worker kernel and its four invariants

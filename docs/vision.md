@@ -10,7 +10,7 @@ serve the vision below, it needs a very good reason to exist.
 
 The open source platform for building, running, and operating production AI
 agents. A developer authors an agent locally, tests it in a loop identical to
-production, and ships it through git flow: a pull request opens a dev agent, a
+production, and ships it through git: a pull request opens a dev agent, a
 merge promotes it to prod. Agents answer in Slack today — the channel is a
 swappable seam, with email and Teams next — run in isolated sandboxes, and
 get observability and evals out of the box. One command brings the whole
@@ -62,7 +62,7 @@ Six commitments that should hold across every feature we build:
 - **The local loop is the production loop.** What a developer tests locally is
   what runs in prod, down to the sandbox and the harness. Local-first is a
   load-bearing promise, not a convenience.
-- **Git flow is the deploy model.** Branches map to bot environments; a PR is a
+- **Git is the deploy model.** Branches map to bot environments; a PR is a
   dev agent, a merge is a promotion. Shipping an agent should feel like shipping
   code, because it is.
 - **Opinionated core, swappable jobs.** One curated default for every job a
@@ -92,7 +92,7 @@ platform that grows the way Supabase and PostHog did: adoption from developers
 who want to own their agent stack instead of renting an expensive black box, a
 comparison the market makes on its own once the box is good enough. We do not
 lead with "the cheap one." We lead with "build agents as code, test them with
-evals, ship them through git flow, run them on your infrastructure with any
+evals, ship them through git, run them on your infrastructure with any
 model," and let owning your stack be the reason people arrive.
 
 The test for any feature is simple: does it make that developer's loop tighter,
