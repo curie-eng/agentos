@@ -559,6 +559,9 @@ pub struct ApplyOpts {
     /// Proceed even when the upgrade would delete a stateful component. The
     /// operator asserting the data is migrated, or expendable.
     pub allow_stateful_removal: bool,
+    /// Carry the object store's contents across a rename, instead of refusing.
+    /// `apply` then stages every object, upgrades, and loads them back.
+    pub migrate_store: bool,
 }
 
 pub struct LocalInstallationPlan {
@@ -711,15 +714,21 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
     if removed.is_empty() {
         return Ok(());
     }
-    bail!(
+    bail!("{}", stateful_removal_message(&removed))
+}
+
+/// The refusal text, factored out so its ordering is testable with no cluster.
+fn stateful_removal_message(removed: &[String]) -> String {
+    format!(
         "refusing to apply: this would DELETE {} stateful component(s) the release is \
          running, and the persistent data with them:\n  {}\n\n\
          The target chart does not render them, which usually means a chart version \
-         renamed or removed the component. Migrate the data first -- for the bundle \
-         store, every sandbox reads from it at start, so losing it breaks the next turn \
-         and not merely a rollback.\n\n\
-         Re-run with --allow-stateful-removal once the data is migrated or you accept \
-         losing it.",
+         renamed or removed the component. For the bundle store, every sandbox reads \
+         from it at start, so losing it breaks the next turn and not merely a \
+         rollback.\n\n\
+         Re-run with --migrate-store and apply will carry the data across itself: it \
+         stages every object, upgrades, loads them back, and verifies per object.\n\n\
+         Use --allow-stateful-removal only to proceed WITHOUT the data.",
         removed.len(),
         removed.join("\n  "),
     )
@@ -737,6 +746,7 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         mut local,
         chart,
         allow_stateful_removal,
+        migrate_store,
     } = opts;
     local.up.chart = chart;
     let dry_run = local.up.common.dry_run;
@@ -762,9 +772,36 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     //
     // `curie diff` learned to warn about the chart mismatch; `apply` had no
     // guard at all and would have gone ahead silently.
-    if !allow_stateful_removal {
-        guard_stateful_removal(&up).await?;
+    // `apply` handles the migration itself rather than sending the operator to a
+    // separate verb. ADR-0097's premise is that the file states whole intent and
+    // apply computes the delta; "go run this other command first, then come back
+    // and pass an override" is the opposite of that -- and it made the
+    // documented happy path include `--allow-stateful-removal`, training an
+    // operator to bypass the one guard that protects the case that is real.
+    //
+    // Still opt-in, because a store migration has a window where the store is
+    // empty and the bot cannot answer. An `apply` that changes a log level must
+    // never silently start moving data. So the refusal NAMES the flag, and
+    // passing it makes apply do the whole thing.
+    let migrating = if allow_stateful_removal {
+        false
+    } else {
+        match guard_stateful_removal(&up).await {
+            Ok(()) => false,
+            Err(e) if migrate_store => {
+                let _ = e;
+                true
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    // Stage BEFORE the upgrade deletes the old store. A failure here leaves the
+    // cluster untouched.
+    if migrating {
+        crate::migrate_store::run_export(&up.common, &up.chart, BUNDLE_BUCKET).await?;
     }
+
     let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
 
     let mut lines = match up_out {
@@ -784,12 +821,39 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     if dry_run {
         return Ok(ApplyOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
+
+    // Load the staged objects into whatever the upgrade created, and verify per
+    // object. `run_import` retains the staging pod when anything is missing, so
+    // a partial load stays recoverable.
+    if migrating {
+        let common = crate::ops::CommonOpts {
+            namespace: cfg.install.namespace.clone(),
+            release: cfg.install.release.clone(),
+            dry_run: false,
+        };
+        let imported = crate::migrate_store::run_import(&common, BUNDLE_BUCKET, false).await?;
+        if let crate::migrate_store::MigrateStoreOutput::Imported { missing, .. } = &imported {
+            if !missing.is_empty() {
+                bail!(
+                    "the upgrade applied, but {} staged object(s) did not reach the new \
+                     store. The staging pod has been kept -- it holds the only other \
+                     copy. Re-run `curie cluster migrate-store --phase import` before \
+                     deleting it.",
+                    missing.len()
+                );
+            }
+        }
+    }
+
     Ok(ApplyOutput::Applied {
         namespace: cfg.install.namespace,
         release: cfg.install.release,
         comms: configured_comms,
     })
 }
+
+/// The bundle bucket the platform reads, mirroring the chart's `BUNDLE_BUCKET`.
+const BUNDLE_BUCKET: &str = "curie-bundles";
 
 // -- curie diff ---------------------------------------------------------------
 
@@ -1101,6 +1165,33 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
         chart_target: crate::artifacts::version().to_string(),
         entries,
     })
+}
+
+#[cfg(test)]
+mod stateful_guard_message_tests {
+    /// The refusal is the only place an operator learns what to do next, so it
+    /// has to lead with the flag that KEEPS the data. Leading with
+    /// `--allow-stateful-removal` is what made the documented happy path a
+    /// safety-override, which trains the habit the guard exists to prevent.
+    #[test]
+    fn the_refusal_offers_migration_before_discarding() {
+        let msg = super::stateful_removal_message(&["acme-minio".to_string()]);
+        let migrate = msg
+            .find("--migrate-store")
+            .expect("must offer --migrate-store");
+        let discard = msg
+            .find("--allow-stateful-removal")
+            .expect("must still mention the discard flag");
+        assert!(
+            migrate < discard,
+            "the data-preserving flag must come first:\n{msg}"
+        );
+        assert!(
+            msg.contains("WITHOUT the data"),
+            "the discard flag must say what it costs:\n{msg}"
+        );
+        assert!(msg.contains("acme-minio"), "must name the component: {msg}");
+    }
 }
 
 #[cfg(test)]

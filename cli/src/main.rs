@@ -411,11 +411,20 @@ enum Command {
         /// Chart reference override, as `cluster up` takes.
         #[arg(long)]
         chart: Option<String>,
+        /// Carry the object store's contents across a chart that renames it,
+        /// instead of refusing. Apply then stages every object, upgrades, loads
+        /// them back, and verifies per object -- one command, no separate
+        /// procedure and no safety override.
+        ///
+        /// Opt-in rather than automatic because the migration has a window
+        /// where the store is empty and the bot cannot answer: an apply that
+        /// changes a log level must never silently start moving data.
+        #[arg(long)]
+        migrate_store: bool,
         /// Proceed even when the upgrade would DELETE a stateful component the
-        /// release is running, losing its data. Refused by default: a chart
-        /// that renames a store (minio -> rustfs in 0.6.0) drops the old one,
-        /// and every sandbox reads the bundle store at start, so the next turn
-        /// fails rather than merely a rollback.
+        /// release is running, WITHOUT its data. Refused by default. Prefer
+        /// --migrate-store, which keeps the data; this flag is for a store you
+        /// genuinely intend to discard.
         #[arg(long)]
         allow_stateful_removal: bool,
     },
@@ -3161,6 +3170,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             file,
             dry_run,
             chart,
+            migrate_store,
             allow_stateful_removal,
         }) => {
             let cfg = curie::installation::Installation::load(&file)?;
@@ -3178,6 +3188,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     local,
                     chart,
                     allow_stateful_removal,
+                    migrate_store,
                 })
                 .await?,
             )
