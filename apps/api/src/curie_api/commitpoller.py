@@ -260,22 +260,35 @@ WHERE a.repo_full_name IS NOT NULL AND d.commit_sha IS NOT NULL
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
-# Rejection codes worth retrying. Everything else `process_push` returns is a
-# property of the commit -- a deploy.yaml naming an unknown agent, an
-# unsupported archive, a branch with no target -- and will fail identically
-# next minute. A clone failure is the exception: the remote was unreachable,
-# not wrong.
-_TRANSIENT_REJECTIONS = frozenset({"git.archive_failed"})
+# These rejections depend on which agents are bound to the repository. They
+# settle against that binding snapshot, then get one new attempt when an
+# operator changes it without pushing a new commit (#1307).
+_TOPOLOGY_REJECTIONS = frozenset(
+    {
+        "deploy.agent_bound_elsewhere",
+        "deploy.no_targets",
+        "deploy.unknown_agent",
+    }
+)
+_ARCHIVE_FAILURE = "git.archive_failed"
 
 
-# Every repository that has at least one agent bound to it. DISTINCT because
-# several agents legitimately share one repository (ADR-0091), and polling it
-# once per agent would race N deploys of the same commit.
-_REPOS_SQL = """
-SELECT DISTINCT repo_full_name
+# Every repository binding. Grouping these rows produces both the unique poll
+# targets and the routing snapshot used to reopen a settled topology rejection.
+_BINDINGS_SQL = """
+SELECT repo_full_name, name
 FROM {schema}.agents
 WHERE repo_full_name IS NOT NULL AND repo_full_name <> ''
+ORDER BY repo_full_name, name
 """
+
+
+@dataclass(frozen=True)
+class Settled:
+    """A terminal sha, optionally only for one routing topology."""
+
+    sha: str
+    bindings: tuple[str, ...] | None
 
 
 class CommitPoller:
@@ -302,13 +315,13 @@ class CommitPoller:
         self._eval_queue = eval_queue
         self._tips = tips
         self._interval = interval_seconds
-        # (repo, branch) -> sha whose outcome was terminal and NOT a
-        # Deployment. The database cannot answer this: it records successes, so
-        # an ignored or rejected push is indistinguishable from one never
-        # attempted, and the poller re-clones it every interval forever
-        # (#1267). In memory only -- a restart re-attempting once is cheap, and
-        # persisting it would mean a schema for something a process can forget.
-        self._settled: dict[tuple[str, str], str] = {}
+        # The database records successes only. Intrinsic failures settle for
+        # the sha, while routing failures settle until the repository binding
+        # snapshot changes. In memory only, so restart can retry once.
+        self._settled: dict[tuple[str, str], Settled] = {}
+        # Archive failure gets one retry on the next pass, then settles. This
+        # bounds network failure clones without making a single blip terminal.
+        self._archive_retry: dict[tuple[str, str], str] = {}
 
     async def run_forever(self) -> None:
         logger.info("commit poller started interval=%ss", self._interval)
@@ -341,14 +354,18 @@ class CommitPoller:
         }
 
         async with self._session_factory() as session:
-            repos = [
-                str(r) for (r,) in (await session.execute(text(_REPOS_SQL.format(schema=schema))))
-            ]
+            bindings: dict[str, list[str]] = {}
+            for repo, agent_name in await session.execute(
+                text(_BINDINGS_SQL.format(schema=schema))
+            ):
+                bindings.setdefault(str(repo), []).append(str(agent_name))
             deployed: dict[tuple[str, str], str] = {}
             for repo, env, sha in await session.execute(text(_DEPLOYED_SQL.format(schema=schema))):
                 branch = branch_for_env.get(str(env))
                 if branch:
                     deployed[(str(repo), branch)] = str(sha)
+
+        binding_snapshots = {repo: tuple(names) for repo, names in bindings.items()}
 
         targets = [
             PollTarget(
@@ -356,7 +373,7 @@ class CommitPoller:
                 clone_url=gitflow.trusted_clone_url(repo, self._settings),
                 branches=tuple(branch_for_env.values()),
             )
-            for repo in repos
+            for repo in bindings
         ]
         # to_thread because the tip reader is sync httpx: a blocking call in
         # the event loop would stall every request the API is serving.
@@ -365,9 +382,21 @@ class CommitPoller:
         # This must happen BEFORE process_push, because the mirror clone is
         # inside it -- at the recommended 60s interval an unchanged
         # non-deploying branch is roughly 1,440 full clones a day (#1267).
-        moves = [m for m in moves if self._settled.get((m.repo_full_name, m.branch)) != m.sha]
+        unsettled: list[Move] = []
+        for move in moves:
+            settled = self._settled.get((move.repo_full_name, move.branch))
+            if settled is None or settled.sha != move.sha:
+                unsettled.append(move)
+                continue
+            if (
+                settled.bindings is not None
+                and settled.bindings != binding_snapshots[move.repo_full_name]
+            ):
+                unsettled.append(move)
+        moves = unsettled
 
         for move in moves:
+            key = (move.repo_full_name, move.branch)
             async with self._session_factory() as session:
                 result = await gitflow.process_push(
                     session, self._store, self._settings, self._eval_queue, move.as_push_payload()
@@ -381,23 +410,31 @@ class CommitPoller:
                 # A Deployment row exists now, so the database is the memory
                 # and this must not keep a second copy that a rollback would
                 # not clear.
-                self._settled.pop((move.repo_full_name, move.branch), None)
-            elif result.status == "rejected" and any(
-                (e.get("code") or "") in _TRANSIENT_REJECTIONS for e in (result.errors or [])
-            ):
-                # The remote was unreachable, not wrong. Worth another pass --
-                # suppressing this would strand a repository on a network blip
-                # until the API restarted.
-                logger.info(
-                    "commit poll will retry repo=%s branch=%s sha=%s (transient)",
-                    move.repo_full_name,
-                    move.branch,
-                    move.sha[:8],
-                )
+                self._settled.pop(key, None)
+                self._archive_retry.pop(key, None)
+            elif result.status == "rejected":
+                codes = {(error.get("code") or "") for error in (result.errors or [])}
+                if codes & _TOPOLOGY_REJECTIONS:
+                    self._settled[key] = Settled(
+                        move.sha, binding_snapshots[move.repo_full_name]
+                    )
+                    self._archive_retry.pop(key, None)
+                elif _ARCHIVE_FAILURE in codes and self._archive_retry.get(key) != move.sha:
+                    self._archive_retry[key] = move.sha
+                    logger.info(
+                        "commit poll will retry repo=%s branch=%s sha=%s (transient)",
+                        move.repo_full_name,
+                        move.branch,
+                        move.sha[:8],
+                    )
+                else:
+                    self._settled[key] = Settled(move.sha, None)
+                    self._archive_retry.pop(key, None)
             else:
-                # ignored, or rejected for a reason this commit will keep
-                # having. Remember it, or the next pass clones again (#1267).
-                self._settled[(move.repo_full_name, move.branch)] = move.sha
+                # An ignored outcome will keep repeating for this commit.
+                # Remember it, or the next pass clones again (#1267).
+                self._settled[key] = Settled(move.sha, None)
+                self._archive_retry.pop(key, None)
 
             if result.status != "rejected":
                 logger.info(

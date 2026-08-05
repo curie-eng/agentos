@@ -651,6 +651,79 @@ def test_a_target_naming_another_repos_agent_is_rejected_end_to_end(
     )
 
 
+def test_commit_poller_retries_after_routing_topology_is_repaired(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected sha deploys on the next pass after its target is created."""
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.schemas import AgentCreate
+
+    _register(client, auth_headers, "bootstrap_agent", "C000000R01")
+    files = {
+        **VALID_FILES,
+        "deploy.yaml": (
+            "targets:\n  dev:\n    agent: repairedagent\n"
+            "    env: dev\n    slack_channel: C000000R02\n"
+        ),
+    }
+    _, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+    settings = get_settings()
+
+    class Tips:
+        def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+            assert repo_full_name == REPO
+            return sha if branch == settings.dev_branch else None
+
+    class NoopEvalQueue:
+        async def enqueue(self, _job: Any) -> None:
+            pass
+
+    async def exercise() -> str:
+        engine = create_async_engine(settings.database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        poller = CommitPoller(
+            session_factory=maker,
+            store=client.app.state.bundle_store,
+            settings=settings,
+            eval_queue=NoopEvalQueue(),
+            tips=Tips(),
+            interval_seconds=60,
+        )
+        try:
+            first = await poller.poll_once()
+            assert [move.sha for move in first] == [sha]
+            assert "deploy.unknown_agent" in caplog.text
+
+            async with maker() as session:
+                assert await crud.list_deployments(session) == []
+                repaired = await crud.create_agent(
+                    session,
+                    AgentCreate(
+                        name="repairedagent",
+                        slack_channel="C000000R02",
+                        repo_full_name=REPO,
+                    ),
+                )
+
+            second = await poller.poll_once()
+            assert [move.sha for move in second] == [sha]
+            return str(repaired.id)
+        finally:
+            await engine.dispose()
+
+    repaired_id = asyncio.run(exercise())
+    deployments = client.get(
+        "/deployments", params={"agent_id": repaired_id}, headers=auth_headers
+    ).json()
+    assert len(deployments) == 1, deployments
+    assert deployments[0]["commit_sha"] == sha
+    assert deployments[0]["environment"] == "dev"
+
+
 # --------------------------------------------------------------------------- #
 # A scaffolded deploy.yaml declares nothing (#1210)
 # --------------------------------------------------------------------------- #
