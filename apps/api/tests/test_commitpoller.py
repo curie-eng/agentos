@@ -233,10 +233,10 @@ async def _run_poll_once(monkeypatch, result, *, on_push=None, deployed=None, ti
 
     class Session:
         async def execute(self, stmt):
-            # First query lists repos, second lists (repo, environment, sha)
-            # already deployed. Both come from the real SQL in the module.
+            # First query lists bindings, second lists deployed state. Both
+            # come from the real SQL in the module.
             if "FROM curie.agents" in str(stmt):
-                return Rows([(REPO,)])
+                return Rows([(REPO, "agent")])
             return Rows(deployed or [])
 
     @asynccontextmanager
@@ -565,7 +565,12 @@ def test_a_404_is_still_a_missing_branch(monkeypatch) -> None:
 
 # Not re-cloning a commit that already settled (#1267)
 # --------------------------------------------------------------------------- #
-async def _passes(monkeypatch, result, n: int = 2) -> int:
+async def _passes(
+    monkeypatch,
+    result,
+    n: int = 2,
+    binding_snapshots: list[tuple[str, ...]] | None = None,
+) -> int:
     """Run n consecutive poll_once passes; return how many reached the deploy path.
 
     Reaching the deploy path is what costs a full mirror clone -- the clone
@@ -584,9 +589,14 @@ async def _passes(monkeypatch, result, n: int = 2) -> int:
         calls["n"] += 1
         return result
 
+    snapshots = binding_snapshots or [("agent",)] * n
+    pass_index = {"value": 0}
+
     class Session:
         async def execute(self, stmt):
-            return [(REPO,)] if "FROM curie.agents" in str(stmt) else []
+            if "FROM curie.agents" in str(stmt):
+                return [(REPO, name) for name in snapshots[pass_index["value"]]]
+            return []
 
     @asynccontextmanager
     async def factory():
@@ -603,6 +613,7 @@ async def _passes(monkeypatch, result, n: int = 2) -> int:
     )
     for _ in range(n):
         await poller.poll_once()
+        pass_index["value"] += 1
     return calls["n"]
 
 
@@ -621,12 +632,44 @@ async def test_an_ignored_branch_is_not_recloned_every_pass(monkeypatch) -> None
 
 
 @pytest.mark.anyio
-async def test_a_permanently_rejected_commit_is_not_recloned(monkeypatch) -> None:
-    # A deploy.yaml naming an unknown agent fails identically next minute.
+async def test_an_intrinsically_rejected_commit_is_not_recloned(monkeypatch) -> None:
+    # An ambiguous environment is fixed only by changing the commit.
     from curie_api.schemas import WebhookResult
 
-    rejected = WebhookResult(status="rejected", errors=[{"code": "deploy.unknown_agent"}])
-    assert await _passes(monkeypatch, rejected) == 1
+    rejected = WebhookResult(status="rejected", errors=[{"code": "deploy.ambiguous_env"}])
+    assert await _passes(
+        monkeypatch,
+        rejected,
+        n=3,
+        binding_snapshots=[("agent",), ("agent", "new"), ("agent", "new")],
+    ) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "code",
+    [
+        "deploy.agent_bound_elsewhere",
+        "deploy.no_targets",
+        "deploy.unknown_agent",
+    ],
+)
+async def test_a_topology_rejection_waits_for_a_binding_change(monkeypatch, code: str) -> None:
+    """Stable topology suppresses clones and one binding change reopens it."""
+    from curie_api.schemas import WebhookResult
+
+    rejected = WebhookResult(status="rejected", errors=[{"code": code}])
+    assert await _passes(
+        monkeypatch,
+        rejected,
+        n=4,
+        binding_snapshots=[
+            ("agent",),
+            ("agent",),
+            ("agent", "repaired"),
+            ("agent", "repaired"),
+        ],
+    ) == 2
 
 
 @pytest.mark.anyio
@@ -641,7 +684,7 @@ async def test_a_transient_clone_failure_IS_retried(monkeypatch) -> None:
     from curie_api.schemas import WebhookResult
 
     transient = WebhookResult(status="rejected", errors=[{"code": "git.archive_failed"}])
-    assert await _passes(monkeypatch, transient) == 2
+    assert await _passes(monkeypatch, transient, n=4) == 2
 
 
 @pytest.mark.anyio
