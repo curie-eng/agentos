@@ -1014,6 +1014,29 @@ fn diff_output_validates() {
 }
 
 #[test]
+fn seal_output_validates() {
+    // Built from a real seal, so the payload is the shape the verb emits.
+    let kp = curie::sealing::generate_keypair();
+    let sealed = curie::sealing::seal(&kp.public_key, "a-real-looking-token").expect("seals");
+    let out = curie::seal::SealOutput {
+        connector: "grafana".to_string(),
+        env_name: "GRAFANA_TOKEN".to_string(),
+        sealed,
+        public_key: kp.public_key.clone(),
+    };
+    let json = out.to_json();
+    assert_valid("seal.schema.json", &json);
+
+    // The plaintext must not survive anywhere in the payload -- this is the
+    // whole point of the verb, and the payload is what gets committed.
+    let rendered = serde_json::to_string(&json).expect("serializes");
+    assert!(
+        !rendered.contains("a-real-looking-token"),
+        "the plaintext reached the --json payload: {rendered}"
+    );
+}
+
+#[test]
 fn check_output_validates() {
     // CheckOutput::to_json is `serde_json::to_value(report)`; validate that exact
     // shape against the check schema.

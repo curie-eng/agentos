@@ -3901,6 +3901,65 @@
       "name": "apply"
     },
     {
+      "about": "Encrypt a connector credential to a cluster (ADR-0094)",
+      "args": [
+        {
+          "global": false,
+          "help": "The connector in connectors.yaml that reads this value",
+          "id": "connector",
+          "long": "connector",
+          "positional": false,
+          "required": true
+        },
+        {
+          "global": false,
+          "help": "The environment variable name the connector reads it as",
+          "id": "env_name",
+          "positional": true,
+          "required": true
+        },
+        {
+          "default_values": [
+            "curie"
+          ],
+          "global": false,
+          "id": "namespace",
+          "long": "namespace",
+          "positional": false,
+          "required": false
+        },
+        {
+          "default_values": [
+            "curie"
+          ],
+          "global": false,
+          "id": "release",
+          "long": "release",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Seal against this public key instead of reading one from a cluster, so an author with no cluster access can still seal",
+          "id": "public_key",
+          "long": "public-key",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Read the value from this environment variable instead of prompting",
+          "id": "from_env",
+          "long": "from-env",
+          "positional": false,
+          "required": false
+        }
+      ],
+      "hidden": false,
+      "long_about": "Encrypt a connector credential to a cluster (ADR-0094).\n\nThe blob is safe to commit: only a cluster holding the matching private key can read it. The value is never taken as an argument -- it comes from a hidden prompt, a pipe, or `--from-env` -- so it cannot land in a shell history or the process table.",
+      "name": "seal"
+    },
+    {
       "about": "Show what `curie apply` would change about the live release (ADR-0097)",
       "args": [
         {
