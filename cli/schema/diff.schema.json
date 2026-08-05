@@ -63,12 +63,30 @@
           "to"
         ]
       }
+    },
+    "chart_deployed": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The chart the release was installed with, e.g. `curie-0.5.1`. Null when helm has no record of the release or the version could not be read."
+    },
+    "chart_target": {
+      "type": "string",
+      "description": "The chart version this CLI would apply."
+    },
+    "chart_version_differs": {
+      "type": "boolean",
+      "description": "True when the deployed chart version differs from the one this CLI would apply. The entry comparison is VALUES-ONLY and cannot see a component added, removed, or renamed between chart versions -- a renamed component's old keys appear as ordinary resets. Treat a true here as 'this diff does not describe a safe apply'."
     }
   },
   "required": [
     "namespace",
     "release",
     "release_exists",
+    "chart_deployed",
+    "chart_target",
+    "chart_version_differs",
     "changes",
     "entries"
   ]

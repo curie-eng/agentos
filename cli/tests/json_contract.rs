@@ -958,6 +958,10 @@ fn diff_output_validates() {
         namespace: "acme-bot".to_string(),
         release: "acme-bot".to_string(),
         release_exists: true,
+        // Mismatched on purpose: the real cluster ran 0.5.1 against a 0.6.0
+        // CLI, and that is the state the warning exists for.
+        chart_deployed: Some("curie-0.5.1".to_string()),
+        chart_target: "0.6.0".to_string(),
         entries: curie::installation::diff_plan(
             &std::collections::BTreeMap::from([
                 ("inference.deploy".to_string(), "true".to_string()),
@@ -1002,6 +1006,11 @@ fn diff_output_validates() {
         !rendered.contains("xoxb-live"),
         "a live secret reached the --json payload: {rendered}"
     );
+
+    // The mismatch must be machine-readable, not only a human note: an agent
+    // consumer gating on this diff has to be able to see that it does not
+    // describe a safe apply.
+    assert_eq!(json["chart_version_differs"], serde_json::json!(true));
 }
 
 #[test]

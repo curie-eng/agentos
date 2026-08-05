@@ -1091,14 +1091,95 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
 }
 
+/// Substrings that mark a chart key as carrying a credential.
+///
+/// The masking rule has to be deny-by-default, and this is what makes it so.
+/// Matching on NAME rather than on membership of a managed list is the whole
+/// point: a list only knows the keys THIS chart version manages, and anything
+/// outside it -- a key an older chart used, a key an operator set by hand --
+/// gets printed.
+///
+/// Over-masking is the safe direction. Masking `api.githubCloneBase` costs a
+/// reader one lookup; printing a password costs a rotation.
+const SECRET_KEY_MARKERS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "salt",
+    "key",
+    "auth",
+];
+
 /// Does this key's VALUE carry a secret?
 ///
 /// `helm get values` returns real passwords and tokens, so anything rendering a
 /// live release has to know which values must never reach a terminal, a log, or
-/// a `--json` consumer. Deliberately broader than [`is_preserved_by_up`]: the
-/// PAT and the model credential are secret but not preserved.
+/// a `--json` consumer.
+///
+/// This was an allowlist of managed keys, and it leaked. Run against a real
+/// release, `curie diff` printed `minio.auth.rootPassword` in full: the chart
+/// had since renamed that store to `rustfs`, so the live key matched no managed
+/// list and fell through to "ordinary value". The store was still running. The
+/// unit tests could not have caught it -- they chose their own fixture values,
+/// so the "no secret in the output" assertion compared against a plaintext the
+/// test itself invented.
+///
+/// The question is now "does this key NAME say it holds a credential?", which
+/// is true of a renamed key, a legacy key, and an operator's own `--set`, none
+/// of which any list can enumerate in advance.
 pub fn is_secret_value_key(key: &str) -> bool {
-    is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY
+    if is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY {
+        return true;
+    }
+    let lowered = key.to_ascii_lowercase();
+    SECRET_KEY_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
+/// `helm list -n <ns> -o json`, for reading the deployed chart version.
+fn helm_list_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("list"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+/// The chart the release was last installed with, e.g. `curie-0.5.1`.
+///
+/// `curie diff` compares VALUES, which says nothing about whether the chart
+/// those values feed is the same chart. On a real release this mattered: the
+/// cluster ran `curie-0.5.1`, whose object store is MinIO, while the CLI would
+/// apply `0.6.0`, where that component is `rustfs` and does not exist under the
+/// old name. A value-level diff renders that as a handful of `minio.*` resets
+/// when it is really a component swap.
+pub async fn fetch_release_chart(o: &CommonOpts) -> Result<Option<String>> {
+    let (ok, out, _err) = run_capture(&helm_list_cmd(o)).await?;
+    if !ok {
+        return Ok(None);
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(out.trim()) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    Ok(parsed
+        .as_array()
+        .and_then(|releases| {
+            releases
+                .iter()
+                .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(o.release.as_str()))
+        })
+        .and_then(|r| r.get("chart"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string))
 }
 
 /// The user-supplied values helm recorded for a release, or `None` when the
