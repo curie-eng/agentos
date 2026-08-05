@@ -1046,6 +1046,57 @@ fn resolve_github_app_values(
         .collect()
 }
 
+/// Supply the sealing keypair (ADR-0094), generating one only when safe.
+///
+/// The rules differ from [`resolve_generated_secrets`] in one place, and the
+/// difference matters:
+///
+/// - An operator `--set` always wins.
+/// - A release that already records a key gets exactly that key back. Never a
+///   new one. Regenerating would render every sealed credential in every agent
+///   repository permanently unreadable -- the #1256 preservation bug with a
+///   blast radius no store password comes close to.
+/// - A release with NO key recorded gets a fresh one, and this is where it
+///   diverges from the store passwords. For those, minting on an existing
+///   release would rotate a credential out from under a running store, so the
+///   rule is "leave it alone". For sealing there is nothing to rotate: no key
+///   means nothing has ever been sealed to this cluster, so generating one is
+///   how an existing install gains the feature.
+///
+/// The PREVIOUS key is only ever preserved, never generated: it exists solely
+/// because an operator deliberately rotated, and inventing one would claim an
+/// overlap that never happened.
+fn resolve_sealing_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let overridden = operator_set_keys(operator_sets);
+    let mut resolved = Vec::new();
+
+    if !overridden.contains(crate::sealing::SEALING_PRIVATE_KEY) {
+        match preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
+            Some(current) => {
+                resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current))
+            }
+            None => resolved.push((
+                crate::sealing::SEALING_PRIVATE_KEY.to_string(),
+                crate::sealing::generate_keypair().private_key,
+            )),
+        }
+    }
+    if !overridden.contains(crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY) {
+        if let Some(previous) =
+            preserved_value(existing, crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY)
+        {
+            resolved.push((
+                crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY.to_string(),
+                previous,
+            ));
+        }
+    }
+    resolved
+}
+
 /// Every value a plain `cluster up` must carry forward, in one place.
 ///
 /// `up` does a FULL upgrade and drops anything it does not re-pass, so each
@@ -1064,6 +1115,7 @@ fn resolve_preserved_values(
 ) -> Vec<(String, String)> {
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
+    all.extend(resolve_sealing_values(existing, operator_sets));
     all
 }
 
@@ -1331,6 +1383,111 @@ pub fn removed_stateful_components(live: &[(String, String)], rendered: &[String
         .filter(|(component, _)| !rendered.iter().any(|r| r == component))
         .map(|(_, name)| name.clone())
         .collect()
+}
+
+#[cfg(test)]
+mod sealing_preservation_tests {
+    use super::*;
+
+    fn values(json: serde_json::Value) -> serde_json::Value {
+        json
+    }
+
+    fn get<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The catastrophic case. A plain `cluster up` drops anything it does not
+    /// re-pass, and dropping this key makes every sealed credential in every
+    /// agent repository permanently unreadable.
+    #[test]
+    fn an_upgrade_re_supplies_the_existing_key_unchanged() {
+        let existing = values(serde_json::json!({
+            "sealing": {"privateKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+        }));
+        let resolved = resolve_sealing_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&resolved, crate::sealing::SEALING_PRIVATE_KEY),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            "the recorded key must come back byte-identical"
+        );
+    }
+
+    /// And it must be reachable through the composed set `up` actually calls,
+    /// not only through the family function. Unit-testing the family alone left
+    /// the WIRING uncovered for the comms and App families before (#1256).
+    #[test]
+    fn the_composed_preserved_set_carries_the_sealing_key() {
+        let existing = values(serde_json::json!({
+            "sealing": {"privateKey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="}
+        }));
+        let all = resolve_preserved_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&all, crate::sealing::SEALING_PRIVATE_KEY),
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+        );
+    }
+
+    /// A fresh install gets a usable key, or the feature never starts.
+    #[test]
+    fn a_fresh_install_generates_a_usable_key() {
+        let resolved = resolve_sealing_values(None, &[]);
+        let key = get(&resolved, crate::sealing::SEALING_PRIVATE_KEY).expect("generated");
+        let public = crate::sealing::public_key_of(key).expect("a real keypair");
+        let blob = crate::sealing::seal(&public, "value").expect("seals");
+        assert_eq!(
+            crate::sealing::open_with_any(&[key.to_string()], &blob).unwrap(),
+            "value"
+        );
+    }
+
+    /// An existing release with no key gains one -- this is how an install that
+    /// predates the feature starts using it. Safe precisely because no key
+    /// means nothing has ever been sealed to this cluster.
+    #[test]
+    fn an_existing_release_without_a_key_gains_one() {
+        let existing = values(serde_json::json!({"ui": {"deploy": false}}));
+        let resolved = resolve_sealing_values(Some(&existing), &[]);
+        assert!(get(&resolved, crate::sealing::SEALING_PRIVATE_KEY).is_some());
+    }
+
+    /// The previous key is preserved when present, so a rotation overlap
+    /// survives the upgrades that happen during it.
+    #[test]
+    fn a_rotation_in_progress_keeps_both_keys() {
+        let existing = values(serde_json::json!({"sealing": {
+            "privateKey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+            "previousPrivateKey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="
+        }}));
+        let resolved = resolve_sealing_values(Some(&existing), &[]);
+        assert_eq!(
+            get(&resolved, crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY),
+            Some("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=")
+        );
+    }
+
+    /// Never invented: a previous key claims a rotation happened.
+    #[test]
+    fn a_previous_key_is_never_generated() {
+        for existing in [None, Some(values(serde_json::json!({})))] {
+            let resolved = resolve_sealing_values(existing.as_ref(), &[]);
+            assert!(
+                get(&resolved, crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY).is_none(),
+                "an overlap that never happened must not be claimed"
+            );
+        }
+    }
+
+    /// An operator `--set` wins, as it does for every other managed family.
+    #[test]
+    fn an_operator_set_is_not_overridden() {
+        let sets = vec![format!("{}=mine", crate::sealing::SEALING_PRIVATE_KEY)];
+        let resolved = resolve_sealing_values(None, &sets);
+        assert!(get(&resolved, crate::sealing::SEALING_PRIVATE_KEY).is_none());
+    }
 }
 
 #[cfg(test)]

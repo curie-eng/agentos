@@ -75,6 +75,8 @@ rpassword = "7.5.4"
 # schemas are self-contained, so keep it lean.
 jsonschema = { version = "0.49", default-features = false }
 serde_norway = "0.9.42"
+crypto_box = { version = "0.9.1", features = ["seal", "std"] }
+base64 = "0.23.1"
 
 [dev-dependencies]
 tempfile = "3"
