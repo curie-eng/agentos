@@ -1272,20 +1272,30 @@ enum ClusterAction {
     /// start, so an empty one stops the bot answering rather than merely
     /// breaking rollbacks.
     ///
-    /// The two stores never coexist, so this runs in two phases around the
-    /// upgrade, holding the objects in a staging pod Helm does not own:
+    /// One command does the whole thing:
     ///
-    ///   curie cluster migrate-store --phase export   # before the upgrade
-    ///   curie apply -f curie.yaml                    # or helm upgrade
-    ///   curie cluster migrate-store --phase import   # after
+    ///   curie cluster migrate-store
     ///
-    /// Each phase refuses when its precondition is unmet, and `import` verifies
-    /// per object rather than by count -- a concurrent push can legitimately add
-    /// one mid-migration, and only a per-object diff tells that from data loss.
+    /// It stages every object into a pod Helm does not own, upgrades the
+    /// release, loads them into the new store, and verifies per object -- a
+    /// concurrent push can legitimately add one mid-migration, and only a
+    /// per-object diff tells that from data loss.
+    ///
+    /// Running it as one operation is the safe default because the halfway
+    /// state is an empty store, which stops the bot answering. It also means no
+    /// `--allow-stateful-removal`: that override exists so a human confirms the
+    /// data is safe, and here the command staged it itself moments earlier.
+    ///
+    /// `--phase export` / `--phase import` run a single half, for recovery when
+    /// an upgrade already happened or a run was interrupted.
     MigrateStore {
-        /// `export` before the upgrade, `import` after it.
+        /// Run only one half. Omit for the whole migration -- export, upgrade,
+        /// import and verify -- which is the safe default: the halfway state is
+        /// an empty store, and that stops the bot answering. The split phases
+        /// exist for recovery, when an upgrade already happened or a run was
+        /// interrupted.
         #[arg(long, value_parser = ["export", "import"])]
-        phase: String,
+        phase: Option<String>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie")]
         namespace: String,
@@ -2499,18 +2509,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                     release,
                     dry_run,
                 };
-                let out = if phase == "export" {
-                    let resolved = artifacts::resolve_chart(
-                        chart.as_deref(),
-                        artifacts::Channel::current(),
-                        artifacts::version(),
-                        artifacts::cache_root,
-                        std::path::Path::new("charts/curie").is_dir(),
-                    )?;
-                    let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                    ms::run_export(&common, &chart, &bucket).await?
-                } else {
-                    ms::run_import(&common, &bucket, keep_staging).await?
+                let out = match phase.as_deref() {
+                    Some("import") => ms::run_import(&common, &bucket, keep_staging).await?,
+                    other => {
+                        let resolved = artifacts::resolve_chart(
+                            chart.as_deref(),
+                            artifacts::Channel::current(),
+                            artifacts::version(),
+                            artifacts::cache_root,
+                            std::path::Path::new("charts/curie").is_dir(),
+                        )?;
+                        let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                        if other == Some("export") {
+                            ms::run_export(&common, &chart, &bucket).await?
+                        } else {
+                            ms::run_auto(&common, &chart, &bucket).await?
+                        }
+                    }
                 };
                 emit(out)
             }

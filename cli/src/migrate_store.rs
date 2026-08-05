@@ -786,3 +786,222 @@ pub async fn run_import(
         staging_kept: kept,
     })
 }
+
+// -- one-command path ---------------------------------------------------------
+
+/// `helm get values <release> -n <ns> -o yaml`, the upgrade's whole intent.
+///
+/// A file, never `--reuse-values`: reuse does not merge the NEW chart's
+/// defaults, so a chart that adds a value key fails outright on a nil pointer.
+/// Passing the captured values merges them OVER the new defaults, which also
+/// re-supplies the generated store passwords -- they must be re-passed or the
+/// upgrade rotates them out from under a running database.
+pub fn get_values_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("get"),
+            plain("values"),
+            plain(&o.release),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("yaml"),
+        ],
+    )
+}
+
+/// `helm upgrade` with the captured values.
+pub fn upgrade_cmd(o: &CommonOpts, chart: &str, values_path: &str) -> OpsCommand {
+    OpsCommand::new(
+        "helm",
+        vec![
+            plain("upgrade"),
+            plain(&o.release),
+            plain(chart),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-f"),
+            plain(values_path),
+            plain("--timeout"),
+            plain("10m"),
+        ],
+    )
+}
+
+/// Wait for the new store's StatefulSet to be ready before importing into it.
+pub fn wait_store_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("rollout"),
+            plain("status"),
+            plain(format!("statefulset/{}", store.suffix())),
+            plain("-n"),
+            plain(&o.namespace),
+        ],
+    )
+}
+
+/// Write helm values to a fresh 0600 file, created with restrictive permissions
+/// atomically so the secrets inside are never briefly world-readable.
+fn write_private_values(body: &str) -> Result<String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "curie-migrate-values-{}.yaml",
+        uuid::Uuid::new_v4()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    use std::io::Write;
+    file.write_all(body.as_bytes())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Removes the values file even when the upgrade fails.
+struct ValuesFileCleanup(String);
+
+impl Drop for ValuesFileCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Export, upgrade, import and verify as one operation.
+///
+/// The whole point of the verb. Split phases exist for recovery, but a
+/// procedure an operator runs by hand is one they can stop halfway -- and the
+/// halfway state here is an empty store, which stops the bot answering.
+///
+/// This path also removes the need to pass `--allow-stateful-removal`: that
+/// override exists so a human confirms the data is safe, and here the command
+/// staged it itself moments earlier. Making an operator bypass a safety check
+/// as a routine step teaches them to bypass it.
+pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<MigrateStoreOutput> {
+    let live: Vec<String> = crate::ops::live_stateful_components(o)
+        .await?
+        .into_iter()
+        .map(|(component, _)| component)
+        .collect();
+    let rendered = crate::ops::chart_stateful_components(chart, o, &[]).await?;
+    let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
+
+    let image = "amazon/aws-cli:2.32.6";
+    let secret = format!("{}-secrets", o.release);
+    if o.dry_run {
+        let ep = endpoint_for("<store-service>", &o.namespace);
+        let cmds = [
+            store_service_cmd(o, from),
+            create_staging_pod_cmd(o, image, &secret),
+            export_cmd(o, from, bucket, &ep),
+            get_values_cmd(o),
+            upgrade_cmd(o, chart, "<captured values>"),
+            store_service_cmd(o, to),
+            import_cmd(o, to, bucket, &ep),
+            store_listing_cmd(o, to, bucket, &ep),
+            delete_staging_pod_cmd(o),
+        ];
+        return Ok(MigrateStoreOutput::DryRun(crate::ui::DryRunPlan {
+            lines: cmds.iter().map(|c| c.display()).collect(),
+        }));
+    }
+
+    let ui = crate::ui::ui();
+
+    // 1. Stage, before anything is destroyed.
+    let exported = run_export(o, chart, bucket).await?;
+    let staged = match &exported {
+        MigrateStoreOutput::Exported { objects, .. } => *objects,
+        _ => 0,
+    };
+    ui.note(&format!("staged {staged} object(s) from {}", from.suffix()));
+
+    // 2. Capture whole intent, then upgrade with it.
+    let (ok, values, err) = crate::ops::run_capture(&get_values_cmd(o)).await?;
+    if !ok {
+        bail!("could not read the release's current values: {err}");
+    }
+    // The captured values carry the generated store passwords, so the file gets
+    // the same 0600-at-creation treatment `ops::SecretValuesFileGuard` gives the
+    // model credential, and is removed on the way out.
+    let values_path = write_private_values(&values)?;
+    let _cleanup = ValuesFileCleanup(values_path.clone());
+
+    ui.note("upgrading the release (the staged copy is safe in the staging pod)");
+    let (ok, _, err) = crate::ops::run_capture(&upgrade_cmd(o, chart, &values_path)).await?;
+    if !ok {
+        bail!(
+            "the upgrade failed, so the old store is still in place and nothing was \
+             lost. The staging pod still holds the export; delete it with \
+             `kubectl delete pod {} -n {}` once you have resolved: {err}",
+            staging_pod(&o.release),
+            o.namespace
+        );
+    }
+
+    // 3. Load the staged objects into whatever the upgrade created, and verify.
+    ui.note(&format!("importing into {}", to.suffix()));
+    run_import(o, bucket, false).await
+}
+
+#[cfg(test)]
+mod auto_tests {
+    use super::*;
+
+    fn opts() -> CommonOpts {
+        CommonOpts {
+            namespace: "acme".into(),
+            release: "acme".into(),
+            dry_run: false,
+        }
+    }
+
+    /// The upgrade must pass a values FILE. `--reuse-values` does not merge the
+    /// new chart's defaults, so a chart that adds a value key fails outright --
+    /// which is exactly what a store rename does.
+    #[test]
+    fn the_upgrade_passes_a_values_file_never_reuse_values() {
+        let cmd = upgrade_cmd(&opts(), "/charts/curie", "/tmp/v.yaml");
+        let line = cmd.display();
+        assert!(line.contains("-f /tmp/v.yaml"), "{line}");
+        assert!(
+            !line.contains("--reuse-values"),
+            "reuse-values drops the new chart's defaults: {line}"
+        );
+    }
+
+    /// Captured values carry generated store passwords; the file must not be
+    /// readable by other users, and must not survive the run.
+    #[test]
+    fn the_values_file_is_private_and_removed() {
+        let path = write_private_values("postgres:\n  auth:\n    password: s3cret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "values file must be 0600, got {mode:o}"
+            );
+        }
+        {
+            let _cleanup = ValuesFileCleanup(path.clone());
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the values file must be removed when the run ends"
+        );
+    }
+}

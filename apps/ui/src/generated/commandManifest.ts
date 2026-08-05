@@ -1978,7 +1978,7 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
-              "help": "`export` before the upgrade, `import` after it",
+              "help": "Run only one half. Omit for the whole migration -- export, upgrade, import and verify -- which is the safe default: the halfway state is an empty store, and that stops the bot answering. The split phases exist for recovery, when an upgrade already happened or a run was interrupted",
               "id": "phase",
               "long": "phase",
               "positional": false,
@@ -1986,7 +1986,7 @@ export const commandManifest = {
                 "export",
                 "import"
               ],
-              "required": true
+              "required": false
             },
             {
               "default_values": [
@@ -2055,7 +2055,7 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324).\n\nChart 0.6.0 renamed the in-cluster store from `minio` to `rustfs`. Helm does a full upgrade, so the old StatefulSet -- and the bundles in it -- are deleted. Every sandbox downloads its bundle from that store at start, so an empty one stops the bot answering rather than merely breaking rollbacks.\n\nThe two stores never coexist, so this runs in two phases around the upgrade, holding the objects in a staging pod Helm does not own:\n\ncurie cluster migrate-store --phase export   # before the upgrade curie apply -f curie.yaml                    # or helm upgrade curie cluster migrate-store --phase import   # after\n\nEach phase refuses when its precondition is unmet, and `import` verifies per object rather than by count -- a concurrent push can legitimately add one mid-migration, and only a per-object diff tells that from data loss.",
+          "long_about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324).\n\nChart 0.6.0 renamed the in-cluster store from `minio` to `rustfs`. Helm does a full upgrade, so the old StatefulSet -- and the bundles in it -- are deleted. Every sandbox downloads its bundle from that store at start, so an empty one stops the bot answering rather than merely breaking rollbacks.\n\nOne command does the whole thing:\n\ncurie cluster migrate-store\n\nIt stages every object into a pod Helm does not own, upgrades the release, loads them into the new store, and verifies per object -- a concurrent push can legitimately add one mid-migration, and only a per-object diff tells that from data loss.\n\nRunning it as one operation is the safe default because the halfway state is an empty store, which stops the bot answering. It also means no `--allow-stateful-removal`: that override exists so a human confirms the data is safe, and here the command staged it itself moments earlier.\n\n`--phase export` / `--phase import` run a single half, for recovery when an upgrade already happened or a run was interrupted.",
           "name": "migrate-store"
         },
         {
