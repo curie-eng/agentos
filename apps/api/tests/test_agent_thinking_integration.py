@@ -83,3 +83,99 @@ def test_the_api_stores_the_value_verbatim_and_does_not_validate_it(
     # provider accepts either).
     agent = _create_agent(client, auth_headers, thinking="not-a-real-value")
     assert agent["thinking"] == "not-a-real-value"
+
+
+# --- clearing the override back to the platform default (#1310) ---------------
+# The distinction these pin is not cosmetic: before this, setting `thinking` was
+# a one-way door. PATCH with null "succeeded" and changed nothing, so an operator
+# who pinned an agent to `disabled` had no way, through the API, to put it back
+# on the platform default.
+
+
+def test_patch_with_explicit_null_clears_the_override(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _create_agent(client, auth_headers, thinking="disabled")
+    assert agent["thinking"] == "disabled"
+
+    resp = client.patch(
+        f"/agents/{agent['id']}",
+        json={"thinking": None},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["thinking"] is None, "explicit null must clear the override"
+
+    # And it is durable, not just echoed back by the write response.
+    resp = client.get(f"/agents/{agent['id']}", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["thinking"] is None
+
+
+def test_omitting_thinking_still_leaves_it_untouched(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The other half of the distinction. If this regressed, every PATCH that
+    # renamed a channel would silently wipe the agent's thinking depth.
+    agent = _create_agent(client, auth_headers, thinking="adaptive")
+    resp = client.patch(
+        f"/agents/{agent['id']}",
+        json={"slack_channel": "CTHINK009"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["thinking"] == "adaptive"
+
+
+def test_the_model_override_clears_the_same_way(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # `model` is the same seam with the same defect; fixing thinking beside it
+    # and leaving this broken on an adjacent line is the drift the repo's
+    # parity-seam rule exists to stop.
+    agent = _create_agent(client, auth_headers, model="glm-5.2")
+    assert agent["model"] == "glm-5.2"
+
+    resp = client.patch(
+        f"/agents/{agent['id']}", json={"model": None}, headers=auth_headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["model"] is None
+
+    # Omission still leaves it alone.
+    agent2 = _create_agent(
+        client, auth_headers, name="model-untouched", slack_channel="CTHINK010",
+        model="kimi-k2.1",
+    )
+    resp = client.patch(
+        f"/agents/{agent2['id']}", json={"thinking": "adaptive"}, headers=auth_headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["model"] == "kimi-k2.1"
+
+
+def test_an_empty_thinking_is_refused_and_the_error_points_at_null(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # An empty string is NOT an alternate reset: it reaches the worker falsy, so
+    # no boot key is emitted at all and the MODEL's default wins -- silently
+    # skipping the platform default the operator configured. Refuse it, and say
+    # what to send instead.
+    agent = _create_agent(client, auth_headers, thinking="adaptive")
+    resp = client.patch(
+        f"/agents/{agent['id']}", json={"thinking": ""}, headers=auth_headers
+    )
+    assert resp.status_code == 422, resp.text
+    assert "null" in resp.text, f"the error must point at the real reset: {resp.text}"
+
+    # And the refusal left the stored value alone.
+    resp = client.get(f"/agents/{agent['id']}", headers=auth_headers)
+    assert resp.json()["thinking"] == "adaptive"
+
+    # Create is refused identically -- same field, same nonsense, same answer.
+    resp = client.post(
+        "/agents",
+        json={"name": "empty-thinking", "slack_channel": "CTHINK011", "thinking": "   "},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422, resp.text
