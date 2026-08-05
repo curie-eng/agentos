@@ -1182,12 +1182,36 @@ pub async fn fetch_release_chart(o: &CommonOpts) -> Result<Option<String>> {
         .map(str::to_string))
 }
 
-/// StatefulSet names the release currently owns.
+/// Has the operator told Helm to keep this resource across upgrades?
 ///
-/// StatefulSets specifically, not every workload: they are the ones carrying a
-/// PersistentVolumeClaim, so they are the ones whose disappearance loses data
-/// rather than merely restarting a process.
-pub async fn live_statefulsets(o: &CommonOpts) -> Result<Vec<String>> {
+/// `helm.sh/resource-policy: keep` is Helm's own mechanism for "do not delete
+/// this, even when the chart stops rendering it". A resource carrying it is not
+/// at risk, so flagging it would be a false alarm -- and annotating it is
+/// exactly how an operator detaches a store before a chart renames it, which is
+/// the supported way through the very migration this guard exists to stop them
+/// botching.
+pub fn helm_keeps(resource: &serde_json::Value) -> bool {
+    resource
+        .get("metadata")
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.get("helm.sh/resource-policy"))
+        .and_then(|p| p.as_str())
+        .map(|p| p.trim().eq_ignore_ascii_case("keep"))
+        .unwrap_or(false)
+}
+
+/// The COMPONENT identities of the StatefulSets the release currently owns.
+///
+/// Keyed on `app.kubernetes.io/component`, never on `metadata.name`. Resource
+/// names embed the chart fullname, so `nameOverride` alone renames every one of
+/// them -- and comparing names made a release installed with an override look
+/// like it was losing every stateful component at once. A guard that cries wolf
+/// teaches operators to pass the override flag by reflex, which is worse than
+/// no guard for the one case that is real.
+///
+/// Returns (component, resource name): the component is the identity, the name
+/// is what an operator needs to see in the error.
+pub async fn live_stateful_components(o: &CommonOpts) -> Result<Vec<(String, String)>> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -1207,23 +1231,36 @@ pub async fn live_statefulsets(o: &CommonOpts) -> Result<Vec<String>> {
         Ok(v) => v,
         Err(_) => return Ok(Vec::new()),
     };
-    let prefix = format!("{}-", o.release);
-    Ok(parsed
-        .get("items")
+    Ok(stateful_components_from_list(&parsed))
+}
+
+/// The pure half of [`live_stateful_components`]: a kubectl List in, the
+/// at-risk components out.
+///
+/// Split out so the `helm.sh/resource-policy: keep` filter is covered by a test
+/// that fails when the filter is REMOVED. Testing `helm_keeps` alone did not:
+/// deleting its call site left every test green, which is the same vacuous
+/// shape that hid three earlier bugs in this file's history.
+pub fn stateful_components_from_list(list: &serde_json::Value) -> Vec<(String, String)> {
+    list.get("items")
         .and_then(|i| i.as_array())
         .map(|items| {
             items
                 .iter()
+                .filter(|i| !helm_keeps(i))
                 .filter_map(|i| {
-                    i.get("metadata")
-                        .and_then(|m| m.get("name"))
-                        .and_then(|n| n.as_str())
+                    let component = i
+                        .get("spec")?
+                        .get("selector")?
+                        .get("matchLabels")?
+                        .get("app.kubernetes.io/component")?
+                        .as_str()?;
+                    let name = i.get("metadata")?.get("name")?.as_str()?;
+                    Some((component.to_string(), name.to_string()))
                 })
-                .filter(|name| name.starts_with(&prefix))
-                .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// StatefulSet names the target chart would render for this release.
@@ -1231,7 +1268,7 @@ pub async fn live_statefulsets(o: &CommonOpts) -> Result<Vec<String>> {
 /// `helm template` rather than a dry-run upgrade: it needs no cluster and
 /// cannot mutate, so the guard is safe to run before deciding whether to
 /// proceed.
-pub async fn chart_statefulsets(
+pub async fn chart_stateful_components(
     chart: &str,
     o: &CommonOpts,
     value_sets: &[String],
@@ -1251,16 +1288,16 @@ pub async fn chart_statefulsets(
     if !ok {
         bail!("could not render the target chart to check for removed stateful components: {err}");
     }
-    Ok(parse_statefulset_names(&out))
+    Ok(parse_statefulset_components(&out))
 }
 
-/// StatefulSet names in a multi-document helm render.
+/// The component identities of StatefulSets in a multi-document helm render.
 ///
 /// Split-and-parse rather than a regex: a `kind: StatefulSet` line can appear
 /// inside an annotation or a ConfigMap payload, and matching that would invent
 /// a component the chart does not actually create.
-pub fn parse_statefulset_names(rendered: &str) -> Vec<String> {
-    let mut names = Vec::new();
+pub fn parse_statefulset_components(rendered: &str) -> Vec<String> {
+    let mut components = Vec::new();
     for doc in rendered.split("\n---") {
         let Ok(value) = serde_norway::from_str::<serde_json::Value>(doc) else {
             continue;
@@ -1268,26 +1305,31 @@ pub fn parse_statefulset_names(rendered: &str) -> Vec<String> {
         if value.get("kind").and_then(|k| k.as_str()) != Some("StatefulSet") {
             continue;
         }
-        if let Some(name) = value
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-        {
-            if !names.iter().any(|n: &String| n == name) {
-                names.push(name.to_string());
+        let component = value
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(|l| l.get("app.kubernetes.io/component"))
+            .and_then(|c| c.as_str());
+        if let Some(component) = component {
+            if !components.iter().any(|c: &String| c == component) {
+                components.push(component.to_string());
             }
         }
     }
-    names
+    components
 }
 
 /// Live stateful components the target chart would not recreate.
 ///
+/// Compares COMPONENTS; reports the resource NAMES, which is what an operator
+/// recognises in their own cluster.
+///
 /// Pure, so the decision this guard turns on is testable without a cluster.
-pub fn removed_stateful_components(live: &[String], rendered: &[String]) -> Vec<String> {
+pub fn removed_stateful_components(live: &[(String, String)], rendered: &[String]) -> Vec<String> {
     live.iter()
-        .filter(|name| !rendered.iter().any(|r| r == *name))
-        .cloned()
+        .filter(|(component, _)| !rendered.iter().any(|r| r == component))
+        .map(|(_, name)| name.clone())
         .collect()
 }
 
@@ -1295,27 +1337,24 @@ pub fn removed_stateful_components(live: &[String], rendered: &[String]) -> Vec<
 mod stateful_guard_tests {
     use super::*;
 
-    /// A helm render is multi-document, and the guard has to read it as one.
+    fn render(component: &str, name: &str) -> String {
+        format!(
+            "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: {name}\nspec:\n  \
+             selector:\n    matchLabels:\n      app.kubernetes.io/component: {component}\n"
+        )
+    }
+
     #[test]
-    fn statefulset_names_come_from_the_render() {
-        let rendered = "\
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: sre-bot-rustfs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sre-bot-rustfs
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: sre-bot-postgres
-";
-        let names = parse_statefulset_names(rendered);
-        assert_eq!(names, vec!["sre-bot-rustfs", "sre-bot-postgres"]);
+    fn components_come_from_the_render() {
+        let rendered = format!(
+            "{}\n---\n{}",
+            render("rustfs", "sre-bot-curie-rustfs"),
+            render("postgres", "sre-bot-curie-postgres")
+        );
+        assert_eq!(
+            parse_statefulset_components(&rendered),
+            vec!["rustfs", "postgres"]
+        );
     }
 
     /// `kind: StatefulSet` inside a ConfigMap payload is data, not a component.
@@ -1333,37 +1372,137 @@ data:
     metadata:
       name: not-a-real-component
 ";
-        assert!(parse_statefulset_names(rendered).is_empty());
+        assert!(parse_statefulset_components(rendered).is_empty());
     }
 
-    /// The exact shape that would have destroyed the bundle store: the release
-    /// runs minio, the target chart renders rustfs, so minio is a removal.
+    /// The real case: the release runs minio, chart 0.6.0 renders rustfs.
     #[test]
     fn a_renamed_store_is_reported_as_a_removal() {
-        let live = vec!["sre-bot-minio".to_string(), "sre-bot-postgres".to_string()];
-        let rendered = vec!["sre-bot-rustfs".to_string(), "sre-bot-postgres".to_string()];
+        let live = vec![
+            ("minio".to_string(), "sre-bot-minio".to_string()),
+            ("postgres".to_string(), "sre-bot-postgres".to_string()),
+        ];
+        let rendered = vec!["rustfs".to_string(), "postgres".to_string()];
         assert_eq!(
             removed_stateful_components(&live, &rendered),
-            vec!["sre-bot-minio"]
+            vec!["sre-bot-minio"],
+            "only the renamed store is lost, and it is named as the operator sees it"
         );
+    }
+
+    /// The false positive that a live run exposed, pinned so it cannot return.
+    ///
+    /// This release was installed with `nameOverride=sre-bot`, so every resource
+    /// is `sre-bot-<component>` while the chart renders `sre-bot-curie-<component>`.
+    /// Comparing NAMES reported all four as removals -- postgres, valkey and
+    /// clickhouse included -- which would have taught the operator to pass
+    /// --allow-stateful-removal by reflex and lose minio for real.
+    #[test]
+    fn a_name_override_does_not_make_every_component_look_removed() {
+        let live = vec![
+            ("clickhouse".to_string(), "sre-bot-clickhouse".to_string()),
+            ("minio".to_string(), "sre-bot-minio".to_string()),
+            ("postgres".to_string(), "sre-bot-postgres".to_string()),
+            ("valkey".to_string(), "sre-bot-valkey".to_string()),
+        ];
+        // What the chart renders WITHOUT the override: different names entirely.
+        let rendered = vec![
+            "clickhouse".to_string(),
+            "postgres".to_string(),
+            "rustfs".to_string(),
+            "valkey".to_string(),
+        ];
+        assert_eq!(
+            removed_stateful_components(&live, &rendered),
+            vec!["sre-bot-minio"],
+            "differing resource names must not be mistaken for removed components"
+        );
+    }
+
+    /// The WIRING, not just the predicate. Removing the `helm_keeps` filter from
+    /// `stateful_components_from_list` leaves every `helm_keeps` unit test green
+    /// -- that mutation survived, so this test exists to kill it.
+    #[test]
+    fn a_kept_component_is_excluded_from_the_at_risk_list() {
+        let list = serde_json::json!({"items": [
+            {
+                "metadata": {
+                    "name": "sre-bot-minio",
+                    "annotations": {"helm.sh/resource-policy": "keep"}
+                },
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "sre-bot-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            }
+        ]});
+        let at_risk = stateful_components_from_list(&list);
+        assert_eq!(
+            at_risk,
+            vec![("postgres".to_string(), "sre-bot-postgres".to_string())],
+            "a component annotated keep is not at risk and must not be listed"
+        );
+    }
+
+    /// And the same list WITHOUT the annotation must still surface it, or the
+    /// test above would pass against a function that returns nothing at all.
+    #[test]
+    fn an_unannotated_component_is_still_at_risk() {
+        let list = serde_json::json!({"items": [
+            {
+                "metadata": {"name": "sre-bot-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            }
+        ]});
+        assert_eq!(
+            stateful_components_from_list(&list),
+            vec![("minio".to_string(), "sre-bot-minio".to_string())]
+        );
+    }
+
+    /// Helm's own opt-out. A store annotated `keep` survives the upgrade, so
+    /// flagging it is a false alarm -- and annotating it is precisely how an
+    /// operator detaches a store before a chart renames it.
+    #[test]
+    fn a_resource_helm_is_told_to_keep_is_not_at_risk() {
+        for value in ["keep", "Keep", " keep "] {
+            let kept = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(helm_keeps(&kept), "{value:?} must read as keep");
+        }
+    }
+
+    /// The escape must be narrow: everything else is still at risk.
+    #[test]
+    fn other_resource_policies_do_not_count_as_kept() {
+        for value in ["delete", "", "keepalive"] {
+            let r = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(!helm_keeps(&r), "{value:?} must not read as keep");
+        }
+        assert!(!helm_keeps(&serde_json::json!({"metadata": {}})));
     }
 
     /// The guard must stay quiet on an ordinary upgrade, or it becomes a flag
     /// everyone passes by reflex and protects nothing.
     #[test]
     fn an_unchanged_component_set_is_not_a_removal() {
-        let same = vec!["sre-bot-postgres".to_string(), "sre-bot-minio".to_string()];
-        assert!(removed_stateful_components(&same, &same).is_empty());
+        let live = vec![
+            ("postgres".to_string(), "r-postgres".to_string()),
+            ("minio".to_string(), "r-minio".to_string()),
+        ];
+        let rendered = vec!["postgres".to_string(), "minio".to_string()];
+        assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 
     /// A chart ADDING a store is not a removal.
     #[test]
     fn a_new_component_is_not_a_removal() {
-        let live = vec!["sre-bot-postgres".to_string()];
-        let rendered = vec![
-            "sre-bot-postgres".to_string(),
-            "sre-bot-clickhouse".to_string(),
-        ];
+        let live = vec![("postgres".to_string(), "r-postgres".to_string())];
+        let rendered = vec!["postgres".to_string(), "clickhouse".to_string()];
         assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 }
