@@ -959,14 +959,17 @@ fn diff_output_validates() {
         release: "acme-bot".to_string(),
         release_exists: true,
         entries: curie::installation::diff_plan(
-            &std::collections::BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
+            &std::collections::BTreeMap::from([
+                ("inference.deploy".to_string(), "true".to_string()),
+                ("ui.deploy".to_string(), "false".to_string()),
+                ("worker.replicas".to_string(), "2".to_string()),
+            ]),
             Some(&serde_json::json!({
                 "ui": {"deploy": true},
                 "dispatcher": {"slack": {"botToken": "xoxb-live"}},
                 "inference": {"deploy": true},
                 "agentSandbox": {"runner": {"fakeModel": false}},
             })),
-            &|k| k == "agentSandbox.runner.fakeModel",
         ),
     };
     let json = out.to_json();
@@ -981,10 +984,11 @@ fn diff_output_validates() {
         .map(|e| e["kind"].as_str().expect("kind is a string"))
         .collect();
     for expected in [
+        "add",
         "change",
+        "unchanged",
         "preserved",
         "reset to chart default",
-        "managed by this file",
     ] {
         assert!(
             kinds.contains(&expected),

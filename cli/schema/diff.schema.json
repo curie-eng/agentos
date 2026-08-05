@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.curietech.ai/cli/diff/v1.json",
   "title": "curie diff --json",
-  "description": "The agent-facing payload of `curie diff`: every chart value the installation file and the live release disagree about, plus the values the release carries that the file does not declare. Read-only; no credential is resolved. Secret-bearing values are rendered as the literal string `<secret>` and never in the clear.",
+  "description": "The agent-facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Declared credentials and provider addresses are resolved to construct the same plan used by apply, but no cluster state is mutated. Secret-bearing values are rendered as the literal string `<secret>` and never in the clear.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -37,10 +37,9 @@
               "change",
               "unchanged",
               "preserved",
-              "managed by this file",
               "reset to chart default"
             ],
-            "description": "`preserved` means the release carries this value, the file does not declare it, and a plain `cluster up` re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). `managed by this file` means the file governs the key but its value is computed at apply time rather than stated literally (a resolved egress CIDR, the model credential and the fake-model switch it rides with). Neither is a pending removal. `reset to chart default` is the genuine loss case: undeclared, not governed, and not carried forward."
+            "description": "`preserved` means the release carries this value, the plan does not declare it, and apply re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). It is not a pending removal. `reset to chart default` is the genuine loss case: undeclared and not carried forward."
           },
           "from": {
             "type": [
