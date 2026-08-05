@@ -160,6 +160,12 @@
       "version": 1
     },
     {
+      "result": "MigrateStoreOutput",
+      "kind": "CliOutput",
+      "schema": "migrate-store.schema.json",
+      "version": 1
+    },
+    {
       "result": "ObservabilityOutput",
       "kind": "CliOutput",
       "schema": "observability.schema.json",

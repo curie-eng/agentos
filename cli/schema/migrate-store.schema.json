@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/migrate-store/v1.json",
+  "title": "curie cluster migrate-store --json",
+  "description": "The agent-facing payload of `curie cluster migrate-store`: the dry-run plan, the result of staging objects out of the old store, or the result of loading them into the new one. One object per invocation.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": { "const": true },
+        "plan": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["dry_run", "plan"]
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/dryRun" },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": { "const": "export" },
+        "from": { "type": "string", "description": "Store component copied out of, e.g. `minio`." },
+        "to": { "type": "string", "description": "Store component the target chart renders, e.g. `rustfs`." },
+        "objects": { "type": "integer", "minimum": 1, "description": "Objects staged. Zero is an error, never a successful export." }
+      },
+      "required": ["phase", "from", "to", "objects"]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "phase": { "const": "import" },
+        "store": { "type": "string" },
+        "objects": { "type": "integer", "minimum": 0, "description": "Objects in the new store after the import." },
+        "missing": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Staged objects absent from the new store, or present at a different size. Non-empty means data loss; the staging pod is retained so a retry is possible."
+        },
+        "added": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Objects in the new store that were not staged. Benign -- a deploy landing mid-migration writes directly to the new store -- but reported so it is not mistaken for a discrepancy."
+        },
+        "verified": { "type": "boolean", "description": "True when `missing` is empty." },
+        "staging_kept": { "type": "boolean", "description": "Whether the staging pod was retained. Always true when anything is missing." }
+      },
+      "required": ["phase", "store", "objects", "missing", "added", "verified", "staging_kept"]
+    }
+  ]
+}

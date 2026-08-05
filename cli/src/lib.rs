@@ -23,6 +23,7 @@ pub mod installation;
 pub mod interactive;
 pub mod local;
 pub mod message;
+pub mod migrate_store;
 pub mod ndjson;
 pub mod observability;
 pub mod ops;
