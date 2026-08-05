@@ -644,6 +644,460 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     })
 }
 
+// -- curie diff ---------------------------------------------------------------
+
+/// How one chart value relates the file to the live release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// The file declares it; the release has no record of it.
+    Add,
+    /// Both have it, with different values.
+    Change,
+    /// Both agree. Reported so `diff` can show the whole intent, not just deltas.
+    Same,
+    /// Only the release has it, and a plain `up` carries it forward untouched.
+    /// NOT a removal -- see [`crate::ops::is_preserved_by_up`].
+    Preserved,
+    /// Only the release has it, and `apply` would reset it to the chart default.
+    Reset,
+}
+
+impl DiffKind {
+    /// The leading glyph. `~`/`+` are diff conventions; `!` marks the one kind
+    /// that loses configuration, so it does not read as ordinary noise.
+    pub fn marker(self) -> char {
+        match self {
+            DiffKind::Add => '+',
+            DiffKind::Change => '~',
+            DiffKind::Same => '=',
+            DiffKind::Preserved => '=',
+            DiffKind::Reset => '!',
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DiffKind::Add => "add",
+            DiffKind::Change => "change",
+            DiffKind::Same => "unchanged",
+            DiffKind::Preserved => "preserved",
+            DiffKind::Reset => "reset to chart default",
+        }
+    }
+
+    /// Would applying this file change the cluster?
+    pub fn is_change(self) -> bool {
+        matches!(self, DiffKind::Add | DiffKind::Change | DiffKind::Reset)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffEntry {
+    pub key: String,
+    pub kind: DiffKind,
+    /// The live value, already masked when the key carries a secret.
+    pub from: Option<String>,
+    /// The declared value, already masked when the key carries a secret.
+    pub to: Option<String>,
+}
+
+/// Flatten `helm get values -o json` into the dotted keys `--set` speaks.
+///
+/// Helm returns nested objects; the file and `up` both express values as dotted
+/// paths. Comparing the two shapes directly would report every key as missing.
+///
+/// Arrays are rendered with helm's own `key[i]` indexing rather than descended
+/// into as objects, so a declared `security.networkPolicy.allowedEgress[0].cidr`
+/// lines up with what a prior `--set` recorded.
+pub fn flatten_values(value: &serde_json::Value, prefix: &str, out: &mut BTreeMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten_values(v, &key, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                flatten_values(v, &format!("{prefix}[{i}]"), out);
+            }
+        }
+        serde_json::Value::Null => {}
+        other => {
+            let rendered = match other {
+                serde_json::Value::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+            out.insert(prefix.to_string(), rendered);
+        }
+    }
+}
+
+/// What a value may be shown as. A secret is never rendered, not even partially:
+/// this output goes to a terminal, a log, and a `--json` consumer.
+fn display_value(key: &str, value: &str) -> String {
+    if crate::ops::is_secret_value_key(key) {
+        "<secret>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Compare what the file declares against what the release records.
+///
+/// Pure: no cluster, no helm, no clock. The caller supplies both sides.
+///
+/// The `Preserved` classification is the point of the whole function. A cluster
+/// stood up by flags carries Slack tokens, a GitHub App, and generated store
+/// passwords that `curie.yaml` does not mention -- and `up` re-supplies every
+/// one of them. Calling those removals would make `diff` lie in the one
+/// situation it exists for: the operator deciding whether it is safe to adopt
+/// the file at all.
+pub fn diff_plan(
+    declared: &BTreeMap<String, String>,
+    live: Option<&serde_json::Value>,
+) -> Vec<DiffEntry> {
+    let mut current = BTreeMap::new();
+    if let Some(values) = live {
+        flatten_values(values, "", &mut current);
+    }
+
+    let mut entries: Vec<DiffEntry> = Vec::new();
+
+    for (key, want) in declared {
+        let kind = match current.get(key) {
+            None => DiffKind::Add,
+            Some(have) if have == want => DiffKind::Same,
+            Some(_) => DiffKind::Change,
+        };
+        entries.push(DiffEntry {
+            key: key.clone(),
+            kind,
+            from: current.get(key).map(|v| display_value(key, v)),
+            to: Some(display_value(key, want)),
+        });
+    }
+
+    for (key, have) in &current {
+        if declared.contains_key(key) {
+            continue;
+        }
+        let kind = if crate::ops::is_preserved_by_up(key) {
+            DiffKind::Preserved
+        } else {
+            DiffKind::Reset
+        };
+        entries.push(DiffEntry {
+            key: key.clone(),
+            kind,
+            from: Some(display_value(key, have)),
+            to: None,
+        });
+    }
+
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    entries
+}
+
+/// What `curie diff` found.
+#[derive(Debug)]
+pub struct DiffOutput {
+    pub namespace: String,
+    pub release: String,
+    /// `false` when helm has no record of the release: everything is a create.
+    pub release_exists: bool,
+    pub entries: Vec<DiffEntry>,
+}
+
+impl DiffOutput {
+    pub fn changes(&self) -> usize {
+        self.entries.iter().filter(|e| e.kind.is_change()).count()
+    }
+}
+
+impl crate::ui::CliOutput for DiffOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "namespace": self.namespace,
+            "release": self.release,
+            "release_exists": self.release_exists,
+            "changes": self.changes(),
+            "entries": self.entries.iter().map(|e| serde_json::json!({
+                "key": e.key,
+                "kind": e.kind.label(),
+                "from": e.from,
+                "to": e.to,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if !self.release_exists {
+            ui.payload_plain(&format!(
+                "release '{}' does not exist in namespace '{}' -- every value below would be created",
+                self.release, self.namespace
+            ));
+        }
+        for e in &self.entries {
+            let line = match (&e.from, &e.to) {
+                (Some(from), Some(to)) if e.kind == DiffKind::Change => {
+                    format!("{} {}: {} -> {}", e.kind.marker(), e.key, from, to)
+                }
+                (_, Some(to)) if e.kind == DiffKind::Add => {
+                    format!("{} {}: {}", e.kind.marker(), e.key, to)
+                }
+                (Some(from), None) => {
+                    format!(
+                        "{} {}: {} ({})",
+                        e.kind.marker(),
+                        e.key,
+                        from,
+                        e.kind.label()
+                    )
+                }
+                (_, Some(to)) => format!("{} {}: {}", e.kind.marker(), e.key, to),
+                _ => format!("{} {}", e.kind.marker(), e.key),
+            };
+            ui.payload_plain(&line);
+        }
+        let changes = self.changes();
+        if changes == 0 {
+            ui.payload_plain("no changes: the cluster already matches this file");
+        } else {
+            ui.payload_plain(&format!("{changes} change(s) would be applied"));
+        }
+        if self.entries.iter().any(|e| e.kind == DiffKind::Reset) {
+            ui.note(
+                "`!` marks a value the release carries that this file does not declare. \
+                 `curie apply` does a full upgrade, so it would go back to the chart \
+                 default. Declare it in curie.yaml to keep it.",
+            );
+        }
+    }
+}
+
+pub struct DiffOpts {
+    pub cfg: Installation,
+}
+
+/// Compare the file against the live release.
+///
+/// Read-only by construction: it resolves no credential and runs one
+/// `helm get values`. A missing credential must not stop an operator from
+/// asking what would change -- that question is most urgent precisely when the
+/// install is not yet complete.
+pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
+    let cfg = opts.cfg;
+    let common = crate::ops::CommonOpts {
+        namespace: cfg.install.namespace.clone(),
+        release: cfg.install.release.clone(),
+        dry_run: false,
+    };
+
+    let live = crate::ops::fetch_release_values(&common).await?;
+
+    let mut declared = BTreeMap::new();
+    for entry in cfg.helm_sets() {
+        if let Some((k, v)) = entry.split_once('=') {
+            declared.insert(k.to_string(), v.to_string());
+        }
+    }
+
+    let entries = diff_plan(&declared, live.as_ref());
+    Ok(DiffOutput {
+        namespace: cfg.install.namespace,
+        release: cfg.install.release,
+        release_exists: live.is_some(),
+        entries,
+    })
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::*;
+
+    fn live(json: serde_json::Value) -> serde_json::Value {
+        json
+    }
+
+    #[test]
+    fn nested_values_flatten_to_the_dotted_keys_set_speaks() {
+        let mut out = BTreeMap::new();
+        flatten_values(
+            &serde_json::json!({"ui": {"deploy": false}, "api": {"apiKey": "x"}}),
+            "",
+            &mut out,
+        );
+        assert_eq!(out.get("ui.deploy").map(String::as_str), Some("false"));
+        assert_eq!(out.get("api.apiKey").map(String::as_str), Some("x"));
+    }
+
+    /// Helm indexes arrays; descending into them as objects would misalign every
+    /// declared `allowedEgress[0].cidr` against what a prior --set recorded.
+    #[test]
+    fn arrays_flatten_with_helm_index_syntax() {
+        let mut out = BTreeMap::new();
+        flatten_values(
+            &serde_json::json!({"security": {"networkPolicy": {"allowedEgress": [{"cidr": "10.0.0.0/8"}]}}}),
+            "",
+            &mut out,
+        );
+        assert_eq!(
+            out.get("security.networkPolicy.allowedEgress[0].cidr")
+                .map(String::as_str),
+            Some("10.0.0.0/8")
+        );
+    }
+
+    #[test]
+    fn a_declared_key_the_release_lacks_is_an_add() {
+        let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
+        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, DiffKind::Add);
+    }
+
+    #[test]
+    fn matching_values_are_unchanged_and_count_as_no_change() {
+        let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
+        );
+        assert_eq!(entries[0].kind, DiffKind::Same);
+        assert!(!entries[0].kind.is_change());
+    }
+
+    #[test]
+    fn a_differing_value_is_a_change_and_shows_both_sides() {
+        let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
+        );
+        assert_eq!(entries[0].kind, DiffKind::Change);
+        assert_eq!(entries[0].from.as_deref(), Some("true"));
+        assert_eq!(entries[0].to.as_deref(), Some("false"));
+    }
+
+    /// The honesty requirement ADR-0097 named: a cluster stood up by flags
+    /// carries tokens and generated passwords the file never mentions, and `up`
+    /// re-supplies every one. Calling them removals would be a lie in exactly
+    /// the situation diff exists for.
+    #[test]
+    fn values_up_carries_forward_are_preserved_never_removals() {
+        let declared = BTreeMap::new();
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({
+                "dispatcher": {"slack": {"appToken": "xapp-x", "botToken": "xoxb-y"}},
+                "api": {"githubAppId": "4475970", "apiKey": "generated"},
+                "postgres": {"auth": {"password": "generated"}},
+            }))),
+        );
+        assert!(
+            !entries.is_empty(),
+            "the fixture declares several preserved keys"
+        );
+        for e in &entries {
+            assert_eq!(
+                e.kind,
+                DiffKind::Preserved,
+                "{} must not be reported as lost",
+                e.key
+            );
+            assert!(!e.kind.is_change(), "{} must not count as a change", e.key);
+        }
+    }
+
+    /// The other half: an undeclared key that `up` does NOT carry forward really
+    /// would be reset, and staying quiet about it would be the same lie inverted.
+    #[test]
+    fn an_undeclared_unpreserved_value_is_reported_as_a_reset() {
+        let declared = BTreeMap::new();
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
+        );
+        assert_eq!(entries[0].kind, DiffKind::Reset);
+        assert!(entries[0].kind.is_change(), "a reset is a real change");
+    }
+
+    /// `helm get values` returns real passwords. None may reach the output.
+    #[test]
+    fn secret_values_are_never_rendered() {
+        let declared = BTreeMap::from([(
+            "api.githubToken".to_string(),
+            "ghp_declared_secret".to_string(),
+        )]);
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({
+                "api": {"githubToken": "ghp_live_secret", "apiKey": "live_api_key"},
+                "dispatcher": {"slack": {"botToken": "xoxb-live"}},
+                "postgres": {"auth": {"password": "live_pg_password"}},
+                "agentSandbox": {"runner": {"credentials": "sk-ant-live"}},
+            }))),
+        );
+        let rendered = format!("{entries:?}");
+        for leaked in [
+            "ghp_declared_secret",
+            "ghp_live_secret",
+            "live_api_key",
+            "xoxb-live",
+            "live_pg_password",
+            "sk-ant-live",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "{leaked} must never appear in diff output: {rendered}"
+            );
+        }
+        assert!(rendered.contains("<secret>"), "must mask, not omit");
+    }
+
+    /// A non-secret value must still be shown, or the mask is useless noise.
+    #[test]
+    fn ordinary_values_are_shown_in_full() {
+        let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
+        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
+        assert_eq!(entries[0].to.as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn a_missing_release_makes_every_declared_value_an_add() {
+        let declared = BTreeMap::from([
+            ("ui.deploy".to_string(), "false".to_string()),
+            ("inference.deploy".to_string(), "false".to_string()),
+        ]);
+        let entries = diff_plan(&declared, None);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.kind == DiffKind::Add));
+    }
+
+    #[test]
+    fn output_is_one_json_object_with_a_change_count() {
+        use crate::ui::CliOutput;
+        let out = DiffOutput {
+            namespace: "acme".into(),
+            release: "acme".into(),
+            release_exists: true,
+            entries: diff_plan(
+                &BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
+                Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
+            ),
+        };
+        let json = out.to_json();
+        assert_eq!(json["changes"], serde_json::json!(1));
+        assert_eq!(json["release_exists"], serde_json::json!(true));
+        assert_eq!(json["entries"][0]["kind"], serde_json::json!("change"));
+    }
+}
+
 #[cfg(test)]
 mod apply_tests {
     use super::*;

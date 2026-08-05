@@ -70,6 +70,12 @@
       "version": 1
     },
     {
+      "result": "DiffOutput",
+      "kind": "CliOutput",
+      "schema": "diff.schema.json",
+      "version": 1
+    },
+    {
       "result": "DryRunPlan",
       "kind": "CliOutput",
       "schema": "dry-run.schema.json",
