@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 from plugin_format import connector_render as r
-from plugin_format.connectors import ConnectorSpec
+from plugin_format.connectors import ConnectorSpec, validate_connectors
 
 HOSTED = ConnectorSpec(
     image="grafana/mcp-grafana:0.17.2",
@@ -369,3 +369,54 @@ def test_a_referenced_secret_is_not_optional() -> None:
         e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
     )
     assert entry["valueFrom"]["secretKeyRef"]["optional"] is False
+
+
+# -- sealed_secrets: the ADR-0094 contract slice ------------------------------
+
+
+def test_sealed_secrets_is_optional_and_absent_by_default() -> None:
+    """Additive: an existing bundle must be unaffected by the new field."""
+
+    spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2")
+    assert spec.sealed_secrets == {}
+    assert spec.secret_names() == []
+
+
+def test_sealed_secret_names_join_the_other_forms() -> None:
+    """All three holders answer the same question, so one list answers it."""
+
+    spec = ConnectorSpec(
+        image="x",
+        secrets=["PLAIN"],
+        sealed_secrets={"SEALED": "AgBv3n2K"},
+    )
+    assert spec.secret_names() == ["PLAIN", "SEALED"]
+    # Only the plain one is Curie's to resolve a value for.
+    assert spec.resolved_secrets() == ["PLAIN"]
+
+
+def test_a_declared_sealed_secret_is_refused_until_decryption_lands() -> None:
+    """Refuse, never ignore.
+
+    Accepting the field while nothing decrypts it would deploy a connector with
+    no credential: a pod that starts, passes its health check, and 401s every
+    call. That is the failure shape ADR-0094 exists to avoid, so the bundle is
+    rejected with a message naming what to use instead.
+    """
+
+    _, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x", "sealed_secrets": {"TOKEN": "AgB"}}}}
+    )
+    codes = [code for code, _ in errors]
+    assert "connectors.sealed_secrets_unsupported" in codes
+    message = next(m for c, m in errors if c == "connectors.sealed_secrets_unsupported")
+    assert "secrets:" in message, "must name the form that works today"
+
+
+def test_an_empty_sealed_blob_is_reported_on_its_own() -> None:
+    """A distinct diagnostic, so the eventual decrypt path inherits the check."""
+
+    _, errors = validate_connectors(
+        {"connectors": {"grafana": {"image": "x", "sealed_secrets": {"TOKEN": "  "}}}}
+    )
+    assert "connectors.empty_sealed_value" in [code for code, _ in errors]
