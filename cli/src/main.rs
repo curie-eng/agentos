@@ -1263,6 +1263,51 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Carry bundle objects across a chart upgrade that renames the object
+    /// store (issue #1324).
+    ///
+    /// Chart 0.6.0 renamed the in-cluster store from `minio` to `rustfs`. Helm
+    /// does a full upgrade, so the old StatefulSet -- and the bundles in it --
+    /// are deleted. Every sandbox downloads its bundle from that store at
+    /// start, so an empty one stops the bot answering rather than merely
+    /// breaking rollbacks.
+    ///
+    /// The two stores never coexist, so this runs in two phases around the
+    /// upgrade, holding the objects in a staging pod Helm does not own:
+    ///
+    ///   curie cluster migrate-store --phase export   # before the upgrade
+    ///   curie apply -f curie.yaml                    # or helm upgrade
+    ///   curie cluster migrate-store --phase import   # after
+    ///
+    /// Each phase refuses when its precondition is unmet, and `import` verifies
+    /// per object rather than by count -- a concurrent push can legitimately add
+    /// one mid-migration, and only a per-object diff tells that from data loss.
+    MigrateStore {
+        /// `export` before the upgrade, `import` after it.
+        #[arg(long, value_parser = ["export", "import"])]
+        phase: String,
+        /// Kubernetes namespace.
+        #[arg(long, default_value = "curie")]
+        namespace: String,
+        /// Helm release name.
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Chart reference, used by `export` to see which store the upgrade
+        /// would render.
+        #[arg(long)]
+        chart: Option<String>,
+        /// Bundle bucket name, matching the platform's BUNDLE_BUCKET.
+        #[arg(long, default_value = "curie-bundles")]
+        bucket: String,
+        /// Keep the staging pod after a successful import, instead of deleting
+        /// it. The staged copy is the only thing standing between a failed
+        /// import and an empty store, so keep it until you have verified a turn.
+        #[arg(long)]
+        keep_staging: bool,
+        /// Print the commands that would run and exit without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Report release health and access URLs (read-only: helm status + kubectl).
     Status {
         /// Kubernetes namespace.
@@ -2439,6 +2484,36 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
+            ClusterAction::MigrateStore {
+                phase,
+                namespace,
+                release,
+                chart,
+                bucket,
+                keep_staging,
+                dry_run,
+            } => {
+                use curie::migrate_store as ms;
+                let common = curie::ops::CommonOpts {
+                    namespace,
+                    release,
+                    dry_run,
+                };
+                let out = if phase == "export" {
+                    let resolved = artifacts::resolve_chart(
+                        chart.as_deref(),
+                        artifacts::Channel::current(),
+                        artifacts::version(),
+                        artifacts::cache_root,
+                        std::path::Path::new("charts/curie").is_dir(),
+                    )?;
+                    let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+                    ms::run_export(&common, &chart, &bucket).await?
+                } else {
+                    ms::run_import(&common, &bucket, keep_staging).await?
+                };
+                emit(out)
+            }
             ClusterAction::Comms {
                 slack,
                 disconnect,

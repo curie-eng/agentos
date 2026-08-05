@@ -46,6 +46,7 @@ use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
 use curie::message::MessageOutcomeOutput;
+use curie::migrate_store::MigrateStoreOutput;
 use curie::observability::{Endpoint, ObservabilityOutput};
 use curie::ops::{ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput};
 use curie::ui::{CliOutput, DryRunPlan};
@@ -304,6 +305,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 namespace: "acme-bot".to_string(),
                 release: "acme-bot".to_string(),
                 comms: true,
+            },
+        ],
+    );
+    m.insert(
+        "MigrateStoreOutput",
+        samples![
+            "DryRun" => MigrateStoreOutput::DryRun(plan()),
+            "Exported" => MigrateStoreOutput::Exported {
+                from: "minio".to_string(),
+                to: "rustfs".to_string(),
+                objects: 22,
+            },
+            "Imported" => MigrateStoreOutput::Imported {
+                store: "rustfs".to_string(),
+                objects: 23,
+                missing: vec![],
+                added: vec!["bundles/x/new.tar".to_string()],
+                staging_kept: false,
             },
         ],
     );

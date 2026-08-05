@@ -1971,6 +1971,91 @@
           "name": "down"
         },
         {
+          "about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324)",
+          "args": [
+            {
+              "global": false,
+              "help": "`export` before the upgrade, `import` after it",
+              "id": "phase",
+              "long": "phase",
+              "positional": false,
+              "possible_values": [
+                "export",
+                "import"
+              ],
+              "required": true
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Kubernetes namespace",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Chart reference, used by `export` to see which store the upgrade would render",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-bundles"
+              ],
+              "global": false,
+              "help": "Bundle bucket name, matching the platform's BUNDLE_BUCKET",
+              "id": "bucket",
+              "long": "bucket",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Keep the staging pod after a successful import, instead of deleting it. The staged copy is the only thing standing between a failed import and an empty store, so keep it until you have verified a turn",
+              "id": "keep_staging",
+              "long": "keep-staging",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the commands that would run and exit without executing",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Carry bundle objects across a chart upgrade that renames the object store (issue #1324).\n\nChart 0.6.0 renamed the in-cluster store from `minio` to `rustfs`. Helm does a full upgrade, so the old StatefulSet -- and the bundles in it -- are deleted. Every sandbox downloads its bundle from that store at start, so an empty one stops the bot answering rather than merely breaking rollbacks.\n\nThe two stores never coexist, so this runs in two phases around the upgrade, holding the objects in a staging pod Helm does not own:\n\ncurie cluster migrate-store --phase export   # before the upgrade curie apply -f curie.yaml                    # or helm upgrade curie cluster migrate-store --phase import   # after\n\nEach phase refuses when its precondition is unmet, and `import` verifies per object rather than by count -- a concurrent push can legitimately add one mid-migration, and only a per-object diff tells that from data loss.",
+          "name": "migrate-store"
+        },
+        {
           "about": "Report release health and access URLs (read-only: helm status + kubectl)",
           "args": [
             {
