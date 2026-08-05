@@ -404,6 +404,18 @@ enum Command {
         #[arg(long)]
         chart: Option<String>,
     },
+
+    /// Show what `curie apply` would change about the live release (ADR-0097).
+    ///
+    /// Read-only, and resolves no credential: "what would change?" is most
+    /// urgent while an install is still incomplete. A value the release carries
+    /// that the file does not declare is reported as preserved or as a reset
+    /// according to what `up` actually does with it, never guessed.
+    Diff {
+        /// Path to the installation file.
+        #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
+        file: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3073,6 +3085,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             )
+        }
+        Some(Command::Diff { file }) => {
+            let cfg = curie::installation::Installation::load(&file)?;
+            emit(curie::installation::diff(curie::installation::DiffOpts { cfg }).await?)
         }
     }
 }

@@ -3790,6 +3790,26 @@
       "hidden": false,
       "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.",
       "name": "apply"
+    },
+    {
+      "about": "Show what `curie apply` would change about the live release (ADR-0097)",
+      "args": [
+        {
+          "default_values": [
+            "curie.yaml"
+          ],
+          "global": false,
+          "help": "Path to the installation file",
+          "id": "file",
+          "long": "file",
+          "positional": false,
+          "required": false,
+          "short": "f"
+        }
+      ],
+      "hidden": false,
+      "long_about": "Show what `curie apply` would change about the live release (ADR-0097).\n\nRead-only, and resolves no credential: \"what would change?\" is most urgent while an install is still incomplete. A value the release carries that the file does not declare is reported as preserved or as a reset according to what `up` actually does with it, never guessed.",
+      "name": "diff"
     }
   ]
 }

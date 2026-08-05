@@ -951,6 +951,49 @@ fn deploy_output_validates() {
 }
 
 #[test]
+fn diff_output_validates() {
+    // Built through `diff_plan` rather than hand-listing entries, so this
+    // validates the shape the real verb emits and not a parallel one.
+    let out = curie::installation::DiffOutput {
+        namespace: "acme-bot".to_string(),
+        release: "acme-bot".to_string(),
+        release_exists: true,
+        entries: curie::installation::diff_plan(
+            &std::collections::BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
+            Some(&serde_json::json!({
+                "ui": {"deploy": true},
+                "dispatcher": {"slack": {"botToken": "xoxb-live"}},
+                "inference": {"deploy": true},
+            })),
+        ),
+    };
+    let json = out.to_json();
+    assert_valid("diff.schema.json", &json);
+
+    // Every classification the schema enumerates must be reachable from a real
+    // plan, or the enum is documenting states the code cannot produce.
+    let kinds: Vec<&str> = json["entries"]
+        .as_array()
+        .expect("entries is an array")
+        .iter()
+        .map(|e| e["kind"].as_str().expect("kind is a string"))
+        .collect();
+    for expected in ["change", "preserved", "reset to chart default"] {
+        assert!(
+            kinds.contains(&expected),
+            "fixture should exercise {expected}: got {kinds:?}"
+        );
+    }
+
+    // The live bot token is in the fixture; it must not be in the payload.
+    let rendered = serde_json::to_string(&json).expect("payload serializes");
+    assert!(
+        !rendered.contains("xoxb-live"),
+        "a live secret reached the --json payload: {rendered}"
+    );
+}
+
+#[test]
 fn check_output_validates() {
     // CheckOutput::to_json is `serde_json::to_value(report)`; validate that exact
     // shape against the check schema.

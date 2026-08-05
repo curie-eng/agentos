@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/diff/v1.json",
+  "title": "curie diff --json",
+  "description": "The agent-facing payload of `curie diff`: every chart value the installation file and the live release disagree about, plus the values the release carries that the file does not declare. Read-only; no credential is resolved. Secret-bearing values are rendered as the literal string `<secret>` and never in the clear.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "namespace": {
+      "type": "string"
+    },
+    "release": {
+      "type": "string"
+    },
+    "release_exists": {
+      "type": "boolean",
+      "description": "False when helm has no record of the release, in which case every declared value is an `add`."
+    },
+    "changes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many entries would actually change the cluster: add, change, and reset. Deliberately excludes `unchanged` and `preserved`, so zero means applying the file is a no-op."
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "The dotted chart value path, in helm `--set` syntax including `[i]` array indexing."
+          },
+          "kind": {
+            "enum": [
+              "add",
+              "change",
+              "unchanged",
+              "preserved",
+              "reset to chart default"
+            ],
+            "description": "`preserved` means the release carries this value, the file does not declare it, and a plain `cluster up` re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). It is NOT a pending removal. `reset to chart default` is the genuine loss case: undeclared and not carried forward."
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The live value, or null when the release does not have this key. `<secret>` when the key carries a credential."
+          },
+          "to": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The declared value, or null when the file does not declare this key. `<secret>` when the key carries a credential."
+          }
+        },
+        "required": [
+          "key",
+          "kind",
+          "from",
+          "to"
+        ]
+      }
+    }
+  },
+  "required": [
+    "namespace",
+    "release",
+    "release_exists",
+    "changes",
+    "entries"
+  ]
+}

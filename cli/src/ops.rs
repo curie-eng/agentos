@@ -992,6 +992,43 @@ fn resolve_preserved_values(
     all
 }
 
+/// The chart value holding the model credential. Named here so the secret
+/// classifier below cannot drift from the key `up_commands` actually masks.
+pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
+
+/// Does a plain `cluster up` carry this key forward when nothing re-passes it?
+///
+/// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
+/// on the release but absent from `curie.yaml` is normally reset to the chart
+/// default -- except for the families [`resolve_preserved_values`] re-supplies,
+/// which survive untouched. Reporting those as removals would be the exact
+/// "proposing to delete what it did not create" failure ADR-0097 named.
+///
+/// Reads the same constants `up` reads, so a new preserved family is picked up
+/// by both or neither.
+pub fn is_preserved_by_up(key: &str) -> bool {
+    COMMS_MANAGED_KEYS.contains(&key)
+        || GITHUB_APP_MANAGED_KEYS.contains(&key)
+        || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
+}
+
+/// Does this key's VALUE carry a secret?
+///
+/// `helm get values` returns real passwords and tokens, so anything rendering a
+/// live release has to know which values must never reach a terminal, a log, or
+/// a `--json` consumer. Deliberately broader than [`is_preserved_by_up`]: the
+/// PAT and the model credential are secret but not preserved.
+pub fn is_secret_value_key(key: &str) -> bool {
+    is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY
+}
+
+/// The user-supplied values helm recorded for a release, or `None` when the
+/// release does not exist. The read-only half of [`fetch_existing_values`],
+/// exposed for `curie diff`.
+pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
+    fetch_existing_values(o).await
+}
+
 /// Resolve [`GITHUB_TOKEN_KEY`] for this run.
 ///
 /// - `flag` is the `--github-token` value: `None` when the flag and
