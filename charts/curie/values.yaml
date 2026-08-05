@@ -286,9 +286,26 @@ clickhouse:
   persistence:
     enabled: true
     size: 3Gi
+  # The CPU limit deliberately leaves headroom rather than matching a node.
+  #
+  # This was `cpu: "2"`, and on a 2-vCPU node that is the WHOLE machine. A
+  # Langfuse merge burst then took ~175% CPU with 0.0% idle, and every new
+  # sandbox pod -- one per Slack thread, on a hard 90s claim-bind deadline --
+  # missed it. Three attempts timed out and the turn escalated to a human as an
+  # opaque `runner-error`. Nothing flagged it: CPU starvation sets no node
+  # condition, so pods were Running, probes green, disk fine.
+  #
+  # ClickHouse serves Langfuse (observability). It must not be able to starve
+  # the product it is observing. Raise this on a node with cores to spare.
+  #
+  # Note the asymmetry that makes a generous limit dangerous here: under
+  # contention the kernel divides CPU in proportion to REQUESTS, not limits, and
+  # the critical-path containers (bundle-fetch, runner) request 50m each. A
+  # limit is a ceiling, never a guarantee -- so a component that requests little
+  # and may burst to everything is exactly the shape that starves a deadline.
   resources:
     requests: { cpu: 200m, memory: 512Mi }
-    limits: { cpu: "2", memory: 1536Mi }
+    limits: { cpu: "1", memory: 1536Mi }
   # Container securityContext (issue #67). Safe subset only -- the ClickHouse
   # image entrypoint starts as root to own /var/lib/clickhouse and drops to the
   # `clickhouse` user, so runAsNonRoot / capabilities.drop are left unset. See
