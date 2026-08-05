@@ -267,8 +267,26 @@ class SandboxSubstrate:
             if claim is not None and claim.ready and claim.sandbox_name:
                 return claim.sandbox_name
             time.sleep(self._config.poll_interval_seconds)
+        # Name the likeliest cause and where to look. This message is the only
+        # thread an operator has: the turn surfaces to the user as an opaque
+        # `runner-error`, and the shape that produces it most often -- a
+        # CPU-starved node -- sets NO node condition, so pods read Running,
+        # probes green, disk fine, and every dashboard says healthy.
+        #
+        # Seen in production: a Langfuse/ClickHouse merge burst took a 2-vCPU
+        # node to 0.0% idle. The sandbox pod was created and its bundle-fetch
+        # init container started, but nothing finished inside the deadline, so
+        # all three attempts timed out identically with nothing to go on.
         raise ClaimTimeoutError(
-            f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s"
+            f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s. "
+            "The sandbox pod was created but did not become ready in time. The most "
+            "common cause is a CPU-saturated node -- which reports no node condition, "
+            "so pods still look Running and probes still pass. Check `top`/`kubectl top "
+            "node` for idle CPU (not just node conditions), and whether a component "
+            "whose CPU LIMIT approaches the node's capacity is bursting; under "
+            "contention the kernel divides CPU by requests, and bundle-fetch and the "
+            "runner request only 50m each. Other causes: the agent-sandbox controller "
+            "not reconciling, or an unfetchable bundle ref."
         )
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
