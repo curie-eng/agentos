@@ -403,6 +403,13 @@ enum Command {
         /// Chart reference override, as `cluster up` takes.
         #[arg(long)]
         chart: Option<String>,
+        /// Proceed even when the upgrade would DELETE a stateful component the
+        /// release is running, losing its data. Refused by default: a chart
+        /// that renames a store (minio -> rustfs in 0.6.0) drops the old one,
+        /// and every sandbox reads the bundle store at start, so the next turn
+        /// fails rather than merely a rollback.
+        #[arg(long)]
+        allow_stateful_removal: bool,
     },
 
     /// Show what `curie apply` would change about the live release (ADR-0097).
@@ -3067,6 +3074,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             file,
             dry_run,
             chart,
+            allow_stateful_removal,
         }) => {
             let cfg = curie::installation::Installation::load(&file)?;
             let local = curie::installation::plan_installation(cfg, dry_run)?;
@@ -3078,7 +3086,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                 std::path::Path::new("charts/curie").is_dir(),
             )?;
             let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-            emit(curie::installation::apply(curie::installation::ApplyOpts { local, chart }).await?)
+            emit(
+                curie::installation::apply(curie::installation::ApplyOpts {
+                    local,
+                    chart,
+                    allow_stateful_removal,
+                })
+                .await?,
+            )
         }
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;

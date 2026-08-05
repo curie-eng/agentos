@@ -1182,6 +1182,192 @@ pub async fn fetch_release_chart(o: &CommonOpts) -> Result<Option<String>> {
         .map(str::to_string))
 }
 
+/// StatefulSet names the release currently owns.
+///
+/// StatefulSets specifically, not every workload: they are the ones carrying a
+/// PersistentVolumeClaim, so they are the ones whose disappearance loses data
+/// rather than merely restarting a process.
+pub async fn live_statefulsets(o: &CommonOpts) -> Result<Vec<String>> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("statefulset"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, _err) = run_capture(&cmd).await?;
+    if !ok {
+        return Ok(Vec::new());
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(out.trim()) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let prefix = format!("{}-", o.release);
+    Ok(parsed
+        .get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| {
+                    i.get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                })
+                .filter(|name| name.starts_with(&prefix))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// StatefulSet names the target chart would render for this release.
+///
+/// `helm template` rather than a dry-run upgrade: it needs no cluster and
+/// cannot mutate, so the guard is safe to run before deciding whether to
+/// proceed.
+pub async fn chart_statefulsets(
+    chart: &str,
+    o: &CommonOpts,
+    value_sets: &[String],
+) -> Result<Vec<String>> {
+    let mut args = vec![
+        plain("template"),
+        plain(&o.release),
+        plain(chart),
+        plain("-n"),
+        plain(&o.namespace),
+    ];
+    for entry in value_sets {
+        args.push(plain("--set"));
+        args.push(plain(entry));
+    }
+    let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
+    if !ok {
+        bail!("could not render the target chart to check for removed stateful components: {err}");
+    }
+    Ok(parse_statefulset_names(&out))
+}
+
+/// StatefulSet names in a multi-document helm render.
+///
+/// Split-and-parse rather than a regex: a `kind: StatefulSet` line can appear
+/// inside an annotation or a ConfigMap payload, and matching that would invent
+/// a component the chart does not actually create.
+pub fn parse_statefulset_names(rendered: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for doc in rendered.split("\n---") {
+        let Ok(value) = serde_norway::from_str::<serde_json::Value>(doc) else {
+            continue;
+        };
+        if value.get("kind").and_then(|k| k.as_str()) != Some("StatefulSet") {
+            continue;
+        }
+        if let Some(name) = value
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            if !names.iter().any(|n: &String| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Live stateful components the target chart would not recreate.
+///
+/// Pure, so the decision this guard turns on is testable without a cluster.
+pub fn removed_stateful_components(live: &[String], rendered: &[String]) -> Vec<String> {
+    live.iter()
+        .filter(|name| !rendered.iter().any(|r| r == *name))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod stateful_guard_tests {
+    use super::*;
+
+    /// A helm render is multi-document, and the guard has to read it as one.
+    #[test]
+    fn statefulset_names_come_from_the_render() {
+        let rendered = "\
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sre-bot-rustfs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sre-bot-rustfs
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sre-bot-postgres
+";
+        let names = parse_statefulset_names(rendered);
+        assert_eq!(names, vec!["sre-bot-rustfs", "sre-bot-postgres"]);
+    }
+
+    /// `kind: StatefulSet` inside a ConfigMap payload is data, not a component.
+    /// A regex over the render would invent one; parsing cannot.
+    #[test]
+    fn a_kind_line_inside_another_document_is_not_a_component() {
+        let rendered = "\
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-bot-docs
+data:
+  example: |
+    kind: StatefulSet
+    metadata:
+      name: not-a-real-component
+";
+        assert!(parse_statefulset_names(rendered).is_empty());
+    }
+
+    /// The exact shape that would have destroyed the bundle store: the release
+    /// runs minio, the target chart renders rustfs, so minio is a removal.
+    #[test]
+    fn a_renamed_store_is_reported_as_a_removal() {
+        let live = vec!["sre-bot-minio".to_string(), "sre-bot-postgres".to_string()];
+        let rendered = vec!["sre-bot-rustfs".to_string(), "sre-bot-postgres".to_string()];
+        assert_eq!(
+            removed_stateful_components(&live, &rendered),
+            vec!["sre-bot-minio"]
+        );
+    }
+
+    /// The guard must stay quiet on an ordinary upgrade, or it becomes a flag
+    /// everyone passes by reflex and protects nothing.
+    #[test]
+    fn an_unchanged_component_set_is_not_a_removal() {
+        let same = vec!["sre-bot-postgres".to_string(), "sre-bot-minio".to_string()];
+        assert!(removed_stateful_components(&same, &same).is_empty());
+    }
+
+    /// A chart ADDING a store is not a removal.
+    #[test]
+    fn a_new_component_is_not_a_removal() {
+        let live = vec!["sre-bot-postgres".to_string()];
+        let rendered = vec![
+            "sre-bot-postgres".to_string(),
+            "sre-bot-clickhouse".to_string(),
+        ];
+        assert!(removed_stateful_components(&live, &rendered).is_empty());
+    }
+}
+
 /// The user-supplied values helm recorded for a release, or `None` when the
 /// release does not exist. The read-only half of [`fetch_existing_values`],
 /// exposed for `curie diff`.

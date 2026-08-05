@@ -3788,6 +3788,18 @@ export const commandManifest = {
           "long": "chart",
           "positional": false,
           "required": false
+        },
+        {
+          "global": false,
+          "help": "Proceed even when the upgrade would DELETE a stateful component the release is running, losing its data. Refused by default: a chart that renames a store (minio -> rustfs in 0.6.0) drops the old one, and every sandbox reads the bundle store at start, so the next turn fails rather than merely a rollback",
+          "id": "allow_stateful_removal",
+          "long": "allow-stateful-removal",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
         }
       ],
       "hidden": false,
