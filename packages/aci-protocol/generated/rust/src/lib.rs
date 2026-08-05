@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.2.8";
+pub const PROTOCOL_VERSION: &str = "0.2.9";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -168,6 +168,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub api_backend: Option<String>,
     #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
     pub max_turns: Option<i64>,
@@ -211,6 +213,7 @@ pub mod env_keys {
     pub const CURIE_SESSION_ID: &str = "CURIE_SESSION_ID";
     pub const CURIE_STATE_TOKEN: &str = "CURIE_STATE_TOKEN";
     pub const CURIE_STATE_URL: &str = "CURIE_STATE_URL";
+    pub const CURIE_THINKING: &str = "CURIE_THINKING";
     pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
     pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
     pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";

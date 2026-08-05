@@ -528,6 +528,22 @@
             "worker"
           ],
           "title": "State Url"
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_THINKING",
+          "producer": [
+            "worker"
+          ],
+          "title": "Thinking"
         }
       },
       "required": [
@@ -1227,6 +1243,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.2.8",
-  "title": "ACI Protocol v0.2.8"
+  "protocolVersion": "0.2.9",
+  "title": "ACI Protocol v0.2.9"
 }
