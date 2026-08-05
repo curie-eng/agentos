@@ -214,34 +214,6 @@ impl Installation {
         out
     }
 
-    /// Does `apply` set this chart key from this file, even though the file
-    /// states no literal value for it?
-    ///
-    /// [`Self::helm_sets`] is NOT the whole of what `apply` declares. Three
-    /// families reach the chart through `UpOpts` instead, with values computed
-    /// at apply time: the model credential, the fake-model switch it rides
-    /// with, and the egress rules resolved from named providers.
-    ///
-    /// Without this, `curie diff` reported all three as "reset to chart
-    /// default" for a file that declares them -- telling the operator they
-    /// would LOSE what `apply` is about to SET. Found by running diff against
-    /// the real sre-bot release rather than a fixture.
-    pub fn governs_key(&self, key: &str) -> bool {
-        // Both are pushed inside one `if let Some(credentials)` in
-        // `ops::up_commands`, so a file naming no model credential governs
-        // neither -- and a live value for them really would be reset.
-        if key == crate::ops::MODEL_CREDENTIAL_KEY || key == crate::ops::FAKE_MODEL_KEY {
-            return self.credentials.model.is_some();
-        }
-        // Index-aware on purpose. A file declaring one host governs rule [0];
-        // a release carrying rules [1] and [2] really would lose them, and
-        // saying otherwise would be the same lie in the other direction.
-        match crate::ops::egress_key_index(key) {
-            Some(index) => index < self.platform.egress.len(),
-            None => false,
-        }
-    }
-
     /// Provider names for `--allow-egress-host`, validated downstream by
     /// `ops::parse_egress_provider` so an unknown host is one error message,
     /// not two divergent ones.
@@ -582,9 +554,135 @@ impl crate::ui::CliOutput for ApplyOutput {
 }
 
 pub struct ApplyOpts {
-    pub cfg: Installation,
+    pub local: LocalInstallationPlan,
     pub chart: String,
-    pub dry_run: bool,
+}
+
+pub struct LocalInstallationPlan {
+    cfg: Installation,
+    resolved: BTreeMap<String, String>,
+    up: crate::ops::UpOpts,
+    github_token: Option<String>,
+}
+
+struct EffectiveInstallationPlan {
+    cfg: Installation,
+    up: crate::ops::UpOpts,
+    up_values: crate::ops::UpValuePlan,
+    github_token: Option<String>,
+    comms: Option<crate::comms::CommsOpts>,
+    live: Option<serde_json::Value>,
+    desired: BTreeMap<String, String>,
+    preserves_undeclared_github_token: bool,
+}
+
+pub fn plan_installation(cfg: Installation, dry_run: bool) -> Result<LocalInstallationPlan> {
+    let resolved = resolve_credentials(&cfg, &resolve_credential)?;
+    let github_token = cfg
+        .credentials
+        .github_token
+        .as_ref()
+        .and_then(|name| resolved.get(name).cloned());
+    let up = crate::ops::UpOpts {
+        common: crate::ops::CommonOpts {
+            namespace: cfg.install.namespace.clone(),
+            release: cfg.install.release.clone(),
+            dry_run,
+        },
+        chart: String::new(),
+        no_expose: false,
+        set: cfg.helm_sets(),
+        allow_egress_host: cfg.egress_hosts(),
+        resolved_egress_cidrs: vec![],
+        allow_web_egress: vec![],
+        fake_model: cfg.credentials.model.is_none(),
+        credentials: cfg
+            .credentials
+            .model
+            .as_ref()
+            .and_then(|name| resolved.get(name).cloned()),
+        local_model: None,
+        model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
+        secrets: vec![],
+        github_token: crate::ops::GithubTokenPlan::Untouched,
+        dev: false,
+    };
+    crate::ops::validate_up_inputs(&up, github_token.as_deref(), false)?;
+    Ok(LocalInstallationPlan {
+        cfg,
+        resolved,
+        up,
+        github_token,
+    })
+}
+
+async fn complete_installation_plan(
+    local: LocalInstallationPlan,
+) -> Result<EffectiveInstallationPlan> {
+    let LocalInstallationPlan {
+        cfg,
+        resolved,
+        up,
+        github_token,
+    } = local;
+    // Apply in dry run mode remains a local preview: no Helm read and no provider
+    // DNS resolution. `diff` builds a live plan, so it still completes the
+    // desired values against the live release.
+    let complete_live_state = !up.common.dry_run;
+    let live = if complete_live_state {
+        crate::ops::fetch_release_values(&up.common).await?
+    } else {
+        None
+    };
+    let preserves_undeclared_github_token = cfg.credentials.github_token.is_none()
+        && !cfg.set.contains_key(crate::ops::GITHUB_TOKEN_KEY)
+        && live
+            .as_ref()
+            .and_then(|values| values.get("api"))
+            .and_then(|api| api.get("githubToken"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty());
+    let up = crate::ops::complete_up_opts(
+        up,
+        live.as_ref(),
+        github_token.as_deref(),
+        false,
+        complete_live_state,
+    )?;
+    let up_values = crate::ops::up_value_plan(&up);
+    let mut desired = up_values.effective_values();
+    let comms = cfg
+        .comms
+        .slack
+        .as_ref()
+        .map(|slack| crate::comms::CommsOpts {
+            common: up.common.clone(),
+            chart: up.chart.clone(),
+            app_token: resolved.get(&slack.app_token).cloned().unwrap_or_default(),
+            bot_token: resolved.get(&slack.bot_token).cloned().unwrap_or_default(),
+            disconnect: false,
+        });
+    if let Some(comms) = &comms {
+        desired.insert(
+            "dispatcher.slack.appToken".to_string(),
+            comms.app_token.clone(),
+        );
+        desired.insert(
+            "dispatcher.slack.botToken".to_string(),
+            comms.bot_token.clone(),
+        );
+        desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
+    }
+    Ok(EffectiveInstallationPlan {
+        cfg,
+        up,
+        up_values,
+        github_token,
+        comms,
+        live,
+        desired,
+        preserves_undeclared_github_token,
+    })
 }
 
 /// Converge the cluster to the file.
@@ -595,51 +693,20 @@ pub struct ApplyOpts {
 /// only as a sentence in a runbook, which is exactly what ADR-0097 set out to
 /// fix: the interface could not express it, so prose had to.
 pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
-    let ApplyOpts {
+    let ApplyOpts { mut local, chart } = opts;
+    local.up.chart = chart;
+    let dry_run = local.up.common.dry_run;
+    let plan = complete_installation_plan(local).await?;
+    let EffectiveInstallationPlan {
         cfg,
-        chart,
-        dry_run,
-    } = opts;
-
-    // Resolve BEFORE mutating anything. A missing Slack token discovered after
-    // the platform install would leave a half-applied cluster, which is the
-    // state this whole file exists to make unreachable.
-    let resolved = resolve_credentials(&cfg, &resolve_credential)?;
-
-    let common = crate::ops::CommonOpts {
-        namespace: cfg.install.namespace.clone(),
-        release: cfg.install.release.clone(),
-        dry_run,
-    };
-
-    let up_out = crate::ops::up(
-        crate::ops::UpOpts {
-            common: common.clone(),
-            chart: chart.clone(),
-            no_expose: false,
-            set: cfg.helm_sets(),
-            allow_egress_host: cfg.egress_hosts(),
-            resolved_egress_cidrs: vec![],
-            allow_web_egress: vec![],
-            fake_model: cfg.credentials.model.is_none(),
-            credentials: cfg
-                .credentials
-                .model
-                .as_ref()
-                .and_then(|n| resolved.get(n).cloned()),
-            local_model: None,
-            model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
-            secrets: vec![],
-            github_token: crate::ops::GithubTokenPlan::Untouched,
-            dev: false,
-        },
-        cfg.credentials
-            .github_token
-            .as_ref()
-            .and_then(|n| resolved.get(n).cloned()),
-        false,
-    )
-    .await?;
+        up,
+        up_values,
+        github_token,
+        comms,
+        live,
+        ..
+    } = plan;
+    let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
 
     let mut lines = match up_out {
         crate::ops::ClusterUpOutput::DryRun(plan) => plan.lines,
@@ -647,15 +714,8 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     };
 
     let mut configured_comms = false;
-    if let Some(slack) = &cfg.comms.slack {
-        let comms_out = crate::comms::comms(crate::comms::CommsOpts {
-            common,
-            chart,
-            app_token: resolved.get(&slack.app_token).cloned().unwrap_or_default(),
-            bot_token: resolved.get(&slack.bot_token).cloned().unwrap_or_default(),
-            disconnect: false,
-        })
-        .await?;
+    if let Some(comms) = comms {
+        let comms_out = crate::comms::comms(comms).await?;
         configured_comms = true;
         if let crate::comms::CommsOutput::DryRun(plan) = comms_out {
             lines.extend(plan.lines);
@@ -686,10 +746,6 @@ pub enum DiffKind {
     /// Only the release has it, and a plain `up` carries it forward untouched.
     /// NOT a removal -- see [`crate::ops::is_preserved_by_up`].
     Preserved,
-    /// The file governs it, but its value is computed at apply time (a resolved
-    /// egress CIDR, the model credential) rather than stated literally. `apply`
-    /// SETS this -- reporting it as a reset was the bug real data exposed.
-    Managed,
     /// Only the release has it, and `apply` would reset it to the chart default.
     Reset,
 }
@@ -703,7 +759,6 @@ impl DiffKind {
             DiffKind::Change => '~',
             DiffKind::Same => '=',
             DiffKind::Preserved => '=',
-            DiffKind::Managed => '=',
             DiffKind::Reset => '!',
         }
     }
@@ -714,7 +769,6 @@ impl DiffKind {
             DiffKind::Change => "change",
             DiffKind::Same => "unchanged",
             DiffKind::Preserved => "preserved",
-            DiffKind::Managed => "managed by this file",
             DiffKind::Reset => "reset to chart default",
         }
     }
@@ -794,7 +848,6 @@ fn display_value(key: &str, value: &str) -> String {
 pub fn diff_plan(
     declared: &BTreeMap<String, String>,
     live: Option<&serde_json::Value>,
-    governs: &dyn Fn(&str) -> bool,
 ) -> Vec<DiffEntry> {
     let mut current = BTreeMap::new();
     if let Some(values) = live {
@@ -821,11 +874,7 @@ pub fn diff_plan(
         if declared.contains_key(key) {
             continue;
         }
-        // Order matters: a key the file governs is being SET, so it must never
-        // fall through to Reset even though it carries no literal value here.
-        let kind = if governs(key) {
-            DiffKind::Managed
-        } else if crate::ops::is_preserved_by_up(key) {
+        let kind = if crate::ops::is_preserved_by_up(key) {
             DiffKind::Preserved
         } else {
             DiffKind::Reset
@@ -920,37 +969,29 @@ impl crate::ui::CliOutput for DiffOutput {
 }
 
 pub struct DiffOpts {
-    pub cfg: Installation,
+    pub local: LocalInstallationPlan,
 }
 
 /// Compare the file against the live release.
 ///
-/// Read-only by construction: it resolves no credential and runs one
-/// `helm get values`. A missing credential must not stop an operator from
-/// asking what would change -- that question is most urgent precisely when the
-/// install is not yet complete.
+/// Resolves the same local inputs as apply, then performs one values read and
+/// provider resolution to complete the desired plan without mutating it.
 pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
-    let cfg = opts.cfg;
-    let common = crate::ops::CommonOpts {
-        namespace: cfg.install.namespace.clone(),
-        release: cfg.install.release.clone(),
-        dry_run: false,
-    };
-
-    let live = crate::ops::fetch_release_values(&common).await?;
-
-    let mut declared = BTreeMap::new();
-    for entry in cfg.helm_sets() {
-        if let Some((k, v)) = entry.split_once('=') {
-            declared.insert(k.to_string(), v.to_string());
+    let plan = complete_installation_plan(opts.local).await?;
+    let mut entries = diff_plan(&plan.desired, plan.live.as_ref());
+    if plan.preserves_undeclared_github_token {
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.key == crate::ops::GITHUB_TOKEN_KEY)
+        {
+            entry.kind = DiffKind::Preserved;
+            entry.to = None;
         }
     }
-
-    let entries = diff_plan(&declared, live.as_ref(), &|key| cfg.governs_key(key));
     Ok(DiffOutput {
-        namespace: cfg.install.namespace,
-        release: cfg.install.release,
-        release_exists: live.is_some(),
+        namespace: plan.cfg.install.namespace,
+        release: plan.cfg.install.release,
+        release_exists: plan.live.is_some(),
         entries,
     })
 }
@@ -961,11 +1002,6 @@ mod diff_tests {
 
     fn live(json: serde_json::Value) -> serde_json::Value {
         json
-    }
-
-    /// A file that governs no computed key: the baseline most cases want.
-    fn governs_nothing(_: &str) -> bool {
-        false
     }
 
     /// The classification tests below run against the REAL key set of the
@@ -1053,23 +1089,8 @@ mod diff_tests {
         root
     }
 
-    fn sre_bot_like() -> Installation {
-        Installation::parse(
-            "version: 1\ninstall:\n  namespace: sre-bot\n  release: sre-bot\n\
-             platform:\n  ui: false\n  inference: false\n  egress:\n    - host: anthropic\n\
-             credentials:\n  model: ANTHROPIC_API_KEY\n\
-             comms:\n  slack:\n    app_token: SLACK_APP_TOKEN\n    bot_token: SLACK_BOT_TOKEN\n",
-        )
-        .unwrap()
-    }
-
-    fn plan_against_live(cfg: &Installation) -> Vec<DiffEntry> {
-        let mut declared = BTreeMap::new();
-        for entry in cfg.helm_sets() {
-            let (k, v) = entry.split_once('=').unwrap();
-            declared.insert(k.to_string(), v.to_string());
-        }
-        diff_plan(&declared, Some(&live_release()), &|k| cfg.governs_key(k))
+    fn plan_against_live(desired: &BTreeMap<String, String>) -> Vec<DiffEntry> {
+        diff_plan(desired, Some(&live_release()))
     }
 
     fn kind_of<'a>(entries: &'a [DiffEntry], key: &str) -> &'a DiffKind {
@@ -1080,23 +1101,39 @@ mod diff_tests {
             .kind
     }
 
-    /// The bug real data exposed: `apply` SETS these three from a file that
-    /// names a model credential, but diff called them resets -- telling the
-    /// operator they would lose what apply was about to write.
+    /// Values from the shared effective plan carry their literal desired value
+    /// into the diff rather than taking a separate classification path.
     #[test]
-    fn keys_apply_sets_outside_helm_sets_are_managed_not_reset() {
-        let entries = plan_against_live(&sre_bot_like());
-        for key in [
-            "agentSandbox.runner.credentials",
-            "agentSandbox.runner.fakeModel",
-            "security.networkPolicy.allowedEgress[0].cidr",
-            "security.networkPolicy.allowedEgress[0].ports[0].port",
-            "security.networkPolicy.allowedEgress[0].ports[0].protocol",
-        ] {
+    fn shared_effective_values_are_reported_as_literal_changes() {
+        let desired = BTreeMap::from([
+            (
+                "agentSandbox.runner.credentials".to_string(),
+                "resolved-model-credential".to_string(),
+            ),
+            (
+                "agentSandbox.runner.fakeModel".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "security.networkPolicy.allowedEgress[0].cidr".to_string(),
+                "203.0.113.10/32".to_string(),
+            ),
+            (
+                "security.networkPolicy.allowedEgress[0].ports[0].port".to_string(),
+                "443".to_string(),
+            ),
+            (
+                "security.networkPolicy.allowedEgress[0].ports[0].protocol".to_string(),
+                "TCP".to_string(),
+            ),
+        ]);
+        let entries = plan_against_live(&desired);
+        for (key, value) in desired {
+            let entry = entries.iter().find(|entry| entry.key == key).unwrap();
+            assert_eq!(entry.kind, DiffKind::Change, "{key}");
             assert_eq!(
-                kind_of(&entries, key),
-                &DiffKind::Managed,
-                "{key} is set by apply, so diff must not call it a reset"
+                entry.to.as_deref(),
+                Some(display_value(&key, &value).as_str())
             );
         }
     }
@@ -1105,10 +1142,7 @@ mod diff_tests {
     /// claiming otherwise would be the same lie inverted.
     #[test]
     fn without_a_declared_model_credential_those_keys_are_resets() {
-        let cfg =
-            Installation::parse("version: 1\ninstall:\n  namespace: sre-bot\n  release: sre-bot\n")
-                .unwrap();
-        let entries = plan_against_live(&cfg);
+        let entries = plan_against_live(&BTreeMap::new());
         for key in [
             "agentSandbox.runner.credentials",
             "agentSandbox.runner.fakeModel",
@@ -1117,23 +1151,11 @@ mod diff_tests {
         }
     }
 
-    /// Governance is index-bounded: a file declaring one egress host does not
-    /// govern a second rule the release carries, and that one really is lost.
-    #[test]
-    fn egress_governance_stops_at_the_declared_count() {
-        let cfg = sre_bot_like();
-        assert!(cfg.governs_key("security.networkPolicy.allowedEgress[0].cidr"));
-        assert!(
-            !cfg.governs_key("security.networkPolicy.allowedEgress[1].cidr"),
-            "one declared host governs rule [0] only"
-        );
-    }
-
     /// Every credential-bearing key on the real release must be preserved, and
     /// none may print. This is the whole "is it safe to adopt the file" answer.
     #[test]
     fn every_live_secret_is_preserved_and_masked() {
-        let entries = plan_against_live(&sre_bot_like());
+        let entries = plan_against_live(&BTreeMap::new());
         for key in [
             "api.apiKey",
             "api.githubAppId",
@@ -1186,11 +1208,7 @@ mod diff_tests {
     #[test]
     fn a_declared_key_the_release_lacks_is_an_add() {
         let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
-        let entries = diff_plan(
-            &declared,
-            Some(&live(serde_json::json!({}))),
-            &governs_nothing,
-        );
+        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, DiffKind::Add);
     }
@@ -1201,7 +1219,6 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
-            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Same);
         assert!(!entries[0].kind.is_change());
@@ -1213,7 +1230,6 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
-            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Change);
         assert_eq!(entries[0].from.as_deref(), Some("true"));
@@ -1234,7 +1250,6 @@ mod diff_tests {
                 "api": {"githubAppId": "4475970", "apiKey": "generated"},
                 "postgres": {"auth": {"password": "generated"}},
             }))),
-            &governs_nothing,
         );
         assert!(
             !entries.is_empty(),
@@ -1259,7 +1274,6 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
-            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Reset);
         assert!(entries[0].kind.is_change(), "a reset is a real change");
@@ -1280,7 +1294,6 @@ mod diff_tests {
                 "postgres": {"auth": {"password": "live_pg_password"}},
                 "agentSandbox": {"runner": {"credentials": "sk-ant-live"}},
             }))),
-            &governs_nothing,
         );
         let rendered = format!("{entries:?}");
         for leaked in [
@@ -1303,11 +1316,7 @@ mod diff_tests {
     #[test]
     fn ordinary_values_are_shown_in_full() {
         let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
-        let entries = diff_plan(
-            &declared,
-            Some(&live(serde_json::json!({}))),
-            &governs_nothing,
-        );
+        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
         assert_eq!(entries[0].to.as_deref(), Some("false"));
     }
 
@@ -1317,7 +1326,7 @@ mod diff_tests {
             ("ui.deploy".to_string(), "false".to_string()),
             ("inference.deploy".to_string(), "false".to_string()),
         ]);
-        let entries = diff_plan(&declared, None, &governs_nothing);
+        let entries = diff_plan(&declared, None);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.kind == DiffKind::Add));
     }
@@ -1332,7 +1341,6 @@ mod diff_tests {
             entries: diff_plan(
                 &BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
                 Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
-                &governs_nothing,
             ),
         };
         let json = out.to_json();

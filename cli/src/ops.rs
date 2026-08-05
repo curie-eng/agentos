@@ -9,6 +9,8 @@
 //! them. That split keeps the argv construction unit-testable with no cluster
 //! and gives one place to mask secrets before anything is printed.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
@@ -254,12 +256,6 @@ pub(crate) fn secret_set(key: &str, value: &str) -> CmdArg {
     }
 }
 
-/// A single secret helm value delivered through a private `-f` values file
-/// rather than an argv `--set`, so the value never reaches the process table.
-pub(crate) fn secret_values_file(key: &str, value: &str) -> CmdArg {
-    CmdArg::SecretValuesFile(vec![(key.to_string(), value.to_string())])
-}
-
 /// Mask a secret for display: the first 8 characters, then `***`. Long enough to
 /// recognise a token by its prefix (e.g. `xoxb-...`), short enough to leak
 /// nothing usable.
@@ -365,25 +361,6 @@ pub struct DownOpts {
 /// Egress port shared by every runner allowlist entry (provider + web): TLS only.
 const EGRESS_TCP_PORT: u16 = 443;
 
-/// Push the three `helm --set` args for one `security.networkPolicy.allowedEgress`
-/// entry (cidr + TCP port) at `idx`. Both the model carve-out and each declared
-/// web destination emit this identical shape, so they share one emitter to keep
-/// the array contiguous and the argv byte-identical across sources.
-fn push_egress_rule(args: &mut Vec<CmdArg>, idx: usize, cidr: &str, port: u16) {
-    args.push(plain("--set"));
-    args.push(plain(format!(
-        "security.networkPolicy.allowedEgress[{idx}].cidr={cidr}"
-    )));
-    args.push(plain("--set"));
-    args.push(plain(format!(
-        "security.networkPolicy.allowedEgress[{idx}].ports[0].protocol=TCP"
-    )));
-    args.push(plain("--set"));
-    args.push(plain(format!(
-        "security.networkPolicy.allowedEgress[{idx}].ports[0].port={port}"
-    )));
-}
-
 /// Resolve the model credential `up` installs with. `--fake-model` forces the
 /// sealed install regardless of the environment; otherwise a non-empty
 /// credential value enables the real model.
@@ -469,6 +446,24 @@ pub fn check_github_token_conflict(flag: Option<&str>, clear: bool, set: &[Strin
              `--set`: it puts the complete token in the process table and shell \
              history, which the dedicated input exists to avoid."
         );
+    }
+    Ok(())
+}
+
+/// Validate every input that must fail before the installer reads cluster
+/// state. `curie apply` and `curie diff` call this through their shared local
+/// planner, while `cluster up` keeps the same validation before its own read.
+pub(crate) fn validate_up_inputs(
+    opts: &UpOpts,
+    github_token: Option<&str>,
+    clear_github_token: bool,
+) -> Result<()> {
+    validate_web_egress_cidrs(&opts.allow_web_egress)
+        .context("invalid --allow-web-egress value")?;
+    check_runner_model_conflict(opts.model.as_deref(), &opts.set)?;
+    check_github_token_conflict(github_token, clear_github_token, &opts.set)?;
+    for host in &opts.allow_egress_host {
+        parse_egress_provider(host)?;
     }
     Ok(())
 }
@@ -678,6 +673,86 @@ pub fn resolve_provider_egress_cidrs(
     cidrs.sort();
     cidrs.dedup();
     Ok(cidrs)
+}
+
+type ProviderAddressResolver = Box<dyn Fn(&str) -> std::io::Result<Vec<std::net::IpAddr>>>;
+
+fn system_provider_address_resolver() -> ProviderAddressResolver {
+    Box::new(|host| {
+        use std::net::ToSocketAddrs;
+        (host, 443u16)
+            .to_socket_addrs()
+            .map(|addresses| addresses.map(|address| address.ip()).collect())
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn provider_address_resolver() -> Result<ProviderAddressResolver> {
+    Ok(system_provider_address_resolver())
+}
+
+#[cfg(debug_assertions)]
+fn provider_address_resolver() -> Result<ProviderAddressResolver> {
+    let raw = match std::env::var("CURIE_TEST_PROVIDER_EGRESS_JSON") {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(system_provider_address_resolver()),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "reading CURIE_TEST_PROVIDER_EGRESS_JSON: {error}"
+            ));
+        }
+    };
+
+    let values: serde_json::Value = serde_json::from_str(&raw).context(
+        "CURIE_TEST_PROVIDER_EGRESS_JSON must be a JSON object mapping hosts to IP lists",
+    )?;
+    let values = values.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "CURIE_TEST_PROVIDER_EGRESS_JSON must be a JSON object mapping hosts to IP lists"
+        )
+    })?;
+    let mut resolved = BTreeMap::new();
+    for (host, addresses) in values {
+        let addresses = addresses.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "CURIE_TEST_PROVIDER_EGRESS_JSON entry for {host} must be an array of IP strings"
+            )
+        })?;
+        let mut parsed = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            let address = address.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CURIE_TEST_PROVIDER_EGRESS_JSON entry for {host} must contain only IP strings"
+                )
+            })?;
+            parsed.push(address.parse().with_context(|| {
+                format!(
+                    "CURIE_TEST_PROVIDER_EGRESS_JSON entry for {host} has invalid IP address {address}"
+                )
+            })?);
+        }
+        resolved.insert(host.clone(), parsed);
+    }
+    Ok(Box::new(move |host| {
+        resolved.get(host).cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "CURIE_TEST_PROVIDER_EGRESS_JSON has no address list for declared egress host {host}"
+                ),
+            )
+        })
+    }))
+}
+
+/// Resolve provider egress through the system resolver. Debug builds may inject
+/// deterministic addresses, which still pass through the routability checks in
+/// [`resolve_provider_egress_cidrs`].
+pub(crate) fn resolve_provider_egress_cidrs_for_current_environment(
+    providers: &[String],
+) -> Result<Vec<String>> {
+    let resolver = provider_address_resolver()?;
+    resolve_provider_egress_cidrs(providers, |host| resolver(host))
 }
 
 /// A note naming the model provider(s) whose egress `cluster up` opened, or
@@ -1000,20 +1075,6 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 /// present -- see `up_commands`, which pushes both inside one `if let`.
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
-/// The `--set` prefix the egress rules are written under.
-pub(crate) const EGRESS_KEY_PREFIX: &str = "security.networkPolicy.allowedEgress[";
-
-/// The array index of an egress chart key, or `None` if it is not one.
-///
-/// `curie diff` needs this to tell "the file governs this rule" from "the
-/// release has a rule the file dropped": both look like the same key family,
-/// and only the INDEX distinguishes them.
-pub(crate) fn egress_key_index(key: &str) -> Option<usize> {
-    let rest = key.strip_prefix(EGRESS_KEY_PREFIX)?;
-    let (digits, _) = rest.split_once(']')?;
-    digits.parse().ok()
-}
-
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
@@ -1088,6 +1149,33 @@ fn resolve_github_token(
         Some(current) => GithubTokenPlan::Set(current),
         None => GithubTokenPlan::Untouched,
     }
+}
+
+/// Finish an already validated up plan with the one live values read and, when
+/// requested, resolved provider addresses. This is kept separate from command
+/// execution so apply and diff can compare the same completed values.
+pub(crate) fn complete_up_opts(
+    mut opts: UpOpts,
+    existing: Option<&serde_json::Value>,
+    github_token: Option<&str>,
+    clear_github_token: bool,
+    resolve_provider_egress: bool,
+) -> Result<UpOpts> {
+    if !opts.dev {
+        opts.secrets = resolve_generated_secrets(existing, &opts.set)?;
+        opts.secrets
+            .extend(resolve_preserved_values(existing, &opts.set));
+    }
+    opts.github_token = resolve_github_token(existing, &opts.set, github_token, clear_github_token);
+    if resolve_provider_egress
+        && !opts.allow_egress_host.is_empty()
+        && opts.resolved_egress_cidrs.is_empty()
+    {
+        opts.resolved_egress_cidrs =
+            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
+                .context("resolving named provider egress hosts")?;
+    }
+    Ok(opts)
 }
 
 /// Whether an operator `--set` assigns a NON-EMPTY value to
@@ -1183,14 +1271,161 @@ async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Valu
     ))
 }
 
-/// `helm upgrade --install` for the release, exposing the UI and Langfuse on
-/// node ports unless `--no-expose`, plus any pass-through `--set` values. When a
-/// model credential is present it switches the fake model off and forwards the
-/// credential (masked when printed) -- but opens NO egress on its own (#362).
-/// Runner egress comes only from the resolved named-provider host routes
-/// (`resolved_egress_cidrs`, first) and the declared web destinations
-/// (`allow_web_egress`, after), sharing one contiguous array index.
-pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffParticipation {
+    Include,
+    Preserve,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum PlannedHelmValues {
+    Set {
+        expression: String,
+        effective: Vec<(String, String)>,
+    },
+    SecretFile {
+        values: Vec<(String, String)>,
+        diff: DiffParticipation,
+    },
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct UpValuePlan {
+    entries: Vec<PlannedHelmValues>,
+}
+
+impl UpValuePlan {
+    fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        let key = key.into();
+        let value = value.into();
+        self.entries.push(PlannedHelmValues::Set {
+            expression: format!("{key}={value}"),
+            effective: vec![(key, value)],
+        });
+    }
+
+    fn set_expression(&mut self, expression: String) {
+        let effective = operator_set_entries(std::slice::from_ref(&expression))
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+            .collect();
+        self.entries.push(PlannedHelmValues::Set {
+            expression,
+            effective,
+        });
+    }
+
+    fn secret_file(&mut self, values: Vec<(String, String)>, diff: DiffParticipation) {
+        if !values.is_empty() {
+            self.entries
+                .push(PlannedHelmValues::SecretFile { values, diff });
+        }
+    }
+
+    fn append_command_args(&self, args: &mut Vec<CmdArg>) {
+        for entry in &self.entries {
+            match entry {
+                PlannedHelmValues::Set { expression, .. } => {
+                    args.push(plain("--set"));
+                    args.push(plain(expression));
+                }
+                PlannedHelmValues::SecretFile { values, .. } => {
+                    args.push(CmdArg::SecretValuesFile(values.clone()));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn effective_values(&self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        for entry in &self.entries {
+            match entry {
+                PlannedHelmValues::Set { effective, .. } => {
+                    values.extend(effective.iter().cloned());
+                }
+                PlannedHelmValues::SecretFile {
+                    values: secrets,
+                    diff: DiffParticipation::Include,
+                } => {
+                    values.extend(secrets.iter().cloned());
+                }
+                PlannedHelmValues::SecretFile {
+                    diff: DiffParticipation::Preserve,
+                    ..
+                } => {}
+            }
+        }
+        values
+    }
+}
+
+/// The ordered chart values supplied by one `cluster up`. Both the Helm command
+/// and installation diff consume this representation, so adding a value cannot
+/// update one path without updating the other.
+pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
+    let mut plan = UpValuePlan::default();
+    if o.dev {
+        plan.set("security.allowDevDefaults", "true");
+    }
+    if !o.no_expose {
+        plan.set("ui.service.type", "NodePort");
+        plan.set("langfuse.web.service.type", "NodePort");
+    }
+    if let Some(model) = &o.local_model {
+        plan.set("inference.deploy", "true");
+        plan.set("inference.model", model);
+    }
+    if let Some(credentials) = &o.credentials {
+        plan.set(FAKE_MODEL_KEY, "false");
+        plan.secret_file(
+            vec![(MODEL_CREDENTIAL_KEY.to_string(), credentials.clone())],
+            DiffParticipation::Include,
+        );
+    }
+    match &o.github_token {
+        GithubTokenPlan::Untouched => {}
+        GithubTokenPlan::Set(token) => {
+            plan.secret_file(
+                vec![(GITHUB_TOKEN_KEY.to_string(), token.clone())],
+                DiffParticipation::Include,
+            );
+        }
+        GithubTokenPlan::Clear => {
+            plan.set(GITHUB_TOKEN_KEY, "");
+        }
+    }
+    for (index, cidr) in o
+        .resolved_egress_cidrs
+        .iter()
+        .chain(o.allow_web_egress.iter())
+        .enumerate()
+    {
+        plan.set(
+            format!("security.networkPolicy.allowedEgress[{index}].cidr"),
+            cidr,
+        );
+        plan.set(
+            format!("security.networkPolicy.allowedEgress[{index}].ports[0].protocol"),
+            "TCP",
+        );
+        plan.set(
+            format!("security.networkPolicy.allowedEgress[{index}].ports[0].port"),
+            EGRESS_TCP_PORT.to_string(),
+        );
+    }
+    plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
+    if let Some(model) = &o.model {
+        if explicit_runner_model(&o.set).is_none() {
+            plan.set(RUNNER_MODEL_KEY, model);
+        }
+    }
+    for expression in &o.set {
+        plan.set_expression(expression.clone());
+    }
+    plan
+}
+
+fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
     let mut args = vec![
         plain("upgrade"),
         plain("--install"),
@@ -1200,98 +1435,14 @@ pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
         plain(&o.common.namespace),
         plain("--create-namespace"),
     ];
-    if o.dev {
-        // With #195 the sealed chart auto-generates strong per-release secrets
-        // by default. `--dev` must opt into the chart's deterministic published
-        // defaults so local/CI stacks stay reproducible and match compose.
-        args.push(plain("--set"));
-        args.push(plain("security.allowDevDefaults=true"));
-    }
-    if !o.no_expose {
-        args.push(plain("--set"));
-        args.push(plain("ui.service.type=NodePort"));
-        args.push(plain("--set"));
-        args.push(plain("langfuse.web.service.type=NodePort"));
-    }
-    if let Some(model) = &o.local_model {
-        args.push(plain("--set"));
-        args.push(plain("inference.deploy=true"));
-        args.push(plain("--set"));
-        args.push(plain(format!("inference.model={model}")));
-    }
-    if let Some(credentials) = &o.credentials {
-        args.push(plain("--set"));
-        args.push(plain("agentSandbox.runner.fakeModel=false"));
-        // The model credential is the one high-sensitivity value here (a live API
-        // key). Deliver it through a private 0600 `-f` values file instead of an
-        // argv `--set`, so it never lands in the process table where any local
-        // user / EDR / crash reporter could read it via `ps -ef` or
-        // `/proc/<pid>/cmdline`. `fakeModel` is not secret and stays as plain
-        // `--set`. helm merges `-f` values before `--set`, so a later operator
-        // `--set` still overrides, matching the prior precedence. Enabling the
-        // real model opens NO egress on its own (#362) -- see the egress rules
-        // below, which come only from named providers and declared web ranges.
-        args.push(secret_values_file(
-            "agentSandbox.runner.credentials",
-            credentials,
-        ));
-    }
-    // The GitHub credential is a live bearer token, so it takes the same private
-    // 0600 `-f` values file as the model credential above and never touches the
-    // argv (#1124). An explicit clear is the empty string, which is NOT secret
-    // and rides as a visible plain `--set` -- the same shape
-    // `comms --disconnect` writes -- so the operator can see the removal in the
-    // preview instead of inferring it from an absence. Both sit before the
-    // passthrough `--set`s, so an operator `--set` keeps helm precedence.
-    match &o.github_token {
-        GithubTokenPlan::Untouched => {}
-        GithubTokenPlan::Set(token) => {
-            args.push(secret_values_file(GITHUB_TOKEN_KEY, token));
-        }
-        GithubTokenPlan::Clear => {
-            args.push(plain("--set"));
-            args.push(plain(format!("{GITHUB_TOKEN_KEY}=")));
-        }
-    }
-    // Egress allowlist entries share one running index so the array stays
-    // contiguous no matter which source contributes: the resolved named-provider
-    // host routes take the first slots (in order), then each declared web
-    // destination follows. When both are empty, no `allowedEgress` entry is
-    // emitted and the runner stays fail-closed.
-    let mut egress_idx = 0;
-    for cidr in &o.resolved_egress_cidrs {
-        push_egress_rule(&mut args, egress_idx, cidr, EGRESS_TCP_PORT);
-        egress_idx += 1;
-    }
-    for cidr in &o.allow_web_egress {
-        push_egress_rule(&mut args, egress_idx, cidr, EGRESS_TCP_PORT);
-        egress_idx += 1;
-    }
-    // The generated/reused required secrets travel through one private 0600 `-f`
-    // values file (materialized at run time), so no secret reaches the process
-    // table. Emitted before the passthrough `--set`s below and (like the model
-    // credential above) before them in helm's precedence, so an explicit
-    // operator `--set` still overrides -- though `resolve_generated_secrets`
-    // already skips any key the operator pinned.
-    if !o.secrets.is_empty() {
-        args.push(CmdArg::SecretValuesFile(o.secrets.clone()));
-    }
-    // Default the sandbox runner model from the shell `CURIE_MODEL` for
-    // cross-tier parity with `local up` (#361). Injected before the passthrough
-    // `--set`s so an explicit operator `--set agentSandbox.runner.model=` keeps
-    // helm precedence; suppressed when the operator already pinned it (a
-    // conflicting value fails loud earlier in `up`).
-    if let Some(model) = &o.model {
-        if explicit_runner_model(&o.set).is_none() {
-            args.push(plain("--set"));
-            args.push(plain(format!("{RUNNER_MODEL_KEY}={model}")));
-        }
-    }
-    for s in &o.set {
-        args.push(plain("--set"));
-        args.push(plain(s));
-    }
+    plan.append_command_args(&mut args);
     vec![OpsCommand::new("helm", args)]
+}
+
+/// `helm upgrade --install` for the release. Its chart values are rendered from
+/// [`up_value_plan`], which is also the source of the installation diff.
+pub fn up_commands(o: &UpOpts) -> Vec<OpsCommand> {
+    up_commands_with_plan(o, &up_value_plan(o))
 }
 
 /// The read-only commands `curie cluster status` runs (and prints under `--dry-run`).
@@ -1887,47 +2038,50 @@ fn should_read_existing(dev: bool, dry_run: bool) -> bool {
 }
 
 pub async fn up(
-    mut opts: UpOpts,
+    opts: UpOpts,
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
-    let ui = crate::ui::ui();
-    validate_web_egress_cidrs(&opts.allow_web_egress)
-        .context("invalid --allow-web-egress value")?;
-    // Fail loud (even under --dry-run) if CURIE_MODEL and an explicit
-    // `--set agentSandbox.runner.model=` disagree (#361).
-    check_runner_model_conflict(opts.model.as_deref(), &opts.set)?;
-    // Fail loud (even under --dry-run) when the credential is supplied through
-    // both the private input and the leaky `--set` pass-through (#1124).
-    check_github_token_conflict(github_token.as_deref(), clear_github_token, &opts.set)?;
-    // Each `--allow-egress-host` must name a known provider. An unknown value is
-    // a usage error (exit 2) pointing at `--allow-web-egress`; the `?` carries
-    // the CliError's exit class into the anyhow chain.
-    for h in &opts.allow_egress_host {
-        parse_egress_provider(h)?;
-    }
-
-    // Resolve the required chart secrets so a no-override `cluster up` never
-    // ships the published dev defaults (#196). `--dev` keeps the chart's
-    // deterministic dev defaults; otherwise a fresh install generates strong
-    // per-release randoms and an upgrade re-supplies whatever helm already
-    // recorded (so a live store's credential is never rotated). `--dry-run`
-    // stays offline (it never touches the cluster), so it previews the fresh
-    // install shape -- a live run reuses any existing release's secrets.
-    //
-    // Read once, used by both the generated-secret resolution below (sealed
-    // installs only) and the GitHub-credential resolution (every install --
-    // `--dev` governs the chart's dev DEFAULTS, not an operator's credential).
-    // `--dry-run` stays offline and therefore previews the fresh-install shape.
+    validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
+    let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
         fetch_existing_values(&opts.common).await?
     } else {
         None
     };
+    let opts = complete_up_opts(
+        opts,
+        existing.as_ref(),
+        github_token.as_deref(),
+        clear_github_token,
+        resolve_provider_egress,
+    )?;
+    let value_plan = up_value_plan(&opts);
+    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+}
+
+/// Execute an up plan whose local validation and live completion already ran.
+/// Installation apply uses this after it has shared that completed plan with
+/// diff, avoiding another values read or provider lookup.
+pub(crate) async fn up_prepared(
+    opts: UpOpts,
+    value_plan: UpValuePlan,
+    existing: Option<serde_json::Value>,
+    github_token: Option<String>,
+) -> Result<ClusterUpOutput> {
+    validate_up_inputs(&opts, github_token.as_deref(), false)?;
+    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+}
+
+async fn run_prepared_up(
+    opts: UpOpts,
+    value_plan: UpValuePlan,
+    existing: Option<serde_json::Value>,
+    github_token: Option<&str>,
+) -> Result<ClusterUpOutput> {
+    let ui = crate::ui::ui();
     if !opts.dev {
-        let fresh = existing.is_none();
-        opts.secrets = resolve_generated_secrets(existing.as_ref(), &opts.set)?;
         let preserved = resolve_preserved_values(existing.as_ref(), &opts.set);
         if !preserved.is_empty() {
             ui.note(&format!(
@@ -1935,25 +2089,14 @@ pub async fn up(
                  re-run those verbs only to change them",
                 preserved.len()
             ));
-            opts.secrets.extend(preserved);
         }
-        if fresh && !opts.secrets.is_empty() && !opts.common.dry_run {
+        if existing.is_none() && !opts.secrets.is_empty() && !opts.common.dry_run {
             ui.note(&format!(
                 "generated strong per-release secrets for {} required chart credential(s); re-running `cluster up` reuses them",
                 opts.secrets.len()
             ));
         }
     }
-
-    // The API's outbound GitHub credential: an explicit `--github-token` /
-    // `--clear-github-token`, otherwise whatever the release already recorded,
-    // so a plain `cluster up` cannot silently reset it (#1124).
-    opts.github_token = resolve_github_token(
-        existing.as_ref(),
-        &opts.set,
-        github_token.as_deref(),
-        clear_github_token,
-    );
     // `existing.is_some()` means this is an UPGRADE: an API pod is already
     // running on the old value and keeps it until it restarts (the api pod
     // template carries no checksum/secret annotation). On a FRESH install the
@@ -1975,9 +2118,9 @@ pub async fn up(
     // An explicit but EMPTY `--github-token` / `CURIE_GITHUB_TOKEN`: a routine
     // shell accident that preserves rather than clears (`resolve_github_token`),
     // so each arm below folds it into its own single note.
-    let empty_flag = github_token.as_deref().is_some_and(str::is_empty);
+    let empty_flag = github_token.is_some_and(str::is_empty);
     match &opts.github_token {
-        GithubTokenPlan::Set(_) if github_token.as_deref().is_some_and(|v| !v.is_empty()) => {
+        GithubTokenPlan::Set(_) if github_token.is_some_and(|v| !v.is_empty()) => {
             if upgrading {
                 ui.note(&format!(
                     "GitHub credential set through the private values path; the running API keeps the old one until it restarts: {restart_hint}"
@@ -2025,40 +2168,25 @@ pub async fn up(
         ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
-    // Resolve the named providers' API host(s) to narrow host-route CIDRs. This
-    // is the only DNS the installer does, and it stays offline under `--dry-run`
-    // (the offline invariant): dry-run previews the intent without resolving,
-    // and a live run resolves and opens exactly the resolved addresses.
-    if !opts.allow_egress_host.is_empty() {
-        if opts.common.dry_run {
-            // Name each provider's host(s) without resolving them, so the
-            // preview stays offline yet shows exactly what a live run reaches.
-            let named = opts
-                .allow_egress_host
-                .iter()
-                .map(|p| match provider_egress_hosts(p) {
-                    Some(hosts) if !hosts.is_empty() => format!("{p} ({})", hosts.join(", ")),
-                    _ => p.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            ui.note(&format!(
-                "a live run resolves {named} to narrow /32+/128 host routes and opens runner egress to the resolved addresses (skipped here to keep --dry-run offline)"
-            ));
-        } else {
-            let real_resolver = |host: &str| -> std::io::Result<Vec<std::net::IpAddr>> {
-                use std::net::ToSocketAddrs;
-                (host, 443u16)
-                    .to_socket_addrs()
-                    .map(|it| it.map(|s| s.ip()).collect())
-            };
-            opts.resolved_egress_cidrs =
-                resolve_provider_egress_cidrs(&opts.allow_egress_host, real_resolver)
-                    .context("resolving named provider egress hosts")?;
-        }
+    if !opts.allow_egress_host.is_empty()
+        && opts.common.dry_run
+        && opts.resolved_egress_cidrs.is_empty()
+    {
+        let named = opts
+            .allow_egress_host
+            .iter()
+            .map(|provider| match provider_egress_hosts(provider) {
+                Some(hosts) if !hosts.is_empty() => format!("{provider} ({})", hosts.join(", ")),
+                _ => provider.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.note(&format!(
+            "a live run resolves {named} to narrow /32+/128 host routes and opens runner egress to the resolved addresses (skipped here to keep --dry-run offline)"
+        ));
     }
 
-    let mut cmds = up_commands(&opts);
+    let mut cmds = up_commands_with_plan(&opts, &value_plan);
 
     // #707 record ownership only on namespaces THIS run creates, so a later
     // `down` sweeps exactly what `up` made and leaves pre-existing state alone.

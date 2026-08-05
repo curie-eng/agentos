@@ -3069,6 +3069,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             chart,
         }) => {
             let cfg = curie::installation::Installation::load(&file)?;
+            let local = curie::installation::plan_installation(cfg, dry_run)?;
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
                 artifacts::Channel::current(),
@@ -3077,18 +3078,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 std::path::Path::new("charts/curie").is_dir(),
             )?;
             let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-            emit(
-                curie::installation::apply(curie::installation::ApplyOpts {
-                    cfg,
-                    chart,
-                    dry_run,
-                })
-                .await?,
-            )
+            emit(curie::installation::apply(curie::installation::ApplyOpts { local, chart }).await?)
         }
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;
-            emit(curie::installation::diff(curie::installation::DiffOpts { cfg }).await?)
+            let local = curie::installation::plan_installation(cfg, false)?;
+            emit(curie::installation::diff(curie::installation::DiffOpts { local }).await?)
         }
     }
 }
