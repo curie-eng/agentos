@@ -50,13 +50,51 @@ Run these from the repo root unless noted. CI (`.github/workflows/ci.yaml`) runs
 the same commands.
 
 **Python (all packages, from root):**
+Run this local Python CI baseline. Do not use `--profile full` for startup
+because it can start stale application images.
+
 ```bash
-uv sync                 # once, and after any dependency change
-uv run pytest -q        # all workspace tests
-uv run ruff check .     # lint (auto-fix: uv run ruff check --fix .)
-uv run mypy             # type-check (strict; targets the src dirs)
-uv run lint-imports     # import boundaries (harness SDK containment, #950/#961)
+(
+  set -e
+  export COMPOSE_PROJECT_NAME=curie-implement-baseline
+  exec 9>/tmp/curie-implement-baseline.lock
+  if ! flock -n 9; then
+    echo "Another local Python CI baseline is already running"
+    exit 1
+  fi
+  wire_lock=$(mktemp /tmp/curie-implement-baseline-wire.lock.XXXXXX)
+  trap 'docker compose --profile full -f compose.dev.yaml down -v; rm -f "$wire_lock"' EXIT
+  uv lock --check
+  uv sync
+  uv run ruff check .
+  uv run mypy
+  uv run lint-imports
+  bash scripts/check-docs.sh
+  bash scripts/check-wire-tolerance.sh
+  docker compose -f compose.dev.yaml up -d \
+    postgres valkey clickhouse rustfs rustfs-init \
+    langfuse-web langfuse-worker otel-collector
+  docker compose -f compose.dev.yaml up -d --wait --wait-timeout 300 \
+    postgres valkey clickhouse rustfs \
+    langfuse-web langfuse-worker otel-collector
+  for i in $(seq 1 60); do
+    if curl -fsS http://localhost:23000/api/public/health >/dev/null 2>&1; then
+      break
+    fi
+    sleep 3
+  done
+  curl -fsS http://localhost:23000/api/public/health >/dev/null
+  (cd apps/api && uv run alembic upgrade head)
+  git fetch --no-tags --depth=1 origin main || true
+  git show origin/main:packages/aci-protocol/schema/wire.lock > "$wire_lock" 2>/dev/null || true
+  uv run python -m aci_protocol.wire_lock --check-base "$wire_lock"
+  uv run pytest -q
+)
 ```
+
+Fixed host ports already in use are an environment occupancy blocker. Stop the
+existing owner before running this baseline. That does not mean the baseline is
+broken.
 
 **Rust CLI:**
 ```bash
