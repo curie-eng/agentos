@@ -45,6 +45,11 @@ See the [target table](#which-target-do-i-want) below for what each tier actuall
 
 ## Quickstart
 
+**Just want a bot in Slack?** [`docs/your-first-slack-agent.md`](docs/your-first-slack-agent.md)
+is the short path: what to get first, four commands, and the six mistakes that
+cost people an hour. The walkthrough below is the longer one, and teaches the
+parity ladder as it goes.
+
 ### Prerequisites
 
 - **Docker + Compose v2**: for the dev stack and the local runner container.
@@ -303,6 +308,9 @@ requires it, and you are free to use Curie whether or not you do.
 
 ## Where do I go next?
 
+- [docs/your-first-slack-agent.md](docs/your-first-slack-agent.md) -- the
+one-page path from nothing to a bot answering in Slack that redeploys itself on
+push, plus the mistakes worth skipping.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) -- the component diagram, the
 message-flow and deploy-flow sequence diagrams, and the built/in-progress
 split.
