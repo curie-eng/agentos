@@ -556,6 +556,9 @@ impl crate::ui::CliOutput for ApplyOutput {
 pub struct ApplyOpts {
     pub local: LocalInstallationPlan,
     pub chart: String,
+    /// Proceed even when the upgrade would delete a stateful component. The
+    /// operator asserting the data is migrated, or expendable.
+    pub allow_stateful_removal: bool,
 }
 
 pub struct LocalInstallationPlan {
@@ -685,6 +688,43 @@ async fn complete_installation_plan(
     })
 }
 
+/// Refuse an apply that would delete a stateful component the release runs.
+///
+/// Runs even under `--dry-run`: the plan a dry run prints is exactly the plan
+/// that would destroy the store, so an operator reading it deserves the same
+/// warning the real run would give.
+async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
+    let live = crate::ops::live_statefulsets(&up.common).await?;
+    if live.is_empty() {
+        // Fresh install, or no cluster to read. Nothing to lose either way.
+        return Ok(());
+    }
+    // The same effective values the upgrade would send, so the render reflects
+    // what this apply would actually create rather than the chart's defaults.
+    let sets: Vec<String> = crate::ops::up_value_plan(up)
+        .effective_values()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let rendered = crate::ops::chart_statefulsets(&up.chart, &up.common, &sets).await?;
+    let removed = crate::ops::removed_stateful_components(&live, &rendered);
+    if removed.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "refusing to apply: this would DELETE {} stateful component(s) the release is \
+         running, and the persistent data with them:\n  {}\n\n\
+         The target chart does not render them, which usually means a chart version \
+         renamed or removed the component. Migrate the data first -- for the bundle \
+         store, every sandbox reads from it at start, so losing it breaks the next turn \
+         and not merely a rollback.\n\n\
+         Re-run with --allow-stateful-removal once the data is migrated or you accept \
+         losing it.",
+        removed.len(),
+        removed.join("\n  "),
+    )
+}
+
 /// Converge the cluster to the file.
 ///
 /// The ordering -- platform install, THEN comms -- is handled here rather than
@@ -693,7 +733,11 @@ async fn complete_installation_plan(
 /// only as a sentence in a runbook, which is exactly what ADR-0097 set out to
 /// fix: the interface could not express it, so prose had to.
 pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
-    let ApplyOpts { mut local, chart } = opts;
+    let ApplyOpts {
+        mut local,
+        chart,
+        allow_stateful_removal,
+    } = opts;
     local.up.chart = chart;
     let dry_run = local.up.common.dry_run;
     let plan = complete_installation_plan(local).await?;
@@ -706,6 +750,21 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         live,
         ..
     } = plan;
+
+    // Refuse before the first mutation, not after.
+    //
+    // `up` does a FULL upgrade, so a component the target chart no longer
+    // renders is DELETED -- and for a StatefulSet that is the data with it.
+    // This is not hypothetical: chart 0.6.0 renamed the object store from
+    // `minio` to `rustfs`, and applying it to a 0.5.1 release would remove the
+    // store every sandbox's bundle-fetch init container reads from. The next
+    // Slack message would fail, not merely a rollback.
+    //
+    // `curie diff` learned to warn about the chart mismatch; `apply` had no
+    // guard at all and would have gone ahead silently.
+    if !allow_stateful_removal {
+        guard_stateful_removal(&up).await?;
+    }
     let up_out = crate::ops::up_prepared(up, up_values, live, github_token).await?;
 
     let mut lines = match up_out {
