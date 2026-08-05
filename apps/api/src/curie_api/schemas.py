@@ -41,6 +41,34 @@ _SLACK_USERGROUP_ID = re.compile(r"^S[A-Z0-9]{7,}$")
 _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
 
 
+def _validate_thinking_override(value: str | None) -> str | None:
+    """Refuse an empty thinking override (#1310).
+
+    Empty is not a third way to say "no override". It reaches the worker as a
+    falsy value, which emits no boot key at all -- so it selects the MODEL's own
+    default and silently skips the platform default an operator configured, the
+    opposite of what someone typing `""` to clear a value expects. Explicit JSON
+    null is the reset, and the error says so.
+
+    None passes through: on PATCH that is the clear, on create it is "no
+    override". The vocabulary itself (`disabled`/`adaptive`/`enabled:<n>`) is
+    deliberately NOT checked here -- it belongs to the runner
+    (`curie_runner.thinking`), the same division `model` already has, so that
+    swapping the harness is not a schema change.
+    """
+    if value is None:
+        return value
+    if not value.strip():
+        raise ValueError(
+            "thinking must not be empty: an empty value skips the platform "
+            "default and selects the model's own behavior, which is not what "
+            "clearing means. Send null to clear the override back to the "
+            "platform default, or a value like 'disabled', 'adaptive' or "
+            "'enabled:2000'."
+        )
+    return value
+
+
 def _validate_slack_channel_id(value: str | None) -> str | None:
     """Enforce a Slack channel-ID shape on a binding. Slack events carry the
     channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name or
@@ -352,6 +380,7 @@ class AgentCreate(BaseModel):
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
 
+    _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
@@ -361,16 +390,24 @@ class AgentCreate(BaseModel):
 class AgentUpdate(BaseModel):
     """Partial update of mutable agent fields. An omitted field is unchanged.
 
+    For the two nullable operator overrides -- `model` and `thinking` -- omitted
+    and explicit JSON null are DIFFERENT requests, and the router tells them
+    apart with `model_fields_set` (#1310). Omitted leaves the current value;
+    explicit null clears the override back to the platform default. Reading
+    `None` alone cannot distinguish the two, which is why setting one of these
+    used to be a one-way door.
+
     The repo binding stopped being identity in ADR-0091: one repository builds
     many agents now, so binding is a routing fact, not a name.
     """
 
     slack_channel: str | None = None
-    # New per-agent model id (#254). Omitted (None) leaves the current model
-    # unchanged, matching the slack_channel convention.
+    # New per-agent model id (#254). OMITTED leaves the current model unchanged;
+    # explicit null clears it back to the platform default (#1310).
     model: str | None = None
-    # New per-agent thinking depth (#1182). Omitted (None) leaves the current
-    # value unchanged, the same convention as `model` above.
+    # New per-agent thinking depth (#1182, ADR-0098). Same three-way semantics as
+    # `model` above: omitted is unchanged, explicit null clears to the platform
+    # default.
     thinking: str | None = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
@@ -388,6 +425,7 @@ class AgentUpdate(BaseModel):
     # agent and a target naming it is rejected as unknown.
     repo_full_name: str | None = None
 
+    _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)

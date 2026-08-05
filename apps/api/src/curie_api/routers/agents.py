@@ -152,9 +152,17 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
                 raise
             status_code, message = classified
             raise HTTPException(status_code, message) from exc
-    if data.model is not None:
+    # Presence, not truthiness (#1310). `is not None` conflates "the client did
+    # not mention this field" with "the client explicitly sent null", so setting
+    # either override used to be a one-way door: nothing could put it back to the
+    # platform default. `model_fields_set` carries exactly the keys the request
+    # actually contained, which is the distinction the API's own semantics rest
+    # on. Both nullable overrides get it -- they are the same seam, and fixing
+    # one beside the other would leave the sibling broken on an adjacent line.
+    sent = data.model_fields_set
+    if "model" in sent:
         agent = await crud.update_agent_model(session, agent, data.model)
-    if data.thinking is not None:
+    if "thinking" in sent:
         agent = await crud.update_agent_thinking(session, agent, data.thinking)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).

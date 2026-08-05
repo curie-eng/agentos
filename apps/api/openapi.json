@@ -227,7 +227,7 @@
         "type": "object"
       },
       "AgentUpdate": {
-        "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
+        "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nFor the two nullable operator overrides -- `model` and `thinking` -- omitted\nand explicit JSON null are DIFFERENT requests, and the router tells them\napart with `model_fields_set` (#1310). Omitted leaves the current value;\nexplicit null clears the override back to the platform default. Reading\n`None` alone cannot distinguish the two, which is why setting one of these\nused to be a one-way door.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
         "properties": {
           "approval_required_tools": {
             "anyOf": [
