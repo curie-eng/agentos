@@ -388,6 +388,21 @@ class BootEnv(_AciModel):
     api_backend: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MODEL_API_BACKEND", "worker")
     )
+    # How deeply the model may reason before answering (#1182, ADR-0098). A
+    # sibling of ``model``: same producer, same consumer, same two-layer operator
+    # ownership (platform default, per-agent override, no bundle surface), so it
+    # is a declared boot key on the same grounds rather than an undeclared env.
+    #
+    # Deliberately ``str`` and not an enum here. The vocabulary and its rejection
+    # belong to the runner (as ``ApiBackend`` does for ``api_backend`` above), so
+    # that the wire contract does not mirror claude-agent-sdk's option shape and a
+    # harness swap is not a protocol change.
+    #
+    # Unset is the pre-#1182 behavior verbatim: the runner sends no thinking
+    # configuration and the model's own default stands.
+    thinking: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_THINKING", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
@@ -501,6 +516,7 @@ class BootEnv(_AciModel):
         credentials_ref: str | None = None,
         base_url: str | None = None,
         api_backend: str | None = None,
+        thinking: str | None = None,
         model_env_key: str | None = None,
         history_token: str | None = None,
         memory_token: str | None = None,
@@ -554,6 +570,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("base_url")] = base_url
         if api_backend:
             env[cls.env_key("api_backend")] = api_backend
+        if thinking:
+            env[cls.env_key("thinking")] = thinking
         if model_env_key:
             env[cls.env_key("model_env_key")] = model_env_key
         if model:
@@ -628,6 +646,8 @@ class BootEnv(_AciModel):
             env[self.env_key("base_url")] = self.base_url
         if self.api_backend is not None:
             env[self.env_key("api_backend")] = self.api_backend
+        if self.thinking is not None:
+            env[self.env_key("thinking")] = self.thinking
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
         if self.max_turns is not None:
@@ -678,6 +698,9 @@ class BootEnv(_AciModel):
             # `env.get(...) or <default>` reads: an empty backend falls back to
             # `messages`, an empty key list to (CURIE_CREDENTIALS,).
             api_backend=_str_or_none(env.get("CURIE_MODEL_API_BACKEND")),
+            # Empty is "not declared" here too: an unset or blank knob leaves the
+            # runner sending no thinking configuration at all (ADR-0098).
+            thinking=_str_or_none(env.get("CURIE_THINKING")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
             max_turns=_required_int(env.get("CURIE_MAX_TURNS")),
             history_max_turns=_tolerant_int(env.get("CURIE_HISTORY_MAX_TURNS")),
