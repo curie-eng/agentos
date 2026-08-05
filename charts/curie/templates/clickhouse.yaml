@@ -1,5 +1,50 @@
 {{- if .Values.clickhouse.deploy }}
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "curie.fullname" . }}-clickhouse-config
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+data:
+  # Overlay merged over the image's config.xml. `config.d/` is already how the
+  # official image layers its own settings (docker_related_config.xml), so this
+  # needs no image change and no entrypoint override.
+  #
+  # Why this file exists at all: stock ClickHouse config is sized for a
+  # dedicated analytics box, and here it is an embedded store holding kilobytes
+  # of Langfuse traces. Left alone it logs at `trace` and keeps 30 days of its
+  # own telemetry, which grows until a merge exceeds the memory limit and wedges
+  # into an infinite retry. See the clickhouse block in values.yaml for the
+  # measured numbers.
+  curie-logging.xml: |
+    <clickhouse>
+      <logger>
+        <level>{{ .Values.clickhouse.logLevel }}</level>
+      </logger>
+    {{- if .Values.clickhouse.systemLogs.enabled }}
+      <!-- Self-telemetry on, but bounded. `remove="1"` is the documented way to
+           drop a section from the merged config; here we only retitle the TTL. -->
+      <text_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></text_log>
+      <trace_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></trace_log>
+      <metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></metric_log>
+      <asynchronous_metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></asynchronous_metric_log>
+    {{- else }}
+      <!-- Removed outright. These four are the firehose: on a real install
+           text_log alone reached 2.30 GiB / 63,295,036 rows in eight days, and
+           metric_log was the table whose merge wedged. Nothing reads them. -->
+      <text_log remove="1"/>
+      <trace_log remove="1"/>
+      <metric_log remove="1"/>
+      <asynchronous_metric_log remove="1"/>
+    {{- end }}
+      <!-- Kept regardless: low volume and genuinely useful when ClickHouse
+           itself misbehaves. Bounded so they cannot become the next text_log. -->
+      <query_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></query_log>
+      <part_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></part_log>
+      <error_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></error_log>
+    </clickhouse>
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "curie.fullname" . }}-clickhouse
@@ -31,6 +76,12 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
   template:
     metadata:
+      annotations:
+        # Roll the pod when the logging overlay changes. Without this a
+        # `logLevel` or `systemLogs` edit renders a new ConfigMap and the
+        # running server keeps the old config until something else restarts it
+        # -- i.e. the fix would appear applied while the node kept starving.
+        checksum/config: {{ printf "%s|%v|%v" .Values.clickhouse.logLevel .Values.clickhouse.systemLogs.enabled .Values.clickhouse.systemLogs.retentionDays | sha256sum }}
       labels:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "clickhouse") | nindent 8 }}
@@ -40,11 +91,14 @@ spec:
       {{- end }}
       securityContext:
         fsGroup: {{ .Values.clickhouse.podSecurityContext.fsGroup }}
-      {{- if not .Values.clickhouse.persistence.enabled }}
       volumes:
+        - name: config
+          configMap:
+            name: {{ include "curie.fullname" . }}-clickhouse-config
+        {{- if not .Values.clickhouse.persistence.enabled }}
         - name: data
           emptyDir: {}
-      {{- end }}
+        {{- end }}
       containers:
         - name: clickhouse
           # Pinned tag; the AVX preflight validates it against the node's CPU.
@@ -88,6 +142,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/clickhouse
+            # subPath, so this lands beside the image's own
+            # docker_related_config.xml instead of replacing the directory.
+            - name: config
+              mountPath: /etc/clickhouse-server/config.d/curie-logging.xml
+              subPath: curie-logging.xml
+              readOnly: true
   {{- if .Values.clickhouse.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

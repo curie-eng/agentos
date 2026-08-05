@@ -98,6 +98,18 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/litellm-sidecar-assertions.sh
 
+      # Prove ClickHouse's own telemetry stays bounded: logger at `warning`, the
+      # four firehose system log tables removed, and whatever remains carrying a
+      # TTL. At image defaults ClickHouse logs at `trace` and keeps 30 days of
+      # self-telemetry -- measured at 2.72 GiB against 31 KiB of real Langfuse
+      # data, filling a 3Gi volume in eight days and ending in a merge that
+      # exceeded the memory limit and retried forever, starving the node until
+      # every agent turn escalated as an opaque `runner-error`.
+      - name: helm render assertions (clickhouse self-telemetry)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/clickhouse-logging-assertions.sh
+
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
       # and the pods actually start on an enforcing cluster.
