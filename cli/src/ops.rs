@@ -1386,6 +1386,65 @@ pub fn removed_stateful_components(live: &[(String, String)], rendered: &[String
 }
 
 #[cfg(test)]
+mod release_secret_name_tests {
+    use super::*;
+
+    /// The bug: `<release>-secrets` is only right when the release name
+    /// contains the chart name. A default install renders
+    /// `<release>-curie-secrets`, and every read silently found nothing.
+    #[test]
+    fn a_default_install_secret_is_found() {
+        let listed = "t-curie-secrets\nsh.helm.release.v1.t.v1\n";
+        assert_eq!(
+            pick_release_secret(listed),
+            Some("t-curie-secrets".to_string())
+        );
+    }
+
+    /// The shape that hid the bug: with `nameOverride` equal to the release
+    /// name, both forms collapse to the same string.
+    #[test]
+    fn a_name_override_install_secret_is_found() {
+        assert_eq!(
+            pick_release_secret("acme-bot-secrets\n"),
+            Some("acme-bot-secrets".to_string())
+        );
+    }
+
+    /// The collision the exclusion exists for. Per-agent connector Secrets
+    /// carry the same release labels, so without it the selector could return
+    /// one -- a confidently WRONG answer, which is worse than an empty one.
+    #[test]
+    fn a_connector_secret_is_never_mistaken_for_the_chart_secret() {
+        let listed = "acme-bot-acme-bot-connector-secrets\n                      acme-bot-acme-dev-connector-secrets\n                      acme-bot-secrets\n";
+        assert_eq!(
+            pick_release_secret(listed),
+            Some("acme-bot-secrets".to_string())
+        );
+    }
+
+    /// Ordering must not decide it: the connector Secret sorting first is the
+    /// realistic case, since kubectl lists alphabetically.
+    #[test]
+    fn ordering_does_not_change_the_answer() {
+        let connector_first = "a-connector-secrets\nz-curie-secrets\n";
+        assert_eq!(
+            pick_release_secret(connector_first),
+            Some("z-curie-secrets".to_string())
+        );
+    }
+
+    /// An absent release must yield nothing, not a guess. The callers turn
+    /// `None` into an actionable error naming their escape-hatch flag.
+    #[test]
+    fn no_matching_secret_yields_none() {
+        assert_eq!(pick_release_secret(""), None);
+        assert_eq!(pick_release_secret("sh.helm.release.v1.t.v1\n"), None);
+        assert_eq!(pick_release_secret("only-connector-secrets\n"), None);
+    }
+}
+
+#[cfg(test)]
 mod sealing_preservation_tests {
     use super::*;
 
@@ -3325,7 +3384,7 @@ pub async fn discover_api_key(namespace: &str, release: &str) -> Result<String> 
         .await
         .ok_or_else(|| {
             api_key_usage_err(format!(
-                "could not read the API key from secret {release}-secrets in namespace {namespace}; \
+                "could not read the API key from the chart Secret for release {release} in namespace {namespace}; \
                  pass --api-key or set CURIE_API_KEY to the release's api.apiKey"
             ))
         })
@@ -3352,7 +3411,7 @@ pub async fn discover_valkey_password(namespace: &str, release: &str) -> Result<
         .await
         .ok_or_else(|| {
             valkey_password_usage_err(format!(
-                "could not read the Valkey password from secret {release}-secrets in namespace \
+                "could not read the Valkey password from the chart Secret for release {release} in namespace \
                  {namespace}; pass --valkey-password or set CURIE_VALKEY_PASSWORD to the \
                  release's valkey.password"
             ))
@@ -3380,7 +3439,7 @@ pub async fn discover_slack_bot_token(namespace: &str, release: &str) -> Result<
         .filter(|token| !token.is_empty())
         .ok_or_else(|| {
             slack_bot_token_usage_err(format!(
-                "could not read a Slack bot token from secret {release}-secrets in namespace \
+                "could not read a Slack bot token from the chart Secret for release {release} in namespace \
                  {namespace}; the workspace may not be connected (run `curie cluster comms \
                  --slack`), or set CURIE_SLACK_BOT_TOKEN"
             ))
@@ -3436,11 +3495,24 @@ pub async fn dispatcher_connected(namespace: &str, release: &str) -> bool {
     }
 }
 
-/// Read one data key out of a release's chart Secret, decoded server-side by
-/// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
-/// when the Secret, the key, or the cluster is unreachable; the caller turns
-/// that into an actionable error naming its own escape-hatch flag.
-async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> Option<String> {
+/// The name of the release's chart Secret, discovered rather than computed.
+///
+/// It was computed as `<release>-secrets`, which is only right when the release
+/// name happens to contain the chart name. The chart uses helm's standard
+/// `fullname`, so a default install renders `<release>-curie-secrets` and every
+/// read silently found nothing. It went unnoticed because the installs that
+/// exercise these paths set `nameOverride` to the release name, which collapses
+/// the two forms.
+///
+/// Discovered because it cannot be computed from what the CLI knows: both
+/// `nameOverride` and `fullnameOverride` change the answer, and neither is
+/// visible from the release name alone. Selecting on the instance label works
+/// whatever the operator set.
+///
+/// The `-connector-secrets` exclusion is load-bearing: per-agent connector
+/// Secrets carry the same release labels, and one of those would be a
+/// confidently wrong answer rather than an empty one.
+async fn release_secret_name(namespace: &str, release: &str) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -3448,7 +3520,59 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
             plain(namespace),
             plain("get"),
             plain("secret"),
-            plain(format!("{release}-secrets")),
+            plain("-l"),
+            plain(format!("app.kubernetes.io/instance={release}")),
+            plain("-o"),
+            plain("jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"),
+        ],
+    );
+    let (ok, out, _err) = run_capture(&cmd).await.ok()?;
+    if !ok {
+        return None;
+    }
+    pick_release_secret(&out)
+}
+
+/// The chart Secret among a release's Secrets, or `None` if it is not there.
+///
+/// Pure, so the selection rule is testable without a cluster -- which is how
+/// the `-connector-secrets` collision was caught before it could pick one.
+pub fn pick_release_secret(names: &str) -> Option<String> {
+    names
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .find(|n| n.ends_with("-secrets") && !n.ends_with("-connector-secrets"))
+        .map(str::to_string)
+}
+
+/// The chart Secret's name, falling back to the historical guess.
+///
+/// A caller that must NAME the Secret (rather than read through it) still needs
+/// a string when the cluster is unreachable -- a `--dry-run` plan, for
+/// instance. The fallback is the old computed form, which is right for the
+/// installs that set `nameOverride` and wrong in exactly the way this function
+/// exists to fix, so it is a last resort and never silent in a live run.
+pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> String {
+    release_secret_name(namespace, release)
+        .await
+        .unwrap_or_else(|| format!("{release}-secrets"))
+}
+
+/// Read one data key out of a release's chart Secret, decoded server-side by
+/// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
+/// when the Secret, the key, or the cluster is unreachable; the caller turns
+/// that into an actionable error naming its own escape-hatch flag.
+async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> Option<String> {
+    let secret = release_secret_name(namespace, release).await?;
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("secret"),
+            plain(secret),
             plain("-o"),
             plain(format!(
                 "go-template={{{{ index .data \"{data_key}\" | base64decode }}}}"

@@ -163,27 +163,54 @@ pub fn create_staging_pod_cmd(o: &CommonOpts, image: &str, secret_name: &str) ->
     )
 }
 
+/// Wait for a Secret key to appear in the staging pod's mount.
+///
+/// The pod mounts the release Secret when it is CREATED, before the upgrade
+/// exists. A mounted Secret is refreshed by kubelet on a sync period, not
+/// instantly, so the key the NEW store uses is typically absent for up to a
+/// minute after the upgrade adds it. The first live run of this verb failed
+/// exactly there: `cat: /secret/rustfsSecretKey: No such file or directory`,
+/// with the staged copy intact.
+///
+/// Waiting rather than re-creating the pod: its `emptyDir` holds the only copy
+/// of the objects at that moment, so recreating it would destroy them.
+fn await_secret_key(key: &str) -> String {
+    format!(
+        "for i in $(seq 1 90); do [ -s /secret/{key} ] && break; sleep 2; done; \
+         [ -s /secret/{key} ] || {{ echo \"secret key {key} never appeared in the \
+         staging pod mount; the staged copy is intact -- retry the import\" >&2; exit 1; }}; "
+    )
+}
+
 /// The in-pod shell for one leg of the copy.
 ///
 /// `direction` is the `aws s3 sync` argument pair. The password is read from
 /// the mounted Secret inside the pod, so it never appears here.
 fn sync_script(store: StoreKind, endpoint: &str, from: &str, to: &str) -> String {
     format!(
-        "set -e; \
+        "set -e; {wait}\
          export AWS_DEFAULT_REGION=us-east-1; \
          aws configure set default.s3.addressing_style path; \
          export AWS_ACCESS_KEY_ID={access}; \
          export AWS_SECRET_ACCESS_KEY=$(cat /secret/{secret}); \
          aws s3 sync {from} {to} --endpoint-url {endpoint} --only-show-errors; \
          echo synced",
+        wait = await_secret_key(store.secret_key()),
         access = store.access_key(),
         secret = store.secret_key(),
     )
 }
 
 /// The store's in-cluster S3 endpoint, from the Service the chart actually
-/// created. Looked up by component label rather than constructed from the
-/// release name, for the `nameOverride` reason above.
+/// created. Looked up by component rather than constructed from the release
+/// name, for the `nameOverride` reason above.
+///
+/// The component lives in the Service's `spec.selector`, NOT in its
+/// `metadata.labels` -- the chart's `selectorLabels` helper puts it there, and
+/// the object-level labels carry only name/instance/version. A `-l` label
+/// selector therefore matches nothing, which is how the first live run of this
+/// verb failed: `array index out of bounds: index 0, length 0`. Filtering on
+/// `spec.selector` is what actually finds it.
 pub fn store_service_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
@@ -192,10 +219,11 @@ pub fn store_service_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
             plain("svc"),
             plain("-n"),
             plain(&o.namespace),
-            plain("-l"),
-            plain(format!("app.kubernetes.io/component={}", store.suffix())),
             plain("-o"),
-            plain("jsonpath={.items[0].metadata.name}"),
+            plain(format!(
+                r#"jsonpath={{.items[?(@.spec.selector.app\.kubernetes\.io/component=="{}")].metadata.name}}"#,
+                store.suffix()
+            )),
         ],
     )
 }
@@ -219,7 +247,7 @@ pub fn export_cmd(o: &CommonOpts, from: StoreKind, bucket: &str, endpoint: &str)
 /// after a partial import must not fail on the bucket already being there.
 pub fn import_cmd(o: &CommonOpts, to: StoreKind, bucket: &str, endpoint: &str) -> OpsCommand {
     let script = format!(
-        "set -e; \
+        "set -e; {wait}\
          export AWS_DEFAULT_REGION=us-east-1; \
          aws configure set default.s3.addressing_style path; \
          export AWS_ACCESS_KEY_ID={access}; \
@@ -227,6 +255,7 @@ pub fn import_cmd(o: &CommonOpts, to: StoreKind, bucket: &str, endpoint: &str) -
          aws s3 mb s3://{bucket} --endpoint-url {endpoint} || true; \
          aws s3 sync /stage s3://{bucket} --endpoint-url {endpoint} --only-show-errors; \
          echo synced",
+        wait = await_secret_key(to.secret_key()),
         access = to.access_key(),
         secret = to.secret_key(),
     );
@@ -250,12 +279,13 @@ pub fn store_listing_cmd(
     endpoint: &str,
 ) -> OpsCommand {
     let script = format!(
-        "export AWS_DEFAULT_REGION=us-east-1; \
+        "{wait}export AWS_DEFAULT_REGION=us-east-1; \
          aws configure set default.s3.addressing_style path; \
          export AWS_ACCESS_KEY_ID={access}; \
          export AWS_SECRET_ACCESS_KEY=$(cat /secret/{secret}); \
          aws s3 ls s3://{bucket} --recursive --endpoint-url {endpoint} \
          | awk '{{print $3, $4}}' | sort",
+        wait = await_secret_key(store.secret_key()),
         access = store.access_key(),
         secret = store.secret_key(),
     );
@@ -634,7 +664,12 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
     let image = "amazon/aws-cli:2.32.6";
-    let secret = format!("{}-secrets", o.release);
+    // Discovered, not computed. `<release>-secrets` is only the chart Secret's
+    // name when the release name contains the chart name; a default install
+    // renders `<release>-curie-secrets`, and the staging pod would then mount a
+    // Secret that does not exist -- failing mid-migration, with the export
+    // already taken and the store half moved.
+    let secret = crate::ops::release_secret_name_or_default(&o.namespace, &o.release).await;
     if o.dry_run {
         let endpoint = endpoint_for("<store-service>", &o.namespace);
         let cmds = [
