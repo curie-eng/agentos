@@ -274,6 +274,121 @@ so the change takes effect immediately.
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).
 
+## Upgrading the chart
+
+A chart upgrade is a **full** upgrade: anything the new chart does not render is
+deleted. For a Deployment that means a restart. For a StatefulSet it means the
+data too.
+
+### Before you upgrade, check what would be removed
+
+```bash
+curie diff -f curie.yaml
+```
+
+`chart_version_differs: true` means the comparison above it is values-only and
+cannot see a component added, removed, or renamed between versions. A renamed
+component's old keys appear as ordinary resets, which reads far milder than the
+swap it would be.
+
+`curie apply` refuses outright when the upgrade would delete a StatefulSet the
+release is running, and names it. `--allow-stateful-removal` overrides that, and
+should only be passed once the data is migrated or you accept losing it.
+
+Without the CLI, the same check by hand:
+
+```bash
+# what the release runs today
+kubectl get sts -n <ns> --no-headers | awk '{print $1}'
+# what the target chart would render
+helm template <release> <chart> -n <ns> -f values.yaml \
+  | awk '/^kind: StatefulSet/{f=1} f&&/^  name:/{print $2; f=0}'
+```
+
+Anything in the first list and not the second is about to be deleted.
+
+### Pass a values FILE, not `--reuse-values`
+
+`--reuse-values` does not merge the new chart's defaults, so any value key the
+new chart introduces is simply absent. Upgrading across a chart that adds a
+component fails outright:
+
+```
+Error: UPGRADE FAILED: template: <a template referencing a NEW value key>:
+  executing ... at <.Values.rustfs.deploy>: nil pointer evaluating interface {}.deploy
+```
+
+Capture the release's current values and pass them as a file instead. That
+merges over the new chart's defaults, so new keys get their defaults and your
+settings are preserved -- including the generated store passwords, which must be
+re-supplied or the upgrade rotates them out from under a running database.
+
+```bash
+helm get values <release> -n <ns> -o yaml > values.yaml
+helm upgrade <release> <chart> -n <ns> -f values.yaml
+```
+
+### Migrating the bundle store (0.5.x → 0.6.0, `minio` → `rustfs`)
+
+0.6.0 renamed the in-cluster object store. The chart cannot migrate it for you,
+and the store is on the hot path of **every** turn: each Slack thread creates a
+sandbox whose `bundle-fetch` init container downloads the bundle before the
+runner starts. An empty store means the bot stops answering, not merely that
+rollbacks break.
+
+Export first, upgrade second, import third. The export and the rollback point
+are both taken while the old store is still up.
+
+```bash
+# 1. Export every object while MinIO is still running
+STAGE=/var/lib/curie-bundle-migration && mkdir -p "$STAGE"
+aws configure set default.s3.addressing_style path
+IP=$(kubectl get svc -n <ns> <release>-minio -o jsonpath='{.spec.clusterIP}')
+export AWS_ACCESS_KEY_ID=minio
+export AWS_SECRET_ACCESS_KEY=$(kubectl get secret -n <ns> <release>-secrets \
+  -o jsonpath='{.data.minioRootPassword}' | base64 -d)
+aws s3 sync s3://curie-bundles "$STAGE" --endpoint-url "http://$IP:9000"
+find "$STAGE" -type f | wc -l          # note this count
+
+# 2. Rollback point
+helm get values <release> -n <ns> -o yaml > values.yaml
+helm list -n <ns>                       # note the revision
+
+# 3. Upgrade
+helm upgrade <release> <chart> -n <ns> -f values.yaml
+
+# 4. Import into RustFS
+IP=$(kubectl get svc -n <ns> <release>-rustfs -o jsonpath='{.spec.clusterIP}')
+export AWS_ACCESS_KEY_ID=rustfs
+export AWS_SECRET_ACCESS_KEY=$(kubectl get secret -n <ns> <release>-secrets \
+  -o jsonpath='{.data.rustfsSecretKey}' | base64 -d)
+aws s3 mb s3://curie-bundles --endpoint-url "http://$IP:9000"
+aws s3 sync "$STAGE" s3://curie-bundles --endpoint-url "http://$IP:9000"
+```
+
+Verify by object, not by total. Compare name-and-size for every object, and
+checksum at least the bundle each active deployment points at -- `head-object`'s
+ETag is the MD5 for a single-part upload:
+
+```bash
+aws s3api head-object --bucket curie-bundles --key "<active bundle key>" \
+  --endpoint-url "http://$IP:9000" --query ETag --output text
+md5sum "$STAGE/<active bundle key>"
+```
+
+A byte total is not enough on its own: a concurrent `git push` can legitimately
+add an object mid-migration, so counts and totals can differ for a benign
+reason. Diffing per object tells the two cases apart.
+
+**The bot is down between steps 3 and 4** -- the store exists but is empty. The
+window is however long the copy takes (seconds for a small install). Do it
+deliberately rather than discovering it.
+
+**Rolling back.** `helm rollback <release> <revision> -n <ns>` restores the
+previous chart. Deleting a StatefulSet does not delete the PVCs its
+`volumeClaimTemplates` created, so the old store's volume survives the upgrade
+and the rollback re-attaches it with the data intact. Keep the export anyway.
+
 ## Known gotchas
 
 Notes from the first installs of the chart on fresh clusters, kept for the
