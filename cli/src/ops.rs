@@ -996,6 +996,24 @@ fn resolve_preserved_values(
 /// classifier below cannot drift from the key `up_commands` actually masks.
 pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 
+/// Emitted alongside [`MODEL_CREDENTIAL_KEY`], and only when a credential is
+/// present -- see `up_commands`, which pushes both inside one `if let`.
+pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
+
+/// The `--set` prefix the egress rules are written under.
+pub(crate) const EGRESS_KEY_PREFIX: &str = "security.networkPolicy.allowedEgress[";
+
+/// The array index of an egress chart key, or `None` if it is not one.
+///
+/// `curie diff` needs this to tell "the file governs this rule" from "the
+/// release has a rule the file dropped": both look like the same key family,
+/// and only the INDEX distinguishes them.
+pub(crate) fn egress_key_index(key: &str) -> Option<usize> {
+    let rest = key.strip_prefix(EGRESS_KEY_PREFIX)?;
+    let (digits, _) = rest.split_once(']')?;
+    digits.parse().ok()
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present

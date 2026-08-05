@@ -964,7 +964,9 @@ fn diff_output_validates() {
                 "ui": {"deploy": true},
                 "dispatcher": {"slack": {"botToken": "xoxb-live"}},
                 "inference": {"deploy": true},
+                "agentSandbox": {"runner": {"fakeModel": false}},
             })),
+            &|k| k == "agentSandbox.runner.fakeModel",
         ),
     };
     let json = out.to_json();
@@ -978,7 +980,12 @@ fn diff_output_validates() {
         .iter()
         .map(|e| e["kind"].as_str().expect("kind is a string"))
         .collect();
-    for expected in ["change", "preserved", "reset to chart default"] {
+    for expected in [
+        "change",
+        "preserved",
+        "reset to chart default",
+        "managed by this file",
+    ] {
         assert!(
             kinds.contains(&expected),
             "fixture should exercise {expected}: got {kinds:?}"

@@ -214,6 +214,34 @@ impl Installation {
         out
     }
 
+    /// Does `apply` set this chart key from this file, even though the file
+    /// states no literal value for it?
+    ///
+    /// [`Self::helm_sets`] is NOT the whole of what `apply` declares. Three
+    /// families reach the chart through `UpOpts` instead, with values computed
+    /// at apply time: the model credential, the fake-model switch it rides
+    /// with, and the egress rules resolved from named providers.
+    ///
+    /// Without this, `curie diff` reported all three as "reset to chart
+    /// default" for a file that declares them -- telling the operator they
+    /// would LOSE what `apply` is about to SET. Found by running diff against
+    /// the real sre-bot release rather than a fixture.
+    pub fn governs_key(&self, key: &str) -> bool {
+        // Both are pushed inside one `if let Some(credentials)` in
+        // `ops::up_commands`, so a file naming no model credential governs
+        // neither -- and a live value for them really would be reset.
+        if key == crate::ops::MODEL_CREDENTIAL_KEY || key == crate::ops::FAKE_MODEL_KEY {
+            return self.credentials.model.is_some();
+        }
+        // Index-aware on purpose. A file declaring one host governs rule [0];
+        // a release carrying rules [1] and [2] really would lose them, and
+        // saying otherwise would be the same lie in the other direction.
+        match crate::ops::egress_key_index(key) {
+            Some(index) => index < self.platform.egress.len(),
+            None => false,
+        }
+    }
+
     /// Provider names for `--allow-egress-host`, validated downstream by
     /// `ops::parse_egress_provider` so an unknown host is one error message,
     /// not two divergent ones.
@@ -658,6 +686,10 @@ pub enum DiffKind {
     /// Only the release has it, and a plain `up` carries it forward untouched.
     /// NOT a removal -- see [`crate::ops::is_preserved_by_up`].
     Preserved,
+    /// The file governs it, but its value is computed at apply time (a resolved
+    /// egress CIDR, the model credential) rather than stated literally. `apply`
+    /// SETS this -- reporting it as a reset was the bug real data exposed.
+    Managed,
     /// Only the release has it, and `apply` would reset it to the chart default.
     Reset,
 }
@@ -671,6 +703,7 @@ impl DiffKind {
             DiffKind::Change => '~',
             DiffKind::Same => '=',
             DiffKind::Preserved => '=',
+            DiffKind::Managed => '=',
             DiffKind::Reset => '!',
         }
     }
@@ -681,6 +714,7 @@ impl DiffKind {
             DiffKind::Change => "change",
             DiffKind::Same => "unchanged",
             DiffKind::Preserved => "preserved",
+            DiffKind::Managed => "managed by this file",
             DiffKind::Reset => "reset to chart default",
         }
     }
@@ -760,6 +794,7 @@ fn display_value(key: &str, value: &str) -> String {
 pub fn diff_plan(
     declared: &BTreeMap<String, String>,
     live: Option<&serde_json::Value>,
+    governs: &dyn Fn(&str) -> bool,
 ) -> Vec<DiffEntry> {
     let mut current = BTreeMap::new();
     if let Some(values) = live {
@@ -786,7 +821,11 @@ pub fn diff_plan(
         if declared.contains_key(key) {
             continue;
         }
-        let kind = if crate::ops::is_preserved_by_up(key) {
+        // Order matters: a key the file governs is being SET, so it must never
+        // fall through to Reset even though it carries no literal value here.
+        let kind = if governs(key) {
+            DiffKind::Managed
+        } else if crate::ops::is_preserved_by_up(key) {
             DiffKind::Preserved
         } else {
             DiffKind::Reset
@@ -907,7 +946,7 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
         }
     }
 
-    let entries = diff_plan(&declared, live.as_ref());
+    let entries = diff_plan(&declared, live.as_ref(), &|key| cfg.governs_key(key));
     Ok(DiffOutput {
         namespace: cfg.install.namespace,
         release: cfg.install.release,
@@ -922,6 +961,197 @@ mod diff_tests {
 
     fn live(json: serde_json::Value) -> serde_json::Value {
         json
+    }
+
+    /// A file that governs no computed key: the baseline most cases want.
+    fn governs_nothing(_: &str) -> bool {
+        false
+    }
+
+    /// The classification tests below run against the REAL key set of the
+    /// sre-bot release (`helm get values`, key names only -- no values were
+    /// read). A fixture I invented would have agreed with whatever I wrote;
+    /// this one disagreed, and that is how the `Managed` bug was found.
+    const LIVE_KEYS: &[&str] = &[
+        "agentSandbox.runner.credentials",
+        "agentSandbox.runner.fakeModel",
+        "agentSandbox.runner.tag",
+        "api.apiKey",
+        "api.githubAppExistingSecret",
+        "api.githubAppExistingSecretKey",
+        "api.githubAppId",
+        "api.githubAppPrivateKey",
+        "api.githubCloneBase",
+        "api.githubWebhookSecret",
+        "api.image.tag",
+        "clickhouse.auth.password",
+        "dispatcher.slack.appToken",
+        "dispatcher.slack.botToken",
+        "inference.deploy",
+        "langfuse.encryptionKey",
+        "langfuse.nextauthSecret",
+        "langfuse.salt",
+        "nameOverride",
+        "postgres.auth.password",
+        "security.gvisor.mode",
+        "security.networkPolicy.allowedEgress[0].cidr",
+        "security.networkPolicy.allowedEgress[0].ports[0].port",
+        "security.networkPolicy.allowedEgress[0].ports[0].protocol",
+        "ui.deploy",
+        "valkey.password",
+        "worker.slackApiBaseUrl",
+    ];
+
+    /// Rebuild the nested shape `helm get values -o json` returns from those
+    /// flat keys, so the test exercises `flatten_values` too.
+    fn live_release() -> serde_json::Value {
+        // Recursive rather than a loop with a cursor: re-seating a `&mut` into a
+        // child it was just borrowed from is what the borrow checker refuses.
+        fn insert(node: &mut serde_json::Value, parts: &[&str]) {
+            let (head, rest) = parts.split_first().expect("non-empty path");
+            let indexed = head
+                .split_once('[')
+                .map(|(name, r)| (name, r.trim_end_matches(']').parse::<usize>().unwrap()));
+            match indexed {
+                Some((name, idx)) => {
+                    let arr = node
+                        .as_object_mut()
+                        .unwrap()
+                        .entry(name.to_string())
+                        .or_insert_with(|| serde_json::json!([]));
+                    let items = arr.as_array_mut().unwrap();
+                    while items.len() <= idx {
+                        items.push(serde_json::json!({}));
+                    }
+                    if rest.is_empty() {
+                        items[idx] = serde_json::json!("LIVE");
+                    } else {
+                        insert(&mut items[idx], rest);
+                    }
+                }
+                None if rest.is_empty() => {
+                    node.as_object_mut()
+                        .unwrap()
+                        .insert((*head).to_string(), serde_json::json!("LIVE"));
+                }
+                None => {
+                    let child = node
+                        .as_object_mut()
+                        .unwrap()
+                        .entry((*head).to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    insert(child, rest);
+                }
+            }
+        }
+
+        let mut root = serde_json::json!({});
+        for key in LIVE_KEYS {
+            let parts: Vec<&str> = key.split('.').collect();
+            insert(&mut root, &parts);
+        }
+        root
+    }
+
+    fn sre_bot_like() -> Installation {
+        Installation::parse(
+            "version: 1\ninstall:\n  namespace: sre-bot\n  release: sre-bot\n\
+             platform:\n  ui: false\n  inference: false\n  egress:\n    - host: anthropic\n\
+             credentials:\n  model: ANTHROPIC_API_KEY\n\
+             comms:\n  slack:\n    app_token: SLACK_APP_TOKEN\n    bot_token: SLACK_BOT_TOKEN\n",
+        )
+        .unwrap()
+    }
+
+    fn plan_against_live(cfg: &Installation) -> Vec<DiffEntry> {
+        let mut declared = BTreeMap::new();
+        for entry in cfg.helm_sets() {
+            let (k, v) = entry.split_once('=').unwrap();
+            declared.insert(k.to_string(), v.to_string());
+        }
+        diff_plan(&declared, Some(&live_release()), &|k| cfg.governs_key(k))
+    }
+
+    fn kind_of<'a>(entries: &'a [DiffEntry], key: &str) -> &'a DiffKind {
+        &entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("{key} missing from the plan"))
+            .kind
+    }
+
+    /// The bug real data exposed: `apply` SETS these three from a file that
+    /// names a model credential, but diff called them resets -- telling the
+    /// operator they would lose what apply was about to write.
+    #[test]
+    fn keys_apply_sets_outside_helm_sets_are_managed_not_reset() {
+        let entries = plan_against_live(&sre_bot_like());
+        for key in [
+            "agentSandbox.runner.credentials",
+            "agentSandbox.runner.fakeModel",
+            "security.networkPolicy.allowedEgress[0].cidr",
+            "security.networkPolicy.allowedEgress[0].ports[0].port",
+            "security.networkPolicy.allowedEgress[0].ports[0].protocol",
+        ] {
+            assert_eq!(
+                kind_of(&entries, key),
+                &DiffKind::Managed,
+                "{key} is set by apply, so diff must not call it a reset"
+            );
+        }
+    }
+
+    /// A file naming NO model credential really does drop those two, and
+    /// claiming otherwise would be the same lie inverted.
+    #[test]
+    fn without_a_declared_model_credential_those_keys_are_resets() {
+        let cfg =
+            Installation::parse("version: 1\ninstall:\n  namespace: sre-bot\n  release: sre-bot\n")
+                .unwrap();
+        let entries = plan_against_live(&cfg);
+        for key in [
+            "agentSandbox.runner.credentials",
+            "agentSandbox.runner.fakeModel",
+        ] {
+            assert_eq!(kind_of(&entries, key), &DiffKind::Reset, "{key}");
+        }
+    }
+
+    /// Governance is index-bounded: a file declaring one egress host does not
+    /// govern a second rule the release carries, and that one really is lost.
+    #[test]
+    fn egress_governance_stops_at_the_declared_count() {
+        let cfg = sre_bot_like();
+        assert!(cfg.governs_key("security.networkPolicy.allowedEgress[0].cidr"));
+        assert!(
+            !cfg.governs_key("security.networkPolicy.allowedEgress[1].cidr"),
+            "one declared host governs rule [0] only"
+        );
+    }
+
+    /// Every credential-bearing key on the real release must be preserved, and
+    /// none may print. This is the whole "is it safe to adopt the file" answer.
+    #[test]
+    fn every_live_secret_is_preserved_and_masked() {
+        let entries = plan_against_live(&sre_bot_like());
+        for key in [
+            "api.apiKey",
+            "api.githubAppId",
+            "api.githubAppPrivateKey",
+            "api.githubWebhookSecret",
+            "clickhouse.auth.password",
+            "dispatcher.slack.appToken",
+            "dispatcher.slack.botToken",
+            "langfuse.encryptionKey",
+            "langfuse.nextauthSecret",
+            "langfuse.salt",
+            "postgres.auth.password",
+            "valkey.password",
+        ] {
+            let entry = entries.iter().find(|e| e.key == key).expect(key);
+            assert_eq!(entry.kind, DiffKind::Preserved, "{key} must survive apply");
+            assert_eq!(entry.from.as_deref(), Some("<secret>"), "{key} must mask");
+        }
     }
 
     #[test]
@@ -956,7 +1186,11 @@ mod diff_tests {
     #[test]
     fn a_declared_key_the_release_lacks_is_an_add() {
         let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
-        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({}))),
+            &governs_nothing,
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, DiffKind::Add);
     }
@@ -967,6 +1201,7 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
+            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Same);
         assert!(!entries[0].kind.is_change());
@@ -978,6 +1213,7 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
+            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Change);
         assert_eq!(entries[0].from.as_deref(), Some("true"));
@@ -998,6 +1234,7 @@ mod diff_tests {
                 "api": {"githubAppId": "4475970", "apiKey": "generated"},
                 "postgres": {"auth": {"password": "generated"}},
             }))),
+            &governs_nothing,
         );
         assert!(
             !entries.is_empty(),
@@ -1022,6 +1259,7 @@ mod diff_tests {
         let entries = diff_plan(
             &declared,
             Some(&live(serde_json::json!({"ui": {"deploy": false}}))),
+            &governs_nothing,
         );
         assert_eq!(entries[0].kind, DiffKind::Reset);
         assert!(entries[0].kind.is_change(), "a reset is a real change");
@@ -1042,6 +1280,7 @@ mod diff_tests {
                 "postgres": {"auth": {"password": "live_pg_password"}},
                 "agentSandbox": {"runner": {"credentials": "sk-ant-live"}},
             }))),
+            &governs_nothing,
         );
         let rendered = format!("{entries:?}");
         for leaked in [
@@ -1064,7 +1303,11 @@ mod diff_tests {
     #[test]
     fn ordinary_values_are_shown_in_full() {
         let declared = BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]);
-        let entries = diff_plan(&declared, Some(&live(serde_json::json!({}))));
+        let entries = diff_plan(
+            &declared,
+            Some(&live(serde_json::json!({}))),
+            &governs_nothing,
+        );
         assert_eq!(entries[0].to.as_deref(), Some("false"));
     }
 
@@ -1074,7 +1317,7 @@ mod diff_tests {
             ("ui.deploy".to_string(), "false".to_string()),
             ("inference.deploy".to_string(), "false".to_string()),
         ]);
-        let entries = diff_plan(&declared, None);
+        let entries = diff_plan(&declared, None, &governs_nothing);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.kind == DiffKind::Add));
     }
@@ -1089,6 +1332,7 @@ mod diff_tests {
             entries: diff_plan(
                 &BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
                 Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
+                &governs_nothing,
             ),
         };
         let json = out.to_json();
