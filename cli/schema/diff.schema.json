@@ -37,9 +37,10 @@
               "change",
               "unchanged",
               "preserved",
+              "managed by this file",
               "reset to chart default"
             ],
-            "description": "`preserved` means the release carries this value, the file does not declare it, and a plain `cluster up` re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). It is NOT a pending removal. `reset to chart default` is the genuine loss case: undeclared and not carried forward."
+            "description": "`preserved` means the release carries this value, the file does not declare it, and a plain `cluster up` re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). `managed by this file` means the file governs the key but its value is computed at apply time rather than stated literally (a resolved egress CIDR, the model credential and the fake-model switch it rides with). Neither is a pending removal. `reset to chart default` is the genuine loss case: undeclared, not governed, and not carried forward."
           },
           "from": {
             "type": [
