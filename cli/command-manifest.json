@@ -3873,7 +3873,19 @@
         },
         {
           "global": false,
-          "help": "Proceed even when the upgrade would DELETE a stateful component the release is running, losing its data. Refused by default: a chart that renames a store (minio -> rustfs in 0.6.0) drops the old one, and every sandbox reads the bundle store at start, so the next turn fails rather than merely a rollback",
+          "help": "Carry the object store's contents across a chart that renames it, instead of refusing. Apply then stages every object, upgrades, loads them back, and verifies per object -- one command, no separate procedure and no safety override",
+          "id": "migrate_store",
+          "long": "migrate-store",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Proceed even when the upgrade would DELETE a stateful component the release is running, WITHOUT its data. Refused by default. Prefer --migrate-store, which keeps the data; this flag is for a store you genuinely intend to discard",
           "id": "allow_stateful_removal",
           "long": "allow-stateful-removal",
           "positional": false,
