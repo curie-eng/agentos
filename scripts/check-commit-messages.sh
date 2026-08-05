@@ -175,7 +175,15 @@ if ! commit_output="$(git log --format=%H "$range" --)"; then
     exit 1
 fi
 if [[ -n "$commit_output" ]]; then
-    mapfile -t commits <<<"$commit_output"
+    # A read loop rather than `mapfile`, which is bash 4+. macOS ships bash 3.2
+    # (the last GPLv2 release) as /bin/bash, and `#!/usr/bin/env bash` finds it
+    # unless the contributor installed a newer one -- so on a stock Mac the
+    # `mapfile` form aborted with "command not found" and the gate never ran.
+    # The usage text advertises this script as the pre-push check, so a Mac
+    # contributor got no answer where CI gives a hard one.
+    while IFS= read -r sha; do
+        commits+=("$sha")
+    done <<<"$commit_output"
 fi
 if ((${#commits[@]} == 0)); then
     echo "no commits in range '$range'; nothing to check"
