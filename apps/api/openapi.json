@@ -84,6 +84,17 @@
           "slack_channel": {
             "title": "Slack Channel",
             "type": "string"
+          },
+          "thinking": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thinking"
           }
         },
         "required": [
@@ -186,6 +197,17 @@
           "slack_channel": {
             "title": "Slack Channel",
             "type": "string"
+          },
+          "thinking": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thinking"
           }
         },
         "required": [
@@ -195,6 +217,7 @@
           "repo_full_name",
           "behavior_packs",
           "model",
+          "thinking",
           "approval_required_tools",
           "approval_routes",
           "secrets",
@@ -280,6 +303,17 @@
               }
             ],
             "title": "Slack Channel"
+          },
+          "thinking": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Thinking"
           }
         },
         "title": "AgentUpdate",

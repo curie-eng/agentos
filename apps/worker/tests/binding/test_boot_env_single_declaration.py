@@ -203,6 +203,12 @@ _EXEMPT: dict[tuple[str, str], str] = {
     # the consumer is the worker process, not the sandbox.
     ("apps/worker/src/curie_worker/config.py", "CURIE_PLUGIN_DIR"): "worker service config",
     ("apps/worker/src/curie_worker/config.py", "CURIE_MODEL"): "worker service config",
+    # Same shape as CURIE_MODEL directly above, and the same honest test: the
+    # sandbox-side name is derived from the declaration on BOTH real boot sites
+    # (binding.THINKING_ENV renders it, the runner reads boot.thinking from
+    # BootEnv.from_env), so a rename still moves them. This site is the worker
+    # process reading its own env to decide what to inject (#1182, ADR-0098).
+    ("apps/worker/src/curie_worker/config.py", "CURIE_THINKING"): "worker service config",
     ("apps/worker/src/curie_worker/config.py", "CURIE_FAKE_MODEL"): "worker service config",
     ("apps/worker/src/curie_worker/config.py", "CURIE_CREDENTIALS"): "worker service config",
     # Same shape as the four above: the operator declares the endpoint's wire

@@ -16,16 +16,25 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from aci_protocol import BootEnv, SessionConfig
 
 from .harness.registry import DEFAULT_HARNESS
+from .thinking import parse_thinking
 
 
 @dataclass(frozen=True)
 class RunnerConfig:
     session: SessionConfig
     model: str | None
+    # The SDK thinking config parsed from CURIE_THINKING (#1182, ADR-0098), or
+    # None when the operator set nothing -- in which case the option is OMITTED
+    # from ClaudeAgentOptions rather than defaulted, so the model's own behavior
+    # is untouched. Parsed here at boot so a malformed value fails the boot
+    # loudly instead of being silently dropped on every turn. The vocabulary is
+    # this lane's (curie_runner.thinking), not the boot contract's.
+    thinking: dict[str, Any] | None
     # The harness whose contribution manifest drives this runner (ADR-0060,
     # #844): read from the runner-local CURIE_HARNESS knob (default the
     # built-in Claude), NOT a BootEnv contract key -- the same runner-local read
@@ -125,6 +134,7 @@ class RunnerConfig:
         return cls(
             session=boot.session,
             model=boot.model,
+            thinking=parse_thinking(boot.thinking),
             harness=harness,
             max_turns=boot.max_turns if boot.max_turns is not None else 20,
             connector_release=boot.connector_release,

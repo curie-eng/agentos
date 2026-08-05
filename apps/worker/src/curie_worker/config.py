@@ -133,6 +133,13 @@ class WorkerConfig(BaseSettings):
     model_api_backend: str = Field(default="", validation_alias="CURIE_MODEL_API_BACKEND")
     model_env_key: str = Field(default="", validation_alias="CURIE_MODEL_ENV_KEY")
     model: str = Field(default="", validation_alias="CURIE_MODEL")
+    # Platform-default thinking depth (#1182, ADR-0098), the lower of the two
+    # operator layers; a per-agent `agents.thinking` overrides it. Empty means
+    # unset, in which case the runner is sent no thinking configuration at all
+    # and the model's own default applies -- the pre-#1182 behavior verbatim.
+    # Operator-only by design: never derived from the agent row's bundle, and a
+    # bundle has no surface for it at any tier.
+    thinking: str = Field(default="", validation_alias="CURIE_THINKING")
 
     # Opt-in false-completion check (#517, #669), operator scope like
     # model_api_backend/model_env_key: forwarded verbatim into every boot env as

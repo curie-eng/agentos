@@ -337,6 +337,9 @@ class AgentCreate(BaseModel):
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
     model: str | None = None
+    # Per-agent thinking depth, forwarded as CURIE_THINKING at boot (#1182,
+    # ADR-0098). None uses the platform default.
+    thinking: str | None = None
     # Per-agent permission gates (#245): tool names requiring human approval.
     # None means no gates (the bypass posture).
     approval_required_tools: list[str] | None = None
@@ -366,6 +369,9 @@ class AgentUpdate(BaseModel):
     # New per-agent model id (#254). Omitted (None) leaves the current model
     # unchanged, matching the slack_channel convention.
     model: str | None = None
+    # New per-agent thinking depth (#1182). Omitted (None) leaves the current
+    # value unchanged, the same convention as `model` above.
+    thinking: str | None = None
     # New permission gates (#245). Omitted (None) leaves the current gates
     # unchanged; an explicit empty list clears them.
     approval_required_tools: list[str] | None = None
@@ -397,6 +403,7 @@ class AgentOut(BaseModel):
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None
+    thinking: str | None
     approval_required_tools: list[str] | None
     approval_routes: dict[str, Any] | None
     # Connector secret NAMES only (#429) -- values are never returned. The stored

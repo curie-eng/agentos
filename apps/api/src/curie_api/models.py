@@ -63,6 +63,14 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
+    # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
+    # unset at both layers means the runner sends no thinking configuration and
+    # the model's own default stands. Operator-owned like `model` above: a bundle
+    # has no surface for it at any tier. The vocabulary is the runner's
+    # (`curie_runner.thinking`), not this column's -- stored as a plain string so
+    # the persistence layer does not have to track the harness.
+    thinking: Mapped[str | None] = mapped_column(default=None)
     # Per-agent behavior packs: declarative, opt-in UX touches the worker applies
     # around a turn (a sampled "working..." line, a canned greeting reply). Stored
     # as JSON here and resolved onto the deployment by the worker's binding layer;

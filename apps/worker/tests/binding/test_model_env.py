@@ -16,6 +16,7 @@ from curie_worker.binding import (
     CREDENTIALS_ENV,
     FAKE_MODEL_ENV,
     MODEL_ENV,
+    THINKING_ENV,
     BindingResolver,
     ResolvedDeployment,
     apply_model_env,
@@ -25,7 +26,7 @@ from curie_worker.eval.stream import EvalJob, EvalStreamConsumer
 from curie_worker.sandbox_token import verify
 
 
-def _resolved(model: str | None = None) -> ResolvedDeployment:
+def _resolved(model: str | None = None, thinking: str | None = None) -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=uuid.uuid4(),
         agent_name="test-agent",
@@ -35,6 +36,7 @@ def _resolved(model: str | None = None) -> ResolvedDeployment:
         max_usd_per_day=None,
         max_output_tokens_per_run=None,
         model=model,
+        thinking=thinking,
     )
 
 
@@ -326,14 +328,24 @@ def test_eval_boot_env_carries_api_backend_and_env_key() -> None:
 
 
 def test_apply_model_env_has_no_per_agent_override_params() -> None:
-    # Signature pin. model_override (#254, the per-agent model) is the ONLY
-    # per-agent parameter this function may take. A new *_override parameter here
-    # is the shape of the regression: it would mean an agent row can aim the
-    # credential read or redeclare the wire protocol.
+    # Signature pin, still exact. Exactly TWO per-agent parameters are allowed
+    # here, each authorized by name: model_override (#254, the per-agent model)
+    # and thinking_override (#1182, ADR-0098, the per-agent thinking depth).
+    #
+    # The regression this guards has not changed shape: a NEW *_override
+    # parameter would mean an agent row can aim the credential read or redeclare
+    # the wire protocol. Thinking depth is neither -- it is the same
+    # capability-versus-cost axis as the model itself, which is why ADR-0098
+    # placed it beside model rather than beside api_backend. Widening this set
+    # again needs the same kind of argument, on the record.
+    #
+    # The teeth are in the two tests below, which are unchanged and still pass:
+    # api_backend and env_key never reach ResolvedDeployment and can never be
+    # supplied per agent.
     import inspect
 
     params = set(inspect.signature(apply_model_env).parameters)
-    assert params == {"env", "config", "model_override"}
+    assert params == {"env", "config", "model_override", "thinking_override"}
 
 
 def test_resolved_deployment_carries_no_api_backend_or_env_key_field() -> None:
@@ -559,3 +571,55 @@ def test_resolved_deployment_carries_no_false_completion_check_field() -> None:
     # boot_env would have a per-agent value to forward.
     fields = set(ResolvedDeployment.model_fields)
     assert "false_completion_check" not in fields
+
+
+# --- thinking depth: the two operator layers (#1182, ADR-0098) ----------------
+# Mirrors the model tests directly, because the precedence IS the model's: the
+# agent row wins, then the platform default, then nothing at all. The third case
+# is the load-bearing one -- "nothing at all" is what keeps an unconfigured
+# install behaving exactly as it did before this feature existed.
+
+
+def test_thinking_unset_at_both_layers_writes_nothing() -> None:
+    # Not "adaptive", not an empty string: the key must be ABSENT, so the runner
+    # omits the SDK option and the model's own default stands.
+    env: dict[str, str] = {}
+    apply_model_env(env, WorkerConfig())
+    assert THINKING_ENV not in env
+
+
+def test_thinking_platform_default_is_forwarded() -> None:
+    env: dict[str, str] = {}
+    apply_model_env(env, WorkerConfig(thinking="adaptive"))
+    assert env[THINKING_ENV] == "adaptive"
+
+
+def test_thinking_per_agent_value_wins_over_the_platform_default() -> None:
+    env: dict[str, str] = {}
+    apply_model_env(env, WorkerConfig(thinking="adaptive"), thinking_override="disabled")
+    assert env[THINKING_ENV] == "disabled"
+
+
+def test_boot_env_applies_the_same_precedence_on_the_runs_lane() -> None:
+    # The eval lane goes through apply_model_env; the runs lane goes through
+    # boot_env. They are the sibling paths that must not drift, so pin the runs
+    # lane against the same three cases.
+    resolver = BindingResolver.__new__(BindingResolver)
+
+    resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+    assert THINKING_ENV not in resolver.boot_env(_resolved(), "thread-1")
+
+    resolver._config = WorkerConfig(thinking="enabled:2000")  # type: ignore[attr-defined]
+    assert resolver.boot_env(_resolved(), "thread-1")[THINKING_ENV] == "enabled:2000"
+
+    env = resolver.boot_env(_resolved(thinking="disabled"), "thread-1")
+    assert env[THINKING_ENV] == "disabled"
+
+
+def test_an_empty_per_agent_thinking_does_not_emit_an_empty_key() -> None:
+    # A cleared column reads as "" through some paths; an empty value is "unset",
+    # never a value, or the runner would parse "" and the operator would see a
+    # knob that does nothing.
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig()  # type: ignore[attr-defined]
+    assert THINKING_ENV not in resolver.boot_env(_resolved(thinking=""), "thread-1")
