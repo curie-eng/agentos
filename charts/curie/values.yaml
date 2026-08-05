@@ -373,6 +373,21 @@ clickhouse:
 # service in production with deploy=false plus host, port, auth, and an
 # existingSecret containing rustfsSecretKey.
 # ---------------------------------------------------------------------------
+# The cluster keypair that sealed connector credentials are sealed to
+# (ADR-0094). Both are supplied by `curie cluster up`, which generates the
+# private key on first install and re-supplies the recorded one on every
+# upgrade. Do NOT set these by hand unless you are restoring a backup: a
+# different key makes every value sealed to the old one unreadable, and nothing
+# outside this cluster can reconstruct it.
+#
+# For durable storage, treat this like any other credential you cannot
+# regenerate and keep it in whatever holds your other irreplaceable secrets.
+sealing:
+  privateKey: ""
+  # Set only during a rotation, so values sealed to the old key keep opening
+  # while repositories are resealed. Remove it once every repository is resealed.
+  previousPrivateKey: ""
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12

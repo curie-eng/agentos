@@ -122,6 +122,21 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: slackBotToken
+            # The sealing keys (ADR-0094). The connector reconciler runs here,
+            # so this is the only workload that needs to DECRYPT a sealed
+            # value; nothing else in the release gets them. Both are optional:
+            # empty means no sealed credential can be opened, which the
+            # reconciler reports rather than working around.
+            - name: CURIE_SEALING_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: sealingPrivateKey
+            - name: CURIE_SEALING_PREVIOUS_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: sealingPreviousPrivateKey
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE

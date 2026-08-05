@@ -153,6 +153,18 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/github-app-credential-assertions.sh
 
+      # Prove the sealing keypair's handling (ADR-0094). It is the one credential
+      # in this chart nobody can regenerate: losing it does not rotate anything,
+      # it makes every value sealed to it -- in every agent repository --
+      # permanently unreadable. So the chart must never GENERATE one (a
+      # chart-side random would mint a new key on every upgrade, since there is
+      # no lookup-persist), only the worker may receive it, and both the current
+      # and previous keys must render so a rotation can overlap.
+      - name: helm render assertions (sealing keypair)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sealing-key-assertions.sh
+
       # Prove the connector reconciler's RBAC (ADR-0090, #1184): absent when the
       # reconciler is off, and when on, exactly {create,list,patch,delete} on
       # exactly the four kinds the client handles. `create` is load-bearing --
