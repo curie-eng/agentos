@@ -387,6 +387,23 @@ enum Command {
     /// The global `--json` emits a structured variant (data on stdout, human
     /// text on stderr).
     Guide,
+
+    /// Converge a cluster to a `curie.yaml` installation file (ADR-0097).
+    ///
+    /// The file states the whole intent, so `apply` never has to be told what
+    /// it was told last time -- the gap behind the dropped-settings failures
+    /// the `--set`/`--reuse-values` shape kept producing.
+    Apply {
+        /// Path to the installation file.
+        #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
+        file: std::path::PathBuf,
+        /// Print the plan without touching the cluster.
+        #[arg(long)]
+        dry_run: bool,
+        /// Chart reference override, as `cluster up` takes.
+        #[arg(long)]
+        chart: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3034,6 +3051,29 @@ async fn run(command: Option<Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::Guide) => curie::guide::run(),
+        Some(Command::Apply {
+            file,
+            dry_run,
+            chart,
+        }) => {
+            let cfg = curie::installation::Installation::load(&file)?;
+            let resolved = artifacts::resolve_chart(
+                chart.as_deref(),
+                artifacts::Channel::current(),
+                artifacts::version(),
+                artifacts::cache_root,
+                std::path::Path::new("charts/curie").is_dir(),
+            )?;
+            let chart = materialize_artifact(resolved, dry_run, "chart").await?;
+            emit(
+                curie::installation::apply(curie::installation::ApplyOpts {
+                    cfg,
+                    chart,
+                    dry_run,
+                })
+                .await?,
+            )
+        }
     }
 }
 

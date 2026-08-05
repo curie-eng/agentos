@@ -3750,6 +3750,46 @@
       "hidden": false,
       "long_about": "Print a self-contained primer for a coding agent driving the harness (ADR-0021).\n\nOrdered by what the agent needs first (roughly 100 lines), carrying only non-discoverable knowledge: the parity ladder, when/which decision logic, the landmines, and verify-first. Human-readable Markdown by default; The global `--json` emits a structured variant (data on stdout, human text on stderr).",
       "name": "guide"
+    },
+    {
+      "about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097)",
+      "args": [
+        {
+          "default_values": [
+            "curie.yaml"
+          ],
+          "global": false,
+          "help": "Path to the installation file",
+          "id": "file",
+          "long": "file",
+          "positional": false,
+          "required": false,
+          "short": "f"
+        },
+        {
+          "global": false,
+          "help": "Print the plan without touching the cluster",
+          "id": "dry_run",
+          "long": "dry-run",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Chart reference override, as `cluster up` takes",
+          "id": "chart",
+          "long": "chart",
+          "positional": false,
+          "required": false
+        }
+      ],
+      "hidden": false,
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.",
+      "name": "apply"
     }
   ]
 }

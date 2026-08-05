@@ -41,6 +41,7 @@ use curie::commands::{
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
+use curie::installation::ApplyOutput;
 use curie::local::{
     LocalDownOutput, LocalRebuildOutput, LocalStatusOutput, LocalUpOutput, ModelMode,
 };
@@ -292,6 +293,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 env: "CURIE_APPROVAL_REQUIRED_TOOLS=Bash".to_string(),
                 restart: "curie skill up --replace".to_string(),
                 bundle_note: "declared in the bundle manifest".to_string(),
+            },
+        ],
+    );
+    m.insert(
+        "ApplyOutput",
+        samples![
+            "DryRun" => ApplyOutput::DryRun(plan()),
+            "Applied" => ApplyOutput::Applied {
+                namespace: "acme-bot".to_string(),
+                release: "acme-bot".to_string(),
+                comms: true,
             },
         ],
     );
