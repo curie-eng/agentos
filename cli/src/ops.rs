@@ -1182,6 +1182,24 @@ pub async fn fetch_release_chart(o: &CommonOpts) -> Result<Option<String>> {
         .map(str::to_string))
 }
 
+/// Has the operator told Helm to keep this resource across upgrades?
+///
+/// `helm.sh/resource-policy: keep` is Helm's own mechanism for "do not delete
+/// this, even when the chart stops rendering it". A resource carrying it is not
+/// at risk, so flagging it would be a false alarm -- and annotating it is
+/// exactly how an operator detaches a store before a chart renames it, which is
+/// the supported way through the very migration this guard exists to stop them
+/// botching.
+pub fn helm_keeps(resource: &serde_json::Value) -> bool {
+    resource
+        .get("metadata")
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.get("helm.sh/resource-policy"))
+        .and_then(|p| p.as_str())
+        .map(|p| p.trim().eq_ignore_ascii_case("keep"))
+        .unwrap_or(false)
+}
+
 /// The COMPONENT identities of the StatefulSets the release currently owns.
 ///
 /// Keyed on `app.kubernetes.io/component`, never on `metadata.name`. Resource
@@ -1213,12 +1231,23 @@ pub async fn live_stateful_components(o: &CommonOpts) -> Result<Vec<(String, Str
         Ok(v) => v,
         Err(_) => return Ok(Vec::new()),
     };
-    Ok(parsed
-        .get("items")
+    Ok(stateful_components_from_list(&parsed))
+}
+
+/// The pure half of [`live_stateful_components`]: a kubectl List in, the
+/// at-risk components out.
+///
+/// Split out so the `helm.sh/resource-policy: keep` filter is covered by a test
+/// that fails when the filter is REMOVED. Testing `helm_keeps` alone did not:
+/// deleting its call site left every test green, which is the same vacuous
+/// shape that hid three earlier bugs in this file's history.
+pub fn stateful_components_from_list(list: &serde_json::Value) -> Vec<(String, String)> {
+    list.get("items")
         .and_then(|i| i.as_array())
         .map(|items| {
             items
                 .iter()
+                .filter(|i| !helm_keeps(i))
                 .filter_map(|i| {
                     let component = i
                         .get("spec")?
@@ -1231,7 +1260,7 @@ pub async fn live_stateful_components(o: &CommonOpts) -> Result<Vec<(String, Str
                 })
                 .collect()
         })
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// StatefulSet names the target chart would render for this release.
@@ -1388,6 +1417,73 @@ data:
             vec!["sre-bot-minio"],
             "differing resource names must not be mistaken for removed components"
         );
+    }
+
+    /// The WIRING, not just the predicate. Removing the `helm_keeps` filter from
+    /// `stateful_components_from_list` leaves every `helm_keeps` unit test green
+    /// -- that mutation survived, so this test exists to kill it.
+    #[test]
+    fn a_kept_component_is_excluded_from_the_at_risk_list() {
+        let list = serde_json::json!({"items": [
+            {
+                "metadata": {
+                    "name": "sre-bot-minio",
+                    "annotations": {"helm.sh/resource-policy": "keep"}
+                },
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "sre-bot-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            }
+        ]});
+        let at_risk = stateful_components_from_list(&list);
+        assert_eq!(
+            at_risk,
+            vec![("postgres".to_string(), "sre-bot-postgres".to_string())],
+            "a component annotated keep is not at risk and must not be listed"
+        );
+    }
+
+    /// And the same list WITHOUT the annotation must still surface it, or the
+    /// test above would pass against a function that returns nothing at all.
+    #[test]
+    fn an_unannotated_component_is_still_at_risk() {
+        let list = serde_json::json!({"items": [
+            {
+                "metadata": {"name": "sre-bot-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            }
+        ]});
+        assert_eq!(
+            stateful_components_from_list(&list),
+            vec![("minio".to_string(), "sre-bot-minio".to_string())]
+        );
+    }
+
+    /// Helm's own opt-out. A store annotated `keep` survives the upgrade, so
+    /// flagging it is a false alarm -- and annotating it is precisely how an
+    /// operator detaches a store before a chart renames it.
+    #[test]
+    fn a_resource_helm_is_told_to_keep_is_not_at_risk() {
+        for value in ["keep", "Keep", " keep "] {
+            let kept = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(helm_keeps(&kept), "{value:?} must read as keep");
+        }
+    }
+
+    /// The escape must be narrow: everything else is still at risk.
+    #[test]
+    fn other_resource_policies_do_not_count_as_kept() {
+        for value in ["delete", "", "keepalive"] {
+            let r = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(!helm_keeps(&r), "{value:?} must not read as keep");
+        }
+        assert!(!helm_keeps(&serde_json::json!({"metadata": {}})));
     }
 
     /// The guard must stay quiet on an ordinary upgrade, or it becomes a flag
