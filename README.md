@@ -9,7 +9,7 @@ Slack — the first channel it speaks, with email and Teams next — author a Cl
 plugin bundle (skills + tools + MCP), deploy it as a versioned bot identity and run it anywhere -
 in your development environment on your laptop or in production on your own Kubernetes cluster.
 Configure your model, so you can point an agent at Anthropic, OpenRouter, or a local model through
-Ollama. Get traces, evals, budgets, and git-flow deploys for free. One CLI, `curie`, drives all of
+Ollama. Get traces, evals, budgets, and git-driven deploys for free. One CLI, `curie`, drives all of
 it.
 
 ![Curie: build an agent in Claude Code, run it locally, ship it with git push](docs/demo/demo-loop.gif)
