@@ -308,10 +308,16 @@ clickhouse:
   # produced 253,727 Debug and 58,186 Trace rows against 15 Information.
   logLevel: warning
   systemLogs:
-    # The four high-volume self-telemetry tables. OFF because nothing reads
-    # them: Langfuse queries its own tables, and the platform never touches
-    # `system`. Turn on only while debugging ClickHouse itself, and note they
-    # stay TTL-bounded even then.
+    # trace_log / metric_log / asynchronous_metric_log -- the timer-driven
+    # samplers. OFF because they have no level filter: they write regardless of
+    # whether anything is happening, so on/off is the only lever, and
+    # Prometheus already measures what they measure from outside the process
+    # that is failing. metric_log is the table whose merge wedged.
+    #
+    # text_log is NOT governed by this and is always kept: it has a `level`
+    # filter, so it can be quiet-but-present, and a queryable text_log is what
+    # diagnosed the incident above. Turn these three on only to profile
+    # ClickHouse itself; they stay TTL-bounded even then.
     enabled: false
     # Retention for whichever system log tables exist. Applies to the
     # always-on diagnostic tables (query_log, part_log, error_log) and to the
