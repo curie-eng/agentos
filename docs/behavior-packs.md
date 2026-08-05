@@ -57,6 +57,54 @@ The substrate, end to end, minus the kernel call sites:
   now selects `behavior_packs`, carries it on `ResolvedDeployment`, and exposes
   `BindingResolver.packs_for(resolved) -> BehaviorPacks`.
 
+## Where a load line actually appears: the Slack shimmer
+
+A load line is not a message. It is rendered through Slack's **assistant-thread
+status** — the caption that sits next to the app's name and animates while the
+app works ([`assistant.threads.setStatus`](https://docs.slack.dev/reference/methods/assistant.threads.setStatus)).
+Three things follow from that, and the first one decides how you should write
+your load lines.
+
+**Slack prefixes the caption with the app name, and you supply only the rest.**
+The rendered result is `<App Name> <status>`, so a caption has to read as a
+*continuation*, not as a standalone sentence:
+
+| load line | renders as | |
+|---|---|---|
+| `is crunching the numbers...` | `Curie is crunching the numbers...` | ✅ |
+| `Crunching the numbers...` | `Curie Crunching the numbers...` | ❌ |
+
+The platform default for the pack-free case follows the same rule
+(`CURIE_STATUS_TEXT`, default `is working on your request...`). It is a separate
+setting from `CURIE_PLACEHOLDER_TEXT` precisely because the two surfaces have
+different grammar: the placeholder is a message body and stands alone, the
+caption is a sentence fragment glued to the app name.
+
+**The caption is not the message, and never touches it.** The placeholder
+message the dispatcher posts is edited in place as the model streams; the
+caption lives outside it. It leaves no `(edited)` marker, notifies nobody, and
+disappears on its own. That is why it is safe to leave on: it is strictly
+additive to whatever the message is doing.
+
+**It is on by default, but a workspace has to enable one thing by hand.**
+`CURIE_SHIMMER` (read by both the dispatcher, which sets the caption, and the
+worker, which clears it) now defaults to on. The `assistant:write` scope ships in
+[`slack-app-manifest.yaml`](../apps/dispatcher/slack-app-manifest.yaml), but the
+app-level **Agents & AI Apps** feature has no manifest key and must be switched
+on once in the app config. Until it is, `setStatus` is rejected, the call is
+swallowed as best-effort (a debug log, never a failed turn), and you simply see
+no caption. Nothing else changes.
+
+**Slack expires a caption after about two minutes.** The status clears
+automatically when the app *posts* a message — but this pipeline **edits** the
+placeholder rather than posting a second message, so that auto-clear never
+fires and the worker clears the caption explicitly at the end of the turn.
+The other half of Slack's rule still applies: if nothing refreshes the caption,
+Slack drops it roughly two minutes in. A turn longer than that loses its
+caption partway through. Refreshing it on a timer is a follow-up (it has to run
+inside the kernel while the turn awaits the runner, so it carries the
+sacred-module review), tracked separately from this substrate.
+
 ## What is NOT built: the deferred runtimes
 
 Two pieces are intentionally out of this PR, each a natural follow-up on top of
@@ -102,8 +150,10 @@ The intended integration points, once that review is scheduled:
 2. **Load/tips first-edit** -- in `Kernel._consume`, seed the `_ThrottledReply`
    with the sampled load line (optionally plus a tip) so the dispatcher's generic
    placeholder is replaced by the per-agent line before the first `text_delta`
-   arrives. (This is also the surface the shimmer status can draw from instead of
-   generic text, once wired.)
+   arrives. (The *shimmer* half of this is now wired —
+   `apps/worker/src/curie_worker/kernel.py::Kernel._set_shimmer` replaces the
+   dispatcher's generic caption with the sampled load line plus tip. What remains
+   deferred is seeding the placeholder **message** itself.)
 
    ```python
    load = sample_load(packs, qevent.thread_ts)

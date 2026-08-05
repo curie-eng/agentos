@@ -89,12 +89,28 @@ def test_shimmer_clears_status_when_the_turn_ends(make_harness) -> None:
 
 
 def test_no_status_clear_when_shimmer_is_off(make_harness) -> None:
-    # Default (shimmer off): the kernel never touches the assistant status.
+    # With shimmer OFF the kernel never touches the assistant status. Pinned
+    # explicitly: shimmer now defaults ON (#1182), so leaning on the default here
+    # would silently stop exercising the off path.
+    async def go() -> None:
+        async with make_harness(shimmer=False) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("hi"))
+            assert h.sink.status_clears == []
+
+    asyncio.run(go())
+
+
+def test_status_is_cleared_by_default(make_harness) -> None:
+    # The mirror of the test above, and the reason the default flipped (#1182):
+    # the dispatcher shimmers by default, and editing the placeholder does not
+    # auto-clear a Slack status, so the worker must clear it on the way out or
+    # the caption lingers until Slack's own timeout.
     async def go() -> None:
         async with make_harness() as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi"))
-            assert h.sink.status_clears == []
+            assert h.sink.status_clears, "the shipped default must clear the caption"
 
     asyncio.run(go())
 

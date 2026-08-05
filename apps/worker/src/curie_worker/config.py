@@ -159,8 +159,16 @@ class WorkerConfig(BaseSettings):
 
     # When true, clear the Slack assistant-thread status (the "shimmer" the
     # dispatcher set) once a turn ends -- editing the placeholder does not
-    # auto-clear it. Off by default; pairs with the dispatcher's CURIE_SHIMMER.
-    shimmer: Bool = Field(default=False, validation_alias=SHIMMER_ENV)
+    # auto-clear it, because Slack only auto-clears a status when the app POSTS
+    # a message and this pipeline edits the placeholder instead.
+    #
+    # ON by default, and it must track the dispatcher's CURIE_SHIMMER (same env
+    # name, read by both services): the dispatcher sets the status and the worker
+    # is the only side holding the reply handle when the turn ends, so leaving
+    # this off while the dispatcher shimmers means nothing clears the status on
+    # our side and the caption lingers until Slack's own two-minute status
+    # timeout expires.
+    shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
     # When true, suppress intermediate placeholder edits while streaming so the
     # placeholder gets exactly one chat.update (the final) -- rate-limit friendly

@@ -57,7 +57,10 @@ _DISPATCHER_OVERRIDES: dict[str, tuple[str, str, object]] = {
         "Sentinel placeholder.",
         "Sentinel placeholder.",
     ),
-    "CURIE_SHIMMER": ("shimmer", "true", True),
+    # Deliberately the NON-default value: shimmer now defaults to True, so a
+    # "true" -> True case would pass even if the alias were never read at all.
+    "CURIE_SHIMMER": ("shimmer", "false", False),
+    "CURIE_STATUS_TEXT": ("status_text", "is sentinel-working...", "is sentinel-working..."),
     "CURIE_BACKOFF_INITIAL_SECONDS": ("backoff_initial_seconds", "2.5", 2.5),
     "CURIE_BACKOFF_MAX_SECONDS": ("backoff_max_seconds", "45.5", 45.5),
     "CURIE_BACKOFF_MULTIPLIER": ("backoff_multiplier", "3.5", 3.5),
@@ -130,7 +133,8 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.dedupe_prefix == "curie:dedupe:"
     assert config.dedupe_ttl_seconds == 3600
     assert config.placeholder_text == "On it. Working on your request."
-    assert config.shimmer is False
+    assert config.status_text == "is working on your request..."
+    assert config.shimmer is True
     assert config.backoff_initial_seconds == 1.0
     assert config.backoff_max_seconds == 30.0
     assert config.backoff_multiplier == 2.0

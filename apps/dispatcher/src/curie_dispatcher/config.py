@@ -19,6 +19,7 @@ Env mapping:
     CURIE_DEDUPE_PREFIX      -> dedupe_prefix
     CURIE_DEDUPE_TTL_SECONDS -> dedupe_ttl_seconds
     CURIE_PLACEHOLDER_TEXT   -> placeholder_text
+    CURIE_STATUS_TEXT        -> status_text (the shimmer caption, NOT the message)
     CURIE_SHIMMER            -> shimmer (assistant-thread status while working)
     CURIE_BACKOFF_INITIAL_SECONDS -> backoff_initial_seconds
     CURIE_BACKOFF_MAX_SECONDS     -> backoff_max_seconds
@@ -134,11 +135,32 @@ class DispatcherConfig(BaseSettings):
         default="On it. Working on your request.",
         validation_alias="CURIE_PLACEHOLDER_TEXT",
     )
+    # The shimmer caption, kept SEPARATE from placeholder_text because the two
+    # surfaces have different grammar. Slack renders an assistant-thread status
+    # as "<App Name> <status>" and inserts the app name itself, so the status has
+    # to read as a CONTINUATION of the app name ("Curie is working on your
+    # request...") while the message body is a standalone sentence ("On it.
+    # Working on your request."). Reusing one string for both produced "Curie On
+    # it. Working on your request." in the shimmer.
+    # https://docs.slack.dev/reference/methods/assistant.threads.setStatus
+    status_text: str = Field(
+        default="is working on your request...",
+        validation_alias="CURIE_STATUS_TEXT",
+    )
     # When true, also set a Slack assistant-thread status (the native "shimmer"
-    # on the app name) to placeholder_text while a turn runs. The worker clears it
-    # when the turn ends. Off by default; requires the app's assistant feature +
-    # assistant:write scope (see slack-app-manifest.yaml).
-    shimmer: Bool = Field(default=False, validation_alias=SHIMMER_ENV)
+    # on the app name) to status_text while a turn runs. The worker clears it
+    # when the turn ends.
+    #
+    # ON by default: during a turn the placeholder only changes when the model
+    # emits text, so a model that spends 30s reasoning before its first token
+    # leaves the thread visibly frozen, and an operator cannot tell that from a
+    # wedge (issue #1182). The shimmer is Slack's own affordance for exactly
+    # that, and it is strictly additive -- it neither edits the message nor
+    # notifies anyone. A workspace whose app lacks the "Agents & AI Apps"
+    # feature just skips it (the call is best-effort and logs at debug), so
+    # defaulting it on cannot break a deployment; see slack-app-manifest.yaml
+    # for the one-click enablement that has no manifest key.
+    shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
     backoff_initial_seconds: float = Field(
         default=1.0, gt=0, validation_alias="CURIE_BACKOFF_INITIAL_SECONDS"
