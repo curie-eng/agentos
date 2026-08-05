@@ -166,6 +166,14 @@ async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, Stri
     Ok((api_url, api_key))
 }
 
+/// clap `value_parser` for every `--local-model` (#1254). All four sites carry the
+/// same value and hand it to the same downstream consumers, so validating one and
+/// not the others is the sibling-path drift this repo keeps getting bitten by.
+fn parse_model_ref(raw: &str) -> Result<String, String> {
+    curie::docker::validate_model_ref(raw).map_err(|e| e.to_string())?;
+    Ok(raw.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "curie",
@@ -544,6 +552,7 @@ enum SkillAction {
             long,
             num_args = 0..=1,
             default_missing_value = commands::DEFAULT_LOCAL_MODEL,
+            value_parser = parse_model_ref,
             conflicts_with = "fake_model",
             conflicts_with = "model"
         )]
@@ -742,7 +751,8 @@ enum LocalAction {
         #[arg(
             long,
             num_args = 0..=1,
-            default_missing_value = commands::DEFAULT_LOCAL_MODEL
+            default_missing_value = commands::DEFAULT_LOCAL_MODEL,
+            value_parser = parse_model_ref
         )]
         local_model: Option<String>,
         /// Allow --local-model to DOWNLOAD its assets on this run. Without it,
@@ -787,7 +797,8 @@ enum LocalAction {
         #[arg(
             long,
             num_args = 0..=1,
-            default_missing_value = commands::DEFAULT_LOCAL_MODEL
+            default_missing_value = commands::DEFAULT_LOCAL_MODEL,
+            value_parser = parse_model_ref
         )]
         local_model: Option<String>,
         /// Match how `local up` brought the stack up (--slack, if used).
@@ -1190,6 +1201,7 @@ enum ClusterAction {
             long,
             num_args = 0..=1,
             default_missing_value = commands::DEFAULT_LOCAL_MODEL,
+            value_parser = parse_model_ref,
             conflicts_with = "fake_model"
         )]
         local_model: Option<String>,
