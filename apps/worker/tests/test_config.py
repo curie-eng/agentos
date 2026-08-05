@@ -56,7 +56,9 @@ _WORKER_OVERRIDES: dict[str, tuple[str, str, object]] = {
     "DB_SCHEMA": ("db_schema", "myschema", "myschema"),
     "CURIE_PLUGIN_DIR": ("bundle_plugin_dir", "/custom/bundles", "/custom/bundles"),
     "CURIE_FAKE_MODEL": ("fake_model", "true", True),
-    "CURIE_SHIMMER": ("shimmer", "yes", True),
+    # Deliberately the NON-default value: shimmer now defaults to True, so a
+    # truthy-token case would pass even if the alias were never read at all.
+    "CURIE_SHIMMER": ("shimmer", "no", False),
     "CURIE_CREDENTIALS": ("credentials", "cred-sentinel", "cred-sentinel"),
     "CURIE_MODEL_BASE_URL": (
         "model_base_url",
@@ -205,8 +207,10 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.credentials == ""
     assert config.model_base_url == ""
     assert config.model == ""
-    # Shimmer
-    assert config.shimmer is False
+    # Shimmer: on by default so a reasoning model's pre-token silence is not
+    # indistinguishable from a wedge (#1182). Must agree with the dispatcher's
+    # default -- one env name drives both services.
+    assert config.shimmer is True
     # Stream / consumer group
     assert config.stream == "curie:runs"
     assert config.consumer_group == "curie-workers"

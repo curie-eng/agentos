@@ -142,12 +142,40 @@ def test_shimmer_sets_assistant_status_after_placeholder(
     handler.handle(sock, _events_api_request("env-1", "Ev-shim", _mention_event()))
     _drain(app)
 
-    # The shimmer status is set on the same thread as the placeholder.
+    # The shimmer status is set on the same thread as the placeholder, and it
+    # carries status_text -- NOT placeholder_text. Slack renders the status as
+    # "<App Name> <status>" and inserts the app name itself, so reusing the
+    # message body produced "Curie On it. Working on your request.".
     web_client.assistant_threads_setStatus.assert_called_once_with(
-        channel_id="C123", thread_ts="1700.0001", status=shimmer_config.placeholder_text
+        channel_id="C123", thread_ts="1700.0001", status=shimmer_config.status_text
     )
+    assert shimmer_config.status_text != shimmer_config.placeholder_text
     # And the normal placeholder + enqueue still happen.
     assert redis_client.xlen(config.stream) == 1
+
+
+def test_shimmer_is_on_by_default_with_no_explicit_config(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """The shipped default shimmers (#1182), not just an explicitly-enabled config.
+
+    Deliberately does NOT model_copy the flag on: the point is that an operator
+    who configures nothing still gets the liveness caption, because during a turn
+    the placeholder only moves when the model emits text and a reasoning model can
+    stay silent for tens of seconds before its first token.
+    """
+    assert config.shimmer is True, "the fixture must carry the shipped default"
+    app, web_client = _build(config, redis_client)
+    web_client.assistant_threads_setStatus = MagicMock()  # type: ignore[method-assign]
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _events_api_request("env-1", "Ev-default-shim", _mention_event()))
+    _drain(app)
+
+    web_client.assistant_threads_setStatus.assert_called_once_with(
+        channel_id="C123", thread_ts="1700.0001", status=config.status_text
+    )
 
 
 def test_duplicate_delivery_enqueues_exactly_once(

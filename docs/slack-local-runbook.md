@@ -52,10 +52,22 @@ subscriptions are correct from the start.
 4. `SLACK_SIGNING_SECRET` is optional and unused in Socket Mode (kept only for
    Bolt app construction); leave it empty.
 
-The `assistant:write` scope in the manifest is only exercised if you enable the
-shimmer status indicator (`CURIE_SHIMMER`), which ALSO requires manually
-toggling **Agents & AI Apps** in the app config. That is a one-click manual step
-with no manifest key. Skip both if you are not using shimmer.
+5. **Turn on Agents & AI Apps** (your app -> **Agents & AI Apps** -> enable).
+   This one has no manifest key, so creating the app from the manifest does not
+   set it — it is a one-click manual step, and it is the only thing standing
+   between you and the shimmer.
+
+That last step is worth doing. The **shimmer** is the animated caption Slack
+shows next to the app's name while a turn runs (`CURIE_SHIMMER`, **on by
+default**, and the `assistant:write` scope it needs is already in the manifest).
+Without it, the only sign the agent is working is the placeholder message — and
+that message does not change until the model emits its first token, so a model
+that reasons for thirty seconds before answering leaves the thread looking
+frozen (issue #1182).
+
+Skipping the toggle is safe, just quiet: `assistant.threads.setStatus` is
+rejected, the call is swallowed best-effort (a debug log, never a failed turn),
+and you get no caption. Set `CURIE_SHIMMER=false` to stop attempting it at all.
 
 ## 2. Bind an agent to your channel
 

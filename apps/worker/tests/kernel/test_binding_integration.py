@@ -239,7 +239,9 @@ def test_shimmer_off_never_sets_a_caption(make_harness) -> None:
     async def go() -> None:
         packs = {"load": {"enabled": True, "lines": ["Working..."]}}
         binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
-        async with make_harness(binding=binding) as h:  # shimmer defaults off
+        # Explicitly OFF: shimmer now defaults ON (#1182), so leaning on the
+        # default here would silently stop exercising the off path.
+        async with make_harness(binding=binding, shimmer=False) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound"))
             assert h.sink.status_sets == []
@@ -294,16 +296,17 @@ def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harnes
 def test_malformed_packs_blob_still_completes_the_turn(make_harness) -> None:
     # Regression: a malformed behavior_packs blob must NOT brick the channel.
     # from_config is total, so packs_for can't raise; process_event resolves an
-    # all-off default and the turn finishes normally (no poison-loop). shimmer is
-    # off (the default config), so this exercises the every-bound-turn path where
-    # packs_for now runs.
+    # all-off default and the turn finishes normally (no poison-loop). This
+    # exercises the every-bound-turn path where packs_for now runs; the shimmer
+    # flag is left at its default (now ON, #1182) because the defensiveness under
+    # test does not depend on it either way.
     async def go() -> None:
         # A nested field of the wrong type would raise pydantic.ValidationError
         # if from_config were not defensive.
         binding = StubBinding(
             {"C-bound": _resolved_with_packs({"nav": {"enabled": "banana"}})}
         )
-        async with make_harness(binding=binding) as h:  # shimmer defaults off
+        async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
             ev = _qevent("hi", channel="C-bound", thread="tBad")
 
