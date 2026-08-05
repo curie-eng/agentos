@@ -210,6 +210,9 @@ def build_runner(
             # no longer feeds resume. build_options keeps the param for an explicit
             # caller; the boot path passes None.
             resume=None,
+            # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
+            # option entirely rather than defaulting it.
+            thinking=config.thinking,
             task_budget_hint=config.session.budget.task_budget_hint,
             env=sdk_env or {},
             hooks=bundle_hooks,

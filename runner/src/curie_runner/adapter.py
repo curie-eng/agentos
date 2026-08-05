@@ -60,6 +60,7 @@ def build_options(
     max_turns: int,
     max_budget_usd: float | None,
     resume: str | None,
+    thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
     hooks: dict[str, list[HookMatcher]] | None = None,
@@ -90,9 +91,15 @@ def build_options(
     permission_mode: PermissionMode = (
         "default" if can_use_tool is not None else "bypassPermissions"
     )
+    # OMITTED, not defaulted, when the operator set nothing (#1182, ADR-0098).
+    # Passing thinking=None would be a value the SDK could act on; leaving the
+    # key out is the only way to say "no opinion", which is what an unconfigured
+    # install has always said and must keep saying.
+    thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
+        **thinking_option,
         system_prompt=system_prompt,
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,

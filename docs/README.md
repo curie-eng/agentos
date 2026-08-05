@@ -40,6 +40,10 @@ git history (`git log -- docs/`).
 - [`approvals.md`](approvals.md): the human-in-the-loop plane. How a turn pauses
   for a human decision, how a route is declared and bound to a channel, who is
   allowed to resolve it, and the resume turn your skill has to handle.
+- [`thinking.md`](thinking.md): what a reasoning model costs you and how to
+  change it — the measured latency gap, the two operator layers that turn
+  thinking down, and the OpenRouter parameter that looks like it works and does
+  not.
 - [`behavior-packs.md`](behavior-packs.md): per-agent, opt-in UX touches (load
   lines, capability tips, greeting/help) applied around a turn — why packs are
   declarative data rather than code, and what is wired today.

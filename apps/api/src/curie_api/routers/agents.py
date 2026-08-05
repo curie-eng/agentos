@@ -154,6 +154,8 @@ async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionD
             raise HTTPException(status_code, message) from exc
     if data.model is not None:
         agent = await crud.update_agent_model(session, agent, data.model)
+    if data.thinking is not None:
+        agent = await crud.update_agent_thinking(session, agent, data.thinking)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud.update_agent_approval_tools(session, agent, data.approval_required_tools)

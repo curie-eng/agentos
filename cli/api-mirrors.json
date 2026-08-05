@@ -21,6 +21,10 @@
           "why": "The CLI never displays or acts on an agent's default model (model routing is server- and claim-time bound, #473); the deploy and lifecycle verbs read only id/name/slack_channel."
         },
         {
+          "field": "thinking",
+          "why": "Same reason as model directly above, and the same ownership: thinking depth is resolved server-side at claim time into the sandbox boot env (#1182, ADR-0098). No CLI verb displays or acts on it; an operator sets it through the platform API."
+        },
+        {
           "field": "secrets",
           "why": "update_agent_secrets WRITES connector-secret names; the CLI never reads the stored secrets list back, so the response field is not modeled."
         },
