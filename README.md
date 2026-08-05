@@ -16,6 +16,8 @@ it.
 
 New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
 
+Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to connect with other builders.
+
 ## Why your agent breaks when it leaves your laptop
 
 Local and production environments are usually different - a different Python version, a missing tool,
