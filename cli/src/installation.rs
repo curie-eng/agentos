@@ -898,12 +898,36 @@ pub struct DiffOutput {
     pub release: String,
     /// `false` when helm has no record of the release: everything is a create.
     pub release_exists: bool,
+    /// The chart the release was installed with (`curie-0.5.1`), if readable.
+    pub chart_deployed: Option<String>,
+    /// The chart version this CLI would apply.
+    pub chart_target: String,
     pub entries: Vec<DiffEntry>,
 }
 
 impl DiffOutput {
     pub fn changes(&self) -> usize {
         self.entries.iter().filter(|e| e.kind.is_change()).count()
+    }
+
+    /// The deployed chart's version, stripped of the `curie-` name prefix.
+    fn deployed_version(&self) -> Option<&str> {
+        self.chart_deployed
+            .as_deref()
+            .map(|c| c.rsplit_once('-').map(|(_, v)| v).unwrap_or(c))
+    }
+
+    /// Would `apply` change the chart under these values, not just the values?
+    ///
+    /// A value-level diff cannot see a component being added, removed, or
+    /// renamed between chart versions -- and when that happens its output is
+    /// not merely incomplete but misleading, since a renamed component's old
+    /// keys render as ordinary resets.
+    pub fn chart_version_differs(&self) -> bool {
+        match self.deployed_version() {
+            Some(deployed) => deployed != self.chart_target,
+            None => false,
+        }
     }
 }
 
@@ -913,6 +937,9 @@ impl crate::ui::CliOutput for DiffOutput {
             "namespace": self.namespace,
             "release": self.release,
             "release_exists": self.release_exists,
+            "chart_deployed": self.chart_deployed,
+            "chart_target": self.chart_target,
+            "chart_version_differs": self.chart_version_differs(),
             "changes": self.changes(),
             "entries": self.entries.iter().map(|e| serde_json::json!({
                 "key": e.key,
@@ -965,6 +992,21 @@ impl crate::ui::CliOutput for DiffOutput {
                  default. Declare it in curie.yaml to keep it.",
             );
         }
+        // Last, so it is the line left on screen. This diff is value-level and
+        // says nothing about components a chart bump adds, removes, or renames
+        // -- and a renamed component's old keys appear above as ordinary
+        // resets, which reads far milder than the swap it would actually be.
+        if self.chart_version_differs() {
+            ui.note(&format!(
+                "CHART VERSION MISMATCH: the release runs {} but this curie applies {}. \
+                 The comparison above is values-only -- it cannot see a component added, \
+                 removed, or renamed between those versions, and a renamed one shows up \
+                 as an ordinary reset. Do not read this as a safe apply. Reconcile the \
+                 chart version first, or apply with the matching chart.",
+                self.chart_deployed.as_deref().unwrap_or("unknown"),
+                self.chart_target,
+            ));
+        }
     }
 }
 
@@ -978,6 +1020,10 @@ pub struct DiffOpts {
 /// provider resolution to complete the desired plan without mutating it.
 pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
     let plan = complete_installation_plan(opts.local).await?;
+    // A second, independent read: the values plan says nothing about WHICH
+    // chart consumes them, and a component renamed between chart versions
+    // shows up in the entries below as an ordinary reset.
+    let chart_deployed = crate::ops::fetch_release_chart(&plan.up.common).await?;
     let mut entries = diff_plan(&plan.desired, plan.live.as_ref());
     if plan.preserves_undeclared_github_token {
         if let Some(entry) = entries
@@ -992,6 +1038,8 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
         namespace: plan.cfg.install.namespace,
         release: plan.cfg.install.release,
         release_exists: plan.live.is_some(),
+        chart_deployed,
+        chart_target: crate::artifacts::version().to_string(),
         entries,
     })
 }
@@ -1312,6 +1360,115 @@ mod diff_tests {
         assert!(rendered.contains("<secret>"), "must mask, not omit");
     }
 
+    /// The leak, as it actually happened. `curie diff` against a live release
+    /// printed `minio.auth.rootPassword` in full: the chart had renamed that
+    /// store to `rustfs`, so the live key matched no managed list. The store
+    /// was still running.
+    ///
+    /// The value here is a real-shaped random hex string rather than a token
+    /// the assertion could trivially find, because the original test's
+    /// "no secret in output" check passed against a plaintext it chose itself.
+    #[test]
+    fn a_credential_key_no_managed_list_knows_is_still_masked() {
+        let leaked = "395f633e7f72be60b36cb19ced9d0889b1d55ede40c78893";
+        let entries = diff_plan(
+            &BTreeMap::new(),
+            Some(&live(serde_json::json!({
+                "minio": {"auth": {"rootPassword": leaked}},
+            }))),
+        );
+        let rendered = format!("{entries:?}");
+        assert!(
+            !rendered.contains(leaked),
+            "a renamed chart's credential key must still mask: {rendered}"
+        );
+        assert!(rendered.contains("<secret>"), "{rendered}");
+    }
+
+    /// The class, not just the one instance: any key naming itself a credential
+    /// masks, whether or not this chart version manages it.
+    #[test]
+    fn credential_shaped_key_names_mask_by_name_alone() {
+        for key in [
+            "minio.auth.rootPassword",
+            "somevendor.apiToken",
+            "legacy.encryptionKey",
+            "custom.thing.secret",
+            "old.store.passwd",
+            "whatever.salt",
+        ] {
+            assert!(
+                crate::ops::is_secret_value_key(key),
+                "{key} names a credential and must mask"
+            );
+        }
+    }
+
+    /// Over-masking is safe but not free: if everything masks, diff is useless.
+    #[test]
+    fn ordinary_keys_still_show_their_values() {
+        for key in [
+            "ui.deploy",
+            "api.image.tag",
+            "security.gvisor.mode",
+            "priorityClasses.platform.name",
+            "worker.connectorReconciler.intervalSeconds",
+        ] {
+            assert!(
+                !crate::ops::is_secret_value_key(key),
+                "{key} is not a credential and must stay readable"
+            );
+        }
+    }
+
+    /// A value-level diff cannot see a component renamed between chart
+    /// versions, and on the real cluster it rendered exactly that as a set of
+    /// ordinary resets. It has to say so.
+    #[test]
+    fn a_chart_version_mismatch_is_reported() {
+        let out = DiffOutput {
+            namespace: "sre-bot".into(),
+            release: "sre-bot".into(),
+            release_exists: true,
+            chart_deployed: Some("curie-0.5.1".into()),
+            chart_target: "0.6.0".into(),
+            entries: vec![],
+        };
+        assert!(out.chart_version_differs());
+        let json = <DiffOutput as crate::ui::CliOutput>::to_json(&out);
+        assert_eq!(json["chart_version_differs"], serde_json::json!(true));
+        assert_eq!(json["chart_deployed"], serde_json::json!("curie-0.5.1"));
+    }
+
+    /// The matching case must stay quiet, or the warning becomes background
+    /// noise that gets ignored on the run that matters.
+    #[test]
+    fn a_matching_chart_version_does_not_warn() {
+        let out = DiffOutput {
+            namespace: "sre-bot".into(),
+            release: "sre-bot".into(),
+            release_exists: true,
+            chart_deployed: Some("curie-0.6.0".into()),
+            chart_target: "0.6.0".into(),
+            entries: vec![],
+        };
+        assert!(!out.chart_version_differs());
+    }
+
+    /// An unreadable chart version must not fabricate a mismatch.
+    #[test]
+    fn an_unknown_deployed_chart_does_not_claim_a_mismatch() {
+        let out = DiffOutput {
+            namespace: "sre-bot".into(),
+            release: "sre-bot".into(),
+            release_exists: false,
+            chart_deployed: None,
+            chart_target: "0.6.0".into(),
+            entries: vec![],
+        };
+        assert!(!out.chart_version_differs());
+    }
+
     /// A non-secret value must still be shown, or the mask is useless noise.
     #[test]
     fn ordinary_values_are_shown_in_full() {
@@ -1338,6 +1495,8 @@ mod diff_tests {
             namespace: "acme".into(),
             release: "acme".into(),
             release_exists: true,
+            chart_deployed: Some("curie-0.6.0".into()),
+            chart_target: "0.6.0".into(),
             entries: diff_plan(
                 &BTreeMap::from([("ui.deploy".to_string(), "false".to_string())]),
                 Some(&live(serde_json::json!({"ui": {"deploy": true}}))),
