@@ -265,6 +265,83 @@ pub fn ollama_volume(container: &str) -> String {
 /// it; `DEFAULT_OLLAMA_IMAGE`'s tag is what this measures.
 pub const OLLAMA_IMAGE_DOWNLOAD_SIZE: &str = "~8.9 GB";
 
+/// The characters an Ollama reference segment may contain (#1254). An allowlist,
+/// not a denylist of shell metacharacters: a denylist has to enumerate every
+/// dangerous byte for every consumer downstream, and gets it wrong the first time
+/// a new consumer appears. This is what Ollama itself accepts in a registry host,
+/// namespace, name or tag.
+fn is_model_segment_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')
+}
+
+/// Reject an Ollama model reference that is not one (#1254).
+///
+/// The preflight this guards (`preflight_local_model`) exists to stop an implicit
+/// multi-GB download, and a reference carrying shell metacharacters used to defeat
+/// it outright: `--local-model 'missing; true #'` made the probe's `test -e` exit 0
+/// regardless, the guard reported the model present, and `compose up` performed
+/// exactly the download ADR-0093 forbids.
+///
+/// The probe no longer builds a shell command out of this value, so injection is
+/// structurally impossible there now. This validator is the other half, and it is
+/// worth having on its own terms: the value also reaches `CURIE_MODEL` in the
+/// compose env, where `ollama-pull` expands it inside a container, and it will
+/// reach whatever consumer is added next. Rejecting a nonsense reference at the
+/// argument boundary is cheaper than auditing every future site, and it turns a
+/// silent wrong answer into an error the operator can read.
+///
+/// Args:
+///   model: the raw `--local-model` value.
+///
+/// Returns:
+///   `Ok(())` when the reference is well-formed, otherwise an error naming the
+///   offending character and the grammar.
+pub fn validate_model_ref(model: &str) -> Result<()> {
+    if model.is_empty() {
+        bail!("model reference is empty; expected something like `qwen3:4b`");
+    }
+    // Segment the same way `model_manifest_path` does, so a reference this accepts
+    // is exactly a reference that function can map to a path. The two are a pair;
+    // validating a different grammar than the one we then parse is how a validator
+    // ends up guarding nothing.
+    let (name, tag) = match model.rsplit_once(':') {
+        Some((n, t)) if !t.contains('/') => (n, t),
+        _ => (model, "latest"),
+    };
+    if tag.is_empty() {
+        bail!("model reference `{model}` has an empty tag; expected e.g. `qwen3:4b`");
+    }
+    // A registry host may carry a port, and only there: `localhost:5000/org/repo`
+    // is a reference `model_manifest_path` maps to `localhost:5000/org/repo/latest`.
+    // Accepting the colon only in that position keeps the validator's grammar equal
+    // to the parser's rather than merely close to it.
+    let segments: Vec<&str> = name.split('/').collect();
+    let host_is_ported = segments.len() >= 3;
+    let named: Vec<(&str, &str)> = segments
+        .iter()
+        .enumerate()
+        .flat_map(|(i, seg)| match seg.split_once(':') {
+            Some((host, port)) if i == 0 && host_is_ported => {
+                vec![("registry host", host), ("registry port", port)]
+            }
+            _ => vec![("name segment", *seg)],
+        })
+        .collect();
+    for (label, part) in [("tag", tag)].into_iter().chain(named) {
+        if part.is_empty() {
+            bail!("model reference `{model}` has an empty {label}");
+        }
+        if let Some(bad) = part.chars().find(|c| !is_model_segment_char(*c)) {
+            bail!(
+                "model reference `{model}` contains {bad:?} in a {label}; \
+                 only letters, digits, `.`, `-` and `_` are allowed, \
+                 separated by `/` with an optional `:tag` (e.g. `qwen3:4b`)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Where Ollama stores a model's manifest inside its data directory, relative
 /// to `/root/.ollama`. Presence of this path is what "the model is already
 /// pulled" means on disk.
@@ -338,23 +415,42 @@ pub async fn model_present_in_volume(volume: &str, image: &str, model: &str) -> 
     if !volume_present(volume).await? {
         return Ok(false);
     }
-    let probe = format!("test -e /root/.ollama/{}", model_manifest_path(model));
-    let (status, _out, _err) = docker_capture_with_env(
-        &[
-            "run".into(),
-            "--rm".into(),
-            "-v".into(),
-            format!("{volume}:/root/.ollama"),
-            "--entrypoint".into(),
-            "/bin/sh".into(),
-            image.to_string(),
-            "-c".into(),
-            probe,
-        ],
-        &[],
-    )
-    .await?;
+    // The path is a POSITIONAL ARGUMENT, never text spliced into the command
+    // (#1254). Interpolating it made `--local-model 'missing; true #'` end the
+    // `test` early and leave a `true` behind, so the probe exited 0, the guard
+    // reported the model present, and `compose up` ran the multi-GB download
+    // ADR-0093 exists to prevent. `"$1"` cannot be reparsed as code no matter
+    // what it holds, so the hole is closed by construction rather than by the
+    // validator agreeing to be perfect. `_` is the conventional `$0` filler.
+    let (status, _out, _err) =
+        docker_capture_with_env(&model_probe_args(volume, image, model), &[]).await?;
     Ok(status.success())
+}
+
+/// The `docker run` argv for the model-presence probe, pure so the property
+/// #1254 turned on is assertable with no daemon.
+///
+/// The path is a POSITIONAL ARGUMENT, never text spliced into the command.
+/// Interpolating it made `--local-model 'missing; true #'` end the probe's
+/// `test -e` early and leave a `true` behind, so the probe exited 0, the guard
+/// reported the model present, and `compose up` performed exactly the multi-GB
+/// download ADR-0093 exists to prevent. `"$1"` cannot be reparsed as code no
+/// matter what it holds, so the hole is closed by construction rather than by
+/// the validator agreeing to be perfect. `_` is the conventional `$0` filler.
+pub fn model_probe_args(volume: &str, image: &str, model: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "-v".into(),
+        format!("{volume}:/root/.ollama"),
+        "--entrypoint".into(),
+        "/bin/sh".into(),
+        image.to_string(),
+        "-c".into(),
+        "test -e \"$1\"".into(),
+        "_".into(),
+        format!("/root/.ollama/{}", model_manifest_path(model)),
+    ]
 }
 
 /// The operator-facing refusal when `--local-model` is asked for assets that are
@@ -971,6 +1067,99 @@ mod tests {
     // refusal) or a missing one as cached (the implicit download this closes).
     // Verified against a real volume: qwen3:4b lives at
     // models/manifests/registry.ollama.ai/library/qwen3/4b.
+    // #1254. The preflight exists to stop an implicit multi-GB download, and a
+    // reference with shell metacharacters defeated it: `missing; true #` ended the
+    // probe's `test -e` early and left a `true`, so the probe exited 0, the guard
+    // reported the model present, and `compose up` performed the download.
+    #[test]
+    fn a_model_ref_with_shell_metacharacters_is_rejected() {
+        for payload in [
+            "missing; true #",     // the reported payload, verbatim
+            "$(touch /tmp/pwned)", // command substitution
+            "`id`",                // the backtick spelling of the same
+            "a && b",
+            "a | b",
+            "a > /tmp/x",
+            "a\nb",
+            "a b", // a bare space is not a reference either
+            "'quoted'",
+            "a\\b",
+        ] {
+            assert!(
+                validate_model_ref(payload).is_err(),
+                "must reject {payload:?}"
+            );
+        }
+    }
+
+    // The refusal has to be readable: an operator who typed something odd needs to
+    // know which character and what the grammar is, not just that it failed.
+    #[test]
+    fn the_rejection_names_the_offending_character_and_the_grammar() {
+        let err = validate_model_ref("missing; true #")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing; true #"), "{err}");
+        assert!(
+            err.contains(';'),
+            "the offending character must be named: {err}"
+        );
+        assert!(
+            err.contains("qwen3:4b"),
+            "the grammar needs an example: {err}"
+        );
+    }
+
+    // The allowlist must not be so tight it rejects references Ollama accepts --
+    // a validator that refuses real input is its own outage.
+    #[test]
+    fn every_shape_ollama_accepts_still_validates() {
+        for good in [
+            "qwen3",
+            "qwen3:4b",
+            "qwen3-coder:30b",
+            "deepseek-v4-flash-0731",
+            "myorg/mymodel:v1",
+            "hf.co/org/repo:q4",
+            "localhost:5000/org/repo",
+            "localhost:5000/org/repo:v2",
+            "a_b.c-d:e_f.g-h",
+        ] {
+            assert!(validate_model_ref(good).is_ok(), "must accept {good:?}");
+        }
+    }
+
+    #[test]
+    fn empty_refs_and_empty_segments_are_rejected() {
+        for bad in ["", ":", "qwen3:", "/qwen3", "a//b:1"] {
+            assert!(validate_model_ref(bad).is_err(), "must reject {bad:?}");
+        }
+    }
+
+    // The structural half of the fix, independent of the validator: the probe
+    // passes the path as a POSITIONAL ARGUMENT, so even a caller that skipped
+    // validation cannot get the payload reparsed as shell code.
+    #[test]
+    fn the_probe_passes_the_path_as_an_argument_not_as_command_text() {
+        // The #1254 payload carried all the way into the argv the probe would run.
+        let args = model_probe_args("vol", "img", "missing; true #");
+        let command = &args[args.len() - 3];
+        let path = args.last().expect("the path is the final argument");
+
+        assert_eq!(command, r#"test -e "$1""#, "the command must reference $1");
+        assert!(
+            !command.contains("missing"),
+            "the payload must never reach the command string: {command}"
+        );
+        assert!(
+            path.contains("missing; true #"),
+            "the payload belongs in the path argument, verbatim: {path}"
+        );
+        // Every byte of the payload sits inside ONE argv element, which is what
+        // makes it inert: `sh` never reparses a positional parameter as code.
+        assert_eq!(args.iter().filter(|a| a.contains("true #")).count(), 1);
+    }
+
     #[test]
     fn model_manifest_path_mirrors_ollama_layout() {
         assert_eq!(
