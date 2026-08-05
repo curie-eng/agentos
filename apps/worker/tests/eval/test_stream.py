@@ -37,7 +37,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV
+from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
 from curie_worker.eval import (
@@ -71,6 +71,10 @@ async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
 class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
+    def __init__(self, *, thinking: str | None = None) -> None:
+        self._thinking = thinking
+        self.thinking_agent_id: uuid.UUID | None = None
+
     async def repo_full_name(self, _agent_id: uuid.UUID) -> str:
         return "owner/repo"
 
@@ -78,6 +82,10 @@ class _StubRepo:
         # No connector secrets in the eval stub; a real BindingResolver returns
         # the agent's secrets so an authed-MCP bundle authenticates during eval.
         return None
+
+    async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
+        self.thinking_agent_id = agent_id
+        return self._thinking
 
 
 class _UnusedSubstrate:
@@ -200,6 +208,7 @@ def _build_consumer(
     reports: list[dict[str, Any]],
     lf_client: httpx.AsyncClient,
     report_status: int = 200,
+    repo_lookup: _StubRepo | None = None,
 ) -> EvalStreamConsumer:
     def handler(request: httpx.Request) -> httpx.Response:
         reports.append(json.loads(request.content))
@@ -226,7 +235,7 @@ def _build_consumer(
         substrate=substrate,
         reporter=reporter,
         recorder=recorder,
-        repo_lookup=_StubRepo(),
+        repo_lookup=repo_lookup or _StubRepo(),
     )
 
 
@@ -634,7 +643,23 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
     asyncio.run(go())
 
 
-def test_provisioned_runner_end_to_end(make_eval_harness, bundles) -> None:
+@pytest.mark.parametrize(
+    ("platform_thinking", "agent_thinking", "item_model", "expected_thinking"),
+    [
+        pytest.param("adaptive", "disabled", "requested_model", "disabled"),
+        pytest.param("adaptive", None, None, "adaptive"),
+        pytest.param(None, "high", None, "high"),
+        pytest.param(None, None, None, None),
+    ],
+)
+def test_provisioned_runner_end_to_end(
+    make_eval_harness,
+    bundles,
+    platform_thinking: str | None,
+    agent_thinking: str | None,
+    item_model: str | None,
+    expected_thinking: str | None,
+) -> None:
     """No target_url: the consumer provisions a runner via the G1 substrate (boot
     env carrying the bundle_ref + budget), evals against it, reports, and tears the
     sandbox down in a finally. The fake runner is the model boundary, so no real
@@ -656,7 +681,14 @@ def test_provisioned_runner_end_to_end(make_eval_harness, bundles) -> None:
                 )
             )
             token = uuid.uuid4().hex[:8]
-            cfg = _cfg(f"test:evals:{token}", f"g-{token}")
+            if platform_thinking is None:
+                cfg = _cfg(f"test:evals:{token}", f"g-{token}")
+            else:
+                cfg = _cfg(
+                    f"test:evals:{token}",
+                    f"g-{token}",
+                    thinking=platform_thinking,
+                )
             sandbox_prefix = f"test:curie:sandbox:{token}"
             sync_client = redis.Redis(
                 host=_VH, port=_VP, password=_VPW or None, decode_responses=False
@@ -678,6 +710,7 @@ def test_provisioned_runner_end_to_end(make_eval_harness, bundles) -> None:
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
             reports: list[dict[str, Any]] = []
             async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                repo_lookup = _StubRepo(thinking=agent_thinking)
                 consumer = _build_consumer(
                     redis_client=client,
                     cfg=cfg,
@@ -685,10 +718,17 @@ def test_provisioned_runner_end_to_end(make_eval_harness, bundles) -> None:
                     substrate=substrate,
                     reports=reports,
                     lf_client=lf_client,
+                    repo_lookup=repo_lookup,
                 )
                 await consumer.ensure_group()
                 sha = f"sha-{token}"
-                item = _item(suite="prov", sha=sha, bundle_ref=bundle_ref, target_url=None)
+                item = _item(
+                    suite="prov",
+                    sha=sha,
+                    bundle_ref=bundle_ref,
+                    target_url=None,
+                    model=item_model,
+                )
                 await client.xadd(cfg.eval_stream, {"payload": item.model_dump_json()})
 
                 await _drain_one(consumer, reports)
@@ -701,6 +741,14 @@ def test_provisioned_runner_end_to_end(make_eval_harness, bundles) -> None:
                 assert fake_k8s.claim_envs, "substrate.claim was never called"
                 assert fake_k8s.claim_envs[0][BUNDLE_REF_ENV] == bundle_ref
                 assert BUDGET_ENV in fake_k8s.claim_envs[0]
+                if expected_thinking is None:
+                    assert THINKING_ENV not in fake_k8s.claim_envs[0]
+                else:
+                    assert fake_k8s.claim_envs[0][THINKING_ENV] == expected_thinking
+                if item_model is not None:
+                    assert fake_k8s.claim_envs[0][MODEL_ENV] == item_model
+                if agent_thinking is not None:
+                    assert repo_lookup.thinking_agent_id == item.agent_id
                 # and the sandbox was torn down after the eval (finally: release).
                 assert fake_k8s.deleted, "provisioned sandbox was never released"
                 assert not fake_k8s.claims

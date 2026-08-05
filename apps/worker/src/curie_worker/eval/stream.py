@@ -352,7 +352,8 @@ class EvalStreamConsumer(StreamConsumer):
         release_key = f"eval-{uuid.uuid4().hex}"
         try:
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
-            env = self._boot_env(item, connector_secrets)
+            thinking = await self._repo_lookup.thinking_for(item.agent_id)
+            env = self._boot_env(item, connector_secrets, thinking)
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
             # claim binds, so the bound sandbox runs its cases while the next
@@ -397,7 +398,10 @@ class EvalStreamConsumer(StreamConsumer):
         return self._config.model or None
 
     def _boot_env(
-        self, item: EvalJob, connector_secrets: dict[str, str] | None = None
+        self,
+        item: EvalJob,
+        connector_secrets: dict[str, str] | None = None,
+        thinking: str | None = None,
     ) -> dict[str, str]:
         budget = Budget(
             max_output_tokens_per_run=self._config.default_max_output_tokens_per_run,
@@ -423,7 +427,12 @@ class EvalStreamConsumer(StreamConsumer):
         # provisioned sandbox actually runs the model this sweep row is measuring;
         # _eval_model tags the same value, keeping the boot and the matrix label
         # in lock-step. None falls back to config.model exactly as before.
-        apply_model_env(env, self._config, model_override=item.model)
+        apply_model_env(
+            env,
+            self._config,
+            model_override=item.model,
+            thinking_override=thinking,
+        )
         return env
 
     async def _report_failed(self, item: EvalJob, repo: str | None, reason: str) -> EvalRunResult:

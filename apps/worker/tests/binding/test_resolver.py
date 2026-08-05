@@ -873,6 +873,50 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
     asyncio.run(go())
 
 
+def test_reads_thinking_for_eval_boots_by_agent_id() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            agent_id = await _seed_agent(
+                engine,
+                channel=f"C-{token}",
+                name=f"agent-{token}",
+                max_usd=None,
+                max_tokens=None,
+            )
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"UPDATE {_SCHEMA}.agents SET thinking = :thinking WHERE id = :id"),
+                        {"thinking": "high", "id": agent_id},
+                    )
+
+                resolver = _resolver(engine)
+                assert await resolver.thinking_for(agent_id) == "high"
+
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"UPDATE {_SCHEMA}.agents SET thinking = NULL WHERE id = :id"),
+                        {"id": agent_id},
+                    )
+
+                assert await resolver.thinking_for(agent_id) is None
+                assert await resolver.thinking_for(uuid.uuid4()) is None
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
 def test_reserved_connector_secret_is_dropped_order_independently() -> None:
     # #457 order-independence regression. A connector secret named
     # ANTHROPIC_BASE_URL redirects the model credential. The old `if name not in

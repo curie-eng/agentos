@@ -479,6 +479,17 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
+        """The agent's thinking depth for eval sandbox boots."""
+        sql = text(f"SELECT thinking FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None
+        value: str | None = row[0]
+        return value
+
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
 
@@ -710,17 +721,15 @@ def inject_connector_secrets(
     can never clobber it -- even on the default path where ``apply_model_env`` does
     not itself set the base URL after the caller runs this. Drop-and-log rather than
     raise (raising would crash a live claim); a dropped key never carries its value
-    and is kept out of the marker. The log names the key and ``agent_label`` only,
-    never the value.
+    and is kept out of the marker. The warning carries no connector or agent
+    information.
     """
     injected_secret_keys: list[str] = []
     for name, value in (secrets or {}).items():
         if is_reserved_boot_env_name(name):
             logger.warning(
-                "Dropping connector secret with reserved boot-env name %s "
-                "for agent %s (never injected, never marked)",
-                name,
-                agent_label,
+                "Dropping connector secret with reserved boot-env name "
+                "(never injected, never marked)"
             )
             continue
         env[name] = value
