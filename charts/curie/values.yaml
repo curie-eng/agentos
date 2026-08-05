@@ -286,6 +286,44 @@ clickhouse:
   persistence:
     enabled: true
     size: 3Gi
+  # ClickHouse's OWN telemetry, which stock config sizes for a dedicated
+  # analytics box. Here it backs Langfuse, holding kilobytes.
+  #
+  # Left at the image defaults this is not a tuning nicety, it is a live
+  # outage: stock `config.xml` logs at `trace` and retains 30 DAYS of
+  # `text_log`/`trace_log`/`metric_log`/`asynchronous_metric_log`. Measured on a
+  # real install, ClickHouse accumulated 2.72 GiB of self-telemetry against
+  # 31 KiB of actual Langfuse data -- a 90,000:1 ratio that filled a 3Gi volume
+  # in eight days.
+  #
+  # It ends in a merge that cannot succeed, retried forever. Once
+  # `system.metric_log` needs more than the memory limit below to merge, the
+  # merge throws MEMORY_LIMIT_EXCEEDED; ClickHouse retries failed merges
+  # indefinitely; each attempt writes a ~4 KiB stack trace into `text_log`,
+  # which then needs merging itself. Failed merges make parts accumulate, so
+  # the next merge is larger and fails harder. Daily CPU climbed 17% -> 98%
+  # over eight days with no change in traffic, and the node starved.
+  #
+  # `logLevel: warning` is the load-bearing one -- an hour of the default
+  # produced 253,727 Debug and 58,186 Trace rows against 15 Information.
+  logLevel: warning
+  systemLogs:
+    # trace_log / metric_log / asynchronous_metric_log -- the timer-driven
+    # samplers. OFF because they have no level filter: they write regardless of
+    # whether anything is happening, so on/off is the only lever, and
+    # Prometheus already measures what they measure from outside the process
+    # that is failing. metric_log is the table whose merge wedged.
+    #
+    # text_log is NOT governed by this and is always kept: it has a `level`
+    # filter, so it can be quiet-but-present, and a queryable text_log is what
+    # diagnosed the incident above. Turn these three on only to profile
+    # ClickHouse itself; they stay TTL-bounded even then.
+    enabled: false
+    # Retention for whichever system log tables exist. Applies to the
+    # always-on diagnostic tables (query_log, part_log, error_log) and to the
+    # four above when enabled. Stock is 30 days, which no volume this size
+    # survives.
+    retentionDays: 3
   # The CPU limit deliberately leaves headroom rather than matching a node.
   #
   # This was `cpu: "2"`, and on a 2-vCPU node that is the WHOLE machine. A
@@ -303,6 +341,13 @@ clickhouse:
   # the critical-path containers (bundle-fetch, runner) request 50m each. A
   # limit is a ceiling, never a guarantee -- so a component that requests little
   # and may burst to everything is exactly the shape that starves a deadline.
+  #
+  # Necessary but NOT sufficient, which the recurrence proved. Capping at 1 core
+  # halved the blast radius and left the cause untouched: ClickHouse still WANTS
+  # a core, permanently, and on a 2-vCPU node half the machine is still fatal to
+  # a 90s deadline. The same `runner-error` escalation returned. What ClickHouse
+  # wanted that core FOR is the `logLevel`/`systemLogs` block above -- it was
+  # merging its own logs, not serving Langfuse. Fix intake, not just the ceiling.
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits: { cpu: "1", memory: 1536Mi }
