@@ -116,10 +116,33 @@ class ConnectorSpec(BaseModel):
     # Secret that already exists.
     secrets: list[str | SecretRef] = Field(default_factory=list)
 
-    def secret_names(self) -> list[str]:
-        """Env var names this connector needs, either form."""
+    #   sealed_secrets:                       The bundle CARRIES the credential,
+    #     TOKEN: AgBv3n2K...                  encrypted to the cluster that will
+    #                                         run it (ADR-0094).
+    #
+    # A third holder for the same question. The blob is useless without the
+    # cluster's private key, so it can live in the repository -- public or
+    # private -- beside the connector that reads it, and an agent repo becomes
+    # self-contained: clone it, point a cluster at it, tools work.
+    #
+    # Keyed by the env var name so it reads like `env` and cannot express two
+    # blobs for one variable. Additive and optional: a bundle that does not use
+    # it is unaffected, which is what lets this land as a backward-compatible
+    # change to a frozen contract.
+    #
+    # NOTHING DECRYPTS THIS YET. The field is the contract; the keypair,
+    # `curie seal`, and the reconciler's decrypt step follow separately. Until
+    # they land, `validate_connectors` REFUSES a bundle that declares one rather
+    # than accepting it and quietly starting a connector with no credential --
+    # a pod that passes its health check and 401s every call is the #1156
+    # failure shape ADR-0094 exists to avoid.
+    sealed_secrets: dict[str, str] = Field(default_factory=dict)
 
-        return [s if isinstance(s, str) else s.name for s in self.secrets]
+    def secret_names(self) -> list[str]:
+        """Env var names this connector needs, any form."""
+
+        named = [s if isinstance(s, str) else s.name for s in self.secrets]
+        return named + list(self.sealed_secrets)
 
     def resolved_secrets(self) -> list[str]:
         """Only the names Curie must resolve a VALUE for.
@@ -292,6 +315,34 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "API server rejects at apply -- long after the deploy looked fine.",
                     )
                 )
+        for env_name, blob in spec.sealed_secrets.items():
+            if not env_name.strip():
+                errors.append(
+                    (
+                        "connectors.empty_sealed_name",
+                        f"{where}: a `sealed_secrets` entry has an empty env var name.",
+                    )
+                )
+            if not blob.strip():
+                errors.append(
+                    (
+                        "connectors.empty_sealed_value",
+                        f"{where}: `{env_name}` has an empty sealed value. An empty blob "
+                        "cannot decrypt to anything, so the connector would start without "
+                        "the credential it needs.",
+                    )
+                )
+        if spec.sealed_secrets:
+            errors.append(
+                (
+                    "connectors.sealed_secrets_unsupported",
+                    f"{where}: `sealed_secrets` is declared but nothing decrypts it yet "
+                    "(ADR-0094 is accepted; the keypair, `curie seal`, and the "
+                    "reconciler's decrypt step are still landing). Refusing rather than "
+                    "ignoring it: a connector deployed without its credential starts "
+                    "healthy and fails every call. Use `secrets:` until then.",
+                )
+            )
         seen_secret_names: set[str] = set()
         for secret_name in spec.secret_names():
             if secret_name in seen_secret_names:
