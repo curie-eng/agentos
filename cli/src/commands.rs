@@ -1001,6 +1001,47 @@ fn select_passthrough_env(
         .collect()
 }
 
+/// What `skill up` will run the model as, for one panel row and one warning.
+///
+/// The gap this closes: `select_passthrough_env` above resolves the model
+/// credential AT BOOT, and `skill up` then said nothing about it. A first-run
+/// user who had not exported anything got a clean boot panel, ran the very
+/// command that panel recommends, and only then hit
+/// `model-credential-rejected` from the provider -- one command after the CLI
+/// already knew. The README does say to export `CURIE_CREDENTIALS` first, but
+/// nothing in `init`'s `Next:` hint or this panel repeats it, so following the
+/// CLI rather than the README walks straight into it.
+///
+/// Names only, never values: the masking rule in cli/CLAUDE.md applies here as
+/// everywhere, and a name is all that is diagnostic anyway.
+fn model_credential_summary(
+    fake_model: bool,
+    local_model: Option<&str>,
+    names: &[String],
+) -> (String, Option<String>) {
+    // Local model first: `--local-model` overrides `--fake-model` at the call
+    // site, so checking fake first would mislabel a run that set both.
+    if let Some(model) = local_model {
+        return (format!("local ollama ({model})"), None);
+    }
+    if fake_model {
+        return ("fake (offline, scripted replies)".to_string(), None);
+    }
+    if !names.is_empty() {
+        return (names.join(" + "), None);
+    }
+    (
+        "none".to_string(),
+        Some(
+            "no model credential resolved, so `curie skill message` will fail with \
+             model-credential-rejected. Either export one (CURIE_CREDENTIALS, \
+             ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN) and re-run `curie skill up \
+             --replace`, or re-run with `--fake-model` to drive the loop offline."
+                .to_string(),
+        ),
+    )
+}
+
 /// A Claude Code OAuth token shares the sk-ant- prefix with an API key; this more
 /// specific prefix marks it (issue #603). A literal mirror of
 /// runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX, the authority for the
@@ -1426,17 +1467,20 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         }
     }
     // Scoped so the borrow of `docker_env` ends before it is moved into the spec.
-    let passthrough_env = {
+    // `model_cred_names` is kept separately from the merged list so the summary
+    // below reports the MODEL credential alone -- a `--secret` name riding in
+    // `passthrough_env` is not one, and counting it would let the panel claim a
+    // credential for a runner that has none.
+    let (model_cred_names, passthrough_env) = {
         let ambient_present = ambient_present_for(&docker_env);
-        merge_secret_env(
-            select_passthrough_env(
-                fake_model,
-                base_url_override,
-                byo_credential.as_deref(),
-                &ambient_present,
-            ),
-            &opts.secret,
-        )
+        let model_cred_names = select_passthrough_env(
+            fake_model,
+            base_url_override,
+            byo_credential.as_deref(),
+            &ambient_present,
+        );
+        let passthrough = merge_secret_env(model_cred_names.clone(), &opts.secret);
+        (model_cred_names, passthrough)
     };
 
     // #1087: the skill tier executes an immutable, content-addressed snapshot,
@@ -1569,6 +1613,11 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         .await
         .map(|sha| format!("dev @ {sha}"))
         .unwrap_or_else(|| format!("{plugin_name} @ {manifest_version}"));
+    // `fake_model`, not `opts.fake_model`: a `--local-model` overrides a
+    // `--fake-model` (line ~1432), and that resolved value is the one that
+    // actually drove the credential selection being reported.
+    let (model_credential, model_warning) =
+        model_credential_summary(fake_model, opts.local_model.as_deref(), &model_cred_names);
     let rows = [
         ("Local bot", base_url),
         (
@@ -1583,8 +1632,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             "Bundle",
             format!("{} (snapshot)", short_digest(&snapshot.digest)),
         ),
+        ("Model", model_credential),
     ];
     ui.payload_plain(&boxed_summary("curie dev environment", &rows));
+    if let Some(warning) = model_warning {
+        ui.note(&warning);
+    }
     if let Some(local_model) = &opts.local_model {
         ui.note(&format!(
             "local model running in container '{}' from '{}' with model '{}'",
@@ -5369,9 +5422,10 @@ pub fn skill_approval_routes_unavailable() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        absent_container_note, merge_secret_env, parse_credential_env_file, parse_manifest_gates,
-        plan_recorded_state, plan_recorded_teardown, plan_skill_down, replace_first_line,
-        report_sweep, resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
+        absent_container_note, merge_secret_env, model_credential_summary,
+        parse_credential_env_file, parse_manifest_gates, plan_recorded_state,
+        plan_recorded_teardown, plan_skill_down, replace_first_line, report_sweep,
+        resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
         select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
         validate_slack_channel, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
         RecordedTeardown, SweepRow,
@@ -5952,6 +6006,64 @@ mod tests {
                 "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
                 "ANTHROPIC_API_KEY".to_string()
             ]
+        );
+    }
+
+    /// The state that used to boot silently and fail one command later.
+    #[test]
+    fn no_resolved_credential_warns_and_says_none() {
+        let (row, warning) = model_credential_summary(false, None, &[]);
+        assert_eq!(row, "none");
+        let warning = warning.expect("a runner that cannot reach a model must say so at boot");
+        assert!(
+            warning.contains("model-credential-rejected"),
+            "the warning must name the error the next command will actually print, \
+             so the two are recognizably the same problem: {warning}"
+        );
+        for way_out in ["CURIE_CREDENTIALS", "--fake-model"] {
+            assert!(
+                warning.contains(way_out),
+                "the warning must offer {way_out} as a way forward: {warning}"
+            );
+        }
+    }
+
+    /// The warning has to stay rare to stay meaningful: every configured path
+    /// reports itself and stays quiet.
+    #[test]
+    fn each_configured_model_path_reports_itself_without_warning() {
+        let cases = [
+            (true, None, None, "fake (offline, scripted replies)"),
+            (false, Some("llama3"), None, "local ollama (llama3)"),
+            (false, None, Some("CURIE_CREDENTIALS"), "CURIE_CREDENTIALS"),
+            (false, None, Some("ANTHROPIC_API_KEY"), "ANTHROPIC_API_KEY"),
+        ];
+        for (fake, local, name, expected) in cases {
+            let names: Vec<String> = name.into_iter().map(String::from).collect();
+            let (row, warning) = model_credential_summary(fake, local, &names);
+            assert_eq!(row, expected, "row for fake={fake} local={local:?}");
+            assert!(
+                warning.is_none(),
+                "a configured model path must not warn (fake={fake} local={local:?})"
+            );
+        }
+    }
+
+    /// `--local-model` beats `--fake-model` at the call site, and the panel has
+    /// to describe the runner that actually booted.
+    #[test]
+    fn local_model_wins_over_fake_in_the_summary() {
+        let (row, _) = model_credential_summary(true, Some("llama3"), &[]);
+        assert_eq!(row, "local ollama (llama3)");
+    }
+
+    /// Names, never values -- the row is printed.
+    #[test]
+    fn summary_reports_names_only() {
+        let (row, _) = model_credential_summary(false, None, &["CURIE_CREDENTIALS".to_string()]);
+        assert!(
+            !row.contains("sk-"),
+            "the panel must never carry a credential value: {row}"
         );
     }
 
