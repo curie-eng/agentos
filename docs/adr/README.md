@@ -122,7 +122,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0091 | [Git-flow resolves deploy targets, so one repo serves many agents](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md) | Accepted |
 | 0092 | [A GitHub App gives the platform its own repository identity](0092-a-github-app-gives-the-platform-its-own-repository-identity.md) | Accepted |
 | 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Draft |
-| 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Draft |
+| 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
 <!-- END GENERATED: adr-index -->
