@@ -184,6 +184,12 @@
       "version": 1
     },
     {
+      "result": "SealOutput",
+      "kind": "CliOutput",
+      "schema": "seal.schema.json",
+      "version": 1
+    },
+    {
       "result": "SecretsListOutput",
       "kind": "CliOutput",
       "schema": "secrets.schema.json",

@@ -3559,6 +3559,25 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
         .unwrap_or_else(|| format!("{release}-secrets"))
 }
 
+/// The release's sealing keys (ADR-0094): current first, then the previous one
+/// if a rotation is in progress.
+///
+/// Returns whatever is present. An empty vector means this release has no
+/// sealing key, which the caller must report rather than work around -- sealing
+/// against nothing, or "decrypting" without a key, both produce a connector
+/// that starts and then fails every call.
+pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for data_key in ["sealingPrivateKey", "sealingPreviousPrivateKey"] {
+        if let Some(value) = read_release_secret(namespace, release, data_key).await {
+            if !value.trim().is_empty() {
+                keys.push(value);
+            }
+        }
+    }
+    keys
+}
+
 /// Read one data key out of a release's chart Secret, decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
 /// when the Secret, the key, or the cluster is unreachable; the caller turns

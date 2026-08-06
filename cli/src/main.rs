@@ -429,6 +429,31 @@ enum Command {
         allow_stateful_removal: bool,
     },
 
+    /// Encrypt a connector credential to a cluster (ADR-0094).
+    ///
+    /// The blob is safe to commit: only a cluster holding the matching private
+    /// key can read it. The value is never taken as an argument -- it comes
+    /// from a hidden prompt, a pipe, or `--from-env` -- so it cannot land in a
+    /// shell history or the process table.
+    Seal {
+        /// The connector in connectors.yaml that reads this value.
+        #[arg(long)]
+        connector: String,
+        /// The environment variable name the connector reads it as.
+        env_name: String,
+        #[arg(long, default_value = "curie")]
+        namespace: String,
+        #[arg(long, default_value = "curie")]
+        release: String,
+        /// Seal against this public key instead of reading one from a cluster,
+        /// so an author with no cluster access can still seal.
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Read the value from this environment variable instead of prompting.
+        #[arg(long)]
+        from_env: Option<String>,
+    },
+
     /// Show what `curie apply` would change about the live release (ADR-0097).
     ///
     /// Read-only, and resolves no credential: "what would change?" is most
@@ -3208,6 +3233,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             )
         }
+        Some(Command::Seal {
+            connector,
+            env_name,
+            namespace,
+            release,
+            public_key,
+            from_env,
+        }) => emit(
+            curie::seal::seal(curie::seal::SealOpts {
+                connector,
+                env_name,
+                namespace,
+                release,
+                public_key,
+                from_env,
+            })
+            .await?,
+        ),
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;
             let local = curie::installation::plan_installation(cfg, false)?;
