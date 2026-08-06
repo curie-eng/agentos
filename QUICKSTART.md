@@ -32,6 +32,51 @@ runbooks, or working on Curie itself — see [Where to go next](#where-to-go-nex
   builds the CLI instead of downloading it — see
   [Where to go next](#where-to-go-next).
 
+## The minimum bundle
+
+`curie init` scaffolds seven files. Only these are required, and it is worth
+knowing which — when a deploy is rejected or an agent behaves oddly, this is
+what actually has to be true.
+
+**One file, one field** is a complete, valid bundle:
+
+```
+my-agent/
+└── .claude-plugin/
+    └── plugin.json     {"name": "my-agent"}
+```
+
+It boots and answers. Everything else in the format is optional and validated
+only when present.
+
+That agent has no instructions, though. **Two files, three fields** is the
+smallest useful one:
+
+```
+my-agent/
+├── .claude-plugin/
+│   └── plugin.json          {"name": "my-agent"}
+└── skills/
+    └── my-agent/
+        └── SKILL.md
+```
+
+```markdown
+---
+name: my-agent
+description: Answers questions about deployment status.
+---
+
+You are a deployment helper. Answer briefly and plainly.
+```
+
+`name` and `description` are the only required frontmatter fields; the body is
+the agent's instructions.
+
+Everything the scaffold adds beyond this — `evals/cases.json`, `.mcp.json`,
+`AGENTS.md`, the `using-curie` primer — is useful and optional. Delete any of
+it and the bundle still deploys.
+
 ## Your first agent reply
 
 1. **Scaffold a bundle.** This creates a starter skill named for your agent,
