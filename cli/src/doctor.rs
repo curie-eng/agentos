@@ -325,6 +325,17 @@ pub fn summary(checks: &[Check]) -> String {
                 missing items above."
             .to_string();
     }
+    // repo-binding reads NotApplicable in two situations that both reach this
+    // point: the platform API was never consulted (no --api-url/--api-key, an
+    // unreachable API, or a rejected key -- indistinguishable from here) or it
+    // was reached and found no agents deployed yet. Neither is evidence a git
+    // push deploys anything, so claiming "Fully wired" here asserted the one
+    // capability the run did not check (#1354).
+    if !has("repo-binding") {
+        return "Answering in Slack. Git-push deploys are unverified -- see the \
+                Repo binding line above."
+            .to_string();
+    }
     "Fully wired: local runs, Slack, and git-push deploys.".to_string()
 }
 
@@ -479,7 +490,10 @@ mod tests {
 
     /// The binding is what makes a push reach an agent. An unbound one fails
     /// SILENTLY: the webhook returns 200, GitHub shows a green delivery, and
-    /// nothing is logged -- so the check has to say that out loud.
+    /// nothing is logged -- so the check has to say that out loud. This also
+    /// pins the Missing versus NotApplicable distinction the verdict turns
+    /// on: a KNOWN unbound agent must reach the actionable "not wired yet"
+    /// summary, not the "unverified" hedge reserved for never having checked.
     #[test]
     fn an_unbound_agent_is_reported_with_what_it_costs() {
         let f = Facts {
@@ -489,13 +503,20 @@ mod tests {
             ]),
             ..wired()
         };
-        let c = find(&evaluate(&f), "repo-binding").clone();
+        let checks = evaluate(&f);
+        let c = find(&checks, "repo-binding").clone();
         assert_eq!(c.state, State::Missing);
         assert!(c.detail.contains("bot-dev"), "must name it: {}", c.detail);
         assert!(
             c.detail.contains("silently ignored"),
             "must say the failure is silent: {}",
             c.detail
+        );
+        assert!(
+            summary(&checks).contains("Git-push deploys are not wired yet"),
+            "a KNOWN unbound agent must route to the actionable verdict, not \
+             the unverified hedge: {}",
+            summary(&checks)
         );
     }
 
@@ -538,6 +559,35 @@ mod tests {
         assert_eq!(find(&evaluate(&f), "repo-binding").state, State::Ok);
     }
 
+    /// Found on a real install (#1354): every other check passed, the platform
+    /// API was never reached (no --api-url/--api-key), and the summary still
+    /// said "Fully wired" -- asserting the one capability the run did not
+    /// check. `wired()` has no `agents` set, so repo-binding is NotApplicable
+    /// here, not Ok.
+    #[test]
+    fn unreached_api_does_not_claim_fully_wired() {
+        let checks = evaluate(&wired());
+        let s = summary(&checks);
+        assert!(!s.contains("Fully wired"), "{s}");
+        assert!(s.contains("Git-push deploys are unverified"), "{s}");
+    }
+
+    /// The sibling NotApplicable path: the platform API WAS reached but no
+    /// agents are deployed yet. A different reason, the same lack of evidence
+    /// that a git push deploys anything, so both paths must land on the same
+    /// hedge rather than one of them slipping through to "Fully wired".
+    #[test]
+    fn no_agents_deployed_does_not_claim_fully_wired() {
+        let f = Facts {
+            agents: Some(vec![]),
+            ..wired()
+        };
+        let checks = evaluate(&f);
+        let s = summary(&checks);
+        assert!(!s.contains("Fully wired"), "{s}");
+        assert!(s.contains("Git-push deploys are unverified"), "{s}");
+    }
+
     /// Found by running this against a real install. sre-bot serves its webhook
     /// on a NodePort with no ingress, and the first version of this check called
     /// that broken -- on a cluster where git-push deploys demonstrably work.
@@ -550,6 +600,7 @@ mod tests {
             slack_configured: true,
             clone_credential: Some("github app".into()),
             api_exposure: Some("NodePort 30799".into()),
+            agents: Some(vec![("sre-bot".into(), Some("acme/sre-bot".into()))]),
             ..laptop()
         };
         let checks = evaluate(&f);
