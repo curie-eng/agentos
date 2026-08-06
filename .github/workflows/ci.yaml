@@ -209,7 +209,7 @@ jobs:
           if-no-files-found: error
 
   cli-portability:
-    name: CLI runs on old glibc (release build path)
+    name: CLI runs on old glibc (and publishes per-commit binaries)
     runs-on: ubuntu-latest
     # The release cross-compile path was never exercised before a tag, so a
     # regression in it was undiscoverable until someone tried the artifact on a
@@ -226,9 +226,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: cli
-      - name: Install zig toolchain
+      # rustup for the std/core rlibs, zig for the C toolchain and the glibc
+      # floor. Both are needed: without the target added, the cross build dies
+      # on `can't find crate for core` while the host target quietly succeeds --
+      # which is why adding arm64 here caught something x86_64-only never could.
+      - name: Install cross toolchain
         run: |
           set -euo pipefail
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
           cargo install cargo-zigbuild --locked --version 0.23.0
       # x86_64 only. The floor is a property of the toolchain, not the
@@ -236,14 +241,24 @@ jobs:
       # same thing -- and the arm64 artifact cannot be EXECUTED here without
       # dragging in qemu. The static assertion below covers arm64 at release
       # time; this job's job is to prove the floor is real, not merely declared.
+      # Both Linux targets, the same way a tag builds them. arm64 is here as
+      # much for the artifact as for the check: it is the target that cannot be
+      # obtained any other way between releases, and the one a Graviton cluster
+      # host needs.
       - name: Build (same path as the release)
         working-directory: cli
         env:
           CURIE_BUILD_CHANNEL: release
           RUSTFLAGS: -C strip=symbols
-        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+          cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.28
       - name: Assert the glibc floor
-        run: bash scripts/check-glibc-floor.sh cli/target/x86_64-unknown-linux-gnu/release/curie 2.28
+        run: |
+          set -euo pipefail
+          bash scripts/check-glibc-floor.sh cli/target/x86_64-unknown-linux-gnu/release/curie 2.28
+          bash scripts/check-glibc-floor.sh cli/target/aarch64-unknown-linux-gnu/release/curie 2.28
       # The floor asserted above is a claim about symbols. This is the claim
       # under test: Amazon Linux 2023 is glibc 2.34, it is what the deployment
       # runbook provisions, and it is where `curie --version` died.
@@ -252,6 +267,31 @@ jobs:
           set -euo pipefail
           docker run --rm -v "$PWD/cli/target/x86_64-unknown-linux-gnu/release/curie:/curie:ro" \
             amazonlinux:2023 /curie --version
+
+      # Installable binaries for any commit, not just tagged releases, so a
+      # cluster can run an unreleased fix without building Rust on the host.
+      #
+      # NOT the same as `curie-x86_64-linux-<sha>` from the build job above:
+      # that one is a native build with the runner's glibc floor, exists to feed
+      # the e2e jobs on ubuntu-latest, and will NOT start on an older distro.
+      # These two carry the 2.28 floor and are the ones to install anywhere real.
+      # Named like the release assets so `--chart`/install flows read the same.
+      #
+      #   gh run download <run-id> -R curie-eng/curie \
+      #     -n curie-aarch64-unknown-linux-gnu-<sha>
+      #   chmod +x curie && sudo install -m 0755 curie /usr/local/bin/curie
+      - name: Publish per-commit portable binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: curie-x86_64-unknown-linux-gnu-${{ github.sha }}
+          path: cli/target/x86_64-unknown-linux-gnu/release/curie
+          if-no-files-found: error
+      - name: Publish per-commit portable binaries (arm64)
+        uses: actions/upload-artifact@v7
+        with:
+          name: curie-aarch64-unknown-linux-gnu-${{ github.sha }}
+          path: cli/target/aarch64-unknown-linux-gnu/release/curie
+          if-no-files-found: error
 
   contracts-ts:
     name: Contracts (generated TypeScript compiles)
