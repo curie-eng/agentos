@@ -41,6 +41,37 @@ kubectl config use-context <your-production-context>
 
 ## Installing and inspecting the Curie platform on the cluster
 
+### Running a build from a commit, without waiting for a release
+
+Every CI run publishes an installable Linux binary for both architectures,
+built the same way a tag builds them and carrying the same glibc 2.28 floor, so
+a cluster can run an unreleased fix without compiling Rust on the host.
+
+```bash
+run=$(gh run list -R curie-eng/curie --commit <sha> \
+        --workflow CI --json databaseId -q '.[0].databaseId')
+gh run download "$run" -R curie-eng/curie -n curie-aarch64-unknown-linux-gnu-<sha>
+chmod +x curie && sudo install -m 0755 curie /usr/local/bin/curie
+curie --version
+```
+
+Swap `aarch64` for `x86_64` as needed. The chart is version-pinned to the
+binary, so pass the matching chart when the commit changes it:
+
+```bash
+curie cluster up --chart /path/to/checkout/charts/curie ...
+```
+
+Two things to know:
+
+- **Artifacts expire** (90 days by default) and are not signed or SBOM'd the way
+  release assets are. This is for testing a fix and for hosts that cannot wait
+  for a tag -- prefer a release for anything long-lived.
+- **`curie-x86_64-linux-<sha>` is a different artifact** and not this one. That
+  is a native build used by the e2e jobs; it inherits the runner's glibc and
+  will not start on an older distro. The ones named for a full Rust target
+  triple (`curie-<target>-<sha>`) are the portable pair.
+
 ### `curie cluster up`
 
 Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
