@@ -395,22 +395,20 @@ def test_sealed_secret_names_join_the_other_forms() -> None:
     assert spec.resolved_secrets() == ["PLAIN"]
 
 
-def test_a_declared_sealed_secret_is_refused_until_decryption_lands() -> None:
-    """Refuse, never ignore.
+def test_a_declared_sealed_secret_is_accepted_now_that_decryption_exists() -> None:
+    """The refusal was a placeholder while nothing could decrypt.
 
-    Accepting the field while nothing decrypts it would deploy a connector with
-    no credential: a pod that starts, passes its health check, and 401s every
-    call. That is the failure shape ADR-0094 exists to avoid, so the bundle is
-    rejected with a message naming what to use instead.
+    It was deliberately strict: accepting the field early would have deployed a
+    connector with no credential -- a pod that starts, passes its health check,
+    and 401s every call. The worker decrypts now, so the field is real.
     """
 
-    _, errors = validate_connectors(
+    parsed, errors = validate_connectors(
         {"connectors": {"grafana": {"image": "x", "sealed_secrets": {"TOKEN": "AgB"}}}}
     )
-    codes = [code for code, _ in errors]
-    assert "connectors.sealed_secrets_unsupported" in codes
-    message = next(m for c, m in errors if c == "connectors.sealed_secrets_unsupported")
-    assert "secrets:" in message, "must name the form that works today"
+    assert [code for code, _ in errors] == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].sealed_secrets == {"TOKEN": "AgB"}
 
 
 def test_an_empty_sealed_blob_is_reported_on_its_own() -> None:

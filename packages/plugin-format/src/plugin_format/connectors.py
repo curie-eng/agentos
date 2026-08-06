@@ -130,12 +130,11 @@ class ConnectorSpec(BaseModel):
     # it is unaffected, which is what lets this land as a backward-compatible
     # change to a frozen contract.
     #
-    # NOTHING DECRYPTS THIS YET. The field is the contract; the keypair,
-    # `curie seal`, and the reconciler's decrypt step follow separately. Until
-    # they land, `validate_connectors` REFUSES a bundle that declares one rather
-    # than accepting it and quietly starting a connector with no credential --
-    # a pod that passes its health check and 401s every call is the #1156
-    # failure shape ADR-0094 exists to avoid.
+    # The worker's reconciler decrypts these with the cluster's sealing key and
+    # writes the plaintext into the agent's own Secret. A blob it cannot open
+    # SKIPS that agent and leaves the running connector alone -- deploying it
+    # without the credential would produce a pod that passes its health check
+    # and 401s every call, the #1156 shape ADR-0094 exists to avoid.
     sealed_secrets: dict[str, str] = Field(default_factory=dict)
 
     def secret_names(self) -> list[str]:
@@ -332,17 +331,6 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "the credential it needs.",
                     )
                 )
-        if spec.sealed_secrets:
-            errors.append(
-                (
-                    "connectors.sealed_secrets_unsupported",
-                    f"{where}: `sealed_secrets` is declared but nothing decrypts it yet "
-                    "(ADR-0094 is accepted; the keypair, `curie seal`, and the "
-                    "reconciler's decrypt step are still landing). Refusing rather than "
-                    "ignoring it: a connector deployed without its credential starts "
-                    "healthy and fails every call. Use `secrets:` until then.",
-                )
-            )
         seen_secret_names: set[str] = set()
         for secret_name in spec.secret_names():
             if secret_name in seen_secret_names:
