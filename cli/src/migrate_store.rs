@@ -531,6 +531,39 @@ mod tests {
         assert_eq!(staging_pod("sre-bot"), "sre-bot-store-migration");
     }
 
+    /// Found by the first live run. The component is in the Service's
+    /// `spec.selector`, not `metadata.labels`, so a `-l` label selector matched
+    /// nothing and the run died with `array index out of bounds: index 0,
+    /// length 0` before copying anything.
+    #[test]
+    fn the_service_lookup_filters_on_spec_selector_not_labels() {
+        let line = store_service_cmd(&opts(), StoreKind::Minio).display();
+        assert!(
+            line.contains("spec.selector"),
+            "must filter on spec.selector, where the chart puts the component: {line}"
+        );
+        assert!(
+            !line.contains(" -l "),
+            "a label selector matches nothing here: {line}"
+        );
+        assert!(line.contains("minio"), "{line}");
+    }
+
+    /// Also found live. The staging pod mounts the release Secret when it is
+    /// CREATED -- before the upgrade exists -- and kubelet refreshes a mounted
+    /// Secret on a sync period, so the NEW store's key is absent for up to a
+    /// minute after the upgrade adds it. The import must wait rather than fail
+    /// on `cat: /secret/rustfsSecretKey: No such file or directory`.
+    #[test]
+    fn the_import_waits_for_the_new_stores_secret_key() {
+        let line =
+            import_cmd(&opts(), StoreKind::Rustfs, "curie-bundles", "http://s:9000").display();
+        assert!(
+            line.contains("rustfsSecretKey") && line.contains("seq 1"),
+            "import must poll for the key the upgrade adds: {line}"
+        );
+    }
+
     #[test]
     fn a_lost_object_is_reported() {
         let before = "100 a.tar\n200 b.tar";
