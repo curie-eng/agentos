@@ -418,13 +418,20 @@ export async function getConfig(): Promise<AppConfig> {
   return jsonOrThrow<AppConfig>(resp);
 }
 
-// PATCH an agent's mutable fields (currently just its Slack channel). Returns
-// the updated agent. Mirrors createAgent's JSON-body shape; non-2xx throws
-// ApiError. The live worker keeps its channel until the next deploy — this only
-// updates the stored config the next deployment reads.
+// PATCH an agent's mutable fields. Returns the updated agent. Mirrors
+// createAgent's JSON-body shape; non-2xx throws ApiError. The live worker keeps
+// its config until the next deploy; this only updates the stored config the
+// next deployment reads.
+//
+// `model` is a THREE-way field (#1310, #1355): omitted leaves it unchanged,
+// explicit null clears the pin back to the platform default, and a string pins
+// it. `null` has to be in the type or the console cannot express the clear at
+// all: it used to send `""`, which the API now refuses, because an empty
+// override reaches the worker falsy, emits no boot key, and skips the very
+// platform default that clearing is supposed to restore.
 export async function updateAgent(
   agentId: string,
-  patch: { slack_channel?: string; model?: string },
+  patch: { slack_channel?: string; model?: string | null },
 ): Promise<AgentOut> {
   const resp = await fetch(url(`/agents/${agentId}`), {
     method: "PATCH",

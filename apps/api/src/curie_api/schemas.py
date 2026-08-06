@@ -3,6 +3,7 @@
 import json
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -41,32 +42,61 @@ _SLACK_USERGROUP_ID = re.compile(r"^S[A-Z0-9]{7,}$")
 _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
 
 
-def _validate_thinking_override(value: str | None) -> str | None:
-    """Refuse an empty thinking override (#1310).
+def _nullable_override_validator(field: str, examples: str) -> Callable[[str | None], str | None]:
+    """Build the refusal shared by every nullable operator override (#1310, #1355).
 
-    Empty is not a third way to say "no override". It reaches the worker as a
-    falsy value, which emits no boot key at all -- so it selects the MODEL's own
-    default and silently skips the platform default an operator configured, the
-    opposite of what someone typing `""` to clear a value expects. Explicit JSON
-    null is the reset, and the error says so.
+    `model` and `thinking` are the same kind of field consumed the same way, and
+    they must answer an empty string the same way. `apply_model_env` reads each as
+    `override if override is not None else config.<field>`, so `""` is not None and
+    wins the ternary, and then `if value:` is falsy and NO boot key is emitted.
+    An empty override therefore skips the platform default an operator configured
+    and hands the decision to the model's own built-in -- the opposite of what
+    someone typing `""` to clear a value expects. Explicit JSON null is the reset,
+    and the error says so.
 
-    None passes through: on PATCH that is the clear, on create it is "no
-    override". The vocabulary itself (`disabled`/`adaptive`/`enabled:<n>`) is
-    deliberately NOT checked here -- it belongs to the runner
-    (`curie_runner.thinking`), the same division `model` already has, so that
-    swapping the harness is not a schema change.
+    Whitespace is worse than empty and is refused by the same predicate: `"  "`
+    passes the falsy check downstream and is stored AND forwarded as a garbage
+    value.
+
+    #1334 attached this to `thinking` only, and its twin on the adjacent line kept
+    accepting what its sibling refused. One factory, two call sites, so the next
+    nullable override cannot drift either.
+
+    None passes through: on PATCH that is the clear, on create it is "no override".
+    The VOCABULARY of each field is deliberately not checked here -- a model id
+    belongs to whatever harness is configured, and thinking's
+    `disabled`/`adaptive`/`enabled:<n>` belongs to the runner
+    (`curie_runner.thinking`) -- so swapping the harness is not a schema change.
+
+    Args:
+        field: the field name, used to open the error message.
+        examples: a trailing clause naming valid values for this field.
+
+    Returns:
+        A pydantic field validator refusing empty and whitespace-only values.
     """
-    if value is None:
+
+    def _validate(value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value.strip():
+            raise ValueError(
+                f"{field} must not be empty: an empty value skips the platform "
+                f"default and selects the model's own behavior, which is not what "
+                f"clearing means. Send null to clear the override back to the "
+                f"platform default, or {examples}."
+            )
         return value
-    if not value.strip():
-        raise ValueError(
-            "thinking must not be empty: an empty value skips the platform "
-            "default and selects the model's own behavior, which is not what "
-            "clearing means. Send null to clear the override back to the "
-            "platform default, or a value like 'disabled', 'adaptive' or "
-            "'enabled:2000'."
-        )
-    return value
+
+    return _validate
+
+
+_validate_thinking_override = _nullable_override_validator(
+    "thinking", "a value like 'disabled', 'adaptive' or 'enabled:2000'"
+)
+_validate_model_override = _nullable_override_validator(
+    "model", "a model id like 'claude-sonnet-5' or 'kimi-k2'"
+)
 
 
 def _validate_slack_channel_id(value: str | None) -> str | None:
@@ -380,6 +410,7 @@ class AgentCreate(BaseModel):
     # sandbox by the worker binding. None means no connector secrets.
     secrets: dict[str, str] | None = None
 
+    _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
@@ -425,6 +456,7 @@ class AgentUpdate(BaseModel):
     # agent and a target naming it is rejected as unknown.
     repo_full_name: str | None = None
 
+    _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
     _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
