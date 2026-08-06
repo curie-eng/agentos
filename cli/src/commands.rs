@@ -1120,7 +1120,7 @@ fn load_model_credentials_from_secret_store() -> Result<Vec<(String, String)>> {
 /// (`CURIE_CREDENTIALS` dominates the SDK pair). These are the ONLY keys read
 /// from an opt-in `--env-file` (#749, ADR-0070); every other key in the dotfile
 /// is ignored, never absorbed into any process env.
-const MODEL_CREDENTIAL_ENV_NAMES: [&str; 3] = [
+pub const MODEL_CREDENTIAL_ENV_NAMES: [&str; 3] = [
     "CURIE_CREDENTIALS",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",

@@ -14,6 +14,7 @@ pub mod comms;
 pub mod connectors;
 pub mod discover;
 pub mod docker;
+pub mod doctor;
 pub mod eval_init;
 pub mod evals;
 pub mod exit;
