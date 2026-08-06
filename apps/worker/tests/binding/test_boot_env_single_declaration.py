@@ -96,6 +96,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_MAX_ATTEMPTS",
         "CURIE_MAX_DELIVERY",
         "CURIE_SLACK_NO_EDIT_STREAMING",
+        # The cluster sealing keys (ADR-0094), read from the WORKER's env at
+        # reconcile time. Never a sandbox boot key -- quite the opposite: the
+        # decrypted VALUE reaches a connector's Secret, and the private key
+        # itself must never leave the worker, least of all into a sandbox that
+        # runs agent-authored code.
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
         "CURIE_EVAL_CONSUMER_GROUP",
         "CURIE_EVAL_MAX_CONCURRENT_CLAIMS",
         "CURIE_EVAL_STREAM",
