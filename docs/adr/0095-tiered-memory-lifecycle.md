@@ -108,7 +108,8 @@ the closest comparable product, Claude in Slack, is a direct precedent:
 ## Decision
 
 **Memory is one tiered system: a single lifecycle (bootstrap where a backlog
-exists, injection, hybrid update with scheduled compaction) applied per
+exists, injection, hybrid update with scheduled compaction, and a bounded
+escape valve into raw history the platform does not store) applied per
 scope, with an agent tier and a channel tier over the existing `memory`
 namespace of the durable state store.** The thread tier of the context
 hierarchy remains the transcript port (ADR-0029), replayed rather than
@@ -118,7 +119,8 @@ below names Slack except its adapter section.
 
 ### The surface obligation (the interface)
 
-A surface adapter owes the platform exactly two things, and nothing else:
+A surface adapter owes the platform one identity and, optionally, two
+capabilities, and nothing else:
 
 1. **A scope key.** Every inbound turn carries a stable, opaque
    `scope_key` identifying the place the conversation happens in (Slack: the
@@ -131,9 +133,18 @@ A surface adapter owes the platform exactly two things, and nothing else:
    the adapter fetched. A surface with no backlog (email) emits nothing; its
    memory starts empty and accretes through the update path. Bootstrap is an
    optimization, not a requirement of the interface.
+3. **Optionally, a history read capability.** A surface that retains its own
+   raw history may serve two channel-neutral operations behind the platform:
+   **dereference** (read the message or thread a provenance pointer names)
+   and, where the surface supports it, **scoped search** (a keyword query
+   with capped results). Both are served platform-side, so the runner never
+   holds surface credentials (ADR-0012); a surface without the capability
+   degrades to document-only memory. This is the escape valve of the read
+   path, defined below.
 
-The agent tier needs neither: its scope is the agent itself, it has no
-backlog, and it participates in the lifecycle from injection onward.
+The agent tier needs none of the optional capabilities: its scope is the
+agent itself, it has no backlog, and its raw history is the platform's own
+transcripts.
 
 ### Storage
 
@@ -146,11 +157,15 @@ backlog, and it participates in the lifecycle from injection onward.
 - The key roles, identical across tiers:
   - the **document**: one curated markdown profile, the always-injected core.
     It is rewritten in place only by the bootstrap and compaction turns,
-    always under compare-and-set;
+    always under compare-and-set. Claims in the document keep their surface
+    references inline, so the document doubles as an index into the raw
+    history it was distilled from;
   - the **notes log**: an append log of provenance-stamped records
-    (ADR-0025's `MemoryRecord` shape, which this ADR carries forward).
-    In-turn saves append here; notes are injected after the document until
-    compaction folds them in;
+    (ADR-0025's `MemoryRecord` shape, which this ADR carries forward,
+    extended with an optional **surface reference**: a permalink or message
+    timestamp, pointer metadata and never copied content). In-turn saves
+    append here; notes are injected after the document until compaction
+    folds them in;
   - the **instructions** (channel tier only): an operator-authored plain-text
     note, editable at runtime through the API/console (extending the memory
     inspection UI of #267), never written by the agent. **Writable with the
@@ -196,8 +211,11 @@ backlog, and it participates in the lifecycle from injection onward.
   preamble, bundle `systemPrompt`**. The authority ladder is stated in the
   rendered headers: the bundle prompt and custom instructions are authored
   guidance and outrank learned memory at every tier; memory is learned
-  context, not instruction. Instructions and memory are read once at session
-  boot; a running thread keeps the set it booted with.
+  context, not instruction. The channel block's rendered header also names
+  the dereference tool and when to reach for it, so the model knows the
+  document is a distillation with an escape valve, not the whole record.
+  Instructions and memory are read once at session boot; a running thread
+  keeps the set it booted with.
 - **The injected tier has a hard budget, enforced at the API state router on
   every write.** Each tier's document and notes log are measured against a
   fixed per-tier cap (Claude Code's 200-line / 25KB class of limit; exact
@@ -292,6 +310,41 @@ The lifecycle is a hybrid, matching the convergent industry pattern:
   activity is skipped, so cost is bounded by real usage, not channel count.
   This is the trigger ADR-0025 deferred and never grew.
 
+### The escape valve: compaction is not the only read path
+
+Compaction is lossy by design, and the best available evidence (TierMem,
+arXiv 2602.17913) puts numbers on both halves of that trade: a summary tier
+answering alone loses roughly twelve points on needle-recall against reading
+retained raw history, while its dominant failure mode is the reader *not
+noticing* the summary is insufficient. An always-injected document with no
+way to look deeper would carry that blind spot permanently. The lifecycle
+therefore keeps the raw history reachable, without storing it:
+
+- **Dereference is the default valve.** In a session, the agent may follow
+  the surface references already pinned in the memory document and notes,
+  reading the message or thread a pointer names through the surface's
+  history read capability, under a per-session call budget. It cannot browse
+  or query beyond the pins: the only raw content reachable by default is
+  content a bootstrap or compaction pass already certified as load-bearing.
+  This bounds cost (explicit dereferences of known targets), context
+  pollution (no open-ended exploration mid-task), and the poisoning surface
+  (arbitrary channel text cannot be pulled into working context by a
+  planted instruction).
+- **Scoped search is an operator opt-in, per agent, off by default**: a
+  keyword query with capped result counts and the same per-session budget,
+  for channels whose work genuinely needs recall beyond the pins.
+  Open-ended exploration is not shipped at all.
+- **The valve feeds the document.** A fact recovered through the valve that
+  proves load-bearing is saved as a note like any other and folded in at the
+  next compaction, so escalation gets rarer as the document matures; the
+  broad reads stay where they belong, in the bootstrap and compaction turns,
+  off the hot path.
+
+The raw stores behind the valve are the surface's own retained history
+(Slack keeps the channel log; the pointers are permalinks into it) and the
+platform's own per-thread transcripts (ADR-0029). The platform never copies
+the surface's raw history into its own store to make this work.
+
 ### Trust posture
 
 - **Memory is context, never an enforcement boundary.** Nothing an agent must
@@ -312,6 +365,18 @@ The lifecycle is a hybrid, matching the convergent industry pattern:
   tier deserves particular care in the compaction prompt: it is the tier a
   poisoned channel could try to escape into, so promotion of a fact from
   channel to agent scope must be conservative.
+- **The retention posture is declared, not discovered.** What the platform
+  stores: the curated documents, the notes, the operator instructions,
+  pointer metadata (permalinks, timestamps), and its own per-thread
+  transcripts (ADR-0029). What it never stores: copies of the surface's raw
+  history (the bootstrap turn reads the backlog transiently and discards
+  it once distilled) and no embedding or vector index over any of it. The
+  surface remains the system of record for its own content, under its own
+  retention and access policy; deployments hold the memory artifacts in
+  their own database. This is the same posture Claude in Slack publishes
+  (retention named explicitly, with the consequence that zero-data-retention
+  configurations exclude the feature), and any compliance story quotes this
+  paragraph rather than reverse-engineering the store.
 
 ### Validation gate (before maintainer acceptance)
 
@@ -326,7 +391,11 @@ message that instructs the agent to write an instruction-shaped memory)
 showing the write lands, is visible with provenance in the console, and
 cannot reach the instructions key; (5) a migration check proving an existing
 ADR-0025 agent-memory log is still injected, unmodified, after the rename to
-`agent/notes` and before any compaction runs.
+`agent/notes` and before any compaction runs; (6) an escape-valve case
+proving a fact absent from the document but named by a pinned surface
+reference is recovered through the dereference operation, and that the
+default valve refuses a read of any target not pinned in the document or
+notes.
 
 ## Alternatives considered
 
@@ -341,12 +410,36 @@ ADR-0025 agent-memory log is still injected, unmodified, after the rename to
   its own lifecycle (append per turn, windowed at boot, ADR-0029) and no
   compaction semantics. It is the hierarchy's narrowest tier but not a
   memory store; the compaction turn consumes it as input instead.
+- **Raw history as the memory: mirror the surface's logs into the platform
+  and expose grep/read tools over them.** Rejected. It duplicates the
+  surface's content into a second store, which is the largest possible
+  retention footprint for a feature that needs the smallest (the surface
+  already retains the raw log under the customer's own policy); it pays the
+  raw path's tokens and latency on queries a curated document answers for
+  hundreds of tokens; and the strongest study cited for it (TierMem) in
+  fact recommends the opposite default, showing routed escalation over
+  retained raw recovering nearly all of raw-only accuracy at half the cost,
+  with its raw-vs-routed margin smaller than the benchmark's known
+  answer-key error rate. The property the proposal is really after, that no
+  fact is irrecoverably lost to compaction, is delivered by the escape
+  valve without storing anything.
 - **A retrieval layer (vector store or knowledge graph) instead of curated
   documents.** Rejected: the unit is one bounded document per scope, well
   within a context window; the surveyed industry trajectory is away from
   vector stores for this job; and the state store gives durability, scoping,
-  caps, and audit for free. A retrieval tier over past transcripts can be
-  added later without changing this decision.
+  caps, and audit for free. An embedding index is also a compliance step
+  backward, a second derived copy of surface content with no clean deletion
+  propagation (purging a message from the surface does not purge its
+  vectors), for retrieval quality the recent literature shows keyword
+  search over raw text matching or beating on this workload. A retrieval
+  tier can be added later without changing this decision.
+- **An unrestricted search tool by default.** Rejected: open-ended agentic
+  exploration of a channel mid-task is a measured failure mode twice over,
+  context pollution (irrelevant history crowding the working context) and
+  the C2 poisoning channel (planted text pulled into context by the agent's
+  own search). The valve ladder (dereference by default, scoped search as
+  operator opt-in, open exploration never) keeps the accuracy benefit while
+  bounding both.
 - **Real-time-only updates (no compaction job).** Rejected: accretion without
   consolidation produces the documented staleness and bloat failure modes,
   and the budget gate alone would then force the model to consolidate during
@@ -398,7 +491,12 @@ ADR-0025 agent-memory log is still injected, unmodified, after the rename to
 - The Slack adapter gains a `member_joined_channel` subscription, three read
   scopes, and a backlog fetch path: a deliberate, confined widening of its
   "ack, dedupe, placeholder, enqueue" discipline. The new OAuth scopes are a
-  reinstall/consent event for existing workspaces.
+  reinstall/consent event for existing workspaces. The dereference valve
+  rides those same read scopes (it reads channels the bot is already a
+  member of); scoped search may require additional Slack authorization and
+  is gated behind its operator opt-in. The history read capability is a new
+  platform-served tool surface, and surface credentials stay out of the
+  sandbox in line with the platform's credential boundary.
 - Cost is one bootstrap turn per channel ever, plus one compaction turn per
   active scope per interval (agent tiers included), skipped for idle scopes.
   Both are attributable per agent through existing observability.
