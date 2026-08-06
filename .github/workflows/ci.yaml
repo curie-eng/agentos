@@ -226,9 +226,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: cli
-      - name: Install zig toolchain
+      # rustup for the std/core rlibs, zig for the C toolchain and the glibc
+      # floor. Both are needed: without the target added, the cross build dies
+      # on `can't find crate for core` while the host target quietly succeeds --
+      # which is why adding arm64 here caught something x86_64-only never could.
+      - name: Install cross toolchain
         run: |
           set -euo pipefail
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
           cargo install cargo-zigbuild --locked --version 0.23.0
       # x86_64 only. The floor is a property of the toolchain, not the
