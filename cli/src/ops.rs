@@ -1275,9 +1275,50 @@ pub async fn live_stateful_components(o: &CommonOpts) -> Result<Vec<(String, Str
             plain("json"),
         ],
     );
-    let (ok, out, _err) = run_capture(&cmd).await?;
+    let (ok, out, err) = run_capture(&cmd).await?;
     if !ok {
-        return Ok(Vec::new());
+        // Fail closed. The ONLY "there is nothing here" answer this argv
+        // produces is exit 0 with an empty items array, which a namespaced LIST
+        // returns even for a namespace that does not exist (verified against a
+        // real apiserver, kubectl v1.36.2). So a nonzero exit always means "I
+        // could not find out", and returning an empty list from it told the
+        // stateful-removal guard "fresh install, nothing to lose" while the
+        // upgrade went on to prune the StatefulSet (#1351). The helm half of
+        // this same guard already bails; this is the symmetric half.
+        //
+        // The wording stays NEUTRAL about why the read was wanted. Three of this
+        // helper's four callers are running a migration rather than the
+        // stateful-removal guard, so naming that guard here reported a check the
+        // caller was not performing (#1351); the guard adds its own framing with
+        // `.context(..)` at its call site.
+        //
+        // kubectl can exit nonzero with an empty stderr (a signal, a wrapper
+        // script), so fall back to stdout and then to a literal rather than
+        // handing the operator a message ending in a bare colon.
+        let detail = [err.trim(), out.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("kubectl exited nonzero with no stderr");
+        let message = format!(
+            "could not list the StatefulSets in namespace {}: {detail}",
+            o.namespace
+        );
+        // The bail is UNCONDITIONAL: every nonzero exit fails, so a Forbidden
+        // still fails (as Failure) and is never swallowed into a vacuous pass.
+        // `is_connectivity_failure` only picks the exit CLASS once that decision
+        // is made. An unreachable apiserver is the retryable condition exit 3
+        // names (`exit.rs`), and the helm half of a teardown already reports it
+        // that way, so an automation loop retries the same argv instead of
+        // reading a rolling restart as permanent (#1351).
+        return Err((if is_connectivity_failure(&err) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        }
+        .with_fix(
+            "check the cluster is reachable and the kubeconfig points at the right context: `kubectl config current-context` then `kubectl get ns`",
+        ))
+        .into());
     }
     let parsed: serde_json::Value = match serde_json::from_str(out.trim()) {
         Ok(v) => v,
@@ -2319,6 +2360,15 @@ fn is_connectivity_failure(stderr: &str) -> bool {
         "dial tcp",
         "connection reset",
         "context deadline exceeded",
+        // kubectl's own refusal wording, added when a kubectl call site started
+        // classifying with this (#1351). client-go prints "The connection to
+        // the server <host> was refused - did you specify the right host or
+        // port?", which carries none of the Go-client signatures above: the
+        // words are separated, so the literal "connection refused" never
+        // appears. Without this marker every unreachable-apiserver kubectl read
+        // classified as a permanent Failure. Kept to that one phrasing, which
+        // client-go emits only for a refused connection.
+        "connection to the server",
     ];
     MARKERS.iter().any(|marker| lower.contains(marker))
 }
@@ -5076,7 +5126,9 @@ mod tests {
     // `is_connectivity_failure` lower-cases stderr and matches only concrete
     // network signatures (connection refused, tls handshake, no route to
     // host, i/o timeout, network is unreachable, could not connect, dial tcp,
-    // connection reset, context deadline exceeded). Bare "unreachable" and
+    // connection reset, context deadline exceeded, and -- since a kubectl call
+    // site started classifying with it in #1351 -- client-go's own "connection
+    // to the server" refusal wording). Bare "unreachable" and
     // "timeout" are deliberately excluded: Helm wraps permanent
     // auth/exec-plugin/kubeconfig errors as `Kubernetes cluster unreachable:
     // ...`, so that generic prefix alone is not a reliable transient signal.
@@ -5100,6 +5152,19 @@ mod tests {
         ));
         assert!(is_connectivity_failure("i/o timeout"));
         assert!(is_connectivity_failure("no route to host"));
+    }
+
+    // #1351: kubectl's own refusal wording, verbatim as kubectl v1.36.2 wrote it
+    // to stderr against an unreachable apiserver during this ticket's live
+    // reproduction. client-go separates the words, so the "connection refused"
+    // marker above never appears in it and every unreadable-cluster kubectl read
+    // classified as a permanent Failure until the "connection to the server"
+    // marker was added.
+    #[test]
+    fn is_connectivity_failure_true_for_kubectls_own_refusal_wording() {
+        assert!(is_connectivity_failure(
+            "The connection to the server localhost:8080 was refused - did you specify the right host or port?"
+        ));
     }
 
     // P2: permanent failures (RBAC, authz, invalid) are NOT connectivity, so they
