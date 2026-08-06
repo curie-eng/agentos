@@ -464,29 +464,43 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # glibc for the MVP: the CLI links rustls (no OpenSSL), but a musl build
-          # needs the musl C cross-toolchain in the runner; glibc is the simple,
-          # portable-enough default. Swap to x86_64-unknown-linux-musl (add
-          # musl-tools) later if a fully static binary is wanted.
+          # `glibc:` pins the SYMBOL FLOOR the binary is built against. It is
+          # not cosmetic and it must not be dropped (#1341).
+          #
+          # These targets used to build with the runner's own libc headers.
+          # `ubuntu-latest` is Ubuntu 24.04, so the artifacts required
+          # GLIBC_2.39, and glibc is backward compatible but NOT forward: the
+          # published binary would not start on anything older. Amazon Linux
+          # 2023 ships 2.34, so `curie --version` on the very host this ARM
+          # target exists to serve died with
+          #   `/lib64/libc.so.6: version GLIBC_2.39 not found`
+          # -- no subcommand reachable, the cluster unoperable by its own CLI.
+          #
+          # Nothing caught it: every runner that executes these artifacts is
+          # also `ubuntu-latest`, so CI and the sre-bot eval lane were green
+          # throughout. The `Assert the glibc floor` step below, and the
+          # `cli-portability` job in ci.yaml, are what close that hole.
+          #
+          # 2.28 covers RHEL/Alma 8, Debian 10, Ubuntu 18.04 and AL2023. Lower
+          # it only with a host in mind; raising it silently is the bug.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            glibc: "2.28"
           # arm64 Linux is the cheap-cloud target: Graviton and equivalents are
           # ~20% less than x86 for this workload, and a single-node k3s box is a
           # normal way to host a bot. Without a published binary the CLI cannot
           # run on the host it is managing -- the only options were compiling it
           # yourself or driving the cluster entirely from a laptop (#1065).
-          # Cross-compiled rather than run on an arm64 runner, so this costs no
-          # extra runner minutes. rustls pulls in `ring`, which compiles C, so a
-          # cross LINKER alone is not enough -- it needs a cross C compiler and
-          # the target libc headers. Without libc6-dev-arm64-cross, ring's build
-          # script reads the HOST /usr/include and dies on
-          # `bits/libc-header-start.h: No such file or directory`. Verified by
-          # reproducing this job in a clean amd64 container.
+          # Still cross-compiled rather than run on an arm64 runner, so this
+          # costs no extra runner minutes.
+          #
+          # The cross gcc + libc6-dev-arm64-cross pair is gone: `zig cc` is the
+          # C compiler now, so `ring` gets a sysroot for the TARGET (with the
+          # pinned glibc) instead of the host's. That was the whole reason those
+          # packages were needed.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            cross_linker: aarch64-linux-gnu-gcc
-            apt_packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-            cross_ar: aarch64-linux-gnu-ar
+            glibc: "2.28"
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
@@ -495,11 +509,17 @@ jobs:
           persist-credentials: false
       - name: Add target
         run: rustup target add ${{ matrix.target }}
-      - name: Install cross-linker
-        if: matrix.apt_packages != ''
+      # zig replaces the cross gcc AND decouples the glibc floor from the
+      # runner. cargo-zigbuild finds zig through the `ziglang` wheel, so no
+      # third-party action and nothing to add to the action-SHA pin list.
+      # `cargo install` compiles it (a few minutes, twice); the release runs on
+      # tags only, and a prebuilt would mean trusting an unpinned asset name.
+      - name: Install zig toolchain
+        if: matrix.glibc != ''
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_packages }}
+          set -euo pipefail
+          python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
+          cargo install cargo-zigbuild --locked --version 0.23.0
       - name: Assert tag matches the release-coupled versions
         run: |
           set -euo pipefail
@@ -517,26 +537,38 @@ jobs:
         working-directory: cli
         env:
           CURIE_BUILD_CHANNEL: release
-          # All empty for a native build. The CC/AR pair is what `ring`'s build
-          # script needs; the linker alone leaves it compiling C against the
-          # host sysroot.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
-          CC_aarch64_unknown_linux_gnu: ${{ matrix.cross_linker }}
-          AR_aarch64_unknown_linux_gnu: ${{ matrix.cross_ar }}
-        run: cargo build --release --target ${{ matrix.target }}
+          # Strip at LINK time for the cross targets. The host `strip` cannot
+          # process a cross-built aarch64 ELF, and dropping the cross binutils
+          # means there is no aarch64-linux-gnu-strip left to fall back to.
+          RUSTFLAGS: ${{ matrix.glibc != '' && '-C strip=symbols' || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.glibc }}" ]; then
+            # The `.<glibc>` suffix is the floor. cargo-zigbuild drops it again
+            # for the output directory, so the path below is unchanged.
+            cargo zigbuild --release --target '${{ matrix.target }}.${{ matrix.glibc }}'
+          else
+            cargo build --release --target '${{ matrix.target }}'
+          fi
       - name: Strip and name the binary
         run: |
           bin="cli/target/${{ matrix.target }}/release/curie"
-          # Host strip cannot process a cross-built arm64 ELF; use the matching
-          # cross binutils when present. `|| true` keeps an unstrippable binary
-          # shippable rather than failing the release over symbol size.
-          if [ -n "${{ matrix.cross_linker }}" ] && command -v aarch64-linux-gnu-strip >/dev/null; then
-            aarch64-linux-gnu-strip "$bin" || true
-          else
+          # The pinned-floor targets are already stripped by
+          # `-C strip=symbols` at link time, which also sidesteps the host
+          # `strip` being unable to read a cross-built arm64 ELF. Only the
+          # native darwin build still needs the external tool. `|| true` keeps
+          # an unstrippable binary shippable rather than failing the release
+          # over symbol size.
+          if [ -z "${{ matrix.glibc }}" ]; then
             strip "$bin" || true
           fi
           mkdir -p dist
           cp "$bin" "dist/curie-${{ matrix.target }}"
+      # The artifact, not the build environment, is what ships. A runner image
+      # bump is exactly how this regressed, and it regressed invisibly.
+      - name: Assert the glibc floor
+        if: matrix.glibc != ''
+        run: bash scripts/check-glibc-floor.sh "cli/dist/curie-${{ matrix.target }}" "${{ matrix.glibc }}"
       # Cataloged from Cargo.lock, not the stripped binary: the lockfile is what
       # actually names every crate that went in, and stripping removes the symbols
       # a binary scan would need. Scanning the cli/ tree instead would also drag in

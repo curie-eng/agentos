@@ -208,6 +208,51 @@ jobs:
           path: cli/target/release/curie
           if-no-files-found: error
 
+  cli-portability:
+    name: CLI runs on old glibc (release build path)
+    runs-on: ubuntu-latest
+    # The release cross-compile path was never exercised before a tag, so a
+    # regression in it was undiscoverable until someone tried the artifact on a
+    # real host. #1341 shipped exactly that way: both Linux targets inherited
+    # the runner's GLIBC_2.39, and every runner that executes them is also
+    # `ubuntu-latest`, so nothing went red. This job runs the same path a tag
+    # would and then runs the result on an OLDER distro, which is the only
+    # check that could have caught it.
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Install zig toolchain
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
+          cargo install cargo-zigbuild --locked --version 0.23.0
+      # x86_64 only. The floor is a property of the toolchain, not the
+      # architecture, so building both would double the cost to re-prove the
+      # same thing -- and the arm64 artifact cannot be EXECUTED here without
+      # dragging in qemu. The static assertion below covers arm64 at release
+      # time; this job's job is to prove the floor is real, not merely declared.
+      - name: Build (same path as the release)
+        working-directory: cli
+        env:
+          CURIE_BUILD_CHANNEL: release
+          RUSTFLAGS: -C strip=symbols
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.28
+      - name: Assert the glibc floor
+        run: bash scripts/check-glibc-floor.sh cli/target/x86_64-unknown-linux-gnu/release/curie 2.28
+      # The floor asserted above is a claim about symbols. This is the claim
+      # under test: Amazon Linux 2023 is glibc 2.34, it is what the deployment
+      # runbook provisions, and it is where `curie --version` died.
+      - name: Run it on Amazon Linux 2023
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/cli/target/x86_64-unknown-linux-gnu/release/curie:/curie:ro" \
+            amazonlinux:2023 /curie --version
+
   contracts-ts:
     name: Contracts (generated TypeScript compiles)
     runs-on: ubuntu-latest
