@@ -568,7 +568,7 @@ jobs:
       # bump is exactly how this regressed, and it regressed invisibly.
       - name: Assert the glibc floor
         if: matrix.glibc != ''
-        run: bash scripts/check-glibc-floor.sh "cli/dist/curie-${{ matrix.target }}" "${{ matrix.glibc }}"
+        run: bash scripts/check-glibc-floor.sh "dist/curie-${{ matrix.target }}" "${{ matrix.glibc }}"
       # Cataloged from Cargo.lock, not the stripped binary: the lockfile is what
       # actually names every crate that went in, and stripping removes the symbols
       # a binary scan would need. Scanning the cli/ tree instead would also drag in

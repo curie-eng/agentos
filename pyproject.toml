@@ -137,6 +137,7 @@ testpaths = [
     "tools/doclint/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
+    "tools/ci-workflow-paths/tests",
     # Only the offline harness unit tests -- NOT the whole tree: the cluster
     # scenario in test_soak_resilience.py stays out of default collection and
     # runs only under CURIE_SOAK=1 (#499).
