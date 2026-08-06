@@ -130,9 +130,11 @@ credentials.
 
 1. **Export the credential before `skill up`.** Otherwise the boot succeeds and
    the *next* command fails with `model-credential-rejected`.
-2. **`--repo` is set once, at the first deploy, and can never be changed.** An
-   agent created without it can never use git-flow, and the only fix is
-   deleting the agent and starting over. Get it right the first time.
+2. **`--repo` binds once and is never re-pointed.** An agent with *no* binding
+   can still be bound by a later `deploy --repo` (#1194) -- but one already
+   pointing at a different repository is left alone and only warned about, so
+   there the fix really is deleting the agent and starting over. `curie doctor`
+   reports which agents are unbound.
 3. **Bind by channel ID (`C0…`), never `#name`.**
 4. **Run `cluster comms` after `cluster up`, not before.**
 5. **Renaming the bot in Slack rotates the bot token** — re-run `cluster comms`.

@@ -469,6 +469,13 @@ enum Command {
         /// Helm release to inspect.
         #[arg(long, default_value = "curie")]
         release: String,
+        /// Platform API, to include the repo-binding check. Optional: every
+        /// other check needs only kubectl and helm.
+        #[arg(long, env = "CURIE_API_URL")]
+        api_url: Option<String>,
+        /// API key for `--api-url`.
+        #[arg(long, env = "CURIE_API_KEY")]
+        api_key: Option<String>,
     },
 
     /// Show what `curie apply` would change about the live release (ADR-0097).
@@ -3268,8 +3275,14 @@ async fn run(command: Option<Command>) -> Result<()> {
             })
             .await?,
         ),
-        Some(Command::Doctor { namespace, release }) => {
-            emit(curie::doctor::doctor(&namespace, &release).await)
+        Some(Command::Doctor {
+            namespace,
+            release,
+            api_url,
+            api_key,
+        }) => {
+            let api = api_url.as_deref().zip(api_key.as_deref());
+            emit(curie::doctor::doctor(&namespace, &release, api).await)
         }
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;

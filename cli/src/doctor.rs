@@ -77,6 +77,10 @@ pub struct Facts {
     pub slack_configured: bool,
     /// Which clone credential the release carries, if any.
     pub clone_credential: Option<String>,
+    /// Every agent and its repository binding. `None` means the platform API
+    /// was not reached, which is a fact to report rather than a failure -- the
+    /// other checks need only kubectl and helm.
+    pub agents: Option<Vec<(String, Option<String>)>>,
     /// How the API is reachable from outside, if it is. `None` means neither
     /// mechanism the chart knows about is in place -- which is NOT proof it is
     /// unreachable, since a load balancer or tunnel in front is invisible here.
@@ -173,6 +177,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             ("slack", "Slack"),
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
+            ("repo-binding", "Repo binding"),
         ] {
             out.push(skipped(id, title, "needs a cluster"));
         }
@@ -191,6 +196,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             ("slack", "Slack"),
             ("clone-credential", "Clone credential"),
             ("webhook", "Webhook exposure"),
+            ("repo-binding", "Repo binding"),
         ] {
             out.push(skipped(id, title, "needs a release"));
         }
@@ -239,6 +245,47 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
         ),
     });
 
+    // The binding decides whether a push reaches this agent at all. A push for
+    // an agent with none matches nothing and is answered `ignored` -- nothing is
+    // logged, so the only symptom is a green delivery in GitHub and no deploy.
+    out.push(match &f.agents {
+        None => skipped(
+            "repo-binding",
+            "Repo binding",
+            "platform API not reached — pass --api-url/--api-key to include this",
+        ),
+        Some(agents) if agents.is_empty() => {
+            skipped("repo-binding", "Repo binding", "no agents deployed yet")
+        }
+        Some(agents) => {
+            let unbound: Vec<&str> = agents
+                .iter()
+                .filter(|(_, repo)| repo.is_none())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if unbound.is_empty() {
+                ok(
+                    "repo-binding",
+                    "Repo binding",
+                    format!("{} agent(s), all bound", agents.len()),
+                )
+            } else {
+                missing(
+                    "repo-binding",
+                    "Repo binding",
+                    format!(
+                        "unbound: {} — a push for these matches no agent and is \
+                         silently ignored",
+                        unbound.join(", ")
+                    ),
+                    "curie cluster deploy --plugin-dir . --repo <owner>/<name>   \
+                     (binds an agent that has none; it will NOT rebind one already \
+                     pointing at a different repository)",
+                )
+            }
+        }
+    });
+
     out
 }
 
@@ -272,7 +319,8 @@ pub fn summary(checks: &[Check]) -> String {
                 way to be reached."
             .to_string();
     }
-    if !has("clone-credential") || !has("webhook") {
+    if !has("clone-credential") || !has("webhook") || state("repo-binding") == Some(State::Missing)
+    {
         return "Answering in Slack. Git-push deploys are not wired yet -- see the \
                 missing items above."
             .to_string();
@@ -289,6 +337,19 @@ mod tests {
             docker_ok: true,
             bundle_name: Some("my-agent".into()),
             ..Default::default()
+        }
+    }
+
+    /// Cluster, release, Slack and clone credential all in place.
+    fn wired() -> Facts {
+        Facts {
+            model_credential: Some("CURIE_CREDENTIALS".into()),
+            kube_context: Some("minikube".into()),
+            release: Some(("acme".into(), "curie-0.6.0".into())),
+            slack_configured: true,
+            clone_credential: Some("github app".into()),
+            api_exposure: Some("NodePort 30799".into()),
+            ..laptop()
         }
     }
 
@@ -387,6 +448,7 @@ mod tests {
                     slack_configured: true,
                     clone_credential: Some("github app".into()),
                     api_exposure: Some("NodePort 30799".into()),
+                    agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
                     ..laptop()
                 },
                 "Fully wired",
@@ -413,6 +475,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The binding is what makes a push reach an agent. An unbound one fails
+    /// SILENTLY: the webhook returns 200, GitHub shows a green delivery, and
+    /// nothing is logged -- so the check has to say that out loud.
+    #[test]
+    fn an_unbound_agent_is_reported_with_what_it_costs() {
+        let f = Facts {
+            agents: Some(vec![
+                ("bot".into(), Some("acme/bot".into())),
+                ("bot-dev".into(), None),
+            ]),
+            ..wired()
+        };
+        let c = find(&evaluate(&f), "repo-binding").clone();
+        assert_eq!(c.state, State::Missing);
+        assert!(c.detail.contains("bot-dev"), "must name it: {}", c.detail);
+        assert!(
+            c.detail.contains("silently ignored"),
+            "must say the failure is silent: {}",
+            c.detail
+        );
+    }
+
+    /// The advice has to be right about what CAN be fixed. An agent with no
+    /// binding is bindable by a later deploy (#1194); only one already pointing
+    /// at a DIFFERENT repository is left alone. Telling someone to delete and
+    /// recreate an unbound agent would destroy its version history for nothing.
+    #[test]
+    fn the_fix_distinguishes_unbound_from_misbound() {
+        let f = Facts {
+            agents: Some(vec![("bot".into(), None)]),
+            ..wired()
+        };
+        let fix = find(&evaluate(&f), "repo-binding")
+            .fix
+            .clone()
+            .expect("must offer a fix");
+        assert!(fix.contains("--repo"), "{fix}");
+        assert!(
+            fix.contains("NOT rebind"),
+            "must be explicit that a wrong binding is not fixed this way: {fix}"
+        );
+    }
+
+    /// Not reaching the API is a fact, not a failure -- doctor needs only
+    /// kubectl and helm for everything else.
+    #[test]
+    fn an_unreachable_api_is_not_a_failure() {
+        let c = find(&evaluate(&wired()), "repo-binding").clone();
+        assert_eq!(c.state, State::NotApplicable);
+        assert!(c.detail.contains("--api-url"), "{}", c.detail);
+    }
+
+    #[test]
+    fn all_bound_agents_pass() {
+        let f = Facts {
+            agents: Some(vec![("bot".into(), Some("acme/bot".into()))]),
+            ..wired()
+        };
+        assert_eq!(find(&evaluate(&f), "repo-binding").state, State::Ok);
     }
 
     /// Found by running this against a real install. sre-bot serves its webhook
@@ -483,7 +606,7 @@ mod tests {
 
 /// Gather the facts. Every probe is read-only and failure-tolerant: a missing
 /// tool or an unreachable cluster is a fact to report, never an error to raise.
-pub async fn gather(namespace: &str, release: &str) -> Facts {
+pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -> Facts {
     let mut f = Facts {
         docker_ok: probe_ok("docker", &["info"]).await,
         bundle_name: bundle_name(),
@@ -500,6 +623,21 @@ pub async fn gather(namespace: &str, release: &str) -> Facts {
             f.model_credential = Some(name.to_string());
             f.model_credential_source = Some("curie secrets".into());
             break;
+        }
+    }
+
+    // Optional: everything else needs only kubectl and helm, so an absent or
+    // unreachable API narrows the report rather than failing it.
+    if let Some((url, key)) = api {
+        if let Ok(client) = crate::api::ApiClient::new(url, key) {
+            if let Ok(agents) = client.list_agents().await {
+                f.agents = Some(
+                    agents
+                        .into_iter()
+                        .map(|a| (a.name, a.repo_full_name))
+                        .collect(),
+                );
+            }
         }
     }
 
@@ -625,8 +763,8 @@ impl crate::ui::CliOutput for DoctorOutput {
     }
 }
 
-pub async fn doctor(namespace: &str, release: &str) -> DoctorOutput {
-    let checks = evaluate(&gather(namespace, release).await);
+pub async fn doctor(namespace: &str, release: &str, api: Option<(&str, &str)>) -> DoctorOutput {
+    let checks = evaluate(&gather(namespace, release, api).await);
     let summary = summary(&checks);
     DoctorOutput { checks, summary }
 }

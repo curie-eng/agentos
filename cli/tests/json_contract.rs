@@ -1050,6 +1050,7 @@ fn doctor_output_validates() {
         slack_configured: true,
         clone_credential: Some("github app (app_id=1234567)".to_string()),
         api_exposure: None,
+        agents: Some(vec![("bot".to_string(), None)]),
     };
     let checks = curie::doctor::evaluate(&facts);
     let out = curie::doctor::DoctorOutput {
