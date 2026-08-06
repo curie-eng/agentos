@@ -140,7 +140,10 @@ capabilities, and nothing else:
    with capped results). Both are served platform-side, so the runner never
    holds surface credentials (ADR-0012); a surface without the capability
    degrades to document-only memory. This is the escape valve of the read
-   path, defined below.
+   path, defined below. The capability itself, its verbs, bounds, and
+   enablement model, is specified by ADR-0100 (agents search their own
+   surface through the channel port); this ADR only requires that memory
+   turns can call it where enabled.
 
 The agent tier needs none of the optional capabilities: its scope is the
 agent itself, it has no backlog, and its raw history is the platform's own
@@ -438,8 +441,8 @@ notes.
   context pollution (irrelevant history crowding the working context) and
   the C2 poisoning channel (planted text pulled into context by the agent's
   own search). The valve ladder (dereference by default, scoped search as
-  operator opt-in, open exploration never) keeps the accuracy benefit while
-  bounding both.
+  an option enabled per ADR-0100, open exploration never) keeps the
+  accuracy benefit while bounding both.
 - **Real-time-only updates (no compaction job).** Rejected: accretion without
   consolidation produces the documented staleness and bloat failure modes,
   and the budget gate alone would then force the model to consolidate during
@@ -493,10 +496,10 @@ notes.
   "ack, dedupe, placeholder, enqueue" discipline. The new OAuth scopes are a
   reinstall/consent event for existing workspaces. The dereference valve
   rides those same read scopes (it reads channels the bot is already a
-  member of); scoped search may require additional Slack authorization and
-  is gated behind its operator opt-in. The history read capability is a new
-  platform-served tool surface, and surface credentials stay out of the
-  sandbox in line with the platform's credential boundary.
+  member of); scoped search is gated behind ADR-0100's enablement option.
+  The history read capability is ADR-0100's platform-served tool surface,
+  and surface credentials stay out of the sandbox in line with the
+  platform's credential boundary.
 - Cost is one bootstrap turn per channel ever, plus one compaction turn per
   active scope per interval (agent tiers included), skipped for idle scopes.
   Both are attributable per agent through existing observability.
