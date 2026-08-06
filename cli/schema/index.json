@@ -76,6 +76,12 @@
       "version": 1
     },
     {
+      "result": "DoctorOutput",
+      "kind": "CliOutput",
+      "schema": "doctor.schema.json",
+      "version": 1
+    },
+    {
       "result": "DryRunPlan",
       "kind": "CliOutput",
       "schema": "dry-run.schema.json",

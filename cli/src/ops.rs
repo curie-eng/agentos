@@ -245,7 +245,7 @@ fn nest_dotted_keys(pairs: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Object(root)
 }
 
-pub(crate) fn plain(s: impl Into<String>) -> CmdArg {
+pub fn plain(s: impl Into<String>) -> CmdArg {
     CmdArg::Plain(s.into())
 }
 
@@ -2556,7 +2556,7 @@ pub(crate) fn require_on_path(bin: &str) -> Result<()> {
 }
 
 /// Run one command capturing stdout; returns (success, stdout, stderr).
-pub(crate) async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
+pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     // Materialize any secret values into a private 0600 `-f` file so the secret
     // stays out of the argv/process table. `_secret_files` guards live until the
     // end of this function, so the temp files are removed after `helm` exits

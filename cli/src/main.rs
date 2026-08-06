@@ -454,6 +454,23 @@ enum Command {
         from_env: Option<String>,
     },
 
+    /// Report what is set up, what is missing, and the command that fixes it.
+    ///
+    /// The required inputs are otherwise learned one failure at a time -- boot
+    /// succeeds and the next command fails on a credential; a deploy works and
+    /// the next push silently does nothing. This states the whole list, and
+    /// reports only what is actually observable rather than what a doc claims.
+    ///
+    /// Read-only. Safe to run anywhere, including against production.
+    Doctor {
+        /// Kubernetes namespace to inspect.
+        #[arg(long, default_value = "curie")]
+        namespace: String,
+        /// Helm release to inspect.
+        #[arg(long, default_value = "curie")]
+        release: String,
+    },
+
     /// Show what `curie apply` would change about the live release (ADR-0097).
     ///
     /// Read-only, and resolves no credential: "what would change?" is most
@@ -3251,6 +3268,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             })
             .await?,
         ),
+        Some(Command::Doctor { namespace, release }) => {
+            emit(curie::doctor::doctor(&namespace, &release).await)
+        }
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;
             let local = curie::installation::plan_installation(cfg, false)?;

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/doctor/v1.json",
+  "title": "curie doctor --json",
+  "description": "What is set up, what is missing, and the command that fixes it. Read-only. Credentials appear as the NAME of the variable holding them, never as a value.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One line stating what this install can DO right now, rather than a pass count."
+    },
+    "ready": {
+      "type": "boolean",
+      "description": "True when no check is `missing`. A `not_applicable` check does not make an install unready -- the laptop rung has no cluster and is not misconfigured."
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, for a consumer gating on one specific check."
+          },
+          "title": { "type": "string" },
+          "state": {
+            "enum": ["ok", "missing", "not_applicable"],
+            "description": "`not_applicable` means the check does not apply at this install's rung, not that it failed."
+          },
+          "detail": {
+            "type": "string",
+            "description": "What was observed. Never a credential value."
+          },
+          "fix": {
+            "type": "string",
+            "description": "The exact command that resolves it. Absent when there is nothing to fix."
+          }
+        },
+        "required": ["id", "title", "state", "detail"]
+      }
+    }
+  },
+  "required": ["summary", "ready", "checks"]
+}

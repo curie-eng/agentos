@@ -3960,6 +3960,36 @@
       "name": "seal"
     },
     {
+      "about": "Report what is set up, what is missing, and the command that fixes it",
+      "args": [
+        {
+          "default_values": [
+            "curie"
+          ],
+          "global": false,
+          "help": "Kubernetes namespace to inspect",
+          "id": "namespace",
+          "long": "namespace",
+          "positional": false,
+          "required": false
+        },
+        {
+          "default_values": [
+            "curie"
+          ],
+          "global": false,
+          "help": "Helm release to inspect",
+          "id": "release",
+          "long": "release",
+          "positional": false,
+          "required": false
+        }
+      ],
+      "hidden": false,
+      "long_about": "Report what is set up, what is missing, and the command that fixes it.\n\nThe required inputs are otherwise learned one failure at a time -- boot succeeds and the next command fails on a credential; a deploy works and the next push silently does nothing. This states the whole list, and reports only what is actually observable rather than what a doc claims.\n\nRead-only. Safe to run anywhere, including against production.",
+      "name": "doctor"
+    },
+    {
       "about": "Show what `curie apply` would change about the live release (ADR-0097)",
       "args": [
         {

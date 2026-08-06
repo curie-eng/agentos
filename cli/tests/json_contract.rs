@@ -1037,6 +1037,49 @@ fn seal_output_validates() {
 }
 
 #[test]
+fn doctor_output_validates() {
+    // Built through `evaluate` rather than hand-listed, so this validates the
+    // shape the real verb emits and not a parallel one.
+    let facts = curie::doctor::Facts {
+        model_credential: Some("CURIE_CREDENTIALS".to_string()),
+        model_credential_source: Some("environment".to_string()),
+        docker_ok: true,
+        bundle_name: Some("my-agent".to_string()),
+        kube_context: Some("minikube".to_string()),
+        release: Some(("acme".to_string(), "curie-0.6.0".to_string())),
+        slack_configured: true,
+        clone_credential: Some("github app (app_id=1234567)".to_string()),
+        api_exposure: None,
+    };
+    let checks = curie::doctor::evaluate(&facts);
+    let out = curie::doctor::DoctorOutput {
+        summary: curie::doctor::summary(&checks),
+        checks,
+    };
+    let json = out.to_json();
+    assert_valid("doctor.schema.json", &json);
+
+    // Every state the schema enumerates must be reachable from a real run.
+    let states: BTreeSet<&str> = json["checks"]
+        .as_array()
+        .expect("checks is an array")
+        .iter()
+        .map(|c| c["state"].as_str().expect("state is a string"))
+        .collect();
+    assert!(states.contains("ok"), "{states:?}");
+    assert!(states.contains("missing"), "{states:?}");
+
+    // This payload is pasted into issues; it must never carry a secret value.
+    let rendered = serde_json::to_string(&json).expect("serializes");
+    for leaked in ["sk-ant-", "xoxb-", "xapp-", "ghp_", "BEGIN RSA"] {
+        assert!(
+            !rendered.contains(leaked),
+            "{leaked} in payload: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn check_output_validates() {
     // CheckOutput::to_json is `serde_json::to_value(report)`; validate that exact
     // shape against the check schema.
