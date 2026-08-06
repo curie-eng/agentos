@@ -425,7 +425,7 @@ enum Command {
         /// release is running, WITHOUT its data. Refused by default. Prefer
         /// --migrate-store, which keeps the data; this flag is for a store you
         /// genuinely intend to discard.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "migrate_store")]
         allow_stateful_removal: bool,
     },
 
@@ -3439,6 +3439,47 @@ mod tests {
         );
         assert!(set_only.is_ok(), "--github-token alone must parse");
         assert!(clear_only.is_ok(), "--clear-github-token alone must parse");
+    }
+
+    #[test]
+    fn clap_rejects_migrate_store_with_allow_stateful_removal() {
+        // #1351: the pair states contradictory intent (carry the object store's
+        // data across the upgrade, versus proceed WITHOUT it). Refused at the
+        // parser, so the contradiction never reaches the code that silently
+        // picked one and took the data destroying path with exit 0.
+        //
+        // Both orderings are asserted rather than trusting that a
+        // `conflicts_with` declared on one arg is mutual. Each flag alone must
+        // still parse: a conflict naming an arg id that does not exist panics
+        // at parse time, and the "alone" arms are what catch that.
+        let both = Cli::try_parse_from([
+            "curie",
+            "apply",
+            "--migrate-store",
+            "--allow-stateful-removal",
+        ]);
+        let reversed = Cli::try_parse_from([
+            "curie",
+            "apply",
+            "--allow-stateful-removal",
+            "--migrate-store",
+        ]);
+        let migrate_only = Cli::try_parse_from(["curie", "apply", "--migrate-store"]);
+        let allow_only = Cli::try_parse_from(["curie", "apply", "--allow-stateful-removal"]);
+
+        assert!(
+            both.is_err(),
+            "--migrate-store with --allow-stateful-removal must be a clap conflict"
+        );
+        assert!(
+            reversed.is_err(),
+            "the conflict must hold in either argument order"
+        );
+        assert!(migrate_only.is_ok(), "--migrate-store alone must parse");
+        assert!(
+            allow_only.is_ok(),
+            "--allow-stateful-removal alone must parse"
+        );
     }
 
     #[test]

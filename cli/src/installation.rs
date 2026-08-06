@@ -691,16 +691,39 @@ async fn complete_installation_plan(
     })
 }
 
-/// Refuse an apply that would delete a stateful component the release runs.
+/// What the stateful-removal guard learned about this apply.
+///
+/// The verdict is a VALUE, not the `Err` half of a `Result`. While the refusal
+/// was the only error the guard could produce, "Err means a removal was found"
+/// held by construction, and `--migrate-store` read it that way. Once the guard
+/// could also fail because the cluster was unreadable (#1351), that reading
+/// promoted "I could not find out" to "definitely at risk, start moving data",
+/// which is the same ambiguous-signal-turned-into-an-action shape #1351 exists
+/// to close, pointed the other way. So `Err` now means only that the guard could
+/// not reach a verdict, and every caller must propagate it.
+enum GuardVerdict {
+    /// Nothing the release runs would be deleted by this apply.
+    Clear,
+    /// This apply would delete stateful component(s), carrying the operator
+    /// facing refusal text.
+    WouldRemove(String),
+}
+
+/// Decide whether an apply would delete a stateful component the release runs.
 ///
 /// Runs even under `--dry-run`: the plan a dry run prints is exactly the plan
 /// that would destroy the store, so an operator reading it deserves the same
 /// warning the real run would give.
-async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
-    let live = crate::ops::live_stateful_components(&up.common).await?;
+async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict> {
+    let live = crate::ops::live_stateful_components(&up.common)
+        .await
+        .context("could not check whether this apply would remove stateful components")?;
     if live.is_empty() {
-        // Fresh install, or no cluster to read. Nothing to lose either way.
-        return Ok(());
+        // Genuinely nothing to lose: a namespaced LIST returns an empty items
+        // array with exit 0 for a fresh install AND for a namespace that does
+        // not exist. A read that FAILED never reaches here; it is an error now
+        // rather than a silent empty answer (#1351).
+        return Ok(GuardVerdict::Clear);
     }
     // The same effective values the upgrade would send, so the render reflects
     // what this apply would actually create rather than the chart's defaults.
@@ -712,9 +735,11 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<()> {
     let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, &sets).await?;
     let removed = crate::ops::removed_stateful_components(&live, &rendered);
     if removed.is_empty() {
-        return Ok(());
+        return Ok(GuardVerdict::Clear);
     }
-    bail!("{}", stateful_removal_message(&removed))
+    Ok(GuardVerdict::WouldRemove(stateful_removal_message(
+        &removed,
+    )))
 }
 
 /// The refusal text, factored out so its ordering is testable with no cluster.
@@ -748,6 +773,18 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         allow_stateful_removal,
         migrate_store,
     } = opts;
+    // The parser rejects this pair (`conflicts_with`), but `ApplyOpts` has pub
+    // fields on a library crate, so the invariant is asserted where the
+    // destruction is owned rather than only at the CLI edge. Contradictory
+    // intent is refused, never resolved by picking one: silently dropping
+    // --migrate-store took the data destroying path with exit 0 (#1351).
+    if allow_stateful_removal && migrate_store {
+        bail!(
+            "--migrate-store and --allow-stateful-removal are contradictory: one \
+             carries the object store's data across the upgrade, the other proceeds \
+             WITHOUT it. Pass exactly one."
+        );
+    }
     local.up.chart = chart;
     let dry_run = local.up.common.dry_run;
     let plan = complete_installation_plan(local).await?;
@@ -783,16 +820,18 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     // empty and the bot cannot answer. An `apply` that changes a log level must
     // never silently start moving data. So the refusal NAMES the flag, and
     // passing it makes apply do the whole thing.
+    //
+    // An `Err` here is the guard failing to reach a verdict (an unreadable
+    // cluster, a failed `helm template`), never a removal. It propagates on
+    // EVERY path including `--migrate-store`: "I could not find out" must not
+    // become "start moving data" (#1351).
     let migrating = if allow_stateful_removal {
         false
     } else {
-        match guard_stateful_removal(&up).await {
-            Ok(()) => false,
-            Err(e) if migrate_store => {
-                let _ = e;
-                true
-            }
-            Err(e) => return Err(e),
+        match guard_stateful_removal(&up).await? {
+            GuardVerdict::Clear => false,
+            GuardVerdict::WouldRemove(_) if migrate_store => true,
+            GuardVerdict::WouldRemove(msg) => bail!("{msg}"),
         }
     };
 
@@ -1663,6 +1702,36 @@ mod diff_tests {
 #[cfg(test)]
 mod apply_tests {
     use super::*;
+
+    /// The library-level half of #1351's AC1, and the one invariant here that
+    /// cannot be pinned through the binary: clap's `conflicts_with` rejects the
+    /// pair at parse time, so a test that shells `curie` can only ever prove the
+    /// PARSER refuses it. `ApplyOpts` has pub fields on a crate that also ships
+    /// as a lib, so a consumer can hand `apply` the contradictory pair with clap
+    /// never involved, and that is exactly the caller the refusal has to survive
+    /// for. Asserted with `dry_run` so it needs no cluster; the `bail!` precedes
+    /// `complete_installation_plan` either way.
+    #[tokio::test]
+    async fn apply_refuses_the_contradictory_flag_pair_without_clap() {
+        let cfg = Installation::parse("version: 1\ninstall:\n  namespace: a\n  release: a\n")
+            .expect("minimal installation parses");
+        let opts = ApplyOpts {
+            local: plan_installation(cfg, true).expect("plan the installation"),
+            chart: "curie".to_string(),
+            allow_stateful_removal: true,
+            migrate_store: true,
+        };
+
+        let Err(err) = apply(opts).await else {
+            panic!("contradictory intent must be refused, never resolved by picking one");
+        };
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("--migrate-store") && msg.contains("--allow-stateful-removal"),
+            "the refusal must name both colliding flags: {msg}"
+        );
+    }
 
     fn cfg_with_all_names() -> Installation {
         Installation::parse(
