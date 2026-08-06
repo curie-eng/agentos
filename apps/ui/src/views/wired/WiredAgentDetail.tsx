@@ -170,14 +170,18 @@ export function WiredAgentDetail() {
     setSavingModel(true);
     setModelError(null);
     try {
-      // Trimmed value; empty string clears the pin so the platform default
-      // applies (apply_model_env treats an empty CURIE_MODEL as unset).
-      const next = model.trim();
+      // A blank box is the clear gesture, and the clear is NULL, not "" (#1355).
+      // apply_model_env reads `override if override is not None else config.model`,
+      // so an empty string is not None, wins the ternary, and is then falsy: no
+      // boot key is emitted and the platform default is skipped, which is the
+      // opposite of clearing. Null is the only value that restores it.
+      const trimmed = model.trim();
+      const next = trimmed === "" ? null : trimmed;
       await updateAgent(agent.id, { model: next });
       refetch();
       dispatch({
         type: "toast",
-        message: next === "" ? "Model cleared (platform default)" : `Model set to ${next}`,
+        message: next === null ? "Model cleared (platform default)" : `Model set to ${next}`,
       });
     } catch (e) {
       setModelError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e));

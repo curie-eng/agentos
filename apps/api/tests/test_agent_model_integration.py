@@ -69,3 +69,78 @@ def test_patch_without_model_leaves_it_unchanged(
     body = resp.json()
     assert body["slack_channel"] == "CMOVED001"
     assert body["model"] == "deepseek-v4"
+
+
+def test_an_empty_model_is_refused_and_the_error_points_at_null(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #1355: the twin of the thinking case, on the adjacent line. An empty string
+    # is NOT an alternate reset -- apply_model_env reads
+    # `override if override is not None else config.model`, so "" is not None and
+    # wins the ternary, then `if model:` is falsy and CURIE_MODEL is never
+    # emitted. The SDK then falls back to its own built-in default instead of the
+    # operator's platform model, and on the BYO lane it dials a custom endpoint
+    # asking for a built-in Anthropic model id. Refuse it, and say what to send.
+    agent = _create_agent(client, auth_headers, model="kimi-k2")
+    resp = client.patch(
+        f"/agents/{agent['id']}", json={"model": ""}, headers=auth_headers
+    )
+    assert resp.status_code == 422, resp.text
+    assert "null" in resp.text, f"the error must point at the real reset: {resp.text}"
+
+    # And the refusal left the stored value alone.
+    resp = client.get(f"/agents/{agent['id']}", headers=auth_headers)
+    assert resp.json()["model"] == "kimi-k2"
+
+    # Create is refused identically -- same field, same nonsense, same answer.
+    resp = client.post(
+        "/agents",
+        json={"name": "empty-model", "slack_channel": "CMODEL011", "model": ""},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_a_whitespace_only_model_is_refused_on_both_paths(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Whitespace is worse than empty: it passes the falsy check downstream, so it
+    # is stored AND forwarded as a garbage model id the harness cannot resolve.
+    # The same predicate that catches "" has to catch it.
+    resp = client.post(
+        "/agents",
+        json={"name": "ws-model", "slack_channel": "CMODEL012", "model": "   "},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422, resp.text
+
+    agent = _create_agent(client, auth_headers, model="kimi-k2")
+    resp = client.patch(
+        f"/agents/{agent['id']}", json={"model": "  "}, headers=auth_headers
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_model_and_thinking_answer_an_empty_string_identically(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The parity assertion itself, not just two tests that happen to agree. #1334
+    # repaired one nullable override and left its twin two lines away accepting
+    # what the first refused; this fails the moment they diverge again.
+    agent = _create_agent(client, auth_headers, model="kimi-k2", thinking="adaptive")
+    for field in ("model", "thinking"):
+        resp = client.patch(
+            f"/agents/{agent['id']}", json={field: ""}, headers=auth_headers
+        )
+        assert resp.status_code == 422, f"{field} must refuse an empty string: {resp.text}"
+        assert "null" in resp.text, f"{field} must point at null: {resp.text}"
+
+    # And both clear to the platform default through the SAME gesture.
+    resp = client.patch(
+        f"/agents/{agent['id']}",
+        json={"model": None, "thinking": None},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["model"] is None
+    assert resp.json()["thinking"] is None

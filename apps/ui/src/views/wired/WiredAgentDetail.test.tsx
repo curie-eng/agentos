@@ -200,7 +200,12 @@ describe("WiredAgentDetail — model edit (#254)", () => {
     await waitFor(() => expect(getAgents).toHaveBeenCalledTimes(2));
   });
 
-  it("clears the model to the platform default (empty string) on save", async () => {
+  // #1355. Blanking the box is the only clear gesture there is, and it used to
+  // send `""`, which the API now refuses, and which reached the worker falsy
+  // and skipped the platform default this test claims to restore. The assertion
+  // was green through the whole defect because it asserted the bug's behavior,
+  // so pin the wire value, not just "some call happened".
+  it("clears the model to the platform default by sending null on save", async () => {
     const user = userEvent.setup();
     // This agent already has a pinned model, so the field seeds with it.
     vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, model: "kimi-k2" }]);
@@ -211,7 +216,24 @@ describe("WiredAgentDetail — model edit (#254)", () => {
     await user.clear(input);
     await user.click(screen.getByTestId("model-save"));
 
-    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("a1", { model: "" }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("a1", { model: null }));
+  });
+
+  // Whitespace is the same gesture typed differently, and it is worse than empty:
+  // it survives the falsy check downstream and is stored AND forwarded as a
+  // garbage model id. It must reach the wire as the same null, not as "  ".
+  it("treats a whitespace-only box as the same clear", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgents).mockResolvedValue([{ ...AGENT, model: "kimi-k2" }]);
+    renderDetail();
+
+    const input = await screen.findByTestId("model-input");
+    await waitFor(() => expect(input).toHaveValue("kimi-k2"));
+    await user.clear(input);
+    await user.type(input, "   ");
+    await user.click(screen.getByTestId("model-save"));
+
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("a1", { model: null }));
   });
 });
 
