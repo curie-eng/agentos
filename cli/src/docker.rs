@@ -338,8 +338,86 @@ pub fn validate_model_ref(model: &str) -> Result<()> {
                  separated by `/` with an optional `:tag` (e.g. `qwen3:4b`)"
             );
         }
+        // Every character of `..` is on the allowlist above, so the #1254 grammar
+        // waved it through -- and `model_manifest_path` then joined it verbatim
+        // into a path the probe's `test -e` resolves for real, letting any
+        // existing file answer "already pulled" (#1363). The rule is stated
+        // POSITIVELY -- a name contains a letter or a digit -- rather than as a
+        // denylist of `.` and `..`, because a denylist has to enumerate every
+        // spelling of "this is a path operator, not a name" and misses the next
+        // one. Ollama has no such reference either way.
+        if !part.chars().any(|c| c.is_ascii_alphanumeric()) {
+            bail!(
+                "model reference `{model}` has a {label} (`{part}`) with no letter or \
+                 digit; a segment like `.` or `..` is a path operator, not a name, and \
+                 the presence probe would resolve it against the real filesystem"
+            );
+        }
+    }
+    // The grammar and the path it composes are a pair, and only the second one is
+    // what the probe acts on. Checking where the reference LANDS closes the class
+    // rather than the one spelling of it that was reported: this holds for any
+    // future loosening of the character rule above, and it is the same predicate
+    // `model_probe_args` re-checks at the probe boundary.
+    let manifest = model_manifest_path(model);
+    if !manifest_path_is_contained(&manifest) {
+        bail!(
+            "model reference `{model}` composes the manifest path `{manifest}`, \
+             which does not stay under `models/manifests/`; it does not name a model"
+        );
     }
     Ok(())
+}
+
+/// The directory every model manifest lives under, relative to `/root/.ollama`.
+/// A composed path that does not land strictly BELOW this is not naming a model.
+const MANIFEST_ROOT: [&str; 2] = ["models", "manifests"];
+
+/// Resolve `.` and `..` in a relative path lexically -- no filesystem, no
+/// symlinks, just the arithmetic a shell would do (#1363).
+///
+/// Args:
+///   path: a relative, `/`-separated path.
+///
+/// Returns:
+///   The surviving segments, or `None` when a `..` climbs above the root. Climbing
+///   above the root is the escape itself, so it is an answer, not an error case to
+///   paper over with an empty vector.
+fn normalize_relative_path(path: &str) -> Option<Vec<&str>> {
+    let mut resolved: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            // A trailing or doubled separator, and `.`, both mean "stay here".
+            "" | "." => {}
+            ".." => {
+                resolved.pop()?;
+            }
+            name => resolved.push(name),
+        }
+    }
+    Some(resolved)
+}
+
+/// Whether a composed manifest path still names something strictly inside
+/// `models/manifests/` (#1363).
+///
+/// Landing ON the prefix counts as an escape, not as containment: the
+/// `models/manifests` directory exists in any volume Ollama has ever written to,
+/// so `test -e` on it answers "present" for a model that was never pulled. That
+/// is exactly what `--local-model '..:..'` composes.
+///
+/// Args:
+///   path: a manifest path relative to the Ollama data root.
+///
+/// Returns:
+///   `true` when the path resolves to a location below `models/manifests/`.
+fn manifest_path_is_contained(path: &str) -> bool {
+    match normalize_relative_path(path) {
+        Some(resolved) => {
+            resolved.len() > MANIFEST_ROOT.len() && resolved.starts_with(&MANIFEST_ROOT)
+        }
+        None => false,
+    }
 }
 
 /// Where Ollama stores a model's manifest inside its data directory, relative
@@ -415,30 +493,56 @@ pub async fn model_present_in_volume(volume: &str, image: &str, model: &str) -> 
     if !volume_present(volume).await? {
         return Ok(false);
     }
-    // The path is a POSITIONAL ARGUMENT, never text spliced into the command
-    // (#1254). Interpolating it made `--local-model 'missing; true #'` end the
-    // `test` early and leave a `true` behind, so the probe exited 0, the guard
-    // reported the model present, and `compose up` ran the multi-GB download
-    // ADR-0093 exists to prevent. `"$1"` cannot be reparsed as code no matter
-    // what it holds, so the hole is closed by construction rather than by the
-    // validator agreeing to be perfect. `_` is the conventional `$0` filler.
+    // `model_probe_args` owns both guards -- argv placement against #1254's shell
+    // injection, and path containment against #1363's traversal -- and refuses to
+    // build a probe it cannot vouch for. Propagating that refusal is the
+    // fail-closed answer: an unvouchable reference must not read as "present",
+    // which is the reading that skips the download disclosure.
     let (status, _out, _err) =
-        docker_capture_with_env(&model_probe_args(volume, image, model), &[]).await?;
+        docker_capture_with_env(&model_probe_args(volume, image, model)?, &[]).await?;
     Ok(status.success())
 }
 
-/// The `docker run` argv for the model-presence probe, pure so the property
-/// #1254 turned on is assertable with no daemon.
+/// The `docker run` argv for the model-presence probe, pure so the properties
+/// #1254 and #1363 turned on are assertable with no daemon.
+///
+/// Two different holes are closed here, and they are closed in two different
+/// ways -- conflating them is how #1363 happened.
 ///
 /// The path is a POSITIONAL ARGUMENT, never text spliced into the command.
 /// Interpolating it made `--local-model 'missing; true #'` end the probe's
 /// `test -e` early and leave a `true` behind, so the probe exited 0, the guard
 /// reported the model present, and `compose up` performed exactly the multi-GB
-/// download ADR-0093 exists to prevent. `"$1"` cannot be reparsed as code no
-/// matter what it holds, so the hole is closed by construction rather than by
-/// the validator agreeing to be perfect. `_` is the conventional `$0` filler.
-pub fn model_probe_args(volume: &str, image: &str, model: &str) -> Vec<String> {
-    vec![
+/// download ADR-0093 exists to prevent (#1254). `"$1"` cannot be reparsed as code
+/// no matter what it holds, so THAT hole is genuinely closed by construction.
+/// `_` is the conventional `$0` filler.
+///
+/// Being inert as code is not the same as naming the right file, which is what
+/// #1363 cost us: an inert `../../../../etc/hostname` is still a path `test -e`
+/// resolves, and any existing file answers "already pulled". Nothing about argv
+/// placement can fix that, so containment is CHECKED here rather than assumed --
+/// and checked at this boundary, not only at the argument boundary, so the
+/// guarantee survives a caller that never ran the validator.
+///
+/// Args:
+///   volume: the Docker volume mounted at Ollama's `/root/.ollama`.
+///   image: an Ollama image known to be present locally.
+///   model: the model reference to look for.
+///
+/// Returns:
+///   The probe argv, or an error when the reference composes a path outside
+///   `models/manifests/`.
+pub fn model_probe_args(volume: &str, image: &str, model: &str) -> Result<Vec<String>> {
+    let manifest = model_manifest_path(model);
+    if !manifest_path_is_contained(&manifest) {
+        bail!(
+            "refusing to probe for model `{model}`: it composes the manifest path \
+             `{manifest}`, which does not stay under `models/manifests/`. A reference \
+             whose segments are path operators would let some unrelated existing file \
+             answer the presence probe, skipping the download disclosure (#1363)"
+        );
+    }
+    Ok(vec![
         "run".into(),
         "--rm".into(),
         "-v".into(),
@@ -449,8 +553,8 @@ pub fn model_probe_args(volume: &str, image: &str, model: &str) -> Vec<String> {
         "-c".into(),
         "test -e \"$1\"".into(),
         "_".into(),
-        format!("/root/.ollama/{}", model_manifest_path(model)),
-    ]
+        format!("/root/.ollama/{manifest}"),
+    ])
 }
 
 /// The operator-facing refusal when `--local-model` is asked for assets that are
@@ -1136,13 +1240,113 @@ mod tests {
         }
     }
 
+    // #1363. Every character in `..` is on the allowlist, so the #1254 grammar
+    // waved it through -- but `..` is a path OPERATOR, not a name, and the probe's
+    // `test -e` resolves it against the real filesystem. That let any existing
+    // path answer "the model is already pulled" and skip the disclosure ADR-0093
+    // calls the ONLY place the download is named before it would be spent.
+    #[test]
+    fn a_model_ref_whose_segments_are_path_operators_is_rejected() {
+        for payload in [
+            "../../../../etc:hostname", // the reported payload, verbatim
+            "..:..",                    // both halves, the minimal spelling
+            "x/../../../../../etc:passwd",
+            "..",          // a bare traversal with the implicit `latest` tag
+            "qwen3:..",    // only the tag is an operator
+            "../qwen3:4b", // only a leading name segment is
+            ".",           // `.` resolves to the parent dir, which also exists
+            "qwen3:.",
+        ] {
+            assert!(
+                validate_model_ref(payload).is_err(),
+                "must reject {payload:?}"
+            );
+        }
+    }
+
+    // A segment made only of punctuation is never a model name, and each spelling
+    // of it is another way to reach the same escape. The rule is positive -- a
+    // name has to contain a letter or a digit -- so it holds for spellings nobody
+    // has thought of yet, which a denylist of `.`/`..` would not.
+    #[test]
+    fn a_segment_with_no_letter_or_digit_is_rejected() {
+        for payload in ["...", "-", "_", "._-", "qwen3:...", "a/-/b:1"] {
+            assert!(
+                validate_model_ref(payload).is_err(),
+                "must reject {payload:?}"
+            );
+        }
+    }
+
+    // The refusal has to tell the operator WHICH segment and WHY, or they will
+    // retype the same thing. A traversal is not a typo they can see.
+    #[test]
+    fn the_traversal_rejection_names_the_segment_and_the_reason() {
+        let err = validate_model_ref("../../../../etc:hostname")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("../../../../etc:hostname"), "{err}");
+        assert!(
+            err.contains("letter") || err.contains("digit"),
+            "the rule the segment broke must be stated: {err}"
+        );
+    }
+
+    // The containment check is the structural half, and it is checked on the
+    // COMPOSED path, so it holds for any spelling the grammar might still admit.
+    #[test]
+    fn a_composed_manifest_path_that_escapes_is_not_contained() {
+        for escaping in [
+            "models/manifests/../../../../etc/hostname",
+            "models/manifests/registry.ollama.ai/library/../..", // lands ON the prefix
+            "models/manifests",                                  // the prefix itself
+            "models/manifests/",
+            "etc/hostname",
+        ] {
+            assert!(
+                !manifest_path_is_contained(escaping),
+                "must not accept {escaping:?}"
+            );
+        }
+        for real in [
+            "models/manifests/registry.ollama.ai/library/qwen3/4b",
+            "models/manifests/localhost:5000/org/repo/latest",
+        ] {
+            assert!(manifest_path_is_contained(real), "must accept {real:?}");
+        }
+    }
+
+    // `models/manifests` itself exists in any seeded volume, so a payload that
+    // merely climbs back TO the prefix still answers `test -e` with 0. Landing on
+    // the prefix has to count as an escape, not as containment.
+    #[test]
+    fn climbing_back_to_the_prefix_does_not_count_as_contained() {
+        // This is exactly what `--local-model '..:..'` composes.
+        let path = model_manifest_path("..:..");
+        assert_eq!(path, "models/manifests/registry.ollama.ai/library/../..");
+        assert!(!manifest_path_is_contained(&path));
+    }
+
+    // The probe boundary refuses too, not just the argument boundary. #1332's own
+    // doc comment claimed the hole was "closed by construction rather than by the
+    // validator agreeing to be perfect", and #1363 was the validator not being
+    // perfect -- so the guarantee has to hold for a caller that never validated.
+    #[test]
+    fn the_probe_refuses_to_build_argv_for_a_path_that_escapes() {
+        let err = model_probe_args("vol", "img", "../../../../etc:hostname")
+            .expect_err("an escaping ref must not produce probe argv")
+            .to_string();
+        assert!(err.contains("models/manifests"), "{err}");
+    }
+
     // The structural half of the fix, independent of the validator: the probe
     // passes the path as a POSITIONAL ARGUMENT, so even a caller that skipped
     // validation cannot get the payload reparsed as shell code.
     #[test]
     fn the_probe_passes_the_path_as_an_argument_not_as_command_text() {
         // The #1254 payload carried all the way into the argv the probe would run.
-        let args = model_probe_args("vol", "img", "missing; true #");
+        let args = model_probe_args("vol", "img", "missing; true #")
+            .expect("this payload is inert, not a traversal; containment is a separate test");
         let command = &args[args.len() - 3];
         let path = args.last().expect("the path is the final argument");
 
