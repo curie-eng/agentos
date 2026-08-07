@@ -24,9 +24,15 @@
             "type": "string",
             "description": "Stable identifier, for a consumer gating on one specific check."
           },
-          "title": { "type": "string" },
+          "title": {
+            "type": "string"
+          },
           "state": {
-            "enum": ["ok", "missing", "not_applicable"],
+            "enum": [
+              "ok",
+              "missing",
+              "not_applicable"
+            ],
             "description": "`not_applicable` means the check does not apply at this install's rung, not that it failed."
           },
           "detail": {
@@ -38,9 +44,26 @@
             "description": "The exact command that resolves it. Absent when there is nothing to fix."
           }
         },
-        "required": ["id", "title", "state", "detail"]
+        "required": [
+          "id",
+          "title",
+          "state",
+          "detail"
+        ]
       }
+    },
+    "guidance": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Present only when two or more checks are missing: a pointer to the guided walkthrough (`curie` with no arguments). Null for zero or one gap, where the per-check `fix` is the whole answer and a walkthrough would be more work than the fix."
     }
   },
-  "required": ["summary", "ready", "checks"]
+  "required": [
+    "summary",
+    "ready",
+    "checks",
+    "guidance"
+  ]
 }

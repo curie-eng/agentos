@@ -76,7 +76,8 @@ struct App {
 pub async fn run() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(crate::exit::usage(
-            "curie interactive requires an interactive terminal; use the regular curie subcommands in non-interactive sessions",
+            "curie interactive requires an interactive terminal. In a non-interactive session, \
+             run `curie doctor` to see what is set up and the command that fixes each gap.",
         ));
     }
     let mut app = App::new();
