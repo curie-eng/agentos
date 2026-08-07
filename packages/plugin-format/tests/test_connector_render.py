@@ -418,3 +418,107 @@ def test_an_empty_sealed_blob_is_reported_on_its_own() -> None:
         {"connectors": {"grafana": {"image": "x", "sealed_secrets": {"TOKEN": "  "}}}}
     )
     assert "connectors.empty_sealed_value" in [code for code, _ in errors]
+
+
+# --- secret_files (#1402) ---------------------------------------------------
+#
+# `secrets:` renders a secretKeyRef and nothing else, so a server that
+# authenticates from a FILE -- a kubeconfig, a TLS client cert, GCP
+# service-account JSON -- had no way to receive its credential at all. These
+# pin the projection, and the guards that keep it from becoming a second, worse
+# way to leak one.
+
+FILE_SPEC = ConnectorSpec(
+    image="ghcr.io/containers/kubernetes-mcp-server:latest",
+    args=["--kubeconfig", "/secrets/kubeconfig", "--read-only"],
+    secret_files={"K8S_READONLY_KUBECONFIG": "/secrets/kubeconfig"},
+)
+
+
+def _file_dep(spec: ConnectorSpec) -> dict:
+    return r.render_deployment("acme-bot", "acme-bot", "acme-bot", "k8s", spec, "conn-secrets")
+
+
+def test_secret_file_lands_at_the_declared_path_not_a_directory() -> None:
+    # subPath is what makes the mount a FILE at exactly the declared path.
+    # Without it Kubernetes mounts a DIRECTORY there, and `--kubeconfig
+    # /secrets/kubeconfig` would open a directory and fail in a way that reads
+    # like a malformed credential.
+    mount = _file_dep(FILE_SPEC)["spec"]["template"]["spec"]["containers"][0]["volumeMounts"][0]
+    assert mount["mountPath"] == "/secrets/kubeconfig"
+    assert mount["subPath"] == "kubeconfig"
+    assert mount["readOnly"] is True
+
+
+def test_secret_file_reads_the_same_per_agent_secret_as_env_secrets() -> None:
+    # Same store, same Secret, same resolution -- only the delivery differs.
+    vol = _file_dep(FILE_SPEC)["spec"]["template"]["spec"]["volumes"][0]["secret"]
+    assert vol["secretName"] == "conn-secrets"
+    assert vol["items"] == [{"key": "K8S_READONLY_KUBECONFIG", "path": "kubeconfig"}]
+
+
+def test_secret_file_is_0400_and_not_optional() -> None:
+    # A credential, in a pod that already runs non-root with a read-only
+    # rootfs. `optional: False` matches `secrets:`: a missing key must stop the
+    # pod rather than start a server that 401s on every call.
+    vol = _file_dep(FILE_SPEC)["spec"]["template"]["spec"]["volumes"][0]["secret"]
+    assert vol["defaultMode"] == 0o400
+    assert vol["optional"] is False
+
+
+def test_each_secret_file_gets_its_own_volume() -> None:
+    # One volume per file, so each carries only its own key. A single volume
+    # with several items would put every credential in one directory, where a
+    # server that reads a directory would see the others.
+    spec = ConnectorSpec(
+        image="x:1",
+        secret_files={"A": "/secrets/a.pem", "B": "/secrets/b.json"},
+    )
+    pod = _file_dep(spec)["spec"]["template"]["spec"]
+    assert len(pod["volumes"]) == 2
+    keys = sorted(v["secret"]["items"][0]["key"] for v in pod["volumes"])
+    assert keys == ["A", "B"]
+    for v in pod["volumes"]:
+        assert len(v["secret"]["items"]) == 1
+
+
+def test_a_connector_without_secret_files_is_unchanged() -> None:
+    # Additive to a frozen contract: a bundle that does not use this must
+    # render exactly what it rendered before, with no empty volumes key.
+    pod = _file_dep(HOSTED)["spec"]["template"]["spec"]
+    assert "volumes" not in pod
+    assert "volumeMounts" not in pod["containers"][0]
+
+
+def test_secret_files_are_reported_as_secret_names() -> None:
+    # They resolve from the same store, so the deploy path must know to fetch
+    # them; missing this would render a volume pointing at a key nobody wrote.
+    assert "K8S_READONLY_KUBECONFIG" in FILE_SPEC.secret_names()
+
+
+@pytest.mark.parametrize(
+    "data,code",
+    [
+        ({"image": "x:1", "secret_files": {"A": "secrets/x"}},
+         "connectors.secret_file_relative_path"),
+        ({"image": "x:1", "secret_files": {"A": "/tmp/x"}},
+         "connectors.secret_file_in_tmp"),
+        ({"image": "x:1", "secret_files": {"A": "/s/x", "B": "/s/x"}},
+         "connectors.secret_file_path_collision"),
+        ({"image": "x:1", "secrets": ["A"], "secret_files": {"A": "/s/x"}},
+         "connectors.secret_both_env_and_file"),
+        ({"url": "https://m/mcp", "secret_files": {"A": "/s/x"}},
+         "connectors.remote_has_secret_files"),
+    ],
+)
+def test_secret_file_misuse_is_refused(data: dict, code: str) -> None:
+    _, errors = validate_connectors({"connectors": {"k": data}})
+    assert code in [c for c, _ in errors]
+
+
+def test_a_well_formed_secret_file_validates() -> None:
+    parsed, errors = validate_connectors(
+        {"connectors": {"k": {"image": "x:1", "secret_files": {"A": "/secrets/kubeconfig"}}}}
+    )
+    assert errors == []
+    assert parsed is not None

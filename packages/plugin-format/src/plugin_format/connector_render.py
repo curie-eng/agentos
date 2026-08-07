@@ -31,6 +31,7 @@ not write.
 from __future__ import annotations
 
 import hashlib
+from pathlib import PurePosixPath
 from typing import Any
 
 from .connectors import ConnectorSpec
@@ -218,6 +219,41 @@ def render_deployment(
                     },
                 }
             )
+    # secret_files project the SAME per-agent Secret as a file instead of an
+    # env var, for servers that authenticate from disk (#1402). One volume per
+    # file so each carries only its own key: a single volume with several items
+    # would put every credential in one directory, and a server that reads a
+    # directory would see the others.
+    volumes: list[dict[str, Any]] = []
+    volume_mounts: list[dict[str, Any]] = []
+    for index, (secret_key, mount_path) in enumerate(sorted(spec.secret_files.items())):
+        vol = f"secret-file-{index}"
+        volumes.append(
+            {
+                "name": vol,
+                "secret": {
+                    "secretName": secret_name,
+                    "items": [{"key": secret_key, "path": PurePosixPath(mount_path).name}],
+                    # 0400: readable by the container's user, nobody else. These
+                    # are credentials in a pod that already runs non-root with a
+                    # read-only rootfs.
+                    "defaultMode": 0o400,
+                    # Not optional, matching `secrets:` -- a missing key must
+                    # stop the pod rather than start a server that 401s on every
+                    # call.
+                    "optional": False,
+                },
+            }
+        )
+        volume_mounts.append(
+            {
+                "name": vol,
+                "mountPath": mount_path,
+                "subPath": PurePosixPath(mount_path).name,
+                "readOnly": True,
+            }
+        )
+
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -241,6 +277,7 @@ def render_deployment(
                             "image": spec.image,
                             "args": [substitute(a, subs) for a in spec.args],
                             "env": env,
+                            **({"volumeMounts": volume_mounts} if volume_mounts else {}),
                             "ports": [{"name": "http", "containerPort": spec.port}],
                             "securityContext": {
                                 "allowPrivilegeEscalation": False,
@@ -253,6 +290,7 @@ def render_deployment(
                             },
                         }
                     ],
+                    **({"volumes": volumes} if volumes else {}),
                 },
             },
         },
