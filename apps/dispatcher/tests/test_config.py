@@ -257,33 +257,31 @@ def test_api_preflight_timeout_rejects_non_finite(
 def test_the_dispatcher_does_not_read_the_shimmer_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No shimmer knob on this side -- the dispatcher makes no status call."""
+    """One reader, so one token cannot mean two things.
+
+    The regression this locks out: the dispatcher's bool parser accepted `on` as
+    truthy and the worker's did not, while BOTH services read CURIE_SHIMMER. So
+    `CURIE_SHIMMER=on` meant "dispatcher raises the caption, worker never lowers
+    it", and every turn stranded a shimmer until Slack's own timeout. A test
+    named ``test_bool_on_divergence_between_services`` asserted that split as
+    intended behavior.
+
+    #1312 removed the split at its source rather than aligning two parsers.
+    Asserting the ABSENCE of the field is the whole property: a token table here
+    could only re-test the worker's own parser (apps/worker/tests/test_config.py
+    already does, including the `on` case), and an earlier version of this test
+    tried exactly that and asserted `isinstance(..., bool)`, which cannot fail
+    for a pydantic bool field and stayed green under an inverted parser (#1394).
+    """
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_SHIMMER", "true")
+    monkeypatch.setenv("CURIE_SHIMMER", "on")
     monkeypatch.setenv("CURIE_STATUS_TEXT", "is doing something")
 
     config = DispatcherConfig()
 
     assert not hasattr(config, "shimmer")
     assert not hasattr(config, "status_text")
-
-
-@pytest.mark.parametrize("token", ["on", "true", "1", "yes", "off", "no", "0", ""])
-def test_no_shimmer_token_can_mean_two_things_across_services(
-    monkeypatch: pytest.MonkeyPatch, token: str
-) -> None:
-    """The regression that made this issue expensive: "on" parsed True on one
-    service and False on the other, so the caption was raised and never lowered.
-    With a single reader, whatever the worker decides IS the release's answer --
-    there is no second interpretation left to disagree with it."""
-    from curie_worker.config import WorkerConfig
-
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_SHIMMER", token)
-
-    # The worker's reading is the only reading. Asserted as a property rather
-    # than a value table so this does not become a second copy of the worker's
-    # own token tests (apps/worker/tests/test_config.py).
-    assert isinstance(WorkerConfig().shimmer, bool)
-    assert "shimmer" not in DispatcherConfig().model_fields_set
-    assert "shimmer" not in type(DispatcherConfig()).model_fields
+    # Not merely unset for this construction -- not declared at all, so no
+    # future env plumbing can quietly reintroduce a second reader.
+    assert "shimmer" not in type(config).model_fields
+    assert "status_text" not in type(config).model_fields

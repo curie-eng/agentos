@@ -77,7 +77,7 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
 
 
 def test_shimmer_clears_status_when_the_turn_ends(make_harness) -> None:
-    # With shimmer on, the kernel clears the assistant-thread status the
+    # With shimmer on, the kernel clears the assistant-thread status it
     # dispatcher set, on the turn's terminal exit (a plain success here).
     async def go() -> None:
         async with make_harness(shimmer=True) as h:
@@ -103,7 +103,7 @@ def test_no_status_clear_when_shimmer_is_off(make_harness) -> None:
 
 def test_status_is_cleared_by_default(make_harness) -> None:
     # The mirror of the test above, and the reason the default flipped (#1182):
-    # the dispatcher shimmers by default, and editing the placeholder does not
+    # the worker shimmers by default, and editing the placeholder does not
     # auto-clear a Slack status, so the worker must clear it on the way out or
     # the caption lingers until Slack's own timeout.
     async def go() -> None:

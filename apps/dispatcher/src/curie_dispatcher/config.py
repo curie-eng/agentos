@@ -117,8 +117,16 @@ class DispatcherConfig(BaseSettings):
     # The dispatcher no longer touches the Slack assistant-thread status: setting
     # it from this side put a best-effort cosmetic call in front of the durable
     # enqueue, and split set/clear across two processes. Both env names are
-    # unchanged and now read by the worker alone, so an operator's existing
-    # setting keeps working -- see apps/worker/src/curie_worker/config.py.
+    # unchanged and now read by the worker alone -- see
+    # apps/worker/src/curie_worker/config.py.
+    #
+    # One token does change meaning, and it is worth naming rather than claiming
+    # blanket compatibility: the deleted parser here accepted `on` as truthy and
+    # the worker's does not. `CURIE_SHIMMER=on` therefore used to mean "the
+    # dispatcher raises the caption and the worker never lowers it", which is the
+    # stranded shimmer #1312 was filed to kill, not a working configuration. It
+    # was produced by nothing in the repo, documented nowhere, and rendered by
+    # neither chart Deployment.
 
     backoff_initial_seconds: float = Field(
         default=1.0, gt=0, validation_alias="CURIE_BACKOFF_INITIAL_SECONDS"

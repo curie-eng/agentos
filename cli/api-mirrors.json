@@ -255,11 +255,11 @@
         },
         {
           "field": "id",
-          "why": "The payload identifies the agent by `agent` (its name), the same identifier the operator typed and the same one BudgetOutput/KillOutput emit; echoing the uuid alongside it adds a second key naming the same row. Pinned by json_emit_contract.rs's overrides_output_json_shape_is_pinned."
+          "why": "The payload identifies the agent by `agent` (its name), the same identifier the operator typed and the same one BudgetOutput/KillOutput emit; echoing the uuid alongside it adds a second key naming the same row. Pinned by cli/tests/cli_output_variants.rs's every_variant_sample_validates_against_its_mapped_schema, against cli/schema/overrides.schema.json (additionalProperties: false)."
         },
         {
           "field": "name",
-          "why": "Emitted, under the key `agent` rather than `name`: that is the key BudgetOutput, KillOutput and ResumeOutput already use for the same fact, and an operator identifies an agent by the string they typed. Renaming this result's key to `name` for the gate's benefit would make it the odd one out among its siblings. Pinned by json_emit_contract.rs's overrides_output_json_shape_is_pinned."
+          "why": "Emitted, under the key `agent` rather than `name`: that is the key BudgetOutput, KillOutput and ResumeOutput already use for the same fact, and an operator identifies an agent by the string they typed. Renaming this result's key to `name` for the gate's benefit would make it the odd one out among its siblings. Pinned by cli/tests/cli_output_variants.rs's every_variant_sample_validates_against_its_mapped_schema, against cli/schema/overrides.schema.json (additionalProperties: false)."
         },
         {
           "field": "repo_full_name",

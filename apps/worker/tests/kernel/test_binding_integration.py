@@ -314,6 +314,8 @@ def test_shimmer_off_raises_and_lowers_nothing(make_harness) -> None:
             await h.kernel.process_event(_qevent("hi", channel="C-bound"))
             assert h.sink.status_calls == []
 
+    asyncio.run(go())
+
 
 def test_shimmer_off_never_sets_a_caption(make_harness) -> None:
     async def go() -> None:
