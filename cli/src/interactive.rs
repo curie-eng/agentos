@@ -765,11 +765,26 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
         "  6. Copy that channel's ID: channel name -> 'View channel details' -> the",
         "     C0... id at the very bottom.",
         "",
-        "Next you'll paste the two tokens (hidden) and the channel id.",
-        "Press Enter when you have all three.",
     ] {
         intro.push(line);
     }
+    // Say what will actually be asked. The `ensure_*` helpers below already skip
+    // a credential that is exported or saved, but they skip it SILENTLY -- so an
+    // operator who is half set up cannot tell whether to have the Slack page
+    // open before starting.
+    let asks = planned_prompts(
+        tier == Tier::Local,
+        model_credential_available(),
+        secret_available("SLACK_APP_TOKEN"),
+        secret_available("SLACK_BOT_TOKEN"),
+    );
+    intro.push("");
+    intro.push(format!("This will ask you for {} things:", asks.len()));
+    for ask in &asks {
+        intro.push(format!("  - {ask}"));
+    }
+    intro.push("");
+    intro.push("Press Enter when you have them.".to_string());
     show_run_view(terminal, app, &mut intro)?;
 
     // 2. Save the model credential + Slack tokens into the vault (hidden input).
@@ -932,6 +947,10 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
     done.push("");
     done.push("Try it: in Slack, @mention the bot in that channel (or DM it) and send a");
     done.push("message -- the dispatcher routes it through the worker to your agent.");
+    done.push("");
+    for line in troubleshooting_lines(tier, release.as_deref()) {
+        done.push(line);
+    }
     done.push("");
     done.push(format!(
         "Disconnect Slack:  curie {verb} comms --slack --disconnect"
@@ -1147,6 +1166,90 @@ fn prompt_checked(
             Err(reason) => shown = format!("{label} -- {reason}"),
         }
     }
+}
+
+/// Is this credential already available, from the environment or the vault?
+///
+/// Mirrors the first two checks in `ensure_secret_available` so the preview and
+/// the prompt cannot disagree about what will be asked. A vault error reads as
+/// "not available": the preview must never fail the workflow.
+fn secret_available(name: &str) -> bool {
+    env_credential_present(name) || crate::secrets::is_saved(name).unwrap_or(false)
+}
+
+/// Any accepted model credential, by the same rule `ensure_model_credential_available` uses.
+fn model_credential_available() -> bool {
+    const NAMES: &[&str] = &[
+        "CURIE_CREDENTIALS",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
+    NAMES.iter().any(|n| secret_available(n))
+}
+
+/// What the workflow will actually ask for, given what is already in place.
+///
+/// The `ensure_*` helpers already SKIP a credential that is exported or saved,
+/// silently. Silently is the problem: an operator who has half of this set up
+/// cannot tell whether the workflow is about to ask for four things or none,
+/// so they cannot tell whether they need the Slack page open before starting.
+///
+/// Pure so the sequencing is testable; the caller supplies what it observed.
+pub(crate) fn planned_prompts(
+    needs_model_credential: bool,
+    have_model_credential: bool,
+    have_app_token: bool,
+    have_bot_token: bool,
+) -> Vec<&'static str> {
+    let mut asks = Vec::new();
+    if needs_model_credential && !have_model_credential {
+        asks.push("a model credential");
+    }
+    if !have_app_token {
+        asks.push("the Slack app-level token (xapp-)");
+    }
+    if !have_bot_token {
+        asks.push("the Slack bot user token (xoxb-)");
+    }
+    asks.push("the Slack channel id");
+    asks.push("the bundle directory");
+    asks
+}
+
+/// What to do when the bot does not answer.
+///
+/// The closing view used to end at "try it in Slack", which is the happy path
+/// and the whole story only when it works. The three commands below are the
+/// ones that distinguish the three ways it silently does not: the dispatcher
+/// never connected, the agent was never bound to that channel, or something
+/// earlier in the install is missing.
+pub(crate) fn troubleshooting_lines(tier: Tier, release: Option<&str>) -> Vec<String> {
+    let mut out = vec!["If the bot does not answer:".to_string()];
+    match tier {
+        Tier::Cluster => {
+            let rel = release.unwrap_or("<release>");
+            out.push(format!(
+                "  1. is the dispatcher connected to Slack?   kubectl logs deploy/{rel}-dispatcher"
+            ));
+            out.push(
+                "  2. did the bind take?                     curie cluster status".to_string(),
+            );
+        }
+        Tier::Local => {
+            out.push("  1. is the dispatcher running?              curie local status".to_string());
+            out.push("  2. did the bind take?                      curie local status".to_string());
+        }
+    }
+    out.push("  3. anything else missing?                  curie doctor".to_string());
+    out.push(String::new());
+    out.push(
+        "The commands above succeeded, which means the bundle deployed and the tokens".to_string(),
+    );
+    out.push(
+        "were accepted. That is not the same as a round trip -- only a real mention is."
+            .to_string(),
+    );
+    out
 }
 
 fn ensure_secret_available(
@@ -2544,6 +2647,63 @@ mod tests {
             .iter()
             .map(|idx| app.recipes[*idx].title)
             .collect()
+    }
+
+    /// A fully-unconfigured operator is told all five, so they know to have the
+    /// Slack page open before they start.
+    #[test]
+    fn a_cold_start_lists_every_prompt() {
+        let asks = planned_prompts(true, false, false, false);
+        assert_eq!(asks.len(), 5, "{asks:?}");
+        assert!(asks.iter().any(|a| a.contains("xapp-")), "{asks:?}");
+        assert!(asks.iter().any(|a| a.contains("xoxb-")), "{asks:?}");
+    }
+
+    /// The point of the preview: what is already set up is not asked for, and
+    /// the operator can see that BEFORE deciding whether they need a browser.
+    #[test]
+    fn what_is_already_available_is_not_listed() {
+        let asks = planned_prompts(true, true, true, true);
+        assert_eq!(asks, vec!["the Slack channel id", "the bundle directory"]);
+    }
+
+    /// The cluster tier configures the model credential on the release at
+    /// `cluster up` time, so this workflow must not ask for it there.
+    #[test]
+    fn the_cluster_tier_does_not_ask_for_a_model_credential() {
+        let asks = planned_prompts(false, false, false, false);
+        assert!(
+            !asks.iter().any(|a| a.contains("model credential")),
+            "{asks:?}"
+        );
+    }
+
+    /// The closing view has to cover the ways it silently does NOT work, or it
+    /// is only useful when nothing went wrong.
+    #[test]
+    fn the_close_names_a_command_for_each_silent_failure() {
+        let lines = troubleshooting_lines(Tier::Cluster, Some("acme-bot")).join("\n");
+        assert!(lines.contains("acme-bot-dispatcher"), "{lines}");
+        assert!(lines.contains("curie cluster status"), "{lines}");
+        assert!(lines.contains("curie doctor"), "{lines}");
+    }
+
+    /// And it must not overclaim. The commands succeeding is not a round trip.
+    #[test]
+    fn the_close_does_not_claim_a_round_trip_was_proven() {
+        let lines = troubleshooting_lines(Tier::Local, None).join("\n");
+        assert!(
+            lines.contains("not the same as a round trip"),
+            "must say what was NOT verified: {lines}"
+        );
+    }
+
+    /// The cluster hint needs a release name; without one it must still render
+    /// a usable command rather than an empty deployment reference.
+    #[test]
+    fn a_missing_release_name_still_renders_a_usable_hint() {
+        let lines = troubleshooting_lines(Tier::Cluster, None).join("\n");
+        assert!(lines.contains("<release>"), "{lines}");
     }
 
     #[test]
