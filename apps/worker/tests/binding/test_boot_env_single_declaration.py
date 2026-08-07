@@ -96,6 +96,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_MAX_ATTEMPTS",
         "CURIE_MAX_DELIVERY",
         "CURIE_SLACK_NO_EDIT_STREAMING",
+        # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
+        # the whole shimmer to this side; it reaches Slack, never a sandbox.
+        "CURIE_STATUS_TEXT",
         # The cluster sealing keys (ADR-0094), read from the WORKER's env at
         # reconcile time. Never a sandbox boot key -- quite the opposite: the
         # decrypted VALUE reaches a connector's Secret, and the private key
