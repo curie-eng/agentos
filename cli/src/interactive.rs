@@ -788,14 +788,13 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
     let repo_root = find_repo_root(cwd.clone())
         .context("could not find Curie repo root; run this workflow from the source checkout")?;
 
-    let Some(channel) = prompt_text(
+    let Some(channel) = prompt_checked(
         terminal,
         app,
         "Deploy to Slack",
         "Slack channel ID (C0...)",
-        None,
         false,
-        false,
+        crate::credcheck::check_channel_id,
     )?
     else {
         return Ok(());
@@ -1123,6 +1122,32 @@ fn example_secret_env(extra_secrets: &[&str]) -> Result<Vec<(String, String)>> {
     Ok(env)
 }
 
+/// Prompt until the pasted value has the right shape, or the operator cancels.
+///
+/// The loop is the point. Rejecting once and aborting the whole workflow would
+/// make a mistyped character cost every prior step; re-prompting with the reason
+/// in the label makes it a two-second correction. The reason replaces the label
+/// rather than appending, so a third attempt does not stack three errors.
+fn prompt_checked(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &App,
+    title: &str,
+    label: &str,
+    secret: bool,
+    check: impl Fn(&str) -> crate::credcheck::CheckResult,
+) -> Result<Option<String>> {
+    let mut shown = label.to_string();
+    loop {
+        let Some(value) = prompt_text(terminal, app, title, &shown, None, secret, false)? else {
+            return Ok(None);
+        };
+        match check(&value) {
+            Ok(()) => return Ok(Some(value)),
+            Err(reason) => shown = format!("{label} -- {reason}"),
+        }
+    }
+}
+
 fn ensure_secret_available(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &App,
@@ -1161,7 +1186,10 @@ fn ensure_secret_available(
     if !save {
         anyhow::bail!("{name} is required for this workflow");
     }
-    let Some(value) = prompt_text(terminal, app, "Save Secret", name, None, true, false)? else {
+    let Some(value) = prompt_checked(terminal, app, "Save Secret", name, true, |v| {
+        crate::credcheck::check_secret(name, v)
+    })?
+    else {
         anyhow::bail!("{name} is required for this workflow");
     };
     crate::secrets::save_value(name, &value)
@@ -1219,15 +1247,9 @@ fn ensure_model_credential_available(
     else {
         anyhow::bail!("a supported model credential is required");
     };
-    let Some(value) = prompt_text(
-        terminal,
-        app,
-        "Save Model Credential",
-        &name,
-        None,
-        true,
-        false,
-    )?
+    let Some(value) = prompt_checked(terminal, app, "Save Model Credential", &name, true, |v| {
+        crate::credcheck::check_model_credential(v)
+    })?
     else {
         anyhow::bail!("a supported model credential is required");
     };
