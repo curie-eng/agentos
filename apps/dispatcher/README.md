@@ -73,8 +73,6 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |
 | `CURIE_DEDUPE_TTL_SECONDS` | `3600` | dedupe guard TTL |
 | `CURIE_PLACEHOLDER_TEXT` | `On it. Working on your request.` | placeholder reply text |
-| `CURIE_STATUS_TEXT` | `is working on your request...` | the shimmer caption, NOT the message. Slack renders it as `<App Name> <status>` and inserts the app name, so write it as a continuation, not a sentence |
-| `CURIE_SHIMMER` | `true` | set the Slack assistant-thread status (the animated caption by the app name) while a turn runs. Also read by the worker, which clears it when the turn ends. Needs the app's **Agents & AI Apps** feature enabled by hand; without it the call is rejected and swallowed best-effort |
 | `CURIE_BACKOFF_INITIAL_SECONDS` | `1.0` | first reconnect backoff |
 | `CURIE_BACKOFF_MAX_SECONDS` | `30.0` | backoff cap |
 | `CURIE_BACKOFF_MULTIPLIER` | `2.0` | backoff growth factor |

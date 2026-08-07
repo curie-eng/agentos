@@ -164,17 +164,44 @@ class WorkerConfig(BaseSettings):
     connector_release: str = Field(default="", validation_alias="CURIE_RELEASE")
     connector_namespace: str = Field(default="", validation_alias="CURIE_NAMESPACE")
 
-    # When true, clear the Slack assistant-thread status (the "shimmer" the
-    # dispatcher set) once a turn ends -- editing the placeholder does not
-    # auto-clear it, because Slack only auto-clears a status when the app POSTS
-    # a message and this pipeline edits the placeholder instead.
+    # The shimmer caption, kept SEPARATE from the dispatcher's placeholder text
+    # because the two surfaces have different grammar. Slack renders an
+    # assistant-thread status as "<App Name> <status>" and inserts the app name
+    # itself, so the status has to read as a CONTINUATION of the app name ("Curie
+    # is working on your request...") while the message body is a standalone
+    # sentence ("On it. Working on your request."). Reusing one string for both
+    # produced "Curie On it. Working on your request." in the shimmer.
     #
-    # ON by default, and it must track the dispatcher's CURIE_SHIMMER (same env
-    # name, read by both services): the dispatcher sets the status and the worker
-    # is the only side holding the reply handle when the turn ends, so leaving
-    # this off while the dispatcher shimmers means nothing clears the status on
-    # our side and the caption lingers until Slack's own two-minute status
-    # timeout expires.
+    # Read here rather than in the dispatcher since #1312 moved the whole shimmer
+    # to this side; the env name is unchanged, so an operator's existing setting
+    # keeps working. It is a plain literal, not a shared constant from
+    # aci_protocol.service_config, because that module is for names BOTH services
+    # read and only the worker reads this one now.
+    # https://docs.slack.dev/reference/methods/assistant.threads.setStatus
+    status_text: str = Field(
+        default="is working on your request...",
+        validation_alias="CURIE_STATUS_TEXT",
+    )
+    # When true, set the Slack assistant-thread status (the native "shimmer" on
+    # the app name) while a turn runs, and clear it when the turn ends. Both
+    # halves live here (#1312). The clear is not optional bookkeeping: editing the
+    # placeholder does not auto-clear a status, because Slack only auto-clears
+    # when the app POSTS a message and this pipeline edits the placeholder.
+    #
+    # ON by default: during a turn the placeholder only changes when the model
+    # emits text, so a model that spends 30s reasoning before its first token
+    # leaves the thread visibly frozen, and an operator cannot tell that from a
+    # wedge (issue #1182). The shimmer is Slack's own affordance for exactly that,
+    # and it is strictly additive -- it neither edits the message nor notifies
+    # anyone. A workspace whose app lacks the "Agents & AI Apps" feature just
+    # skips it (the calls are best-effort and log at debug), so defaulting it on
+    # cannot break a deployment; see slack-app-manifest.yaml for the one-click
+    # enablement that has no manifest key.
+    #
+    # One flag now governs one producer. Before #1312 the dispatcher set the
+    # status and the worker cleared it, so the two had to be kept in agreement by
+    # an operator setting the same env twice; disagreeing left a caption nothing
+    # would clear until Slack's own two-minute timeout.
     shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
     # When true, suppress intermediate placeholder edits while streaming so the

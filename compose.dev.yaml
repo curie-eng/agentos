@@ -516,6 +516,13 @@ services:
       - CURIE_RUNNER_API_URL=http://curie-api:8000
       - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}
+      # The Slack assistant-thread "shimmer" (#1182), on by default. One knob,
+      # one consumer: the worker raises and lowers the caption, and the
+      # dispatcher does not touch it (#1312), so setting this false here turns
+      # the feature off for the whole stack. Before that it was unexposed on
+      # BOTH surfaces and an operator had no shipped way to disable it.
+      - CURIE_SHIMMER=${CURIE_SHIMMER:-true}
+      - CURIE_STATUS_TEXT=${CURIE_STATUS_TEXT:-is working on your request...}
       # Fake model by default (no credential needed). `curie local up` reaches
       # skill-tier parity: when a credential (one of the bare names below) is set
       # in your SHELL it injects CURIE_FAKE_MODEL=0 automatically, so local goes

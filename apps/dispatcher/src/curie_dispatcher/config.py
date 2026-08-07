@@ -19,8 +19,6 @@ Env mapping:
     CURIE_DEDUPE_PREFIX      -> dedupe_prefix
     CURIE_DEDUPE_TTL_SECONDS -> dedupe_ttl_seconds
     CURIE_PLACEHOLDER_TEXT   -> placeholder_text
-    CURIE_STATUS_TEXT        -> status_text (the shimmer caption, NOT the message)
-    CURIE_SHIMMER            -> shimmer (assistant-thread status while working)
     CURIE_BACKOFF_INITIAL_SECONDS -> backoff_initial_seconds
     CURIE_BACKOFF_MAX_SECONDS     -> backoff_max_seconds
     CURIE_BACKOFF_MULTIPLIER      -> backoff_multiplier
@@ -31,41 +29,21 @@ Env mapping:
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
 """
 
-from typing import Annotated
-
 from aci_protocol.service_config import (
     API_KEY_ENV,
     HEARTBEAT_FILE_ENV,
     HEARTBEAT_INTERVAL_ENV,
     RUNS_STREAM_DEFAULT,
-    SHIMMER_ENV,
     STREAM_ENV,
     AliasOnlyEnvSource,
     api_url_validation_alias,
     warn_if_deprecated_api_url_env,
 )
-from pydantic import BeforeValidator, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
-
-
-def _parse_bool(value: object) -> bool:
-    """Parse the truthy env-string set the dispatcher has always accepted.
-
-    A real bool passes through (so kwarg construction in tests is unchanged); any
-    other string is truthy only when it is one of the accepted tokens, matching
-    the previous hand-rolled ``_set_bool``.
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
-Bool = Annotated[bool, BeforeValidator(_parse_bool)]
 
 
 class DispatcherConfig(BaseSettings):
@@ -135,32 +113,12 @@ class DispatcherConfig(BaseSettings):
         default="On it. Working on your request.",
         validation_alias="CURIE_PLACEHOLDER_TEXT",
     )
-    # The shimmer caption, kept SEPARATE from placeholder_text because the two
-    # surfaces have different grammar. Slack renders an assistant-thread status
-    # as "<App Name> <status>" and inserts the app name itself, so the status has
-    # to read as a CONTINUATION of the app name ("Curie is working on your
-    # request...") while the message body is a standalone sentence ("On it.
-    # Working on your request."). Reusing one string for both produced "Curie On
-    # it. Working on your request." in the shimmer.
-    # https://docs.slack.dev/reference/methods/assistant.threads.setStatus
-    status_text: str = Field(
-        default="is working on your request...",
-        validation_alias="CURIE_STATUS_TEXT",
-    )
-    # When true, also set a Slack assistant-thread status (the native "shimmer"
-    # on the app name) to status_text while a turn runs. The worker clears it
-    # when the turn ends.
-    #
-    # ON by default: during a turn the placeholder only changes when the model
-    # emits text, so a model that spends 30s reasoning before its first token
-    # leaves the thread visibly frozen, and an operator cannot tell that from a
-    # wedge (issue #1182). The shimmer is Slack's own affordance for exactly
-    # that, and it is strictly additive -- it neither edits the message nor
-    # notifies anyone. A workspace whose app lacks the "Agents & AI Apps"
-    # feature just skips it (the call is best-effort and logs at debug), so
-    # defaulting it on cannot break a deployment; see slack-app-manifest.yaml
-    # for the one-click enablement that has no manifest key.
-    shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
+    # CURIE_SHIMMER and CURIE_STATUS_TEXT are deliberately NOT read here (#1312).
+    # The dispatcher no longer touches the Slack assistant-thread status: setting
+    # it from this side put a best-effort cosmetic call in front of the durable
+    # enqueue, and split set/clear across two processes. Both env names are
+    # unchanged and now read by the worker alone, so an operator's existing
+    # setting keeps working -- see apps/worker/src/curie_worker/config.py.
 
     backoff_initial_seconds: float = Field(
         default=1.0, gt=0, validation_alias="CURIE_BACKOFF_INITIAL_SECONDS"

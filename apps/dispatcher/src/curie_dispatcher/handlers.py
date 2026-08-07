@@ -103,19 +103,15 @@ def process_event(
     )
     placeholder_ts = placeholder["ts"]
 
-    if config.shimmer:
-        # Native Slack "shimmer": set the assistant-thread status so the app name
-        # shimmers while we work. Best-effort -- a workspace without the assistant
-        # feature just skips it; the worker clears the status when the turn ends.
-        # Uses status_text, not placeholder_text: Slack prefixes the status with
-        # the app name, so this surface needs a continuation, not a sentence.
-        try:
-            web_client.assistant_threads_setStatus(
-                channel_id=channel, thread_ts=thread_ts, status=config.status_text
-            )
-        except Exception as exc:  # noqa: BLE001 -- shimmer is best-effort, never fatal
-            log.debug("assistant setStatus skipped for %s: %s", slack_event_id, exc)
-
+    # Nothing else goes between the placeholder and the XADD below. The Slack
+    # assistant-thread status ("shimmer") used to sit right here, and it was the
+    # wrong side of the durable write (#1312): a best-effort cosmetic call, whose
+    # own failures are swallowed at debug, gating the only moment this turn
+    # becomes recoverable. slack_sdk's retry handler puts the worst case near
+    # 4.5s (see app.py's timeout constant), and Bolt has five shared listener
+    # workers, so a handful of slow status calls could stall ingestion with no
+    # visible explanation. The worker raises and lowers the shimmer now, which
+    # also puts set and clear in one process instead of racing across two.
     queued = QueuedTurn(
         event_id=slack_event_id,
         conversation_id=thread_ts,
