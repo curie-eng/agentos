@@ -121,21 +121,17 @@ def test_a_whitespace_only_model_is_refused_on_both_paths(
     assert resp.status_code == 422, resp.text
 
 
-def test_model_and_thinking_answer_an_empty_string_identically(
+def test_model_and_thinking_clear_through_the_same_gesture(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The parity assertion itself, not just two tests that happen to agree. #1334
-    # repaired one nullable override and left its twin two lines away accepting
-    # what the first refused; this fails the moment they diverge again.
+    # Refusal parity no longer lives here: it hardcoded ("model", "thinking")
+    # against this one endpoint, which is exactly why #1349 could add a third
+    # unguarded override on EvalTriggerRequest without reddening anything.
+    # test_nullable_override_parity.py now walks every routed request body
+    # reflectively and owns that half (#1389). What stays is the endpoint-level
+    # half a schema test cannot see: both fields clear to the platform default
+    # through the SAME gesture, one PATCH with explicit JSON null.
     agent = _create_agent(client, auth_headers, model="kimi-k2", thinking="adaptive")
-    for field in ("model", "thinking"):
-        resp = client.patch(
-            f"/agents/{agent['id']}", json={field: ""}, headers=auth_headers
-        )
-        assert resp.status_code == 422, f"{field} must refuse an empty string: {resp.text}"
-        assert "null" in resp.text, f"{field} must point at null: {resp.text}"
-
-    # And both clear to the platform default through the SAME gesture.
     resp = client.patch(
         f"/agents/{agent['id']}",
         json={"model": None, "thinking": None},
