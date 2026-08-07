@@ -17,14 +17,6 @@
           "why": "No CLI path reads an agent's behavior-pack list; deploy uploads a bundle rather than composing packs, so behavior_packs is never consumed."
         },
         {
-          "field": "model",
-          "why": "The CLI never displays or acts on an agent's default model (model routing is server- and claim-time bound, #473); the deploy and lifecycle verbs read only id/name/slack_channel."
-        },
-        {
-          "field": "thinking",
-          "why": "Same reason as model directly above, and the same ownership: thinking depth is resolved server-side at claim time into the sandbox boot env (#1182, ADR-0098). No CLI verb displays or acts on it; an operator sets it through the platform API."
-        },
-        {
           "field": "secrets",
           "why": "update_agent_secrets WRITES connector-secret names; the CLI never reads the stored secrets list back, so the response field is not modeled."
         },
@@ -248,6 +240,36 @@
       "output": "ApprovalsOutput",
       "struct": "ApprovalRecord",
       "omissions": []
+    },
+    {
+      "output": "OverridesOutput",
+      "struct": "Agent",
+      "omissions": [
+        {
+          "field": "approval_required_tools",
+          "why": "Gate configuration, surfaced by `approvals`. Emitting it from the overrides result would duplicate that verb's payload with no way to act on it here."
+        },
+        {
+          "field": "approval_routes",
+          "why": "Same as approval_required_tools: owned by `approvals --list-routes`."
+        },
+        {
+          "field": "id",
+          "why": "The payload identifies the agent by `agent` (its name), the same identifier the operator typed and the same one BudgetOutput/KillOutput emit; echoing the uuid alongside it adds a second key naming the same row. Pinned by json_emit_contract.rs's overrides_output_json_shape_is_pinned."
+        },
+        {
+          "field": "name",
+          "why": "Emitted, under the key `agent` rather than `name`: that is the key BudgetOutput, KillOutput and ResumeOutput already use for the same fact, and an operator identifies an agent by the string they typed. Renaming this result's key to `name` for the gate's benefit would make it the odd one out among its siblings. Pinned by json_emit_contract.rs's overrides_output_json_shape_is_pinned."
+        },
+        {
+          "field": "repo_full_name",
+          "why": "Same reason as slack_channel: a routing fact owned by the git-flow binding (ADR-0091), not part of the override pair this result is about."
+        },
+        {
+          "field": "slack_channel",
+          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel binding is a different concern with its own surface (`deploy --slack-channel`), and emitting it here would imply this verb can change it."
+        }
+      ]
     }
   ]
 }

@@ -73,8 +73,9 @@ Nine, all in the CLI crate:
   from `OpsCommand::display()` (already credential-masked), so this type never
   re-derives argv or reads a raw secret. It is also **composed** rather than
   duplicated: the other outputs carry a `DryRun` variant that delegates to it.
-- **Seven command outputs** (`cli/src/commands.rs`) — `KillOutput`, `ResumeOutput`,
-  `BudgetOutput`, `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `ApprovalsOutput`.
+- **Eight command outputs** (`cli/src/commands.rs`) — `KillOutput`, `ResumeOutput`,
+  `BudgetOutput`, `OverridesOutput`, `DeleteOutput`, `VersionsOutput`, `MemoryOutput`,
+  `ApprovalsOutput`.
 - **`ObservabilityOutput`** (`cli/src/observability.rs`) — the tier-aware
   observability surfaces (#460). Notable as the shape the seam is for: both the local
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
@@ -92,9 +93,9 @@ Nine, all in the CLI crate:
   syntactic call-site inventory, not a type-level proof that *every* verb returns
   a `CliOutput`.
 - **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 38 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 39 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
-  CliOutput`, and per-family output validation — all 38 are validated against real
+  CliOutput`, and per-family output validation — all 39 are validated against real
   `to_json()` output across 59 tests in `cli/tests/json_contract.rs`. Those tests
   drive each output type's `to_json()` once per output variant rather than calling
   the pure builder functions behind it, so a variant whose `to_json()` arm drifts

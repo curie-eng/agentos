@@ -1544,6 +1544,94 @@ export const commandManifest = {
           "name": "observability"
         },
         {
+          "about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Pin this model for the agent (forwarded as CURIE_MODEL at boot)",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the model override back to the platform default",
+              "id": "clear_model",
+              "long": "clear-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
+              "id": "thinking",
+              "long": "thinking",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the thinking override back to the platform default",
+              "id": "clear_thinking",
+              "long": "clear-thinking",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": false,
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie-dev-key"
+              ],
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).\n\nWith no flags this inspects. Both fields are nullable operator overrides of a platform default, so clearing is `--clear-<field>` (which sends JSON null) and never an empty value, which would skip the platform default rather than restore it.",
+          "name": "overrides"
+        },
+        {
           "about": "Set an agent's daily budget (`PUT /agents/{id}/budget`)",
           "args": [
             {
@@ -2953,6 +3041,113 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "resume"
+        },
+        {
+          "about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Pin this model for the agent (forwarded as CURIE_MODEL at boot)",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the model override back to the platform default",
+              "id": "clear_model",
+              "long": "clear-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
+              "id": "thinking",
+              "long": "thinking",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the thinking override back to the platform default",
+              "id": "clear_thinking",
+              "long": "clear-thinking",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).\n\nWith no flags this inspects. Both fields are nullable operator overrides of a platform default, so clearing is `--clear-<field>` (which sends JSON null) and never an empty value, which would skip the platform default rather than restore it.",
+          "name": "overrides"
         },
         {
           "about": "Set an agent's budget via the platform API (`PUT /agents/{id}/budget`)",

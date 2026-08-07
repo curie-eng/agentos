@@ -178,6 +178,12 @@
       "version": 1
     },
     {
+      "result": "OverridesOutput",
+      "kind": "CliOutput",
+      "schema": "overrides.schema.json",
+      "version": 1
+    },
+    {
       "result": "ResetThreadOutput",
       "kind": "CliOutput",
       "schema": "reset-thread.schema.json",
