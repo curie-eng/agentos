@@ -788,20 +788,71 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict>
 }
 
 /// The refusal text, factored out so its ordering is testable with no cluster.
-fn stateful_removal_message(removed: &[String]) -> String {
-    format!(
+///
+/// Branches on the CAUSE, because the two causes need opposite advice and a
+/// refusal an operator cannot act on is a wall, not a guard. A rename in
+/// particular has a one-line fix in their own file -- if the message withheld
+/// that and offered `--migrate-store` instead, the only way past would be
+/// `--allow-stateful-removal`, i.e. the guard would talk them into the
+/// destruction it exists to prevent.
+fn stateful_removal_message(removed: &[crate::ops::StatefulRemoval]) -> String {
+    use crate::ops::RemovalCause;
+
+    let listed = removed
+        .iter()
+        .map(|r| match &r.cause {
+            RemovalCause::ComponentGone => {
+                format!("{} ({}, not rendered at all)", r.name, r.component)
+            }
+            RemovalCause::RenamedTo(to) => format!("{} -> {}", r.name, to),
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    let mut msg = format!(
         "refusing to apply: this would DELETE {} stateful component(s) the release is \
-         running, and the persistent data with them:\n  {}\n\n\
-         The target chart does not render them, which usually means a chart version \
-         renamed or removed the component. For the bundle store, every sandbox reads \
-         from it at start, so losing it breaks the next turn and not merely a \
-         rollback.\n\n\
-         Re-run with --migrate-store and apply will carry the data across itself: it \
-         stages every object, upgrades, loads them back, and verifies per object.\n\n\
-         Use --allow-stateful-removal only to proceed WITHOUT the data.",
+         running, and the persistent data with them:\n  {listed}\n\n\
+         For the bundle store, every sandbox reads from it at start, so losing it \
+         breaks the next turn and not merely a rollback.\n\n",
         removed.len(),
-        removed.join("\n  "),
-    )
+    );
+
+    let renamed: Vec<&crate::ops::StatefulRemoval> = removed
+        .iter()
+        .filter(|r| matches!(r.cause, RemovalCause::RenamedTo(_)))
+        .collect();
+    if !renamed.is_empty() {
+        // Deliberately concrete. The operator is looking at a resource named
+        // `<something>-postgres` and a plan that creates `<something>-curie-postgres`;
+        // "your values disagree" is true and useless. The name the chart uses
+        // is derived from `nameOverride`, so hand them that line.
+        msg.push_str(
+            "These components still exist in the chart -- they would just be recreated \
+             under NEW names, empty, beside the orphaned volumes. That is a values \
+             difference, not a chart change: the release was installed with a \
+             `nameOverride` your curie.yaml does not declare.\n\n\
+             Fix it in the file rather than overriding the guard -- add the release's \
+             own name:\n\n\
+             \x20 set:\n\
+             \x20   nameOverride: <the name the live resources start with>\n\n\
+             then re-run `curie diff` and confirm the rename entries are gone.\n\n",
+        );
+    }
+
+    if removed
+        .iter()
+        .any(|r| r.cause == RemovalCause::ComponentGone)
+    {
+        msg.push_str(
+            "Component(s) the chart does not render at all usually mean a chart version \
+             renamed or removed them. Re-run with --migrate-store and apply will carry \
+             the data across itself: it stages every object, upgrades, loads them back, \
+             and verifies per object.\n\n",
+        );
+    }
+
+    msg.push_str("Use --allow-stateful-removal only to proceed WITHOUT the data.");
+    msg
 }
 
 /// Converge the cluster to the file.
@@ -1282,7 +1333,11 @@ mod stateful_guard_message_tests {
     /// safety-override, which trains the habit the guard exists to prevent.
     #[test]
     fn the_refusal_offers_migration_before_discarding() {
-        let msg = super::stateful_removal_message(&["acme-minio".to_string()]);
+        let msg = super::stateful_removal_message(&[crate::ops::StatefulRemoval {
+            name: "acme-minio".to_string(),
+            component: "minio".to_string(),
+            cause: crate::ops::RemovalCause::ComponentGone,
+        }]);
         let migrate = msg
             .find("--migrate-store")
             .expect("must offer --migrate-store");
@@ -1298,6 +1353,57 @@ mod stateful_guard_message_tests {
             "the discard flag must say what it costs:\n{msg}"
         );
         assert!(msg.contains("acme-minio"), "must name the component: {msg}");
+    }
+
+    /// A rename has a one-line fix in the operator's OWN file. If the refusal
+    /// does not say so, the only way past it is `--allow-stateful-removal` --
+    /// the guard would be arguing for the destruction it exists to prevent.
+    #[test]
+    fn a_rename_is_pointed_at_the_file_not_at_a_flag() {
+        let msg = super::stateful_removal_message(&[crate::ops::StatefulRemoval {
+            name: "acme-bot-postgres".to_string(),
+            component: "postgres".to_string(),
+            cause: crate::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
+        }]);
+        assert!(
+            msg.contains("nameOverride"),
+            "must name the value that causes it:\n{msg}"
+        );
+        assert!(
+            msg.contains("acme-bot-postgres") && msg.contains("acme-bot-curie-postgres"),
+            "must show both names, so the operator can see it IS their release:\n{msg}"
+        );
+        assert!(
+            !msg.contains("--migrate-store"),
+            "--migrate-store cannot fix a rename -- both sides run the same store, so \
+             there is nothing to migrate between. Offering it sends the operator down a \
+             path that dead-ends at --allow-stateful-removal:\n{msg}"
+        );
+    }
+
+    /// Both causes at once must not lose either remedy.
+    #[test]
+    fn a_mixed_batch_carries_both_remedies() {
+        let msg = super::stateful_removal_message(&[
+            crate::ops::StatefulRemoval {
+                name: "acme-bot-minio".to_string(),
+                component: "minio".to_string(),
+                cause: crate::ops::RemovalCause::ComponentGone,
+            },
+            crate::ops::StatefulRemoval {
+                name: "acme-bot-postgres".to_string(),
+                component: "postgres".to_string(),
+                cause: crate::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
+            },
+        ]);
+        assert!(msg.contains("nameOverride"), "{msg}");
+        assert!(msg.contains("--migrate-store"), "{msg}");
+        let discard = msg.find("--allow-stateful-removal").unwrap();
+        assert!(
+            msg.find("--migrate-store").unwrap() < discard
+                && msg.find("nameOverride").unwrap() < discard,
+            "the data-preserving remedies must still come before the discard flag:\n{msg}"
+        );
     }
 }
 
