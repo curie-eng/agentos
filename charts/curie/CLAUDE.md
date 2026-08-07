@@ -69,6 +69,38 @@ component and rail detail in `charts/curie/README.md`.
   install/upgrade instead, and every `helm upgrade` rolls it to refresh the
   cache. Do not flip the runner to `Always` and do not disable the prewarm
   on `:latest`-tag clusters without accepting stale-image risk.
+- **`values.schema.json` is deliberately permissive, not a full contract.**
+  The chart had no values schema at all before issue #1388; Helm now
+  validates the ENTIRE coalesced values tree against `values.schema.json`
+  on lint, template, install, and upgrade -- not just the keys a given
+  operation touches. Because of that blast radius, the schema stays
+  draft-07 with no top-level `required` and no `additionalProperties:
+  false`, and it types only the three bounded worker knobs
+  (`worker.claimTimeoutSeconds`, `worker.routeTtlSeconds`,
+  `worker.suspendedRouteTtlSeconds`). Adding a `required` or
+  `additionalProperties: false` constraint, or typing any other existing
+  key, would fail every install whose values file happens not to match the
+  new shape -- broaden the schema only for a key you are prepared to
+  validate across every current values file and overlay.
+  - Known trap: `api.githubAppId` must stay untyped. It reaches the
+    coalesced values tree as a JSON string when `curie cluster
+    github-app` sets it via `--set-string` (`cli/src/github_app.rs`,
+    deliberately, to dodge Helm's float64 round-trip on a bare numeric
+    `--set`), but as a number if anyone sets it with a plain `--set` or an
+    unquoted YAML override. Typing it either way in the schema breaks the
+    other path.
+  - Corollary: `--set-string` on any of the three bounded worker knobs now
+    fails by design -- a JSON string violates `type: integer` /
+    `type: number` even though the rendered env var is itself a quoted
+    string.
+  - The schema is not the only gate. Helm drops nil-valued keys during
+    values coalescing before schema validation runs, so
+    `--set worker.routeTtlSeconds=null` is not caught by the schema; it
+    renders an empty `CURIE_ROUTE_TTL_SECONDS` env value and is caught
+    instead by the worker's own boot-time refusal. Both checks are
+    load-bearing -- the schema catches a bad value early for the common
+    cases, the worker's refusal is the backstop for the coalescing gap the
+    schema cannot see.
 
 ## Verify
 

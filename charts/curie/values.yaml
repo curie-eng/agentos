@@ -768,6 +768,16 @@ worker:
   # bundle-fetch/extract init containers + runner boot + readiness) to bind
   # before giving up. Must stay below the worker's per-thread lock TTL (120s) so
   # the lock never lapses mid-claim; raise it only on a slow cluster.
+  #
+  # Must be greater than 0 and at most 31536000 (one year); values.schema.json
+  # makes helm refuse anything outside that at install/template time. 0 is
+  # accepted by YAML and renders fine, and makes every claim time out
+  # instantly -- unlike the two TTLs below, that degrades cleanly (a
+  # ClaimTimeoutError, caught and retried within bounds) rather than hanging
+  # and leaking, but it is never a value anyone means. Bounded here for
+  # parity with its siblings, read by the same loader, and because a
+  # non-positive or absurd claim timeout is a configuration error worth
+  # refusing at install time rather than discovering as a per-turn failure.
   claimTimeoutSeconds: 90
   # How long a thread PINS its sandbox after its last message. This is the term
   # that decides how MANY sandboxes exist at once, and it was the one an
@@ -785,11 +795,21 @@ worker:
   #
   # Lower it on a small node or a low-conversation-depth bot; raise it where
   # threads are genuinely conversational and cold creates are expensive.
+  #
+  # Must be greater than 0 and at most 31536000 (one year); values.schema.json
+  # makes helm refuse anything outside that at install/template time, because 0
+  # is accepted by YAML, renders fine, and used to boot healthy and then hang
+  # every turn while leaking a sandbox per attempt (#1388).
   routeTtlSeconds: 3600
   # The same, for a route suspended awaiting an approval -- it waits far longer
   # because the human may answer tomorrow. Exposed alongside the live TTL
   # because capping one while the other still pins a sandbox for a day would
   # only move the accumulation.
+  #
+  # Must be greater than 0 and at most 31536000 (one year); values.schema.json
+  # makes helm refuse anything outside that at install/template time, because 0
+  # is accepted by YAML, renders fine, and used to boot healthy and then hang
+  # every turn while leaking a sandbox per attempt (#1388).
   suspendedRouteTtlSeconds: 86400
   # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
   # shows next to the app's name while a turn runs. On by default -- the

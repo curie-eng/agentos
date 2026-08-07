@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "worker": {
+      "type": "object",
+      "properties": {
+        "claimTimeoutSeconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "description": "Seconds claim() waits for a cold sandbox create to bind. Must be greater than 0 and at most 31536000 (one year). 0 or a negative value installs green and then fails on every turn, so helm refuses it here rather than letting it reach worker env (issue #1388)."
+        },
+        "routeTtlSeconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "description": "Seconds a thread pins its sandbox after its last message. Must be greater than 0 and at most 31536000 (one year). Integer rather than number on purpose: a YAML float renders through the template's `| quote` as scientific notation for larger values (the class documented at ci/github-app-credential-assertions.sh:11), which the worker then cannot parse."
+        },
+        "suspendedRouteTtlSeconds": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 31536000,
+          "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
+        }
+      }
+    }
+  }
+}

@@ -225,6 +225,22 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/ephemeral-storage-assertions.sh
 
+      # Prove values.schema.json bounds the three worker TTL/timeout knobs at
+      # both ends (issue #1388): 0, a negative, 31536001 and a non-integer are
+      # refused by helm itself, while the shipped defaults, legitimate tuning
+      # and the value exactly at the maximum still render. `routeTtlSeconds: 0`
+      # is valid YAML that installs green and then hangs every turn, leaking a
+      # sandbox per attempt, so the value must never reach worker env. Also the
+      # blast-radius net for the schema: a chart-root values.schema.json is
+      # validated against the WHOLE coalesced values tree on
+      # lint/template/install/upgrade, so an over-specified one breaks every
+      # install, and this asserts every overlay this job already exercises
+      # still lints and renders clean.
+      - name: helm render assertions (worker TTL bounds)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-ttl-bounds-assertions.sh
+
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail

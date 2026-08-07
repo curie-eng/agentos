@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping
@@ -69,14 +70,78 @@ class Runtime:
     connector_loop: ConnectorReconcileLoop | None = None
 
 
+# 365 days, the ceiling shared by all three operator-tunable seconds knobs
+# (#1388). It is the smallest bound unambiguously above every legitimate
+# setting: 365x the shipped suspended_route_ttl_seconds default (86400) and
+# 8760x the route_ttl_seconds default (3600). It also sits ~9 orders of
+# magnitude below the boundary where Valkey's millisecond expiry arithmetic
+# overflows a signed 64-bit value and the store answers "value is not an
+# integer or out of range", so that failure class becomes structurally
+# unreachable rather than merely unlikely. And it doubles as an accumulation
+# guard in the spirit of #1380: route expiry IS the orphan signal reap_orphans
+# keys off, so a year-long route already means "never reaped by TTL" and
+# anything longer is definitionally a leak.
+_MAX_TUNABLE_SECONDS = 31_536_000
+
+
+def _bounded_seconds(
+    env: Mapping[str, str], name: str, cast: Callable[[str], int | float]
+) -> int | float | None:
+    """Read one operator-tunable seconds knob, or None when it is unset.
+
+    None means "leave the SubstrateConfig default in place", so an install that
+    sets nothing is unaffected. Everything else is refused at boot with a
+    ValueError naming the env var and the offending value, because these numbers
+    reach Valkey as expiries: a non-positive TTL makes ``SET ... EX 0`` raise a
+    ResponseError the kernel does not classify, and ``EXPIRE key 0`` silently
+    DELETES the route instead of erroring. Refusing here turns a first-message
+    hang that leaks a sandbox per attempt into a startup failure an operator can
+    read (#1388).
+    """
+    raw = env.get(name)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise ValueError(
+            f"{name} is set to an empty value ({raw!r}): unset it to take the "
+            f"default, or set a number of seconds greater than 0 and at most "
+            f"{_MAX_TUNABLE_SECONDS}"
+        )
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError) as exc:
+        kind = "a whole number of seconds" if cast is int else "a number of seconds"
+        raise ValueError(f"{name} must be {kind}, got {raw!r}") from exc
+    # inf (from "inf" or an overflowing literal like "1e400") makes the claim
+    # deadline never elapse, so the wait spins forever inside the per-thread
+    # lock; nan compares False against everything, so the wait never runs and
+    # every claim fails instantly. The bounds check below does reject all three
+    # on its own, but only because ``0 < nan`` happens to evaluate False --
+    # implicit IEEE semantics a later "simplification" of that line would break
+    # silently. This branch states the intent and owns the clearer message.
+    # It is scoped to the float path because only a float can be non-finite,
+    # and math.isfinite() on an int too large to convert to float raises
+    # OverflowError, which would escape this helper as something other than a
+    # ValueError naming the knob. Such an int is finite; the bounds check
+    # rejects it, in integer arithmetic, as out of range.
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number of seconds, got {raw!r}")
+    if not 0 < value <= _MAX_TUNABLE_SECONDS:
+        raise ValueError(
+            f"{name} must be greater than 0 and at most {_MAX_TUNABLE_SECONDS} "
+            f"seconds (365 days), got {raw!r}"
+        )
+    return value
+
+
 def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # claim_timeout is overridable so a slow cluster can raise it; when unset the
     # authoritative default lives in SubstrateConfig. Keep any override below the
     # per-thread lock TTL (WorkerConfig.lock_ttl_ms) -- see that comment.
     overrides: dict[str, Any] = {}
-    claim_timeout = env.get("CURIE_CLAIM_TIMEOUT_SECONDS")
+    claim_timeout = _bounded_seconds(env, "CURIE_CLAIM_TIMEOUT_SECONDS", float)
     if claim_timeout is not None:
-        overrides["claim_timeout_seconds"] = float(claim_timeout)
+        overrides["claim_timeout_seconds"] = claim_timeout
     # The route TTLs govern how long a thread PINS its sandbox, which is the
     # term that decides how many exist at once. Leaving them hardcoded while
     # claim_timeout was tunable gave operators the deadline knob but not the
@@ -84,12 +149,12 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     # slower (#1380). Both are exposed because they are the same mechanism:
     # capping the live TTL while a suspended route still pins a sandbox for a
     # day would just move the accumulation.
-    route_ttl = env.get("CURIE_ROUTE_TTL_SECONDS")
+    route_ttl = _bounded_seconds(env, "CURIE_ROUTE_TTL_SECONDS", int)
     if route_ttl is not None:
-        overrides["route_ttl_seconds"] = int(route_ttl)
-    suspended_route_ttl = env.get("CURIE_SUSPENDED_ROUTE_TTL_SECONDS")
+        overrides["route_ttl_seconds"] = route_ttl
+    suspended_route_ttl = _bounded_seconds(env, "CURIE_SUSPENDED_ROUTE_TTL_SECONDS", int)
     if suspended_route_ttl is not None:
-        overrides["suspended_route_ttl_seconds"] = int(suspended_route_ttl)
+        overrides["suspended_route_ttl_seconds"] = suspended_route_ttl
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),

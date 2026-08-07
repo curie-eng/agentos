@@ -8,12 +8,20 @@ CURIE_FAKE_MODEL must fail loudly instead of silently degrading to a fake.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
 from curie_worker.config import WorkerConfig
-from curie_worker.run import _sandbox_client, _substrate_config, _supervise, main
+from curie_worker.run import (
+    _MAX_TUNABLE_SECONDS,
+    _sandbox_client,
+    _substrate_config,
+    _supervise,
+    main,
+)
 from curie_worker.sandbox import DockerSandboxClient, SubstrateConfig
 
 _SUB = SubstrateConfig(namespace="default", warm_pool="pool")
@@ -77,6 +85,194 @@ def test_valkey_socket_timeout_exceeds_the_block_interval() -> None:
     # quiet across any read_block_ms tuning.
     cfg = WorkerConfig()
     assert cfg.valkey_socket_timeout_s > cfg.read_block_ms / 1000
+
+
+# --- #1388: the three operator-tunable seconds knobs are bounded at both ends ---
+#
+# Every assertion below goes through _substrate_config, the loader build() calls
+# at run.py:180 -- never through whatever private helper implements the bound.
+# A test bound to that helper would still pass if the helper were disconnected
+# from the loader, which is the regression these exist to catch.
+
+# The documented ceiling, 365 days. Duplicated as a JSON Schema literal in
+# charts/curie/values.schema.json; the accept/reject pair below is one half of
+# the four-assertion net that keeps the two literals from drifting apart (the
+# chart half is assertions (e) and (h) of
+# charts/curie/ci/worker-ttl-bounds-assertions.sh).
+_MAX_SECONDS = "31536000"
+_OVER_MAX_SECONDS = "31536001"
+
+
+def test_substrate_config_defaults_unchanged_by_the_bounds_guard() -> None:
+    # Full frozen-dataclass equality rather than field-by-field: it pins EVERY
+    # field at once, so bounding the three knobs cannot quietly move a default
+    # for the installs that set nothing.
+    assert _substrate_config({}) == SubstrateConfig(
+        namespace="default", warm_pool="curie-runner-pool"
+    )
+
+
+@pytest.mark.parametrize(
+    ("var", "raw"),
+    [
+        ("CURIE_ROUTE_TTL_SECONDS", "0"),
+        ("CURIE_ROUTE_TTL_SECONDS", "-1"),
+        ("CURIE_ROUTE_TTL_SECONDS", "-5"),
+        ("CURIE_SUSPENDED_ROUTE_TTL_SECONDS", "0"),
+        ("CURIE_SUSPENDED_ROUTE_TTL_SECONDS", "-1"),
+        ("CURIE_SUSPENDED_ROUTE_TTL_SECONDS", "-5"),
+        ("CURIE_CLAIM_TIMEOUT_SECONDS", "0"),
+        ("CURIE_CLAIM_TIMEOUT_SECONDS", "-1"),
+    ],
+)
+def test_substrate_config_refuses_a_non_positive_knob(var: str, raw: str) -> None:
+    # A non-positive value boots healthy today and fails on the FIRST message,
+    # unclassified: route_ttl 0 makes AffinityStore.put_if_absent issue
+    # SET ... NX EX 0, which real Valkey refuses. The refusal must name the env
+    # var so an operator can act on it without reading the traceback.
+    with pytest.raises(ValueError) as exc:
+        _substrate_config({var: raw})
+    assert var in str(exc.value)
+    # repr(raw), not raw: the bare "0" params are a substring of the 31536000 in
+    # the message's range text, so `raw in ...` would pass against a message that
+    # never echoed the operator's value at all. The message formats with {raw!r},
+    # so the quoted form is exact for every param and appears nowhere else.
+    assert repr(raw) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "CURIE_ROUTE_TTL_SECONDS",
+        "CURIE_SUSPENDED_ROUTE_TTL_SECONDS",
+        "CURIE_CLAIM_TIMEOUT_SECONDS",
+    ],
+)
+def test_substrate_config_refuses_above_the_documented_maximum(var: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        _substrate_config({var: _OVER_MAX_SECONDS})
+    assert var in str(exc.value)
+    assert _OVER_MAX_SECONDS in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("var", "field", "expected"),
+    [
+        ("CURIE_ROUTE_TTL_SECONDS", "route_ttl_seconds", 31536000),
+        ("CURIE_SUSPENDED_ROUTE_TTL_SECONDS", "suspended_route_ttl_seconds", 31536000),
+        ("CURIE_CLAIM_TIMEOUT_SECONDS", "claim_timeout_seconds", 31536000.0),
+    ],
+)
+def test_substrate_config_accepts_exactly_the_documented_maximum(
+    var: str, field: str, expected: float
+) -> None:
+    # The accept side of the boundary. Paired with the refusal above, it proves
+    # the bound is inclusive at 31536000 and not off by one, and it is what stops
+    # the Python constant and the chart schema's `maximum` from drifting apart.
+    assert getattr(_substrate_config({var: _MAX_SECONDS}), field) == expected
+
+
+def test_chart_schema_bounds_match_the_python_bound() -> None:
+    # The direct pin on the cross-language seam AGENTS.md names: a deploy-time
+    # validator and the runtime loader that re-parses the same value. The
+    # behavioural boundary pairs above and assertions (e)/(h) of
+    # charts/curie/ci/worker-ttl-bounds-assertions.sh read the seam from two
+    # ends; this reads the chart's own JSON and compares the literals, so
+    # moving either side alone fails here rather than shipping a helm that
+    # accepts a value the worker refuses at boot (or the reverse).
+    #
+    # Resolved from this file's location, not the working directory, so it
+    # holds whether pytest runs from the repo root or from apps/worker.
+    repo_root = Path(__file__).resolve().parents[3]
+    schema_path = repo_root / "charts" / "curie" / "values.schema.json"
+    worker = json.loads(schema_path.read_text())["properties"]["worker"]["properties"]
+    drift = (
+        f"{schema_path} and _MAX_TUNABLE_SECONDS in curie_worker/run.py have "
+        f"drifted apart. They are the same bound expressed in two languages and "
+        f"must move together: helm refuses the value at install time, the worker "
+        f"refuses it at boot, and changing one alone makes a chart the worker "
+        f"will not start under."
+    )
+    for knob in ("claimTimeoutSeconds", "routeTtlSeconds", "suspendedRouteTtlSeconds"):
+        maximum = worker[knob]["maximum"]
+        exclusive_minimum = worker[knob]["exclusiveMinimum"]
+        # isinstance(True, int) is True in Python, so a draft-4 style rewrite of
+        # the schema ("minimum": 0, "exclusiveMinimum": false -- which under
+        # draft-4 semantics legalizes the value 0, exactly what this branch
+        # exists to forbid) would satisfy `== 0` / `== _MAX_TUNABLE_SECONDS`
+        # without this bool exclusion, since False == 0 and (depending on the
+        # rewrite) True could stand in for a truthy bound. Require a real
+        # number, not a bool wearing one.
+        assert (
+            isinstance(exclusive_minimum, (int, float))
+            and not isinstance(exclusive_minimum, bool)
+            and exclusive_minimum == 0
+        ), f"{knob}: {drift}"
+        assert (
+            isinstance(maximum, (int, float))
+            and not isinstance(maximum, bool)
+            and maximum == _MAX_TUNABLE_SECONDS
+        ), f"{knob}: {drift}"
+
+
+@pytest.mark.parametrize("raw", ["abc", "3600.5", ""])
+def test_substrate_config_refuses_an_unparseable_ttl_naming_the_env_var(raw: str) -> None:
+    # int("abc") already raises ValueError today, so `pytest.raises(ValueError)`
+    # alone would pass against the unguarded loader. The env-var-name assertion
+    # is the load-bearing half: the bare message
+    # "invalid literal for int() with base 10: 'abc'" names nothing an operator
+    # can act on. The "" case is the only gate on the helm explicit-null path --
+    # `--set worker.routeTtlSeconds=null` renders CURIE_ROUTE_TTL_SECONDS present
+    # with an empty value, which the chart schema structurally cannot see (pinned
+    # from the other end by assertion (i) of
+    # charts/curie/ci/worker-ttl-bounds-assertions.sh).
+    with pytest.raises(ValueError) as exc:
+        _substrate_config({"CURIE_ROUTE_TTL_SECONDS": raw})
+    assert "CURIE_ROUTE_TTL_SECONDS" in str(exc.value)
+
+
+@pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "1e400"])
+def test_substrate_config_refuses_a_non_finite_claim_timeout(raw: str) -> None:
+    # The float-only failure mode a positivity check alone misses. float("inf")
+    # (and float("1e400"), which overflows to inf) makes
+    # `deadline = time.monotonic() + claim_timeout_seconds` at
+    # sandbox/substrate.py:217 never elapse, so the claim wait spins forever
+    # inside the per-thread lock. float("nan") is the mirror image: every `<`
+    # comparison against it is False, so the wait loop never runs and every
+    # claim fails instantly. Neither is caught by `value > 0`.
+    with pytest.raises(ValueError) as exc:
+        _substrate_config({"CURIE_CLAIM_TIMEOUT_SECONDS": raw})
+    assert "CURIE_CLAIM_TIMEOUT_SECONDS" in str(exc.value)
+    # The range check rejects all four on its own (inf fails the upper bound;
+    # -inf and nan fail `0 < value`), so `pytest.raises(ValueError)` plus the
+    # env-var name would pass with the non-finite branch deleted. Pinning the
+    # word "finite" is the only observable difference between the two
+    # implementations, so it is what makes this test discriminate.
+    assert "finite" in str(exc.value)
+    assert repr(raw) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "var",
+    [
+        "CURIE_ROUTE_TTL_SECONDS",
+        "CURIE_SUSPENDED_ROUTE_TTL_SECONDS",
+        "CURIE_CLAIM_TIMEOUT_SECONDS",
+    ],
+)
+def test_substrate_config_refuses_a_huge_integer_literal(var: str) -> None:
+    # An operator typo of the leaning-on-the-zero-key kind. int() accepts an
+    # arbitrarily large literal, and math.isfinite() converts its argument to a
+    # C double, so on the int knobs an unnarrowed isfinite() raises
+    # OverflowError -- an ArithmeticError, not a ValueError -- which escapes the
+    # loader entirely and reaches the operator as "int too large to convert to
+    # float", naming no env var and no value. The refusal must stay a ValueError
+    # that names the knob, the same as every other out-of-range input.
+    raw = "9" * 400
+    with pytest.raises(ValueError) as exc:
+        _substrate_config({var: raw})
+    assert var in str(exc.value)
+    assert repr(raw) in str(exc.value)
 
 
 def test_docker_without_credential_or_fake_fails_loudly() -> None:

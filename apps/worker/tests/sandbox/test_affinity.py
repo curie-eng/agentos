@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import redis
 from curie_worker.sandbox import AffinityStore, RouteRecord, RouteState, SandboxHandle
 
@@ -75,3 +76,36 @@ def test_live_claim_names_skips_expired_routes(affinity: AffinityStore) -> None:
 
     affinity.delete_if_claim("T2", "claim-b")
     assert affinity.live_claim_names() == {"claim-a"}
+
+
+# --- #1388: why a non-positive TTL is refused at boot rather than at the store ---
+#
+# Observed against the real Valkey 8.1.8 on the compose dev stack
+# (`docker compose -f compose.dev.yaml up -d valkey`, localhost:26379) on
+# 2026-08-07:
+#
+#   SET k v EX 0    -> redis.exceptions.ResponseError: invalid expire time in 'set' command
+#   SET k v EX -1   -> redis.exceptions.ResponseError: invalid expire time in 'set' command
+#   SET k v EX 10**20 -> redis.exceptions.ResponseError: value is not an integer or out of range
+#   EXPIRE k 0      -> 1 (True), and the key is DELETED
+#
+# These two tests pin that behavior, not the guard: they assert what the store
+# does when a bad TTL reaches it, which is the reason CURIE_ROUTE_TTL_SECONDS is
+# bounded in the worker's env loader (run.py) instead. ResponseError is not in
+# the kernel's _attempt catch tuple, so the first form escapes unclassified; the
+# EXPIRE form never raises at all and silently drops the route on a touch.
+
+
+def test_zero_ttl_put_if_absent_raises_valkey_response_error(affinity: AffinityStore) -> None:
+    with pytest.raises(redis.exceptions.ResponseError) as exc:
+        affinity.put_if_absent("T1", RouteRecord(handle=_handle()), ttl_seconds=0)
+    assert "invalid expire time" in str(exc.value)
+
+
+def test_zero_ttl_touch_reports_success_and_deletes_the_route(affinity: AffinityStore) -> None:
+    assert affinity.put_if_absent("T1", RouteRecord(handle=_handle()), ttl_seconds=60)
+
+    # The quietest failure of the three: touch() reports the refresh succeeded
+    # while EXPIRE has already removed the route the thread was pinned to.
+    assert affinity.touch("T1", ttl_seconds=0)
+    assert affinity.get("T1") is None

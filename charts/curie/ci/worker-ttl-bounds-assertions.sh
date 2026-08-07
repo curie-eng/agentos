@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+#
+# Render-assertion test for the worker TTL/timeout bounds (issue #1388).
+#
+# `worker.routeTtlSeconds: 0` is valid YAML, renders cleanly, installs green and
+# passes readiness -- and then fails on the FIRST message, because it reaches
+# Valkey as `SET ... NX EX 0`, which raises `invalid expire time in 'set'
+# command`. That exception is not classified by the kernel, so the turn hangs,
+# the entry is re-delivered to dead-letter, and every attempt leaks a sandbox.
+# `values.schema.json` makes helm refuse the value at install/template time so it
+# never reaches worker env at all. Nine assertions:
+#
+#   (a) POSITIVE, defaults: the render SUCCEEDS and the worker Deployment
+#       carries the three env vars at their shipped defaults.
+#   (b) POSITIVE, valid overrides: legitimate tuning (300 / 7200 / 45, the
+#       literals #1382's own tests use) still reaches worker env. This is the
+#       assertion that catches a schema so strict it refuses real operation.
+#   (c) NEGATIVE, zero: each of the three knobs at 0 fails the render.
+#   (d) NEGATIVE, negative: -5 fails the render, for each of the three knobs.
+#   (e) NEGATIVE, over the documented maximum: MAX + 1 fails the render, for
+#       each of the three knobs. MAX (31536000, one year in seconds) is
+#       defined once below and every executable assertion below derives from
+#       it; this header states the literal once and does not restate it.
+#   (f) NEGATIVE, non-integer TTL: 3600.5 fails the render for routeTtlSeconds
+#       and suspendedRouteTtlSeconds, proving `type: integer` is doing work. A
+#       YAML float renders through `| quote` as "4.47597e+06" for larger values
+#       -- the exact class documented at ci/github-app-credential-assertions.sh:11.
+#       claimTimeoutSeconds is `type: number`, not `integer`, so the same
+#       fractional shape is LEGAL there; (f) also pins that 45.5 renders and
+#       reaches worker env unrefused, so the integer/number split stays real.
+#   (g) BLAST RADIUS: every values combination helm-ci already exercises still
+#       lints and renders clean with the schema present. A chart-root
+#       values.schema.json is validated against the WHOLE coalesced values tree
+#       on lint/template/install/upgrade, so an over-specified schema breaks
+#       every install. This is the regression net for that.
+#   (h) POSITIVE, at max: MAX renders, for each of the three knobs. The
+#       accept side of the boundary. Without it a schema `maximum` that
+#       drifted BELOW MAX would still satisfy (e) while the worker's
+#       Python bound still accepted the value --
+#       the cross-language divergence the paired literal exists to prevent. The
+#       Python twin is test_substrate_config_accepts_exactly_the_documented_maximum
+#       in apps/worker/tests/test_run.py.
+#   (i) OBSERVED-BEHAVIOR PIN, explicit null: `--set worker.routeTtlSeconds=null`
+#       exits 0 and renders CURIE_ROUTE_TTL_SECONDS PRESENT WITH AN EMPTY VALUE
+#       (a bare `value:`, which the API server hands the container as "").
+#       Helm drops nil keys during values coalescing, which happens BEFORE schema
+#       validation, so no `type`, `exclusiveMinimum` or `not: {type: null}` can
+#       ever reach this case. This path is closed only by the worker loader's
+#       empty-string refusal, asserted from the other end by the "" case of
+#       test_substrate_config_refuses_an_unparseable_ttl_naming_the_env_var. (i)
+#       and that case are one seam read from two ends; deleting either removes
+#       half of the only gate on the null path.
+#
+# WORDING IS NOT ASSERTED, AND MUST NOT BECOME ASSERTED. Every negative below
+# checks only (1) that helm exited non-zero and (2) that the captured output
+# contains the bare knob name. The failure text comes from helm's own bundled
+# JSON-Schema validator, whose wording changed between the CI-pinned helm and
+# current helm while the pass/fail outcomes stayed identical:
+#
+#   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:41):
+#     - worker.routeTtlSeconds: Must be greater than 0
+#     - worker.routeTtlSeconds: Invalid type. Expected: integer, given: string
+#   helm 3.20.0:
+#     - at '/worker/routeTtlSeconds': exclusiveMinimum: got 0, want 0
+#     - at '/worker/routeTtlSeconds': got string, want integer
+#
+# The bare knob name is the only token common to both. Do NOT "improve" these
+# into greps for `Must be greater than`, `exclusiveMinimum`, `Invalid type`,
+# `want integer`, or the `- <path>: ` prefix shape: a wording-locked assertion
+# passes on the author's machine and fails in CI, or the reverse, for a reason
+# that has nothing to do with the chart.
+#
+# Runnable locally (from anywhere) and from CI. Fails loudly.
+set -euo pipefail
+
+CHART="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fail() { echo "FAIL [$1] $2" >&2; exit 1; }
+render() { helm template curie "$CHART" "$@" 2>&1; }
+
+# Reads the worker Deployment's env list by NAME out of a render, rather than
+# grepping: a value moving between containers, or a second container growing a
+# same-named var, is invisible to a grep and caught here.
+WORKER_ENV_PY="$(
+  cat <<'PY'
+import sys, yaml
+want = sys.argv[2:]
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(deploys) != 1:
+    raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
+containers = deploys[0]["spec"]["template"]["spec"]["containers"]
+env = {}
+for c in containers:
+    for e in c.get("env", []):
+        env[e["name"]] = e.get("value")
+for pair in want:
+    name, _, expected = pair.partition("=")
+    if name not in env:
+        raise SystemExit(f"{name} is not in the worker env (got {sorted(env)})")
+    got = env[name]
+    if expected == "":
+        # "present with an empty value". `nil | quote` emits a bare `value:`,
+        # which parses as null and which Kubernetes hands the container as an
+        # empty string; both spellings are the same thing to the worker.
+        if got not in (None, ""):
+            raise SystemExit(f"{name} rendered {got!r}, expected it present and empty")
+    elif got != expected:
+        raise SystemExit(f"{name} rendered {got!r}, expected {expected!r}")
+PY
+)"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+# Renders into a file and asserts the named env vars. Fails the assertion when
+# the render itself fails, so a broken schema can never make a content check
+# pass vacuously.
+assert_env() {
+  local letter="$1" out="$TMP/$1.yaml"
+  shift
+  local -a sets=()
+  while [ "$1" != "--" ]; do sets+=("$1"); shift; done
+  shift
+  if ! helm template curie "$CHART" -s templates/worker.yaml "${sets[@]}" >"$out" 2>&1; then
+    fail "$letter" "the render FAILED; it must succeed
+  $(head -5 "$out")"
+  fi
+  local msg
+  if ! msg="$(python3 -c "$WORKER_ENV_PY" "$out" "$@" 2>&1)"; then
+    fail "$letter" "$msg"
+  fi
+}
+
+# Asserts a render fails AND that its output names the knob. Captured rather
+# than piped: helm exits non-zero here by design, and under `set -o pipefail`
+# a pipeline would fail even when the check succeeds.
+assert_refused() {
+  local letter="$1" knob="$2"
+  shift 2
+  local out
+  if out="$(render "$@" 2>&1)"; then
+    fail "$letter" "helm accepted $* -- the schema must refuse it"
+  fi
+  grep -q "$knob" <<<"$out" \
+    || fail "$letter" "the refusal of $* does not name $knob
+  $(head -5 <<<"$out")"
+}
+
+# (a) The DEFAULT render must SUCCEED before anything else is asserted. A schema
+#     with a syntax error fails every render, which would make every negative
+#     below pass for the wrong reason -- the exact trap
+#     ci/api-ingress-assertions.sh:31-34 documents having fallen into. The
+#     negatives below render the WHOLE chart (via `render()`, no `-s`), so the
+#     guard must cover that same render shape, not just the worker template.
+helm template curie "$CHART" >/dev/null 2>&1 \
+  || fail a "the full-chart default render FAILED; every negative below would pass for the wrong reason"
+assert_env a -- \
+  CURIE_CLAIM_TIMEOUT_SECONDS=90 \
+  CURIE_ROUTE_TTL_SECONDS=3600 \
+  CURIE_SUSPENDED_ROUTE_TTL_SECONDS=86400
+
+# (b)
+assert_env b \
+  --set worker.routeTtlSeconds=300 \
+  --set worker.suspendedRouteTtlSeconds=7200 \
+  --set worker.claimTimeoutSeconds=45 \
+  -- \
+  CURIE_CLAIM_TIMEOUT_SECONDS=45 \
+  CURIE_ROUTE_TTL_SECONDS=300 \
+  CURIE_SUSPENDED_ROUTE_TTL_SECONDS=7200
+
+# The documented ceiling, one year in seconds. Defined once; every executable
+# assertion below that touches the bound (c/d/e via the loop, h) derives from
+# this variable rather than restating the literal.
+MAX=31536000
+OVER_MAX=$((MAX + 1))
+
+# (c), (d), (e). All three knobs refuse 0, -5 and OVER_MAX identically, so the
+# per-knob repetition carries no information; the loop keeps the coverage and
+# makes an added knob a one-word edit. (f) below is NOT folded in with them,
+# because its behaviour genuinely differs per knob.
+for knob in routeTtlSeconds suspendedRouteTtlSeconds claimTimeoutSeconds; do
+  assert_refused c "$knob" --set "worker.$knob=0"
+  assert_refused d "$knob" --set "worker.$knob=-5"
+  assert_refused e "$knob" --set "worker.$knob=$OVER_MAX"
+done
+
+# (f) `--set-json`, not `--set`: helm's `--set` parser hands 3600.5 to the
+# schema as the STRING "3600.5", which every type here (integer or number)
+# refuses -- that would pass this assertion even if `type: integer` were
+# edited away, since a string never satisfies `type: number` either.
+# `--set-json` delivers a genuine JSON number, so the refusal is actually
+# about `type: integer` and not about `--set`'s own string coercion.
+assert_refused f routeTtlSeconds --set-json worker.routeTtlSeconds=3600.5
+assert_refused f suspendedRouteTtlSeconds --set-json worker.suspendedRouteTtlSeconds=3600.5
+# claimTimeoutSeconds is `type: number`, so the same fractional JSON number is
+# legal there.
+assert_env f --set-json worker.claimTimeoutSeconds=45.5 -- CURIE_CLAIM_TIMEOUT_SECONDS=45.5
+
+# (g) BLAST RADIUS.
+helm lint "$CHART" >/dev/null 2>&1 \
+  || fail g "helm lint on defaults broke with the schema present"
+helm lint "$CHART" -f "$CHART/values-dev.yaml" >/dev/null 2>&1 \
+  || fail g "helm lint -f values-dev.yaml broke with the schema present"
+helm lint "$CHART" -f "$CHART/values-dev.yaml" -f "$CHART/values-e2e-nogvisor.yaml" \
+  >/dev/null 2>&1 \
+  || fail g "helm lint -f values-dev.yaml -f values-e2e-nogvisor.yaml broke"
+helm template curie "$CHART" -f "$CHART/values-e2e-harness.yaml" >/dev/null 2>&1 \
+  || fail g "helm template -f values-e2e-harness.yaml broke with the schema present"
+# api.githubAppId is an integer in values.yaml and a STRING when the CLI sets it
+# (cli/src/github_app.rs:52 uses --set-string). Typing it either way breaks one
+# of the two paths, so the schema must leave it untyped; this proves it did.
+helm template curie "$CHART" \
+  --set-string api.githubAppId=1234567 \
+  --set api.githubAppPrivateKey=X >/dev/null 2>&1 \
+  || fail g "the --set-string api.githubAppId path broke; the schema over-typed it"
+
+# (h) One chart key paired with the env var it must reach, so the maximum
+# appears once per side of the render rather than six times.
+for pair in \
+  routeTtlSeconds:CURIE_ROUTE_TTL_SECONDS \
+  suspendedRouteTtlSeconds:CURIE_SUSPENDED_ROUTE_TTL_SECONDS \
+  claimTimeoutSeconds:CURIE_CLAIM_TIMEOUT_SECONDS; do
+  assert_env h --set "worker.${pair%%:*}=$MAX" -- "${pair##*:}=$MAX"
+done
+
+# (i)
+assert_env i --set worker.routeTtlSeconds=null -- CURIE_ROUTE_TTL_SECONDS=
+
+echo "worker-ttl-bounds-assertions: all nine assertions passed"
