@@ -182,6 +182,15 @@ spec:
             # gives up. Must stay below the worker's per-thread lock TTL (120s).
             - name: CURIE_CLAIM_TIMEOUT_SECONDS
               value: {{ .Values.worker.claimTimeoutSeconds | quote }}
+            # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
+            # only: it both raises the caption and lowers it, so one value
+            # governs the feature release-wide and the two halves cannot be
+            # configured into disagreement (#1312). Deliberately absent from
+            # templates/dispatcher.yaml -- that service no longer reads it.
+            - name: CURIE_SHIMMER
+              value: {{ .Values.worker.shimmer | quote }}
+            - name: CURIE_STATUS_TEXT
+              value: {{ .Values.worker.statusText | quote }}
             # Runner model passthrough: the worker injects these into every claim
             # (fake model needs no credential; a real credential comes from the
             # chart Secret and is only wired when one is configured).

@@ -57,10 +57,6 @@ _DISPATCHER_OVERRIDES: dict[str, tuple[str, str, object]] = {
         "Sentinel placeholder.",
         "Sentinel placeholder.",
     ),
-    # Deliberately the NON-default value: shimmer now defaults to True, so a
-    # "true" -> True case would pass even if the alias were never read at all.
-    "CURIE_SHIMMER": ("shimmer", "false", False),
-    "CURIE_STATUS_TEXT": ("status_text", "is sentinel-working...", "is sentinel-working..."),
     "CURIE_BACKOFF_INITIAL_SECONDS": ("backoff_initial_seconds", "2.5", 2.5),
     "CURIE_BACKOFF_MAX_SECONDS": ("backoff_max_seconds", "45.5", 45.5),
     "CURIE_BACKOFF_MULTIPLIER": ("backoff_multiplier", "3.5", 3.5),
@@ -95,10 +91,10 @@ def test_alias_wins_over_bare_field_name(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_field_name_kwargs_still_populate() -> None:
     """populate_by_name construction (used by tests) is unchanged."""
-    config = DispatcherConfig(stream="s", shimmer=True)
+    config = DispatcherConfig(stream="s", dedupe_ttl_seconds=99)
 
     assert config.stream == "s"
-    assert config.shimmer is True
+    assert config.dedupe_ttl_seconds == 99
 
 
 def test_non_aliased_field_still_reads_plain_env(
@@ -133,8 +129,6 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.dedupe_prefix == "curie:dedupe:"
     assert config.dedupe_ttl_seconds == 3600
     assert config.placeholder_text == "On it. Working on your request."
-    assert config.status_text == "is working on your request..."
-    assert config.shimmer is True
     assert config.backoff_initial_seconds == 1.0
     assert config.backoff_max_seconds == 30.0
     assert config.backoff_multiplier == 2.0
@@ -245,45 +239,51 @@ def test_api_preflight_timeout_rejects_non_finite(
         DispatcherConfig()
 
 
-# --- Per-service bool divergence (review #178) -------------------------------
+# --- CURIE_SHIMMER has exactly one reader (#1312) -----------------------------
 #
-# The old dispatcher ``_set_bool`` accepted ("1", "true", "yes", "on") as truthy
-# -- it DOES treat "on" as truthy, unlike the worker's ``_b``. These lock that.
+# This block used to lock the OPPOSITE property. The dispatcher's bool parser
+# accepted "on" as truthy and the worker's did not, and a test named
+# ``test_bool_on_divergence_between_services`` asserted that split as intended
+# behavior -- while both services read CURIE_SHIMMER. So `CURIE_SHIMMER=on`
+# really meant "dispatcher raises the caption, worker never lowers it", and every
+# turn stranded a shimmer until Slack's own timeout. No operator could have
+# guessed that from the env name.
+#
+# #1312 removes the split at its source rather than aligning two parsers: the
+# worker is the only service that reads the flag now, so one string cannot mean
+# two things. These lock that there is still exactly one reader.
 
 
-@pytest.mark.parametrize(
-    "token", ["1", "true", "yes", "on", "ON", "On", " on ", "TRUE"]
-)
-def test_bool_dispatcher_truthy_tokens_including_on(
-    monkeypatch: pytest.MonkeyPatch, token: str
-) -> None:
-    """The dispatcher truthy set includes "on" (case/space-insensitive)."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_SHIMMER", token)
-
-    assert DispatcherConfig().shimmer is True
-
-
-@pytest.mark.parametrize("token", ["0", "no", "off", "", "maybe"])
-def test_bool_dispatcher_falsy_tokens(
-    monkeypatch: pytest.MonkeyPatch, token: str
-) -> None:
-    """Falsy tokens ("off" included) parse to False."""
-    _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_SHIMMER", token)
-
-    assert DispatcherConfig().shimmer is False
-
-
-def test_bool_on_divergence_between_services(
+def test_the_dispatcher_does_not_read_the_shimmer_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CURIE_SHIMMER=on: dispatcher True, worker False -- the documented per-service split."""
+    """No shimmer knob on this side -- the dispatcher makes no status call."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_SHIMMER", "true")
+    monkeypatch.setenv("CURIE_STATUS_TEXT", "is doing something")
+
+    config = DispatcherConfig()
+
+    assert not hasattr(config, "shimmer")
+    assert not hasattr(config, "status_text")
+
+
+@pytest.mark.parametrize("token", ["on", "true", "1", "yes", "off", "no", "0", ""])
+def test_no_shimmer_token_can_mean_two_things_across_services(
+    monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    """The regression that made this issue expensive: "on" parsed True on one
+    service and False on the other, so the caption was raised and never lowered.
+    With a single reader, whatever the worker decides IS the release's answer --
+    there is no second interpretation left to disagree with it."""
     from curie_worker.config import WorkerConfig
 
     _clear_all_config_env(monkeypatch)
-    monkeypatch.delenv("CURIE_SHIMMER", raising=False)
-    monkeypatch.setenv("CURIE_SHIMMER", "on")
+    monkeypatch.setenv("CURIE_SHIMMER", token)
 
-    assert DispatcherConfig().shimmer is True
-    assert WorkerConfig().shimmer is False
+    # The worker's reading is the only reading. Asserted as a property rather
+    # than a value table so this does not become a second copy of the worker's
+    # own token tests (apps/worker/tests/test_config.py).
+    assert isinstance(WorkerConfig().shimmer, bool)
+    assert "shimmer" not in DispatcherConfig().model_fields_set
+    assert "shimmer" not in type(DispatcherConfig()).model_fields

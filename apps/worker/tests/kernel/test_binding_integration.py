@@ -224,15 +224,95 @@ def test_shimmer_caption_uses_the_agents_load_pack(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_shimmer_no_caption_when_agent_has_no_load_or_tips(make_harness) -> None:
-    # Shimmer on but the agent enables neither pack: the kernel sets no caption,
-    # so the dispatcher's generic status stays.
+def test_the_generic_caption_is_set_when_the_agent_has_no_load_or_tips(
+    make_harness,
+) -> None:
+    """AC4, default configuration. Shimmer on, agent enables neither pack: the
+    kernel raises the operator's generic ``status_text``.
+
+    This assertion is inverted from what it was. It used to read
+    ``status_sets == []``, because the DISPATCHER supplied the generic caption
+    and the kernel only personalized it (#1312 moved both halves here). Two
+    things about the old version are worth keeping in view: it encoded a
+    cross-process assumption a single-process test could never check, and it was
+    missing its ``asyncio.run(go())`` -- the body never executed, so it would
+    have stayed green either way.
+    """
+
     async def go() -> None:
         binding = StubBinding({"C-bound": _resolved_with_packs({})})
-        async with make_harness(binding=binding, shimmer=True) as h:
+        async with make_harness(
+            binding=binding, shimmer=True, status_text="is working on your request..."
+        ) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tG"))
+            assert h.sink.status_sets == [
+                ("C-bound", "tG", "is working on your request...")
+            ]
+
+    asyncio.run(go())
+
+
+def test_a_blank_status_text_raises_no_generic_caption(make_harness) -> None:
+    """An operator who blanks the caption wants none. Setting an empty status
+    would read to Slack as a clear, not as a shimmer, so the kernel sends
+    nothing -- while a per-agent pack line, if configured, still wins."""
+
+    async def go() -> None:
+        binding = StubBinding({"C-bound": _resolved_with_packs({})})
+        async with make_harness(binding=binding, shimmer=True, status_text="") as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound"))
             assert h.sink.status_sets == []
+
+    asyncio.run(go())
+
+
+def test_the_caption_is_raised_before_it_is_lowered_even_on_a_fast_turn(
+    make_harness,
+) -> None:
+    """AC3/AC4, the race that used to be structural.
+
+    The dispatcher set the caption and the worker cleared it, in two processes
+    with no ordering between them. A turn that finished quickly -- a canned
+    behavior-pack reply needs no model call at all -- could clear before the
+    dispatcher's set landed, stranding a caption until Slack's own timeout. Both
+    halves are one ``await`` chain in one process now, so the ordering is a
+    property of the code rather than of who happened to win.
+
+    Asserted on ONE ordered log; two separate lists cannot show interleaving.
+    """
+
+    async def go() -> None:
+        binding = StubBinding({"C-bound": _resolved_with_packs({})})
+        async with make_harness(
+            binding=binding, shimmer=True, status_text="is working..."
+        ) as h:
+            # Terminal on the first frame: the fastest turn this harness can run.
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tR"))
+
+            kinds = [kind for kind, _thread, _status in h.sink.status_calls]
+            assert kinds == ["set", "clear"], f"raised then lowered, got {kinds}"
+            assert h.sink.status_calls[0] == ("set", "tR", "is working...")
+            assert h.sink.status_calls[-1][0] == "clear"
+
+    asyncio.run(go())
+
+
+def test_shimmer_off_raises_and_lowers_nothing(make_harness) -> None:
+    """AC4, disabled configuration. One flag, one consumer: off means the whole
+    feature is off, both halves. Before #1312 an operator had to set the same env
+    on two services, and the two parsers did not even agree on the token ``on``,
+    so a caption could be raised by one side and never lowered by the other."""
+
+    async def go() -> None:
+        packs = {"load": {"enabled": True, "lines": ["Working..."]}}
+        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        async with make_harness(binding=binding, shimmer=False) as h:
+            h.runner.default_script = [Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("hi", channel="C-bound"))
+            assert h.sink.status_calls == []
 
 
 def test_shimmer_off_never_sets_a_caption(make_harness) -> None:

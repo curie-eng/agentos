@@ -111,6 +111,12 @@ class FakeSink(SlackSink):
         self.update_endpoints: list[str | None] = []
         self.status_sets: list[tuple[str, str, str]] = []
         self.status_clears: list[tuple[str, str]] = []
+        # Sets and clears in ONE ordered log. The two lists above cannot express
+        # ordering between a set and a clear, and ordering is the property #1312
+        # turns on: both halves now run in this process, so "the caption was
+        # raised before it was lowered" has to be assertable, including for a
+        # turn that finishes almost instantly.
+        self.status_calls: list[tuple[str, str, str]] = []
         # New messages posted by the kernel (the approval card, #246): the
         # channel-neutral OutboundMessage the kernel emits (ADR-0020) plus its
         # framing -- (channel, message, requested_by, thread_ts, endpoint) per
@@ -164,11 +170,13 @@ class FakeSink(SlackSink):
         self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
     ) -> None:
         self.status_sets.append((channel, thread_ts, status))
+        self.status_calls.append(("set", thread_ts, status))
 
     async def clear_status(
         self, *, channel: str, thread_ts: str, endpoint: str | None = None
     ) -> None:
         self.status_clears.append((channel, thread_ts))
+        self.status_calls.append(("clear", thread_ts, ""))
 
     async def post(
         self,

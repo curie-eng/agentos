@@ -468,9 +468,13 @@ class Kernel:
                 # carry the routes attribute; absent means unbound (#247).
                 approval_routes = getattr(resolved, "approval_routes", None)
                 nav = packs.nav
-                # Personalize the shimmer: replace the dispatcher's generic status
-                # with this agent's sampled load line (+ tip). Best-effort and
-                # outside the concurrency-critical section, like the clear below.
+                # Raise the shimmer (#1312). Deliberately placed HERE, after the
+                # binding resolved and before ``_attempt`` claims a sandbox: a
+                # channel we are about to refuse never gets a caption that would
+                # flicker straight back off, and a cold claim (up to
+                # claim_timeout) is spent with the shimmer already lit rather than
+                # in silence. Best-effort and outside the concurrency-critical
+                # section, like the clear below.
                 if self._config.shimmer:
                     await self._set_shimmer(qevent, packs)
 
@@ -513,10 +517,16 @@ class Kernel:
                 await asyncio.sleep(self._backoff(attempt))
         finally:
             release_order()
-            # Clear the assistant-thread "shimmer" the dispatcher set, on every
-            # exit path (success, escalate, drop, or error). Best-effort and
+            # Lower the assistant-thread "shimmer" raised above, on every exit
+            # path (success, escalate, drop, or error). Best-effort and
             # idempotent -- it never repeats an action or blocks the turn, so it
             # is safe outside the concurrency-critical section above.
+            #
+            # Unconditional on the exit paths that never raised one (an unmapped
+            # channel, a paused agent, an already-done event) on purpose: clearing
+            # a status that was never set is a no-op on Slack's side, and the
+            # alternative is tracking "did we set it" across every early return in
+            # this function, which is more state on the sacred path for no gain.
             if self._config.shimmer:
                 await self._sink.clear_status(
                     channel=qevent.reply_handle.channel,
@@ -730,9 +740,21 @@ class Kernel:
         await self._markers.mark_done(qevent.event_id)
 
     async def _set_shimmer(self, qevent: QueuedTurn, packs: BehaviorPacks) -> None:
-        """Set the shimmer caption to this agent's sampled load line (+ tip),
-        seeded by the thread ts. No-op when the agent enables neither pack, so the
-        dispatcher's generic status stays. Best-effort (the sink swallows errors)."""
+        """Raise the shimmer for this turn, and own the only side that lowers it.
+
+        The caption is this agent's sampled load line (+ tip), seeded by the thread
+        ts, falling back to the operator's generic ``status_text`` when the agent
+        enables neither pack. That fallback is why this is unconditional now: the
+        dispatcher used to set the generic caption before enqueueing, so a slow
+        Slack call delayed the durable ``XADD`` of the turn, and set and clear
+        lived in two different processes where a fast turn could clear before the
+        set landed and strand a caption until Slack's own timeout (#1312). Both
+        halves are on this side now, ordered by the same ``await`` chain, so that
+        race cannot be expressed rather than merely being tested for.
+
+        Best-effort: the sink swallows errors, so a workspace without the
+        assistant feature costs one debug line and nothing else.
+        """
         load = sample_load(packs, qevent.conversation_id)
         tip = sample_tip(packs, qevent.conversation_id)
         if load and tip:
@@ -742,6 +764,10 @@ class Kernel:
         elif tip:
             caption = f"Tip: {tip}"
         else:
+            caption = self._config.status_text
+        if not caption:
+            # An operator who blanks status_text wants no caption at all; setting
+            # an empty status would read as a clear, not as a shimmer.
             return
         await self._sink.set_status(
             channel=qevent.reply_handle.channel,

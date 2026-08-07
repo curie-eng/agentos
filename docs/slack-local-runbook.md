@@ -67,7 +67,9 @@ frozen (issue #1182).
 
 Skipping the toggle is safe, just quiet: `assistant.threads.setStatus` is
 rejected, the call is swallowed best-effort (a debug log, never a failed turn),
-and you get no caption. Set `CURIE_SHIMMER=false` to stop attempting it at all.
+and you get no caption. Set `CURIE_SHIMMER=false` to stop attempting it at all --
+on the **worker**, which is the one service that raises and lowers the caption
+(#1312); the dispatcher does not touch it.
 
 ## 2. Bind an agent to your channel
 

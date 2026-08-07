@@ -5,6 +5,8 @@ API client (the only two things faked, per test discipline), and assert the full
 lifecycle step: envelope -> ack -> in-thread placeholder -> XADD to real Valkey.
 """
 
+import threading
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -130,11 +132,18 @@ def test_envelope_acked_placeholder_posted_and_enqueued(
     assert queued.reply_handle.placeholder == BOT_TS
 
 
-def test_shimmer_sets_assistant_status_after_placeholder(
+def test_the_dispatcher_makes_no_assistant_status_call(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    shimmer_config = config.model_copy(update={"shimmer": True})
-    app, web_client = _build(shimmer_config, redis_client)
+    """The shimmer left this side entirely (#1312).
+
+    It used to be set right here, between the placeholder and the XADD. That put
+    a best-effort cosmetic call -- one whose own failures are swallowed at debug
+    -- in front of the only moment a turn becomes durable. The worker raises and
+    lowers the caption now, so nothing on the ingest path can be slow on its
+    behalf.
+    """
+    app, web_client = _build(config, redis_client)
     web_client.assistant_threads_setStatus = MagicMock()  # type: ignore[method-assign]
     handler = SocketModeHandler(app, app_token="xapp-test")
     sock = FakeSocketClient()
@@ -142,40 +151,44 @@ def test_shimmer_sets_assistant_status_after_placeholder(
     handler.handle(sock, _events_api_request("env-1", "Ev-shim", _mention_event()))
     _drain(app)
 
-    # The shimmer status is set on the same thread as the placeholder, and it
-    # carries status_text -- NOT placeholder_text. Slack renders the status as
-    # "<App Name> <status>" and inserts the app name itself, so reusing the
-    # message body produced "Curie On it. Working on your request.".
-    web_client.assistant_threads_setStatus.assert_called_once_with(
-        channel_id="C123", thread_ts="1700.0001", status=shimmer_config.status_text
-    )
-    assert shimmer_config.status_text != shimmer_config.placeholder_text
-    # And the normal placeholder + enqueue still happen.
+    web_client.assistant_threads_setStatus.assert_not_called()
+    # The placeholder and the enqueue are untouched by the removal.
     assert redis_client.xlen(config.stream) == 1
 
 
-def test_shimmer_is_on_by_default_with_no_explicit_config(
+def test_a_slow_status_call_cannot_delay_the_enqueue(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
-    """The shipped default shimmers (#1182), not just an explicitly-enabled config.
+    """AC2, asserted on the clock rather than on a call count.
 
-    Deliberately does NOT model_copy the flag on: the point is that an operator
-    who configures nothing still gets the liveness caption, because during a turn
-    the placeholder only moves when the model emits text and a reasoning model can
-    stay silent for tens of seconds before its first token.
+    The Slack client here would block far past slack_sdk's own worst case (about
+    4.5s once its ConnectionErrorRetryHandler is counted) if anything on this
+    path still called it. Bolt runs listeners on five shared workers, so five
+    such calls used to be enough to stall ingestion with no visible explanation.
+    The turn must reach Valkey regardless -- and quickly, because nothing on this
+    path calls Slack for a status at all any more.
     """
-    assert config.shimmer is True, "the fixture must carry the shipped default"
+    stalled = threading.Event()
+
+    def _never_returns_in_time(**_kwargs: object) -> None:
+        stalled.set()
+        time.sleep(30)
+
     app, web_client = _build(config, redis_client)
-    web_client.assistant_threads_setStatus = MagicMock()  # type: ignore[method-assign]
+    web_client.assistant_threads_setStatus = _never_returns_in_time  # type: ignore[method-assign]
     handler = SocketModeHandler(app, app_token="xapp-test")
     sock = FakeSocketClient()
 
-    handler.handle(sock, _events_api_request("env-1", "Ev-default-shim", _mention_event()))
+    started = time.monotonic()
+    handler.handle(sock, _events_api_request("env-1", "Ev-slow-status", _mention_event()))
     _drain(app)
+    elapsed = time.monotonic() - started
 
-    web_client.assistant_threads_setStatus.assert_called_once_with(
-        channel_id="C123", thread_ts="1700.0001", status=config.status_text
-    )
+    assert redis_client.xlen(config.stream) == 1, "the turn must be durable"
+    assert not stalled.is_set(), "nothing on the ingest path may call setStatus"
+    # Generous by design: this is a regression guard against a multi-second
+    # blocking call reappearing here, not a latency benchmark on CI hardware.
+    assert elapsed < 5.0, f"enqueue waited {elapsed:.1f}s on a cosmetic call"
 
 
 def test_duplicate_delivery_enqueues_exactly_once(

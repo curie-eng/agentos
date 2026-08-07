@@ -75,7 +75,8 @@ The rendered result is `<App Name> <status>`, so a caption has to read as a
 | `Crunching the numbers...` | `Curie Crunching the numbers...` | ❌ |
 
 The platform default for the pack-free case follows the same rule
-(`CURIE_STATUS_TEXT`, default `is working on your request...`). It is a separate
+(`CURIE_STATUS_TEXT`, default `is working on your request...`, read by the
+worker). It is a separate
 setting from `CURIE_PLACEHOLDER_TEXT` precisely because the two surfaces have
 different grammar: the placeholder is a message body and stands alone, the
 caption is a sentence fragment glued to the app name.
@@ -87,8 +88,8 @@ disappears on its own. That is why it is safe to leave on: it is strictly
 additive to whatever the message is doing.
 
 **It is on by default, but a workspace has to enable one thing by hand.**
-`CURIE_SHIMMER` (read by both the dispatcher, which sets the caption, and the
-worker, which clears it) now defaults to on. The `assistant:write` scope ships in
+`CURIE_SHIMMER` (read by the worker, which both raises and lowers the caption
+since #1312) defaults to on. The `assistant:write` scope ships in
 [`slack-app-manifest.yaml`](../apps/dispatcher/slack-app-manifest.yaml), but the
 app-level **Agents & AI Apps** feature has no manifest key and must be switched
 on once in the app config. Until it is, `setStatus` is rejected, the call is
@@ -150,10 +151,11 @@ The intended integration points, once that review is scheduled:
 2. **Load/tips first-edit** -- in `Kernel._consume`, seed the `_ThrottledReply`
    with the sampled load line (optionally plus a tip) so the dispatcher's generic
    placeholder is replaced by the per-agent line before the first `text_delta`
-   arrives. (The *shimmer* half of this is now wired —
-   `apps/worker/src/curie_worker/kernel.py::Kernel._set_shimmer` replaces the
-   dispatcher's generic caption with the sampled load line plus tip. What remains
-   deferred is seeding the placeholder **message** itself.)
+   arrives. (The *shimmer* half of this is now wired --
+   `apps/worker/src/curie_worker/kernel.py::Kernel._set_shimmer` raises the
+   caption, using the sampled load line plus tip when the agent enables the packs
+   and `CURIE_STATUS_TEXT` otherwise. What remains deferred is seeding the
+   placeholder **message** itself.)
 
    ```python
    load = sample_load(packs, qevent.thread_ts)

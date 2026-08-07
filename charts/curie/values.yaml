@@ -769,6 +769,24 @@ worker:
   # before giving up. Must stay below the worker's per-thread lock TTL (120s) so
   # the lock never lapses mid-claim; raise it only on a slow cluster.
   claimTimeoutSeconds: 90
+  # The Slack assistant-thread "shimmer" (#1182): the animated caption Slack
+  # shows next to the app's name while a turn runs. On by default -- the
+  # placeholder message only changes when the model emits text, so a model that
+  # reasons before its first token leaves a thread looking frozen, and the
+  # caption is Slack's own affordance for exactly that. It edits no message and
+  # notifies nobody.
+  #
+  # One knob, one consumer: the worker raises the caption and lowers it, so this
+  # single value governs the feature for the whole release (#1312). The
+  # dispatcher does not touch the status. A workspace whose Slack app lacks the
+  # manually-enabled "Agents & AI Apps" feature simply gets no caption -- the
+  # call is best-effort and logs at debug -- so leaving this on is safe.
+  shimmer: true
+  # The caption text. Slack renders it as "<App Name> <status>" and supplies the
+  # app name, so write a CONTINUATION ("is working on your request..."), not a
+  # standalone sentence. Empty disables the generic caption while leaving any
+  # per-agent behavior-pack load line intact.
+  statusText: "is working on your request..."
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
   # worker Deployment so the worker's Slack sink posts placeholder edits at this
   # base URL instead of real Slack -- the seam `curie cluster message` drives when it
