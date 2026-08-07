@@ -173,8 +173,8 @@ class WorkerConfig(BaseSettings):
     # produced "Curie On it. Working on your request." in the shimmer.
     #
     # Read here rather than in the dispatcher since #1312 moved the whole shimmer
-    # to this side; the env name is unchanged, so an operator's existing setting
-    # keeps working. It is a plain literal, not a shared constant from
+    # to this side; the env name is unchanged. It is a plain literal, not a
+    # shared constant from
     # aci_protocol.service_config, because that module is for names BOTH services
     # read and only the worker reads this one now.
     # https://docs.slack.dev/reference/methods/assistant.threads.setStatus

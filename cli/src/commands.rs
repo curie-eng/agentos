@@ -7648,6 +7648,43 @@ pub fn overrides_patch_body(
     Some(serde_json::Value::Object(body))
 }
 
+/// The one-line human summary of an `overrides` result.
+///
+/// Pure so the wording is assertable. The spacing defect this replaced (#1394)
+/// existed precisely because the line was built inline in `render` and could
+/// only be checked by running the command and looking at it: an inspect
+/// interpolated an empty verb before the colon and printed
+/// `overrides for x : model ...`.
+///
+/// "platform default" rather than "none": a null here is not an absence, it is
+/// a deferral to the platform-level setting, and an operator reading "none"
+/// would reasonably expect no model at all.
+///
+/// Args:
+///   agent: the agent's name.
+///   model: the stored model override, `None` when the platform default applies.
+///   thinking: the stored thinking override, same convention.
+///   changed: whether this invocation wrote, as opposed to inspecting.
+///
+/// Returns:
+///   The summary line, with no trailing newline.
+pub fn overrides_summary(
+    agent: &str,
+    model: &Option<String>,
+    thinking: &Option<String>,
+    changed: bool,
+) -> String {
+    let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    // The verb carries its own leading space, so an inspect closes straight
+    // onto the colon instead of leaving a gap where a word used to be.
+    let verb = if changed { " now" } else { "" };
+    format!(
+        "overrides for {agent}{verb}: model {}, thinking {}",
+        show(model),
+        show(thinking)
+    )
+}
+
 /// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's two
 /// nullable overrides as the API stored them. Owns its data so it outlives the
 /// `ApiClient`.
@@ -7694,18 +7731,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 thinking,
                 changed,
             } => {
-                // "platform default" rather than "none": null here is not an
-                // absence, it is a deferral to the platform-level setting, and
-                // an operator reading "none" would reasonably expect no model.
-                let show = |v: &Option<String>| {
-                    v.clone().unwrap_or_else(|| "platform default".to_string())
-                };
-                let verb = if *changed { "now" } else { "" };
-                ui.payload(&format!(
-                    "overrides for {agent} {verb}: model {}, thinking {}",
-                    show(model),
-                    show(thinking)
-                ));
+                ui.payload(&overrides_summary(agent, model, thinking, *changed));
             }
         }
     }
@@ -7848,6 +7874,26 @@ mod overrides_tests {
                 "the refusal must name the flag that clears: {err}"
             );
         }
+    }
+
+    // #1394: an inspect used to print "overrides for a : model ..." because the
+    // verb was interpolated as an empty string before the colon.
+    #[test]
+    fn the_inspect_summary_has_no_gap_where_the_verb_would_be() {
+        let line = super::overrides_summary("a", &Some("kimi-k2".into()), &None, false);
+        assert_eq!(
+            line,
+            "overrides for a: model kimi-k2, thinking platform default"
+        );
+        assert!(!line.contains("  "), "no double space anywhere: {line}");
+    }
+
+    #[test]
+    fn a_write_summary_says_now_and_names_a_cleared_field_as_the_default() {
+        assert_eq!(
+            super::overrides_summary("a", &None, &Some("adaptive".into()), true),
+            "overrides for a now: model platform default, thinking adaptive"
+        );
     }
 
     #[test]

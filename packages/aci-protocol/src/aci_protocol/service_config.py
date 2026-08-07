@@ -2,9 +2,15 @@
 
 The worker and dispatcher are separate services that nonetheless read the SAME
 handful of platform env vars (the API base URL + key, the runs stream, the
-heartbeat file + interval, the shimmer flag). Those names used to be hand-mirrored
-as string literals in each service's pydantic config, so a rename could drift one
-out of sync with the other. They are declared ONCE here and imported by both.
+heartbeat file + interval). Those names used to be hand-mirrored as string
+literals in each service's pydantic config, so a rename could drift one out of
+sync with the other. They are declared ONCE here and imported by both.
+
+``SHIMMER_ENV`` is the exception and stays declared here on purpose: #1312 moved
+the whole shimmer to the worker, so only one service reads it today. The
+constant is kept because the name is an operator-facing contract that outlived
+the split, and because a second reader is exactly what this module exists to keep
+honest if the caption ever grows one.
 
 This module also owns the one-release deprecation of the platform-API-base-URL
 env name: the canonical name is ``CURIE_API_URL`` (the name the CLI and the
