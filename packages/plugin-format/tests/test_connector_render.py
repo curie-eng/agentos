@@ -457,13 +457,29 @@ def test_secret_file_reads_the_same_per_agent_secret_as_env_secrets() -> None:
     assert vol["items"] == [{"key": "K8S_READONLY_KUBECONFIG", "path": "kubeconfig"}]
 
 
-def test_secret_file_is_0400_and_not_optional() -> None:
-    # A credential, in a pod that already runs non-root with a read-only
-    # rootfs. `optional: False` matches `secrets:`: a missing key must stop the
-    # pod rather than start a server that 401s on every call.
+def test_secret_file_is_readable_by_the_nonroot_user_that_must_open_it() -> None:
+    # Regression: this shipped as 0400 and the server died with
+    #   open /secrets/kubeconfig: permission denied
+    # on a file that was mounted correctly. Secret volume files are owned by
+    # root:fsGroup, NOT by runAsUser, so owner-only is unreadable by the 65532
+    # the container runs as. 0440 + a matching fsGroup is the narrowest pair
+    # that actually opens.
+    pod = _file_dep(FILE_SPEC)["spec"]["template"]["spec"]
+    assert pod["volumes"][0]["secret"]["defaultMode"] == 0o440
+    assert pod["securityContext"]["fsGroup"] == pod["securityContext"]["runAsUser"]
+
+
+def test_secret_file_is_not_optional() -> None:
+    # Matches `secrets:`: a missing key must stop the pod rather than start a
+    # server that 401s on every call.
     vol = _file_dep(FILE_SPEC)["spec"]["template"]["spec"]["volumes"][0]["secret"]
-    assert vol["defaultMode"] == 0o400
     assert vol["optional"] is False
+
+
+def test_fsgroup_is_absent_when_nothing_is_projected() -> None:
+    # fsGroup applies to EVERY volume in the pod, so it is set only when a
+    # secret is actually projected as a file.
+    assert "fsGroup" not in _file_dep(HOSTED)["spec"]["template"]["spec"]["securityContext"]
 
 
 def test_each_secret_file_gets_its_own_volume() -> None:

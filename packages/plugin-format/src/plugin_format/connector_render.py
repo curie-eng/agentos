@@ -234,10 +234,14 @@ def render_deployment(
                 "secret": {
                     "secretName": secret_name,
                     "items": [{"key": secret_key, "path": PurePosixPath(mount_path).name}],
-                    # 0400: readable by the container's user, nobody else. These
-                    # are credentials in a pod that already runs non-root with a
-                    # read-only rootfs.
-                    "defaultMode": 0o400,
+                    # 0440, not 0400, and paired with the pod's fsGroup below.
+                    # Secret volume files are owned by root:fsGroup -- NOT by
+                    # runAsUser -- so an owner-only 0400 is unreadable by the
+                    # 65532 the container actually runs as, and the server dies
+                    # with `permission denied` on a file that is right there.
+                    # Group-readable plus a matching fsGroup is the narrowest
+                    # mode that a non-root container can actually open.
+                    "defaultMode": 0o440,
                     # Not optional, matching `secrets:` -- a missing key must
                     # stop the pod rather than start a server that 401s on every
                     # call.
@@ -270,6 +274,13 @@ def render_deployment(
                         "runAsNonRoot": True,
                         "runAsUser": 65532,
                         "seccompProfile": {"type": "RuntimeDefault"},
+                        # Only when a secret is projected as a file: it makes
+                        # the kubelet chgrp the volume so the non-root user can
+                        # read a 0440 credential. Omitted otherwise, because
+                        # fsGroup applies to every volume in the pod and there
+                        # is no reason to widen ownership for a connector that
+                        # mounts nothing.
+                        **({"fsGroup": 65532} if spec.secret_files else {}),
                     },
                     "containers": [
                         {
