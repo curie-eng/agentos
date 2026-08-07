@@ -122,6 +122,12 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # Substrate wiring: how the worker provisions sandboxes, not what it puts
         # inside one. SubstrateConfig reads these from the worker's env.
         "CURIE_CLAIM_TIMEOUT_SECONDS",
+        # How long a thread pins its sandbox, and how long a suspended one waits
+        # (#1380). Same family as the claim timeout above: the worker's own
+        # provisioning policy, decided before any sandbox exists, so never a
+        # boot key.
+        "CURIE_ROUTE_TTL_SECONDS",
+        "CURIE_SUSPENDED_ROUTE_TTL_SECONDS",
         "CURIE_DOCKER_NETWORK",
         "CURIE_NAMESPACE",
         # The Helm release name (ADR-0086, #1118). Read from the WORKER's env by

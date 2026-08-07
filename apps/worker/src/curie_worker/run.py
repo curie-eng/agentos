@@ -77,6 +77,19 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
     claim_timeout = env.get("CURIE_CLAIM_TIMEOUT_SECONDS")
     if claim_timeout is not None:
         overrides["claim_timeout_seconds"] = float(claim_timeout)
+    # The route TTLs govern how long a thread PINS its sandbox, which is the
+    # term that decides how many exist at once. Leaving them hardcoded while
+    # claim_timeout was tunable gave operators the deadline knob but not the
+    # accumulation knob -- and raising a deadline only makes a doomed turn fail
+    # slower (#1380). Both are exposed because they are the same mechanism:
+    # capping the live TTL while a suspended route still pins a sandbox for a
+    # day would just move the accumulation.
+    route_ttl = env.get("CURIE_ROUTE_TTL_SECONDS")
+    if route_ttl is not None:
+        overrides["route_ttl_seconds"] = int(route_ttl)
+    suspended_route_ttl = env.get("CURIE_SUSPENDED_ROUTE_TTL_SECONDS")
+    if suspended_route_ttl is not None:
+        overrides["suspended_route_ttl_seconds"] = int(suspended_route_ttl)
     return SubstrateConfig(
         namespace=env.get("CURIE_NAMESPACE", "default"),
         warm_pool=env.get("CURIE_WARM_POOL", "curie-runner-pool"),

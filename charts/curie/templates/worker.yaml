@@ -182,6 +182,13 @@ spec:
             # gives up. Must stay below the worker's per-thread lock TTL (120s).
             - name: CURIE_CLAIM_TIMEOUT_SECONDS
               value: {{ .Values.worker.claimTimeoutSeconds | quote }}
+            # How long a thread pins its sandbox after its last message -- the
+            # term that governs how many exist at once, and the one that used
+            # to be unreachable while the deadline above was tunable (#1380).
+            - name: CURIE_ROUTE_TTL_SECONDS
+              value: {{ .Values.worker.routeTtlSeconds | quote }}
+            - name: CURIE_SUSPENDED_ROUTE_TTL_SECONDS
+              value: {{ .Values.worker.suspendedRouteTtlSeconds | quote }}
             # Slack assistant-thread "shimmer" (#1182). Rendered on the WORKER
             # only: it both raises the caption and lowers it, so one value
             # governs the feature release-wide and the two halves cannot be

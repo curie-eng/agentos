@@ -34,6 +34,36 @@ def test_substrate_config_claim_timeout_reads_env() -> None:
     assert cfg.claim_timeout_seconds == 45.0
 
 
+def test_substrate_config_route_ttls_default_unchanged() -> None:
+    # Exposing these must not change behaviour for anyone who sets nothing.
+    cfg = _substrate_config({})
+    assert cfg.route_ttl_seconds == 3600
+    assert cfg.suspended_route_ttl_seconds == 86400
+
+
+def test_substrate_config_route_ttl_reads_env() -> None:
+    cfg = _substrate_config({"CURIE_ROUTE_TTL_SECONDS": "300"})
+    assert cfg.route_ttl_seconds == 300
+
+
+def test_substrate_config_suspended_route_ttl_reads_env() -> None:
+    cfg = _substrate_config({"CURIE_SUSPENDED_ROUTE_TTL_SECONDS": "7200"})
+    assert cfg.suspended_route_ttl_seconds == 7200
+
+
+def test_route_ttl_override_is_independent_of_claim_timeout() -> None:
+    # The regression this whole change exists for (#1380): an operator could
+    # reach the DEADLINE but not the ACCUMULATION term, so the only available
+    # lever made a doomed turn fail slower instead of reducing how many
+    # sandboxes were alive. Setting one must not disturb the other.
+    cfg = _substrate_config(
+        {"CURIE_ROUTE_TTL_SECONDS": "300", "CURIE_CLAIM_TIMEOUT_SECONDS": "45"}
+    )
+    assert cfg.route_ttl_seconds == 300
+    assert cfg.claim_timeout_seconds == 45.0
+    assert cfg.suspended_route_ttl_seconds == 86400
+
+
 def test_claim_timeout_default_stays_under_lock_ttl() -> None:
     # The claim is the dominant term in the per-thread critical section; it must
     # stay below the lock TTL so the lock never lapses mid-claim.
