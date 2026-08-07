@@ -11,6 +11,7 @@ real Postgres (and real Valkey/Langfuse); nothing here mocks them.
 import asyncio
 import os
 import secrets
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -155,3 +156,53 @@ def client(_disposable_db: Any) -> Any:
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"X-API-Key": get_settings().api_key}
+
+
+@pytest.fixture
+def isolated_migration_db() -> Iterator[None]:
+    """A throwaway database ALL to itself, for a test that downgrades/upgrades.
+
+    The session ``_disposable_db`` is shared across every test in the run, so
+    running ``alembic downgrade`` against it mid-suite disrupts siblings (the
+    approval sweeper tests seed rows and count them). apps/api/CLAUDE.md is
+    explicit: migrations are tested against a database of their own, never
+    shared state. This provisions one, points DATABASE_URL + alembic at it for
+    the test, and drops it after, restoring the session URL so nothing else is
+    perturbed.
+
+    Lives here rather than in one test module because it now has a second
+    consumer (the 0015 provenance backfill and the 0020 blank-override
+    backfill). A private copy per migration test is how the next one silently
+    diverges from whichever version its author happened to find.
+    """
+    base = make_url(get_settings().database_url)
+    run_db = f"curie_test_mig_{secrets.token_hex(4)}"
+
+    async def _admin(sql: str) -> None:
+        conn = await asyncpg.connect(
+            user=base.username,
+            password=base.password,
+            host=base.host,
+            port=base.port,
+            database="postgres",
+        )
+        try:
+            await conn.execute(sql)
+        finally:
+            await conn.close()
+
+    saved_url = os.environ.get("DATABASE_URL")
+    asyncio.run(_admin(f'CREATE DATABASE "{run_db}"'))
+    try:
+        os.environ["DATABASE_URL"] = base.set(database=run_db).render_as_string(
+            hide_password=False
+        )
+        get_settings.cache_clear()
+        yield
+    finally:
+        if saved_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = saved_url
+        get_settings.cache_clear()
+        asyncio.run(_admin(f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))

@@ -47,13 +47,23 @@ BLANKABLE_OVERRIDES = ("model", "thinking")
 
 def upgrade() -> None:
     for column in BLANKABLE_OVERRIDES:
-        # `~ '^[[:space:]]*$'` is the SQL spelling of the validator's
-        # `not value.strip()`, and the spelling matters: Postgres `TRIM()` strips
+        # `~ '^[[:space:]]*$'`, not `TRIM(col) = ''`: Postgres `TRIM()` strips
         # SPACES only, so `TRIM(E'\t ') = ''` is false and a tab-indented value
-        # would survive a backfill that claimed to match Python. The POSIX class
-        # covers space, tab, newline, carriage return, form feed and vertical tab,
-        # which is what `str.strip()` removes. Verified on a scratch database
-        # against a seeded `E'\t '` row, which the TRIM spelling did NOT collapse.
+        # survives a backfill that claims to catch it. Proven by mutation --
+        # swapping this line back to the TRIM spelling reds
+        # test_migration_0020_blank_overrides.py with "'tab' was not cleared".
+        #
+        # The POSIX class is close to the validator's `not value.strip()` but is
+        # NOT equal to it, and the earlier version of this comment claimed it was.
+        # Measured on postgres:16-alpine at en_US.utf8: the class matches space,
+        # tab, LF, CR, VT, FF, U+0085, U+2000, U+2028 and U+3000, while
+        # `str.strip()` additionally removes U+001C..U+001F, U+00A0, U+1680 and
+        # U+202F, which therefore survive. Accepted rather than widened: no
+        # shipped client can write one (the console trims, the create modal trims
+        # and omits, the CLI refuses a blank), and such a row behaves identically
+        # before and after #1374. The boundary is pinned by
+        # test_a_unicode_blank_survives_and_that_boundary_is_deliberate, so
+        # widening the predicate later is a decision rather than a drift.
         #
         # Rows already NULL are untouched, and a real value is only tested, never
         # rewritten -- an empty match set makes this a no-op.

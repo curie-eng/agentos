@@ -8,10 +8,8 @@ test-isolated runs stream as a valid frozen-contract QueuedTurn.
 """
 
 import asyncio
-import contextlib
 import json
 import os
-import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -21,7 +19,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import httpx
 import pytest
 import redis
@@ -44,7 +41,7 @@ from curie_test_support.valkey import (
     connect_or_skip,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import make_url, text
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -765,52 +762,7 @@ def test_create_approval_persists_gate_kind_and_granted_tool(
     assert legacy["granted_tool"] is None
 
 
-@contextlib.contextmanager
-def _isolated_migration_db() -> Iterator[None]:
-    """A throwaway database ALL to itself, for a test that downgrades/upgrades.
-
-    The session ``_disposable_db`` is shared across every test in this file, so
-    running ``alembic downgrade`` against it mid-suite disrupts siblings (the
-    sweeper tests seed rows and count them). apps/api/CLAUDE.md is explicit:
-    migrations are tested against a database of their own, never shared state.
-    This provisions one, points DATABASE_URL + alembic at it for the body, and
-    drops it after, restoring the session URL so no other test is perturbed.
-    """
-
-    base = make_url(get_settings().database_url)
-    run_db = f"curie_test_mig_{secrets.token_hex(4)}"
-
-    async def _admin(sql: str) -> None:
-        conn = await asyncpg.connect(
-            user=base.username,
-            password=base.password,
-            host=base.host,
-            port=base.port,
-            database="postgres",
-        )
-        try:
-            await conn.execute(sql)
-        finally:
-            await conn.close()
-
-    saved_url = os.environ.get("DATABASE_URL")
-    asyncio.run(_admin(f'CREATE DATABASE "{run_db}"'))
-    try:
-        os.environ["DATABASE_URL"] = base.set(database=run_db).render_as_string(
-            hide_password=False
-        )
-        get_settings.cache_clear()
-        yield
-    finally:
-        if saved_url is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = saved_url
-        get_settings.cache_clear()
-        asyncio.run(_admin(f'DROP DATABASE IF EXISTS "{run_db}" WITH (FORCE)'))
-
-
-def test_backfill_classifies_existing_rows() -> None:
+def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
     """(18) The migration backfills rows at rest, then round-trips.
 
     A prefixed summary is a genuine permission-gate block (the runner is the
@@ -827,31 +779,32 @@ def test_backfill_classifies_existing_rows() -> None:
     cfg = Config()
     cfg.set_main_option("script_location", str(ALEMBIC_DIR))
 
-    with _isolated_migration_db():
-        # Bring the fresh DB up to the full schema, then step back to BEFORE the
-        # provenance migration (0015) to the state an existing deployment holds.
-        # Target 0014 explicitly rather than a relative "-1": a later migration
-        # (e.g. 0016) moving head would make "-1" stop short of undoing 0015, and
-        # the backfill would never re-run on the seeded rows.
-        command.upgrade(cfg, "head")
-        command.downgrade(cfg, "0014")
-        permission_id = uuid.uuid4()
-        policy_id = uuid.uuid4()
-        _seed_raw_approval(
-            permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}'
-        )
-        _seed_raw_approval(policy_id, "Give ACME a 20% discount")
-        command.upgrade(cfg, "head")
+    # Bring the fresh DB up to the full schema, then step back to BEFORE the
+    # provenance migration (0015) to the state an existing deployment holds.
+    # Target 0014 explicitly rather than a relative "-1": a later migration
+    # (e.g. 0016) moving head would make "-1" stop short of undoing 0015, and
+    # the backfill would never re-run on the seeded rows.
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "0014")
+    permission_id = uuid.uuid4()
+    policy_id = uuid.uuid4()
+    _seed_raw_approval(
+        permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}'
+    )
+    _seed_raw_approval(policy_id, "Give ACME a 20% discount")
+    command.upgrade(cfg, "head")
 
-        assert _read_provenance(permission_id) == ("permission", "Bash")
-        assert _read_provenance(policy_id) == ("policy", None)
+    assert _read_provenance(permission_id) == ("permission", "Bash")
+    assert _read_provenance(policy_id) == ("policy", None)
 
-        # And the revision round-trips cleanly rather than only migrating forward.
-        command.downgrade(cfg, "-1")
-        command.upgrade(cfg, "head")
+    # And the revision round-trips cleanly rather than only migrating forward.
+    command.downgrade(cfg, "-1")
+    command.upgrade(cfg, "head")
 
 
-def test_gate_kind_check_constraint_rejects_unknown_values() -> None:
+def test_gate_kind_check_constraint_rejects_unknown_values(
+    isolated_migration_db: None,
+) -> None:
     """(#544) The DB-layer guard on the security-load-bearing gate_kind column.
 
     ``gate_kind`` is trusted in a worker security branch (binding.py:
@@ -891,16 +844,15 @@ def test_gate_kind_check_constraint_rejects_unknown_values() -> None:
         finally:
             await engine.dispose()
 
-    with _isolated_migration_db():
-        command.upgrade(cfg, "head")
-        # Accepted: the two literals plus NULL (NULL IN (...) is NULL, not
-        # FALSE, so the CHECK passes -- the old-runner / pre-backfill case).
-        asyncio.run(_insert("permission"))
-        asyncio.run(_insert("policy"))
-        asyncio.run(_insert(None))
-        # Rejected: anything outside the closed set trips ck_approvals_gate_kind.
-        with pytest.raises(IntegrityError):
-            asyncio.run(_insert("bogus"))
+    command.upgrade(cfg, "head")
+    # Accepted: the two literals plus NULL (NULL IN (...) is NULL, not
+    # FALSE, so the CHECK passes -- the old-runner / pre-backfill case).
+    asyncio.run(_insert("permission"))
+    asyncio.run(_insert("policy"))
+    asyncio.run(_insert(None))
+    # Rejected: anything outside the closed set trips ck_approvals_gate_kind.
+    with pytest.raises(IntegrityError):
+        asyncio.run(_insert("bogus"))
 
 
 def test_route_bound_approval_authorizes_against_card_channel(
