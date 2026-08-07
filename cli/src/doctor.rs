@@ -289,6 +289,28 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
     out
 }
 
+/// Point at the guided path when there is more than one thing to fix.
+///
+/// A single missing item needs no signpost: the `→ fix` line beside it is the
+/// whole answer. Several is different -- the fixes have an order, some depend
+/// on values the operator has not collected yet, and reading eight lines and
+/// sequencing them is exactly the work the guided workflow already does.
+///
+/// `curie` with no arguments opens that workflow. It is discoverable in
+/// principle and invisible in practice, because a first-time user reaching for
+/// help types `curie --help` and gets an alphabetical list of eighteen verbs
+/// with `interactive` eleventh.
+pub fn guidance(checks: &[Check]) -> Option<String> {
+    let missing = checks.iter().filter(|c| c.state == State::Missing).count();
+    if missing < 2 {
+        return None;
+    }
+    Some(format!(
+        "{missing} things to set up. Run `curie` with no arguments for a guided \
+         walkthrough, or fix them one at a time with the commands above."
+    ))
+}
+
 /// The one-line verdict: what this install can do right now.
 ///
 /// Deliberately capability-shaped rather than a count. "3 of 8 checks passed"
@@ -349,6 +371,61 @@ mod tests {
             bundle_name: Some("my-agent".into()),
             ..Default::default()
         }
+    }
+
+    fn checks_with(missing: usize) -> Vec<Check> {
+        (0..missing)
+            .map(|i| Check {
+                id: "x",
+                title: "t",
+                state: State::Missing,
+                detail: format!("{i}"),
+                fix: None,
+            })
+            .collect()
+    }
+
+    /// One gap needs no signpost -- the `-> fix` beside it is the whole answer.
+    /// Sending someone to a TUI to set one environment variable is worse than
+    /// telling them the variable.
+    #[test]
+    fn a_single_gap_does_not_advertise_the_walkthrough() {
+        assert_eq!(guidance(&checks_with(0)), None);
+        assert_eq!(guidance(&checks_with(1)), None);
+    }
+
+    /// Several gaps have an ORDER and depend on values not yet collected, which
+    /// is the work the guided workflow exists to do.
+    #[test]
+    fn several_gaps_name_the_guided_path() {
+        let hint = guidance(&checks_with(3)).expect("should advertise");
+        assert!(hint.contains("3 things"), "{hint}");
+        assert!(hint.contains("`curie`"), "must name the command: {hint}");
+        assert!(
+            hint.contains("one at a time"),
+            "must leave the manual path open: {hint}"
+        );
+    }
+
+    /// A check that is NotApplicable is not a gap. Counting it would advertise
+    /// a walkthrough for a cluster the operator does not have.
+    #[test]
+    fn checks_that_do_not_apply_are_not_counted_as_gaps() {
+        let mut checks = checks_with(1);
+        for i in 0..4 {
+            checks.push(Check {
+                id: "n",
+                title: "t",
+                state: State::NotApplicable,
+                detail: format!("{i}"),
+                fix: None,
+            });
+        }
+        assert_eq!(
+            guidance(&checks),
+            None,
+            "one real gap plus four n/a is one gap"
+        );
     }
 
     /// Cluster, release, Slack and clone credential all in place.
@@ -794,6 +871,7 @@ impl crate::ui::CliOutput for DoctorOutput {
             "summary": self.summary,
             "ready": self.checks.iter().all(|c| c.state != State::Missing),
             "checks": self.checks,
+            "guidance": guidance(&self.checks),
         })
     }
 
@@ -811,6 +889,9 @@ impl crate::ui::CliOutput for DoctorOutput {
         }
         ui.payload_plain("");
         ui.payload_plain(&self.summary);
+        if let Some(hint) = guidance(&self.checks) {
+            ui.payload_plain(&hint);
+        }
     }
 }
 
