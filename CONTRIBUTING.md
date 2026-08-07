@@ -8,17 +8,6 @@ Read [`AGENTS.md`](AGENTS.md) alongside this guide: it is the authoritative
 source for the build, test, and architecture conventions summarized here, and
 each area's own `CLAUDE.md` carries the rules specific to that directory.
 
-<!-- TODO(maintainer): Decision 1 (issue #635) - confirm whether outside pull
-     requests are accepted and what scope is welcome. This guide is written
-     assuming community PRs are welcome. If that holds, delete this comment and
-     the placeholder scope note below and state the accepted scope plainly, for
-     example:
-     - Bug fixes and documentation: welcome freely.
-     - New connectors, CLI verbs, or UI surfaces: via an issue first.
-     - Changes to the frozen contracts: never as a drive-by.
-     If outside PRs are NOT accepted, say so here instead and describe how to
-     propose changes. -->
-
 ## Scope of contributions
 
 We welcome bug reports, documentation improvements, tests, and focused feature
@@ -26,9 +15,6 @@ work. Before starting anything larger than a bug fix or a docs tweak, please
 open a GitHub issue describing the change so a maintainer can confirm it fits
 the project's direction. This is especially important for anything that touches
 a cross-component seam or a frozen contract (see below).
-
-> TODO(maintainer): confirm the accepted contribution scope for the public
-> announcement, then finalize the paragraph above.
 
 ## Before you start
 
