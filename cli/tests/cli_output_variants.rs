@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, DeleteOutput, KillOutput, MemoryOutput, ResetThreadOutput,
-    ResumeOutput, SkillApprovalsOutput, VersionsOutput,
+    ApprovalsOutput, BudgetOutput, DeleteOutput, KillOutput, MemoryOutput, OverridesOutput,
+    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::github_app::GithubAppOutput;
@@ -204,6 +204,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => BudgetOutput::DryRun(plan()),
             "Done" => BudgetOutput::Done { agent: "a".to_string(), max_usd_per_day: Some(1.5) },
+        ],
+    );
+    m.insert(
+        "OverridesOutput",
+        samples![
+            "DryRun" => OverridesOutput::DryRun(plan()),
+            // Both nullable fields carry a value here, and the null case rides
+            // the schema's `["string","null"]` type plus the round-trip tests
+            // in api_lifecycle.rs -- a sample per VARIANT is what this gate
+            // wants, not a sample per field state.
+            "Done" => OverridesOutput::Done {
+                agent: "a".to_string(),
+                model: Some("kimi-k2".to_string()),
+                thinking: Some("adaptive".to_string()),
+                changed: true,
+            },
         ],
     );
     m.insert(

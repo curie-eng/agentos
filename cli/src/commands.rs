@@ -7549,3 +7549,320 @@ mod tests {
         );
     }
 }
+
+/// Which nullable override a `<tier> overrides` invocation intends to change.
+///
+/// Three states, because the API's PATCH semantics have three (#1310): omitted
+/// leaves the stored value alone, an explicit JSON null clears it back to the
+/// platform default, and a string pins it. A plain `Option<String>` can only
+/// express two of those, and collapsing "clear" onto the empty string is the
+/// exact defect #1355 fixed on the console -- an empty override reaches the
+/// worker falsy, emits no boot key, and skips the platform default that
+/// clearing is supposed to restore. So the CLI never sends `""` either; the
+/// operator says `--clear-model` and the wire carries `null`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideChange {
+    /// Not mentioned on the command line: leave whatever is stored.
+    Unchanged,
+    /// `--clear-<field>`: send explicit null, restoring the platform default.
+    Clear,
+    /// `--<field> <value>`: pin this value for this agent.
+    Set(String),
+}
+
+impl OverrideChange {
+    /// Resolve the `--<field>` / `--clear-<field>` pair into one intent.
+    ///
+    /// Args:
+    ///   field: the field name, used only in the usage error.
+    ///   value: the `--<field>` value, if the operator passed one.
+    ///   clear: whether `--clear-<field>` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when both were passed or the value is
+    ///   blank.
+    pub fn resolve(field: &str, value: Option<String>, clear: bool) -> Result<Self> {
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(format!(
+                "--{field} and --clear-{field} contradict each other; pass one. \
+                 --clear-{field} restores the platform default"
+            ))),
+            // Refused here rather than forwarded, so the operator gets the fix
+            // from the CLI instead of a 422 from the API. The API refuses it
+            // too (#1355), and for the reason the hint states.
+            (Some(v), false) if v.trim().is_empty() => Err(crate::exit::usage(format!(
+                "--{field} must not be blank: an empty value skips the platform \
+                 default instead of restoring it. Pass --clear-{field} to clear \
+                 the override, or a real value"
+            ))),
+            (Some(v), false) => Ok(OverrideChange::Set(v)),
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
+
+    /// The JSON value this intent contributes to a `PATCH /agents/{id}` body,
+    /// or `None` when the field must be OMITTED from the body entirely.
+    ///
+    /// Returns:
+    ///   `Some(Value::Null)` to clear, `Some(Value::String)` to pin, `None` to
+    ///   leave the field out so the API's `model_fields_set` check reads it as
+    ///   unchanged.
+    fn patch_value(&self) -> Option<serde_json::Value> {
+        match self {
+            OverrideChange::Unchanged => None,
+            OverrideChange::Clear => Some(serde_json::Value::Null),
+            OverrideChange::Set(v) => Some(serde_json::Value::String(v.clone())),
+        }
+    }
+}
+
+/// The `PATCH /agents/{id}` body for a `<tier> overrides` write, or `None` when
+/// nothing was asked for (the inspect path).
+///
+/// Pure so the three-way semantics are assertable with no server: the property
+/// that matters is that an Unchanged field is ABSENT from the body rather than
+/// present-and-null, since the API tells those apart with `model_fields_set`
+/// and present-and-null is the clear.
+///
+/// Args:
+///   model: the intent for the model override.
+///   thinking: the intent for the thinking override.
+///
+/// Returns:
+///   The body to PATCH, or `None` when both intents are `Unchanged`.
+pub fn overrides_patch_body(
+    model: &OverrideChange,
+    thinking: &OverrideChange,
+) -> Option<serde_json::Value> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = model.patch_value() {
+        body.insert("model".to_string(), v);
+    }
+    if let Some(v) = thinking.patch_value() {
+        body.insert("thinking".to_string(), v);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(body))
+}
+
+/// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's two
+/// nullable overrides as the API stored them. Owns its data so it outlives the
+/// `ApiClient`.
+///
+/// `model`/`thinking` are `None` when no override is pinned, which is the same
+/// fact the API returns as JSON null: the platform default applies. `changed`
+/// distinguishes an inspect from a write, so an agent consumer can tell "this
+/// is what it is" from "this is what it now is" without diffing.
+#[derive(Debug)]
+pub enum OverridesOutput {
+    DryRun(crate::ui::DryRunPlan),
+    Done {
+        agent: String,
+        model: Option<String>,
+        thinking: Option<String>,
+        changed: bool,
+    },
+}
+
+impl crate::ui::CliOutput for OverridesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            OverridesOutput::DryRun(plan) => plan.to_json(),
+            OverridesOutput::Done {
+                agent,
+                model,
+                thinking,
+                changed,
+            } => serde_json::json!({
+                "agent": agent,
+                "model": model,
+                "thinking": thinking,
+                "changed": changed,
+            }),
+        }
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            OverridesOutput::DryRun(plan) => plan.render(ui),
+            OverridesOutput::Done {
+                agent,
+                model,
+                thinking,
+                changed,
+            } => {
+                // "platform default" rather than "none": null here is not an
+                // absence, it is a deferral to the platform-level setting, and
+                // an operator reading "none" would reasonably expect no model.
+                let show = |v: &Option<String>| {
+                    v.clone().unwrap_or_else(|| "platform default".to_string())
+                };
+                let verb = if *changed { "now" } else { "" };
+                ui.payload(&format!(
+                    "overrides for {agent} {verb}: model {}, thinking {}",
+                    show(model),
+                    show(thinking)
+                ));
+            }
+        }
+    }
+}
+
+/// `curie <tier> overrides <agent> [--model V|--clear-model] [--thinking V|--clear-thinking]`.
+///
+/// With no change flags this INSPECTS: one `GET`-resolved agent, no write. With
+/// any change flag it PATCHes only the fields named, then reports the row as the
+/// API stored it, so the operator sees what took rather than what was intended.
+///
+/// Covers both nullable overrides in one verb on purpose. The issue (#1311)
+/// names `thinking` only, but `model` has the identical gap -- also settable
+/// only by raw PATCH, also omitted from the CLI DTO -- and the two share the
+/// API's `_nullable_override_validator` and its three-way semantics. Splitting
+/// them would mean two verbs, two committed schemas and two manifest
+/// regenerations for one concept, and would leave the sibling defect open for
+/// exactly as long as it took someone to file it again.
+///
+/// Args:
+///   opts: api url/key, the agent name or id, and the dry-run flag.
+///   model: the intent for the model override.
+///   thinking: the intent for the thinking override.
+///
+/// Returns:
+///   The stored overrides, or the dry-run plan.
+pub async fn overrides(
+    opts: AgentActionOpts,
+    model: OverrideChange,
+    thinking: OverrideChange,
+) -> Result<OverridesOutput> {
+    let ui = crate::ui::ui();
+    let body = overrides_patch_body(&model, &thinking);
+    if opts.dry_run {
+        let plan = match &body {
+            Some(b) => format!(
+                "PATCH {}/agents/<id>  {b}  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            ),
+            None => format!(
+                "GET {}/agents  (read-only: would resolve agent {:?} and print its overrides)",
+                opts.api_url, opts.agent
+            ),
+        };
+        return Ok(OverridesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![plan],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let Some(body) = body else {
+        // Inspect: find_agent already carries both fields, so there is nothing
+        // further to fetch and nothing to write.
+        return Ok(OverridesOutput::Done {
+            agent: agent.name,
+            model: agent.model,
+            thinking: agent.thinking,
+            changed: false,
+        });
+    };
+    let cl = ui.checklist();
+    let step = cl.step(&format!("updating overrides for {}", agent.name));
+    let saved = match client.update_agent(&agent.id, &body).await {
+        Ok(saved) => {
+            step.done("updated");
+            saved
+        }
+        Err(err) => {
+            step.fail("failed");
+            return Err(err);
+        }
+    };
+    Ok(OverridesOutput::Done {
+        agent: saved.name,
+        model: saved.model,
+        thinking: saved.thinking,
+        changed: true,
+    })
+}
+
+#[cfg(test)]
+mod overrides_tests {
+    use super::{overrides_patch_body, OverrideChange};
+
+    // The property the whole verb rests on (#1310, #1311): an UNCHANGED field is
+    // absent from the body, a CLEARED field is present and null. The API tells
+    // those apart with `model_fields_set`, so collapsing them means "leave this
+    // alone" silently becomes "reset this to the platform default".
+    #[test]
+    fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
+        let body = overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Clear)
+            .expect("a clear is a write");
+        let obj = body.as_object().expect("an object");
+        assert!(
+            !obj.contains_key("model"),
+            "unchanged must be absent: {body}"
+        );
+        assert_eq!(obj.get("thinking"), Some(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn both_unchanged_is_no_body_at_all_which_is_the_inspect_path() {
+        assert!(
+            overrides_patch_body(&OverrideChange::Unchanged, &OverrideChange::Unchanged).is_none()
+        );
+    }
+
+    #[test]
+    fn a_set_field_carries_its_value() {
+        let body = overrides_patch_body(
+            &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Set("adaptive".into()),
+        )
+        .expect("a set is a write");
+        assert_eq!(body["model"], "kimi-k2");
+        assert_eq!(body["thinking"], "adaptive");
+    }
+
+    // --value and --clear-value are contradictory, not a precedence puzzle:
+    // picking a winner would make one of them silently do nothing.
+    #[test]
+    fn setting_and_clearing_the_same_field_is_a_usage_error() {
+        let err = OverrideChange::resolve("model", Some("m".into()), true)
+            .expect_err("contradictory flags must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--model"), "{msg}");
+        assert!(msg.contains("--clear-model"), "{msg}");
+    }
+
+    // Refused at the CLI rather than forwarded to earn a 422: the operator gets
+    // the fix from the tool they typed into, and the message names the flag that
+    // actually does what they meant.
+    #[test]
+    fn a_blank_value_is_refused_and_points_at_the_clear_flag() {
+        for blank in ["", "   ", "\t"] {
+            let err = OverrideChange::resolve("thinking", Some(blank.into()), false)
+                .expect_err("a blank value must be refused");
+            assert!(
+                err.to_string().contains("--clear-thinking"),
+                "the refusal must name the flag that clears: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_intents_round_trip_from_their_flag_pairs() {
+        assert_eq!(
+            OverrideChange::resolve("model", None, false).unwrap(),
+            OverrideChange::Unchanged
+        );
+        assert_eq!(
+            OverrideChange::resolve("model", None, true).unwrap(),
+            OverrideChange::Clear
+        );
+        assert_eq!(
+            OverrideChange::resolve("model", Some("m".into()), false).unwrap(),
+            OverrideChange::Set("m".into())
+        );
+    }
+}

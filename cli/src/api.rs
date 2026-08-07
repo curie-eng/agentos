@@ -86,6 +86,19 @@ pub struct Agent {
     /// the same fact as "no routes bound".
     #[serde(default)]
     pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBinding>>,
+    /// Per-agent model override, forwarded as `CURIE_MODEL` at sandbox boot
+    /// (#254). `None` means no override: the platform default applies. Modeled
+    /// since #1311 gave the CLI a verb that reads and writes it -- until then
+    /// the only way to set it was a raw authenticated PATCH, which is exactly
+    /// the one-entry-point rule this field now satisfies.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-agent thinking-depth override, forwarded as `CURIE_THINKING` at
+    /// sandbox boot (#1182, ADR-0098). `None` means the platform default
+    /// applies. Same three-way PATCH semantics as `model`: omitted leaves it,
+    /// explicit null clears it.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 /// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.

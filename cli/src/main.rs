@@ -1163,6 +1163,34 @@ enum LocalAction {
         #[arg(long)]
         open: bool,
     },
+    /// Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).
+    ///
+    /// With no flags this inspects. Both fields are nullable operator
+    /// overrides of a platform default, so clearing is `--clear-<field>`
+    /// (which sends JSON null) and never an empty value, which would skip the
+    /// platform default rather than restore it.
+    Overrides {
+        /// Agent name or id.
+        agent: String,
+        /// Pin this model for the agent (forwarded as CURIE_MODEL at boot).
+        #[arg(long)]
+        model: Option<String>,
+        /// Clear the model override back to the platform default.
+        #[arg(long)]
+        clear_model: bool,
+        /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
+        #[arg(long)]
+        thinking: Option<String>,
+        /// Clear the thinking override back to the platform default.
+        #[arg(long)]
+        clear_thinking: bool,
+        #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
+        api_url: String,
+        #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Set an agent's daily budget (`PUT /agents/{id}/budget`).
     Budget {
         /// Agent name or id.
@@ -1714,6 +1742,33 @@ enum ClusterAction {
     Resume {
         /// Agent name or id to resume.
         agent: String,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`).
+    ///
+    /// With no flags this inspects. Both fields are nullable operator
+    /// overrides of a platform default, so clearing is `--clear-<field>`
+    /// (which sends JSON null) and never an empty value, which would skip the
+    /// platform default rather than restore it.
+    Overrides {
+        /// Agent name or id.
+        agent: String,
+        /// Pin this model for the agent (forwarded as CURIE_MODEL at boot).
+        #[arg(long)]
+        model: Option<String>,
+        /// Clear the model override back to the platform default.
+        #[arg(long)]
+        clear_model: bool,
+        /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
+        #[arg(long)]
+        thinking: Option<String>,
+        /// Clear the thinking override back to the platform default.
+        #[arg(long)]
+        clear_thinking: bool,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
@@ -2369,6 +2424,28 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
             LocalAction::Observability { open } => emit(commands::observability(open).await?),
+            LocalAction::Overrides {
+                agent,
+                model,
+                clear_model,
+                thinking,
+                clear_thinking,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::overrides(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    commands::OverrideChange::resolve("model", model, clear_model)?,
+                    commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
+                )
+                .await?,
+            ),
             LocalAction::Budget {
                 agent,
                 limit,
@@ -3033,6 +3110,37 @@ async fn run(command: Option<Command>) -> Result<()> {
                         agent,
                         dry_run,
                     })
+                    .await?,
+                )
+            }
+            ClusterAction::Overrides {
+                agent,
+                model,
+                clear_model,
+                thinking,
+                clear_thinking,
+                conn,
+                dry_run,
+            } => {
+                // Resolve the flag pairs BEFORE discovering the connection: a
+                // contradictory invocation is a usage error, and making the
+                // operator wait on a cluster lookup to be told so is worse than
+                // telling them immediately.
+                let model = commands::OverrideChange::resolve("model", model, clear_model)?;
+                let thinking =
+                    commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
+                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                emit(
+                    commands::overrides(
+                        AgentActionOpts {
+                            api_url,
+                            api_key,
+                            agent,
+                            dry_run,
+                        },
+                        model,
+                        thinking,
+                    )
                     .await?,
                 )
             }

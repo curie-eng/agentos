@@ -307,3 +307,179 @@ async fn dry_run_makes_no_request_for_any_verb() {
         "no dry-run verb may make a request"
     );
 }
+
+// --- `<tier> overrides`: the two nullable operator overrides (#1311) ---------
+//
+// Both fields were settable only by a raw authenticated PATCH before this verb,
+// and both are three-way on the wire: OMITTED leaves the stored value, explicit
+// JSON null clears it to the platform default, a string pins it. The whole point
+// of the verb is that an operator can express all three, so these assert the
+// BODY, not just that a request happened -- a body that sends null where it
+// meant "leave it" is the failure mode, and it looks identical from the outside.
+
+/// A one-agent list whose overrides are already pinned, for the inspect path.
+fn agent_list_with_overrides() -> Response {
+    Response::json(
+        200,
+        &format!(
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#x","model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z"}}]"##
+        ),
+    )
+}
+
+#[tokio::test]
+async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list_with_overrides(),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
+    )
+    .await
+    .unwrap();
+
+    match out {
+        commands::OverridesOutput::Done {
+            agent,
+            model,
+            thinking,
+            changed,
+        } => {
+            assert_eq!(agent, "deal-desk");
+            assert_eq!(model.as_deref(), Some("kimi-k2"));
+            assert_eq!(thinking.as_deref(), Some("adaptive"));
+            assert!(!changed, "an inspect must not report itself as a write");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    // The resolve GET and nothing else: inspect is read-only.
+    let rec = server.recorded();
+    assert_eq!(rec.len(), 1, "inspect must issue exactly one request");
+    assert_eq!(rec[0].method, "GET");
+}
+
+#[tokio::test]
+async fn overrides_set_patches_only_the_field_named() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#x","model":null,"thinking":"enabled:2000"}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Set("enabled:2000".to_string()),
+    )
+    .await
+    .unwrap();
+
+    match out {
+        commands::OverridesOutput::Done {
+            thinking, changed, ..
+        } => {
+            assert_eq!(thinking.as_deref(), Some("enabled:2000"));
+            assert!(changed);
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    let rec = server.recorded();
+    let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(
+        body.contains(r#""thinking":"enabled:2000""#),
+        "body: {body}"
+    );
+    // The load-bearing half: an unmentioned field is ABSENT, not null. The API
+    // tells omitted from explicit-null apart with `model_fields_set` (#1310), so
+    // sending null here would silently clear an override the operator never
+    // touched.
+    assert!(
+        !body.contains("model"),
+        "an unmentioned override must be omitted, not nulled: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list_with_overrides(),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#x","model":null,"thinking":null}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::overrides(
+        opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Clear,
+        commands::OverrideChange::Clear,
+    )
+    .await
+    .unwrap();
+
+    match out {
+        commands::OverridesOutput::Done {
+            model,
+            thinking,
+            changed,
+            ..
+        } => {
+            assert!(model.is_none() && thinking.is_none());
+            assert!(changed);
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    let patch = server
+        .recorded()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .expect("a PATCH");
+    let body = String::from_utf8_lossy(&patch.body);
+    assert!(body.contains(r#""model":null"#), "body: {body}");
+    assert!(body.contains(r#""thinking":null"#), "body: {body}");
+    // Never the empty string. The API refuses it (#1355) and it would be the
+    // wrong request anyway: an empty override reaches the worker falsy, emits no
+    // boot key, and skips the very platform default clearing restores.
+    assert!(
+        !body.contains(r#""""#),
+        "clear must be null, not empty: {body}"
+    );
+}
+
+#[tokio::test]
+async fn overrides_dry_run_makes_no_request_on_either_path() {
+    let server = serve(|req| panic!("--dry-run must not call the API: {req:?}"));
+
+    for (model, thinking) in [
+        (
+            commands::OverrideChange::Unchanged,
+            commands::OverrideChange::Unchanged,
+        ),
+        (
+            commands::OverrideChange::Clear,
+            commands::OverrideChange::Set("adaptive".to_string()),
+        ),
+    ] {
+        let out = commands::overrides(opts(&server.base_url, "deal-desk", true), model, thinking)
+            .await
+            .unwrap();
+        assert!(matches!(out, commands::OverridesOutput::DryRun(_)));
+    }
+    assert!(server.recorded().is_empty());
+}

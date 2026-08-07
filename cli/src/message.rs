@@ -2997,6 +2997,8 @@ mod tests {
             repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
+            model: None,
+            thinking: None,
         }
     }
 
@@ -3747,6 +3749,8 @@ mod tests {
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
+                model: None,
+                thinking: None,
             },
             Agent {
                 id: "a2".into(),
@@ -3755,6 +3759,8 @@ mod tests {
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
+                model: None,
+                thinking: None,
             },
         ];
         // Explicit channel picks the matching agent's id.

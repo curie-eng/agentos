@@ -38,14 +38,22 @@ the worker's other env (compose, or `worker.extraEnv` in the chart):
 CURIE_THINKING=disabled
 ```
 
-**Per agent** is the `thinking` column, set through the platform API, and it
-wins over the platform default for that agent only:
+**Per agent** is the `thinking` column, and it wins over the platform default
+for that agent only. Set it with the CLI (#1311); the raw PATCH this used to
+document is what the one-entry-point rule exists to avoid:
 
 ```bash
-curl -X PATCH "$CURIE_API_URL/agents/$AGENT_ID" \
-  -H "X-API-Key: $CURIE_API_KEY" -H 'content-type: application/json' \
-  -d '{"thinking": "adaptive"}'
+curie local overrides deal-desk --thinking adaptive     # or `cluster`
+curie local overrides deal-desk                         # read it back
+curie local overrides deal-desk --clear-thinking        # back to the platform default
 ```
+
+Clearing is `--clear-thinking`, never an empty value: an empty override reaches
+the worker falsy, emits no boot key, and so skips the platform default instead
+of restoring it. The API refuses a blank for that reason, and the CLI refuses it
+one step earlier with a message naming the flag that does work.
+
+The same verb carries `--model` / `--clear-model`, which had the identical gap.
 
 ### The vocabulary
 
