@@ -140,3 +140,45 @@ def test_model_and_thinking_clear_through_the_same_gesture(
     assert resp.status_code == 200, resp.text
     assert resp.json()["model"] is None
     assert resp.json()["thinking"] is None
+
+
+def test_a_padded_override_is_stored_trimmed_on_both_paths(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # #1392: the API is the gate every client passes through, so normalization
+    # belongs here rather than in each surface. The console trimmed and the CLI
+    # did not, so one paste stored two different values; a padded model id is
+    # forwarded as CURIE_MODEL and rejected by the provider at the agent's next
+    # turn, far from the request that stored it.
+    agent = _create_agent(client, auth_headers, model="  kimi-k2  ", thinking="\tadaptive\n")
+    assert agent["model"] == "kimi-k2"
+    assert agent["thinking"] == "adaptive"
+
+    resp = client.patch(
+        f"/agents/{agent['id']}",
+        json={"model": " glm-5.2 ", "thinking": " enabled:2000 "},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["model"] == "glm-5.2"
+    assert resp.json()["thinking"] == "enabled:2000"
+
+    # Stored, not merely echoed: a later read returns the normalized value.
+    resp = client.get(f"/agents/{agent['id']}", headers=auth_headers)
+    assert resp.json()["model"] == "glm-5.2"
+    assert resp.json()["thinking"] == "enabled:2000"
+
+
+def test_trimming_does_not_soften_the_blank_refusal(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The obvious way to get this wrong: strip first, then test emptiness, which
+    # turns a whitespace-only value into "" and stores it -- the exact defect
+    # #1355 closed. The refusal must still fire before normalization.
+    for blank in ("", "   ", "\t\n"):
+        resp = client.post(
+            "/agents",
+            json={"name": f"blank-{len(blank)}x", "slack_channel": "CBLANK001", "model": blank},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422, f"{blank!r} must still be refused: {resp.text}"

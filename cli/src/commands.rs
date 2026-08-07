@@ -7595,7 +7595,11 @@ impl OverrideChange {
                  default instead of restoring it. Pass --clear-{field} to clear \
                  the override, or a real value"
             ))),
-            (Some(v), false) => Ok(OverrideChange::Set(v)),
+            // Trimmed before it becomes an intent (#1392). The API strips too
+            // and is the authoritative gate, but doing it here as well is what
+            // makes `--dry-run` honest: it must print the body that would
+            // actually be sent, not the argv the operator typed.
+            (Some(v), false) => Ok(OverrideChange::Set(v.trim().to_string())),
             (None, true) => Ok(OverrideChange::Clear),
             (None, false) => Ok(OverrideChange::Unchanged),
         }
@@ -7894,6 +7898,34 @@ mod overrides_tests {
             super::overrides_summary("a", &None, &Some("adaptive".into()), true),
             "overrides for a now: model platform default, thinking adaptive"
         );
+    }
+
+    // #1392: the CLI stored `" kimi-k2 "` verbatim while the console trimmed, so
+    // the same paste produced two different stored values depending on the
+    // surface. A padded id is then forwarded as CURIE_MODEL and rejected by the
+    // provider at the agent's NEXT turn, far from the command that exited 0.
+    #[test]
+    fn a_padded_value_is_trimmed_before_it_becomes_an_intent() {
+        assert_eq!(
+            OverrideChange::resolve("model", Some("  kimi-k2  ".into()), false).unwrap(),
+            OverrideChange::Set("kimi-k2".into())
+        );
+        assert_eq!(
+            OverrideChange::resolve("thinking", Some("\tadaptive\n".into()), false).unwrap(),
+            OverrideChange::Set("adaptive".into())
+        );
+    }
+
+    // The dry-run plan is the operator's only preview of the write, so it has to
+    // show the body that will actually be sent, not the argv they typed.
+    #[test]
+    fn the_dry_run_body_carries_the_trimmed_value() {
+        let body = overrides_patch_body(
+            &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
+        )
+        .expect("a set is a write");
+        assert_eq!(body["model"], "kimi-k2");
     }
 
     #[test]
