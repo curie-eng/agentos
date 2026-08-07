@@ -78,6 +78,13 @@
     "chart_version_differs": {
       "type": "boolean",
       "description": "True when the deployed chart version differs from the one this CLI would apply. The entry comparison is VALUES-ONLY and cannot see a component added, removed, or renamed between chart versions -- a renamed component's old keys appear as ordinary resets. Treat a true here as 'this diff does not describe a safe apply'."
+    },
+    "unresolved_credentials": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Credential NAMES the file declares that have no value in this environment. Never fatal for diff, which mutates nothing; the entries are unaffected because none depends on a credential VALUE. A non-empty list means `curie apply` would refuse until they resolve."
     }
   },
   "required": [
@@ -88,6 +95,7 @@
     "chart_target",
     "chart_version_differs",
     "changes",
-    "entries"
+    "entries",
+    "unresolved_credentials"
   ]
 }

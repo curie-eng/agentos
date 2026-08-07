@@ -481,6 +481,34 @@ pub fn resolve_credentials(
     cfg: &Installation,
     resolver: &dyn Fn(&str) -> Result<Option<String>>,
 ) -> Result<BTreeMap<String, String>> {
+    let (resolved, missing) = resolve_credentials_lenient(cfg, resolver)?;
+    if !missing.is_empty() {
+        bail!(
+            "curie.yaml names credential(s) with no value available: {}. \
+             Export each in the environment, or save it with `curie secrets set <NAME>`. \
+             The file names them; it never carries their values.",
+            missing.join(", ")
+        );
+    }
+    Ok(resolved)
+}
+
+/// Resolve what is available and REPORT what is not, rather than refusing.
+///
+/// `curie diff` needs the credential NAMES to know which chart values the file
+/// governs; it never needs the values, because it mutates nothing. Refusing
+/// there withheld the answer exactly when it is most wanted -- on an install
+/// that is not finished yet, which is the state an operator is in when they ask
+/// "what would this change?".
+///
+/// That is what the verb was for, and a shared-plan refactor (#1319) quietly
+/// took it away: `diff` started going through `plan_installation`, which bails.
+/// Nothing caught it, because the tests cover the pure planner and not this
+/// seam. Found by running `curie diff` against a real cluster.
+pub fn resolve_credentials_lenient(
+    cfg: &Installation,
+    resolver: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<(BTreeMap<String, String>, Vec<String>)> {
     let mut resolved = BTreeMap::new();
     let mut missing = Vec::new();
     for name in cfg.credential_names() {
@@ -491,15 +519,7 @@ pub fn resolve_credentials(
             None => missing.push(name),
         }
     }
-    if !missing.is_empty() {
-        bail!(
-            "curie.yaml names credential(s) with no value available: {}. \
-             Export each in the environment, or save it with `curie secrets set <NAME>`. \
-             The file names them; it never carries their values.",
-            missing.join(", ")
-        );
-    }
-    Ok(resolved)
+    Ok((resolved, missing))
 }
 
 /// What `curie apply` did, as one object (the `--json` contract allows exactly
@@ -583,7 +603,32 @@ struct EffectiveInstallationPlan {
 }
 
 pub fn plan_installation(cfg: Installation, dry_run: bool) -> Result<LocalInstallationPlan> {
-    let resolved = resolve_credentials(&cfg, &resolve_credential)?;
+    plan_installation_inner(cfg, dry_run, false)
+}
+
+/// The same plan, but tolerating credentials that are not available yet.
+///
+/// Only `curie diff` uses this. `apply` must keep refusing: resolving BEFORE
+/// mutating is what stops a missing Slack token being discovered after the
+/// platform install has already run, leaving a half-applied cluster.
+pub fn plan_installation_lenient(
+    cfg: Installation,
+) -> Result<(LocalInstallationPlan, Vec<String>)> {
+    let (_, missing) = resolve_credentials_lenient(&cfg, &resolve_credential)?;
+    let plan = plan_installation_inner(cfg, false, true)?;
+    Ok((plan, missing))
+}
+
+fn plan_installation_inner(
+    cfg: Installation,
+    dry_run: bool,
+    lenient: bool,
+) -> Result<LocalInstallationPlan> {
+    let resolved = if lenient {
+        resolve_credentials_lenient(&cfg, &resolve_credential)?.0
+    } else {
+        resolve_credentials(&cfg, &resolve_credential)?
+    };
     let github_token = cfg
         .credentials
         .github_token
@@ -1056,6 +1101,10 @@ pub fn diff_plan(
 /// What `curie diff` found.
 #[derive(Debug)]
 pub struct DiffOutput {
+    /// Declared credential names with no value available. A non-empty list
+    /// means `apply` would refuse until they resolve -- the entries below are
+    /// still accurate, because none of them depends on a credential VALUE.
+    pub unresolved_credentials: Vec<String>,
     pub namespace: String,
     pub release: String,
     /// `false` when helm has no record of the release: everything is a create.
@@ -1099,6 +1148,7 @@ impl crate::ui::CliOutput for DiffOutput {
             "namespace": self.namespace,
             "release": self.release,
             "release_exists": self.release_exists,
+            "unresolved_credentials": self.unresolved_credentials,
             "chart_deployed": self.chart_deployed,
             "chart_target": self.chart_target,
             "chart_version_differs": self.chart_version_differs(),
@@ -1158,6 +1208,15 @@ impl crate::ui::CliOutput for DiffOutput {
         // says nothing about components a chart bump adds, removes, or renames
         // -- and a renamed component's old keys appear above as ordinary
         // resets, which reads far milder than the swap it would actually be.
+        if !self.unresolved_credentials.is_empty() {
+            ui.note(&format!(
+                "{} declared credential(s) have no value here: {}. The comparison above \
+                 is unaffected -- no entry depends on a credential VALUE -- but `curie \
+                 apply` will refuse until they resolve.",
+                self.unresolved_credentials.len(),
+                self.unresolved_credentials.join(", "),
+            ));
+        }
         if self.chart_version_differs() {
             ui.note(&format!(
                 "CHART VERSION MISMATCH: the release runs {} but this curie applies {}. \
@@ -1173,6 +1232,9 @@ impl crate::ui::CliOutput for DiffOutput {
 }
 
 pub struct DiffOpts {
+    /// Credential NAMES the file declares that have no value available here.
+    /// Reported, never fatal: diff mutates nothing.
+    pub unresolved_credentials: Vec<String>,
     pub local: LocalInstallationPlan,
 }
 
@@ -1180,6 +1242,11 @@ pub struct DiffOpts {
 ///
 /// Resolves the same local inputs as apply, then performs one values read and
 /// provider resolution to complete the desired plan without mutating it.
+///
+/// **A credential it cannot resolve is reported, never fatal.** The question
+/// "what would this change?" is most urgent on an install that is not finished,
+/// and refusing to answer it there was the behaviour a shared-plan refactor
+/// introduced and a real run against a cluster exposed.
 pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
     let plan = complete_installation_plan(opts.local).await?;
     // A second, independent read: the values plan says nothing about WHICH
@@ -1197,6 +1264,7 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
         }
     }
     Ok(DiffOutput {
+        unresolved_credentials: opts.unresolved_credentials,
         namespace: plan.cfg.install.namespace,
         release: plan.cfg.install.release,
         release_exists: plan.live.is_some(),
@@ -1617,6 +1685,7 @@ mod diff_tests {
     #[test]
     fn a_chart_version_mismatch_is_reported() {
         let out = DiffOutput {
+            unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
             release_exists: true,
@@ -1635,6 +1704,7 @@ mod diff_tests {
     #[test]
     fn a_matching_chart_version_does_not_warn() {
         let out = DiffOutput {
+            unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
             release_exists: true,
@@ -1649,6 +1719,7 @@ mod diff_tests {
     #[test]
     fn an_unknown_deployed_chart_does_not_claim_a_mismatch() {
         let out = DiffOutput {
+            unresolved_credentials: Vec::new(),
             namespace: "acme-bot".into(),
             release: "acme-bot".into(),
             release_exists: false,
@@ -1682,6 +1753,7 @@ mod diff_tests {
     fn output_is_one_json_object_with_a_change_count() {
         use crate::ui::CliOutput;
         let out = DiffOutput {
+            unresolved_credentials: Vec::new(),
             namespace: "acme".into(),
             release: "acme".into(),
             release_exists: true,
@@ -1740,6 +1812,38 @@ mod apply_tests {
              comms:\n  slack:\n    app_token: APP_TOK\n    bot_token: BOT_TOK\n",
         )
         .unwrap()
+    }
+
+    /// The property a real run against a cluster proved was gone: `diff` must
+    /// answer on an install whose credentials are not in place yet. That is
+    /// precisely when "what would this change?" is worth asking.
+    #[test]
+    fn the_lenient_resolver_reports_gaps_instead_of_refusing() {
+        let cfg = cfg_with_all_names();
+        let (resolved, missing) =
+            resolve_credentials_lenient(&cfg, &|_| Ok(None)).expect("must not refuse");
+        assert!(resolved.is_empty());
+        assert_eq!(missing, vec!["MODEL_KEY", "APP_TOK", "BOT_TOK"]);
+    }
+
+    /// Apply keeps refusing. Resolving BEFORE mutating is what stops a missing
+    /// Slack token being discovered after the platform install already ran,
+    /// leaving a half-applied cluster.
+    #[test]
+    fn the_strict_resolver_still_refuses_so_apply_cannot_half_apply() {
+        let cfg = cfg_with_all_names();
+        assert!(resolve_credentials(&cfg, &|_| Ok(None)).is_err());
+    }
+
+    /// A partial resolution reports only what is absent, in both modes.
+    #[test]
+    fn the_lenient_resolver_keeps_what_it_found() {
+        let cfg = cfg_with_all_names();
+        let (resolved, missing) =
+            resolve_credentials_lenient(&cfg, &|n| Ok((n == "MODEL_KEY").then(|| "v".to_string())))
+                .expect("must not refuse");
+        assert_eq!(resolved.get("MODEL_KEY").map(String::as_str), Some("v"));
+        assert_eq!(missing, vec!["APP_TOK", "BOT_TOK"]);
     }
 
     /// One round trip, not four. An operator standing up a new install is
