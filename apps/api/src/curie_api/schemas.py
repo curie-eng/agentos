@@ -926,7 +926,14 @@ class EvalTriggerRequest(BaseModel):
     # The model to evaluate under (#526): booted into the eval sandbox and used as
     # the run's matrix model dimension. None uses the worker default. A sweep posts
     # one trigger per model, then reads GET /evals/matrix sliced by model back.
+    # Blank and whitespace-only are refused (#1389): "" is not None, so it won the
+    # binding's override ternary but was then falsy, CURIE_MODEL was never emitted
+    # and the run booted the BYO endpoint's own default while the matrix labelled
+    # the row ''. Whitespace was worse -- it passed the falsy check and rode
+    # through as a garbage model id. Send null to get the worker default.
     model: str | None = None
+
+    _check_model = field_validator("model")(_validate_model_override)
 
 
 class EvalTriggerResult(BaseModel):

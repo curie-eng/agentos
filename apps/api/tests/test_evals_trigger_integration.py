@@ -166,6 +166,33 @@ def test_trigger_threads_requested_model_onto_the_job(
     assert EvalJob.model_validate(payload).model == "claude-sweep-x"
 
 
+def test_trigger_blank_model_is_refused_and_does_not_enqueue(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """#1389: a blank model must not reach the worker. "" is not None, so it wins
+    the override ternary in the binding but is then falsy, and CURIE_MODEL is
+    never emitted -- the BYO base URL stays set and the SDK dials the custom
+    endpoint asking for its own built-in default, while the matrix row is
+    labelled ''. Whitespace survives the falsy check and is forwarded verbatim as
+    a garbage model id. The accepting paths (a real model id, an omitted model)
+    are already covered by the two tests at the top of this file.
+    """
+
+    agent = _create_agent(client, auth_headers, "trigger-blank-model")
+    _seed(agent["id"])
+
+    for blank in ("", "   "):
+        resp = client.post(
+            "/evals/trigger",
+            json={"agent_id": agent["id"], "model": blank},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 422, f"model={blank!r}: {resp.text}"
+        assert "null" in resp.text, f"model={blank!r} must point at null: {resp.text}"
+
+    assert _count_eval_entries_for_agent(agent["id"]) == 0
+
+
 def test_trigger_requires_api_key(client: Any) -> None:
     assert client.post("/evals/trigger", json={"agent_id": str(uuid.uuid4())}).status_code == 401
 
