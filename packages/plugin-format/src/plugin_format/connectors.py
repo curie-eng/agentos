@@ -137,11 +137,34 @@ class ConnectorSpec(BaseModel):
     # and 401s every call, the #1156 shape ADR-0094 exists to avoid.
     sealed_secrets: dict[str, str] = Field(default_factory=dict)
 
+    #   secret_files:                         Project a stored secret as a FILE
+    #     K8S_KUBECONFIG: /secrets/kubeconfig instead of an environment variable.
+    #
+    # Same stored secret, same resolution, same per-agent Secret -- only the
+    # delivery differs. It exists because `secrets:` renders a secretKeyRef and
+    # nothing else, so a server that authenticates from a FILE has no way in:
+    # kubeconfigs, TLS client certs, GCP service-account JSON, a CA bundle.
+    # `connectors.yaml` forbids extra keys and has no `command`, so a bundle
+    # cannot write $VAR out to a path itself either -- the credential was
+    # simply unreachable (#1402).
+    #
+    # Keyed by SECRET NAME so the same name cannot be projected to two paths,
+    # and so the key reads identically to `secrets:` -- a bundle moving from one
+    # to the other changes the delivery, not the credential.
+    #
+    # Mounted 0400 and read-only into a container that already runs as non-root
+    # with a read-only rootfs. Paths must be absolute and must not collide with
+    # each other; `/tmp` is refused because a server's scratch space is a poor
+    # place for a credential and an emptyDir there would shadow the mount.
+    secret_files: dict[str, str] = Field(default_factory=dict)
+
     def secret_names(self) -> list[str]:
         """Env var names this connector needs, any form."""
 
         named = [s if isinstance(s, str) else s.name for s in self.secrets]
-        return named + list(self.sealed_secrets)
+        # secret_files are resolved from the same store and land in the same
+        # per-agent Secret; only the projection differs, so they belong here.
+        return named + list(self.sealed_secrets) + list(self.secret_files)
 
     def resolved_secrets(self) -> list[str]:
         """Only the names Curie must resolve a VALUE for.
@@ -292,6 +315,58 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     f"{where}: `unhosted_url` is the hosted form's fallback for tiers that "
                     "cannot run the image. A `url` connector is already reachable everywhere, "
                     "so this would never apply",
+                )
+            )
+        if spec.url and spec.secret_files:
+            errors.append(
+                (
+                    "connectors.remote_has_secret_files",
+                    f"{where}: `secret_files` project a file into a container Curie "
+                    "starts; a `url` connector is already running elsewhere, so the "
+                    "file would go nowhere",
+                )
+            )
+        seen_paths: dict[str, str] = {}
+        for sname, path in spec.secret_files.items():
+            if not path.startswith("/"):
+                errors.append(
+                    (
+                        "connectors.secret_file_relative_path",
+                        f"{where}: secret_files[{sname}] is {path!r}; the mount path must "
+                        "be absolute, because it is a container path and not relative to "
+                        "anything the bundle controls",
+                    )
+                )
+            # /tmp is a server's scratch space. A credential does not belong
+            # there, and an emptyDir mounted at /tmp would shadow the file.
+            if path == "/tmp" or path.startswith("/tmp/"):
+                errors.append(
+                    (
+                        "connectors.secret_file_in_tmp",
+                        f"{where}: secret_files[{sname}] mounts under /tmp, which is "
+                        "scratch space -- pick a dedicated path such as /secrets/...",
+                    )
+                )
+            if path in seen_paths:
+                errors.append(
+                    (
+                        "connectors.secret_file_path_collision",
+                        f"{where}: secret_files[{sname}] and secret_files"
+                        f"[{seen_paths[path]}] both mount at {path}; one would silently "
+                        "win and the other credential would never appear",
+                    )
+                )
+            seen_paths[path] = sname
+        overlap = set(spec.secret_files) & {
+            s if isinstance(s, str) else s.name for s in spec.secrets
+        }
+        for name in sorted(overlap):
+            errors.append(
+                (
+                    "connectors.secret_both_env_and_file",
+                    f"{where}: {name} is declared in both `secrets` and `secret_files`. "
+                    "Pick one delivery -- a credential in an env var AND on disk doubles "
+                    "the places it can leak from for no benefit",
                 )
             )
         if spec.image and spec.headers:
