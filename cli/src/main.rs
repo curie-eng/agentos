@@ -3394,8 +3394,17 @@ async fn run(command: Option<Command>) -> Result<()> {
         }
         Some(Command::Diff { file }) => {
             let cfg = curie::installation::Installation::load(&file)?;
-            let local = curie::installation::plan_installation(cfg, false)?;
-            emit(curie::installation::diff(curie::installation::DiffOpts { local }).await?)
+            // Lenient on purpose: `diff` mutates nothing, so a credential it
+            // cannot resolve must not withhold the answer. See
+            // installation::resolve_credentials_lenient.
+            let (local, missing) = curie::installation::plan_installation_lenient(cfg)?;
+            emit(
+                curie::installation::diff(curie::installation::DiffOpts {
+                    local,
+                    unresolved_credentials: missing,
+                })
+                .await?,
+            )
         }
     }
 }

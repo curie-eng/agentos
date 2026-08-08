@@ -955,6 +955,7 @@ fn diff_output_validates() {
     // Built through `diff_plan` rather than hand-listing entries, so this
     // validates the shape the real verb emits and not a parallel one.
     let out = curie::installation::DiffOutput {
+        unresolved_credentials: vec!["SLACK_BOT_TOKEN".to_string()],
         namespace: "acme-bot".to_string(),
         release: "acme-bot".to_string(),
         release_exists: true,
