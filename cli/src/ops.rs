@@ -1136,11 +1136,21 @@ pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
 /// Reads the same constants `up` reads, so a new preserved family is picked up
-/// by both or neither.
+/// by both or neither. That claim was false for one release: sealing (ADR-0094)
+/// added a family to [`resolve_preserved_values`] and not to this list, so
+/// `diff` announced that apply would reset `sealing.privateKey` to the chart
+/// default. Apply does no such thing -- it hands the live key straight back.
+///
+/// A false reset here is worse than a missing one. The note `diff` prints on a
+/// reset says to declare the value in `curie.yaml` to keep it, and following
+/// that for this key means pasting a PRIVATE KEY into a file whose own header
+/// says it carries names and never secrets. `sealing_test` below asserts the
+/// two lists agree by construction rather than by a hand-kept fixture.
 pub fn is_preserved_by_up(key: &str) -> bool {
     COMMS_MANAGED_KEYS.contains(&key)
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
+        || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1585,6 +1595,50 @@ mod sealing_preservation_tests {
         assert_eq!(
             get(&all, crate::sealing::SEALING_PRIVATE_KEY),
             Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+        );
+    }
+
+    /// The seam that actually broke, closed by construction.
+    ///
+    /// `up` re-supplies a set of keys; `diff` decides which keys survive an
+    /// apply via `is_preserved_by_up`. Those two answers must be the same
+    /// answer. They were kept in step by a hand-written list, and sealing was
+    /// added to one and not the other -- so `curie diff` against a real 0.6.0
+    /// release announced `sealing.privateKey (reset to chart default)` for a
+    /// key apply hands straight back.
+    ///
+    /// This drives the REAL resolver over a release carrying every preserved
+    /// family and asserts `diff` agrees about every key it returns. A future
+    /// family added to `resolve_preserved_values` alone fails here instead of
+    /// reaching an operator as a false alarm about their own data.
+    #[test]
+    fn diff_agrees_with_every_key_up_actually_re_supplies() {
+        let existing = values(serde_json::json!({
+            "sealing": {
+                "privateKey": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+                "previousPrivateKey": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD="
+            },
+            "dispatcher": {"slack": {"appToken": "xapp-EXAMPLE", "botToken": "xoxb-EXAMPLE"}},
+            "api": {
+                "githubAppId": "1",
+                "githubAppExistingSecret": "an-app-secret",
+                "githubAppExistingSecretKey": "privateKey"
+            }
+        }));
+        let supplied = resolve_preserved_values(Some(&existing), &[]);
+        assert!(
+            !supplied.is_empty(),
+            "fixture must exercise the resolver, not pass vacuously"
+        );
+        let disagreements: Vec<&str> = supplied
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !is_preserved_by_up(k))
+            .collect();
+        assert!(
+            disagreements.is_empty(),
+            "`up` re-supplies these keys but `is_preserved_by_up` says apply drops them, \
+             so `curie diff` would report a reset that never happens: {disagreements:?}"
         );
     }
 
