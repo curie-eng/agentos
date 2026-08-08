@@ -71,6 +71,15 @@ Declaring a route says nothing about where it goes. The binding is **operator-ow
 per agent, and read fresh at resolve time so revoking an approver takes effect on the
 next click rather than the next restart:
 
+> **One exception, and it is the one worth knowing.** "Read fresh" holds for the
+> binding itself and for `approvers.users`. Slack **user-group** membership sits
+> behind a per-group TTL cache in the API (`slack_usergroups.py`, 60s by default
+> via `slack_usergroup_cache_ttl_s`), because `usergroups.users.list` is a Slack
+> Tier 2 method and a fetch per click would rate-limit a busy channel. So
+> removing someone from a group can take up to that TTL to bite, where removing
+> them from `approvers.users` bites immediately. Setting the TTL to 0 is the
+> operator lever for a fetch per resolve.
+
 ```json
 {
   "approval_routes": {
@@ -153,8 +162,13 @@ Three properties worth knowing before you design around this:
   membership, because that would silently widen the set an operator narrowed.
 
 Resolving a group-bound route needs `SLACK_BOT_TOKEN` on the API with the
-`usergroups:read` scope (`apps/api/src/curie_api/slack_usergroups.py`). Without it, such
-a route fails closed.
+`usergroups:read` scope. Both requirements are stated in
+[ADR-0034](adr/0034-approval-authorizers-resolve-membership-in-the-api.md) and
+`.env.example`; `apps/api/src/curie_api/slack_usergroups.py` is the lookup that
+consumes them and names neither, so it is the wrong place to send a reader
+checking the claim. The scope needs the Slack app reinstalled. Without the
+token, such a route fails closed: every resolution on it is refused as
+not-an-approver, with nothing naming the missing token as the cause.
 
 ## What your skill must handle on resume
 
