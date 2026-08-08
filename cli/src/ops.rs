@@ -1365,7 +1365,7 @@ pub async fn chart_stateful_components(
     chart: &str,
     o: &CommonOpts,
     value_sets: &[String],
-) -> Result<Vec<String>> {
+) -> Result<Vec<(String, String)>> {
     let mut args = vec![
         plain("template"),
         plain(&o.release),
@@ -1389,8 +1389,8 @@ pub async fn chart_stateful_components(
 /// Split-and-parse rather than a regex: a `kind: StatefulSet` line can appear
 /// inside an annotation or a ConfigMap payload, and matching that would invent
 /// a component the chart does not actually create.
-pub fn parse_statefulset_components(rendered: &str) -> Vec<String> {
-    let mut components = Vec::new();
+pub fn parse_statefulset_components(rendered: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     for doc in rendered.split("\n---") {
         let Ok(value) = serde_norway::from_str::<serde_json::Value>(doc) else {
             continue;
@@ -1404,25 +1404,82 @@ pub fn parse_statefulset_components(rendered: &str) -> Vec<String> {
             .and_then(|s| s.get("matchLabels"))
             .and_then(|l| l.get("app.kubernetes.io/component"))
             .and_then(|c| c.as_str());
-        if let Some(component) = component {
-            if !components.iter().any(|c: &String| c == component) {
-                components.push(component.to_string());
+        let name = value
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str());
+        if let (Some(component), Some(name)) = (component, name) {
+            if !out.iter().any(|(c, _)| c == component) {
+                out.push((component.to_string(), name.to_string()));
             }
         }
     }
-    components
+    out
+}
+
+/// Why a live stateful component would not survive the apply.
+///
+/// Carried rather than collapsed to a bare name because the two causes have
+/// DIFFERENT remedies, and the refusal is the only place an operator learns
+/// which one they need. Offering `--migrate-store` for a rename would send
+/// them to a flag that cannot help: both releases run the same store, so
+/// there is nothing to migrate between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovalCause {
+    /// The component is absent from the render entirely -- a chart version
+    /// renamed or dropped it (minio -> rustfs). The data must be carried
+    /// across, which is what `--migrate-store` does.
+    ComponentGone,
+    /// The component survives, under a different resource name. Nothing about
+    /// the chart changed; the values did.
+    RenamedTo(String),
+}
+
+/// A live stateful component the target chart would not recreate in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatefulRemoval {
+    /// The live resource name, which is what an operator recognises in their
+    /// own cluster.
+    pub name: String,
+    pub component: String,
+    pub cause: RemovalCause,
 }
 
 /// Live stateful components the target chart would not recreate.
 ///
-/// Compares COMPONENTS; reports the resource NAMES, which is what an operator
-/// recognises in their own cluster.
-///
 /// Pure, so the decision this guard turns on is testable without a cluster.
-pub fn removed_stateful_components(live: &[(String, String)], rendered: &[String]) -> Vec<String> {
+pub fn removed_stateful_components(
+    live: &[(String, String)],
+    rendered: &[(String, String)],
+) -> Vec<StatefulRemoval> {
     live.iter()
-        .filter(|(component, _)| !rendered.iter().any(|r| r == component))
-        .map(|(_, name)| name.clone())
+        .filter_map(|(component, name)| {
+            let cause = match rendered.iter().find(|(c, _)| c == component) {
+                // The component is gone entirely: a rename or removal between
+                // chart versions. This is the case the guard was built for.
+                None => RemovalCause::ComponentGone,
+                // The component survives under a DIFFERENT resource name. Helm
+                // deletes the old object and creates the new one, so the
+                // StatefulSet's volumes are orphaned and it comes up EMPTY.
+                // Just as destructive, and far likelier: any curie.yaml that
+                // does not reproduce the release's `nameOverride` renames every
+                // object at once.
+                //
+                // Comparing components alone missed this, and comparing names
+                // alone produced a 4-of-4 false positive on a release that
+                // merely uses an override (#1323). Neither is the rule; the
+                // rule is "same component, same name".
+                Some((_, rendered_name)) if rendered_name != name => {
+                    RemovalCause::RenamedTo(rendered_name.clone())
+                }
+                Some(_) => return None,
+            };
+            Some(StatefulRemoval {
+                name: name.clone(),
+                component: component.clone(),
+                cause,
+            })
+        })
         .collect()
 }
 
@@ -1601,8 +1658,12 @@ mod stateful_guard_tests {
         )
     }
 
+    fn pair(component: &str, name: &str) -> (String, String) {
+        (component.to_string(), name.to_string())
+    }
+
     #[test]
-    fn components_come_from_the_render() {
+    fn components_and_names_both_come_from_the_render() {
         let rendered = format!(
             "{}\n---\n{}",
             render("rustfs", "acme-bot-curie-rustfs"),
@@ -1610,12 +1671,14 @@ mod stateful_guard_tests {
         );
         assert_eq!(
             parse_statefulset_components(&rendered),
-            vec!["rustfs", "postgres"]
+            vec![
+                pair("rustfs", "acme-bot-curie-rustfs"),
+                pair("postgres", "acme-bot-curie-postgres"),
+            ]
         );
     }
 
     /// `kind: StatefulSet` inside a ConfigMap payload is data, not a component.
-    /// A regex over the render would invent one; parsing cannot.
     #[test]
     fn a_kind_line_inside_another_document_is_not_a_component() {
         let rendered = "\
@@ -1632,54 +1695,105 @@ data:
         assert!(parse_statefulset_components(rendered).is_empty());
     }
 
-    /// The real case: the release runs minio, chart 0.6.0 renders rustfs.
+    /// The original case: the release runs minio, the chart renders rustfs.
     #[test]
-    fn a_renamed_store_is_reported_as_a_removal() {
+    fn a_renamed_component_is_reported_as_a_removal() {
         let live = vec![
-            ("minio".to_string(), "acme-bot-minio".to_string()),
-            ("postgres".to_string(), "acme-bot-postgres".to_string()),
+            pair("minio", "acme-bot-minio"),
+            pair("postgres", "acme-bot-postgres"),
         ];
-        let rendered = vec!["rustfs".to_string(), "postgres".to_string()];
-        assert_eq!(
-            removed_stateful_components(&live, &rendered),
-            vec!["acme-bot-minio"],
-            "only the renamed store is lost, and it is named as the operator sees it"
-        );
-    }
-
-    /// The false positive that a live run exposed, pinned so it cannot return.
-    ///
-    /// The release was installed with a `nameOverride`, so every resource is
-    /// `<override>-<component>` while the chart renders
-    /// `<override>-curie-<component>`.
-    /// Comparing NAMES reported all four as removals -- postgres, valkey and
-    /// clickhouse included -- which would have taught the operator to pass
-    /// --allow-stateful-removal by reflex and lose minio for real.
-    #[test]
-    fn a_name_override_does_not_make_every_component_look_removed() {
-        let live = vec![
-            ("clickhouse".to_string(), "acme-bot-clickhouse".to_string()),
-            ("minio".to_string(), "acme-bot-minio".to_string()),
-            ("postgres".to_string(), "acme-bot-postgres".to_string()),
-            ("valkey".to_string(), "acme-bot-valkey".to_string()),
-        ];
-        // What the chart renders WITHOUT the override: different names entirely.
         let rendered = vec![
-            "clickhouse".to_string(),
-            "postgres".to_string(),
-            "rustfs".to_string(),
-            "valkey".to_string(),
+            pair("rustfs", "acme-bot-rustfs"),
+            pair("postgres", "acme-bot-postgres"),
         ];
+        let removed = removed_stateful_components(&live, &rendered);
         assert_eq!(
-            removed_stateful_components(&live, &rendered),
-            vec!["acme-bot-minio"],
-            "differing resource names must not be mistaken for removed components"
+            removed,
+            vec![StatefulRemoval {
+                name: "acme-bot-minio".to_string(),
+                component: "minio".to_string(),
+                cause: RemovalCause::ComponentGone,
+            }]
         );
     }
 
-    /// The WIRING, not just the predicate. Removing the `helm_keeps` filter from
-    /// `stateful_components_from_list` leaves every `helm_keeps` unit test green
-    /// -- that mutation survived, so this test exists to kill it.
+    /// The case a live `apply --dry-run` exposed, and the reason this rule is
+    /// not "same component".
+    ///
+    /// A curie.yaml that does not reproduce the release's `nameOverride`
+    /// renames EVERY object. The component labels are identical either way, so
+    /// a component-only comparison sees nothing wrong -- while helm deletes
+    /// `acme-bot-postgres` and creates an empty `acme-bot-curie-postgres`
+    /// beside the orphaned volume. All four data stores, silently.
+    #[test]
+    fn the_same_component_under_a_new_name_is_still_a_deletion() {
+        let live = vec![
+            pair("clickhouse", "acme-bot-clickhouse"),
+            pair("postgres", "acme-bot-postgres"),
+            pair("rustfs", "acme-bot-rustfs"),
+            pair("valkey", "acme-bot-valkey"),
+        ];
+        // What the chart renders when nameOverride is absent from the file.
+        let rendered = vec![
+            pair("clickhouse", "acme-bot-curie-clickhouse"),
+            pair("postgres", "acme-bot-curie-postgres"),
+            pair("rustfs", "acme-bot-curie-rustfs"),
+            pair("valkey", "acme-bot-curie-valkey"),
+        ];
+        let removed = removed_stateful_components(&live, &rendered);
+        assert_eq!(
+            removed.len(),
+            4,
+            "every store is deleted and recreated empty; none may be missed"
+        );
+        // The cause is what steers the operator to `nameOverride` instead of
+        // `--migrate-store`, so it is part of the answer, not a detail.
+        assert_eq!(
+            removed[1].cause,
+            RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string())
+        );
+    }
+
+    /// And the false positive #1323 fixed must not come back: matching names
+    /// under matching components is not a removal.
+    #[test]
+    fn an_unchanged_component_set_is_not_a_removal() {
+        let live = vec![pair("postgres", "r-postgres"), pair("minio", "r-minio")];
+        let rendered = vec![pair("postgres", "r-postgres"), pair("minio", "r-minio")];
+        assert!(removed_stateful_components(&live, &rendered).is_empty());
+    }
+
+    #[test]
+    fn a_new_component_is_not_a_removal() {
+        let live = vec![pair("postgres", "r-postgres")];
+        let rendered = vec![
+            pair("postgres", "r-postgres"),
+            pair("clickhouse", "r-clickhouse"),
+        ];
+        assert!(removed_stateful_components(&live, &rendered).is_empty());
+    }
+
+    #[test]
+    fn a_resource_helm_is_told_to_keep_is_not_at_risk() {
+        for value in ["keep", "Keep", " keep "] {
+            let kept = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(helm_keeps(&kept), "{value:?} must read as keep");
+        }
+    }
+
+    #[test]
+    fn other_resource_policies_do_not_count_as_kept() {
+        for value in ["delete", "", "keepalive"] {
+            let r = serde_json::json!({
+                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
+            });
+            assert!(!helm_keeps(&r), "{value:?} must not read as keep");
+        }
+        assert!(!helm_keeps(&serde_json::json!({"metadata": {}})));
+    }
+
     #[test]
     fn a_kept_component_is_excluded_from_the_at_risk_list() {
         let list = serde_json::json!({"items": [
@@ -1695,16 +1809,12 @@ data:
                 "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
             }
         ]});
-        let at_risk = stateful_components_from_list(&list);
         assert_eq!(
-            at_risk,
-            vec![("postgres".to_string(), "acme-bot-postgres".to_string())],
-            "a component annotated keep is not at risk and must not be listed"
+            stateful_components_from_list(&list),
+            vec![pair("postgres", "acme-bot-postgres")]
         );
     }
 
-    /// And the same list WITHOUT the annotation must still surface it, or the
-    /// test above would pass against a function that returns nothing at all.
     #[test]
     fn an_unannotated_component_is_still_at_risk() {
         let list = serde_json::json!({"items": [
@@ -1715,53 +1825,8 @@ data:
         ]});
         assert_eq!(
             stateful_components_from_list(&list),
-            vec![("minio".to_string(), "acme-bot-minio".to_string())]
+            vec![pair("minio", "acme-bot-minio")]
         );
-    }
-
-    /// Helm's own opt-out. A store annotated `keep` survives the upgrade, so
-    /// flagging it is a false alarm -- and annotating it is precisely how an
-    /// operator detaches a store before a chart renames it.
-    #[test]
-    fn a_resource_helm_is_told_to_keep_is_not_at_risk() {
-        for value in ["keep", "Keep", " keep "] {
-            let kept = serde_json::json!({
-                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
-            });
-            assert!(helm_keeps(&kept), "{value:?} must read as keep");
-        }
-    }
-
-    /// The escape must be narrow: everything else is still at risk.
-    #[test]
-    fn other_resource_policies_do_not_count_as_kept() {
-        for value in ["delete", "", "keepalive"] {
-            let r = serde_json::json!({
-                "metadata": {"annotations": {"helm.sh/resource-policy": value}}
-            });
-            assert!(!helm_keeps(&r), "{value:?} must not read as keep");
-        }
-        assert!(!helm_keeps(&serde_json::json!({"metadata": {}})));
-    }
-
-    /// The guard must stay quiet on an ordinary upgrade, or it becomes a flag
-    /// everyone passes by reflex and protects nothing.
-    #[test]
-    fn an_unchanged_component_set_is_not_a_removal() {
-        let live = vec![
-            ("postgres".to_string(), "r-postgres".to_string()),
-            ("minio".to_string(), "r-minio".to_string()),
-        ];
-        let rendered = vec!["postgres".to_string(), "minio".to_string()];
-        assert!(removed_stateful_components(&live, &rendered).is_empty());
-    }
-
-    /// A chart ADDING a store is not a removal.
-    #[test]
-    fn a_new_component_is_not_a_removal() {
-        let live = vec![("postgres".to_string(), "r-postgres".to_string())];
-        let rendered = vec!["postgres".to_string(), "clickhouse".to_string()];
-        assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 }
 
