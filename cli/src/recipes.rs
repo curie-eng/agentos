@@ -279,6 +279,54 @@ pub(crate) fn recipes() -> Vec<Recipe> {
                 "The server blocks self-approval, so the resolving actor must not be the person whose turn raised the request.",
             ],
         },
+        // #1051 item 4, landed by #1086: the end-to-end flow, not another
+        // single verb. The two recipes above configure a gate and read what it
+        // produced; neither shows an agent author how a declaration becomes a
+        // resolved card. That path was not expressible without curl until
+        // #1057's --route flags merged, which is why the catalog carried only
+        // the --list step.
+        //
+        // Anchored on the bind because that is the step an operator types and
+        // the one the flags are new for; the declaration before it and the
+        // drive/resolve after it are ordered in the notes. Deliberately a
+        // Command rather than a Workflow: a Workflow is an interactive TUI flow
+        // in interactive.rs, which is a feature, not the primer completion this
+        // issue is.
+        Recipe {
+            tabs: &["platform"],
+            title: "Approvals end to end (declare, bind, drive, resolve)",
+            description: "Take a gated tool from its bundle declaration to a resolved card, with no curl.",
+            kind: RecipeKind::Command,
+            args: vec![
+                ArgPart::Tier,
+                ArgPart::Literal("approvals"),
+                ArgPart::Field("agent"),
+                ArgPart::Literal("--route"),
+                ArgPart::Field("route"),
+            ],
+            fields: vec![
+                Field {
+                    key: "agent",
+                    label: "Agent name",
+                    default: None,
+                    required: true,
+                },
+                Field {
+                    key: "route",
+                    label: "Route binding (name=channel)",
+                    default: Some("managers=C0EXAMPLE1"),
+                    required: true,
+                },
+            ],
+            notes: &[
+                "1. Declare the gate in the bundle: .claude-plugin/plugin.json, approvalPolicy.gates[] = {gate: <tool name>, route: <route name>}. Both keys are required and an incomplete gate is rejected at deploy.",
+                "2. Deploy it: `deploy --plugin-dir <dir> --slack-channel <C...>`. The declaration reaches the platform with the bundle, not separately.",
+                "3. Bind the route (the command above). `channel` is WHERE the card posts. Add `--route-approvers <name>=users:U1,U2` to say WHO may act; without it the card channel's members are the approver set.",
+                "4. Drive a turn that calls the gated tool. The call is denied before it runs and the turn ends awaiting approval, with a card in the bound channel.",
+                "5. Resolve it: `approvals <AGENT> --list` for the id, then `--resolve <id> --as <user> --actor-channel <channel>`. Self-approval is refused, so `--as` must name someone other than the author of the turn.",
+                "A route write REPLACES the whole map, so pass every route the agent should keep. `--list-routes` shows what is bound now.",
+            ],
+        },
         Recipe {
             tabs: &["platform"],
             title: "Inspect memory",

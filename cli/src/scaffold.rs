@@ -591,6 +591,26 @@ mod tests {
         // prose, so a copy here goes stale silently. The `allowed-tools`
         // teaching lives in the correct-by-example scaffolded SKILL.md above.
         assert!(!agents.contains("allowed-tools"));
+        // The approval pointer is pinned, unlike the landmine prose above, and
+        // the difference is which way each can rot. The landmine list is
+        // deliberately NOT copied here, so there is nothing to go stale. The
+        // approval pointer IS content, and it is the one #1051 propagation path
+        // with no gate: SKILL.md is byte-pinned against `guide::primer_markdown`
+        // and the primer has its own drift test, while this file is hand-written
+        // prose that satisfied a done-when item and could quietly lose it (#1086).
+        //
+        // Two facts, both non-derivable from the command tree: the tool that
+        // raises a request, and the prefix the resume turn arrives with. An
+        // agent missing the first never pauses for a human; missing the second,
+        // it silently drops the verdict.
+        assert!(
+            agents.contains("request_approval"),
+            "AGENTS.md must name the tool that raises an approval"
+        );
+        assert!(
+            agents.contains("[approval resolved]"),
+            "AGENTS.md must name the resume-turn prefix a skill has to handle"
+        );
 
         // The installable harness primer skill, discovered by Claude Code.
         let harness_skill =

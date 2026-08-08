@@ -285,8 +285,12 @@ pub fn primer() -> Primer {
                 detail: "The platform blocks the author of the turn that raised a request from resolving it, under every approver set. Testing an approval flow therefore needs a second actor: pass `--as <other-user>` on the resolve.",
             },
             Landmine {
+                title: "A group-bound route with no bot token on the API refuses every click",
+                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED, so every resolution is refused as not-an-approver with nothing naming the token as the cause. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
+            },
+            Landmine {
                 title: "Silence after a request usually means an unbound route",
-                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere. Check the binding before suspecting the gate.",
+                detail: "A route the bundle names but the agent's approval_routes never bound is escalated to a human rather than widened to the requesting channel, so no card appears anywhere and the turn still reports the request as pending. Bind the route with `--route <name>=<channel>` and re-run the turn; check that before suspecting the gate.",
             },
             Landmine {
                 title: "Fake vs live model is symmetric across skill and local",
@@ -335,12 +339,16 @@ pub fn primer() -> Primer {
                 fix: "You are the author of the turn that raised it, which no approver set overrides. Resolve as a different actor with `--as <user>`.",
             },
             Recovery {
-                symptom: "a resolve is refused with \"you are not an approver\"",
-                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
+                symptom: "a resolve returns 409 already resolved",
+                fix: "Someone settled it first; resolution is once-only and the loser is told who won. Read the decision off `--list` (or the card) rather than retrying -- a retry cannot change it.",
             },
             Recovery {
-                symptom: "the agent says a request is pending but no approval card appeared",
-                fix: "The route it named is not bound for this agent, so the turn escalated instead of posting. Bind the route in the agent's approval_routes, then re-run the turn.",
+                symptom: "a resolve returns 410 expired",
+                fix: "The record aged out before anyone acted, and the turn already resumed with an `[approval expired]` prefix. Nothing is recoverable on that record: drive the gated action again to raise a fresh one.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"you are not an approver\"",
+                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
             },
             Recovery {
                 symptom: "a command \"does not exist\"",

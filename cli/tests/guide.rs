@@ -219,6 +219,19 @@ fn guide_documents_the_approval_plane() {
             "approvers.group",
             "self-approval",
             "[approval resolved]",
+            // #1086. Each is a fact an agent cannot derive from the command
+            // tree, and each was reachable only from docs/approvals.md, which
+            // the primer's own premise says the agent does not read.
+            //
+            // The token: a group-bound route with no SLACK_BOT_TOKEN on the API
+            // refuses EVERY click, and the refusal names the approver set
+            // rather than the missing token, so the cause is invisible.
+            "SLACK_BOT_TOKEN",
+            "usergroups:read",
+            // The two refusals a second approver actually meets. Everything the
+            // primer covered before was a first-approver problem.
+            "409",
+            "410",
         ] {
             assert!(
                 text.contains(needle),
