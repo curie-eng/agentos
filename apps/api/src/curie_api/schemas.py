@@ -43,7 +43,11 @@ _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
 
 
 def _nullable_override_validator(field: str, examples: str) -> Callable[[str | None], str | None]:
-    """Build the refusal shared by every nullable operator override (#1310, #1355).
+    """Build the gate shared by every nullable operator override (#1310, #1355, #1392).
+
+    Refuses a blank and normalizes what it accepts: the returned value is
+    stripped, so one paste stores one value no matter which surface it came
+    through.
 
     `model` and `thinking` are the same kind of field consumed the same way, and
     they must answer an empty string the same way. `apply_model_env` reads each as
@@ -73,7 +77,8 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
         examples: a trailing clause naming valid values for this field.
 
     Returns:
-        A pydantic field validator refusing empty and whitespace-only values.
+        A pydantic field validator that refuses empty and whitespace-only values
+        and returns every other value stripped.
     """
 
     def _validate(value: str | None) -> str | None:
@@ -86,7 +91,20 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
                 f"clearing means. Send null to clear the override back to the "
                 f"platform default, or {examples}."
             )
-        return value
+        # Normalize here, not in each client (#1392). Leading or trailing
+        # whitespace is never meaningful in either override, and storing it
+        # verbatim is a bug that surfaces far from its cause: a padded model id
+        # is forwarded as CURIE_MODEL and rejected by the provider at the
+        # agent's NEXT turn, long after the command that stored it exited 0.
+        #
+        # This is the API's job because the API is the gate every client passes
+        # through -- the same reasoning `_validate_slack_channel_id` states for
+        # itself ("the authoritative gate for every caller (UI, API, CLI)"). The
+        # console already trimmed and the CLI did not, so the same paste stored
+        # two different values depending on which surface an operator used;
+        # fixing only the CLI would have left curl and every future client on
+        # the old behavior.
+        return value.strip()
 
     return _validate
 
