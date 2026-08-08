@@ -58,6 +58,8 @@ git history (`git log -- docs/`).
 - [`slack-local-runbook.md`](slack-local-runbook.md): connect your own Slack
   app to the local compose stack to exercise real mentions and threads without a
   cluster.
+- [`pillars.md`](pillars.md): the eight agent-development pillars issues, PRs,
+  and discussions are labeled against, and how to apply the labels.
 
 Forward-looking work is planned and tracked in
 [GitHub issues](https://github.com/curie-eng/curie/issues), with larger

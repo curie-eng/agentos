@@ -16,6 +16,16 @@ open a GitHub issue describing the change so a maintainer can confirm it fits
 the project's direction. This is especially important for anything that touches
 a cross-component seam or a frozen contract (see below).
 
+## Labeling issues, PRs, and discussions
+
+Work here is organized around eight agent-development pillars (capability
+authoring, model and routing strategy, memory and institutional knowledge,
+connectivity and channels, security and governance, observability and
+auditability, evaluation and continuous improvement, and deployment and
+lifecycle management), each with a `pillar:*` label. See
+[`docs/pillars.md`](docs/pillars.md) for what each pillar covers and how to
+apply the labels to issues, epics, PRs, and discussions.
+
 ## Before you start
 
 - **Be respectful.** All participation is governed by our
