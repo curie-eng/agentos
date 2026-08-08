@@ -27,6 +27,10 @@ _LF_HOST = os.environ.get("TEST_LANGFUSE_HOST", "http://localhost:23000")
 _LF_PK = os.environ.get("TEST_LANGFUSE_PUBLIC_KEY", "pk-lf-curie-dev")
 _LF_SK = os.environ.get("TEST_LANGFUSE_SECRET_KEY", "sk-lf-curie-dev")
 
+# One bound for every wait on Langfuse's asynchronous ingestion, shared so the
+# trace poll and the score poll cannot drift apart: they wait on the same path.
+_INGEST_POLL_ATTEMPTS = 40
+
 
 async def _traces_for_version(client: httpx.AsyncClient, version: str) -> list[dict[str, Any]]:
     resp = await client.get(
@@ -41,12 +45,51 @@ async def _traces_for_version(client: httpx.AsyncClient, version: str) -> list[d
 
 
 async def _score_for_trace(client: httpx.AsyncClient, trace_id: str) -> float | None:
+    """One immediate read. ``None`` means "not there YET" as often as "not there".
+
+    Two distinct not-yet states collapse into the same ``None``: the trace itself
+    may not be queryable (non-200), or it may be queryable while its score has
+    not ingested. Both are why callers must poll rather than read once.
+    """
     resp = await client.get(f"{_LF_HOST}/api/public/traces/{trace_id}", auth=(_LF_PK, _LF_SK))
     if resp.status_code != 200:
         return None
     for score in resp.json().get("scores") or []:
         if score.get("name") == SCORE_NAME:
             return float(score["value"])
+    return None
+
+
+async def _score_for_trace_eventually(
+    client: httpx.AsyncClient, trace_id: str, *, attempts: int = _INGEST_POLL_ATTEMPTS
+) -> float | None:
+    """Poll one trace's ``eval_pass`` score until it ingests (#1165).
+
+    Traces and scores ingest through Langfuse SEPARATELY, so a trace can be
+    queryable before its score is. The test that reads these already polled for
+    the traces and then read the score once, which fails as ``assert None == 1.0``
+    when the two land far enough apart. Observed on CI run 30594997403; a re-run
+    of the same commit was green, which is exactly why the source and not the
+    frequency is the thing to fix.
+
+    ``is not None`` and never truthiness: a FAILING case scores a legitimate
+    ``0.0``, so ``if score:`` would poll it to the bound every run and then
+    report the correct value as a timeout.
+
+    Args:
+        client: an authenticated httpx client.
+        trace_id: the trace whose score to wait for.
+        attempts: one-second attempts before giving up. Defaults to the same
+            bound the trace poll uses, since the two wait on one ingestion path.
+
+    Returns:
+        The score, or ``None`` when it never materialized.
+    """
+    for _ in range(attempts):
+        score = await _score_for_trace(client, trace_id)
+        if score is not None:
+            return score
+        await asyncio.sleep(1)
     return None
 
 
@@ -307,22 +350,35 @@ def test_records_per_case_results_and_reads_them_back() -> None:
 
             # Poll for the async-ingested traces (keyed by the unique version tag).
             traces: list[dict[str, Any]] = []
-            for _ in range(40):
+            for _ in range(_INGEST_POLL_ATTEMPTS):
                 traces = await _traces_for_version(client, version)
                 if len(traces) >= 2:
                     break
                 await asyncio.sleep(1)
             assert len(traces) == 2, f"eval traces did not materialize for {version}: {traces}"
 
+            # Read off the polled traces, not re-fetched: metadata travels in the
+            # trace body, so anything the poll above returned already carries it.
+            # This needs no wait of its own (#1165's second done-when).
             passed_by_name = {t["name"]: (t.get("metadata") or {}).get("passed") for t in traces}
             assert passed_by_name == {
                 "eval:recorder-test:pass-case": True,
                 "eval:recorder-test:fail-case": False,
             }
 
-            # Each trace carries its eval_pass score matching pass/fail.
+            # Each trace carries its eval_pass score matching pass/fail. Polled,
+            # because a materialized trace does NOT imply a materialized score
+            # (#1165): scores ingest on their own path and can land later.
             for trace in traces:
                 expected = 1.0 if (trace.get("metadata") or {}).get("passed") else 0.0
-                assert await _score_for_trace(client, trace["id"]) == expected
+                actual = await _score_for_trace_eventually(client, trace["id"])
+                assert actual is not None, (
+                    f"score {SCORE_NAME!r} never materialized for trace {trace['id']} "
+                    f"({trace['name']}) after {_INGEST_POLL_ATTEMPTS}s; the trace itself "
+                    "was already queryable, so this is score ingestion lagging"
+                )
+                assert actual == expected, (
+                    f"trace {trace['id']} ({trace['name']}) scored {actual}, expected {expected}"
+                )
 
     asyncio.run(go())
