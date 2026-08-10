@@ -15,7 +15,11 @@ mod schema_inventory;
 
 use std::collections::BTreeMap;
 
-use schema_inventory::{version_from_id, violations, SchemaState, Violation};
+use std::collections::BTreeSet;
+
+use schema_inventory::{
+    version_from_entry, version_from_id, violations, SchemaState, SchemaVersion, Violation,
+};
 use serde_json::Value;
 
 // ─── Loaders ─────────────────────────────────────────────────────────────────
@@ -113,13 +117,38 @@ fn every_committed_schema_compiles_and_declares_a_version() {
 
 #[test]
 fn version_from_id_parses_the_v_segment() {
+    let v = |major, minor| Some(SchemaVersion { major, minor });
     assert_eq!(
         version_from_id("https://schemas.curietech.ai/cli/kill/v1.json"),
-        Some(1)
+        v(1, 0),
+        "a bare major reads as minor zero (ADR-0101), so v1 == v1.0"
     );
-    assert_eq!(version_from_id(".../foo/v12.json"), Some(12));
+    assert_eq!(version_from_id(".../foo/v12.json"), v(12, 0));
+    assert_eq!(version_from_id(".../foo/v1.1.json"), v(1, 1));
+    assert_eq!(version_from_id(".../foo/v2.13.json"), v(2, 13));
     assert_eq!(version_from_id(".../foo/bar.json"), None);
     assert_eq!(version_from_id(".../foo/vX.json"), None);
+    // Malformed minors are rejected rather than silently read as major-only:
+    // a typo'd `$id` must not pass as a version the index can agree with.
+    assert_eq!(version_from_id(".../foo/v1..json"), None);
+    assert_eq!(version_from_id(".../foo/v1.x.json"), None);
+}
+
+// ADR-0101 widened index.json's `version` from an integer to a "major.minor"
+// string. Both spellings stay legal and mean the same thing, so a schema that
+// never changed does not have to be rewritten to satisfy the new type.
+#[test]
+fn version_from_entry_accepts_both_the_integer_and_the_string_spelling() {
+    let v = |major, minor| Some(SchemaVersion { major, minor });
+    assert_eq!(version_from_entry(Some(&serde_json::json!(1))), v(1, 0));
+    assert_eq!(version_from_entry(Some(&serde_json::json!("1.0"))), v(1, 0));
+    assert_eq!(version_from_entry(Some(&serde_json::json!("1.1"))), v(1, 1));
+    assert_eq!(version_from_entry(Some(&serde_json::json!("2"))), v(2, 0));
+    // Zero is not a version, in either spelling.
+    assert_eq!(version_from_entry(Some(&serde_json::json!(0))), None);
+    assert_eq!(version_from_entry(Some(&serde_json::json!("0.3"))), None);
+    assert_eq!(version_from_entry(Some(&serde_json::json!("x"))), None);
+    assert_eq!(version_from_entry(None), None);
 }
 
 // ─── Guard-rejects-a-violating-input demonstrations (AC2 teeth) ──────────────
@@ -147,7 +176,7 @@ fn fixture_schemas() -> BTreeMap<String, SchemaState> {
             "good.schema.json".to_string(),
             SchemaState {
                 compiles: true,
-                id_version: Some(1),
+                id_version: Some(SchemaVersion { major: 1, minor: 0 }),
             },
         ),
         (
@@ -161,7 +190,7 @@ fn fixture_schemas() -> BTreeMap<String, SchemaState> {
             "v2.schema.json".to_string(),
             SchemaState {
                 compiles: true,
-                id_version: Some(2),
+                id_version: Some(SchemaVersion { major: 2, minor: 0 }),
             },
         ),
         // "absent.schema.json" is deliberately not here.
@@ -235,7 +264,9 @@ fn rejects_a_version_that_disagrees_with_the_schema_id() {
     assert!(
         vs.iter().any(
             |v| matches!(v, Violation::VersionMismatch { result, entry_version, id_version, .. }
-            if result == "MismatchOne" && *entry_version == 1 && *id_version == 2)
+            if result == "MismatchOne"
+                && *entry_version == SchemaVersion { major: 1, minor: 0 }
+                && *id_version == SchemaVersion { major: 2, minor: 0 })
         ),
         "{vs:#?}"
     );
@@ -260,5 +291,134 @@ fn rejects_an_undeclared_raw_emit_json_site() {
             if file == "drifted.rs" && *expected == 0 && *found == 1)
         ),
         "{vs:#?}"
+    );
+}
+
+// ─── ADR-0101: an unchanged $id must stay compatible ─────────────────────────
+
+/// Every property name a schema accepts at its root, including inside `oneOf`
+/// branches, plus the `required` set. Enough to decide the two compatibility
+/// questions ADR-0101 turns on and nothing more.
+fn shape(schema: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut props = BTreeSet::new();
+    let mut required = BTreeSet::new();
+    let mut collect = |v: &serde_json::Value| {
+        if let Some(p) = v.get("properties").and_then(|p| p.as_object()) {
+            props.extend(p.keys().cloned());
+        }
+        if let Some(r) = v.get("required").and_then(|r| r.as_array()) {
+            required.extend(r.iter().filter_map(|x| x.as_str().map(str::to_string)));
+        }
+    };
+    collect(schema);
+    for branch in schema
+        .get("oneOf")
+        .and_then(|b| b.as_array())
+        .into_iter()
+        .flatten()
+    {
+        collect(branch);
+    }
+    (props, required)
+}
+
+fn schema_id(v: &serde_json::Value) -> String {
+    v["$id"].as_str().unwrap_or_default().to_string()
+}
+
+/// ADR-0101's gate: a schema may not change shape while keeping its `$id`.
+///
+/// Every committed schema is `additionalProperties: false`, so a consumer
+/// holding the previous revision REJECTS a payload carrying a property added
+/// since. ADR-0074's superseded additive clause said such an addition needed no
+/// bump, and three landed that way (#1056, #1057, #1306) with no red build,
+/// because nothing compares a schema against its own past.
+///
+/// Compares SHAPES rather than sample payloads deliberately. A payload-based
+/// version of this gate covers only the result families that happen to have a
+/// constructed sample -- 23 of 47 when this was written, excluding `guide`,
+/// `diff` and `doctor`, which are exactly the three that broke. Shape comparison
+/// covers all 39 schemas by construction.
+///
+/// The baseline is a committed file, not `git show HEAD~1:...`, because CI
+/// checks out at depth 1: a history-based lookup would find no previous
+/// revision, skip everything, and pass. See `cli/schema/baseline/README.md`.
+#[test]
+fn a_schema_may_not_change_shape_while_keeping_its_id() {
+    let dir = format!("{}/schema", env!("CARGO_MANIFEST_DIR"));
+    let mut problems: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+    let mut versioned = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("cli/schema exists") {
+        let path = entry.expect("readable entry").path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".schema.json") {
+            continue;
+        }
+        let current: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read schema"))
+                .unwrap_or_else(|e| panic!("{name} is valid JSON: {e}"));
+        let base_path = format!("{dir}/baseline/{name}");
+        let Ok(raw) = std::fs::read_to_string(&base_path) else {
+            continue; // a brand-new schema has no previous revision to break
+        };
+        let baseline: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("baseline {name}: {e}"));
+
+        if schema_id(&current) != schema_id(&baseline) {
+            versioned += 1;
+            continue;
+        }
+        compared += 1;
+
+        let (cur_props, cur_req) = shape(&current);
+        let (base_props, base_req) = shape(&baseline);
+
+        let added: Vec<_> = cur_props.difference(&base_props).cloned().collect();
+        let removed: Vec<_> = base_props.difference(&cur_props).cloned().collect();
+        let newly_required: Vec<_> = cur_req.difference(&base_req).cloned().collect();
+
+        if !added.is_empty() {
+            problems.push(format!(
+                "  {name} at UNCHANGED $id {} adds {added:?}\n    \
+                 A consumer holding this $id rejects the new payload \
+                 (additionalProperties: false). Bump the MINOR version.",
+                schema_id(&current)
+            ));
+        }
+        if !newly_required.is_empty() {
+            problems.push(format!(
+                "  {name} at UNCHANGED $id {} newly requires {newly_required:?}\n    \
+                 A consumer holding this $id also rejects an OLDER payload, which \
+                 no refetch fixes. Bump the MAJOR version.",
+                schema_id(&current)
+            ));
+        }
+        if !removed.is_empty() {
+            problems.push(format!(
+                "  {name} at UNCHANGED $id {} removes {removed:?}\n    \
+                 Bump the MAJOR version.",
+                schema_id(&current)
+            ));
+        }
+    }
+
+    assert!(
+        compared + versioned >= 39,
+        "the baseline covered only {} schema(s); cli/schema/baseline/ is stale, so \
+         this gate is green because it did nothing",
+        compared + versioned
+    );
+    assert!(
+        problems.is_empty(),
+        "These schemas changed shape while keeping their $id, so a conforming \
+         consumer is broken under an identifier that promises it is not \
+         (ADR-0101). Bump the version, then refresh the baseline with \
+         `curie dev schema-baseline`.\n\n{}\n\n({compared} compared, {versioned} \
+         already versioned)",
+        problems.join("\n")
     );
 }

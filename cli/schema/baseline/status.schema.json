@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/status/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/status/v1.json",
   "title": "curie skill status --json",
   "description": "The agent-facing payload of `curie skill status --json`: the runner base URL, the serialized ACI SessionStatus, and the recorded bundle digest (#1087). The wrapper keys are what the CLI owns and are locked; the inner `session` is a frozen ACI contract elsewhere, so it is left unconstrained here rather than mirrored field-by-field.",
   "type": "object",

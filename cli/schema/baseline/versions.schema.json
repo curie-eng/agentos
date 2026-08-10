@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/versions/v1.json",
+  "title": "curie <tier> versions --json",
+  "description": "The agent-facing payload of `curie <tier> versions <agent>`: the dry-run plan, or the agent's versions newest-first (an empty array when none exist).",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "version_label": {
+                "type": "string"
+              },
+              "commit_sha": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bundle_sha256": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_by": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "bundle_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "version_label",
+              "commit_sha",
+              "bundle_sha256",
+              "created_by",
+              "created_at",
+              "bundle_ref"
+            ]
+          }
+        }
+      },
+      "required": [
+        "agent",
+        "versions"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/error/v1.json",
+  "title": "curie --json error",
+  "description": "The agent-facing error payload emitted to stdout when a command fails under --json: the rendered error message plus an optional actionable fix hint (null when none applies).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "error",
+    "fix"
+  ],
+  "properties": {
+    "error": {
+      "type": "string"
+    },
+    "fix": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

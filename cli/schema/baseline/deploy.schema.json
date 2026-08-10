@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/deploy/v1.json",
+  "title": "curie <tier> deploy --json",
+  "description": "The agent-facing payload of `curie local deploy` / `curie cluster deploy`: the deployed agent, version, channel, bundle, and deployment summary.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "plugin": {
+      "type": "string"
+    },
+    "label": {
+      "type": "string"
+    },
+    "environment": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "id"
+      ]
+    },
+    "version": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "id"
+      ]
+    },
+    "channel": {
+      "type": "string"
+    },
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ref",
+        "sha256",
+        "size_bytes"
+      ]
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "environment": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "environment",
+        "status"
+      ]
+    }
+  },
+  "required": [
+    "plugin",
+    "label",
+    "environment",
+    "agent",
+    "version",
+    "channel",
+    "bundle",
+    "deployment"
+  ]
+}

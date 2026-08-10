@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/local-down/v1.json",
+  "title": "curie local down --json",
+  "description": "The agent-facing payload of `curie local down`: the dry-run plan, an operator abort, or the stopped stack (whether volumes were wiped and how many stray runner containers were reaped).",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stopped": {
+          "const": false
+        },
+        "aborted": {
+          "const": true
+        }
+      },
+      "required": [
+        "stopped",
+        "aborted"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stopped": {
+          "const": true
+        },
+        "volumes_wiped": {
+          "type": "boolean"
+        },
+        "runners_reaped": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "stopped",
+        "volumes_wiped",
+        "runners_reaped"
+      ]
+    }
+  ]
+}

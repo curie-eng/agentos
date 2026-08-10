@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/eval/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/eval/v1.json",
   "title": "curie skill eval --json",
   "description": "The agent-facing payload of `curie skill eval --json`: the outcome roll-up plus one row per eval case.",
   "type": "object",

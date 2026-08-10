@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v1.json",
+  "title": "curie <tier> overrides --json",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's two nullable operator overrides as the API stored them. `model` and `thinking` are null when no override is pinned, which is the same fact the API returns: the platform default applies. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "model",
+        "thinking",
+        "changed"
+      ]
+    }
+  ]
+}

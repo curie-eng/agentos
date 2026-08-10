@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/seal/v1.json",
+  "title": "curie seal --json",
+  "description": "The agent-facing payload of `curie seal`: a connector credential encrypted to one cluster (ADR-0094). Every field is safe to commit -- the sealed blob is useless without the cluster's private key, and the public key is published by design. The plaintext value never appears.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "connector": {
+      "type": "string",
+      "description": "The connector in connectors.yaml that reads this value."
+    },
+    "env_name": {
+      "type": "string",
+      "description": "The environment variable name the connector reads it as."
+    },
+    "sealed": {
+      "type": "string",
+      "description": "Base64 of a NaCl sealed box. Safe to commit. Sealing the same value twice yields different blobs, so a repository's history does not reveal which credentials are equal."
+    },
+    "public_key": {
+      "type": "string",
+      "description": "The cluster public key this was sealed to, so an author can confirm which cluster can open it. Not a secret."
+    },
+    "yaml": {
+      "type": "string",
+      "description": "A ready-to-paste connectors.yaml fragment carrying the sealed value at the path the loader reads."
+    }
+  },
+  "required": ["connector", "env_name", "sealed", "public_key", "yaml"]
+}

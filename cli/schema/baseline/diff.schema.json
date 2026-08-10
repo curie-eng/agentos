@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/diff/v2.0.json",
+  "$id": "https://schemas.curietech.ai/cli/diff/v1.json",
   "title": "curie diff --json",
   "description": "The agent-facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Declared credentials and provider addresses are resolved to construct the same plan used by apply, but no cluster state is mutated. Secret-bearing values are rendered as the literal string `<secret>` and never in the clear.",
   "type": "object",

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/resume/v1.json",
+  "title": "curie <tier> resume --json",
+  "description": "The agent-facing payload of `curie <tier> resume <agent>`: the dry-run plan, or the resulting kill state (`killed` is false once resumed).",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "killed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "agent",
+        "killed"
+      ]
+    }
+  ]
+}

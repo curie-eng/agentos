@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/bump-version/v1.json",
+  "title": "curie dev bump-version --json",
+  "description": "The agent-facing payload of `curie dev bump-version`: the single version string now set across the release-coupled fields.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "version"
+  ]
+}

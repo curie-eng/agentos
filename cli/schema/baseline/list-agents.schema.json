@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/list-agents/v1.json",
+  "title": "curie list-agents --json",
+  "description": "The agent-facing payload of `curie list-agents`: the local bundles discovered under `agents/`, each with its name, description, and directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "agents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "directory"
+        ]
+      }
+    }
+  },
+  "required": [
+    "agents"
+  ]
+}

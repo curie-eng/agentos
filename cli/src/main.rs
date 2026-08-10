@@ -526,6 +526,9 @@ enum DevAction {
     /// downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`).
     /// Offline, no credential.
     EmitParity,
+    /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
+    /// Refuses when a schema changed shape without a version bump.
+    SchemaBaseline,
     /// Assert Rail 1 (ADR-0067) actually ENFORCES on the cluster kubectl points
     /// at, not merely that its NetworkPolicies are applied (#1153,
     /// `bash scripts/check-netpol-enforcement.sh`). Structured as a
@@ -1995,6 +1998,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                 commands::dev_script("cli/scripts/check-field-parity.sh").await
             }
             DevAction::EmitParity => commands::dev_script("cli/scripts/check-emit-parity.sh").await,
+            DevAction::SchemaBaseline => {
+                commands::dev_script("cli/scripts/refresh-schema-baseline.sh").await
+            }
             DevAction::NetpolCheck => {
                 commands::dev_script("scripts/check-netpol-enforcement.sh").await
             }

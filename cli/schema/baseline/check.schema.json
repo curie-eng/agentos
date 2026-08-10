@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/check/v1.json",
+  "title": "curie skill check --json",
+  "description": "The agent-facing payload of `curie skill check`: the versioned runner MCP-load report (`version` is the frozen report-contract version, currently 1). `registered` is an opaque pass-through of the runner's registered-server list.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "check": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer"
+    },
+    "plugin_dir": {
+      "type": "string"
+    },
+    "declared": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "form": {
+            "type": "string"
+          },
+          "authed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "source",
+          "form",
+          "authed"
+        ]
+      }
+    },
+    "registered": {
+      "type": "array",
+      "items": true
+    },
+    "matches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "declared": {
+            "type": "string"
+          },
+          "registered": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "tool_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "declared",
+          "registered",
+          "connected",
+          "tool_count"
+        ]
+      }
+    },
+    "verdict": {
+      "type": "string"
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "hints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "check",
+    "version",
+    "plugin_dir",
+    "declared",
+    "registered",
+    "matches",
+    "verdict",
+    "reasons",
+    "hints"
+  ]
+}
