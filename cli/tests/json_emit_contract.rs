@@ -753,6 +753,8 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
         summary: "Deploy the thing".to_string(),
         expires_at: Some("2026-07-16T00:00:00Z".to_string()),
         resolved_by: None,
+        // #1078: the field --actor-channel is derived from.
+        card_channel: Some("CFINANCE01".to_string()),
     };
     assert_eq!(
         ApprovalsOutput::Pending {
@@ -774,6 +776,11 @@ fn approvals_pending_and_resolved_json_shapes_are_pinned() {
                 "summary": "Deploy the thing",
                 "expires_at": "2026-07-16T00:00:00Z",
                 "resolved_by": null,
+                // #1078. Pinned here because this assertion is the reason the
+                // omission was noticeable at all: the projection is spelled out
+                // key by key, so a field the API carries and the CLI drops is
+                // visible in the diff rather than inferred.
+                "card_channel": "CFINANCE01",
             }],
             "count": 1,
             "truncated": false,

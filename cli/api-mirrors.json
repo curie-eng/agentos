@@ -71,10 +71,6 @@
           "why": "The idempotency key is a server-side dedupe concern; the CLI neither displays it nor resubmits on it."
         },
         {
-          "field": "card_channel",
-          "why": "Where the approval card was posted is a Slack-delivery detail; the operator-facing listing renders conversation_id/summary, not the card channel."
-        },
-        {
           "field": "resolution_note",
           "why": "resolve_approval SENDS a note via --note; it does not read back the stored resolution_note when listing pending approvals."
         },

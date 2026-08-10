@@ -207,6 +207,16 @@ pub struct ApprovalRecord {
     pub expires_at: Option<String>,
     #[serde(default)]
     pub resolved_by: Option<String>,
+    /// The channel the approval card was posted to (#1078). Load-bearing, not
+    /// a delivery detail: with no `approvers` block on the route this channel's
+    /// MEMBERS are the approver set, and `--resolve` needs it as
+    /// `--actor-channel` because that is what the server-side authorizer
+    /// compares against. Without it the value is underivable from the CLI and
+    /// a guess is a refusal. `#[serde(default)]` keeps a record that predates
+    /// route bindings parsing to None, which is the same fact as "no route, so
+    /// the requesting channel applies".
+    #[serde(default)]
+    pub card_channel: Option<String>,
 }
 
 /// What a deploy did with the agent's Slack channel, for the summary printout.
