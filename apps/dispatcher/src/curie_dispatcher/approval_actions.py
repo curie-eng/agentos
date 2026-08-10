@@ -390,6 +390,31 @@ def _resolved_card_blocks(original: dict[str, Any], verdict: str) -> list[dict[s
     return blocks
 
 
+def escape_mrkdwn(text: str) -> str:
+    """Neutralize Slack's control sequences in text a person typed (#1074).
+
+    The verdict line is rendered as ``mrkdwn`` in a bot-authored context block,
+    so an approver's note was interpreted rather than shown: ``<!channel>``
+    pinged the whole room and ``*text*`` forged emphasis in a message attributed
+    to Curie. An approver is authorized to make a binary decision on one gated
+    action, not to broadcast to a channel or to write in the platform's voice.
+
+    Escaping the three characters Slack's own documentation names is enough and
+    is what Slack recommends: ``<`` is what opens every control sequence (a
+    broadcast, a user mention, a link), and ``&`` must go first or it would
+    double-escape the entities the other two produce. ``*``/``_``/`` ` `` are
+    deliberately NOT escaped -- they are cosmetic, they render inertly, and
+    stripping them would mangle a note that legitimately quotes code.
+
+    Args:
+        text: the approver-supplied note, verbatim.
+
+    Returns:
+        The note with Slack's control characters rendered as literals.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _verdict_line(decision: str, user: str, note: str | None) -> str:
     """The context line stamped onto a settled card.
 
@@ -409,7 +434,7 @@ def _verdict_line(decision: str, user: str, note: str | None) -> str:
     # note ends the same way whichever service stamped the card.
     line = f"{decision.capitalize()} by <@{user}>"
     if note:
-        line = f"{line}\nNote: {note}"
+        line = f"{line}\nNote: {escape_mrkdwn(note)}"
     if len(line) <= _VERDICT_LINE_MAX:
         return line
     return line[: _VERDICT_LINE_MAX - 1] + "…"

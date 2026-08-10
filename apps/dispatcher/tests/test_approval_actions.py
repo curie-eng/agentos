@@ -23,6 +23,7 @@ from curie_dispatcher.approval_actions import (
     REJECT_ACTION_ID,
     ApprovalResolveClient,
     ResolveOutcome,
+    settled_verdict_line,
 )
 from curie_dispatcher.config import DispatcherConfig
 from slack_bolt import App
@@ -511,3 +512,58 @@ def test_action_ids_match_the_frozen_vector() -> None:
         "approval card and `curie local message` would stop reporting an "
         "awaiting-approval turn."
     )
+
+
+# ─── #1074: a note is user text in a bot-authored mrkdwn block ────────────────
+
+INJECTION = "<!channel> <@U_TARGET> *Approved by CFO*"
+
+
+def test_a_note_cannot_broadcast_or_forge_attribution_on_the_card() -> None:
+    """The verdict line renders as ``mrkdwn`` in a context block attributed to
+    Curie, so an approver's note was INTERPRETED rather than shown: ``<!channel>``
+    pinged the whole room and ``*text*`` forged emphasis in the platform's voice.
+
+    An approver is authorized to decide one gated action. Broadcasting to a
+    channel, and writing what looks like a second attribution line, are not part
+    of that.
+    """
+    line = settled_verdict_line(decision="approved", resolver="U_MANAGER", note=INJECTION)
+
+    # The control sequences are shown, not executed.
+    assert "<!channel>" not in line, f"a note must not broadcast:\n{line}"
+    assert "<@U_TARGET>" not in line, f"a note must not mention:\n{line}"
+    assert "&lt;!channel&gt;" in line
+    assert "&lt;@U_TARGET&gt;" in line
+
+    # The genuine attribution -- the one the platform wrote -- is untouched, so
+    # escaping the note did not escape the line around it.
+    assert "<@U_MANAGER>" in line, f"the real resolver mention must survive:\n{line}"
+
+
+def test_escaping_is_ampersand_first_so_entities_are_not_double_escaped() -> None:
+    """`&` has to go first or `<` becomes `&amp;lt;` and the reader sees the
+    escaping rather than the text."""
+    line = settled_verdict_line(decision="approved", resolver="U1", note="a & b <c>")
+
+    assert "a &amp; b &lt;c&gt;" in line
+    assert "&amp;lt;" not in line, f"double-escaped:\n{line}"
+
+
+def test_cosmetic_markdown_is_left_alone() -> None:
+    """`*`, `_` and backticks are not escaped on purpose: they render inertly,
+    and stripping them would mangle a note that legitimately quotes code."""
+    line = settled_verdict_line(
+        decision="rejected", resolver="U1", note="use `--force` carefully"
+    )
+
+    assert "`--force`" in line
+
+
+def test_a_plain_note_is_unchanged() -> None:
+    """The common case pays nothing for the guard."""
+    line = settled_verdict_line(
+        decision="rejected", resolver="U1", note="discount exceeds policy"
+    )
+
+    assert "Note: discount exceeds policy" in line
