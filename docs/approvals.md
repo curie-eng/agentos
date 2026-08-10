@@ -244,7 +244,7 @@ or `approvers.group` ignores the channel entirely, so passing it there is harmle
 | Symptom | Cause and fix |
 |---|---|
 | `403 self-approval is blocked` | You are the author of the turn that raised it. Resolve as a different actor. |
-| `403 you are not an approver` | The route's set does not admit that actor from that channel. Pass the `--actor-channel` the record reports, or check the `approvers` block. |
+| `403 you are not an approver` | The route's set does not admit that actor from that channel. Pass the record's `card_channel` as `--actor-channel` (`--list --json` reports it since #1078), or check the `approvers` block. A null `card_channel` means the record names no route, so the requesting channel is the set. |
 | `403 could not verify approvers` | A group lookup failed or the approvers block does not parse. Check `SLACK_BOT_TOKEN` and the `usergroups:read` scope; this never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |

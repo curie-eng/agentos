@@ -296,30 +296,62 @@ fn rejects_an_undeclared_raw_emit_json_site() {
 
 // ─── ADR-0101: an unchanged $id must stay compatible ─────────────────────────
 
-/// Every property name a schema accepts at its root, including inside `oneOf`
-/// branches, plus the `required` set. Enough to decide the two compatibility
-/// questions ADR-0101 turns on and nothing more.
+/// Every property a schema accepts, and every property it requires, ANYWHERE in
+/// the document. Enough to decide the two compatibility questions ADR-0101 turns
+/// on and nothing more.
+///
+/// Names are qualified by their JSON Pointer path, so a `card_channel` added
+/// under `$defs/approvalRecord` is a different name from one added at the root.
+/// Without that, moving a property between two objects would cancel out and read
+/// as no change at all.
+///
+/// Walks the whole tree rather than the root plus `oneOf`. The first version of
+/// this gate did only those two, and 20 of 39 schemas keep their real content in
+/// `$defs` -- including `approvals`, whose entire record shape lives there. The
+/// gap surfaced on the very next change to land (#1078, adding
+/// `$defs/approvalRecord/card_channel`), which the gate waved straight through.
 fn shape(schema: &serde_json::Value) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut props = BTreeSet::new();
     let mut required = BTreeSet::new();
-    let mut collect = |v: &serde_json::Value| {
-        if let Some(p) = v.get("properties").and_then(|p| p.as_object()) {
-            props.extend(p.keys().cloned());
-        }
-        if let Some(r) = v.get("required").and_then(|r| r.as_array()) {
-            required.extend(r.iter().filter_map(|x| x.as_str().map(str::to_string)));
-        }
-    };
-    collect(schema);
-    for branch in schema
-        .get("oneOf")
-        .and_then(|b| b.as_array())
-        .into_iter()
-        .flatten()
-    {
-        collect(branch);
-    }
+    walk(schema, String::new(), &mut props, &mut required);
     (props, required)
+}
+
+/// Recursive half of [`shape`]. `path` is the JSON Pointer to `node`.
+fn walk(
+    node: &serde_json::Value,
+    path: String,
+    props: &mut BTreeSet<String>,
+    required: &mut BTreeSet<String>,
+) {
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(p) = map.get("properties").and_then(|p| p.as_object()) {
+                props.extend(p.keys().map(|k| format!("{path}/properties/{k}")));
+            }
+            if let Some(r) = map.get("required").and_then(|r| r.as_array()) {
+                required.extend(
+                    r.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|k| format!("{path}/required/{k}")),
+                );
+            }
+            for (k, v) in map {
+                // Prose, not shape: skipping it keeps a reworded description
+                // from reading as a compatibility event.
+                if matches!(k.as_str(), "description" | "title" | "$comment") {
+                    continue;
+                }
+                walk(v, format!("{path}/{k}"), props, required);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                walk(v, format!("{path}/{i}"), props, required);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn schema_id(v: &serde_json::Value) -> String {

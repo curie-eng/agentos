@@ -190,3 +190,68 @@ async fn actor_channel_present_alongside_reject_decision() {
     assert_eq!(body["decision"], "rejected");
     assert_eq!(body["resolved_by"], "brian");
 }
+
+// ─── #1078: the recipe promises this field; --list must actually emit it ─────
+
+/// The card channel must reach the operator through `--list --json`, because
+/// `--resolve` cannot be driven without it.
+///
+/// #1056's recipe told an agent that `--list` reports the channel a route bound
+/// the card to. It did not: `approval_record_json` projected ten fields and
+/// dropped `card_channel`, while the API had carried it all along. With no
+/// `approvers` block on the route, that channel's MEMBERS are the approver set
+/// and `slack_approvers.py` compares `actor_channel` against it, so a guess is a
+/// 403 and the value was underivable from the CLI.
+///
+/// Asserted end to end through the real handler rather than by constructing an
+/// `ApprovalRecord`: the defect was in the PROJECTION, which a hand-built record
+/// walks straight past.
+#[tokio::test]
+async fn list_json_reports_the_card_channel_the_recipe_promises() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            r##"[{"id":"11111111-1111-1111-1111-111111111111","name":"weather","slack_channel":"CREQUEST01","created_at":"2026-07-05T00:00:00Z"}]"##,
+        ),
+        ("GET", p) if p.starts_with("/approvals") => Response::json(
+            200,
+            r##"[{"id":"22222222-2222-2222-2222-222222222222","agent_id":"11111111-1111-1111-1111-111111111111","author":"U-REQUESTER","route":"finance","gate_kind":"policy","granted_tool":null,"status":"pending","conversation_id":"thread-1","summary":"approve invoice","expires_at":null,"resolved_by":null,"card_channel":"CFINANCE01","reply_channel":"CREQUEST01"}]"##,
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = approvals(
+        AgentActionOpts {
+            api_url: server.base_url.clone(),
+            api_key: TEST_API_KEY.to_string(),
+            agent: "weather".to_string(),
+            dry_run: false,
+        },
+        vec![],
+        false,
+        ApprovalCmd {
+            list: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("list succeeds");
+
+    let json = curie::ui::CliOutput::to_json(&out);
+    let record = &json["pending"][0];
+
+    assert_eq!(
+        record["card_channel"], "CFINANCE01",
+        "--list --json must report the card channel; without it --actor-channel \
+         is underivable and every resolve on a channel-authorized route 403s. \
+         Payload: {json}"
+    );
+    // The requesting channel is a DIFFERENT channel, which is the whole reason
+    // guessing fails: an agent that assumed the two were the same would send the
+    // wrong one and read the refusal as an authorization problem.
+    assert_ne!(
+        record["card_channel"], "CREQUEST01",
+        "the fixture must keep card and reply channels distinct, or this test \
+         cannot tell a correct value from a lucky one"
+    );
+}

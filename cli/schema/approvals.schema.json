@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v1.2.json",
   "title": "curie <tier> approvals --json",
   "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings, where each route's `channel` is where its card posts and its optional `approvers` block is who may resolve it.",
   "$defs": {
@@ -67,6 +67,13 @@
           ]
         },
         "resolved_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "card_channel": {
+          "description": "The channel the approval card was posted to, or null when the record names no route (the requesting channel is then the approver set). This is what `--resolve` needs as `--actor-channel`: with no `approvers` block the channel's MEMBERS are the approver set, and the server-side authorizer compares against it, so the value is not derivable by guessing (#1078).\n\nOPTIONAL, and the only optional property in this record, which is deliberate rather than an oversight. Every sibling was required at birth, when no compatibility question existed. ADR-0101 prefers optional for a property added later: a consumer can tolerate its absence in a payload from an older CLI, which keeps this a MINOR bump. Making it required would reject those older payloads and cost a major version for no gain.",
           "type": [
             "string",
             "null"

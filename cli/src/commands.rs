@@ -4327,6 +4327,10 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
         "summary": r.summary,
         "expires_at": r.expires_at,
         "resolved_by": r.resolved_by,
+        // #1078: the one field --resolve cannot be driven without. Null when
+        // the record names no route, which means the requesting channel is the
+        // approver set rather than a bound one.
+        "card_channel": r.card_channel,
     })
 }
 
