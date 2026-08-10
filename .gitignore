@@ -15,6 +15,11 @@ oauth.env
 # any secret material, and the schema contract test requires it committed.
 # Without this the `*secret*` rule above silently drops it and CI goes red.
 !cli/schema/secrets.schema.json
+# Same exception for its ADR-0101 compatibility baseline, which is a byte copy
+# of the schema above and equally free of secret material. Without this the
+# `*secret*` rule drops it, the baseline covers 38 of 39 schemas, and the gate
+# fails on its own coverage assertion -- which is the assertion working.
+!cli/schema/baseline/secrets.schema.json
 # Same exception for the per-agent connector-secret template + its render-
 # assertion script (ADR-0009, #429): Helm syntax / a test, not secret material.
 !charts/curie/templates/agent-connector-secrets.yaml
