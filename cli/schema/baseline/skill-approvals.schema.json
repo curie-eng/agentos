@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/skill-approvals/v1.json",
+  "title": "curie skill approvals --json",
+  "description": "The agent-facing payload of `curie skill approvals`: the bundle's declared gates, or the env assignment a set/clear WOULD need (the skill tier boots the runner from env, so there is nothing to mutate; ADR-0041).",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "gate": {
+                "type": "string"
+              },
+              "route": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "gate",
+              "route"
+            ]
+          }
+        }
+      },
+      "required": [
+        "gates"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "type": "string"
+        },
+        "restart": {
+          "type": "string"
+        },
+        "bundle_note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "env",
+        "restart",
+        "bundle_note"
+      ]
+    }
+  ]
+}

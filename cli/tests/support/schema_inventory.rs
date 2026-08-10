@@ -48,14 +48,14 @@ pub enum Violation {
     SchemaFileMissing { result: String, schema: String },
     /// An entry's schema file does not compile to a JSON Schema validator.
     SchemaInvalid { result: String, schema: String },
-    /// An entry has no positive-integer `version`.
+    /// An entry has no usable `version` (a positive integer, or `"N.M"`).
     MissingVersion { result: String },
-    /// An entry's `version` disagrees with the `/vN` segment of the schema's `$id`.
+    /// An entry's `version` disagrees with the version segment of the `$id`.
     VersionMismatch {
         result: String,
         schema: String,
-        entry_version: u64,
-        id_version: u64,
+        entry_version: SchemaVersion,
+        id_version: SchemaVersion,
     },
     /// An entry is missing a required key (`result`/`kind`/`schema`), so it would
     /// silently escape comparison.
@@ -75,8 +75,8 @@ pub enum Violation {
 pub struct SchemaState {
     /// `jsonschema::validator_for` accepted it.
     pub compiles: bool,
-    /// The version parsed from the `/vN` segment of the schema's `$id`, if any.
-    pub id_version: Option<u64>,
+    /// The version parsed from the `$id`'s version segment, if any.
+    pub id_version: Option<SchemaVersion>,
 }
 
 /// Collects every `impl (path::)?CliOutput for T` self-type name, including impls
@@ -123,14 +123,73 @@ pub fn cli_output_impls(cli_srcs: &[(&str, &str)]) -> BTreeSet<String> {
 /// Parse the `/vN` version segment from a schema `$id` string, e.g.
 /// `https://.../cli/kill/v1.json` -> `Some(1)`. The version identity AC1 asks
 /// for: it must be present and must agree with the inventory entry's `version`.
-pub fn version_from_id(id: &str) -> Option<u64> {
+/// A schema's two-part version (ADR-0101).
+///
+/// `v1` and `v1.0` are the SAME version: a bare major is read as minor zero, so
+/// no schema had to move when the minor half was introduced. Ordering is
+/// derived (major first, then minor) but nothing compares them yet -- the gate
+/// checks identity between the `$id` and the index, not precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SchemaVersion {
+    pub major: u64,
+    pub minor: u64,
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// Parse `vN` or `vN.M` from the last segment of a schema `$id` (ADR-0101).
+///
+/// Args:
+///   id: the schema's `$id`.
+///
+/// Returns:
+///   The version, or `None` when the segment is not a version at all.
+pub fn version_from_id(id: &str) -> Option<SchemaVersion> {
     let last = id.rsplit('/').next()?;
     let stem = last.strip_suffix(".json").unwrap_or(last);
     let digits = stem.strip_prefix('v')?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    let (major, minor) = match digits.split_once('.') {
+        Some((maj, min)) => (maj, min),
+        None => (digits, "0"),
+    };
+    let numeric = |s: &str| -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
+    Some(SchemaVersion {
+        major: numeric(major)?,
+        minor: numeric(minor)?,
+    })
+}
+
+/// Parse an `index.json` `version` value, which ADR-0101 widened from an integer
+/// to a `"major.minor"` string. Both spellings are accepted and mean the same
+/// thing, so an entry that never changed does not have to be rewritten.
+///
+/// Args:
+///   value: the raw `version` field.
+///
+/// Returns:
+///   The version, or `None` when it is neither a positive integer nor a
+///   well-formed version string.
+pub fn version_from_entry(value: Option<&Value>) -> Option<SchemaVersion> {
+    match value {
+        Some(Value::Number(n)) => {
+            let major = n.as_u64()?;
+            (major > 0).then_some(SchemaVersion { major, minor: 0 })
+        }
+        Some(Value::String(s)) => {
+            let v = version_from_id(&format!("/v{s}.json"))?;
+            (v.major > 0).then_some(v)
+        }
+        _ => None,
     }
-    digits.parse().ok()
 }
 
 fn entry_str<'a>(e: &'a Value, key: &str) -> Option<&'a str> {
@@ -175,13 +234,12 @@ pub fn violations(
             declared_cli_output.insert(result.to_string());
         }
 
-        // Version identity: a positive integer that agrees with the schema `$id`.
-        let entry_version = entry.get("version").and_then(Value::as_u64);
-        match entry_version {
-            None | Some(0) => out.push(Violation::MissingVersion {
+        // Version identity: a usable version that agrees with the schema `$id`.
+        let entry_version = version_from_entry(entry.get("version"));
+        if entry_version.is_none() {
+            out.push(Violation::MissingVersion {
                 result: result.to_string(),
-            }),
-            Some(_) => {}
+            });
         }
 
         match schemas.get(schema) {

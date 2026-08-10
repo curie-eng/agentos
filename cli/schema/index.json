@@ -7,283 +7,283 @@
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "BudgetOutput",
       "kind": "CliOutput",
       "schema": "budget.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "BumpVersionOutput",
       "kind": "CliOutput",
       "schema": "bump-version.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "CheckOutput",
       "kind": "CliOutput",
       "schema": "check.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ClusterDownOutput",
       "kind": "CliOutput",
       "schema": "cluster-down.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ClusterUpOutput",
       "kind": "CliOutput",
       "schema": "cluster-up.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "CommsOutput",
       "kind": "CliOutput",
       "schema": "comms.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "DeleteOutput",
       "kind": "CliOutput",
       "schema": "delete.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "DiffOutput",
       "kind": "CliOutput",
       "schema": "diff.schema.json",
-      "version": 1
+      "version": "2.0"
     },
     {
       "result": "DoctorOutput",
       "kind": "CliOutput",
       "schema": "doctor.schema.json",
-      "version": 1
+      "version": "2.0"
     },
     {
       "result": "DryRunPlan",
       "kind": "CliOutput",
       "schema": "dry-run.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "EvalOutput",
       "kind": "CliOutput",
       "schema": "eval.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "GithubAppOutput",
       "kind": "CliOutput",
       "schema": "github-app.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "GuideOutput",
       "kind": "CliOutput",
       "schema": "guide.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "InitOutput",
       "kind": "CliOutput",
       "schema": "init.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "KillOutput",
       "kind": "CliOutput",
       "schema": "kill.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ListAgentsOutput",
       "kind": "CliOutput",
       "schema": "list-agents.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "LocalDownOutput",
       "kind": "CliOutput",
       "schema": "local-down.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "LocalRebuildOutput",
       "kind": "CliOutput",
       "schema": "local-rebuild.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "LocalStatusOutput",
       "kind": "CliOutput",
       "schema": "local-status.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "LocalUpOutput",
       "kind": "CliOutput",
       "schema": "local-up.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "MessageDryRunOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "MessageOutcomeOutput",
       "kind": "CliOutput",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "MigrateStoreOutput",
       "kind": "CliOutput",
       "schema": "migrate-store.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ObservabilityOutput",
       "kind": "CliOutput",
       "schema": "observability.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ResetThreadOutput",
       "kind": "CliOutput",
       "schema": "reset-thread.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "ResumeOutput",
       "kind": "CliOutput",
       "schema": "resume.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "SealOutput",
       "kind": "CliOutput",
       "schema": "seal.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "SecretsListOutput",
       "kind": "CliOutput",
       "schema": "secrets.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "SkillApprovalsOutput",
       "kind": "CliOutput",
       "schema": "skill-approvals.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "SkillMessageOutput",
       "kind": "CliOutput",
       "schema": "skill-message.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "StatusOutput",
       "kind": "CliOutput",
       "schema": "status.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "VersionsOutput",
       "kind": "CliOutput",
       "schema": "versions.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "error_json",
       "kind": "builder",
       "schema": "error.schema.json",
-      "version": 1
+      "version": "1.0"
     },
     {
       "result": "eval_json",
       "kind": "builder",
       "schema": "eval.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "message_awaiting_approval_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "message_dry_run_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "message_enqueued_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "message_reply_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "message_timeout_json",
       "kind": "builder",
       "schema": "message.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "status_json",
       "kind": "builder",
       "schema": "status.schema.json",
-      "version": 1
+      "version": "1.1"
     },
     {
       "result": "sweep_json",
       "kind": "builder",
       "schema": "sweep.schema.json",
-      "version": 1
+      "version": "1.1"
     }
   ],
   "raw_emit_sites": {

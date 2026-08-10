@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/delete/v1.json",
+  "title": "curie <tier> delete --json",
+  "description": "The agent-facing payload of `curie <tier> delete <agent>`: the dry-run plan, or the deleted agent's name.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "deleted": {
+          "const": true
+        }
+      },
+      "required": [
+        "agent",
+        "deleted"
+      ]
+    }
+  ]
+}

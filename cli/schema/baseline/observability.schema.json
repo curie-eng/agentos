@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability/v1.json",
+  "title": "curie local|cluster observability --json",
+  "description": "The agent-facing payload of `curie local observability --json` and `curie cluster observability --json`. Exactly one of two shapes is emitted per invocation: the resolved observability surfaces, or (cluster tier only) a `--dry-run` descriptor of the discovery commands a real run would execute.",
+  "oneOf": [
+    {
+      "title": "surfaces",
+      "description": "One row per observability surface. An additive superset of the shipped {\"surfaces\":[{\"name\",\"url\"}]} contract -- `note` and `browsable` are new. `url` is a parseable URL or null (degraded); `note` is a hint/error string or null. The two are never overloaded onto one field. All four row keys are always present, with explicit nulls.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surfaces"
+      ],
+      "properties": {
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "url",
+              "note",
+              "browsable"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "note": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "browsable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "title": "dry-run",
+      "description": "A `--dry-run` preview (cluster tier only, delegated to the shared `DryRunPlan`): `plan` is the shell command lines a real run would execute, already credential-masked.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dry_run",
+        "plan"
+      ],
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

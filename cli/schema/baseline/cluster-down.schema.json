@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/cluster-down/v1.json",
+  "title": "curie cluster down --json",
+  "description": "The agent-facing payload of `curie cluster down`: the dry-run plan, an operator abort, or the removed release (`release_was_absent` true when there was nothing installed to remove).",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "down": {
+          "const": false
+        },
+        "aborted": {
+          "const": true
+        }
+      },
+      "required": [
+        "down",
+        "aborted"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "down": {
+          "const": true
+        },
+        "release_was_absent": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "down",
+        "release_was_absent"
+      ]
+    }
+  ]
+}

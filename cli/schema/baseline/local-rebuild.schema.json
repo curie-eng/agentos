@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/local-rebuild/v1.json",
+  "title": "curie local rebuild --json",
+  "description": "The agent-facing payload of `curie local rebuild`: the dry-run plan, or which service was rebuilt and which model mode it came back up running.",
+  "$defs": {
+    "dryRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dry_run": {
+          "const": true
+        },
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "dry_run",
+        "plan"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dryRun"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "rebuilt"
+        },
+        "service": {
+          "type": "string"
+        },
+        "model_mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "service",
+        "model_mode"
+      ]
+    }
+  ]
+}

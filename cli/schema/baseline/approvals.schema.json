@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v1.json",
   "title": "curie <tier> approvals --json",
   "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings, where each route's `channel` is where its card posts and its optional `approvers` block is who may resolve it.",
   "$defs": {

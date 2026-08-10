@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/dry-run/v1.json",
+  "title": "curie --json --dry-run plan",
+  "description": "The uniform planned-action descriptor every agent-facing verb emits under `--json --dry-run`: the literal shell command lines the verb WOULD run, never executed. Emitted directly by `DryRunPlan` and embedded as one branch of every result family that has a `--dry-run` path.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "dry_run": {
+      "const": true
+    },
+    "plan": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "dry_run",
+    "plan"
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/init/v1.json",
+  "title": "curie init --json",
+  "description": "The agent-facing payload of `curie init` (both the plain-name and `--from-spec`/`--adopt` branches): the scaffolded bundle name, its directory, the spec source (null on the plain-name path), the created paths, and the copy-pasteable next command.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "initialized": {
+      "const": true
+    },
+    "name": {
+      "type": "string"
+    },
+    "dir": {
+      "type": "string"
+    },
+    "from_spec": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "initialized",
+    "name",
+    "dir",
+    "from_spec",
+    "created",
+    "next"
+  ]
+}
