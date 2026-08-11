@@ -169,11 +169,29 @@ class ConnectorSpec(BaseModel):
     def resolved_secrets(self) -> list[str]:
         """Only the names Curie must resolve a VALUE for.
 
-        A referenced secret is excluded: the whole point is that nothing in the
-        deploy path handles it.
+        This is what the deploy path is told to write into the per-agent Secret,
+        so anything the renderer points at that Secret MUST appear here. That is
+        why `secret_files` belongs: it names a key in that same Secret, mounted
+        as a file rather than injected as an env var, and the volume is rendered
+        `optional: false`. Omitting them left the Secret with no such key -- and
+        for a `secret_files`-only connector, with no keys at all, so the CLI
+        skipped creating the Secret entirely and the pod never started, stuck on
+        `FailedMount ... secret not found` (#1424).
+
+        Two forms are excluded, and neither is an oversight:
+
+        - a `SecretRef` (`from_secret`) points at a Secret provisioned out of
+          band, and the whole point of ADR-0090 is that nothing in the deploy
+          path ever handles its value -- resolving it would reimpose the
+          credential access this form exists to remove;
+        - a `sealed_secrets` blob IS the credential, carried by the bundle and
+          sealed to the cluster that will run it, so the deploy path has no value
+          to resolve; opening it belongs to the worker under ADR-0094, and asking
+          an operator for a value here would ask for one the bundle already has.
         """
 
-        return [s for s in self.secrets if isinstance(s, str)]
+        named = [s for s in self.secrets if isinstance(s, str)]
+        return named + list(self.secret_files)
 
     @property
     def is_hosted(self) -> bool:
