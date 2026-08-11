@@ -514,13 +514,16 @@ def test_secret_files_are_reported_as_both_declared_and_resolved() -> None:
     assert "K8S_READONLY_KUBECONFIG" in FILE_SPEC.resolved_secrets()
 
 
-def test_no_volume_references_a_key_the_deploy_path_was_not_told_to_write() -> None:
-    # The invariant #1424 violated. A secret volume is rendered
-    # `optional: false`, so a key the deploy path never resolved is not a
-    # degraded connector: the kubelet cannot mount it and the pod never starts,
-    # stuck on `FailedMount ... secret not found`. Pinned as the class -- every
-    # projected key must be one `resolved_secrets()` claims -- so the fix cannot
-    # be satisfied by a rename or by handling only this one spec's shape.
+def test_every_rendered_volume_key_is_one_resolved_secrets_claims() -> None:
+    # Why this invariant matters, and what #1424 violated. A secret volume is
+    # rendered `optional: false`, so a key the deploy path never resolved is
+    # not a degraded connector: the kubelet cannot mount it and the pod never
+    # starts, stuck on `FailedMount ... secret not found`. Pinned as the class
+    # -- every projected key must be one `resolved_secrets()` claims -- so the
+    # fix cannot be satisfied by handling only this one spec's shape.
+    # Boundary: this pins the renderer against the accessor in process; the
+    # deploy path itself is covered by the API-level test in
+    # `apps/api/tests/test_bundle_connectors.py`.
     spec = ConnectorSpec(
         image="x:1",
         secrets=["ENV_TOKEN"],
