@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/message/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/message/v1.1.json",
   "title": "curie local|cluster message --json",
   "description": "The agent-facing payload of `curie local message --json` and `curie cluster message --json`. Exactly one of five terminal-state shapes is emitted per invocation: a reply object (the model's final reply text, the thread the turn ran under, and whether a reply was captured), an awaiting-approval object (the turn parked on a human approval gate), a timeout object (no reply captured before the deadline), a dry-run descriptor (what a real run would enqueue), or an enqueued object (the turn was enqueued onto the real Valkey stream in connected transport mode and the CLI did not wait for a reply). All keys are CLI-owned and locked.",
   "oneOf": [
