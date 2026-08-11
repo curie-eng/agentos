@@ -146,6 +146,22 @@ def test_a_literal_secret_still_must_be_resolved(tmp_path: Path) -> None:
     assert bundles.owned_secret_keys(declared) == ["GRAFANA_TOKEN"]
 
 
+FILE_ONLY = (
+    "connectors:\n"
+    "  k8s:\n"
+    "    image: ghcr.io/containers/kubernetes-mcp-server:latest\n"
+    "    secret_files: {K8S_KUBECONFIG: /secrets/kubeconfig}\n"
+)
+
+
+def test_a_secret_file_is_something_the_caller_must_resolve(tmp_path: Path) -> None:
+    # #1424: with no `secrets:` entry at all this came back empty, so the CLI
+    # skipped creating the Secret and the pod hung on FailedMount against the
+    # volume the renderer had already emitted `optional: false`.
+    declared = bundles.read_connectors(_bundle(tmp_path, FILE_ONLY))
+    assert bundles.owned_secret_keys(declared) == ["K8S_KUBECONFIG"]
+
+
 def test_a_referenced_secret_points_outside_curies_own_secret(tmp_path: Path) -> None:
     dep = next(o for o in _render(_bundle(tmp_path, REFERENCED)) if o["kind"] == "Deployment")
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]

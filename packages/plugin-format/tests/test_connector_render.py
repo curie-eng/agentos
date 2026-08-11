@@ -506,10 +506,35 @@ def test_a_connector_without_secret_files_is_unchanged() -> None:
     assert "volumeMounts" not in pod["containers"][0]
 
 
-def test_secret_files_are_reported_as_secret_names() -> None:
-    # They resolve from the same store, so the deploy path must know to fetch
-    # them; missing this would render a volume pointing at a key nobody wrote.
+def test_secret_files_are_reported_as_both_declared_and_resolved() -> None:
+    # `secret_names()` feeds the duplicate-name validator; `resolved_secrets()`
+    # is what the deploy path is told to WRITE into the per-agent Secret. The
+    # second was missing, so the volume pointed at a key nobody wrote.
     assert "K8S_READONLY_KUBECONFIG" in FILE_SPEC.secret_names()
+    assert "K8S_READONLY_KUBECONFIG" in FILE_SPEC.resolved_secrets()
+
+
+def test_no_volume_references_a_key_the_deploy_path_was_not_told_to_write() -> None:
+    # The invariant #1424 violated. A secret volume is rendered
+    # `optional: false`, so a key the deploy path never resolved is not a
+    # degraded connector: the kubelet cannot mount it and the pod never starts,
+    # stuck on `FailedMount ... secret not found`. Pinned as the class -- every
+    # projected key must be one `resolved_secrets()` claims -- so the fix cannot
+    # be satisfied by a rename or by handling only this one spec's shape.
+    spec = ConnectorSpec(
+        image="x:1",
+        secrets=["ENV_TOKEN"],
+        secret_files={"KUBECONFIG": "/secrets/kubeconfig", "CA_BUNDLE": "/secrets/ca.pem"},
+    )
+    resolved = spec.resolved_secrets()
+    projected = [
+        item["key"]
+        for vol in _file_dep(spec)["spec"]["template"]["spec"]["volumes"]
+        for item in vol["secret"]["items"]
+    ]
+    assert projected, "expected the spec to project at least one key"
+    for key in projected:
+        assert key in resolved, f"volume projects {key!r}, absent from resolved_secrets()"
 
 
 @pytest.mark.parametrize(
