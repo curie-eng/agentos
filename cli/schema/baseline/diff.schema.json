@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/diff/v2.0.json",
+  "$id": "https://schemas.curietech.ai/cli/diff/v2.1.json",
   "title": "curie diff --json",
-  "description": "The agent-facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Declared credentials and provider addresses are resolved to construct the same plan used by apply, but no cluster state is mutated. Secret-bearing values are rendered as the literal string `<secret>` and never in the clear.",
+  "description": "The agent facing payload of `curie diff`: every chart value the effective installation plan and the live release disagree about, plus the values the release carries that the plan does not declare. Read only. Available credentials and provider addresses are resolved to construct the same plan used by apply. Comparisons that depend on an unavailable declared credential are marked unknown. No cluster state is mutated. Secret values are rendered as the literal string `<secret>` and never in the clear.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -14,12 +14,12 @@
     },
     "release_exists": {
       "type": "boolean",
-      "description": "False when helm has no record of the release, in which case every declared value is an `add`."
+      "description": "False when helm has no record of the release, in which case every known declared value is an `add`; entries that depend on unavailable credentials remain `unknown`."
     },
     "changes": {
       "type": "integer",
       "minimum": 0,
-      "description": "How many entries would actually change the cluster: add, change, and reset. Deliberately excludes `unchanged` and `preserved`, so zero means applying the file is a no-op."
+      "description": "How many entries are known changes or unresolved comparisons: add, change, reset, and unknown. Unknown counts conservatively so zero still means applying the file is a no op."
     },
     "entries": {
       "type": "array",
@@ -37,9 +37,10 @@
               "change",
               "unchanged",
               "preserved",
-              "reset to chart default"
+              "reset to chart default",
+              "unknown"
             ],
-            "description": "`preserved` means the release carries this value, the plan does not declare it, and apply re-supplies it anyway (Slack tokens, the GitHub App, generated store passwords). It is not a pending removal. `reset to chart default` is the genuine loss case: undeclared and not carried forward."
+            "description": "`preserved` means the release carries this value, the plan does not declare it, and apply supplies it again anyway (Slack tokens, the GitHub App, generated store passwords). It is not a pending removal. `reset to chart default` is the genuine loss case: undeclared and not carried forward. `unknown` means the file declares this value through a credential that is unavailable, so diff cannot infer the outcome and apply would refuse."
           },
           "from": {
             "type": [
@@ -53,7 +54,11 @@
               "string",
               "null"
             ],
-            "description": "The declared value, or null when the file does not declare this key. `<secret>` when the key carries a credential."
+            "description": "The resolved declared value, or null when the file does not declare this key or its declared credential is unavailable. `<secret>` when the key carries a resolved credential."
+          },
+          "unresolved_credential": {
+            "type": "string",
+            "description": "The unavailable credential name that makes this entry unknown. Present only on unknown entries. Export this name or save it with `curie secrets set` to resolve the comparison."
           }
         },
         "required": [
@@ -84,7 +89,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Credential NAMES the file declares that have no value in this environment. Never fatal for diff, which mutates nothing; the entries are unaffected because none depends on a credential VALUE. A non-empty list means `curie apply` would refuse until they resolve."
+      "description": "Credential names the file declares that have no value in this environment. Never fatal for diff, which mutates nothing. Every value comparison that depends on one of these names is marked unknown. A non empty list means `curie apply` would refuse until they resolve."
     }
   },
   "required": [

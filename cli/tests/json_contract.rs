@@ -952,10 +952,30 @@ fn deploy_output_validates() {
 
 #[test]
 fn diff_output_validates() {
-    // Built through `diff_plan` rather than hand-listing entries, so this
-    // validates the shape the real verb emits and not a parallel one.
+    let mut entries = curie::installation::diff_plan(
+        &std::collections::BTreeMap::from([
+            ("inference.deploy".to_string(), "true".to_string()),
+            ("ui.deploy".to_string(), "false".to_string()),
+            ("worker.replicas".to_string(), "2".to_string()),
+        ]),
+        Some(&serde_json::json!({
+            "ui": {"deploy": true},
+            "dispatcher": {"slack": {"botToken": "xoxb-live"}},
+            "inference": {"deploy": true},
+            "agentSandbox": {"runner": {"fakeModel": false}},
+        })),
+    );
+    entries.push(curie::installation::DiffEntry {
+        key: "api.githubToken".to_string(),
+        kind: curie::installation::DiffKind::Unknown,
+        from: Some("<secret>".to_string()),
+        to: None,
+        unresolved_credential: Some("CURIE_1426_GITHUB_CREDENTIAL".to_string()),
+    });
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+
     let out = curie::installation::DiffOutput {
-        unresolved_credentials: vec!["SLACK_BOT_TOKEN".to_string()],
+        unresolved_credentials: vec!["CURIE_1426_GITHUB_CREDENTIAL".to_string()],
         namespace: "acme-bot".to_string(),
         release: "acme-bot".to_string(),
         release_exists: true,
@@ -963,19 +983,7 @@ fn diff_output_validates() {
         // CLI, and that is the state the warning exists for.
         chart_deployed: Some("curie-0.5.1".to_string()),
         chart_target: "0.6.0".to_string(),
-        entries: curie::installation::diff_plan(
-            &std::collections::BTreeMap::from([
-                ("inference.deploy".to_string(), "true".to_string()),
-                ("ui.deploy".to_string(), "false".to_string()),
-                ("worker.replicas".to_string(), "2".to_string()),
-            ]),
-            Some(&serde_json::json!({
-                "ui": {"deploy": true},
-                "dispatcher": {"slack": {"botToken": "xoxb-live"}},
-                "inference": {"deploy": true},
-                "agentSandbox": {"runner": {"fakeModel": false}},
-            })),
-        ),
+        entries,
     };
     let json = out.to_json();
     assert_valid("diff.schema.json", &json);
@@ -994,6 +1002,7 @@ fn diff_output_validates() {
         "unchanged",
         "preserved",
         "reset to chart default",
+        "unknown",
     ] {
         assert!(
             kinds.contains(&expected),
@@ -1012,6 +1021,210 @@ fn diff_output_validates() {
     // consumer gating on this diff has to be able to see that it does not
     // describe a safe apply.
     assert_eq!(json["chart_version_differs"], serde_json::json!(true));
+
+    let entries = json["entries"].as_array().expect("entries is an array");
+    let unknown = entries
+        .iter()
+        .find(|entry| entry["kind"] == "unknown")
+        .expect("fixture contains an unknown entry");
+    assert_eq!(
+        unknown["unresolved_credential"],
+        "CURIE_1426_GITHUB_CREDENTIAL"
+    );
+}
+
+#[test]
+fn diff_schema_keeps_unresolved_credential_marker_optional() {
+    let schema = load_schema("diff.schema.json");
+    let entry_schema = &schema["properties"]["entries"]["items"];
+    assert!(
+        entry_schema["properties"]["unresolved_credential"].is_object(),
+        "degraded entries need a per-entry unresolved credential marker"
+    );
+    let required = entry_schema["required"]
+        .as_array()
+        .expect("entry required list");
+    assert!(
+        !required.iter().any(|name| name == "unresolved_credential"),
+        "the per-entry marker must remain optional for known entries"
+    );
+
+    let description = schema["properties"]["unresolved_credentials"]["description"]
+        .as_str()
+        .expect("unresolved credential description");
+    assert!(
+        !description.to_ascii_lowercase().contains("unaffected"),
+        "the schema must disclose degraded entries: {description}"
+    );
+    assert!(
+        description.to_ascii_lowercase().contains("unknown"),
+        "the schema must explain the unknown classification: {description}"
+    );
+}
+
+#[test]
+fn credentialless_diff_human_output_names_export_and_never_claims_a_reset() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config = temp.path().join("curie.yaml");
+    std::fs::write(
+        &config,
+        concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_1426_MODEL_CREDENTIAL\n",
+        ),
+    )
+    .expect("write configuration");
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("create binary directory");
+    let helm = bin_dir.join("helm");
+    std::fs::write(
+        &helm,
+        r#"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = values ]; then
+    printf '%s\n' '{"agentSandbox":{"runner":{"credentials":"model live","fakeModel":false}},"ui":{"service":{"type":"NodePort"}},"langfuse":{"web":{"service":{"type":"NodePort"}}}}'
+    exit 0
+fi
+if [ "$1" = list ]; then
+    printf '%s\n' '[{"name":"acme","chart":"curie-0.6.0"}]'
+    exit 0
+fi
+exit 64
+"#,
+    )
+    .expect("write helm stub");
+    let mut permissions = std::fs::metadata(&helm)
+        .expect("helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .arg("diff")
+        .arg("--file")
+        .arg(&config)
+        .env("PATH", &bin_dir)
+        .env("CURIE_CONFIG_DIR", temp.path().join("config"))
+        .env_remove("CURIE_MODEL")
+        .env_remove("CURIE_1426_MODEL_CREDENTIAL")
+        .output()
+        .expect("run credentialless diff");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "credentialless diff failed: {rendered}"
+    );
+    assert!(
+        rendered.contains("export CURIE_1426_MODEL_CREDENTIAL="),
+        "the remedy must name the missing export with an assignment: {rendered}"
+    );
+    assert!(
+        !rendered.contains("`export CURIE_1426_MODEL_CREDENTIAL`"),
+        "the remedy must not be a bare export with no value: {rendered}"
+    );
+    let assignment = rendered
+        .split("export CURIE_1426_MODEL_CREDENTIAL=")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .map(str::trim)
+        .expect("the remedy must contain an assignment value");
+    assert!(
+        !assignment.is_empty(),
+        "the remedy assignment must not be empty: {rendered}"
+    );
+    assert!(
+        !rendered.contains("model live"),
+        "the diff must not expose the live credential value: {rendered}"
+    );
+    assert!(
+        !rendered.contains("comparison above is unaffected"),
+        "the output must not claim certainty: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Declare it in curie.yaml to keep it"),
+        "an already declared credential must not be called a reset: {rendered}"
+    );
+}
+
+#[test]
+fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_created() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config = temp.path().join("curie.yaml");
+    std::fs::write(
+        &config,
+        concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_1426_MODEL_CREDENTIAL\n",
+        ),
+    )
+    .expect("write configuration");
+    let bin_dir = temp.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("create binary directory");
+    let helm = bin_dir.join("helm");
+    std::fs::write(
+        &helm,
+        r##"#!/bin/sh
+if [ "$1" = get ] && [ "$2" = values ]; then
+    exit 1
+fi
+if [ "$1" = list ]; then
+    printf '%s\n' '[]'
+    exit 0
+fi
+exit 64
+"##,
+    )
+    .expect("write helm stub");
+    let mut permissions = std::fs::metadata(&helm)
+        .expect("helm stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&helm, permissions).expect("make helm stub executable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .arg("diff")
+        .arg("--file")
+        .arg(&config)
+        .env("PATH", &bin_dir)
+        .env("CURIE_CONFIG_DIR", temp.path().join("config"))
+        .env_remove("CURIE_MODEL")
+        .env_remove("CURIE_1426_MODEL_CREDENTIAL")
+        .output()
+        .expect("run credentialless diff without a release");
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "credentialless diff failed: {rendered}"
+    );
+    assert!(
+        !rendered.contains("every value below would be created"),
+        "an unresolved declared value cannot be described as certainly created: {rendered}"
+    );
+    assert!(
+        rendered.contains("? agentSandbox.runner.credentials: unknown"),
+        "the unresolved declared value must be represented as unknown: {rendered}"
+    );
 }
 
 #[test]

@@ -73,7 +73,7 @@
       "result": "DiffOutput",
       "kind": "CliOutput",
       "schema": "diff.schema.json",
-      "version": "2.0"
+      "version": "2.1"
     },
     {
       "result": "DoctorOutput",
