@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/doctor/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/doctor/v2.0.json",
   "title": "curie doctor --json",
   "description": "What is set up, what is missing, and the command that fixes it. Read-only. Credentials appear as the NAME of the variable holding them, never as a value.",
   "type": "object",

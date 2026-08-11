@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/sweep/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/sweep/v1.1.json",
   "title": "curie <tier> eval --sweep --json",
   "description": "The agent-facing payload of a `curie <tier> eval --sweep` run: one row per model. `pass_rate` is null (not a fabricated 0.0) on a never-completed row; `plumbing_only` flags a fixture-only row whose `passed`/`total` carry no graded signal.",
   "type": "object",

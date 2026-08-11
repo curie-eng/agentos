@@ -445,12 +445,16 @@ fn a_schema_may_not_change_shape_while_keeping_its_id() {
         compared + versioned
     );
     assert!(
+        versioned == 0,
+        "These schemas changed their $id without refreshing the compatibility baseline. \
+         Refresh it with `curie dev schema-baseline`.\n\n({compared} compared, {versioned} already versioned)"
+    );
+    assert!(
         problems.is_empty(),
         "These schemas changed shape while keeping their $id, so a conforming \
          consumer is broken under an identifier that promises it is not \
          (ADR-0101). Bump the version, then refresh the baseline with \
-         `curie dev schema-baseline`.\n\n{}\n\n({compared} compared, {versioned} \
-         already versioned)",
+         `curie dev schema-baseline`.\n\n{}\n\n({compared} compared, {versioned} already versioned)",
         problems.join("\n")
     );
 }

@@ -19,9 +19,30 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 schema_dir="$root/cli/schema"
 baseline_dir="$schema_dir/baseline"
+check=false
+
+if (( $# > 1 )); then
+  echo "usage: $(basename "$0") [--check]" >&2
+  exit 2
+fi
+
+case "${1:-}" in
+  "")
+    ;;
+  --check)
+    check=true
+    ;;
+  *)
+    echo "usage: $(basename "$0") [--check]" >&2
+    exit 2
+    ;;
+esac
+
+shopt -s nullglob
+live_schemas=("$schema_dir"/*.schema.json)
 
 mismatched=()
-for f in "$schema_dir"/*.schema.json; do
+for f in "${live_schemas[@]}"; do
   name="$(basename "$f")"
   base="$baseline_dir/$name"
   [[ -f "$base" ]] || continue
@@ -33,7 +54,7 @@ for f in "$schema_dir"/*.schema.json; do
 done
 
 changed=()
-for f in "$schema_dir"/*.schema.json; do
+for f in "${live_schemas[@]}"; do
   name="$(basename "$f")"
   base="$baseline_dir/$name"
   if [[ ! -f "$base" ]] || ! diff -q "$f" "$base" >/dev/null; then
@@ -41,7 +62,32 @@ for f in "$schema_dir"/*.schema.json; do
   fi
 done
 
-if (( ${#changed[@]} == 0 )); then
+baseline_only=()
+for base in "$baseline_dir"/*.schema.json; do
+  name="$(basename "$base")"
+  [[ -f "$schema_dir/$name" ]] || baseline_only+=("$name")
+done
+
+if "$check"; then
+  if (( ${#changed[@]} == 0 && ${#baseline_only[@]} == 0 )); then
+    echo "baseline matches cli/schema/."
+    exit 0
+  fi
+
+  echo "schema baseline is stale:" >&2
+  if (( ${#changed[@]} > 0 )); then
+    echo "  live schemas differing from their baseline:" >&2
+    printf '    %s\n' "${changed[@]}" >&2
+  fi
+  if (( ${#baseline_only[@]} > 0 )); then
+    echo "  baseline-only schemas:" >&2
+    printf '    %s\n' "${baseline_only[@]}" >&2
+  fi
+  echo "run curie dev schema-baseline to refresh it." >&2
+  exit 1
+fi
+
+if (( ${#changed[@]} == 0 && ${#baseline_only[@]} == 0 )); then
   echo "baseline already matches cli/schema/; nothing to refresh." >&2
   exit 0
 fi
@@ -56,6 +102,18 @@ if (( ${#mismatched[@]} > 0 )); then
   exit 1
 fi
 
-cp "$schema_dir"/*.schema.json "$baseline_dir"/
-echo "schema baseline refreshed for ${#changed[@]} schema(s):"
-printf '  %s\n' "${changed[@]}"
+for name in "${changed[@]}"; do
+  cp "$schema_dir/$name" "$baseline_dir/$name"
+done
+for name in "${baseline_only[@]}"; do
+  rm -- "$baseline_dir/$name"
+done
+
+if (( ${#changed[@]} > 0 )); then
+  echo "schema baseline refreshed for ${#changed[@]} schema(s):"
+  printf '  %s\n' "${changed[@]}"
+fi
+if (( ${#baseline_only[@]} > 0 )); then
+  echo "removed ${#baseline_only[@]} baseline-only schema(s):"
+  printf '  %s\n' "${baseline_only[@]}"
+fi

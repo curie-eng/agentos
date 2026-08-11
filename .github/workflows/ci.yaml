@@ -169,6 +169,8 @@ jobs:
       # is the lockfile-freshness gate for Rust (mirrors uv lock --check above).
       - name: Clippy
         run: cargo clippy --locked -- -D warnings
+      - name: Schema baseline
+        run: bash scripts/refresh-schema-baseline.sh --check
       - name: Test
         run: cargo test --locked
       - name: Generated ACI protocol crate compiles
