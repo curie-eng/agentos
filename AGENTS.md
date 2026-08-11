@@ -457,6 +457,18 @@ commands.
   retroactively enforced.
 - No dashes/emdashes in prose content; no emojis in code or docs.
 
+## Ticket implementation
+
+Use `/implement <ticket URL, ID, or description>` as the default entry point for
+ticket work with clear acceptance criteria. Its portable workflow is in
+`.claude/skills/implement/SKILL.md`. Claude, Codex, and OpenCode can use the
+workflow without requiring a particular provider or any machine local setup.
+
+The active provider implements the change. An independently available provider
+performs read only plan or diff review where that improves confidence. The
+repository's instructions remain authoritative for branching, tests, reviews,
+runtime verification, commits, and pull requests.
+
 ## Decisions: ADR vs. GitHub issue
 
 Two different tools; do not conflate them.
