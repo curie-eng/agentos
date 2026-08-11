@@ -8,8 +8,8 @@ description: >-
   and two install-time preflights ship baked in: a CPU-AVX / ClickHouse-pin
   check and a NetworkPolicy-enforcement probe.
 type: application
-version: 0.7.0-rc.2
-appVersion: "0.7.0-rc.2"
+version: 0.7.0-rc.3
+appVersion: "0.7.0-rc.3"
 kubeVersion: ">=1.25.0-0"
 maintainers:
   - name: Curie
