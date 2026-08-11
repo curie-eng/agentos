@@ -161,9 +161,19 @@ impl Installation {
         }
         Self::reject_secret_shaped(&self.credentials.model, "credentials.model")?;
         Self::reject_secret_shaped(&self.credentials.github_token, "credentials.github_token")?;
+        Self::validate_credential_name(&self.credentials.model, "credentials.model")?;
+        Self::validate_credential_name(&self.credentials.github_token, "credentials.github_token")?;
         if let Some(slack) = &self.comms.slack {
             Self::reject_secret_shaped(&Some(slack.app_token.clone()), "comms.slack.app_token")?;
             Self::reject_secret_shaped(&Some(slack.bot_token.clone()), "comms.slack.bot_token")?;
+            Self::validate_credential_name(
+                &Some(slack.app_token.clone()),
+                "comms.slack.app_token",
+            )?;
+            Self::validate_credential_name(
+                &Some(slack.bot_token.clone()),
+                "comms.slack.bot_token",
+            )?;
         }
         Ok(())
     }
@@ -190,6 +200,23 @@ impl Installation {
                      value in the environment or `curie secrets set`, and name it here."
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Keep the name safe to show in a shell assignment guide.
+    fn validate_credential_name(value: &Option<String>, field: &str) -> Result<()> {
+        let Some(name) = value else { return Ok(()) };
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            bail!(
+                "{field} must name an environment variable using letters, digits, and \
+                 underscores, and must not start with a digit"
+            );
         }
         Ok(())
     }
@@ -496,10 +523,11 @@ pub fn resolve_credentials(
 /// Resolve what is available and REPORT what is not, rather than refusing.
 ///
 /// `curie diff` needs the credential NAMES to know which chart values the file
-/// governs; it never needs the values, because it mutates nothing. Refusing
-/// there withheld the answer exactly when it is most wanted -- on an install
-/// that is not finished yet, which is the state an operator is in when they ask
-/// "what would this change?".
+/// governs. When it cannot resolve a value, the affected comparison is marked
+/// unknown rather than inferred from the incomplete plan. Refusing there
+/// withheld the answer exactly when it is most wanted: on an install that is
+/// not finished yet, which is the state an operator is in when they ask "what
+/// would this change?".
 ///
 /// That is what the verb was for, and a shared-plan refactor (#1319) quietly
 /// took it away: `diff` started going through `plan_installation`, which bails.
@@ -702,6 +730,15 @@ async fn complete_installation_plan(
     )?;
     let up_values = crate::ops::up_value_plan(&up);
     let mut desired = up_values.effective_values();
+    // Declaring a model credential selects the real model independently of the
+    // credential value. The lenient diff may not know that value, but it still
+    // knows apply will set fakeModel=false. Keep an explicit set override if
+    // the file supplied one.
+    if cfg.credentials.model.is_some() {
+        desired
+            .entry(crate::ops::FAKE_MODEL_KEY.to_string())
+            .or_insert_with(|| "false".to_string());
+    }
     let comms = cfg
         .comms
         .slack
@@ -1006,6 +1043,9 @@ pub enum DiffKind {
     Preserved,
     /// Only the release has it, and `apply` would reset it to the chart default.
     Reset,
+    /// The file declares the value through a credential that is unavailable.
+    /// Apply refuses this state, so no concrete outcome may be inferred.
+    Unknown,
 }
 
 impl DiffKind {
@@ -1018,6 +1058,7 @@ impl DiffKind {
             DiffKind::Same => '=',
             DiffKind::Preserved => '=',
             DiffKind::Reset => '!',
+            DiffKind::Unknown => '?',
         }
     }
 
@@ -1028,12 +1069,16 @@ impl DiffKind {
             DiffKind::Same => "unchanged",
             DiffKind::Preserved => "preserved",
             DiffKind::Reset => "reset to chart default",
+            DiffKind::Unknown => "unknown",
         }
     }
 
-    /// Would applying this file change the cluster?
+    /// Must this entry keep the change count above zero?
     pub fn is_change(self) -> bool {
-        matches!(self, DiffKind::Add | DiffKind::Change | DiffKind::Reset)
+        matches!(
+            self,
+            DiffKind::Add | DiffKind::Change | DiffKind::Reset | DiffKind::Unknown
+        )
     }
 }
 
@@ -1043,8 +1088,11 @@ pub struct DiffEntry {
     pub kind: DiffKind,
     /// The live value, already masked when the key carries a secret.
     pub from: Option<String>,
-    /// The declared value, already masked when the key carries a secret.
+    /// The resolved declared value, already masked when the key carries a secret.
+    /// Absent when the file does not declare the key or its credential is unavailable.
     pub to: Option<String>,
+    /// The unavailable credential NAME that prevents a concrete comparison.
+    pub unresolved_credential: Option<String>,
 }
 
 /// Flatten `helm get values -o json` into the dotted keys `--set` speaks.
@@ -1125,6 +1173,7 @@ pub fn diff_plan(
             kind,
             from: current.get(key).map(|v| display_value(key, v)),
             to: Some(display_value(key, want)),
+            unresolved_credential: None,
         });
     }
 
@@ -1142,6 +1191,7 @@ pub fn diff_plan(
             kind,
             from: Some(display_value(key, have)),
             to: None,
+            unresolved_credential: None,
         });
     }
 
@@ -1149,16 +1199,73 @@ pub fn diff_plan(
     entries
 }
 
+/// Replace every comparison that depends on an unavailable credential with one
+/// explicit unknown entry. Missing desired and live values still get an entry,
+/// because their absence cannot prove what strict apply would do after the
+/// credential resolves.
+fn disclose_unresolved_credentials(
+    entries: &mut Vec<DiffEntry>,
+    cfg: &Installation,
+    unresolved: &[String],
+) {
+    let is_unresolved = |name: &str| unresolved.iter().any(|missing| missing == name);
+    let mut affected = Vec::new();
+
+    if let Some(name) = cfg
+        .credentials
+        .model
+        .as_deref()
+        .filter(|n| is_unresolved(n))
+    {
+        affected.push((crate::ops::MODEL_CREDENTIAL_KEY, name));
+    }
+    if let Some(name) = cfg
+        .credentials
+        .github_token
+        .as_deref()
+        .filter(|n| is_unresolved(n))
+    {
+        affected.push((crate::ops::GITHUB_TOKEN_KEY, name));
+    }
+    if let Some(slack) = &cfg.comms.slack {
+        if is_unresolved(&slack.app_token) {
+            affected.push(("dispatcher.slack.appToken", slack.app_token.as_str()));
+        }
+        if is_unresolved(&slack.bot_token) {
+            affected.push(("dispatcher.slack.botToken", slack.bot_token.as_str()));
+        }
+    }
+
+    for (key, credential) in affected {
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.key == key) {
+            entry.kind = DiffKind::Unknown;
+            entry.to = None;
+            entry.unresolved_credential = Some(credential.to_string());
+        } else {
+            entries.push(DiffEntry {
+                key: key.to_string(),
+                kind: DiffKind::Unknown,
+                from: None,
+                to: None,
+                unresolved_credential: Some(credential.to_string()),
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+}
+
 /// What `curie diff` found.
 #[derive(Debug)]
 pub struct DiffOutput {
     /// Declared credential names with no value available. A non-empty list
-    /// means `apply` would refuse until they resolve -- the entries below are
-    /// still accurate, because none of them depends on a credential VALUE.
+    /// means `apply` would refuse until they resolve. Entries that depend on a
+    /// missing value are marked unknown.
     pub unresolved_credentials: Vec<String>,
     pub namespace: String,
     pub release: String,
-    /// `false` when helm has no record of the release: everything is a create.
+    /// `false` when helm has no record of the release. Known values are creates,
+    /// while unavailable credential values remain unknown.
     pub release_exists: bool,
     /// The chart the release was installed with (`curie-0.5.1`), if readable.
     pub chart_deployed: Option<String>,
@@ -1204,47 +1311,87 @@ impl crate::ui::CliOutput for DiffOutput {
             "chart_target": self.chart_target,
             "chart_version_differs": self.chart_version_differs(),
             "changes": self.changes(),
-            "entries": self.entries.iter().map(|e| serde_json::json!({
-                "key": e.key,
-                "kind": e.kind.label(),
-                "from": e.from,
-                "to": e.to,
-            })).collect::<Vec<_>>(),
+            "entries": self.entries.iter().map(|e| {
+                let mut value = serde_json::json!({
+                    "key": e.key,
+                    "kind": e.kind.label(),
+                    "from": e.from,
+                    "to": e.to,
+                });
+                if let Some(credential) = &e.unresolved_credential {
+                    value
+                        .as_object_mut()
+                        .expect("diff entry is an object")
+                        .insert(
+                            "unresolved_credential".to_string(),
+                            serde_json::Value::String(credential.clone()),
+                        );
+                }
+                value
+            }).collect::<Vec<_>>(),
         })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
         if !self.release_exists {
             ui.payload_plain(&format!(
-                "release '{}' does not exist in namespace '{}' -- every value below would be created",
+                "release '{}' does not exist in namespace '{}'; every known value below would be created, while entries marked `?` remain unknown",
                 self.release, self.namespace
             ));
         }
         for e in &self.entries {
-            let line = match (&e.from, &e.to) {
-                (Some(from), Some(to)) if e.kind == DiffKind::Change => {
-                    format!("{} {}: {} -> {}", e.kind.marker(), e.key, from, to)
-                }
-                (_, Some(to)) if e.kind == DiffKind::Add => {
-                    format!("{} {}: {}", e.kind.marker(), e.key, to)
-                }
-                (Some(from), None) => {
-                    format!(
-                        "{} {}: {} ({})",
+            let line = if e.kind == DiffKind::Unknown {
+                match (&e.from, &e.unresolved_credential) {
+                    (Some(from), Some(credential)) => format!(
+                        "{} {}: {} to unknown (`export {}='<value>'` to resolve)",
                         e.kind.marker(),
                         e.key,
                         from,
-                        e.kind.label()
-                    )
+                        credential
+                    ),
+                    (_, Some(credential)) => format!(
+                        "{} {}: unknown (`export {}='<value>'` to resolve)",
+                        e.kind.marker(),
+                        e.key,
+                        credential
+                    ),
+                    (Some(from), None) => {
+                        format!("{} {}: {} to unknown", e.kind.marker(), e.key, from)
+                    }
+                    (None, None) => format!("{} {}: unknown", e.kind.marker(), e.key),
                 }
-                (_, Some(to)) => format!("{} {}: {}", e.kind.marker(), e.key, to),
-                _ => format!("{} {}", e.kind.marker(), e.key),
+            } else {
+                match (&e.from, &e.to) {
+                    (Some(from), Some(to)) if e.kind == DiffKind::Change => {
+                        format!("{} {}: {} -> {}", e.kind.marker(), e.key, from, to)
+                    }
+                    (_, Some(to)) if e.kind == DiffKind::Add => {
+                        format!("{} {}: {}", e.kind.marker(), e.key, to)
+                    }
+                    (Some(from), None) => {
+                        format!(
+                            "{} {}: {} ({})",
+                            e.kind.marker(),
+                            e.key,
+                            from,
+                            e.kind.label()
+                        )
+                    }
+                    (_, Some(to)) => format!("{} {}: {}", e.kind.marker(), e.key, to),
+                    _ => format!("{} {}", e.kind.marker(), e.key),
+                }
             };
             ui.payload_plain(&line);
         }
         let changes = self.changes();
         if changes == 0 {
             ui.payload_plain("no changes: the cluster already matches this file");
+        } else if self
+            .entries
+            .iter()
+            .any(|entry| entry.kind == DiffKind::Unknown)
+        {
+            ui.payload_plain(&format!("{changes} change(s) or unresolved comparison(s)"));
         } else {
             ui.payload_plain(&format!("{changes} change(s) would be applied"));
         }
@@ -1260,12 +1407,18 @@ impl crate::ui::CliOutput for DiffOutput {
         // -- and a renamed component's old keys appear above as ordinary
         // resets, which reads far milder than the swap it would actually be.
         if !self.unresolved_credentials.is_empty() {
+            let exports = self
+                .unresolved_credentials
+                .iter()
+                .map(|name| format!("`export {name}='<value>'`"))
+                .collect::<Vec<_>>()
+                .join(", ");
             ui.note(&format!(
-                "{} declared credential(s) have no value here: {}. The comparison above \
-                 is unaffected -- no entry depends on a credential VALUE -- but `curie \
-                 apply` will refuse until they resolve.",
+                "{} declared credential(s) have no value here. Entries marked `?` are \
+                 unknown until they resolve. Set them with {}; `curie apply` will refuse \
+                 until then.",
                 self.unresolved_credentials.len(),
-                self.unresolved_credentials.join(", "),
+                exports,
             ));
         }
         if self.chart_version_differs() {
@@ -1314,6 +1467,7 @@ pub async fn diff(opts: DiffOpts) -> Result<DiffOutput> {
             entry.to = None;
         }
     }
+    disclose_unresolved_credentials(&mut entries, &plan.cfg, &opts.unresolved_credentials);
     Ok(DiffOutput {
         unresolved_credentials: opts.unresolved_credentials,
         namespace: plan.cfg.install.namespace,
@@ -1410,6 +1564,38 @@ mod stateful_guard_message_tests {
 #[cfg(test)]
 mod diff_tests {
     use super::*;
+
+    static CREDENTIAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CredentialEnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl CredentialEnvRestore {
+        fn clear(names: &[&'static str]) -> Self {
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var_os(*name)))
+                .collect();
+            for name in names {
+                std::env::remove_var(*name);
+            }
+            Self(saved)
+        }
+
+        fn set(&self, name: &str, value: &str) {
+            std::env::set_var(name, value);
+        }
+    }
+
+    impl Drop for CredentialEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(*name, value),
+                    None => std::env::remove_var(*name),
+                }
+            }
+        }
+    }
 
     fn live(json: serde_json::Value) -> serde_json::Value {
         json
@@ -1512,6 +1698,201 @@ mod diff_tests {
             .kind
     }
 
+    fn desired_from_local(
+        local: LocalInstallationPlan,
+        live: &serde_json::Value,
+    ) -> BTreeMap<String, String> {
+        let LocalInstallationPlan {
+            cfg,
+            resolved,
+            up,
+            github_token,
+        } = local;
+        let up =
+            crate::ops::complete_up_opts(up, Some(live), github_token.as_deref(), false, false)
+                .expect("complete desired values");
+        let mut desired = crate::ops::up_value_plan(&up).effective_values();
+        if cfg.credentials.model.is_some() {
+            desired
+                .entry(crate::ops::FAKE_MODEL_KEY.to_string())
+                .or_insert_with(|| "false".to_string());
+        }
+        if let Some(slack) = &cfg.comms.slack {
+            desired.insert(
+                "dispatcher.slack.appToken".to_string(),
+                resolved.get(&slack.app_token).cloned().unwrap_or_default(),
+            );
+            desired.insert(
+                "dispatcher.slack.botToken".to_string(),
+                resolved.get(&slack.bot_token).cloned().unwrap_or_default(),
+            );
+            desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
+        }
+        desired
+    }
+
+    #[test]
+    fn every_lenient_desired_map_difference_is_disclosed_as_unknown() {
+        let _lock = CREDENTIAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names = [
+            "CURIE_1426_MODEL_CREDENTIAL",
+            "CURIE_1426_GITHUB_CREDENTIAL",
+            "CURIE_1426_SLACK_APP_CREDENTIAL",
+            "CURIE_1426_SLACK_BOT_CREDENTIAL",
+        ];
+        let env = CredentialEnvRestore::clear(&names);
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_1426_MODEL_CREDENTIAL\n",
+            "  github_token: CURIE_1426_GITHUB_CREDENTIAL\n",
+            "comms:\n",
+            "  slack:\n",
+            "    app_token: CURIE_1426_SLACK_APP_CREDENTIAL\n",
+            "    bot_token: CURIE_1426_SLACK_BOT_CREDENTIAL\n",
+        ))
+        .expect("configuration parses");
+        let live = serde_json::json!({
+            "agentSandbox": {"runner": {"credentials": "model live", "fakeModel": false}},
+            "api": {"githubToken": "github live"},
+            "dispatcher": {"slack": {"appToken": "app live", "botToken": "bot live"}}
+        });
+
+        let (lenient_local, missing) =
+            plan_installation_lenient(cfg.clone()).expect("lenient planning must answer");
+        assert_eq!(missing, names.map(str::to_string));
+        let lenient = desired_from_local(lenient_local, &live);
+
+        env.set("CURIE_1426_MODEL_CREDENTIAL", "model replacement");
+        env.set("CURIE_1426_GITHUB_CREDENTIAL", "github replacement");
+        env.set("CURIE_1426_SLACK_APP_CREDENTIAL", "app replacement");
+        env.set("CURIE_1426_SLACK_BOT_CREDENTIAL", "bot replacement");
+        let strict = desired_from_local(
+            plan_installation(cfg.clone(), false).expect("strict planning must resolve"),
+            &live,
+        );
+
+        assert_eq!(
+            lenient.get("agentSandbox.runner.fakeModel"),
+            strict.get("agentSandbox.runner.fakeModel")
+        );
+
+        let all_keys = lenient
+            .keys()
+            .chain(strict.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let differing = all_keys
+            .into_iter()
+            .filter(|key| lenient.get(key) != strict.get(key))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            differing,
+            [
+                "agentSandbox.runner.credentials",
+                "api.githubToken",
+                "dispatcher.slack.appToken",
+                "dispatcher.slack.botToken",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+
+        let mut entries = diff_plan(&lenient, Some(&live));
+        disclose_unresolved_credentials(&mut entries, &cfg, &missing);
+        let unknown = entries
+            .iter()
+            .filter(|entry| entry.kind == DiffKind::Unknown)
+            .map(|entry| entry.key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unknown, differing);
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == DiffKind::Unknown)
+        {
+            let expected = match entry.key.as_str() {
+                "agentSandbox.runner.credentials" => "CURIE_1426_MODEL_CREDENTIAL",
+                "api.githubToken" => "CURIE_1426_GITHUB_CREDENTIAL",
+                "dispatcher.slack.appToken" => "CURIE_1426_SLACK_APP_CREDENTIAL",
+                "dispatcher.slack.botToken" => "CURIE_1426_SLACK_BOT_CREDENTIAL",
+                key => panic!("unexpected unknown key {key}"),
+            };
+            assert_eq!(entry.unresolved_credential.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn an_unresolved_declared_github_change_never_reports_zero_changes() {
+        let _lock = CREDENTIAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = CredentialEnvRestore::clear(&["CURIE_1426_GITHUB_CREDENTIAL"]);
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  github_token: CURIE_1426_GITHUB_CREDENTIAL\n",
+        ))
+        .expect("configuration parses");
+        let live = serde_json::json!({
+            "api": {"githubToken": "github live"},
+            "ui": {"service": {"type": "NodePort"}},
+            "langfuse": {"web": {"service": {"type": "NodePort"}}}
+        });
+        let (lenient_local, missing) =
+            plan_installation_lenient(cfg.clone()).expect("lenient planning must answer");
+        assert_eq!(missing, vec!["CURIE_1426_GITHUB_CREDENTIAL".to_string()]);
+        let lenient = desired_from_local(lenient_local, &live);
+
+        env.set("CURIE_1426_GITHUB_CREDENTIAL", "github replacement");
+        let strict = desired_from_local(
+            plan_installation(cfg.clone(), false).expect("strict planning must resolve"),
+            &live,
+        );
+        let differing = lenient
+            .keys()
+            .chain(strict.keys())
+            .filter(|key| lenient.get(*key) != strict.get(*key))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            differing,
+            ["api.githubToken".to_string()].into_iter().collect()
+        );
+
+        let mut entries = diff_plan(&lenient, Some(&live));
+        disclose_unresolved_credentials(&mut entries, &cfg, &missing);
+        let out = DiffOutput {
+            unresolved_credentials: vec!["CURIE_1426_GITHUB_CREDENTIAL".to_string()],
+            namespace: "acme".to_string(),
+            release: "acme".to_string(),
+            release_exists: true,
+            chart_deployed: Some("curie-0.6.0".to_string()),
+            chart_target: "0.6.0".to_string(),
+            entries,
+        };
+
+        let github_entry = out
+            .entries
+            .iter()
+            .find(|entry| entry.key == "api.githubToken")
+            .expect("the declared GitHub token must remain in the diff");
+        assert_eq!(github_entry.kind, DiffKind::Unknown);
+        assert_eq!(
+            github_entry.unresolved_credential.as_deref(),
+            Some("CURIE_1426_GITHUB_CREDENTIAL")
+        );
+        assert_eq!(out.changes(), 1);
+    }
+
     /// Values from the shared effective plan carry their literal desired value
     /// into the diff rather than taking a separate classification path.
     #[test]
@@ -1560,6 +1941,37 @@ mod diff_tests {
         ] {
             assert_eq!(kind_of(&entries, key), &DiffKind::Reset, "{key}");
         }
+    }
+
+    #[test]
+    fn an_unresolved_declared_model_credential_without_a_release_is_unknown() {
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_1426_MODEL_CREDENTIAL\n",
+        ))
+        .expect("configuration parses");
+        let desired =
+            BTreeMap::from([("agentSandbox.runner.credentials".to_string(), String::new())]);
+        let mut entries = diff_plan(&desired, None);
+        disclose_unresolved_credentials(
+            &mut entries,
+            &cfg,
+            &["CURIE_1426_MODEL_CREDENTIAL".to_string()],
+        );
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == "agentSandbox.runner.credentials")
+            .expect("the declared model credential must remain in the diff");
+        assert_eq!(entry.kind, DiffKind::Unknown);
+        assert_eq!(entry.to, None);
+        assert_eq!(
+            entry.unresolved_credential.as_deref(),
+            Some("CURIE_1426_MODEL_CREDENTIAL")
+        );
     }
 
     /// Every credential-bearing key on the real release must be preserved, and
