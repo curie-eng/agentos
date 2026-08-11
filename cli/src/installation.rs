@@ -724,6 +724,26 @@ async fn complete_installation_plan(
         );
         desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
     }
+    // The model credential is declared by NAME, and `up_value_plan` only carries
+    // its key when a VALUE resolved. So on an install whose credentials are not
+    // in place yet -- exactly the state `diff` exists to describe -- the key
+    // vanished from the desired state and diff called it a reset: "the release
+    // carries this, your file does not declare it, declare it in curie.yaml to
+    // keep it." For a model API key, in a file whose own header says it holds
+    // NAMES and never secrets. Same defect #1415 fixed for the sealing key,
+    // reached by a different route.
+    //
+    // Comms three lines up already had this right, and this mirrors it: a
+    // DECLARED credential is part of the desired state whether or not it
+    // resolves in this shell, because apply is what supplies it -- and apply
+    // refuses outright while it cannot. `desired` feeds the diff report only;
+    // the argv apply actually runs is built from `up_values`, untouched here.
+    if let Some(name) = cfg.credentials.model.as_ref() {
+        desired.insert(
+            crate::ops::MODEL_CREDENTIAL_KEY.to_string(),
+            resolved.get(name).cloned().unwrap_or_default(),
+        );
+    }
     Ok(EffectiveInstallationPlan {
         cfg,
         up,
@@ -1930,6 +1950,40 @@ mod apply_tests {
             resolve_credentials_lenient(&cfg, &|_| Ok(None)).expect("must not refuse");
         assert!(resolved.is_empty());
         assert_eq!(missing, vec!["MODEL_KEY", "APP_TOK", "BOT_TOK"]);
+    }
+
+    /// The rc.1 -> rc.2 defect, reached by its other route.
+    ///
+    /// Running the published rc.2 against the live release with no credentials
+    /// exported reported
+    ///
+    ///   ! agentSandbox.runner.credentials: <secret> (reset to chart default)
+    ///
+    /// and the legend beside a reset reads "Declare it in curie.yaml to keep
+    /// it." The file DOES declare it -- by name, which is the only thing it may
+    /// carry -- so the advice is both wrong and, followed literally for a model
+    /// API key, the one thing that file's own header forbids.
+    ///
+    /// A declared credential belongs in the desired state whether or not it
+    /// resolves in this shell. Apply supplies it, and refuses while it cannot.
+    #[tokio::test]
+    async fn a_declared_but_unresolved_model_credential_is_not_a_reset() {
+        let cfg = cfg_with_all_names();
+        let (local, missing) = plan_installation_lenient(cfg).expect("lenient plan");
+        assert!(
+            missing.contains(&"MODEL_KEY".to_string()),
+            "fixture must leave the model credential unresolved: {missing:?}"
+        );
+        let plan = complete_installation_plan(local)
+            .await
+            .expect("dry-run plan needs no cluster");
+        assert!(
+            plan.desired.contains_key(crate::ops::MODEL_CREDENTIAL_KEY),
+            "a declared credential must stay in the desired state unresolved, or \
+             diff reports it as a reset and tells the operator to paste the key \
+             into curie.yaml. desired: {:?}",
+            plan.desired.keys().collect::<Vec<_>>()
+        );
     }
 
     /// Apply keeps refusing. Resolving BEFORE mutating is what stops a missing
