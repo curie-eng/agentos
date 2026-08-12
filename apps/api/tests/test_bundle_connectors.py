@@ -116,10 +116,22 @@ def test_ingress_policy_admits_only_the_sandbox(tmp_path: Path) -> None:
     # Same ClusterIP trap on the way in, and the same reason it matters: this is
     # the path a real deploy takes, so a rule that parses but never matches
     # would leave the connector open while looking closed.
-    np = _policy(_render(_bundle(tmp_path, HOSTED)), "Ingress")
+    connectors = HOSTED.replace(
+        "    args: [-t, streamable-http]\n",
+        "    args: [-t, streamable-http]\n    port: 9876\n",
+    )
+    root = _bundle(tmp_path, connectors)
+    objs = _render(root)
+    np = _policy(objs, "Ingress")
     src = np["spec"]["ingress"][0]["from"]
     assert len(src) == 1
     assert "podSelector" in src[0] and "ipBlock" not in src[0]
+    svc = next(o for o in objs if o["kind"] == "Service")
+    assert (
+        svc["spec"]["ports"][0]["port"]
+        == np["spec"]["ingress"][0]["ports"][0]["port"]
+        == 9876
+    )
 
 
 def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
