@@ -21,7 +21,7 @@ order: 17
 ## The black line
 
 A "trigger" is the thing that wakes an agent: an inbound event that gets turned into a
-run. Today there are **two hardcoded triggers** wired directly into their respective
+run. Today there are **three hardcoded triggers** wired directly into their respective
 ingress handlers, with **no shared `Trigger`/`EventSource` port** between them. There
 is no swappable line here yet — each trigger is bespoke code. The open architectural
 question (Epic #29) is whether "trigger" is even a real seam, or whether new triggers
@@ -32,7 +32,7 @@ assert a port that does not exist.
 ## Current contract
 
 There is no cross-trigger contract to satisfy — a new trigger today means adding
-another hardcoded handler. The two that exist:
+another hardcoded handler. The three that exist:
 
 - **Slack mention** — `apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`:
   the `@app.event("app_mention")` listener (wired in
@@ -56,7 +56,7 @@ GitHub HMAC auth, and an asyncio timer. The last two converge one step earlier t
 the others -- both call `process_push`, deliberately, so the two deploy ingresses
 cannot disagree about what a push means.
 
-**Two further wake paths the inventory omitted.** Beyond the two external triggers, two
+**Two further wake paths the inventory omitted.** Beyond the three external triggers, two
 platform-internal paths also turn an event into a run on the same `curie:runs` stream,
 and a truthful inventory names them:
 
