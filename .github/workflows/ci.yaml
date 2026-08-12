@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
-    branches: [main]
+    branches: [main, next]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -649,7 +649,8 @@ jobs:
     # Skip on PRs that can't affect what the ladder tests (docs, UI-only, gtools,
     # non-ladder CI). Not a required check, so skipping never blocks a merge; it
     # just stops paying the ~2min image-build + rung cost when nothing it
-    # exercises changed. Always runs on push to main (the changes job forces it).
+    # exercises changed. Always runs on push to either release train branch (the
+    # changes job forces it).
     if: needs.changes.outputs.ladder == 'true'
     steps:
       - uses: actions/checkout@v7
@@ -868,7 +869,7 @@ jobs:
   # Gate the expensive e2e parity ladder rungs so they run ONLY when a change
   # could affect the build/deploy/message path any rung exercises (charts / cli /
   # app+runner images / the ACI wire / this workflow), and always on push to
-  # main. An unrelated PR (docs, UI-only, gtools, etc.) skips every ladder rung
+  # either release train branch. An unrelated PR (docs, UI-only, gtools, etc.) skips every ladder rung
   # entirely -- the ladder's image builds + rungs are ~2min it need not pay when
   # nothing it tests changed. Pure git-diff, no third-party action. (No ladder
   # rung is a required check anyway -- the ruleset requires only
@@ -888,7 +889,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "ladder=true" >> "$GITHUB_OUTPUT"   # post-merge gate on main
+            echo "ladder=true" >> "$GITHUB_OUTPUT"   # post-merge gate on a release train branch
             exit 0
           fi
           base="${{ github.base_ref }}"

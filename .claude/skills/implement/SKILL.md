@@ -33,9 +33,23 @@ helper scripts. Repository instructions and available tools are authoritative.
 
 1. Read the ticket and its linked requirements. Do not infer scope from an ID alone.
 2. Read the repository instructions and the relevant architecture or component docs.
-3. Check for an existing branch or worktree for the ticket. Otherwise create a fresh
-   branch and worktree from the repository's current target base, following its own
-   instructions.
+3. Check for an existing branch or worktree for the ticket. Otherwise select the
+   target release train before creating work:
+
+   | Work | Base and PR target |
+   | --- | --- |
+   | General bug, security fix, or shared change | `main` |
+   | v0.7 feature or a bug unique to unreleased v0.7 work | `next` |
+
+   Fetch the chosen base and create the worktree from its remote tip:
+
+   ```bash
+   git fetch origin <base>
+   git worktree add <path> -b task/<short-description> "$(git rev-parse origin/<base>)"
+   ```
+
+   Never commit directly to either release train. If the ticket does not make
+   the target clear, stop and ask.
 4. Run the focused existing tests, type checks, and lint for the affected area. Stop
    on a relevant baseline failure. Record unrelated failures without widening scope.
 
@@ -87,6 +101,9 @@ that a new or modified guard rejects violating input through its real consumer p
 ## Finish
 
 Confirm that the final diff satisfies every acceptance criterion and that validation
-evidence reflects the final code. Present the diff and verification results. Follow
-the repository's commit, push, pull request, and ticket status rules. Do not create
-a pull request or publish changes without the authority required by those rules.
+evidence reflects the final code. Present the diff and verification results. Open
+the PR against the selected release train. For a general fix merged to `main`,
+create or request the follow up PR that merges `main` forward into `next`; do not
+normally cherry pick the fix. Follow the repository's commit, push, pull request,
+and ticket status rules. Do not create a pull request or publish changes without
+the authority required by those rules.

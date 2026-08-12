@@ -6,12 +6,12 @@ name: Helm CI
 # values overlay, and schema-validate the rendered manifests.
 on:
   push:
-    branches: [main]
+    branches: [main, next]
     paths:
       - "charts/curie/**"
       - ".github/workflows/helm-ci.yaml"
   pull_request:
-    branches: [main]
+    branches: [main, next]
     paths:
       - "charts/curie/**"
       - ".github/workflows/helm-ci.yaml"

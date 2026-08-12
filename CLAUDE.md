@@ -19,6 +19,14 @@ New tooling ships as a `curie` subcommand (add the clap surface in
 `cli/src/main.rs`, the handler in `cli/src/commands.rs`); a new loose script in
 `scripts/` should be the exception with a reason, not the default.
 
+## Release train selection
+
+`main` is the stable v0.6.x line and `next` is the v0.7.0 integration branch.
+Before starting work, choose the release train from the branch table in
+[`AGENTS.md`](AGENTS.md#release-train-branch-and-commit-conventions), then create
+the worktree and PR against that base. Do not assume `main` is the target for
+every feature.
+
 ## Architecture Decision Records (ADRs)
 
 `docs/adr/` is the system of record for architecture decisions. Each ADR captures

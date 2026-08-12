@@ -8,6 +8,14 @@
 
 Closes #
 
+## Release train
+
+<!-- Use main for general bugs, security fixes, and shared changes. Use next only
+     for v0.7 features or bugs unique to unreleased v0.7 work. -->
+
+- [ ] This PR targets `main`.
+- [ ] This PR targets `next`.
+
 ## Checklist
 
 - [ ] Tests pass for the area I touched (see CONTRIBUTING.md for the commands).
