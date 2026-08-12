@@ -16,13 +16,17 @@
 #
 # So this asserts AGREEMENT, not presence. Presence alone would still pass the
 # day someone points the worker at a different-but-populated endpoint.
+#
+# The key set is DERIVED from the API's rendered env rather than listed here, so
+# a fifth object-store variable added to api.yaml alone is a failure instead of
+# being invisible. Every secretKeyRef is resolved against the rendered Secret,
+# because a reference identically wrong on both sides passes an equality check
+# and leaves both pods in CreateContainerConfigError.
 set -euo pipefail
 
 CHART=${CHART:-charts/curie}
-DEFAULT_RENDERED=$(mktemp)
-EXTERNAL_RENDERED=$(mktemp)
 EXTERNAL_VALUES=$(mktemp)
-trap 'rm -f "$DEFAULT_RENDERED" "$EXTERNAL_RENDERED" "$EXTERNAL_VALUES"' EXIT
+trap 'rm -f "$EXTERNAL_VALUES"' EXIT
 
 cat > "$EXTERNAL_VALUES" <<'EOF'
 rustfs:
@@ -31,103 +35,229 @@ rustfs:
   port: 443
 EOF
 
-helm template curie "$CHART" --namespace dev > "$DEFAULT_RENDERED"
-helm template curie "$CHART" --namespace dev \
-  --values "$EXTERNAL_VALUES" > "$EXTERNAL_RENDERED"
+# Capture Helm output in Python so a large manifest cannot be truncated by a
+# shell command substitution or redirected into the script's stdin.
+python3 - "$CHART" "$EXTERNAL_VALUES" <<'PY'
+import subprocess
+import sys
 
-# The rendered manifests go via a FILE, not a second stdin redirect: with both
-# `<<'PY'` and `<<<"$out"` on one command the herestring wins and python reads
-# the chart instead of the script.
-python3 - \
-  "$DEFAULT_RENDERED" "default" "http://curie-rustfs:9000" \
-  "$EXTERNAL_RENDERED" "external" "https://s3.example.com:443" <<'PY'
-import sys, yaml
+import yaml
 
-KEYS = ("S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BUNDLE_BUCKET")
+CHART, EXTERNAL_VALUES = sys.argv[1], sys.argv[2]
 
 
-def env_for(container):
-    return {entry["name"]: entry for entry in container.get("env", [])}
+def render(*values):
+    command = ["helm", "template", "curie", CHART, "--namespace", "dev"]
+    for path in values:
+        command += ["--values", path]
+    try:
+        rendered = subprocess.run(command, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as error:
+        print("FAIL: helm template could not render the chart", file=sys.stderr)
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise SystemExit(error.returncode)
+    return [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
 
 
-def object_store_envs(path):
-    api = worker = bundle_fetch = None
-    with open(path) as fh:
-        for doc in yaml.safe_load_all(fh):
-            if not doc:
-                continue
-            if doc.get("kind") == "Deployment":
-                name = doc["metadata"]["name"]
-                containers = doc["spec"]["template"]["spec"].get("containers", [])
-                assert containers, f"{name} Deployment has no containers"
-                if name.endswith("-api"):
-                    api = env_for(containers[0])
-                elif name.endswith("-worker"):
-                    worker = env_for(containers[0])
-            elif doc.get("kind") == "SandboxTemplate":
-                pod_spec = doc["spec"]["podTemplate"]["spec"]
-                matches = [
-                    container
-                    for container in pod_spec.get("initContainers", [])
-                    if container.get("name") == "bundle-fetch"
-                ]
-                assert len(matches) == 1, (
-                    "SandboxTemplate must render exactly one bundle-fetch init container"
-                )
-                bundle_fetch = env_for(matches[0])
+def value_source(entry):
+    return {key: entry[key] for key in ("value", "valueFrom") if key in entry}
 
+
+def has_usable_source(entry):
+    return bool(entry.get("value")) or bool(entry.get("valueFrom"))
+
+
+def env_of(docs, kind, component, container_name, init=False):
+    """Select by the component LABEL and the container NAME.
+
+    `endswith("-worker")` also matches `<release>-curie-langfuse-worker`, which
+    renders earlier and legitimately has no object-store env -- so a suffix
+    match silently inspected Langfuse and reported the curie worker as
+    misconfigured while the chart was correct. The label is unambiguous, and the
+    container name keeps a sidecar rendered first from being inspected instead
+    of the application container.
+    """
+
+    for d in docs:
+        if d.get("kind") != kind:
+            continue
+        if d["metadata"].get("labels", {}).get("app.kubernetes.io/component") != component:
+            continue
+        pod_template = "template" if kind == "Deployment" else "podTemplate"
+        pod_spec = d["spec"][pod_template]["spec"]
+        containers = pod_spec.get("initContainers" if init else "containers", [])
+        matches = [c for c in containers if c.get("name") == container_name]
+        assert len(matches) == 1, (
+            f"{kind} {component} must render exactly one container named "
+            f"{container_name}, got {len(matches)}"
+        )
+        return {e["name"]: e for e in matches[0].get("env", [])}
+    return None
+
+
+def object_store_keys(env):
+    return {name for name in env if name.startswith("S3_") or name == "BUNDLE_BUCKET"}
+
+
+def assert_contract(docs, label, expected_endpoint):
+    for d in docs:
+        if d.get("kind") == "Deployment":
+            assert d["spec"]["template"]["spec"].get("containers"), (
+                f"{d['metadata']['name']} Deployment has no containers"
+            )
+
+    api = env_of(docs, "Deployment", "api", "api")
+    worker = env_of(docs, "Deployment", "worker", "worker")
+    bundle_fetch = env_of(
+        docs, "SandboxTemplate", "agent-sandbox", "bundle-fetch", init=True
+    )
     assert api is not None, "api Deployment not rendered"
     assert worker is not None, "worker Deployment not rendered"
     assert bundle_fetch is not None, "SandboxTemplate bundle-fetch not rendered"
-    return api, worker, bundle_fetch
 
+    failures = []
 
-def assert_contract(path, label, expected_endpoint):
-    api, worker, bundle_fetch = object_store_envs(path)
+    required_keys = {"S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BUNDLE_BUCKET"}
+    for k in sorted(required_keys - api.keys()):
+        failures.append(f"api is missing object-store key {k}")
 
-    for service, env in (("api", api), ("worker", worker)):
-        missing = [key for key in KEYS if key not in env]
-        if service == "worker":
-            assert not missing, (
-                f"worker is missing {missing}. Its config defaults these to the compose stack "
-                "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED -- and "
-                "the symptom is a ClaimTimeoutError that blames the node's CPU."
-            )
-        else:
-            assert not missing, f"{service} is missing object-store keys: {missing}"
+    # The API is the writer and defines the full object store configuration, so
+    # the key set is read off its rendered env. This keeps a newly introduced S3
+    # setting from being invisible to this gate.
+    keys = object_store_keys(api)
+    worker_keys = object_store_keys(worker)
 
-    for key in KEYS:
-        assert api[key] == worker[key], (
-            f"api and worker disagree on {key}:\n  api    = {api[key]}\n  worker = {worker[key]}\n"
-            "The API writes bundles and the worker reads them, so a difference here means "
-            "the write lands somewhere the read never looks."
+    for source, env, env_keys in (("api", api, keys), ("worker", worker, worker_keys)):
+        for k in sorted(env_keys):
+            if not has_usable_source(env[k]):
+                failures.append(f"{source} {k} has neither a usable value nor valueFrom")
+
+    for k in sorted(keys - worker_keys):
+        failures.append(
+            f"worker is missing {k}. Its config defaults these to the compose stack "
+            "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED -- and "
+            "the symptom is a ClaimTimeoutError that blames the node's CPU."
         )
+    for k in sorted(worker_keys - keys):
+        failures.append(f"worker has {k}, but api does not")
 
-    assert api["S3_ENDPOINT_URL"].get("value") == expected_endpoint, (
-        f"{label} API endpoint must be {expected_endpoint}, got {api['S3_ENDPOINT_URL']}"
-    )
-    assert worker["S3_ENDPOINT_URL"].get("value") == expected_endpoint, (
-        f"{label} worker endpoint must be {expected_endpoint}, got {worker['S3_ENDPOINT_URL']}"
-    )
-    assert bundle_fetch.get("S3_ENDPOINT", {}).get("value") == expected_endpoint, (
-        f"{label} bundle-fetch endpoint must be {expected_endpoint}, "
-        f"got {bundle_fetch.get('S3_ENDPOINT')}"
-    )
+    # Equality, not merely presence. Two different but present endpoints is the
+    # subtler version of the same bug and would pass a presence only check.
+    for k in sorted(keys & worker_keys):
+        if value_source(api[k]) != value_source(worker[k]):
+            failures.append(
+                f"api and worker disagree on {k}:\n"
+                f"      api    = {value_source(api[k])}\n"
+                f"      worker = {value_source(worker[k])}\n"
+                "    The API writes bundles and the worker reads them, so a difference here "
+                "means the write lands somewhere the read never looks."
+            )
 
-    # The credential must be a reference, never inline: helm keeps its values in the
-    # release Secret, so an inline password is readable in every retained revision.
-    entry = worker["S3_SECRET_KEY"]
+    # A secretKeyRef that names a Secret or key the chart never renders leaves the
+    # pod in CreateContainerConfigError. Identically wrong on both sides, it is
+    # indistinguishable from a correct reference to the equality check above.
+    for source, env, env_keys in (
+        ("api", api, keys),
+        ("worker", worker, worker_keys),
+        (
+            "bundle fetch",
+            bundle_fetch,
+            {k for k in ("S3_ENDPOINT", "BUNDLE_BUCKET") if k in bundle_fetch},
+        ),
+    ):
+        for k in sorted(env_keys):
+            ref = env[k].get("valueFrom", {}).get("secretKeyRef")
+            if not ref:
+                continue
+            name, key = ref.get("name"), ref.get("key")
+            secret = next(
+                (
+                    d for d in docs
+                    if d.get("kind") == "Secret"
+                    and d.get("metadata", {}).get("name") == name
+                ),
+                None,
+            )
+            if secret is None:
+                failures.append(f"{source} {k} secretKeyRef names missing Secret {name!r}")
+                continue
+            secret_keys = set(secret.get("data", {})) | set(secret.get("stringData", {}))
+            if key not in secret_keys:
+                failures.append(
+                    f"{source} {k} secretKeyRef names missing key {key!r} in Secret {name!r}"
+                )
+
+    # The sandbox bundle-fetch init container reads the same store under a
+    # different variable name, and on Kubernetes it is what actually fetches the
+    # bundle on the turn path.
+    for api_key, fetch_key in (
+        ("S3_ENDPOINT_URL", "S3_ENDPOINT"),
+        ("BUNDLE_BUCKET", "BUNDLE_BUCKET"),
+    ):
+        if fetch_key not in bundle_fetch:
+            failures.append(f"bundle fetch is missing {fetch_key}")
+            continue
+        if not has_usable_source(bundle_fetch[fetch_key]):
+            failures.append(
+                f"bundle fetch {fetch_key} has neither a usable value nor valueFrom"
+            )
+        for source, env in (("api", api), ("worker", worker)):
+            if api_key in env and value_source(env[api_key]) != value_source(
+                bundle_fetch[fetch_key]
+            ):
+                failures.append(
+                    f"bundle fetch {fetch_key} disagrees with {source} {api_key}:\n"
+                    f"      bundle fetch = {value_source(bundle_fetch[fetch_key])}\n"
+                    f"      {source} = {value_source(env[api_key])}"
+                )
+
+    for source, env, key in (
+        ("api", api, "S3_ENDPOINT_URL"),
+        ("worker", worker, "S3_ENDPOINT_URL"),
+        ("bundle fetch", bundle_fetch, "S3_ENDPOINT"),
+    ):
+        if env.get(key, {}).get("value") != expected_endpoint:
+            failures.append(
+                f"{label} {source} endpoint must be {expected_endpoint}, got {env.get(key)}"
+            )
+
+    # The compose default must never be what a Kubernetes pod receives.
+    ep = worker.get("S3_ENDPOINT_URL", {}).get("value", "")
+    if "localhost" in ep or "127.0.0.1" in ep:
+        failures.append(f"worker S3_ENDPOINT_URL points at the pod itself: {ep!r}")
+
+    # The credential must be a reference, never inline: helm keeps its values in
+    # the release Secret, so an inline password is readable in every retained
+    # revision.
+    entry = worker.get("S3_SECRET_KEY", {})
     ref = entry.get("valueFrom", {}).get("secretKeyRef")
-    assert ref, "S3_SECRET_KEY must come from a secretKeyRef"
-    assert "value" not in entry, "S3_SECRET_KEY must not be an inline value"
+    if "value" in entry:
+        failures.append("worker S3_SECRET_KEY must not be an inline value")
+    if not ref:
+        failures.append("worker S3_SECRET_KEY must come from a secretKeyRef")
 
-    print(f"ok: {label}: api and worker agree on {', '.join(KEYS)}")
+    if failures:
+        print(f"FAIL: {label}: api/worker object-store configuration diverges\n")
+        for f in failures:
+            print("  - " + f)
+        raise SystemExit(1)
+
+    def shown(env_entry):
+        if "value" in env_entry:
+            return env_entry["value"]
+        secret_ref = env_entry.get("valueFrom", {}).get("secretKeyRef")
+        if secret_ref:
+            return f"<secretKeyRef {secret_ref.get('name')}/{secret_ref.get('key')}>"
+        return "<no value>"
+
+    print(f"ok: {label}: api and worker agree on {', '.join(sorted(keys))}")
+    for k in sorted(keys):
+        print(f"      {k:18} = {shown(api[k])}")
     print(f"ok: {label}: all S3 endpoints are {expected_endpoint}")
     print(f"ok: {label}: S3_SECRET_KEY is a ref -> {ref['name']}/{ref['key']}")
 
 
-arguments = sys.argv[1:]
-assert len(arguments) % 3 == 0, "expected path, label, endpoint triples"
-for index in range(0, len(arguments), 3):
-    assert_contract(*arguments[index:index + 3])
+assert_contract(render(), "default", "http://curie-rustfs:9000")
+assert_contract(render(EXTERNAL_VALUES), "external", "https://s3.example.com:443")
 PY
