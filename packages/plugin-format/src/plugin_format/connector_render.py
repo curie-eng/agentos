@@ -1,7 +1,8 @@
 """Derive Kubernetes objects from a declared connector (ADR-0086).
 
 This is the half of #1063 that deletes the bundle author's Kubernetes. Given a
-``ConnectorSpec``, it produces the Deployment, Service, and NetworkPolicy that
+``ConnectorSpec``, it produces the Deployment, Service, and the two
+NetworkPolicies -- egress from the sandbox, ingress to the connector -- that
 Curie previously expected every author to write by hand.
 
 Deriving rather than documenting is the point. Two defects in the hand-written
@@ -337,6 +338,65 @@ def render_networkpolicy(
     }
 
 
+def render_ingress_networkpolicy(
+    release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
+) -> dict[str, Any]:
+    """Ingress to this connector: the sandbox, and nothing else.
+
+    The egress policy above says where the sandbox may GO. It says nothing
+    about who may ARRIVE, and those are not the same question. Without this,
+    every pod in the namespace can call the connector -- and the connector is
+    deliberately unauthenticated, because the sandbox holds no credential to
+    authenticate WITH. So the network is not one layer of the access control
+    here, it is the whole of it.
+
+    What that is worth is concrete: a connector holds a production credential
+    and answers anyone who asks. In a namespace that also runs Postgres,
+    ClickHouse, Valkey, an object store and an OTLP collector, "any neighbour
+    can read production through it" is a real step in a compromise, and those
+    datastores already carry a default-deny of their own. The connector holding
+    the credential should not be the one object without one.
+
+    One policy, not the customary deny/allow PAIR. A NetworkPolicy that selects
+    a pod and declares ``policyTypes: [Ingress]`` already denies every source it
+    does not list (ADR-0067: policies are additive, and selecting a pod at all
+    switches it from allow-by-default to deny-by-default for that direction).
+    A separate default-deny object would be inert.
+
+    Safe here specifically because the connector Deployment declares no probes:
+    an ingress policy that omits the kubelet would otherwise fail readiness and
+    take the connector out of its Service endpoints -- the failure mode being a
+    connector that is healthy, running, and unreachable. If probes are ever
+    added to ``render_deployment``, this rule has to grow a companion for them
+    in the same commit.
+    """
+
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        # Not "-allow-ingress" paired with a renamed "-allow-egress": the
+        # existing object ships as "-allow" on every live install, and renaming
+        # it strands a policy that still grants egress under a name nothing
+        # reconciles any more. Additive is the safe shape for a rule whose
+        # failure mode is silent.
+        "metadata": {
+            "name": f"{object_name(release, agent, connector)}-allow-ingress",
+            "labels": _labels(release, agent, connector),
+        },
+        "spec": {
+            # Selects the CONNECTOR, where the egress policy selects the sandbox.
+            "podSelector": {"matchLabels": _labels(release, agent, connector)},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [{"podSelector": {"matchLabels": sandbox_selector(release, app_name)}}],
+                    "ports": [{"protocol": "TCP", "port": spec.port}],
+                }
+            ],
+        },
+    }
+
+
 def render(
     release: str,
     agent: str,
@@ -354,6 +414,7 @@ def render(
         render_service(release, agent, connector, spec),
         render_deployment(release, agent, namespace, connector, spec, secret_name),
         render_networkpolicy(release, agent, app_name, connector, spec),
+        render_ingress_networkpolicy(release, agent, app_name, connector, spec),
     ]
 
 
