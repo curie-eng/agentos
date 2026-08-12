@@ -241,6 +241,20 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-ttl-bounds-assertions.sh
 
+      # Prove the API and the worker agree about the object store. The API writes
+      # each uploaded plugin bundle to the bundle bucket and the worker reads it
+      # back, so a disagreement -- or an omission -- makes every bundle
+      # unfetchable. worker.yaml set none of the four variables, so the worker
+      # used its compose defaults (localhost:29000) and every fetch in
+      # Kubernetes hit ECONNREFUSED. Both symptoms point elsewhere: the
+      # post-deploy eval goes quiet with "unresolvable suite/bundle", and turns
+      # die as ClaimTimeoutError, whose message blames a CPU-saturated node --
+      # on the install where this was found the node was at 11% CPU.
+      - name: helm render assertions (worker/api object store agree)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-object-store-assertions.sh
+
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail
