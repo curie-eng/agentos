@@ -53,30 +53,95 @@ CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-TPL=templates/clickhouse.yaml
-
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-DEFAULT="$TMP/default.yaml"
-VERBOSE="$TMP/verbose.yaml"
-NOPERSIST="$TMP/nopersist.yaml"
-OFF="$TMP/off.yaml"
+render() {
+  local name="$1"
+  local chart="$2"
+  shift 2
+
+  RENDER_DIR="$TMP/$name"
+  helm template rel "$chart" --output-dir "$RENDER_DIR" "$@"
+}
+
+manifest_for() {
+  local manifest
+  manifest="$(find "$1" -type f -path "*/templates/clickhouse.yaml" -print -quit)"
+  [[ -n "$manifest" ]] || fail "ClickHouse template was not written to $1"
+  printf '%s\n' "$manifest"
+}
 
 echo "=== Rendering ClickHouse (defaults) ==="
-helm template rel "$CHART" --show-only "$TPL" > "$DEFAULT"
+render default "$CHART"
+DEFAULT="$(manifest_for "$RENDER_DIR")"
 
 echo "=== Rendering ClickHouse (systemLogs.enabled=true, retentionDays=7) ==="
-helm template rel "$CHART" --show-only "$TPL" \
+render verbose "$CHART" \
   --set clickhouse.systemLogs.enabled=true \
-  --set clickhouse.systemLogs.retentionDays=7 > "$VERBOSE"
+  --set clickhouse.systemLogs.retentionDays=7
+VERBOSE="$(manifest_for "$RENDER_DIR")"
 
 echo "=== Rendering ClickHouse (persistence disabled) ==="
-helm template rel "$CHART" --show-only "$TPL" \
-  --set clickhouse.persistence.enabled=false > "$NOPERSIST"
+render nopersist "$CHART" --set clickhouse.persistence.enabled=false
+NOPERSIST="$(manifest_for "$RENDER_DIR")"
 
 echo "=== Rendering ClickHouse (deploy=false) ==="
-helm template rel "$CHART" --show-only "$TPL" \
-  --set clickhouse.deploy=false > "$OFF" 2>/dev/null || true
+render off "$CHART" \
+  --set clickhouse.deploy=false \
+  --set clickhouse.host=clickhouse.example.com
+OFF="$RENDER_DIR"
+
+CHECKSUM_VALUES=(
+  --set clickhouse.logLevel=warning
+  --set clickhouse.systemLogs.enabled=false
+  --set clickhouse.systemLogs.retentionDays=30
+)
+MUTATED_CHART="$TMP/checksum-chart"
+cp -a "$CHART" "$MUTATED_CHART"
+
+echo "=== Rendering ClickHouse checksum baseline ==="
+render checksum-original "$MUTATED_CHART" "${CHECKSUM_VALUES[@]}"
+CHECKSUM_ORIGINAL="$(manifest_for "$RENDER_DIR")"
+
+python3 - "$MUTATED_CHART/templates/_helpers.tpl" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+original = path.read_text()
+mutated = original.replace("<console>1</console>", "<console>0</console>", 1)
+assert mutated != original, "checksum mutation target was not found"
+path.write_text(mutated)
+PY
+
+echo "=== Rendering ClickHouse checksum mutation ==="
+render checksum-mutated "$MUTATED_CHART" "${CHECKSUM_VALUES[@]}"
+CHECKSUM_MUTATED="$(manifest_for "$RENDER_DIR")"
+
+python3 - "$CHECKSUM_ORIGINAL" "$CHECKSUM_MUTATED" <<'PY'
+import sys, yaml
+
+def config_and_checksum(path):
+    docs = [d for d in yaml.safe_load_all(open(path)) if d]
+    cm = next((d for d in docs if d["kind"] == "ConfigMap"), None)
+    sts = next((d for d in docs if d["kind"] == "StatefulSet"), None)
+    assert cm is not None, f"{path}: no ClickHouse config ConfigMap rendered"
+    assert sts is not None, f"{path}: no ClickHouse StatefulSet rendered"
+    annotations = sts["spec"]["template"]["metadata"].get("annotations") or {}
+    checksum = annotations.get("checksum/config")
+    assert checksum, f"{path}: no checksum/config annotation rendered"
+    return cm["data"]["curie-logging.xml"], checksum
+
+original_body, original_checksum = config_and_checksum(sys.argv[1])
+mutated_body, mutated_checksum = config_and_checksum(sys.argv[2])
+
+assert original_body != mutated_body, "checksum mutation did not change the ConfigMap body"
+assert original_checksum != mutated_checksum, (
+    "ConfigMap body changed but checksum/config did not. The pod would not roll."
+)
+
+print("  ConfigMap body mutation updates checksum: OK")
+PY
 
 # ---------------------------------------------------------------- 1, 2, 4, 6
 python3 - "$DEFAULT" "$VERBOSE" <<'PY'
@@ -204,10 +269,10 @@ assert "volumeClaimTemplates" not in sts["spec"], "persistence=false must not re
 print("  persistence=false still gets its data emptyDir: OK")
 PY
 
-if grep -q "kind:" "$OFF" 2>/dev/null; then
-  fail "clickhouse.deploy=false still rendered objects"
+if [[ -d "$OFF" ]] && [[ -n "$(find "$OFF" -type f -path "*/templates/clickhouse.yaml" -print -quit)" ]]; then
+  fail "clickhouse.deploy=false still rendered the ClickHouse manifest"
 fi
-echo "  clickhouse.deploy=false renders nothing: OK"
+echo "  clickhouse.deploy=false renders no ClickHouse manifest: OK"
 
 echo
 echo "PASS: ClickHouse self-telemetry defaults are bounded."
