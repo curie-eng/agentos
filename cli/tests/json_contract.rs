@@ -950,6 +950,75 @@ fn deploy_output_validates() {
     assert_valid("deploy.schema.json", &out.to_json());
 }
 
+fn deploy_result_for_target(target: &str) -> serde_json::Value {
+    let environment = if target == "prod" { "prod" } else { "dev" };
+    DeployOutput {
+        plugin_name: "acme-bundle".to_string(),
+        label: "v1-test".to_string(),
+        env: environment.to_string(),
+        agent_name: format!("acme-{target}"),
+        agent_id: format!("agent-{target}"),
+        version_label: "v1-test".to_string(),
+        version_id: format!("version-{target}"),
+        channel: if target == "prod" {
+            "C0EXAMPLE1".to_string()
+        } else {
+            "C0EXAMPLE2".to_string()
+        },
+        bundle_ref: format!("bundles/{target}.tar.gz"),
+        bundle_sha256: format!("sha-{target}"),
+        bundle_size_bytes: if target == "prod" { 202 } else { 101 },
+        deployment_id: format!("deployment-{target}"),
+        deployment_environment: environment.to_string(),
+        deployment_status: "active".to_string(),
+    }
+    .to_json()
+}
+
+#[test]
+fn deploy_all_targets_success_output_validates() {
+    let value = serde_json::json!({
+        "results": [
+            {"target": "dev", "result": deploy_result_for_target("dev")},
+            {"target": "prod", "result": deploy_result_for_target("prod")}
+        ]
+    });
+    assert_valid("deploy.schema.json", &value);
+}
+
+#[test]
+fn deploy_all_targets_failure_outputs_validate() {
+    let first_failure = serde_json::json!({
+        "failed_target": "dev",
+        "stage": "deploy",
+        "completed": [],
+        "error": "creating the deployment failed with 500",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &first_failure);
+
+    let later_failure = serde_json::json!({
+        "failed_target": "prod",
+        "stage": "deploy",
+        "completed": [
+            {"target": "dev", "result": deploy_result_for_target("dev")}
+        ],
+        "error": "creating the deployment failed with 500",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &later_failure);
+
+    let connector_failure = serde_json::json!({
+        "failed_target": "dev",
+        "stage": "connector_sync",
+        "completed": [],
+        "failed_result": deploy_result_for_target("dev"),
+        "error": "connector sync failed",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &connector_failure);
+}
+
 #[test]
 fn diff_output_validates() {
     let mut entries = curie::installation::diff_plan(

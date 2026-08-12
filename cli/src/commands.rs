@@ -3474,6 +3474,80 @@ pub struct DeployOutput {
     pub deployment_status: String,
 }
 
+/// One completed entry in a deploy across every declared target, retaining the
+/// target name beside the full deploy result.
+#[derive(Debug)]
+pub struct AllTargetsDeployResult {
+    pub target: String,
+    pub result: DeployOutput,
+}
+
+impl AllTargetsDeployResult {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "target": self.target,
+            "result": <DeployOutput as crate::ui::CliOutput>::to_json(&self.result),
+        })
+    }
+}
+
+/// Ordered result of a cluster deploy across every declared target.
+#[derive(Debug)]
+pub struct AllTargetsDeployOutput {
+    pub results: Vec<AllTargetsDeployResult>,
+}
+
+impl crate::ui::CliOutput for AllTargetsDeployOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "results": self
+                .results
+                .iter()
+                .map(AllTargetsDeployResult::to_json)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if let Some(last) = self.results.last() {
+            <DeployOutput as crate::ui::CliOutput>::render(&last.result, ui);
+        }
+    }
+}
+
+/// Build the reconciliation payload for a failed cluster deploy across every
+/// target. A connector failure includes the completed deploy result.
+pub fn all_targets_deploy_failure_json(
+    failed_target: &str,
+    completed: &[AllTargetsDeployResult],
+    failed_result: Option<&DeployOutput>,
+    err: &anyhow::Error,
+) -> serde_json::Value {
+    let completed = completed
+        .iter()
+        .map(AllTargetsDeployResult::to_json)
+        .collect::<Vec<_>>();
+    let fix = crate::exit::classify(err).1;
+
+    match failed_result {
+        Some(result) => serde_json::json!({
+            "failed_target": failed_target,
+            "stage": "connector_sync",
+            "completed": completed,
+            "failed_result": <DeployOutput as crate::ui::CliOutput>::to_json(result),
+            "error": format!("{err:#}"),
+            "fix": fix,
+        }),
+        None => serde_json::json!({
+            "failed_target": failed_target,
+            "stage": "deploy",
+            "completed": completed,
+            "error": format!("{err:#}"),
+            "fix": fix,
+        }),
+    }
+}
+
 impl crate::ui::CliOutput for DeployOutput {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({

@@ -20,8 +20,9 @@
 //! an unreachable dependency is detected structurally by walking the error chain
 //! for a `reqwest` connect/timeout error. Everything else is
 //! [`ExitClass::Failure`]. [`classify`] returns the class plus an optional
-//! one-line fix hint, and [`error_json`] renders the whole thing as the `--json`
-//! error payload.
+//! one-line fix hint, and [`error_json`] renders the generic `--json` error
+//! payload. Command-specific wrapped payloads are exposed by
+//! [`wrapped_json_payload`] for the centralized emitter to select.
 
 /// The five semantic exit classes. The `#[repr(i32)]` values are the process
 /// exit codes and are a stable contract agents branch on.
@@ -51,6 +52,24 @@ pub struct CliError {
     pub fix: Option<String>,
     pub class: ExitClass,
 }
+
+/// An error whose JSON rendering is a command specific reconciliation
+/// payload instead of the ordinary `{error, fix}` object.
+#[derive(Debug)]
+struct JsonPayloadError {
+    message: String,
+    payload: serde_json::Value,
+    class: ExitClass,
+    fix: Option<String>,
+}
+
+impl std::fmt::Display for JsonPayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JsonPayloadError {}
 
 impl CliError {
     /// A deterministic input error (exit 2).
@@ -146,6 +165,18 @@ pub fn transient(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::from(CliError::transient(msg))
 }
 
+/// Preserve an error's semantic exit classification while replacing only its
+/// centralized JSON rendering with `payload`.
+pub fn with_json_payload(err: anyhow::Error, payload: serde_json::Value) -> anyhow::Error {
+    let (class, fix) = classify(&err);
+    anyhow::Error::from(JsonPayloadError {
+        message: format!("{err:#}"),
+        payload,
+        class,
+        fix,
+    })
+}
+
 /// Classify an error into its exit class plus an optional fix hint. Walks the
 /// `anyhow` chain so a tagged [`CliError`] is found even under context layers; a
 /// `reqwest` connect/timeout failure anywhere in the chain maps to
@@ -153,6 +184,9 @@ pub fn transient(msg: impl Into<String>) -> anyhow::Error {
 /// [`ExitClass::Failure`] with no fix.
 pub fn classify(err: &anyhow::Error) -> (ExitClass, Option<String>) {
     for cause in err.chain() {
+        if let Some(payload) = cause.downcast_ref::<JsonPayloadError>() {
+            return (payload.class, payload.fix.clone());
+        }
         if let Some(cli) = cause.downcast_ref::<CliError>() {
             // A transient error is retryable by definition, so it always carries
             // a retry hint even when the caller did not attach a specific one.
@@ -185,7 +219,7 @@ pub fn is_transient_reqwest(err: &anyhow::Error) -> bool {
 /// The default one-line retry hint for a transient (retryable) failure.
 const RETRY_HINT: &str = "the endpoint was unreachable; retry once it is up";
 
-/// The `--json` error payload: `{"error": <message>, "fix": <hint or null>}`.
+/// The generic `--json` error payload: `{"error": <message>, "fix": <hint or null>}`.
 /// `error` is the top-level rendered error; `fix` comes from [`classify`].
 pub fn error_json(err: &anyhow::Error) -> serde_json::Value {
     let (_class, fix) = classify(err);
@@ -193,6 +227,13 @@ pub fn error_json(err: &anyhow::Error) -> serde_json::Value {
         "error": format!("{err:#}"),
         "fix": fix,
     })
+}
+
+/// Return a command-specific JSON payload carried by a wrapped error, if any.
+pub fn wrapped_json_payload(err: &anyhow::Error) -> Option<serde_json::Value> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<JsonPayloadError>())
+        .map(|payload| payload.payload.clone())
 }
 
 #[cfg(test)]

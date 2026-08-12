@@ -12,7 +12,14 @@
 //! (comms/eval legitimately exit non-zero with a JSON *error* object); the bug
 //! under test is empty stdout, not a nonzero code.
 
-use std::process::Command;
+mod support;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use support::{serve, Response};
 
 // The eval-concurrency forward-surface (#706): `EvalOpts` gains a
 // `pub concurrency: usize` field, and `eval_dry_run_lines` must emit one plan
@@ -1324,4 +1331,379 @@ fn init_output_next_shell_quotes_a_dir_with_a_space() {
         json!("cd 'my bundle' && curie skill up"),
         "a dir with a space must be shell-quoted in the next command: {out}"
     );
+}
+
+// `cluster deploy --all-targets --json` result and failure contracts (#1308).
+
+const DEPLOY_LABEL: &str = "v1-test";
+const DEPLOY_API_KEY: &str = "test-key";
+
+#[derive(Clone, Copy)]
+enum DeployFixtureFailure {
+    None,
+    Deploy(&'static str),
+}
+
+fn target_from_agent(agent: &str) -> &'static str {
+    if agent.contains("prod") {
+        "prod"
+    } else {
+        "dev"
+    }
+}
+
+fn target_config(target: &str) -> (&'static str, &'static str, &'static str) {
+    match target {
+        "dev" => ("acme-dev", "dev", "C0EXAMPLE2"),
+        "prod" => ("acme-prod", "prod", "C0EXAMPLE1"),
+        other => panic!("unexpected deploy target {other}"),
+    }
+}
+
+fn response_json(status: u16, value: serde_json::Value) -> Response {
+    Response::json(status, &value.to_string())
+}
+
+fn deploy_api_response(req: &support::Request, failure: DeployFixtureFailure) -> Response {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/deploy-targets/list") => response_json(
+            200,
+            json!({
+                "targets": [
+                    {"name": "dev", "agent": "acme-dev", "env": "dev", "slack_channel": "C0EXAMPLE2"},
+                    {"name": "prod", "agent": "acme-prod", "env": "prod", "slack_channel": "C0EXAMPLE1"}
+                ]
+            }),
+        ),
+        ("POST", "/deploy-targets/resolve") => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("target request body is JSON");
+            let target = body["target"].as_str().expect("target is a string");
+            let (agent, env, channel) = target_config(target);
+            response_json(
+                200,
+                json!({"agent": agent, "env": env, "slack_channel": channel}),
+            )
+        }
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("agent request body is JSON");
+            let name = body["name"].as_str().expect("agent name is a string");
+            let channel = body["slack_channel"]
+                .as_str()
+                .expect("agent channel is a string");
+            let target = target_from_agent(name);
+            response_json(
+                201,
+                json!({
+                    "id": format!("agent-{target}"),
+                    "name": name,
+                    "slack_channel": channel
+                }),
+            )
+        }
+        ("POST", path) if path.starts_with("/agents/") && path.ends_with("/versions") => {
+            let agent_id = path
+                .trim_start_matches("/agents/")
+                .trim_end_matches("/versions")
+                .trim_end_matches('/');
+            let target = target_from_agent(agent_id);
+            response_json(
+                201,
+                json!({"id": format!("version-{target}"), "version_label": DEPLOY_LABEL}),
+            )
+        }
+        ("PUT", path) if path.contains("/versions/") && path.ends_with("/bundle") => {
+            let target = target_from_agent(path);
+            response_json(
+                201,
+                json!({
+                    "bundle_ref": format!("bundles/{target}.tar.gz"),
+                    "bundle_sha256": format!("sha-{target}"),
+                    "size_bytes": if target == "dev" { 101 } else { 202 }
+                }),
+            )
+        }
+        ("POST", "/deployments") => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("deployment request body is JSON");
+            let agent_id = body["agent_id"]
+                .as_str()
+                .expect("deployment agent is a string");
+            let target = target_from_agent(agent_id);
+            if matches!(failure, DeployFixtureFailure::Deploy(failed) if failed == target) {
+                return Response::json(500, &format!("deployment {target} exploded"));
+            }
+            response_json(
+                201,
+                json!({
+                    "id": format!("deployment-{target}"),
+                    "environment": target,
+                    "status": "active"
+                }),
+            )
+        }
+        ("GET", path) if path.contains("/versions/") && path.contains("/connectors?") => {
+            response_json(
+                200,
+                json!({
+                    "manifests": [],
+                    "owned_secret_name": "",
+                    "owned_secret_keys": [],
+                    "mcp_entries": {}
+                }),
+            )
+        }
+        (method, path) => Response::json(
+            500,
+            &format!("unexpected mock API request: {method} {path}"),
+        ),
+    }
+}
+
+fn write_kubectl_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("kubectl");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$*" in
+  *"get deployment"*)
+    if [ "${CURIE_TEST_CONNECTOR_FAILURE:-}" = 1 ]; then
+      printf '%s\n' 'connector sync exploded' >&2
+      exit 1
+    fi
+    printf '%s' 'curie'
+    ;;
+  *"delete deployment,service,networkpolicy,secret"*)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected kubectl invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("write kubectl stub");
+    let mut permissions = fs::metadata(&path)
+        .expect("read kubectl stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("make kubectl stub executable");
+    path
+}
+
+fn stub_path(bin_dir: &Path) -> std::ffi::OsString {
+    let mut paths = vec![bin_dir.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).expect("join stub PATH")
+}
+
+fn run_cluster_deploy_json(
+    all_targets: bool,
+    failure: DeployFixtureFailure,
+    connector_failure: bool,
+) -> Output {
+    let plugin = tempfile::tempdir().expect("plugin tempdir");
+    curie::scaffold::scaffold(plugin.path(), "acme-bundle").expect("scaffold test bundle");
+    fs::write(
+        plugin.path().join("deploy.yaml"),
+        "targets:\n  dev: { agent: acme-dev, env: dev, slack_channel: C0EXAMPLE2 }\n  prod: { agent: acme-prod, env: prod, slack_channel: C0EXAMPLE1 }\n",
+    )
+    .expect("write deploy targets");
+
+    let tools = tempfile::tempdir().expect("tool tempdir");
+    write_kubectl_stub(tools.path());
+    let server = serve(move |req| deploy_api_response(req, failure));
+
+    let mut command = Command::new(bin());
+    command.args([
+        "cluster",
+        "deploy",
+        "--plugin-dir",
+        plugin.path().to_str().expect("plugin path is valid UTF8"),
+        "--api-url",
+        &server.base_url,
+        "--api-key",
+        DEPLOY_API_KEY,
+        "--namespace",
+        "curie",
+        "--release",
+        "curie",
+        "--label",
+        DEPLOY_LABEL,
+    ]);
+    if all_targets {
+        command.arg("--all-targets");
+    } else {
+        command.args(["--target", "dev"]);
+    }
+    command
+        .arg("--json")
+        .env("PATH", stub_path(tools.path()))
+        .env_remove("CURIE_API_URL")
+        .env_remove("CURIE_API_KEY");
+    if connector_failure {
+        command.env("CURIE_TEST_CONNECTOR_FAILURE", "1");
+    } else {
+        command.env_remove("CURIE_TEST_CONNECTOR_FAILURE");
+    }
+    command.output().expect("run cluster deploy JSON contract")
+}
+
+fn one_stdout_object(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "stdout must not be empty");
+    let mut values =
+        serde_json::Deserializer::from_slice(&output.stdout).into_iter::<serde_json::Value>();
+    let first = values
+        .next()
+        .unwrap_or_else(|| panic!("stdout must contain one JSON object: {stdout}"))
+        .unwrap_or_else(|error| panic!("stdout must start with JSON: {error}\n{stdout}"));
+    assert!(
+        first.is_object(),
+        "stdout must contain a JSON object: {stdout}"
+    );
+    assert!(
+        values.next().is_none(),
+        "stdout must contain exactly one JSON object: {stdout}"
+    );
+    first
+}
+
+fn expected_deploy(target: &str) -> serde_json::Value {
+    let (agent, environment, channel) = target_config(target);
+    json!({
+        "plugin": "acme-bundle",
+        "label": DEPLOY_LABEL,
+        "environment": environment,
+        "agent": {"name": agent, "id": format!("agent-{target}")},
+        "version": {"label": DEPLOY_LABEL, "id": format!("version-{target}")},
+        "channel": channel,
+        "bundle": {
+            "ref": format!("bundles/{target}.tar.gz"),
+            "sha256": format!("sha-{target}"),
+            "size_bytes": if target == "dev" { 101 } else { 202 }
+        },
+        "deployment": {
+            "id": format!("deployment-{target}"),
+            "environment": environment,
+            "status": "active"
+        }
+    })
+}
+
+fn assert_failure_keys(value: &serde_json::Value, includes_failed_result: bool) {
+    let object = value.as_object().expect("failure payload is an object");
+    let expected = if includes_failed_result { 6 } else { 5 };
+    assert_eq!(
+        object.len(),
+        expected,
+        "failure keys must stay exact: {value}"
+    );
+    for key in ["failed_target", "stage", "completed", "error", "fix"] {
+        assert!(
+            object.contains_key(key),
+            "failure is missing {key}: {value}"
+        );
+    }
+    assert_eq!(
+        object.contains_key("failed_result"),
+        includes_failed_result,
+        "failed_result presence must match the failure stage: {value}"
+    );
+    assert!(
+        value["fix"].is_null(),
+        "a permanent failure has no retry fix: {value}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_all_targets_emits_one_ordered_complete_object() {
+    let output = run_cluster_deploy_json(true, DeployFixtureFailure::None, false);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "all target deploy must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        one_stdout_object(&output),
+        json!({
+            "results": [
+                {"target": "dev", "result": expected_deploy("dev")},
+                {"target": "prod", "result": expected_deploy("prod")}
+            ]
+        })
+    );
+}
+
+#[test]
+fn cluster_deploy_json_later_failure_names_target_and_completed_results() {
+    let output = run_cluster_deploy_json(true, DeployFixtureFailure::Deploy("prod"), false);
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_failure_keys(&value, false);
+    assert_eq!(value["failed_target"], json!("prod"));
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(
+        value["completed"],
+        json!([{"target": "dev", "result": expected_deploy("dev")}])
+    );
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("deployment prod exploded")),
+        "failure must retain the API error: {value}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_first_failure_has_empty_completed_results() {
+    let output = run_cluster_deploy_json(true, DeployFixtureFailure::Deploy("dev"), false);
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_failure_keys(&value, false);
+    assert_eq!(value["failed_target"], json!("dev"));
+    assert_eq!(value["stage"], json!("deploy"));
+    assert_eq!(value["completed"], json!([]));
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("deployment dev exploded")),
+        "failure must retain the API error: {value}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_connector_sync_failure_carries_failed_result() {
+    let output = run_cluster_deploy_json(true, DeployFixtureFailure::None, true);
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_failure_keys(&value, true);
+    assert_eq!(value["failed_target"], json!("dev"));
+    assert_eq!(value["stage"], json!("connector_sync"));
+    assert_eq!(value["completed"], json!([]));
+    assert_eq!(value["failed_result"], expected_deploy("dev"));
+    assert!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("connector sync exploded")),
+        "failure must retain the connector error: {value}"
+    );
+}
+
+#[test]
+fn cluster_deploy_json_single_target_shape_is_unchanged() {
+    let output = run_cluster_deploy_json(false, DeployFixtureFailure::None, false);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "single target deploy must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(one_stdout_object(&output), expected_deploy("dev"));
 }
