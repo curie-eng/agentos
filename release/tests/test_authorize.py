@@ -292,6 +292,24 @@ class TestRequiredCheckAllowlist:
         ):
             authorize_module.authorize(sha, runs, "main", cwd=git_repo)
 
+    def test_authorize_refuses_a_failed_chart_check_when_every_other_check_passes(
+        self, git_repo
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        chart_check = "Chart (lint + template + kubeconform)"
+        runs = [
+            {
+                "name": name,
+                "conclusion": "failure" if name == chart_check else "success",
+            }
+            for name in authorize_module.REQUIRED_CHECK_NAMES
+        ]
+
+        with pytest.raises(
+            authorize_module.AuthorizationError, match=re.escape(chart_check)
+        ):
+            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+
 
 class TestFetchCheckRuns:
     """`gh api` must be pinned to GET (issue #732, defect 1).
@@ -739,6 +757,7 @@ class TestMainLookupFailures:
 
 
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+HELM_CI_YAML = REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml"
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
 
@@ -772,29 +791,51 @@ def ci_job_check_run_names() -> set[str]:
     return names
 
 
-class TestRequiredNamesMatchCiYaml:
-    """`REQUIRED_CHECK_NAMES` must not drift from ci.yaml's job names (#811).
+def helm_ci_job_check_run_names() -> set[str]:
+    doc = yaml.safe_load(HELM_CI_YAML.read_text())
+    return {job["name"] for job in doc["jobs"].values() if job.get("name")}
 
-    The gate is fail-closed: a required name that no ci.yaml job produces can
+
+class TestRequiredNamesMatchCiWorkflows:
+    """`REQUIRED_CHECK_NAMES` must not drift from CI workflow job names (#811).
+
+    The gate is fail-closed: a required name that no CI workflow job produces can
     never appear among a commit's real check-runs, so it is reported missing on
     every otherwise-legitimate commit and blocks the release. Conversely a
     stale name masks the loss of the check it was meant to assert. This pins the
-    constant as a subset of the concrete check-run names the current ci.yaml
-    actually emits, parsed live (never derived from the constant itself).
+    constant as a subset of the concrete check-run names the current CI workflows
+    actually emit, parsed live (never derived from the constant itself).
 
-    So renaming or splitting a required job in ci.yaml without updating
+    So renaming or splitting a required job in a CI workflow without updating
     `REQUIRED_CHECK_NAMES` fails here (with the drifted names listed), rather
     than silently dropping a release gate.
     """
 
-    def test_every_required_name_is_a_real_ci_yaml_check_run_name(self):
-        ci_names = ci_job_check_run_names()
+    def test_every_required_name_is_a_real_ci_workflow_check_run_name(self):
+        ci_names = ci_job_check_run_names() | helm_ci_job_check_run_names()
         stale = authorize_module.REQUIRED_CHECK_NAMES - ci_names
 
         assert authorize_module.REQUIRED_CHECK_NAMES <= ci_names, (
-            "REQUIRED_CHECK_NAMES has drifted from ci.yaml -- these required "
+            "REQUIRED_CHECK_NAMES has drifted from the CI workflows -- these required "
             f"names match no current job check-run: {sorted(stale)}"
         )
+
+
+class TestHelmCiWorkflowTriggers:
+    """Pin the deliberate push and pull request trigger asymmetry."""
+
+    def test_push_trigger_is_unfiltered_for_releasable_branches(self):
+        doc = yaml.safe_load(HELM_CI_YAML.read_text())
+        triggers = doc[True]
+
+        assert triggers["push"]["branches"] == ["main", "next"]
+        assert "paths" not in triggers["push"]
+        assert "paths-ignore" not in triggers["push"]
+        assert triggers["pull_request"]["branches"] == ["main", "next"]
+        assert triggers["pull_request"]["paths"] == [
+            "charts/curie/**",
+            ".github/workflows/helm-ci.yaml",
+        ]
 
 
 class TestMixedPassFailRequiredCheck:

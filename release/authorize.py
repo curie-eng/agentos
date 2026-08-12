@@ -52,11 +52,13 @@ PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
 # excluded -- they matter, but are not what this gate is asserting about
 # *this* commit's CI.
+# The chart check is included despite living in another workflow because it
+# validates the release chart itself.
 #
-# This list is a plain constant, not derived from ci.yaml at runtime -- the
-# simpler of the two options ADR-0058 left open (issue #733). A renamed or
-# removed ci.yaml job needs a matching edit here; there is no drift check
-# tying the two together yet.
+# This list is a plain constant, not derived from ci.yaml or helm-ci.yaml at
+# runtime. It is the simpler of the two options ADR-0058 left open (issue
+# #733). Tests pin its required names to jobs in both workflows, so a job
+# rename or removal requires a matching edit here.
 REQUIRED_CHECK_NAMES = frozenset(
     {
         "Python (ruff + mypy + pytest)",
@@ -74,6 +76,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",
+        "Chart (lint + template + kubeconform)",
     }
 )
 

@@ -5,11 +5,10 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
+  # Push runs for every releasable commit because release authorization
+  # requires this check. Pull requests remain filtered to chart changes.
   push:
     branches: [main, next]
-    paths:
-      - "charts/curie/**"
-      - ".github/workflows/helm-ci.yaml"
   pull_request:
     branches: [main, next]
     paths:
