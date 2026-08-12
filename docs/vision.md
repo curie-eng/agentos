@@ -79,6 +79,9 @@ Six commitments that should hold across every feature we build:
   human at a prompt. Commands are structured, non-interactive, idempotent, and
   self-describing, and the harness tells the agent exactly how to use it, so a
   coding agent can drive the whole loop and a human rarely needs to.
+  The guided walkthrough, invoked by `curie` with no arguments, is a committed
+  surface beside the agent facing CLI, so developer cold start work is on
+  strategy.
 
 ## What it could become
 
