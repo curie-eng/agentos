@@ -62,9 +62,9 @@ down` (add `-v` to wipe volumes). If you brought it up, you own tearing it
 down. AGENTS.md documents the per-service host ports and the load-bearing
 gotchas.
 
-Do stack testing from a git worktree cut from `origin/main`, not the main
-checkout. Read-only runs against the current tree are fine; the moment you need
-to change code, cut a worktree.
+Do stack testing from a git worktree cut from the release train base, not the
+main checkout. Read only runs against the current tree are fine; the moment you
+need to change code, cut a worktree.
 
 ## Running the checks
 
@@ -157,10 +157,44 @@ observability, convergence, protection, or parity.
   the why; the how lives in the PR.
 - When in doubt, write the issue.
 
-## Branch, commit, and PR conventions
+## Release train, branch, commit, and PR conventions
 
-- **Branch per change**, cut from the latest `origin/main`, named
-  `task/<short-description>`. Keep the slug terse. Never commit to `main`.
+`main` is the stable v0.6.x line. `next` integrates v0.7.0 work. It is one
+time bounded release train, not a permanently divergent branch.
+
+| Change | Worktree base and PR target |
+| --- | --- |
+| General bug fix, security fix, or shared change | `main` |
+| v0.7 feature or a bug unique to unreleased v0.7 work | `next` |
+
+Create each `task/<short-description>` branch from the selected latest base:
+
+```bash
+git fetch origin <base>
+git worktree add <path> -b task/<short-description> "$(git rev-parse origin/<base>)"
+```
+
+Never commit directly to `main` or `next`. `main` stays the default contributor
+target. Choose `next` only for v0.7 work. After a fix merges to `main`, merge
+`main` forward into `next` through a follow up PR. Do not routinely cherry pick
+between the two branches. An administrator must protect both branches with the
+same pull request review and required check rules, and prohibit force pushes and
+branch deletion. Do not use an unprotected release train branch.
+
+When v0.7 is ready, merge `next` into `main`, then run every parity ladder rung
+on the resulting `main` commit:
+
+```bash
+CURIE_E2E_TIERS=all curie dev e2e-ladder
+CURIE_E2E_TIERS=local-release curie dev e2e-ladder
+```
+
+Tag v0.7.0 from `main` only after both commands pass, then delete `next` or
+recreate it from `main` for the next approved feature train. Only an
+administrator may retire `next`, by temporarily removing protection after the
+tag while `main` remains protected. If `next` is recreated, restore its full
+protection before accepting PRs against it.
+
 - **Commit messages**: a short imperative summary line, then detail bullets.
 - **Reference the issue in the PR body** with `Closes #123` (or `Ref #123`). Do
   not put the issue number in the PR or commit title; use a plain descriptive
@@ -168,8 +202,8 @@ observability, convergence, protection, or parity.
 - **No dashes or emdashes in prose; no emojis** in code or docs.
 - **Never mention any AI assistant** (or AI in general) in commit messages, and
   never add `Co-Authored-By` lines referencing an AI.
-- Open a PR against `main`. Keep the change focused; a PR that touches unrelated
-  areas is harder to review and to revert.
+- Open the PR against its selected release train base. Keep the change focused;
+  a PR that touches unrelated areas is harder to review and to revert.
 
 ## Certifying your contribution
 

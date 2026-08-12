@@ -238,9 +238,15 @@ selects rungs; `local-release` is NOT folded into `all` since it needs those
 extra images built first, so name it explicitly (e.g.
 `skill,local,local-release`). `CURIE_E2E_LIVE` (default fake, `1` for live)
 governs every named rung, including rung 1 -- `e2e.sh` reads the same env var
-directly rather than being told by the ladder. One-command pre-release gate:
+directly rather than being told by the ladder. The standard pre release gate is:
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
+```
+
+A release candidate also runs the separately named release compose rung:
+
+```bash
+CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
 Falsifiability gate (issue #619) -- a gate, NOT an E2E test: it never runs a real

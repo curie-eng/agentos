@@ -163,10 +163,10 @@ stack up owns tearing it down — a blocked or crashed test agent never cleans u
 after itself, so do not assume someone else will.
 
 **Do stack testing from a worktree, not the main checkout.** If a local test
-requires code edits, make them in a git worktree cut from `origin/main` and land
-them as a PR — never edit `main` in place to make a local run work. Read-only
-runs against the current tree are fine; the moment you need to change code, cut a
-worktree.
+requires code edits, make them in a git worktree cut from the release train base
+selected below and land them as a PR. Never edit `main` or `next` in place to
+make a local run work. Read only runs against the current tree are fine; the
+moment you need to change code, cut a worktree.
 
 Add `--profile slack` through `curie local up --slack` to start the optional dispatcher for real Slack.
 
@@ -432,10 +432,47 @@ satisfy a runtime AC. See
 [`charts/curie/CLAUDE.md`](charts/curie/CLAUDE.md) for the install and probe
 commands.
 
-## Branch and commit conventions
+## Release train, branch, and commit conventions
 
-- Branch per change: `task/<short-description>`, cut from the latest
-  `origin/main`. Never commit to `main`.
+`main` is the stable v0.6.x line. `next` is the v0.7.0 integration branch. It
+is one release train, not a second product line.
+
+| Change | Worktree base and PR target |
+| --- | --- |
+| General bug fix, security fix, or change shared by both lines | `main` |
+| v0.7 feature or a bug unique to unreleased v0.7 work | `next` |
+
+Create a short lived `task/<short-description>` branch from the selected base:
+
+```bash
+git fetch origin <base>
+git worktree add <path> -b task/<short-description> "$(git rev-parse origin/<base>)"
+```
+
+Never commit directly to `main` or `next`. `main` remains the default GitHub
+contributor target. Select `next` only for v0.7 work.
+
+Before accepting PRs against either branch, an administrator must protect both
+`main` and `next` with the same pull request review and required check rules,
+and must prohibit force pushes and branch deletion. Do not use an unprotected
+release train branch.
+
+After a fix merges to `main`, merge `main` forward into `next` promptly through
+a PR. Do not routinely cherry pick fixes between release lines. When v0.7 is
+ready, merge `next` into `main`, then run every parity ladder rung on the
+resulting `main` commit:
+
+```bash
+CURIE_E2E_TIERS=all curie dev e2e-ladder
+CURIE_E2E_TIERS=local-release curie dev e2e-ladder
+```
+
+Tag v0.7.0 from `main` only after both commands pass, then delete `next` or
+recreate it from `main` for the next approved feature train. Only an
+administrator may retire `next`, by temporarily removing protection after the
+tag while `main` remains protected. If `next` is recreated, restore its full
+protection before accepting PRs against it.
+
 - Commit message format: a short imperative summary line, then detail bullets.
 - Reference the relevant issue in the PR body (e.g. `Closes #123`).
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
@@ -443,7 +480,7 @@ commands.
   CI enforces this on every PR (issue #962); check before pushing with:
 
   ```bash
-  scripts/check-commit-messages.sh            # defaults to origin/main..HEAD
+  scripts/check-commit-messages.sh origin/<base>..HEAD
   scripts/check-commit-messages.sh --self-test
   ```
 
