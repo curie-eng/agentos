@@ -587,18 +587,37 @@ def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
     # call a connector that holds a production credential and authenticates
     # nobody -- because the sandbox has no credential to authenticate WITH, so
     # the network is the entire access control.
-    np = _ingress_np(_objs())
+    np = _ingress_np(
+        r.render(
+            "release-r",
+            "agent-a",
+            "namespace-n",
+            "app-name",
+            "connector-c",
+            HOSTED,
+            "connector-secret",
+        )
+    )
     src = np["spec"]["ingress"][0]["from"]
     assert len(src) == 1, "exactly one source: the sandbox"
-    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("acme-bot", "acme-bot")
+    assert src[0]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "app-name",
+        "app.kubernetes.io/instance": "release-r",
+        "app.kubernetes.io/component": "runner-sandbox",
+    }
+    assert set(src[0]) == {"podSelector"}
+    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("release-r", "app-name")
 
 
 def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
     # Getting this backwards yields a policy that parses, applies, and protects
     # the wrong pod -- the sandbox gains an ingress restriction it does not need
     # while the connector keeps none.
-    ing = _ingress_np(_objs())
-    egr = _egress_np(_objs())
+    objs = r.render(
+        "release-r", "agent-a", "namespace-n", "app-name", "connector-c", HOSTED, "connector-secret"
+    )
+    ing = _ingress_np(objs)
+    egr = _egress_np(objs)
     # The two policies must select OPPOSITE ends of the same hop: egress is
     # attached to the sandbox, ingress to the connector. Swapping them still
     # parses and still applies -- it just protects the wrong pod.
@@ -611,6 +630,10 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
         egr["spec"]["podSelector"]["matchLabels"]
         == ing["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
     ), "ingress must admit the pod the egress rule is attached to"
+    dep = next(o for o in objs if o["kind"] == "Deployment")
+    assert ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"][
+        "labels"
+    ]
 
 
 def test_ingress_is_port_scoped_to_the_connector_port() -> None:
