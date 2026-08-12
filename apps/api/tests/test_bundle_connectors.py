@@ -57,8 +57,17 @@ def test_bundle_without_connectors_renders_nothing(tmp_path: Path) -> None:
 
 
 def test_hosted_connector_renders_the_full_object_set(tmp_path: Path) -> None:
-    kinds = [o["kind"] for o in _render(_bundle(tmp_path, HOSTED))]
-    assert kinds == ["Service", "Deployment", "NetworkPolicy"]
+    objs = _render(_bundle(tmp_path, HOSTED))
+    kinds = [o["kind"] for o in objs]
+    # TWO NetworkPolicies, and asserting the count alone would not say why:
+    # egress attached to the sandbox (where it may go) and ingress attached to
+    # the connector (who may arrive). The connector is unauthenticated by
+    # design -- the sandbox has no credential to authenticate with -- so
+    # without the ingress half every pod in the namespace can reach something
+    # holding a production credential.
+    assert kinds == ["Service", "Deployment", "NetworkPolicy", "NetworkPolicy"]
+    directions = sorted(p["spec"]["policyTypes"][0] for p in objs if p["kind"] == "NetworkPolicy")
+    assert directions == ["Egress", "Ingress"]
 
 
 def test_rendering_needs_no_cluster_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,11 +97,29 @@ def test_secret_is_referenced_not_inlined(tmp_path: Path) -> None:
     assert "value" not in token
 
 
+def _policy(objs: list[dict], direction: str) -> dict:
+    # Selecting "the NetworkPolicy" by kind picks whichever sorts first now that
+    # two ship, so a rename or a reorder would silently test the wrong object.
+    return next(
+        o for o in objs if o["kind"] == "NetworkPolicy" and o["spec"]["policyTypes"] == [direction]
+    )
+
+
 def test_egress_policy_uses_a_podselector(tmp_path: Path) -> None:
     # The ClusterIP form silently never matches; see connector_render's module
     # docstring. Pinned here too because this is the path a real deploy takes.
-    np = next(o for o in _render(_bundle(tmp_path, HOSTED)) if o["kind"] == "NetworkPolicy")
+    np = _policy(_render(_bundle(tmp_path, HOSTED)), "Egress")
     assert "podSelector" in np["spec"]["egress"][0]["to"][0]
+
+
+def test_ingress_policy_admits_only_the_sandbox(tmp_path: Path) -> None:
+    # Same ClusterIP trap on the way in, and the same reason it matters: this is
+    # the path a real deploy takes, so a rule that parses but never matches
+    # would leave the connector open while looking closed.
+    np = _policy(_render(_bundle(tmp_path, HOSTED)), "Ingress")
+    src = np["spec"]["ingress"][0]["from"]
+    assert len(src) == 1
+    assert "podSelector" in src[0] and "ipBlock" not in src[0]
 
 
 def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:

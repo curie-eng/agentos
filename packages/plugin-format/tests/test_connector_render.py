@@ -29,6 +29,21 @@ def _objs(release: str = "acme-bot", app: str = "acme-bot") -> list[dict]:
     return r.render(release, "acme-bot", "acme-bot", app, "grafana", HOSTED, "conn-secrets")
 
 
+# Two NetworkPolicies ship per connector now, so selecting "the NetworkPolicy"
+# by kind picks whichever happens to be first and silently tests the wrong
+# object. Select by direction.
+def _egress_np(objs: list) -> dict:
+    return next(
+        o for o in objs if o["kind"] == "NetworkPolicy" and o["spec"]["policyTypes"] == ["Egress"]
+    )
+
+
+def _ingress_np(objs: list) -> dict:
+    return next(
+        o for o in objs if o["kind"] == "NetworkPolicy" and o["spec"]["policyTypes"] == ["Ingress"]
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The ClusterIP trap -- the defect this renderer exists to prevent
 # --------------------------------------------------------------------------- #
@@ -38,7 +53,7 @@ def test_egress_rule_uses_a_podselector_never_an_ipblock() -> None:
     # symptom is a bare connection refused, and on a CNI that ignores
     # NetworkPolicy (minikube's default) the broken rule looks identical to a
     # correct one -- so it survives local testing and fails in a real cluster.
-    np = next(o for o in _objs() if o["kind"] == "NetworkPolicy")
+    np = _egress_np(_objs())
     to = np["spec"]["egress"][0]["to"][0]
     assert "podSelector" in to
     assert "ipBlock" not in to
@@ -49,11 +64,7 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
     # cannot narrow -- ADR-0067) so the sandbox still cannot reach the
     # connector. Too broad -- e.g. only `component` -- and it also grants egress
     # to every OTHER release's sandboxes in the namespace. Both fail silently.
-    np = next(
-        o
-        for o in r.render("relA", "a", "ns", "acme-bot", "g", HOSTED, "s")
-        if o["kind"] == "NetworkPolicy"
-    )
+    np = _egress_np(r.render("relA", "a", "ns", "acme-bot", "g", HOSTED, "s"))
     assert np["spec"]["podSelector"]["matchLabels"] == {
         "app.kubernetes.io/name": "acme-bot",
         "app.kubernetes.io/instance": "relA",
@@ -62,16 +73,8 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
 
 
 def test_two_releases_do_not_select_each_others_sandboxes() -> None:
-    a = next(
-        o
-        for o in r.render("relA", "a", "ns", "app", "g", HOSTED, "s")
-        if o["kind"] == "NetworkPolicy"
-    )
-    b = next(
-        o
-        for o in r.render("relB", "a", "ns", "app", "g", HOSTED, "s")
-        if o["kind"] == "NetworkPolicy"
-    )
+    a = _egress_np(r.render("relA", "a", "ns", "app", "g", HOSTED, "s"))
+    b = _egress_np(r.render("relB", "a", "ns", "app", "g", HOSTED, "s"))
     assert a["spec"]["podSelector"] != b["spec"]["podSelector"]
 
 
@@ -543,16 +546,23 @@ def test_every_rendered_volume_key_is_one_resolved_secrets_claims() -> None:
 @pytest.mark.parametrize(
     "data,code",
     [
-        ({"image": "x:1", "secret_files": {"A": "secrets/x"}},
-         "connectors.secret_file_relative_path"),
-        ({"image": "x:1", "secret_files": {"A": "/tmp/x"}},
-         "connectors.secret_file_in_tmp"),
-        ({"image": "x:1", "secret_files": {"A": "/s/x", "B": "/s/x"}},
-         "connectors.secret_file_path_collision"),
-        ({"image": "x:1", "secrets": ["A"], "secret_files": {"A": "/s/x"}},
-         "connectors.secret_both_env_and_file"),
-        ({"url": "https://m/mcp", "secret_files": {"A": "/s/x"}},
-         "connectors.remote_has_secret_files"),
+        (
+            {"image": "x:1", "secret_files": {"A": "secrets/x"}},
+            "connectors.secret_file_relative_path",
+        ),
+        ({"image": "x:1", "secret_files": {"A": "/tmp/x"}}, "connectors.secret_file_in_tmp"),
+        (
+            {"image": "x:1", "secret_files": {"A": "/s/x", "B": "/s/x"}},
+            "connectors.secret_file_path_collision",
+        ),
+        (
+            {"image": "x:1", "secrets": ["A"], "secret_files": {"A": "/s/x"}},
+            "connectors.secret_both_env_and_file",
+        ),
+        (
+            {"url": "https://m/mcp", "secret_files": {"A": "/s/x"}},
+            "connectors.remote_has_secret_files",
+        ),
     ],
 )
 def test_secret_file_misuse_is_refused(data: dict, code: str) -> None:
@@ -566,3 +576,68 @@ def test_a_well_formed_secret_file_validates() -> None:
     )
     assert errors == []
     assert parsed is not None
+
+
+# --------------------------------------------------------------------------- #
+# Ingress: who may REACH the connector
+# --------------------------------------------------------------------------- #
+def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
+    # The egress policy governs where the sandbox may go; it places no limit on
+    # who may arrive. Without an ingress rule every pod in the namespace can
+    # call a connector that holds a production credential and authenticates
+    # nobody -- because the sandbox has no credential to authenticate WITH, so
+    # the network is the entire access control.
+    np = _ingress_np(_objs())
+    src = np["spec"]["ingress"][0]["from"]
+    assert len(src) == 1, "exactly one source: the sandbox"
+    assert src[0]["podSelector"]["matchLabels"] == r.sandbox_selector("acme-bot", "acme-bot")
+
+
+def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
+    # Getting this backwards yields a policy that parses, applies, and protects
+    # the wrong pod -- the sandbox gains an ingress restriction it does not need
+    # while the connector keeps none.
+    ing = _ingress_np(_objs())
+    egr = _egress_np(_objs())
+    # The two policies must select OPPOSITE ends of the same hop: egress is
+    # attached to the sandbox, ingress to the connector. Swapping them still
+    # parses and still applies -- it just protects the wrong pod.
+    assert ing["spec"]["podSelector"] != egr["spec"]["podSelector"]
+    assert (
+        ing["spec"]["podSelector"]["matchLabels"]
+        == egr["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]
+    ), "ingress must select the pod the egress rule points AT"
+    assert (
+        egr["spec"]["podSelector"]["matchLabels"]
+        == ing["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+    ), "ingress must admit the pod the egress rule is attached to"
+
+
+def test_ingress_is_port_scoped_to_the_connector_port() -> None:
+    ports = _ingress_np(_objs())["spec"]["ingress"][0]["ports"]
+    assert ports == [{"protocol": "TCP", "port": HOSTED.port}]
+
+
+def test_ingress_uses_a_podselector_never_an_ipblock() -> None:
+    # Same trap as the egress rule: a ClusterIP ipBlock can never match, and it
+    # looks correct on a CNI that ignores NetworkPolicy.
+    src = _ingress_np(_objs())["spec"]["ingress"][0]["from"][0]
+    assert "podSelector" in src and "ipBlock" not in src
+
+
+def test_two_releases_do_not_admit_each_others_sandboxes() -> None:
+    # A too-broad source selector would let another release's sandbox read
+    # production through this connector, silently.
+    a = _ingress_np(r.render("relA", "a", "ns", "app", "g", HOSTED, "s"))
+    b = _ingress_np(r.render("relB", "a", "ns", "app", "g", HOSTED, "s"))
+    assert a["spec"]["ingress"][0]["from"] != b["spec"]["ingress"][0]["from"]
+
+
+def test_the_two_policies_do_not_collide_on_name() -> None:
+    names = [o["metadata"]["name"] for o in _objs() if o["kind"] == "NetworkPolicy"]
+    assert len(names) == len(set(names)) == 2
+
+
+def test_a_remote_connector_renders_no_policies() -> None:
+    # Nothing is hosted, so there is nothing in-cluster to admit traffic to.
+    assert not [o for o in r.render("rel", "a", "ns", "app", "x", REMOTE, "s")]
