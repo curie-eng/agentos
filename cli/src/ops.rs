@@ -1258,7 +1258,7 @@ pub fn helm_keeps(resource: &serde_json::Value) -> bool {
         .and_then(|m| m.get("annotations"))
         .and_then(|a| a.get("helm.sh/resource-policy"))
         .and_then(|p| p.as_str())
-        .map(|p| p.trim().eq_ignore_ascii_case("keep"))
+        .map(|p| p == "keep")
         .unwrap_or(false)
 }
 
@@ -1827,13 +1827,19 @@ data:
         assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 
+    /// Helm upgrade honors only the exact lowercase `keep` value.
     #[test]
-    fn a_resource_helm_is_told_to_keep_is_not_at_risk() {
-        for value in ["keep", "Keep", " keep "] {
+    fn helm_upgrade_exact_keep_annotation_is_not_at_risk() {
+        let kept = serde_json::json!({
+            "metadata": {"annotations": {"helm.sh/resource-policy": "keep"}}
+        });
+        assert!(helm_keeps(&kept), "exact lowercase keep must be accepted");
+
+        for value in ["Keep", "KEEP", " keep "] {
             let kept = serde_json::json!({
                 "metadata": {"annotations": {"helm.sh/resource-policy": value}}
             });
-            assert!(helm_keeps(&kept), "{value:?} must read as keep");
+            assert!(!helm_keeps(&kept), "{value:?} must not read as exact keep");
         }
     }
 
