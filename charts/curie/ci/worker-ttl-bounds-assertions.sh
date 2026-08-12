@@ -57,7 +57,7 @@
 # JSON-Schema validator, whose wording changed between the CI-pinned helm and
 # current helm while the pass/fail outcomes stayed identical:
 #
-#   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:41):
+#   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:40):
 #     - worker.routeTtlSeconds: Must be greater than 0
 #     - worker.routeTtlSeconds: Invalid type. Expected: integer, given: string
 #   helm 3.20.0:
