@@ -106,7 +106,7 @@ PROTECTED_STEPS = frozenset(
         (
             "release.yaml",
             "authorize-release",
-            "Tag's commit must be reviewed, on main, and fully checked",
+            "Tag's commit must be reviewed, on an allowed branch, and fully checked",
         ),
         ("release.yaml", "release", "Gate the asset set and build the checksum manifest"),
         ("release.yaml", "release", "Refuse to re-release an already-published tag"),
