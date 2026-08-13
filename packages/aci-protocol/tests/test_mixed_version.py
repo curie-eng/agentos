@@ -76,7 +76,7 @@ def test_the_0_2_9_model_parses_a_0_3_0_payload_and_loses_the_kind() -> None:
     new_payload = json.loads(
         ReplyHandle(
             kind="email",
-            channel="sandbox.theconnman@agentmail.to",
+            channel="agent@example.test",
             placeholder="msg_abc123",
             endpoint="http://curie-mail-adapter:8080/",
             adapter="agentmail-sandbox",
@@ -89,7 +89,7 @@ def test_the_0_2_9_model_parses_a_0_3_0_payload_and_loses_the_kind() -> None:
     # (a) It parsed. No exception, no warning, no version gate -- `QueuedTurn`
     # has no `version` field at all (`ndjson.py:109-118`), which is why FU-7
     # exists and why this cutover is quiescent.
-    assert old.channel == "sandbox.theconnman@agentmail.to"
+    assert old.channel == "agent@example.test"
 
     # (b) And the routing half is simply gone.
     assert not hasattr(old, "kind")

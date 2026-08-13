@@ -16,13 +16,18 @@ base_url=<whatever the turn named>)``, so a turn carrying an attacker's endpoint
 captured the platform bot token. An endpoint whose origin differs from
 ``slack_api_base_url`` (or from real Slack when that is unset) is now refused
 with ``UntrustedSlackEndpointError`` before any request leaves the process.
+
+The dev/CLI stub, whose host and port the single ``slack_api_base_url`` cannot
+also name, is admitted by an EXPLICITLY CONFIGURED operator override
+(``CURIE_SLACK_TRUSTED_ORIGINS``), never by a wire-supplied origin: config the
+operator typed is trusted, a URL a turn carried is not.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urlsplit
 
@@ -77,6 +82,34 @@ def _origin(url: str) -> tuple[str, str, int]:
     return scheme, (parts.hostname or "").lower(), port
 
 
+def _split_trusted(
+    origins: Sequence[str],
+) -> tuple[frozenset[tuple[str, str, int]], frozenset[tuple[str, str]]]:
+    """Split configured dev origins into exact ones and any-port ones.
+
+    An entry that names a PORT is matched exactly. An entry that omits the port
+    (``http://host.docker.internal``) trusts any port on that scheme+host: the
+    CLI's stub binds an EPHEMERAL port on `curie chat` and on
+    ``cluster message --listen-port 0``, so there is no port an operator could
+    write down in advance. It is a dev affordance and nothing else -- it widens
+    trust to every port on a named host, so it belongs on a loopback or
+    docker-host name, never in production.
+    """
+    exact: set[tuple[str, str, int]] = set()
+    any_port: set[tuple[str, str]] = set()
+    for raw in origins:
+        if not raw:
+            continue
+        parts = urlsplit(raw)
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        if parts.port is None:
+            any_port.add((scheme, host))
+        else:
+            exact.add((scheme, host, parts.port))
+    return frozenset(exact), frozenset(any_port)
+
+
 def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     """The wire affordance in the renderer's own vocabulary.
 
@@ -115,12 +148,32 @@ class SlackReplyAdapter:
     client construction.
     """
 
-    def __init__(self, token: str, *, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str | None = None,
+        trusted_origins: Sequence[str] = (),
+    ) -> None:
         self._token = token
         # Normalize "" to None so the default and an explicit-empty override map to
         # the same (real-Slack) client.
         self._default_base_url = base_url or None
-        self._trusted_origin = _origin(self._default_base_url or REAL_SLACK_BASE_URL)
+        # The configured Slack origin is always trusted. ``trusted_origins`` adds
+        # the OPERATOR-CONFIGURED dev origins (``CURIE_SLACK_TRUSTED_ORIGINS``):
+        # the CLI's throwaway stub is reached on a host and port the worker's
+        # single ``slack_api_base_url`` cannot also name (``local message``
+        # advertises ``host.docker.internal``, ``cluster message`` a routable
+        # host), so without this the dev/CLI loop is refused. It is a WORKER
+        # CONFIG value and never wire-supplied, which is the whole distinction
+        # D4.4 rests on: an origin an operator typed, not one a turn named.
+        # The configured default is ALWAYS matched exactly, port included: it is
+        # a full base URL, and reading it as "any port on slack.com" would widen
+        # the production origin.
+        extra_exact, self._trusted_any_port = _split_trusted(trusted_origins)
+        self._trusted_origins = frozenset(
+            {_origin(self._default_base_url or REAL_SLACK_BASE_URL)} | extra_exact
+        )
         self._clients: dict[str | None, AsyncWebClient] = {}
 
     async def emit(
@@ -179,6 +232,14 @@ class SlackReplyAdapter:
             return ReplyAck(ref=None)
         raise AssertionError(f"unmodelled reply event {event!r}")
 
+    def _is_trusted(self, endpoint: str) -> bool:
+        """Is this endpoint's ORIGIN one the operator configured as trusted?"""
+        scheme, host, port = _origin(endpoint)
+        return (scheme, host, port) in self._trusted_origins or (
+            scheme,
+            host,
+        ) in self._trusted_any_port
+
     def _client_for(self, endpoint: str | None) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.
 
@@ -191,11 +252,12 @@ class SlackReplyAdapter:
         before the transport fallback, before any retry, and before any request
         leaves the process with the platform bot token attached (D4.4).
         """
-        if endpoint and _origin(endpoint) != self._trusted_origin:
+        if endpoint and not self._is_trusted(endpoint):
             raise UntrustedSlackEndpointError(
                 f"refusing to send the Slack bot token to {endpoint!r}: its origin is "
-                f"not the configured Slack origin "
-                f"{self._default_base_url or REAL_SLACK_BASE_URL!r}"
+                f"neither the configured Slack origin "
+                f"{self._default_base_url or REAL_SLACK_BASE_URL!r} nor a configured "
+                "trusted dev origin (CURIE_SLACK_TRUSTED_ORIGINS)"
             )
         base_url = endpoint or self._default_base_url
         client = self._clients.get(base_url)

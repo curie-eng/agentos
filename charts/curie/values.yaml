@@ -838,6 +838,20 @@ worker:
   # --reuse-values` that sets the dispatcher tokens) clears it back to empty in
   # the same command, so that upgrade un-wires any stub routing.
   slackApiBaseUrl: ""
+  # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+  # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
+  # production posture: the configured Slack origin (slackApiBaseUrl, or real
+  # Slack) is the only endpoint the worker will send the bot token to, and every
+  # cross-origin endpoint a turn names is refused before any request.
+  #
+  # DEV ONLY. It exists for `curie cluster message`, whose throwaway stub binds a
+  # host and port the single slackApiBaseUrl cannot also name -- and, with
+  # `--listen-port 0`, an EPHEMERAL port. An entry that omits the port
+  # (http://host.docker.internal) therefore trusts ANY port on that host, so
+  # setting one on a real deployment widens where the platform bot token can go.
+  # A LAN-host dev setup (`--listen-host <ip>`) must name that host here itself.
+  # Rendered only when non-empty.
+  slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
   # shared secret. The slug is the operator-chosen `adapter` on the agent's
   # channel binding row; the worker presents the matching secret as the

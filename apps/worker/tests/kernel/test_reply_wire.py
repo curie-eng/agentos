@@ -43,7 +43,7 @@ DONE = SessionStatus.DONE
 
 ADAPTER = "agentmail-sandbox"
 SECRET = "secret-for-agentmail-sandbox"
-EMAIL_ADDRESS = "sandbox.theconnman@agentmail.to"
+EMAIL_ADDRESS = "agent@example.test"
 
 
 # --- doubles ------------------------------------------------------------------
@@ -426,6 +426,15 @@ def test_the_already_done_skip_makes_no_sink_call(make_harness) -> None:
     # T-B15(a). The skip at kernel.py:372-374 returns before anything else. With
     # no pending completion record it has nothing to hand off, so it emits
     # nothing at all -- it never had a resolved route and must not invent one.
+    #
+    # This is the HALF of T-B15 that stays silent, and the distinction is not
+    # "pre-resolution paths are silent": the side-effect escalate below is also
+    # pre-resolution and DOES emit. The line is whether the path reaches a NEW
+    # terminal outcome. The escalate does (it marks done here, now), so it owes
+    # both the message and the completion. The already-done skip does not -- the
+    # outcome was reached by an earlier delivery, which already emitted or left a
+    # record for the sweeper, so emitting here would be a duplicate this kernel
+    # invented rather than one the outbox owed.
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
@@ -481,7 +490,18 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
     # revision 3's shape suppressed it. It runs BEFORE binding resolution, so its
     # route comes from the server-minted ``reply_handle`` (EB-B6's trust
     # argument: after phase 2 no adapter writes to the stream at all).
-    # Mutation: make this path silent and it fails.
+    #
+    # Driver adjudication (supersedes AC10f's original "suppresses turn.completed"
+    # wording): this path calls ``mark_done`` at kernel.py:389, so it IS a durable
+    # terminal outcome and owes a completion. Emitting the escalation text without
+    # it is only correct for an edit-in-place channel like Slack; a BUFFERED
+    # adapter -- email being the whole reason this phase exists -- accumulates the
+    # reply and sends on ``turn.completed``, so a suppressed completion means the
+    # escalation is written, marked done, and never delivered. That is strictly
+    # worse than the duplicate the suppression was avoiding, and it fails silently
+    # on exactly the channel with no human watching a thread.
+    # Mutation: make this path silent, OR emit the text without the completion,
+    # and it fails.
     async def go() -> None:
         binding = StubBinding({("email", EMAIL_ADDRESS): _resolved()})
         async with make_harness(binding=binding, shimmer=False) as h:
@@ -507,10 +527,33 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
             assert route.adapter == ADAPTER
             # No binding lookup happened: the resolver was never reached.
             assert binding.resolve_calls == []
-            # Only ``turn.completed`` is suppressed here: this path holds no
-            # resolved route to write a completion record against.
-            assert h.sink.completions == []
+
+            # EXACTLY ONE completion, so a buffered adapter flushes the
+            # escalation instead of holding it forever. One, not "at least one":
+            # this path runs before the retry loop, so a second completion here
+            # would be a duplicate the kernel manufactured rather than one the
+            # at-least-once outbox is entitled to.
+            assert len(h.sink.completions) == 1
+            completed = h.sink.completions[0]
+            assert completed.event_id == ev.event_id
+            # ``TurnCompleted.outcome`` is where escalation is reported on this
+            # wire (reply.py:131-133's Literal). ``SettledOutcome`` is the
+            # approval-card shape carried on ``reply.update`` and has no role
+            # here -- nothing was decided, the turn escalated.
+            assert completed.outcome == "escalated"
+            assert completed.target.address == EMAIL_ADDRESS
+            # Same reply_handle-derived route as the escalation text: a
+            # completion delivered to a different transport than the message it
+            # completes would flush a buffer that never received the text.
+            assert h.sink.routes_for("turn.completed") == [route]
+
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+            # The outbox record was cleared, which only happens after a CONFIRMED
+            # emit (EB-B6 step 4) -- the completion really was delivered, not just
+            # queued.
+            assert (
+                await h.async_redis.smembers(h.config.completions_pending_key()) == set()
+            )
 
     asyncio.run(go())
 

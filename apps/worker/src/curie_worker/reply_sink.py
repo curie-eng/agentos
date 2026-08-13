@@ -54,6 +54,17 @@ class MissingAdapterCredentialError(RuntimeError):
     """Platform egress had no credential (or no target) and sent nothing."""
 
 
+class RedirectedAdapterEndpointError(RuntimeError):
+    """The adapter endpoint answered with a redirect, which is NOT followed.
+
+    Following it would re-send the request -- and the per-adapter egress secret
+    in ``X-Curie-Adapter-Secret`` -- to whatever origin the redirect named, so a
+    compromised or misconfigured adapter could bounce the platform's credential
+    anywhere. A redirect is therefore a delivery FAILURE, loud like any other
+    rejected response, never a hop.
+    """
+
+
 class TargetRoute(BaseModel):
     """Where this turn's replies are delivered, and under whose credential.
 
@@ -131,7 +142,19 @@ class HttpReplyAdapter:
         headers = {"Content-Type": "application/json", ADAPTER_SECRET_HEADER: secret}
         try:
             async with aiohttp.ClientSession(timeout=self._timeout) as session:
-                async with session.post(endpoint, data=body, headers=headers) as response:
+                # ``allow_redirects=False``: aiohttp's default replays the request,
+                # secret header and all, at the Location the ENDPOINT chose, so a
+                # redirecting adapter would be a cross-origin credential-exfil
+                # primitive. Refuse the redirect instead of following it.
+                async with session.post(
+                    endpoint, data=body, headers=headers, allow_redirects=False
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise RedirectedAdapterEndpointError(
+                            f"adapter endpoint {endpoint!r} answered "
+                            f"{response.status} (redirect); refusing to re-send the "
+                            "egress credential to the redirect target"
+                        )
                     response.raise_for_status()
                     payload = await response.text()
         except _UNREACHABLE_ERRORS as exc:
@@ -189,7 +212,9 @@ def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:
     return ReplySinkRouter(
         adapters={
             SLACK_KIND: SlackReplyAdapter(
-                config.slack_bot_token, base_url=config.slack_api_base_url or None
+                config.slack_bot_token,
+                base_url=config.slack_api_base_url or None,
+                trusted_origins=config.slack_trusted_origins,
             )
         },
         default=HttpReplyAdapter(config.adapter_credentials),

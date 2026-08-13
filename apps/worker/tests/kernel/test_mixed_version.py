@@ -53,7 +53,7 @@ def _qevent(*, thread: str, event_id: str) -> QueuedTurn:
         text="hi",
         reply_handle=ReplyHandle(
             kind="email",
-            channel="sandbox.theconnman@agentmail.to",
+            channel="agent@example.test",
             placeholder="msg_upstream",
             endpoint="https://adapter.example/hook",
             adapter="agentmail-sandbox",

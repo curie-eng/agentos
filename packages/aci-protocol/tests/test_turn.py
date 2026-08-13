@@ -155,7 +155,7 @@ def test_adapter_is_optional_and_round_trips_when_a_producer_sets_it() -> None:
 
     routed = ReplyHandle(
         kind="email",
-        channel="sandbox.theconnman@agentmail.to",
+        channel="agent@example.test",
         placeholder="msg_abc123",
         endpoint="http://curie-mail-adapter:8080/",
         adapter="agentmail-sandbox",

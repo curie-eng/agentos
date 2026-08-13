@@ -144,6 +144,16 @@ RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
 
+# The channel kind a POLICY-ROUTED approval card posts to (#247). The one place
+# the kernel names a kind, and it is a fact about the route binding rather than a
+# branch on the turn: ``ApprovalRouteBinding.channel`` is validated as a Slack
+# channel id (``apps/api/src/curie_api/schemas.py``), the channel-membership
+# authorizer proves approver membership through Slack, and widening that binding
+# to other kinds is explicitly out of scope for ADR-0096 phase 2. Its route is
+# empty on both halves, which means the worker's DEFAULT Slack transport (#451):
+# the card is policy, so its transport is policy too, never the trigger's.
+POLICY_CARD_KIND = "slack"
+
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
     """The approval id inside a resume turn's deterministic event id (#1084).
@@ -424,7 +434,15 @@ class Kernel:
                 self._release_order_entry(thread, entry)
 
         try:
-            if await self._markers.is_done(event_id):
+            if await self._markers.is_terminal(event_id):
+                # ``is_terminal``, not ``is_done``: a DONE outbox record proves
+                # this turn finished just as well as the marker does, and it
+                # outlives the marker by the retention window. Reading the marker
+                # alone reran a completed turn after a >24h outage -- the startup
+                # sweep emitted the record and cleared it, and the entry that was
+                # never acked was then reclaimed with nothing left to refuse it.
+                # Completion emit stays at-least-once; turn side effects stay
+                # at-most-once for the whole outbox retention period.
                 logger.info("event %s already done; skipping", event_id)
                 # The skip holds no resolved route of its own and must not
                 # invent one, so it makes no sink call -- except to hand off a
@@ -445,8 +463,19 @@ class Kernel:
                 # needs to see. It runs before binding resolution, so it emits
                 # over the server-minted handle's route, verbatim -- never a
                 # lookup it cannot reach and never a default standing in for a
-                # missing adapter. It writes no completion record, because it
-                # holds no resolved route to write one against.
+                # missing adapter.
+                #
+                # And it is a DURABLE TERMINAL OUTCOME, so it completes through
+                # the same ordering every other terminal path uses (driver
+                # adjudication, superseding the earlier "suppress the completion
+                # here" wording). Marking done without a completion is only
+                # survivable on an edit-in-place channel: a BUFFERED adapter
+                # accumulates the reply and flushes on ``turn.completed``, so a
+                # suppressed completion writes the escalation, marks the turn
+                # done, and never delivers it -- silently, on exactly the channel
+                # with nobody watching a thread. The handle-derived route is what
+                # the record stores, so a sweeper re-emits over the same
+                # transport the escalation text went to.
                 await self._escalate(
                     qevent,
                     target,
@@ -454,7 +483,7 @@ class Kernel:
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
                 )
-                await self._markers.mark_done(event_id)
+                await self._complete(qevent, target, route, "escalated")
                 return
 
             # Deployment-to-runtime binding: resolve which agent/version this
@@ -885,7 +914,14 @@ class Kernel:
         Step 3 failing is caught and logged, never raised: the turn is already
         durably done, and re-running it is the harm. The record survives so a
         sweeper (or the next redelivery) delivers the completion the adapter is
-        still owed. Reachable only from paths that hold a resolved route.
+        still owed.
+
+        The ONLY ``mark_done`` call site: every durable terminal outcome
+        completes here, including the pre-resolution prior-side-effect
+        escalation, whose route is the server-minted ``reply_handle``'s (EB-B2's
+        second sanctioned source -- no adapter can write to the stream, so the
+        handle is trustworthy). A terminal path that marked done without a record
+        would be a completion nothing could ever recover.
         """
         event_id = qevent.event_id
         record = CompletionRecord(
@@ -901,12 +937,20 @@ class Kernel:
             created_at=time.time(),
             done=False,
         )
-        await self._markers.mark_completion_pending(event_id, record)
+        generation = await self._markers.mark_completion_pending(event_id, record)
         await self._markers.mark_done(event_id, also_flag_completion=event_id)
-        await self._deliver_completion(record)
+        await self._deliver_completion(record, generation=generation)
 
-    async def _deliver_completion(self, record: CompletionRecord) -> bool:
-        """Emit a stored completion and clear it, or leave it owed. True on send."""
+    async def _deliver_completion(
+        self, record: CompletionRecord, *, generation: str | None
+    ) -> bool:
+        """Emit a stored completion and clear it, or leave it owed. True on send.
+
+        The clear is compare-and-checked against ``generation`` -- the identity of
+        the record this caller actually read -- so a pass holding a stale record
+        can never delete the fresh one a concurrent retry wrote for the same
+        event id.
+        """
         try:
             await self._sink.emit(record.event, route=record.route)
         except Exception as exc:  # noqa: BLE001 - the turn is already durably done
@@ -916,7 +960,7 @@ class Kernel:
                 exc,
             )
             return False
-        await self._markers.clear_completion(record.event_id)
+        await self._markers.clear_completion(record.event_id, generation=generation)
         return True
 
     async def _reemit_pending_completion(self, event_id: str) -> None:
@@ -926,10 +970,10 @@ class Kernel:
         STORED record rather than building one, because it never resolved a
         route of its own and must not invent one.
         """
-        record = await self._markers.read_completion(event_id)
-        if record is None:
+        stored = await self._markers.read_completion(event_id)
+        if stored is None:
             return
-        await self._deliver_completion(record)
+        await self._deliver_completion(stored.record, generation=stored.generation)
 
     async def sweep_pending_completions(self) -> int:
         """Drain the completion outbox. Returns how many completions were sent.
@@ -945,25 +989,51 @@ class Kernel:
            in the same MULTI as the done marker, so a false flag means the
            kernel is mid-flight or crashed before durability -- the sweeper stays
            silent and stream redelivery reruns the turn, correctly. ``is_done``
-           is consulted only as a fallback, for a record written by a
-           pre-upgrade worker: the marker expires at ``idempotency_ttl_s`` while
-           the record is retained for a week, so a guard resting on it alone
-           could never pass after day one.
+           is consulted only as a fallback for a record whose flag field is
+           ABSENT, which only a pre-upgrade writer can produce: the marker
+           expires at ``idempotency_ttl_s`` while the record is retained for a
+           week, so a guard resting on it alone could never pass after day one.
+           An EXPLICIT false never reaches that fallback, and the distinction is
+           the whole guard: collapsing "no flag" and "flag says not yet" lets a
+           CONCURRENT retry's done marker authorize this pass to emit and clear
+           a record that retry is still mid-flight on.
         2. **the record is older than the grace period**, which keeps the
            sweeper out of the kernel's own emit window so the normal path is not
            racing it on every turn.
+
+        The pass is BOUNDED, in members and in wall time (``completion_sweep_batch``
+        / ``completion_sweep_budget_s``). Every delivery attempt is an HTTP call
+        with the sink's own timeout, so an unbounded pass over an unreachable
+        adapter is measured in hours -- and this same coroutine runs at startup,
+        against exactly the backlog an outage left behind. The remainder is
+        drained by the next maintenance tick.
         """
         sent = 0
         now = time.time()
-        for event_id in sorted(await self._markers.pending_completions()):
-            record = await self._markers.read_completion(event_id)
-            if record is None:
+        deadline = now + self._config.completion_sweep_budget_s
+        batch = await self._markers.pending_completions(
+            self._config.completion_sweep_batch
+        )
+        for seen, event_id in enumerate(sorted(batch)):
+            if time.time() >= deadline:
+                logger.info(
+                    "completion sweep budget (%.0fs) reached after %d record(s); "
+                    "the rest are left for the next pass",
+                    self._config.completion_sweep_budget_s,
+                    seen,
+                )
+                break
+            stored = await self._markers.read_completion(event_id)
+            if stored is None:
                 # A member whose payload is gone: some emitter confirmed
                 # delivery and cleared it between our read of the set and our
                 # read of the key. Re-emitting would be a duplicate with no
                 # record to guide it, and no route to reconstruct one from.
-                await self._markers.clear_completion(event_id)
+                # Only the stale index entry goes: deleting the KEY here would
+                # destroy a record a concurrent retry may have just written.
+                await self._markers.drop_pending_member(event_id)
                 continue
+            record = stored.record
             age = now - record.created_at
             if age > self._config.completion_max_retention_s:
                 # Never a silent expiry, and never a set member without its
@@ -976,13 +1046,20 @@ class Kernel:
                     record.route.adapter,
                     record.event.target.address,
                 )
-                await self._markers.clear_completion(event_id)
+                await self._markers.clear_completion(
+                    event_id, generation=stored.generation
+                )
                 continue
-            if not record.done and not await self._markers.is_done(event_id):
+            if stored.done_flag is None:
+                # The pre-upgrade shape, and the ONLY case the marker answers for.
+                terminal = record.done or await self._markers.is_done(event_id)
+            else:
+                terminal = stored.done_flag
+            if not terminal:
                 continue
             if age < self._config.completion_sweep_grace_s:
                 continue
-            if await self._deliver_completion(record):
+            if await self._deliver_completion(record, generation=stored.generation):
                 sent += 1
         return sent
 
@@ -1344,7 +1421,13 @@ class Kernel:
                     version=REPLY_WIRE_VERSION,
                     event="reply.update",
                     target=ReplyTarget(
-                        kind=qevent.reply_handle.kind,
+                        # The card's OWN destination, remembered at post time. A
+                        # policy-routed card lives in a channel this resume turn
+                        # may not share a kind or a transport with, so rebuilding
+                        # either from the turn addresses the wrong place; ``kind``
+                        # empty is the pre-upgrade entry, which falls back to the
+                        # turn exactly as it did before.
+                        kind=ref.kind or qevent.reply_handle.kind,
                         address=ref.channel,
                         conversation_id=qevent.conversation_id,
                         reply_ref=ref.ts,
@@ -1352,7 +1435,10 @@ class Kernel:
                     message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
                     settled=settled,
                 ),
-                route=TargetRoute(endpoint=ref.endpoint, adapter=route.adapter),
+                route=TargetRoute(
+                    endpoint=ref.endpoint,
+                    adapter=ref.adapter if ref.kind else route.adapter,
+                ),
             )
             logger.info("settled approval card for thread %s", qevent.conversation_id)
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
@@ -1529,12 +1615,24 @@ class Kernel:
         )
         await self._reply(target, route_, f"{base}\n\n{notice}" if base else notice)
 
-        # In the requesting channel the card joins the thread and rides the
-        # trigger's transport; a route-bound channel has no such thread and is
-        # policy, not a per-turn reply, so it posts top-level over the worker's
-        # default Slack transport.
+        # The card's destination -- kind AND route -- is selected from the
+        # channel it POSTS TO, never from the turn that requested it. In the
+        # requesting channel the card joins the thread and rides the trigger's
+        # own transport. A route-bound channel has no such thread and is policy,
+        # not a per-turn reply: it posts top-level over the worker's default
+        # Slack transport, because an ``ApprovalRouteBinding`` is a Slack channel
+        # id by construction (``schemas.py`` validates it as one, and #247's
+        # binding shape is explicitly out of scope for ADR-0096 phase 2), and the
+        # authorizer proves membership of that channel through Slack.
+        #
+        # Keeping the requesting turn's kind and adapter here was a fail-closed
+        # bug: an email-originated approval routed to a Slack policy channel kept
+        # ``kind=email`` with an email adapter and NO endpoint, so the egress
+        # raised and the channel the policy exists to notify never saw the card.
         in_requesting_channel = card_channel == qevent.reply_handle.channel
+        card_kind = qevent.reply_handle.kind if in_requesting_channel else POLICY_CARD_KIND
         card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
+        card_adapter = route_.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
@@ -1597,7 +1695,7 @@ class Kernel:
                     version=REPLY_WIRE_VERSION,
                     event="reply.post",
                     target=ReplyTarget(
-                        kind=qevent.reply_handle.kind,
+                        kind=card_kind,
                         address=card_channel,
                         conversation_id=thread if in_requesting_channel else None,
                         reply_ref=None,
@@ -1605,7 +1703,7 @@ class Kernel:
                     message=card_message,
                     requested_by=qevent.author,
                 ),
-                route=TargetRoute(endpoint=card_endpoint, adapter=route_.adapter),
+                route=TargetRoute(endpoint=card_endpoint, adapter=card_adapter),
             )
             card_ts = card_ack.ref
         except Exception as exc:  # noqa: BLE001 - the pause stands without the card
@@ -1623,6 +1721,13 @@ class Kernel:
                         ts=card_ts,
                         summary=summary,
                         endpoint=card_endpoint,
+                        # The whole destination, not just the endpoint: the
+                        # settle path posts to THIS card, so it must re-use the
+                        # kind and adapter the card was posted through rather
+                        # than rebuilding them from the resume turn (which, for
+                        # a policy-routed card, is a different channel entirely).
+                        kind=card_kind,
+                        adapter=card_adapter,
                         # Pair the ref to the approval it belongs to (#1199).
                         # The entry is keyed by thread, so this is the only
                         # thing that lets the resume turn tell "my card" from a

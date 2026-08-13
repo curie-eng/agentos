@@ -16,12 +16,19 @@ Three properties make it worth its own test rather than a schema diff:
    phase 1's own live E2E created a `kind='email'` binding. A blind `UPDATE ...
    SET reply_kind = 'slack'` would stamp Slack onto an email approval and
    misroute its resume, which is the exact failure this whole change exists to
-   kill, so an UNRECONSTRUCTABLE **pending** row aborts the migration by name.
+   kill, so an UNRECONSTRUCTABLE row aborts the migration by name.
 
-2. **Terminal rows are treated differently on purpose.** A resolved/rejected/
-   expired approval owes no wake, so it can never misroute; refusing on it would
-   block the cutover on rows that cannot hurt anyone. It backfills to `'slack'`
-   and is logged.
+2. **No status is provably inert, so the refusal is status-blind.** An earlier
+   revision of this file asserted that a settled (approved/rejected/expired) row
+   could safely take a fabricated `'slack'`, on the theory that it owes no wake.
+   That theory is false in this codebase: `crud._RESUMABLE_STATUSES`
+   (`crud.py:622-626`) is exactly `(approved, rejected, expired)`, so
+   `resumequeue.resume_turn_for` builds a wake for all three, and
+   `crud.reopen_dead_lettered_resume` clears `resumed_at` so even an
+   already-resumed row can re-owe one (#532). A settled row with fabricated
+   provenance therefore misroutes a LATER wake -- the same silent misroute, just
+   deferred. The only backfill-to-`'slack'` path is a row whose provenance
+   actually resolves to a slack binding.
 
 3. **The downgrade destroys durable routing identity**, so it refuses in two
    directions: a non-`'slack'` kind (obviously unrepresentable) AND a `'slack'`
@@ -187,29 +194,73 @@ def test_the_upgrade_backfills_each_approval_from_its_own_binding(
 
 
 @pytest.mark.parametrize("status", ["approved", "rejected", "expired"])
-def test_a_terminal_unreconstructable_approval_backfills_to_slack(
+def test_the_upgrade_refuses_an_unreconstructable_row_of_any_settled_status(
     isolated_migration_db: None, status: str
 ) -> None:
-    """T-A10, terminal half. A settled approval owes no wake, so its kind can
-    never misroute anything; blocking the cutover on it would be refusing for the
-    sake of refusing. It takes `'slack'` and is logged.
+    """T-A10, status-blind half / AC3.
+
+    A settled row is NOT inert here, which is the whole correction. All three of
+    these statuses are in `crud._RESUMABLE_STATUSES` (`crud.py:622-626`), so
+    `resumequeue.resume_turn_for` builds a wake for each, and
+    `crud.reopen_dead_lettered_resume` can clear `resumed_at` on a row whose
+    resume was dead-lettered (#532), putting it back on the reconciler's
+    work-list. Fabricating `'slack'` on a row nobody can vouch for therefore
+    buys a misroute later instead of an abort now.
+
+    All three statuses are parametrized rather than tested on one representative
+    because the plausible wrong implementation is a status allow-list, and an
+    allow-list gets one status right by accident.
     """
 
     cfg = _at_below()
+    _seed_binding("slack-agent", "slack", "C0FINE002")
+    healthy = _seed_approval(
+        reply_channel="C0FINE002", status=status, summary="resolvable one"
+    )
     settled = _seed_approval(
-        reply_channel="C0GONE001", status=status, summary="long since decided"
+        reply_channel="nobody@example.test", status=status, summary="long since decided"
+    )
+
+    with pytest.raises(Exception) as caught:
+        command.upgrade(cfg, REVISION)
+
+    message = str(caught.value)
+    assert str(settled) in message, message
+    assert "nobody@example.test" in message, message
+    assert str(healthy) not in message, message
+
+
+@pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
+def test_the_only_backfill_to_slack_is_a_row_bound_to_a_slack_binding(
+    isolated_migration_db: None, status: str
+) -> None:
+    """T-A7's other half, and the positive control for the refusal above.
+
+    `'slack'` is written when, and only when, the row's own address resolves to a
+    slack binding -- earned provenance, never a default. Without this the
+    migration could satisfy every refusal test by aborting on everything, and
+    without the status sweep a status-gated backfill would go unnoticed on the
+    lane it skipped.
+    """
+
+    cfg = _at_below()
+    _seed_binding("slack-agent", "slack", "C0EARNED1")
+    approval = _seed_approval(
+        reply_channel="C0EARNED1", status=status, summary="ordinary slack"
     )
 
     command.upgrade(cfg, REVISION)
 
-    assert _reply_kind(settled) == "slack"
+    assert _reply_kind(approval) == "slack"
 
 
 def test_the_upgrade_refuses_a_pending_approval_that_matches_no_binding(
     isolated_migration_db: None,
 ) -> None:
-    """T-A10, refusal half / AC3. A PENDING row carries a live resume
-    obligation, and guessing its kind is the silent misroute.
+    """T-A10, refusal half / AC3. A pending row carries a live resume
+    obligation, and guessing its kind is the silent misroute. (The refusal is
+    status-blind -- see the settled-status sweep below -- but pending is the
+    shape an operator actually meets during the cutover.)
 
     Mutation this catches: replace the pre-flight with a blind `UPDATE` and the
     migration succeeds, stamping `'slack'` on a row nobody can vouch for.

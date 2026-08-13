@@ -103,6 +103,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # sandbox running agent-authored code holding them could impersonate
         # the platform to every bound channel.
         "CURIE_ADAPTER_CREDENTIALS",
+        # The operator-configured extra Slack origins a per-turn reply endpoint
+        # may name (ADR-0096 D4.4), read from the WORKER's env by WorkerConfig
+        # and consumed by ``build_reply_sink``. It is an egress-trust decision
+        # made on the worker; nothing about it reaches a sandbox.
+        "CURIE_SLACK_TRUSTED_ORIGINS",
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",

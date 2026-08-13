@@ -290,3 +290,43 @@ def test_the_downgrade_refuses_and_names_any_routed_binding(
     assert _sql(
         "SELECT adapter FROM curie.agent_channels WHERE address = 'ops@example.test'"
     ) == [("agentmail-sandbox",)]
+
+
+def test_the_downgrade_refuses_a_rebound_binding_whose_generation_is_nonzero(
+    isolated_migration_db: None,
+) -> None:
+    """T-A14, the revocation half.
+
+    An unrouted Slack binding passes the route predicate, and its generation is
+    still a durable SECURITY fact: a token claim binds `(channel_id, generation)`
+    and `update_agent_binding` mutates the row in place, so the id survives every
+    rebind. Drop the column and re-upgrade (which restores it at 0) and every
+    credential those rebinds revoked is authoritative again for the same binding
+    id -- revocation silently undone.
+
+    Mutation this catches: delete the generation predicate. Every other test in
+    this file still passes (they all sit at generation 0), and the only signal is
+    a revoked adapter token that starts working again.
+    """
+
+    cfg = _at_below()
+    command.upgrade(cfg, REVISION)
+    _seed_slack_binding("rebound-agent", "C0ROUTE05")
+    _seed_slack_binding("settled-agent", "C0ROUTE06")
+    # Two rebinds, exactly as `update_agent_binding` would have counted them.
+    _sql(
+        "UPDATE curie.agent_channels SET generation = 2 WHERE address = 'C0ROUTE05'"
+    )
+
+    with pytest.raises(Exception) as caught:
+        command.downgrade(cfg, BELOW)
+
+    message = str(caught.value)
+    assert "C0ROUTE05" in message, message
+    assert "generation 2" in message, message
+    # The never-rebound binding is not blamed for its neighbour's state.
+    assert "C0ROUTE06" not in message, message
+    # And the refusal was total: the generation survives to be rotated against.
+    assert _sql(
+        "SELECT generation FROM curie.agent_channels WHERE address = 'C0ROUTE05'"
+    ) == [(2,)]

@@ -231,6 +231,14 @@ spec:
             - name: SLACK_API_BASE_URL
               value: {{ .Values.worker.slackApiBaseUrl | quote }}
             {{- end }}
+            # Extra trusted Slack origins (ADR-0096 D4.4), a DEV-ONLY widening of
+            # where the bot token may be sent. Empty (the default) renders
+            # nothing, leaving the configured Slack origin as the only trusted
+            # one and every cross-origin per-turn endpoint refused.
+            {{- if .Values.worker.slackTrustedOrigins }}
+            - name: CURIE_SLACK_TRUSTED_ORIGINS
+              value: {{ .Values.worker.slackTrustedOrigins | quote }}
+            {{- end }}
             # Object store, for fetching immutable plugin bundles.
             #
             # These four were missing entirely, and the worker's config defaults

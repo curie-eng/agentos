@@ -39,7 +39,7 @@ _EVENTS = TypeAdapter(ReplyEvent)
 def _target(**overrides: object) -> ReplyTarget:
     base: dict[str, object] = {
         "kind": "email",
-        "address": "sandbox.theconnman@agentmail.to",
+        "address": "agent@example.test",
         "conversation_id": "thread-9",
         "reply_ref": "msg_abc123",
     }
@@ -67,7 +67,7 @@ def test_turn_status_round_trips() -> None:
     decoded = _round_trip(event)
     assert isinstance(decoded, TurnStatus)
     assert decoded == event
-    assert decoded.target.address == "sandbox.theconnman@agentmail.to"
+    assert decoded.target.address == "agent@example.test"
 
 
 def test_empty_status_is_the_clear_and_survives_the_wire() -> None:

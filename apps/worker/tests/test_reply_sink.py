@@ -39,6 +39,7 @@ from channel_protocol.reply import (
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     MissingAdapterCredentialError,
+    RedirectedAdapterEndpointError,
     TargetRoute,
     build_reply_sink,
 )
@@ -73,6 +74,7 @@ class _Capture:
                 web.post("/b", self._record_ok),
                 web.post("/slack/api/{method}", self._record_slack),
                 web.post("/slack/dead/{method}", self._drop),
+                web.post("/redirect", self._redirect_to_b),
             ]
         )
 
@@ -106,6 +108,14 @@ class _Capture:
         transport.close()
         return web.Response()
 
+    async def _redirect_to_b(self, request: web.Request) -> web.Response:
+        # A redirecting adapter endpoint: record the attempt, then point the
+        # client at ANOTHER path. aiohttp's default would replay the POST there
+        # with the egress secret still attached, so ``/b`` receiving anything is
+        # the leak this shape exists to catch.
+        await self._capture(request)
+        return web.Response(status=307, headers={"Location": "/b"})
+
     def paths(self) -> list[str]:
         return [r["path"] for r in self.requests]
 
@@ -130,7 +140,7 @@ def _closed_port() -> int:
 def _target(kind: str, **overrides: object) -> ReplyTarget:
     base: dict[str, object] = {
         "kind": kind,
-        "address": "sandbox.theconnman@agentmail.to" if kind != "slack" else "C1",
+        "address": "agent@example.test" if kind != "slack" else "C1",
         "conversation_id": "thread-1",
         "reply_ref": "ref-1",
     }
@@ -470,6 +480,154 @@ def test_a_slack_endpoint_at_the_configured_origin_is_accepted() -> None:
     asyncio.run(go())
 
 
+def test_a_configured_trusted_dev_origin_is_accepted() -> None:
+    # The dev/CLI stub is reached on a host and port the worker's single
+    # ``slack_api_base_url`` cannot also name (`local message` advertises
+    # ``host.docker.internal``, `cluster message` a routable host), so the origin
+    # pin alone would refuse the local loop. ``CURIE_SLACK_TRUSTED_ORIGINS`` is
+    # the explicitly CONFIGURED override; it is operator config, never a
+    # wire-supplied origin, which is what keeps the test above true.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            stub = _Capture()
+            stub_server = TestServer(stub.app)
+            await stub_server.start_server()
+            stub_port = stub_server.port
+            assert stub_port is not None
+            try:
+                sink = build_reply_sink(
+                    _config(
+                        port,
+                        slack_trusted_origins=f"http://127.0.0.1:{stub_port}",
+                    )
+                )
+                await sink.emit(
+                    _update("slack"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{stub_port}/slack/api/",
+                        adapter=None,
+                    ),
+                )
+                # Delivered at the configured dev origin, and nothing was sent to
+                # the worker's own default transport.
+                assert stub.paths() == ["/slack/api/chat.update"]
+                assert capture.requests == []
+            finally:
+                await stub_server.close()
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_portless_trusted_entry_accepts_any_port_on_that_host() -> None:
+    # The dev affordance that makes the override usable at all: `curie chat` and
+    # `cluster message --listen-port 0` bind an EPHEMERAL stub port, so no fixed
+    # origin can be configured ahead of time. A portless entry
+    # (``http://127.0.0.1``) trusts any port on that scheme+host.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            stub = _Capture()
+            stub_server = TestServer(stub.app)
+            await stub_server.start_server()
+            stub_port = stub_server.port
+            assert stub_port is not None
+            try:
+                sink = build_reply_sink(
+                    _config(port, slack_trusted_origins="http://127.0.0.1")
+                )
+                await sink.emit(
+                    _update("slack"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{stub_port}/slack/api/",
+                        adapter=None,
+                    ),
+                )
+                assert stub.paths() == ["/slack/api/chat.update"]
+                assert capture.requests == []
+            finally:
+                await stub_server.close()
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_portless_trusted_entry_still_refuses_another_host() -> None:
+    # Portless widens the PORT, never the host: an endpoint on any other host is
+    # refused exactly as before, with nothing sent.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(
+                _config(port, slack_trusted_origins="http://127.0.0.1")
+            )
+            with pytest.raises(UntrustedSlackEndpointError):
+                await sink.emit(
+                    _update("slack"),
+                    route=TargetRoute(
+                        endpoint="http://attacker.invalid:9999/slack/api/",
+                        adapter=None,
+                    ),
+                )
+            assert capture.requests == []
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_an_exact_trusted_entry_still_refuses_a_port_mismatch() -> None:
+    # An entry that NAMES a port keeps exact matching, so the portless form is an
+    # opt-in widening rather than a blanket one: same host, other port, refused.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            stub = _Capture()
+            stub_server = TestServer(stub.app)
+            await stub_server.start_server()
+            stub_port = stub_server.port
+            assert stub_port is not None
+            try:
+                sink = build_reply_sink(
+                    _config(port, slack_trusted_origins=f"http://127.0.0.1:{stub_port}")
+                )
+                with pytest.raises(UntrustedSlackEndpointError):
+                    await sink.emit(
+                        _update("slack"),
+                        route=TargetRoute(
+                            endpoint=f"http://127.0.0.1:{_closed_port()}/slack/api/",
+                            adapter=None,
+                        ),
+                    )
+                assert stub.requests == []
+                assert capture.requests == []
+            finally:
+                await stub_server.close()
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
 def test_a_slack_turn_with_no_per_turn_endpoint_uses_the_configured_origin() -> None:
     async def go() -> None:
         capture = _Capture()
@@ -517,6 +675,68 @@ def test_an_unreachable_slack_endpoint_falls_back_to_the_configured_default() ->
                 "/slack/dead/chat.update",
                 "/slack/api/chat.update",
             ]
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_redirecting_adapter_endpoint_is_refused_and_the_secret_never_moves() -> None:
+    # aiohttp follows redirects by default and KEEPS the custom
+    # ``X-Curie-Adapter-Secret`` header across the hop, so a redirecting adapter
+    # endpoint is a credential-exfil primitive: it names any Location and the
+    # platform re-sends its egress secret there. A redirect is a delivery
+    # FAILURE, not a hop. Mutation: drop ``allow_redirects=False`` and the secret
+    # lands on ``/b``.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(_config(port))
+            with pytest.raises(RedirectedAdapterEndpointError):
+                await sink.emit(
+                    _update("email"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{port}/redirect",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+            assert capture.paths() == ["/redirect"], (
+                "the redirect target must never receive the request"
+            )
+            assert capture.secrets() == [SECRET_A]
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_redirect_is_not_swallowed_by_best_effort_delivery() -> None:
+    # #708's swallow covers an UNREACHABLE target only. A redirect is a live
+    # answer from a reachable endpoint, so it must stay loud even on a
+    # best-effort resume turn -- otherwise a redirecting adapter both keeps the
+    # secret-bounce attempt and reads as a delivered reply.
+    async def go() -> None:
+        capture = _Capture()
+        server = TestServer(capture.app)
+        await server.start_server()
+        try:
+            port = server.port
+            assert port is not None
+            sink = build_reply_sink(_config(port))
+            with pytest.raises(RedirectedAdapterEndpointError):
+                await sink.emit(
+                    _update("email"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{port}/redirect",
+                        adapter=ADAPTER_A,
+                    ),
+                    best_effort_unreachable=True,
+                )
+            assert capture.paths() == ["/redirect"]
         finally:
             await server.close()
 

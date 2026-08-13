@@ -47,6 +47,10 @@ from slack_sdk.errors import SlackApiError
 # trusted origin whose path moved or died -- the surviving #530 shape.
 _DEFAULT = "http://default:1/api/"
 _STUB = "http://default:1/stub/"
+# A second path inside the REAL-Slack origin, used as a no-wander recorder by the
+# no-default-configured cases below: with no ``base_url`` the trusted origin is
+# real Slack, so this is the only second client those cases can legally build.
+_ELSEWHERE = "https://slack.com/elsewhere/"
 
 
 def _target(
@@ -448,9 +452,21 @@ def test_best_effort_unreachable_swallows_when_no_default() -> None:
     # approval's turn ACKs instead of dead-lettering.
     sink = SlackReplyAdapter("xoxb-test")  # no base_url -> no configured default
     sink._client_for(None).chat_update = _raise_connection_error()  # type: ignore[method-assign]
+    # The no-wander half, restored in the shape the new model allows. Before
+    # D4.4 this case named a dead per-turn CLI-stub endpoint and asserted the
+    # real-Slack default took zero calls; a FOREIGN origin is now refused at
+    # ``_client_for`` before a client can even be built, so the recorder sits on
+    # a second path within the trusted origin instead. The property is the one
+    # the old assertion was a special case of: a swallowed delivery must never be
+    # quietly retried against some other transport.
+    elsewhere: list[str] = []
+    sink._client_for(_ELSEWHERE).chat_update = _record_call(  # type: ignore[method-assign]
+        elsewhere, "elsewhere"
+    )
 
     # Must NOT raise.
     asyncio.run(_update(sink, text="hi", best_effort_unreachable=True))
+    assert elsewhere == [], "the best-effort swallow must not re-send anywhere else"
 
 
 def test_best_effort_false_still_raises_when_no_default() -> None:
@@ -459,9 +475,17 @@ def test_best_effort_false_still_raises_when_no_default() -> None:
     # transport with no default still raises loudly.
     sink = SlackReplyAdapter("xoxb-test")
     sink._client_for(None).chat_update = _raise_connection_error()  # type: ignore[method-assign]
+    elsewhere: list[str] = []
+    sink._client_for(_ELSEWHERE).chat_update = _record_call(  # type: ignore[method-assign]
+        elsewhere, "elsewhere"
+    )
 
     with pytest.raises(aiohttp.ClientError):
         asyncio.run(_update(sink, text="hi", best_effort_unreachable=False))
+    # Raising loudly and re-sending elsewhere are different failures, and only
+    # the first is wanted: a loud failure that also delivered somewhere leaves a
+    # reply in a place nothing will retract when the reclaim retries the turn.
+    assert elsewhere == [], "a loud failure must not deliver anywhere else"
 
 
 def test_slack_api_error_not_swallowed_even_with_best_effort() -> None:
@@ -469,15 +493,27 @@ def test_slack_api_error_not_swallowed_even_with_best_effort() -> None:
     # NOT an unreachability, so best_effort_unreachable must NOT swallow it (that
     # would hide a real delivery rejection). Only transport-unreachable errors
     # (_UNREACHABLE_ERRORS) are in scope for the best-effort resume swallow.
-    sink = SlackReplyAdapter("xoxb-test")
+    # Arranged on a PER-TURN target with a configured default, restoring the
+    # dimension this case carried before the seam swap: a rejection on a second
+    # target must be neither swallowed by the best-effort flag NOR re-sent to the
+    # default. Those are two distinct misroutes and one arrangement catches both;
+    # its non-best-effort twin is test_slack_api_error_is_not_treated_as_unreachable.
+    sink = SlackReplyAdapter("xoxb-test", base_url=_DEFAULT)
+    default_hits: list[str] = []
 
     async def _reject(**_kwargs):
         raise SlackApiError("nope", response={"error": "channel_not_found"})
 
-    sink._client_for(None).chat_update = _reject  # type: ignore[method-assign]
+    sink._client_for(_STUB).chat_update = _reject  # type: ignore[method-assign]
+    sink._client_for(None).chat_update = _record_call(default_hits, "default")  # type: ignore[method-assign]
 
     with pytest.raises(SlackApiError):
-        asyncio.run(_update(sink, text="hi", best_effort_unreachable=True))
+        asyncio.run(
+            _update(sink, text="hi", endpoint=_STUB, best_effort_unreachable=True)
+        )
+    assert default_hits == [], (
+        "a SlackApiError must not fall back to the default, best-effort or not"
+    )
 
 
 def test_best_effort_stays_loud_when_default_transport_is_the_dead_target() -> None:

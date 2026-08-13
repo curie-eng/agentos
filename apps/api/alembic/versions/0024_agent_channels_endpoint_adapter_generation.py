@@ -26,14 +26,26 @@ non-Slack kind REQUIRES both. The database states the invariant true for every
 kind; the schema layer states the kind-specific policy. A CHECK that knew what
 `slack` meant would be the schema layer, in the wrong place.
 
-`downgrade` REFUSES while any binding carries a non-NULL `endpoint` or `adapter`:
-dropping those columns destroys the only record of where a live adapter's traffic
-goes and which credential authenticates it, a re-upgrade cannot reconstruct either
-(this backfill is all-NULL by construction), and a worker running against a
-downgraded schema fails closed on every non-Slack turn. When nothing is routed it
-drops in REVERSE CREATION ORDER -- the CHECK first, then `generation`, `adapter`,
-`endpoint` -- so the constraint never outlives a column it references, and no
-orphaned constraint blocks a re-upgrade's own ADD CONSTRAINT.
+`downgrade` REFUSES in TWO directions, both of which the drop would destroy
+silently:
+
+1. any binding carrying a non-NULL `endpoint` or `adapter` -- dropping those
+   columns destroys the only record of where a live adapter's traffic goes and
+   which credential authenticates it, a re-upgrade cannot reconstruct either
+   (this backfill is all-NULL by construction), and a worker running against a
+   downgraded schema fails closed on every non-Slack turn; and
+2. any binding whose `generation` is nonzero -- a token claim binds
+   `(channel_id, generation)`, and `update_agent_binding` mutates the row in
+   place, so the id is a STABLE identity and the generation is the only thing
+   that revokes a credential minted before a rebind. Dropping the column and
+   re-upgrading resets every counter to 0, which makes every previously revoked
+   generation-0 token valid again against the same binding id: revocation
+   undone, with no trace in either schema.
+
+When nothing is routed and every generation is 0 it drops in REVERSE CREATION
+ORDER -- the CHECK first, then `generation`, `adapter`, `endpoint` -- so the
+constraint never outlives a column it references, and no orphaned constraint
+blocks a re-upgrade's own ADD CONSTRAINT.
 
 Revision ID: 0024
 Revises: 0023
@@ -100,6 +112,37 @@ def downgrade() -> None:
             "all-NULL by construction), and a worker running against the narrowed "
             "schema fails closed on every non-Slack turn. Record these routes "
             "elsewhere, clear them, then re-run this downgrade."
+        )
+
+    # A nonzero generation is a REVOCATION record, not merely a counter: a token
+    # claim binds (channel_id, generation), and the row id survives every rebind,
+    # so dropping the column and re-upgrading (which restores it at 0) makes every
+    # already-revoked generation-0 token authoritative again for that same id.
+    # Refused in the same style as the route columns above: destroying a durable
+    # security fact is never a silent step.
+    rebound = conn.execute(
+        sa.text(
+            f"""
+            SELECT kind, address, generation
+            FROM {SCHEMA}.{TABLE}
+            WHERE generation <> 0
+            ORDER BY kind, address
+            """
+        )
+    ).all()
+    if rebound:
+        detail = "; ".join(
+            f"{row.kind}:{row.address} (generation {row.generation})" for row in rebound
+        )
+        raise RuntimeError(
+            "cannot drop agent_channels.generation (#1459): these bindings have "
+            f"been rebound and their generation is the record of it -- {detail}. A "
+            "token claim binds (channel_id, generation), and the binding id is "
+            "stable across a rebind, so dropping this column and re-upgrading "
+            "resets every counter to 0 and RESURRECTS the credentials those "
+            "rebinds revoked. Rotate the affected bindings' credentials and record "
+            "their generations elsewhere, reset them to 0, then re-run this "
+            "downgrade."
         )
 
     # Reverse creation order: the CHECK references both columns it is dropped

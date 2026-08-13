@@ -515,6 +515,17 @@ services:
       # network membership), so this name resolves from a spawned runner.
       - CURIE_RUNNER_API_URL=http://curie-api:8000
       - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}
+      # Additional Slack origins a per-turn reply endpoint may name (ADR-0096
+      # D4.4). The CLI stub advertises itself as `localhost` on native-Docker
+      # Linux and `host.docker.internal` under Docker Desktop (#680), and it
+      # binds an EPHEMERAL port on `curie chat`, so the single
+      # SLACK_API_BASE_URL above cannot also name it -- without these the origin
+      # pin refuses the local loop. A portless entry trusts any port on that
+      # host, which is why the ephemeral-port stub works. DEV ONLY: the deployed
+      # chart defaults this to empty, and a LAN-host dev setup (`cluster message
+      # --listen-host <ip>`, or CURIE_LOCAL_STUB_HOST) must extend this list
+      # with that host itself.
+      - CURIE_SLACK_TRUSTED_ORIGINS=${CURIE_SLACK_TRUSTED_ORIGINS-http://localhost,http://127.0.0.1,http://host.docker.internal}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}
       # Per-adapter egress credentials (ADR-0096 D4.2): a JSON object mapping an
       # adapter slug (the binding row's `adapter`) to the secret the worker

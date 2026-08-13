@@ -42,7 +42,7 @@ from curie_worker.runner_client import RunnerClient
 DONE = SessionStatus.DONE
 
 ADAPTER = "agentmail-sandbox"
-EMAIL_ADDRESS = "sandbox.theconnman@agentmail.to"
+EMAIL_ADDRESS = "agent@example.test"
 ENDPOINT = "https://adapter.example/hook"
 
 

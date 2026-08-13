@@ -14,14 +14,24 @@ has no adapter, so NULL is the correct and only honest value.
 **The backfill is BY PROVENANCE, and refuses rather than guesses.** Each approval
 joins `agent_channels` on `approvals.reply_channel = agent_channels.address`. A
 row whose address resolves to exactly one binding takes that binding's kind. A row
-resolving to zero bindings, or to more than one kind, is UNRECONSTRUCTABLE:
+resolving to zero bindings, or to more than one kind, is UNRECONSTRUCTABLE, and
+the migration RAISES on it whatever its status, naming every offending id and its
+`reply_channel`. There is deliberately no force-through flag; the operator's next
+step is to re-point or remove the offending bindings.
 
-* still PENDING -> raise, naming every offending id and its `reply_channel`. A
-  pending approval carries a live resume obligation, and there is deliberately no
-  force-through flag; the operator's next step is to resolve those approvals.
-* TERMINAL (approved/rejected/expired) -> `'slack'`, logged. It owes no wake, so
-  its kind can never misroute anything, and refusing on it would block the cutover
-  on rows that cannot hurt anyone.
+**The refusal is status-BLIND, because no status in this schema is provably
+inert.** An earlier revision let a settled (approved/rejected/expired) row take a
+fabricated `'slack'` on the theory that it owes no wake. It does owe one:
+`crud._RESUMABLE_STATUSES` is exactly `(approved, rejected, expired)`, so
+`resumequeue.resume_turn_for` builds a resume turn for all three, and
+`crud.reopen_dead_lettered_resume` clears `resumed_at` on a row whose resume was
+dead-lettered (#532), putting an already-resumed row back on the reconciler's
+work-list. Only `pending` owes nothing YET -- and it is the one status that
+certainly will. So a fabricated kind on a settled row does not avoid the
+misroute, it defers it to a wake nobody is watching for, which is strictly worse
+than an abort the operator can see. `'slack'` is written when, and only when, a
+row's own address resolves to a slack binding: earned provenance, never a
+default.
 
 **Stated rather than papered over: this preflight decides on the CURRENT binding,
 and the current binding is mutable.** `crud.update_agent_binding` rewrites kind and
@@ -67,14 +77,11 @@ SCHEMA = "curie"
 TABLE = "approvals"
 CHANNELS = "agent_channels"
 
-# The only kind a row with no usable provenance can honestly take, and only when
-# it is terminal. Inventing it for a pending row is the failure this refuses on.
+# The kind whose absence the downgrade checks for, and the only kind a row can
+# EARN from its own binding without being unrepresentable afterwards. It is never
+# a default here: inventing it for a row with no provenance is the failure this
+# migration refuses on, whatever that row's status.
 SLACK = "slack"
-
-# Statuses that owe no future wake. Kept as a literal tuple rather than imported
-# from the app: a migration is a historical record and must not change meaning
-# when `ApprovalStatus` grows a member.
-TERMINAL_STATUSES = ("approved", "rejected", "expired")
 
 logger = logging.getLogger("alembic.runtime.migration")
 
@@ -107,35 +114,29 @@ def upgrade() -> None:
         )
     ).all()
 
-    # 3. Refuse on ambiguity that still matters: a PENDING row.
-    blocking = [row for row in unreconstructable if row.status not in TERMINAL_STATUSES]
-    if blocking:
+    # 3. Refuse on ambiguity, whatever the row's status. A settled row is not
+    # inert here: `crud._RESUMABLE_STATUSES` is exactly (approved, rejected,
+    # expired), and #532 can re-open an already-resumed row, so every status can
+    # still owe a wake. Guessing buys a deferred misroute instead of an abort.
+    if unreconstructable:
         detail = "; ".join(
-            f"{row.id} (reply_channel {row.reply_channel!r}: "
+            f"{row.id} (reply_channel {row.reply_channel!r}, status {row.status}: "
             f"{'no binding' if row.kinds == 0 else f'{row.kinds} kinds'})"
-            for row in blocking
+            for row in unreconstructable
         )
         raise RuntimeError(
-            "cannot backfill approvals.reply_kind (#1459): these approvals are "
-            f"still pending and their channel kind cannot be established -- {detail}. "
-            "A pending approval carries a live resume obligation, and guessing its "
-            "kind would deliver its reply through the wrong adapter, which is the "
-            "silent misroute this column exists to prevent. Resolve or expire these "
-            "approvals (POST /approvals/{id}/resolve), then re-run this migration."
-        )
-
-    for row in unreconstructable:
-        logger.warning(
-            "approval %s (reply_channel %r) has no reconstructable channel kind; "
-            "it is terminal (%s) so it can never be resumed -- backfilling %r",
-            row.id,
-            row.reply_channel,
-            row.status,
-            SLACK,
+            "cannot backfill approvals.reply_kind (#1459): the channel kind of these "
+            f"approvals cannot be established from any binding -- {detail}. Guessing "
+            "a kind would deliver the reply through the wrong adapter, which is the "
+            "silent misroute this column exists to prevent, and no status is safe to "
+            "guess on: approved, rejected and expired rows are exactly the ones the "
+            "resume reconciler wakes, and a dead-lettered resume can re-open a row "
+            "that already woke. Re-point or restore the bindings these addresses "
+            "belong to, or delete the approvals, then re-run this migration."
         )
 
     # The provenance backfill: each row takes the kind of the binding its OWN
-    # address resolves to. Everything left over is terminal by the check above.
+    # address resolves to. Every row resolves to exactly one by the check above.
     conn.execute(
         sa.text(
             f"""
@@ -152,17 +153,16 @@ def upgrade() -> None:
             """
         )
     )
-    conn.execute(
-        sa.text(
-            f"UPDATE {SCHEMA}.{TABLE} SET reply_kind = :kind WHERE reply_kind IS NULL"
-        ),
-        {"kind": SLACK},
-    )
+    # No `SET reply_kind = 'slack' WHERE reply_kind IS NULL` sweep follows, and
+    # that absence is the fix: it was the fabrication path. Any row it could still
+    # reach is unreconstructable, and those aborted above; if one somehow survived,
+    # the SET NOT NULL below fails loudly rather than inventing a kind for it.
 
-    # Every pending row that was backfilled is logged for the cutover's
-    # operator-confirmation step: the preflight cannot distinguish a correct match
-    # from an address that was rebound since the approval was raised.
-    pending = conn.execute(
+    # Every backfilled row is logged for the cutover's operator-confirmation step:
+    # the preflight cannot distinguish a correct match from an address that was
+    # rebound since the approval was raised. Status-blind for the same reason the
+    # refusal is -- a settled row's wake can still be owed.
+    backfilled = conn.execute(
         sa.text(
             f"""
             SELECT id, reply_channel, reply_kind, status
@@ -171,7 +171,7 @@ def upgrade() -> None:
             """
         )
     ).all()
-    for row in (r for r in pending if r.status not in TERMINAL_STATUSES):
+    for row in backfilled:
         logger.info(
             "approval %s (reply_channel %r) backfilled to reply_kind %r; confirm this "
             "is the kind it was RAISED on, not merely the kind its address holds now",
