@@ -27,10 +27,11 @@ TARGET_IMAGE="${CURIE_NETPOL_TARGET_IMAGE:-hashicorp/http-echo:1.0}"
 
 SANDBOX_POD="netpol-probe-sandbox"
 OUTSIDE_POD="netpol-probe-outside"
+DENY_TARGET_POD="netpol-probe-deny-target"
 
 # Non-blocking on the way out: the run is over, nothing waits on the pods.
 cleanup() {
-  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" \
+  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 # BLOCKING before the apply. A previous run's pod may still be terminating, and
@@ -38,7 +39,7 @@ cleanup() {
 # `wait --for=Ready` then passes on a pod that is on its way out and every exec
 # after it fails for reasons that have nothing to do with policy.
 cleanup_and_settle() {
-  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" \
+  kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
     --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -51,8 +52,8 @@ kubectl -n "$NS" get networkpolicy "${RELEASE}-runner-default-deny-egress" >/dev
   || fail "no ${RELEASE}-runner-default-deny-egress in $NS; is the chart installed?"
 
 # The sandbox probe wears exactly the labels Rail 1 selects, so the policies
-# under test apply to it. The outside probe wears none, and is the target the
-# sandbox must NOT reach.
+# under test apply to it. The outside probe and deny target wear none of the
+# runner sandbox labels.
 cleanup_and_settle
 kubectl -n "$NS" apply -f - >/dev/null <<YAML
 apiVersion: v1
@@ -80,23 +81,37 @@ spec:
   restartPolicy: Never
   containers:
     - name: probe
+      image: $PROBE_IMAGE
+      command: ["sleep", "600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $DENY_TARGET_POD
+  labels:
+    app.kubernetes.io/name: netpol-probe-deny-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
       image: $TARGET_IMAGE
       args: ["-listen=:8000", "-text=reachable"]
 YAML
 
-kubectl -n "$NS" wait --for=condition=Ready "pod/$SANDBOX_POD" "pod/$OUTSIDE_POD" --timeout=180s >/dev/null \
+kubectl -n "$NS" wait --for=condition=Ready \
+  "pod/$SANDBOX_POD" "pod/$OUTSIDE_POD" "pod/$DENY_TARGET_POD" --timeout=180s >/dev/null \
   || fail "probe pods did not become ready"
 
-OUTSIDE_IP="$(kubectl -n "$NS" get pod "$OUTSIDE_POD" -o jsonpath='{.status.podIP}')"
-[ -n "$OUTSIDE_IP" ] || fail "could not read the outside probe's pod IP"
+DENY_TARGET_IP="$(kubectl -n "$NS" get pod "$DENY_TARGET_POD" -o jsonpath='{.status.podIP}')"
+[ -n "$DENY_TARGET_IP" ] || fail "could not read the deny target's pod IP"
 
 # ---------------------------------------------------------------------------
 # GATE: the deny must hold. Everything below is meaningless without this.
 # ---------------------------------------------------------------------------
 # Rail 1 denies all sandbox egress except what an allow policy adds, and nothing
-# allows the outside probe. Reaching it means policy is not being evaluated.
+# allows the deny target. Reaching it means policy is not being evaluated.
 if kubectl -n "$NS" exec "$SANDBOX_POD" -- \
-     curl -s -m 8 -o /dev/null "http://${OUTSIDE_IP}:8000/" 2>/dev/null; then
+     curl -s -m 8 -o /dev/null "http://${DENY_TARGET_IP}:8000/" 2>/dev/null; then
   fail "the sandbox reached a pod Rail 1 denies.
 
 This is NOT a policy bug -- it means the CNI is not enforcing NetworkPolicy at
@@ -112,9 +127,27 @@ Re-run against a cluster whose CNI enforces."
 fi
 echo "  ok  deny holds -- the CNI enforces NetworkPolicy (non-vacuity gate)"
 
+# The outside probe must reach the same known listener before its inability to
+# reach a connector can prove ingress enforcement. Otherwise a broken outside
+# network would make every connector ingress denial pass vacuously.
+if ! kubectl -n "$NS" exec "$OUTSIDE_POD" -- \
+      curl -s -m 8 -o /dev/null "http://${DENY_TARGET_IP}:8000/" 2>/dev/null; then
+  fail "the outside probe cannot reach the deny target; a broken outside network cannot certify connector ingress"
+fi
+echo "  ok  outside positive control reaches the deny target"
+
 # ---------------------------------------------------------------------------
 # Now the allow direction means something.
 # ---------------------------------------------------------------------------
+# The outside probe must resolve Service DNS before its inability to reach a
+# connector can prove ingress enforcement. Otherwise a broken outside DNS
+# path would make every connector ingress denial pass vacuously.
+if ! kubectl -n "$NS" exec "$OUTSIDE_POD" -- \
+      getent hosts kubernetes.default.svc.cluster.local >/dev/null 2>&1; then
+  fail "the outside probe cannot resolve DNS; connector ingress denial would be vacuous"
+fi
+echo "  ok  outside positive control resolves DNS"
+
 # DNS is the allow every sandbox depends on (curie-runner-allow-dns); without it
 # a sandbox cannot resolve any Service name, which surfaces as a confusing
 # connection failure rather than a policy error.
@@ -124,25 +157,40 @@ if ! kubectl -n "$NS" exec "$SANDBOX_POD" -- \
 fi
 echo "  ok  allow holds -- the sandbox can resolve DNS"
 
-# Any connector Service present is exercised too: this is the rule that was
-# silently broken by the ipBlock form, so it is the one most worth asserting.
-CONNECTORS="$(kubectl -n "$NS" get svc -l app.kubernetes.io/part-of="$RELEASE" \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -- "-mcp-" || true)"
-if [ -z "$CONNECTORS" ]; then
-  echo "  --  no connector Services in $NS; skipping the connector reachability leg"
-else
-  while IFS= read -r svc; do
-    [ -n "$svc" ] || continue
-    PORT="$(kubectl -n "$NS" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')"
-    kubectl -n "$NS" exec "$SANDBOX_POD" -- \
-      curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null \
-      || fail "the sandbox cannot reach connector Service $svc:$PORT.
+# Every connector Service is exercised in both directions. A missing Service
+# makes the connector policy check vacuous and is therefore fatal.
+CONNECTORS=()
+while IFS= read -r svc; do
+  [ -n "$svc" ] && CONNECTORS+=("$svc")
+done < <(
+  kubectl -n "$NS" get svc -l app.kubernetes.io/part-of="$RELEASE" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+    | grep -- "-mcp-" || true
+)
+CONNECTOR_COUNT="${#CONNECTORS[@]}"
+(( CONNECTOR_COUNT > 0 )) \
+  || fail "found 0 connector Services in $NS; connector NetworkPolicy enforcement would be vacuous"
+echo "  ok  connector Service count: $CONNECTOR_COUNT"
+
+for svc in "${CONNECTORS[@]}"; do
+  kubectl -n "$NS" rollout status "deployment/$svc" --timeout=180s >/dev/null 2>&1 \
+    || fail "connector Deployment $svc did not become ready"
+
+  PORT="$(kubectl -n "$NS" get svc "$svc" -o jsonpath='{.spec.ports[0].port}')"
+  kubectl -n "$NS" exec "$SANDBOX_POD" -- \
+    curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null \
+    || fail "the sandbox cannot reach connector Service $svc:$PORT.
 
 Its egress rule is applied but not matching. The usual cause is an ipBlock of
 the Service ClusterIP: kube-proxy DNATs the destination to a pod IP before
 NetworkPolicy is evaluated, so such a rule can never match (ADR-0086)."
-    echo "  ok  sandbox reaches connector $svc:$PORT"
-  done <<<"$CONNECTORS"
-fi
+  echo "  ok  sandbox reaches connector $svc:$PORT"
 
-echo "== Rail 1 enforces, and every allowed path is reachable =="
+  if kubectl -n "$NS" exec "$OUTSIDE_POD" -- \
+       curl -s -m 10 -o /dev/null "http://${svc}:${PORT}/" 2>/dev/null; then
+    fail "the outside probe reached connector Service $svc:$PORT; connector ingress is not restricted to runner sandboxes"
+  fi
+  echo "  ok  outside probe cannot reach connector $svc:$PORT"
+done
+
+echo "== Rail 1, connector egress, and connector ingress enforce =="
