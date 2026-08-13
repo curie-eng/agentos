@@ -130,11 +130,8 @@ class ConnectorSpec(BaseModel):
     # it is unaffected, which is what lets this land as a backward-compatible
     # change to a frozen contract.
     #
-    # The worker's reconciler decrypts these with the cluster's sealing key and
-    # writes the plaintext into the agent's own Secret. A blob it cannot open
-    # SKIPS that agent and leaves the running connector alone -- deploying it
-    # without the credential would produce a pod that passes its health check
-    # and 401s every call, the #1156 shape ADR-0094 exists to avoid.
+    # Validation refuses this field until a production decrypt path exists.
+    # This prevents a connector from deploying without the credential it needs.
     sealed_secrets: dict[str, str] = Field(default_factory=dict)
 
     #   secret_files:                         Project a stored secret as a FILE
@@ -424,6 +421,15 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "the credential it needs.",
                     )
                 )
+        if spec.sealed_secrets:
+            errors.append(
+                (
+                    "connectors.sealed_secrets_unsupported",
+                    f"{where}: `sealed_secrets` is declared but nothing decrypts it yet. "
+                    "Refusing rather than deploying without its credential. "
+                    "Use `secrets:` until then.",
+                )
+            )
         seen_secret_names: set[str] = set()
         for secret_name in spec.secret_names():
             if secret_name in seen_secret_names:
