@@ -3920,7 +3920,7 @@ export const commandManifest = {
           "name": "contracts"
         },
         {
-          "about": "Render-assert the Helm chart (`bash charts/curie/ci/render-assertions.sh`)",
+          "about": "Discover and run every executable shell assertion directly in charts/curie/ci",
           "hidden": false,
           "name": "chart-check"
         },

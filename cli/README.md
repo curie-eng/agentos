@@ -567,15 +567,18 @@ checkout it errors clearly -- a release binary has nothing to install.
 ### `curie dev`
 
 Thin wrappers over the repo's dev scripts, so contributors get one unified
-`curie <command>` surface while the scripts stay the implementation. Each finds
-the repo root, confirms the script exists, shells `bash <script>` from the root,
-streams its output, and propagates its exit code. Run outside a source checkout
-they error clearly -- a release binary has no dev scripts.
+`curie <command>` surface while the scripts stay the implementation. Most find
+the repo root, confirm one script exists, shell `bash <script>` from the root,
+stream its output, and propagate its exit code. `curie dev chart-check` instead
+discovers every direct executable chart assertion under `charts/curie/ci`, runs
+all of them, reports each result, and returns aggregate failure after every
+script finishes. Run outside a source checkout they error clearly because a
+release binary has no dev scripts.
 
 | Command | What it does |
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
-| `curie dev chart-check` | `bash charts/curie/ci/render-assertions.sh` -- render-assert the Helm chart. |
+| `curie dev chart-check` | Discover direct executable chart assertions under `charts/curie/ci`, run every one, report each result, and return aggregate failure after all scripts finish. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
 | `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |

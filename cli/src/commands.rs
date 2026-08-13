@@ -5,6 +5,7 @@
 //! scaffold, state, evals, render).
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -612,6 +613,91 @@ pub async fn dev_script(rel_path: &str) -> Result<()> {
         .context("failed to invoke bash")?;
     if !status.success() {
         bail!("{rel_path} failed ({status})");
+    }
+    Ok(())
+}
+
+/// Discover and run every executable shell assertion directly in the chart CI directory.
+pub async fn chart_check() -> Result<()> {
+    let ui = crate::ui::ui();
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout because a release binary has no dev scripts.",
+    )?;
+    let assertions_dir = root.join("charts/curie/ci");
+    let entries = std::fs::read_dir(&assertions_dir).with_context(|| {
+        format!(
+            "failed to read chart assertion directory: {}",
+            assertions_dir.display()
+        )
+    })?;
+    let mut scripts = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry in chart assertion directory: {}",
+                assertions_dir.display()
+            )
+        })?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let permissions = entry
+            .metadata()
+            .with_context(|| format!("failed to read permissions for {}", entry.path().display()))?
+            .permissions();
+        if permissions.mode() & 0o111 != 0 {
+            scripts.push(entry.file_name());
+        }
+    }
+    scripts.sort();
+    if scripts.is_empty() {
+        bail!(
+            "no executable shell assertions found in {}",
+            assertions_dir.display()
+        );
+    }
+
+    let mut failed = Vec::new();
+    for file_name in scripts {
+        let rel_path = Path::new("charts/curie/ci").join(&file_name);
+        let display_name = file_name.to_string_lossy();
+        ui.note(&format!(
+            "=== bash {} (in {}) ===",
+            rel_path.display(),
+            root.display()
+        ));
+        match tokio::process::Command::new("bash")
+            .arg(&rel_path)
+            .current_dir(&root)
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                ui.success(&format!("PASS {display_name}"));
+            }
+            Ok(status) => {
+                ui.failure(&format!("FAIL {display_name} ({status})"));
+                failed.push(display_name.into_owned());
+            }
+            Err(error) => {
+                ui.failure(&format!(
+                    "FAIL {display_name} because bash could not start: {error}"
+                ));
+                failed.push(display_name.into_owned());
+            }
+        }
+    }
+
+    if !failed.is_empty() {
+        bail!(
+            "{} chart assertion scripts failed: {}",
+            failed.len(),
+            failed.join(", ")
+        );
     }
     Ok(())
 }
