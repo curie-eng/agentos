@@ -609,13 +609,72 @@ class ChannelBinding(BaseModel):
         return self
 
 
+class ChannelBindingWrite(ChannelBinding):
+    """The WRITE side of a binding: the public pair plus its reply ROUTE.
+
+    A separate model from `ChannelBinding` because that one doubles as
+    `AgentOut.channel` in RESPONSES, and the public read contract is exactly
+    `{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and
+    `adapter` are server-controlled facts an operator configures at bind time --
+    where this kind's replies go back through, and which egress credential
+    authenticates them -- so they are durable on the row and ABSENT from every
+    read. A write-side policy on the shared model would 422 valid reads and
+    leak a write rule into a read contract.
+
+    Three rules, stated here because this is the write path every caller (UI,
+    API, CLI) passes through; `agent_channels_route_pair_ck` states the first of
+    them at the database for out-of-band writers:
+
+    - **Both or neither.** A half-configured route is an operator error that
+      would otherwise surface as a fail-closed escalation mid-turn, in the
+      worker, far from the request that caused it.
+    - **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,
+      migration 0024 backfills every existing row to exactly that, and the
+      cutover binds the agent first and PATCHes the route in later. The gate for
+      an unroutable binding is `POST /channels/token`, which refuses (409) to
+      mint for a non-`slack` binding with no route -- `slack`'s route is
+      legitimately implicit (the worker's configured Slack origin).
+    - **`adapter` is a lowercase slug**, on the same pattern as `kind`, because
+      it is a CONFIG-MAP KEY on the worker
+      (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a
+      space or a `:` is a config-injection shape, not a name.
+    """
+
+    endpoint: str | None = None
+    adapter: str | None = None
+
+    @model_validator(mode="after")
+    def _check_route(self) -> "ChannelBindingWrite":
+        if (self.endpoint is None) != (self.adapter is None):
+            missing = "adapter" if self.endpoint is not None else "endpoint"
+            present = "endpoint" if missing == "adapter" else "adapter"
+            raise ValueError(
+                f"channel route is half-configured: {present} is set but "
+                f"{missing} is not. A reply route needs both halves -- where the "
+                "reply goes (endpoint) and which egress credential authenticates "
+                f"it (adapter) -- so set {missing} too, or send neither and "
+                "configure the route later."
+            )
+        if self.adapter is not None and not _CHANNEL_KIND.match(self.adapter):
+            raise ValueError(
+                f"channel adapter {self.adapter!r} is not an adapter name: an "
+                "adapter names the egress identity whose credential authenticates "
+                "the reply and is used as a config key by the worker, so it must "
+                "be a lowercase slug (e.g. 'agentmail-sandbox', 'ms-teams')."
+            )
+        return self
+
+
 class AgentCreate(BaseModel):
     name: str
     # Required, and singular. Every create path supplies exactly one binding
     # today (the CLI defaults to C0LOCALDEV), and an agent with no binding
     # cannot receive a turn -- it would look deployed and healthy while
     # answering nothing, which is #38's silent-shadow failure.
-    channel: ChannelBinding
+    #
+    # The WRITE model: a create may also configure the reply route (ADR-0096
+    # phase 2). `AgentOut.channel` stays the read-only `{kind, address}` pair.
+    channel: ChannelBindingWrite
     repo_full_name: str | None = None
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
@@ -670,7 +729,7 @@ class AgentUpdate(BaseModel):
     # `json_schema_extra` keeps the PUBLISHED contract honest about that: the
     # annotation has to admit `None` for the omitted case, but the exported
     # OpenAPI must not offer `null` as a value a client may send.
-    channel: ChannelBinding | None = Field(
+    channel: ChannelBindingWrite | None = Field(
         default=None, json_schema_extra=_channel_schema_omittable_not_null
     )
     # New per-agent model id (#254). OMITTED leaves the current model unchanged;

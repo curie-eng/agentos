@@ -21,7 +21,7 @@ from .models import (
 from .schemas import (
     AgentCreate,
     ApprovalRequest,
-    ChannelBinding,
+    ChannelBindingWrite,
     DeploymentCreate,
     VersionCreate,
 )
@@ -64,7 +64,17 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # the agent row and its binding are one transaction: a unique-constraint
         # collision on either rolls BOTH back, and no agent is ever left behind
         # bound to nothing (#38's silent-shadow state).
-        channel=AgentChannel(kind=data.channel.kind, address=data.channel.address),
+        # `endpoint`/`adapter` are the server-controlled reply route (ADR-0096
+        # phase 2): both NULL for `slack` and for a binding whose route is
+        # configured later, both set together otherwise. The write schema has
+        # already refused a half-configured pair, and
+        # `agent_channels_route_pair_ck` refuses one from an out-of-band writer.
+        channel=AgentChannel(
+            kind=data.channel.kind,
+            address=data.channel.address,
+            endpoint=data.channel.endpoint,
+            adapter=data.channel.adapter,
+        ),
         repo_full_name=data.repo_full_name,
         model=data.model,
         thinking=data.thinking,
@@ -120,7 +130,7 @@ async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
 
 
 async def update_agent_binding(
-    session: AsyncSession, agent: Agent, channel: ChannelBinding
+    session: AsyncSession, agent: Agent, channel: ChannelBindingWrite
 ) -> Agent:
     """Move the agent's single binding to a new kind/address (ADR-0096, #1459).
 
@@ -142,6 +152,12 @@ async def update_agent_binding(
 
     agent.channel.kind = channel.kind
     agent.channel.address = channel.address
+    # The reply route moves WITH the binding (ADR-0096 phase 2): a PATCH that
+    # re-points the pair and leaves the old endpoint/adapter behind would send
+    # the new route's replies to the previous adapter, authenticated as it. This
+    # is also the cutover's step 10 -- bind first, PATCH the route in later.
+    agent.channel.endpoint = channel.endpoint
+    agent.channel.adapter = channel.adapter
     agent.channel.generation += 1
     return await _refresh_with_channel(session, agent)
 

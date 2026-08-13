@@ -42,7 +42,7 @@
             ]
           },
           "channel": {
-            "$ref": "#/components/schemas/ChannelBinding"
+            "$ref": "#/components/schemas/ChannelBindingWrite"
           },
           "model": {
             "anyOf": [
@@ -256,7 +256,7 @@
             "title": "Approval Routes"
           },
           "channel": {
-            "$ref": "#/components/schemas/ChannelBinding"
+            "$ref": "#/components/schemas/ChannelBindingWrite"
           },
           "model": {
             "anyOf": [
@@ -1015,6 +1015,88 @@
           "address"
         ],
         "title": "ChannelBinding",
+        "type": "object"
+      },
+      "ChannelBindingWrite": {
+        "additionalProperties": false,
+        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because that one doubles as\n`AgentOut.channel` in RESPONSES, and the public read contract is exactly\n`{kind, address}` (ADR-0096 phase 2, EB-A18 as relocated). `endpoint` and\n`adapter` are server-controlled facts an operator configures at bind time --\nwhere this kind's replies go back through, and which egress credential\nauthenticates them -- so they are durable on the row and ABSENT from every\nread. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThree rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_pair_ck` states the first of\nthem at the database for out-of-band writers:\n\n- **Both or neither.** A half-configured route is an operator error that\n  would otherwise surface as a fail-closed escalation mid-turn, in the\n  worker, far from the request that caused it.\n- **Both absent is legal**, for every kind. The 0024 CHECK permits both-NULL,\n  migration 0024 backfills every existing row to exactly that, and the\n  cutover binds the agent first and PATCHes the route in later. The gate for\n  an unroutable binding is `POST /channels/token`, which refuses (409) to\n  mint for a non-`slack` binding with no route -- `slack`'s route is\n  legitimately implicit (the worker's configured Slack origin).\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelBindingWrite",
+        "type": "object"
+      },
+      "ChannelTokenOut": {
+        "properties": {
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "ChannelTokenOut",
+        "type": "object"
+      },
+      "ChannelTokenRequest": {
+        "additionalProperties": false,
+        "description": "Mint request: the binding pair to scope the token to, plus its lifetime.\n\nSubclasses `ChannelBinding` so the SAME `_validate_channel_binding` the\nagents API runs judges the pair here (E11). Two write paths cannot drift\ninto two rules -- that drift is how #143 happened -- and an operator reads\nthe identical message from either endpoint.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 3600,
+            "exclusiveMinimum": 0.0,
+            "maximum": 604800.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelTokenRequest",
         "type": "object"
       },
       "ConnectorManifests": {
@@ -2493,6 +2575,37 @@
           "tree"
         ],
         "title": "TraceTree",
+        "type": "object"
+      },
+      "TurnAccepted": {
+        "description": "The ingress receipt. `duplicate` says whether THIS request enqueued.\n\n`stream_id` is None only while another request holds the claim and has not\nenqueued yet (the 202 case): there is no id to hand back yet, and the\nadapter's retry loop already knows what \"come back\" means.",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "stream_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Id"
+          }
+        },
+        "required": [
+          "event_id",
+          "stream_id",
+          "duplicate"
+        ],
+        "title": "TurnAccepted",
         "type": "object"
       },
       "ValidationError": {
@@ -5209,6 +5322,116 @@
         "summary": "Resolve Approval",
         "tags": [
           "approvals"
+        ]
+      }
+    },
+    "/channels/token": {
+      "post": {
+        "description": "Mint a `chn` token for one binding (platform key only).\n\nPlatform-key-only on purpose: a `chn` token does exactly one thing, enqueue\nfor the binding in its claims. If it could mint, a compromised adapter would\ndefeat both the TTL and the generation -- the only two things standing in for\na revocation list.\n\nThe token claims the ROW's id and its CURRENT generation, so it dies both\nwhen the pair is deleted and recreated (a new row id) and when the binding is\nre-pointed or merely re-asserted (a bumped generation).",
+        "operationId": "mint_channel_token_channels_token_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelTokenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Channel Token",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
+    "/channels/turns": {
+      "post": {
+        "description": "Enqueue one inbound delivery for the binding the body names.\n\nOrder is load-bearing. The size bound runs FIRST, before authentication and\nbefore JSON parsing, so an oversized body is refused without the server ever\nHMAC-verifying or deserializing it. The body is validated next because the\ncredential is scoped to the binding the body CLAIMS -- there is nothing to\nverify a `chn` token against until the pair is known. Only then is the\nrequest authenticated, and only then does an unknown pair earn a 404: a\ncaller with no credential learns nothing about which bindings exist.",
+        "operationId": "ingest_turn_channels_turns_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Turn",
+        "tags": [
+          "channels"
         ]
       }
     },

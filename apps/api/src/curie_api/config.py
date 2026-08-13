@@ -276,6 +276,28 @@ class Settings(BaseSettings):
     runner_namespace: str = "curie"
     runner_pod_label_selector: str = "app.kubernetes.io/component=runner-sandbox"
 
+    # Channel ingress (ADR-0096 phase 2, #1459). The turn body bound is enforced
+    # BEFORE authentication and before JSON parsing (`routers/channels.py`), so an
+    # oversized body is refused without the server ever HMAC-verifying or
+    # deserializing it -- the same posture `github_webhook_max_body_bytes` takes
+    # above, two orders of magnitude tighter because a turn is a message, not a
+    # git payload, and 256 KiB is far above any real email body an adapter
+    # extracts. The route is reachable from outside the first-party network, so
+    # the bound is what keeps it from being an unauthenticated memory-pressure
+    # surface.
+    channel_turn_max_body_bytes: int = 256 * 1024  # 256 KiB
+    # The delivery claim's lease: how long ONE in-flight ingress request owns a
+    # `delivery_id` before a retry may take it. Deliberately short -- it bounds
+    # how long a delivery whose winner died stays un-enqueued (nothing else
+    # recovers that case), while being far longer than the enqueue it covers.
+    channel_delivery_lease_s: int = 300
+    # How long the claim key survives as the RECEIPT once the turn is enqueued:
+    # the replay window in which a retry is answered with the original
+    # `event_id`/`stream_id` instead of enqueuing a second turn. Mirrors the
+    # dispatcher's `dedupe_ttl_seconds` (3600), whose guard this one is the
+    # structural sibling of.
+    channel_delivery_receipt_ttl_s: int = 3600
+
     def valkey_dsn(self) -> str:
         if self.valkey_url:
             return self.valkey_url
