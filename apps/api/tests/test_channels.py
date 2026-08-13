@@ -26,6 +26,7 @@ import os
 import re
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -34,6 +35,7 @@ from aci_protocol import QueuedTurn
 from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
+from curie_api.routers import channels as channels_router
 from curie_test_support.valkey import connect_or_skip
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -323,6 +325,86 @@ def test_the_mint_refuses_a_non_slack_binding_whose_route_is_unset(
         headers=auth_headers,
     )
     assert slack.status_code == 200, slack.text
+
+
+def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """AC13b / E17: the route check belongs on BOTH endpoints, not just the mint.
+
+    Refusing at `POST /channels/token` closes the token-bearing path only. The
+    platform key is accepted at the ingress by design (auth order:
+    `verify_platform_key` first), so an operator or first-party caller can post a
+    turn for a route-less non-Slack binding without ever minting a token -- and
+    that turn is enqueued with `endpoint=None, adapter=None`, fails closed in the
+    worker's `HttpReplyAdapter`, and escalates to a human far from the request
+    that caused it. That is exactly the mid-turn failure E17 exists to prevent,
+    so the ingress must refuse it with the mint's semantics.
+
+    The two negatives that keep the guard honest: `slack` needs no HTTP route
+    (D4.4) and must still enqueue, and a fully routed email binding must still
+    enqueue -- a guard written as "refuse when endpoint is None" without the
+    kind test would break every Slack turn on the platform.
+    """
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="unroutable-email",
+        channel=_channel("email", "unroutable@example.test"),
+    )
+    _bind(
+        channels_client,
+        auth_headers,
+        name="routeless-slack",
+        channel=_channel("slack", "C0NOROUT1"),
+    )
+    _bind(
+        channels_client,
+        auth_headers,
+        name="routed-email",
+        channel=_email_channel("routed-ingress@example.test"),
+    )
+
+    mint_refusal = channels_client.post(
+        "/channels/token",
+        json={"kind": "email", "address": "unroutable@example.test", "ttl_s": 60},
+        headers=auth_headers,
+    )
+    assert mint_refusal.status_code == 409, mint_refusal.text
+
+    refused = _post_turn(
+        channels_client,
+        None,
+        _turn("email", "unroutable@example.test"),
+        headers=auth_headers,
+    )
+    # Same status and the same shape of explanation the mint gives, so an
+    # operator meets one rule stated once rather than two half-rules.
+    assert refused.status_code == 409, refused.text
+    assert "no reply route" in refused.text, refused.text
+    assert "endpoint" in refused.text and "adapter" in refused.text, refused.text
+    assert _turns_on(valkey, runs_stream) == []
+
+    slack = _post_turn(
+        channels_client, None, _turn("slack", "C0NOROUT1"), headers=auth_headers
+    )
+    assert slack.status_code == 200, slack.text
+
+    routed = _post_turn(
+        channels_client,
+        None,
+        _turn("email", "routed-ingress@example.test"),
+        headers=auth_headers,
+    )
+    assert routed.status_code == 200, routed.text
+
+    kinds = {turn.reply_handle.kind for turn in _turns_on(valkey, runs_stream)}
+    assert kinds == {"slack", "email"}
 
 
 def test_the_mint_is_platform_key_only_and_refuses_a_channel_token(
@@ -686,6 +768,166 @@ def test_the_401_matrix_is_uniform_and_never_leaks_which_half_failed(
     # the request shape.
     ok = _post_turn(channels_client, valid, body)
     assert ok.status_code == 200, ok.text
+
+
+@pytest.fixture
+def tight_backlog_quota() -> Iterator[int]:
+    """Lower the per-binding quota so a test can cross it in three requests.
+
+    The window is widened rather than left at 60s: the counter key is bucketed
+    by `int(time.time()) // window_s`, so a test straddling a real window
+    boundary would silently get its slots back and pass while asserting nothing.
+    """
+
+    limit = 2
+    os.environ["CHANNEL_BINDING_BACKLOG_LIMIT"] = str(limit)
+    os.environ["CHANNEL_BINDING_BACKLOG_WINDOW_S"] = "3600"
+    get_settings.cache_clear()
+    yield limit
+    os.environ.pop("CHANNEL_BINDING_BACKLOG_LIMIT", None)
+    os.environ.pop("CHANNEL_BINDING_BACKLOG_WINDOW_S", None)
+    get_settings.cache_clear()
+
+
+def test_the_backlog_quota_is_per_binding_and_never_charges_a_retry(
+    tight_backlog_quota: int,
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """The per-binding backlog quota (`channel_binding_backlog_limit`).
+
+    A `chn` token is SCOPED to a binding but not METERED by one, so without this
+    a compromised adapter submits unlimited unique `delivery_id`s and fills the
+    shared stream -- and, since receipts are permanent, the shared Valkey -- for
+    every other tenant. The cap is on NEW work per binding.
+
+    Three properties, and each one is a different way to get this wrong:
+
+    - crossing the limit is a 429 carrying `Retry-After`, not a silent drop and
+      not a queued turn (MUTATION: delete the quota eval and every post is 200);
+    - the counter is keyed by `channel_id`, so a second binding is unaffected
+      (MUTATION: drop `channel_id` from the counter key and binding B's post
+      429s -- one noisy adapter would mute every other tenant, which is the
+      failure this quota exists to prevent, wearing a different hat);
+    - a RETRY of a delivery already through is free, because the slot is taken
+      only once a claim is WON (MUTATION: count before the claim and the retry
+      below 429s, which would punish exactly the well-behaved adapter behavior
+      the idempotency design asks for).
+    """
+
+    _bind(
+        channels_client,
+        auth_headers,
+        name="quota-binding-a",
+        channel=_email_channel("quota-a@example.test"),
+    )
+    _bind(
+        channels_client,
+        auth_headers,
+        name="quota-binding-b",
+        channel=_email_channel("quota-b@example.test"),
+    )
+    token_a = _mint(channels_client, auth_headers, kind="email", address="quota-a@example.test")
+    token_b = _mint(channels_client, auth_headers, kind="email", address="quota-b@example.test")
+
+    spent = [_turn("email", "quota-a@example.test") for _ in range(tight_backlog_quota)]
+    for body in spent:
+        accepted = _post_turn(channels_client, token_a, body)
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["duplicate"] is False
+
+    # At the cap, a RETRY of a delivery already through is still answered from
+    # its receipt: it never reaches the meter.
+    retry = _post_turn(channels_client, token_a, spent[0])
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["duplicate"] is True
+
+    # The next NEW delivery on this binding is refused, with the header that
+    # tells the adapter how long the window is.
+    refused = _post_turn(channels_client, token_a, _turn("email", "quota-a@example.test"))
+    assert refused.status_code == 429, refused.text
+    assert refused.headers["Retry-After"] == "3600", dict(refused.headers)
+
+    # Per binding, not global.
+    other = _post_turn(channels_client, token_b, _turn("email", "quota-b@example.test"))
+    assert other.status_code == 200, other.text
+    assert other.json()["duplicate"] is False
+
+    turns = _turns_on(valkey, runs_stream)
+    assert len(turns) == tight_backlog_quota + 1
+
+    for channel_id in {t.event_id.split("-", 1)[1].rsplit("-", 1)[0] for t in turns}:
+        for key in list(valkey.scan_iter(match=f"*:{channel_id}:*")):
+            valkey.delete(key)
+
+
+def test_a_rebind_landing_after_verification_is_still_caught_at_the_enqueue(
+    channels_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generation RE-READ immediately before the claim, distinct from T-C8.
+
+    T-C8 rebinds before the request starts, so the token dies at the auth layer
+    and the recheck is never consulted. This is the other case: the credential
+    verifies against the row as loaded at the top of the request, and the rebind
+    commits DURING the request -- between verification and the enqueue. Without
+    the re-read, a credential an operator has just revoked still gets one turn
+    onto the stream for a binding it no longer names, which is the one turn most
+    likely to matter (an operator re-points a route precisely because something
+    is wrong with it).
+
+    The rebind is landed at the real seam by wrapping `_mint_turn`, which the
+    handler calls between `_authorize` and the re-read. MUTATION: delete the
+    re-read (trust the dependency's check alone) and this enqueues a turn.
+    """
+
+    agent_id = _bind(
+        channels_client,
+        auth_headers,
+        name="mid-request-rebind",
+        channel=_email_channel("midflight@example.test"),
+    )
+    token = _mint(channels_client, auth_headers, kind="email", address="midflight@example.test")
+    real_mint_turn = channels_router._mint_turn
+
+    def _bump_generation() -> None:
+        async def run() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        sql_text(
+                            "UPDATE curie.agent_channels SET generation = "
+                            "generation + 1 WHERE agent_id = :aid"
+                        ),
+                        {"aid": agent_id},
+                    )
+            finally:
+                await engine.dispose()
+
+        asyncio.run(run())
+
+    def mint_turn_then_rebind(*args: Any, **kwargs: Any) -> Any:
+        turn = real_mint_turn(*args, **kwargs)
+        # A committed rebind, in the window the re-read exists to narrow. Run on
+        # another thread because we are inside the app's event loop.
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(_bump_generation).result(timeout=30)
+        return turn
+
+    monkeypatch.setattr(channels_router, "_mint_turn", mint_turn_then_rebind)
+
+    refused = _post_turn(channels_client, token, _turn("email", "midflight@example.test"))
+    assert refused.status_code == 401, refused.text
+    assert refused.json()["detail"] == AUTH_DETAIL
+    assert _turns_on(valkey, runs_stream) == []
 
 
 def _other_routes() -> list[tuple[str, str]]:

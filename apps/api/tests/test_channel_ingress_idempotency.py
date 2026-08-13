@@ -408,17 +408,66 @@ def test_a_retry_waits_for_the_lease_then_wins_it_cleanly(
     assert entries[-1][0] == late.json()["stream_id"]
 
 
-def test_the_claim_lease_carries_an_expiry(
+def test_the_pending_lease_expires_but_the_receipt_never_does(
     channels_client: TestClient,
     binding: Binding,
     valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The lease is what makes (c) recoverable at all: a claim written without an
-    # EX strands every future retry of that delivery forever. -1 is "no expiry".
+    """The claim key has TWO phases with OPPOSITE expiry contracts.
+
+    - `pending:<token>` carries the lease TTL. That expiry is what makes (c)
+      recoverable: a claim written without one strands every future retry of a
+      crashed winner's delivery forever.
+    - the stream id is a RECEIPT, and it is PERMANENT ("no NX, no EX: the claim
+      becomes the receipt", plan EB-C5). Putting the lease's expiry on the
+      receipt looks harmless and is the worst defect in the file: once it
+      lapses, the same `delivery_id` wins a fresh `NX`, enqueues a second time,
+      and the correspondent gets the email twice -- silently, days later, only
+      for deliveries an adapter happens to retry after the window.
+
+    Both phases are observed on the REAL path: the wrapper reads the key in the
+    instant between the claim and the script, which is the only moment the
+    pending value exists.
+    """
+
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    assert _post(channels_client, binding, body).status_code == 200
+    real_claim = channels_router._claim_delivery
+    pending: dict[str, Any] = {}
+
+    async def claim_then_inspect(*args: Any, **kwargs: Any) -> Any:
+        result = await real_claim(*args, **kwargs)
+        key = _claim_key(valkey, binding.channel_id, body["delivery_id"])
+        pending["value"] = valkey.get(key)
+        pending["ttl"] = valkey.ttl(key)
+        return result
+
+    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_inspect)
+
+    first = _post(channels_client, binding, body)
+    assert first.status_code == 200, first.text
+
+    # Phase 1: an owned lease, and it is time-bounded.
+    assert str(pending["value"]).startswith("pending:"), pending
+    assert pending["ttl"] > 0, pending
+
+    # Phase 2: the receipt, and it is not. -1 is redis for "no expiry set"; -2
+    # would mean the key is already gone.
     key = _claim_key(valkey, binding.channel_id, body["delivery_id"])
-    assert valkey.ttl(key) > 0
+    assert valkey.get(key) == first.json()["stream_id"]
+    assert valkey.ttl(key) == -1, (
+        "the success receipt must be permanent; an expiry here lets the same "
+        "delivery_id re-enqueue after the window and doubles the reply"
+    )
+
+    # And the consequence, stated as behavior: a replay arriving arbitrarily
+    # later is still answered from the receipt, with no second entry.
+    replay = _post(channels_client, binding, body)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["duplicate"] is True
+    assert replay.json()["stream_id"] == first.json()["stream_id"]
+    assert len(_entries(valkey, runs_stream)) == 1
 
 
 # --- (c3) the resumed owner that finds an EMPTY key ---------------------------
@@ -468,8 +517,12 @@ def test_a_resumed_owner_with_an_expired_uncontested_lease_still_enqueues(
     entries = _entries(valkey, runs_stream)
     assert len(entries) == 1, entries
     assert entries[0][0] == resumed.json()["stream_id"]
-    # The re-claim left the receipt behind, so a later replay is still answered.
+    # The re-claim left the receipt behind, so a later replay is still answered
+    # -- and branch (b)'s receipt is as PERMANENT as branch (a)'s. The two arms
+    # write the receipt in two places, which is exactly where an expiry gets
+    # fixed on one and left on the other.
     assert valkey.get(expired["key"]) == resumed.json()["stream_id"]
+    assert valkey.ttl(expired["key"]) == -1
 
 
 # --- (c2) the slow LIVE winner ------------------------------------------------
@@ -651,6 +704,7 @@ def test_the_ingress_claim_matches_the_dispatchers_set_nx_ex_primitive(
     channels_client: TestClient,
     binding: Binding,
     valkey: redis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """T-C10 (f). The dispatcher's `already_enqueued` guard and this claim are
     structural siblings (`queue.py:70-77`), and sibling-path drift is this
@@ -664,12 +718,28 @@ def test_the_ingress_claim_matches_the_dispatchers_set_nx_ex_primitive(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    assert _post(channels_client, binding, body).status_code == 200
-    key = _claim_key(valkey, binding.channel_id, body["delivery_id"])
+    real_claim = channels_router._claim_delivery
+    pending: dict[str, Any] = {}
 
-    assert valkey.ttl(key) > 0
-    # First-writer-wins: a second NX against a live claim does not take it.
-    assert not valkey.set(key, "pending:someone-else", nx=True, ex=60)
+    async def claim_then_inspect(*args: Any, **kwargs: Any) -> Any:
+        result = await real_claim(*args, **kwargs)
+        key = _claim_key(valkey, binding.channel_id, body["delivery_id"])
+        pending["ttl"] = valkey.ttl(key)
+        # First-writer-wins, asserted while the claim is LIVE: a second NX
+        # against a held lease does not take it. This is the dispatcher's
+        # primitive exactly.
+        pending["nx_taken"] = bool(
+            valkey.set(key, "pending:someone-else", nx=True, ex=60)
+        )
+        return result
+
+    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_inspect)
+
+    assert _post(channels_client, binding, body).status_code == 200
+    # The LEASE is what carries the expiry; the receipt it becomes does not
+    # (asserted by the pending-vs-receipt test above).
+    assert pending["ttl"] > 0, pending
+    assert pending["nx_taken"] is False, pending
 
     # Corroboration only (the behavioral half above is the proof): both call
     # sites reach for the same primitive, so a future rewrite of one is visible

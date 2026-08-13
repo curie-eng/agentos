@@ -74,13 +74,15 @@ return 1
 """
 
 # Clear the record and its set membership together, but only when the record is
-# still the one the caller read. A stored generation that does not match means
-# some other pass rewrote it; the safe answer is to touch nothing and let that
-# pass own its own clear. An ABSENT generation is a record written before this
-# field existed, and it clears unconditionally exactly as it did then.
+# still the one the caller read. A stored generation that does not match -- a
+# different one, or none at all -- means this is not the record the caller read;
+# the safe answer is to touch nothing and let whoever owns it own its clear.
+# There is no unconditional arm: a record with no generation is MALFORMED, never
+# a legacy shape, because the outbox is introduced by this train and every
+# writer sets the field. Clearing on an absent generation would let one pass
+# delete a record it never read.
 _CLEAR_COMPLETION_LUA = """
-local gen = redis.call('HGET', KEYS[1], ARGV[2])
-if gen == false or gen == ARGV[1] then
+if redis.call('HGET', KEYS[1], ARGV[2]) == ARGV[1] then
   redis.call('DEL', KEYS[1])
   redis.call('SREM', KEYS[2], ARGV[3])
   return 1
@@ -106,24 +108,31 @@ class CompletionRecord(BaseModel):
     done: bool = False
 
 
+class MalformedCompletionError(RuntimeError):
+    """A stored completion record is missing a field every writer sets.
+
+    The outbox is introduced by this train, so there is no pre-upgrade record to
+    be tolerant of: a record without its done flag or its generation was
+    corrupted or written by something that is not this code. Reading it as
+    "not done yet" or as "safe to clear" both act on a record nobody can vouch
+    for, so it is raised out instead and the caller quarantines it.
+    """
+
+
 @dataclass(frozen=True)
 class StoredCompletion:
     """A completion record AS STORED, with the two facts the JSON cannot carry.
 
-    ``done_flag`` keeps the three states the guard needs apart, and collapsing
-    them is a live defect rather than a tidiness point: ABSENT means a record
-    written before the flag field existed (the only case the ``is_done``
-    fallback may apply to), ``False`` means this worker wrote it and the turn is
-    NOT durably done yet, and ``True`` means it is. Reading an explicit ``False``
-    through the fallback lets a CONCURRENT retry's done marker authorize a
-    sweeper to emit and clear a record the retry is still mid-flight on.
-
-    ``generation`` is the record's identity, used to compare-and-clear.
+    Both are REQUIRED, which is what keeps the impossible legacy mode out by
+    construction: ``done_flag`` is ``False`` while this worker is still
+    mid-flight and ``True`` once the turn is durably done, and there is no third
+    state for a guard to be lenient about. ``generation`` is the record's
+    identity, used to compare-and-clear.
     """
 
     record: CompletionRecord
-    done_flag: bool | None
-    generation: str | None
+    done_flag: bool
+    generation: str
 
 
 class Markers:
@@ -227,10 +236,11 @@ class Markers:
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
         """The stored record AS STORED, or None when some emitter cleared it.
 
-        The three states of the done flag are preserved rather than collapsed
-        (see ``StoredCompletion``): only an ABSENT flag may fall back to the
-        ``is_done`` marker, because only an absent flag proves the record
-        predates the field.
+        Raises ``MalformedCompletionError`` when the hash exists but is missing
+        the done flag or the generation. Both are written by
+        ``mark_completion_pending`` on every path, so their absence is
+        corruption, not an older shape to fall back for -- the outbox has no
+        pre-upgrade records. The caller quarantines rather than guessing.
         """
         stored: dict[Any, Any] = await self._redis.hgetall(
             self._config.completion_key(event_id)
@@ -240,16 +250,20 @@ class Markers:
             return None
         record = CompletionRecord.model_validate(json.loads(raw))
         flag = _as_str(stored.get(_DONE_FIELD))
-        done_flag = None if flag is None else flag == "1"
-        if done_flag is not None:
-            record = record.model_copy(update={"done": done_flag})
+        generation = _as_str(stored.get(_GENERATION_FIELD))
+        if flag is None or generation is None:
+            raise MalformedCompletionError(
+                f"completion record {event_id} is missing "
+                f"{'the done flag' if flag is None else 'its generation'}"
+            )
+        done_flag = flag == "1"
         return StoredCompletion(
-            record=record,
+            record=record.model_copy(update={"done": done_flag}),
             done_flag=done_flag,
-            generation=_as_str(stored.get(_GENERATION_FIELD)),
+            generation=generation,
         )
 
-    async def clear_completion(self, event_id: str, *, generation: str | None) -> bool:
+    async def clear_completion(self, event_id: str, *, generation: str) -> bool:
         """Drop the payload and its set membership together, in one MULTI.
 
         Together, so the set and the payload can never diverge durably: a member
@@ -260,13 +274,17 @@ class Markers:
         sweeper that read a stale record could delete the fresh one a concurrent
         retry wrote in between -- an undelivered completion discarded by a pass
         that never saw it. Returns whether anything was cleared.
+
+        ``generation`` is required, and a stored record with none is never
+        cleared here: that record is malformed and belongs in quarantine, not in
+        a delete a caller cannot prove it owns.
         """
         cleared = await self._redis.eval(
             _CLEAR_COMPLETION_LUA,
             2,
             self._config.completion_key(event_id),
             self._config.completions_pending_key(),
-            generation or "",
+            generation,
             _GENERATION_FIELD,
             event_id,
         )
@@ -279,6 +297,10 @@ class Markers:
         delivery and cleared it. Deleting the key here would destroy a record a
         concurrent retry may have just written under the same event id, so this
         removes the stale index entry and nothing else.
+
+        Also the quarantine step for a MALFORMED record: the payload stays put
+        for an operator to inspect, and only the index entry goes, so the sweeper
+        stops re-reading a record it has already refused to act on.
         """
         await self._redis.srem(self._config.completions_pending_key(), event_id)
 

@@ -81,7 +81,7 @@ from .behaviorpacks import (
 from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
 from .config import WorkerConfig
 from .killswitch import KillSwitch
-from .markers import CompletionRecord, Markers
+from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .reply_sink import ReplySink, TargetRoute
 from .runner_client import RunnerClient, RunnerError, TurnStream
 from .sandbox import SandboxSubstrate
@@ -942,7 +942,7 @@ class Kernel:
         await self._deliver_completion(record, generation=generation)
 
     async def _deliver_completion(
-        self, record: CompletionRecord, *, generation: str | None
+        self, record: CompletionRecord, *, generation: str
     ) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
 
@@ -970,10 +970,36 @@ class Kernel:
         STORED record rather than building one, because it never resolved a
         route of its own and must not invent one.
         """
-        stored = await self._markers.read_completion(event_id)
+        try:
+            stored = await self._markers.read_completion(event_id)
+        except MalformedCompletionError as exc:
+            await self._quarantine_completion(event_id, exc)
+            return
         if stored is None:
             return
         await self._deliver_completion(stored.record, generation=stored.generation)
+
+    async def _quarantine_completion(
+        self, event_id: str, exc: MalformedCompletionError
+    ) -> None:
+        """Refuse a malformed outbox record, loudly, and stop re-reading it.
+
+        The outbox is new in this train, so every record in it was written by a
+        writer that sets both the done flag and the generation. A record missing
+        either is corrupt, and there is no safe reading of it: treating it as
+        done would emit a completion for a turn that may still rerun, and
+        treating it as clearable would delete a record this pass cannot prove it
+        owns. The payload is therefore LEFT IN PLACE for an operator, and only
+        its index entry goes, so the sweeper does not spend a delivery attempt
+        on it every pass.
+        """
+        logger.warning(
+            "quarantining a malformed completion outbox record: event_id=%s (%s); "
+            "the payload is left in place and will never be emitted",
+            event_id,
+            exc,
+        )
+        await self._markers.drop_pending_member(event_id)
 
     async def sweep_pending_completions(self) -> int:
         """Drain the completion outbox. Returns how many completions were sent.
@@ -988,15 +1014,15 @@ class Kernel:
         1. **the record is flagged done.** ``Markers.mark_done`` sets that flag
            in the same MULTI as the done marker, so a false flag means the
            kernel is mid-flight or crashed before durability -- the sweeper stays
-           silent and stream redelivery reruns the turn, correctly. ``is_done``
-           is consulted only as a fallback for a record whose flag field is
-           ABSENT, which only a pre-upgrade writer can produce: the marker
+           silent and stream redelivery reruns the turn, correctly. The flag is
+           the WHOLE guard, with no marker fallback behind it: ``done_key``
            expires at ``idempotency_ttl_s`` while the record is retained for a
-           week, so a guard resting on it alone could never pass after day one.
-           An EXPLICIT false never reaches that fallback, and the distinction is
-           the whole guard: collapsing "no flag" and "flag says not yet" lets a
+           week, so a guard resting on the marker could never pass after day
+           one, and consulting it for a record whose flag says "not yet" lets a
            CONCURRENT retry's done marker authorize this pass to emit and clear
-           a record that retry is still mid-flight on.
+           a record that retry is still mid-flight on. A record with NO flag is
+           malformed rather than legacy (the outbox is new in this train) and is
+           quarantined, never guessed at.
         2. **the record is older than the grace period**, which keeps the
            sweeper out of the kernel's own emit window so the normal path is not
            racing it on every turn.
@@ -1023,7 +1049,11 @@ class Kernel:
                     seen,
                 )
                 break
-            stored = await self._markers.read_completion(event_id)
+            try:
+                stored = await self._markers.read_completion(event_id)
+            except MalformedCompletionError as exc:
+                await self._quarantine_completion(event_id, exc)
+                continue
             if stored is None:
                 # A member whose payload is gone: some emitter confirmed
                 # delivery and cleared it between our read of the set and our
@@ -1050,12 +1080,7 @@ class Kernel:
                     event_id, generation=stored.generation
                 )
                 continue
-            if stored.done_flag is None:
-                # The pre-upgrade shape, and the ONLY case the marker answers for.
-                terminal = record.done or await self._markers.is_done(event_id)
-            else:
-                terminal = stored.done_flag
-            if not terminal:
+            if not stored.done_flag:
                 continue
             if age < self._config.completion_sweep_grace_s:
                 continue
@@ -1512,11 +1537,20 @@ class Kernel:
         # Resolve the manifest route (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
         route = outcome.approval_route
+        # The card's destination is a (kind, address) PAIR, never an address on
+        # its own: the schema permits the same address string under two kinds,
+        # so an address-only comparison misreads an email turn whose address
+        # happens to equal a Slack policy channel as "the requesting channel".
+        card_kind = qevent.reply_handle.kind
         card_channel = qevent.reply_handle.channel
         if route:
             binding = (approval_routes or {}).get(route)
             bound = binding.get("channel") if isinstance(binding, dict) else None
             if bound:
+                # A policy channel is a Slack channel id by construction
+                # (POLICY_CARD_KIND), so the routed card's pair is that kind
+                # with that address -- whatever kind the requesting turn had.
+                card_kind = POLICY_CARD_KIND
                 card_channel = str(bound)
             else:
                 logger.warning(
@@ -1629,8 +1663,15 @@ class Kernel:
         # bug: an email-originated approval routed to a Slack policy channel kept
         # ``kind=email`` with an email adapter and NO endpoint, so the egress
         # raised and the channel the policy exists to notify never saw the card.
-        in_requesting_channel = card_channel == qevent.reply_handle.channel
-        card_kind = qevent.reply_handle.kind if in_requesting_channel else POLICY_CARD_KIND
+        #
+        # The comparison is the full PAIR, because an address is only unique
+        # within its kind: two bindings may carry the same address string under
+        # different kinds, and comparing addresses alone would hand a non-Slack
+        # turn's transport to a Slack policy card that merely shares its address.
+        in_requesting_channel = (card_kind, card_channel) == (
+            qevent.reply_handle.kind,
+            qevent.reply_handle.channel,
+        )
         card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
         card_adapter = route_.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral

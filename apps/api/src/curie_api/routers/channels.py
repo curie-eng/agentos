@@ -94,20 +94,50 @@ _CLAIM_PREFIX = "curie:channel"
 # adapter retries only transport failures, so that delivery is silently dropped.
 # (c)'s TOKEN comparison is what makes the lease OWNED: a merely SLOW winner
 # whose lease was re-claimed must not XADD on top of the retry's entry.
+#
+# The claim key has TWO phases with OPPOSITE expiry contracts, and BOTH enqueue
+# arms below write the second one: `pending:<token>` carries the lease TTL (what
+# makes a dead winner's delivery recoverable), while the stream id that replaces
+# it is a RECEIPT and is written with NO expiry at all. An expiry there lets the
+# same `delivery_id` win a fresh `SET NX` once it lapses, enqueue a second time,
+# and answer the correspondent twice -- silently, and only for the deliveries an
+# adapter happens to retry after the window.
 _ENQUEUE_SCRIPT = """
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
   local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
-  redis.call('SET', KEYS[1], id, 'EX', ARGV[5])
+  redis.call('SET', KEYS[1], id)
   return {1, id}
 elseif not cur then
   redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
   local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
-  redis.call('SET', KEYS[1], id, 'EX', ARGV[5])
+  redis.call('SET', KEYS[1], id)
   return {1, id}
 else
   return {0, cur}
 end
+"""
+
+# One binding's slot counter for the current window, taken atomically: INCR and
+# the window's EXPIRE cannot be two round trips, or a process that dies between
+# them leaves a counter that never expires and 429s that binding forever.
+_QUOTA_SCRIPT = """
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return n
+"""
+
+# Give a claim back, and ONLY our own: used when the quota refuses a delivery we
+# have already claimed, so the refusal does not leave the `delivery_id` locked
+# for a lease's duration. The compare is what keeps a slow caller from deleting
+# a successor's claim.
+_RELEASE_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+end
+return 1
 """
 
 
@@ -268,6 +298,26 @@ def _route_is_configured(row: AgentChannel) -> bool:
     return row.endpoint is not None and row.adapter is not None
 
 
+def _unroutable(kind: str, address: str) -> HTTPException:
+    """E17's refusal, in ONE place because BOTH endpoints owe it.
+
+    Refusing at the mint closes only the token-bearing path: the platform key is
+    accepted at the ingress by design, so a first-party caller could otherwise
+    post a turn for a route-less non-`slack` binding and have it enqueued with
+    `endpoint=None, adapter=None`, fail closed in the worker's reply sink, and
+    escalate to a human far from the request that caused it -- the mid-turn
+    failure E17 exists to prevent. One rule, one message, stated once.
+    """
+
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        f"the binding for kind {kind!r} at address {address!r} has no reply "
+        "route: set its endpoint and adapter (PATCH the agent's channel) before "
+        "minting a token for it or posting turns to it, or its turns would be "
+        "enqueued with nowhere to reply and no credential to reply with.",
+    )
+
+
 # --- POST /channels/token -----------------------------------------------------
 
 
@@ -299,14 +349,8 @@ async def mint_channel_token(
     if not _route_is_configured(row):
         # E17: refuse at MINT time, so the operator error surfaces at bind time
         # rather than as a fail-closed escalation mid-turn, in the worker, far
-        # from the request that caused it.
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"the binding for kind {data.kind!r} at address {data.address!r} has "
-            "no reply route: set its endpoint and adapter (PATCH the agent's "
-            "channel) before minting a token, or its turns would be enqueued "
-            "with nowhere to reply and no credential to reply with.",
-        )
+        # from the request that caused it. `ingest_turn` raises the same refusal.
+        raise _unroutable(data.kind, data.address)
     token = channel_token.mint(
         get_settings().api_key,
         channel_id=str(row.id),
@@ -332,31 +376,55 @@ def _claim_key(channel_id: uuid.UUID, delivery_id: str) -> str:
     return f"{_CLAIM_PREFIX}:delivery:{channel_id}:{_sha16(delivery_id)}"
 
 
-def _authenticate(x_api_key: str | None, row: AgentChannel | None) -> None:
-    """The ingress 401 matrix, in the order `require_state_access` fixed.
+def _verify_credential(x_api_key: str | None) -> channel_token.ChannelClaims | None:
+    """The STATELESS half of the ingress 401 matrix: no row, no query, no I/O.
 
-    The platform key first (operator/first-party); else, if the header is
-    present at all, the `chn` token against the binding the BODY claimed. Every
-    failure -- absent header, malformed token, another binding's token, a stale
-    generation, an expired token, the right token in the wrong header -- raises
-    the identical 401.
+    The platform key first (operator/first-party), which authenticates on its own
+    and carries no binding claim -- `None` is its "authenticated, nothing
+    claimed". Else the header, if present at all, is verified as a `chn` token
+    against the shared key: signature, scope and expiry are decidable without
+    touching the database, so a caller holding no valid credential is refused
+    BEFORE it can make the API query anything. Without that ordering a network
+    attacker floods small well-formed bodies, each costing a binding lookup, and
+    exhausts the database pool through a route that answers 401.
+
+    Every failure -- absent header, malformed token, an expired token, a foreign
+    key's signature, the wrong scope, the right token in the wrong header --
+    raises the identical 401. `_authorize` decides the row-dependent half.
     """
 
     if verify_platform_key(x_api_key):
+        return None
+    if x_api_key is not None:
+        claims = channel_token.verify_claims(
+            x_api_key, get_settings().api_key, scope=CHANNEL_ENQUEUE_SCOPE
+        )
+        if claims is not None:
+            return claims
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
+
+
+def _authorize(
+    claims: channel_token.ChannelClaims | None, row: AgentChannel | None
+) -> None:
+    """The STATEFUL half: bind already-verified claims to the loaded row.
+
+    A token names one binding ROW at one GENERATION, so a token for another
+    binding, for a pair that resolves to nothing, or for a generation the row has
+    moved past is refused here -- with the identical detail string the stateless
+    half uses, because a caller that can tell "no credential" from "wrong
+    binding" from "stale generation" can enumerate live bindings and probe
+    rebinds. The platform key claims no binding and passes.
+    """
+
+    if claims is None:
         return
     if (
-        x_api_key is not None
-        and row is not None
-        and channel_token.verify(
-            x_api_key,
-            get_settings().api_key,
-            channel_id=str(row.id),
-            generation=row.generation,
-            scope=CHANNEL_ENQUEUE_SCOPE,
-        )
+        row is None
+        or str(row.id) != claims.channel_id
+        or row.generation != claims.generation
     ):
-        return
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
 def _mint_turn(row: AgentChannel, body: TurnIn) -> QueuedTurn:
@@ -417,10 +485,12 @@ async def _enqueue_owned(
     owner: str,
     payload: str,
     lease_s: int,
-    receipt_ttl_s: int,
 ) -> tuple[bool, str]:
     """Run the owner-checked enqueue script; True with the stream id when THIS
-    request enqueued, False with the current owner's value when it did not."""
+    request enqueued, False with the current owner's value when it did not.
+
+    No receipt TTL is passed because the receipt has none: the claim key survives
+    as the stream id for good (see `_ENQUEUE_SCRIPT`)."""
 
     result: Any = await client.eval(
         _ENQUEUE_SCRIPT,
@@ -431,10 +501,31 @@ async def _enqueue_owned(
         payload,
         STREAM_PAYLOAD_FIELD,
         str(lease_s),
-        str(receipt_ttl_s),
     )
     enqueued, current = result
     return bool(enqueued), _as_str(current)
+
+
+async def _take_backlog_slot(
+    client: redis.Redis, *, channel_id: uuid.UUID, limit: int, window_s: int
+) -> bool:
+    """Count ONE new delivery against this binding's window, atomically.
+
+    Called only once a claim is won, so a duplicate an adapter is retrying costs
+    nothing -- the cap is on NEW work per binding, which is the thing a
+    compromised adapter can make unbounded.
+    """
+
+    window = int(time.time()) // window_s
+    key = f"{_CLAIM_PREFIX}:backlog:{channel_id}:{window}"
+    count: Any = await client.eval(_QUOTA_SCRIPT, 1, key, str(window_s))
+    return int(count) <= limit
+
+
+async def _release_claim(client: redis.Redis, key: str, owner: str) -> None:
+    """Give back a claim this request took but will not enqueue."""
+
+    await client.eval(_RELEASE_SCRIPT, 1, key, owner)
 
 
 def _duplicate(
@@ -463,32 +554,60 @@ async def ingest_turn(
 ) -> TurnAccepted:
     """Enqueue one inbound delivery for the binding the body names.
 
-    Order is load-bearing. The size bound runs FIRST, before authentication and
-    before JSON parsing, so an oversized body is refused without the server ever
-    HMAC-verifying or deserializing it. The body is validated next because the
-    credential is scoped to the binding the body CLAIMS -- there is nothing to
-    verify a `chn` token against until the pair is known. Only then is the
-    request authenticated, and only then does an unknown pair earn a 404: a
-    caller with no credential learns nothing about which bindings exist.
+    Order is load-bearing, and every step of it earns its place:
+
+    1. the size bound, before authentication and before JSON parsing, so an
+       oversized body is refused without the server ever HMAC-verifying or
+       deserializing it;
+    2. the body, parsed next because the credential is scoped to the binding the
+       body CLAIMS and a 422 costs no database work either;
+    3. the credential's SIGNATURE, verified statelessly -- no row, no query. An
+       attacker with no valid credential must not be able to make this route
+       query the database, or a flood of small well-formed bodies exhausts the
+       connection pool behind a 401;
+    4. the binding row, loaded only for a caller that already authenticated;
+    5. the claims bound to that row, and only then does an unknown pair earn a
+       404 -- a caller with no credential learns nothing about which bindings
+       exist.
     """
 
     settings = get_settings()
     raw = await _read_bounded_body(request, settings.channel_turn_max_body_bytes)
     body = _parse_turn(raw)
+    claims = _verify_credential(x_api_key)
     row = await _resolve_binding(session, body.kind, body.address)
-    _authenticate(x_api_key, row)
+    _authorize(claims, row)
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             f"no agent is bound to channel kind {body.kind!r} at address "
             f"{body.address!r}",
         )
+    if not _route_is_configured(row):
+        # The mint's refusal, on the ingress. Enqueuing here would hand the
+        # worker a turn with nowhere to reply and no credential to reply with.
+        raise _unroutable(body.kind, body.address)
 
     turn = _mint_turn(row, body)
     client: redis.Redis = request.app.state.valkey
     key = _claim_key(row.id, body.delivery_id)
     owner = f"pending:{secrets.token_hex(16)}"
     payload = turn.model_dump_json()
+
+    # The generation, re-read at the LAST moment before the claim. The row above
+    # was loaded at the top of the request, and `update_agent_binding` bumps the
+    # generation on a rebind, so a credential revoked mid-request would otherwise
+    # still enqueue against the binding it no longer names. Re-reading here
+    # narrows that race from the whole request to the gap below; it does NOT
+    # close it -- a rebind committing between this SELECT and the XADD still
+    # lands, and closing that honestly needs a row lock held across the enqueue,
+    # which phase 2 does not take (FU: revocation list).
+    if claims is not None:
+        current_generation = await session.scalar(
+            select(AgentChannel.generation).where(AgentChannel.id == row.id)
+        )
+        if current_generation != claims.generation:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
     # Two attempts, not a loop: the second exists only for the narrow case where
     # the claim key expired between our failed `SET NX` and the `GET` that would
@@ -498,6 +617,32 @@ async def ingest_turn(
         if await _claim_delivery(
             client, key, owner, settings.channel_delivery_lease_s
         ):
+            if not await _take_backlog_slot(
+                client,
+                channel_id=row.id,
+                limit=settings.channel_binding_backlog_limit,
+                window_s=settings.channel_binding_backlog_window_s,
+            ):
+                # Over this binding's quota: give the claim back so the delivery
+                # is not locked out for a lease, and tell the adapter to retry.
+                # Metered per binding, so one compromised or runaway adapter
+                # cannot fill the shared stream for every other tenant.
+                await _release_claim(client, key, owner)
+                logger.warning(
+                    "channel ingress refused event_id=%s kind=%s: binding backlog "
+                    "quota of %d per %ds exceeded",
+                    turn.event_id,
+                    row.kind,
+                    settings.channel_binding_backlog_limit,
+                    settings.channel_binding_backlog_window_s,
+                )
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "too many new deliveries for this binding; retry later",
+                    headers={
+                        "Retry-After": str(settings.channel_binding_backlog_window_s)
+                    },
+                )
             enqueued, current = await _enqueue_owned(
                 client,
                 key=key,
@@ -505,7 +650,6 @@ async def ingest_turn(
                 owner=owner,
                 payload=payload,
                 lease_s=settings.channel_delivery_lease_s,
-                receipt_ttl_s=settings.channel_delivery_receipt_ttl_s,
             )
             if enqueued:
                 logger.info(

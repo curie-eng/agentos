@@ -291,12 +291,24 @@ class Settings(BaseSettings):
     # how long a delivery whose winner died stays un-enqueued (nothing else
     # recovers that case), while being far longer than the enqueue it covers.
     channel_delivery_lease_s: int = 300
-    # How long the claim key survives as the RECEIPT once the turn is enqueued:
-    # the replay window in which a retry is answered with the original
-    # `event_id`/`stream_id` instead of enqueuing a second turn. Mirrors the
-    # dispatcher's `dedupe_ttl_seconds` (3600), whose guard this one is the
-    # structural sibling of.
-    channel_delivery_receipt_ttl_s: int = 3600
+    # There is deliberately NO receipt TTL beside the lease above. Once the turn
+    # is enqueued the claim key becomes a PERMANENT receipt: an expiry on it lets
+    # the same `delivery_id` win a fresh `SET NX` after the window and enqueue a
+    # second time, so the correspondent is answered twice, silently, days later
+    # (the divergence from the dispatcher's `dedupe_ttl_seconds`, which guards a
+    # queue rather than an outward-facing reply).
+    #
+    # How many NEW deliveries one binding may enqueue per window. A `chn` token
+    # is scoped to a binding but not metered by one, so a compromised adapter can
+    # otherwise submit unlimited unique `delivery_id`s and fill the shared stream
+    # (and, since receipts are permanent, the shared Valkey) until every tenant is
+    # affected. Counted per binding and per fixed window, on the claim -- so an
+    # adapter's retries of a delivery it already got through are free -- and
+    # exceeded requests are refused 429 rather than queued. It bounds the rate of
+    # NEW work, not the depth of unconsumed work: the API cannot observe what the
+    # worker has consumed without infrastructure phase 2 does not build.
+    channel_binding_backlog_limit: int = 64
+    channel_binding_backlog_window_s: int = 60
 
     def valkey_dsn(self) -> str:
         if self.valkey_url:

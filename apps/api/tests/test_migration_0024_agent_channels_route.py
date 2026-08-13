@@ -227,6 +227,121 @@ def test_both_set_and_both_absent_are_accepted(isolated_migration_db: None) -> N
     assert _constraint_named(ROUTE_PAIR_CHECK)
 
 
+def _seed_approval(*, reply_channel: str, reply_kind: str, status: str) -> uuid.UUID:
+    """One approval on the 0023 schema (`reply_kind` exists, `reply_adapter` is
+    NULL for every row until this revision fills it)."""
+
+    approval_id = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.approvals "
+        "(id, conversation_id, author, summary, reply_kind, reply_channel, "
+        " reply_placeholder, dedupe_key, status) "
+        "VALUES (:id, :conv, 'U1', 'send the quote', :kind, :chan, 'p-1', :dedupe, :status)",
+        {
+            "id": approval_id,
+            "conv": f"th-{approval_id.hex[:8]}",
+            "kind": reply_kind,
+            "chan": reply_channel,
+            "dedupe": approval_id.hex,
+            "status": status,
+        },
+    )
+    return approval_id
+
+
+def _reply_adapter(approval_id: uuid.UUID) -> str | None:
+    rows = _sql(
+        "SELECT reply_adapter FROM curie.approvals WHERE id = :id", {"id": approval_id}
+    )
+    assert rows, f"approval {approval_id} vanished"
+    return rows[0][0]
+
+
+@pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
+def test_the_upgrade_refuses_a_non_slack_approval_with_no_adapter_provenance(
+    isolated_migration_db: None, status: str
+) -> None:
+    """0022's other half, landed here because `adapter` does not exist until this
+    revision. A non-Slack approval whose binding names no egress identity has no
+    adapter provenance ANYWHERE in the schema, and `resumequeue` rebuilds the
+    resume turn from the approval row -- so resuming it POSTs with no credential
+    and fails closed inside the worker, days later and far from any request.
+
+    Every status is swept, not just `pending`: all of approved/rejected/expired
+    are in `crud._RESUMABLE_STATUSES` (`crud.py:622-626`) and
+    `crud.reopen_dead_lettered_resume` can re-owe a wake on an already-resumed
+    row (#532), so no status is inert here either.
+
+    Mutations this catches: delete the refusal predicate and the migration
+    completes leaving `reply_adapter` NULL on a row that needs it; narrow the
+    predicate to `pending` and three of the four cases go green while the deferred
+    misroute stands. The message must name the id, the channel, the kind AND the
+    status, because the operator's fix differs by status (resolve it, or configure
+    the binding's route).
+    """
+
+    cfg = _at_below()
+    _sql(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, 'mail-agent')",
+        {"id": (agent_id := uuid.uuid4())},
+    )
+    _sql(
+        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+        "VALUES (:id, :agent, 'email', 'agent@example.test')",
+        {"id": uuid.uuid4(), "agent": agent_id},
+    )
+    approval = _seed_approval(
+        reply_channel="agent@example.test", reply_kind="email", status=status
+    )
+
+    with pytest.raises(Exception) as caught:
+        command.upgrade(cfg, REVISION)
+
+    message = str(caught.value)
+    assert str(approval) in message, message
+    assert "agent@example.test" in message, message
+    assert "email" in message, message
+    assert status in message, message
+
+
+@pytest.mark.parametrize("status", ["pending", "approved", "rejected", "expired"])
+def test_a_slack_approval_upgrades_with_a_null_reply_adapter(
+    isolated_migration_db: None, status: str
+) -> None:
+    """The sibling lane, and the positive control for the refusal above.
+
+    Slack's reply route is the worker's configured origin (D4.4), so a Slack
+    approval with no adapter is COMPLETE, not unroutable. NULL is the honest
+    value and the migration must leave it alone.
+
+    Mutations this catches: widen the refusal predicate to every approval and the
+    cutover cannot run at all on a Slack install; or "fix" the NULL by stamping a
+    placeholder slug, which would make the worker look up a credential for an
+    adapter that does not own the turn.
+    """
+
+    cfg = _at_below()
+    _sql(
+        "INSERT INTO curie.agents (id, name) VALUES (:id, 'slack-agent')",
+        {"id": (agent_id := uuid.uuid4())},
+    )
+    _sql(
+        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+        "VALUES (:id, :agent, 'slack', 'C0ROUTE05')",
+        {"id": uuid.uuid4(), "agent": agent_id},
+    )
+    approval = _seed_approval(
+        reply_channel="C0ROUTE05", reply_kind="slack", status=status
+    )
+
+    command.upgrade(cfg, REVISION)
+
+    assert _reply_adapter(approval) is None
+    assert _sql(
+        "SELECT reply_kind FROM curie.approvals WHERE id = :id", {"id": approval}
+    ) == [("slack",)]
+
+
 def test_the_round_trip_succeeds_on_a_slack_only_database(
     isolated_migration_db: None,
 ) -> None:

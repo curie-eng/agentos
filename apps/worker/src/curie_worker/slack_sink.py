@@ -82,6 +82,25 @@ def _origin(url: str) -> tuple[str, str, int]:
     return scheme, (parts.hostname or "").lower(), port
 
 
+def _redacted(url: str | None) -> str:
+    """A URL reduced to scheme and host, for a message a human will read.
+
+    The twin of ``reply_sink._redacted`` (and of the API side's helper in
+    ``alembic/versions/0024_...``): a per-turn endpoint can carry a token in its
+    path or query, and refusals and unreachability warnings land in worker logs
+    and dead-letter rows. The origin is the whole point of these messages
+    anyway -- the trust check is an ORIGIN check.
+    """
+
+    if not url:
+        return "unset"
+    parts = urlsplit(url)
+    if not parts.scheme or not parts.hostname:
+        return "an unparseable endpoint"
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{parts.hostname}{port}"
+
+
 def _split_trusted(
     origins: Sequence[str],
 ) -> tuple[frozenset[tuple[str, str, int]], frozenset[tuple[str, str]]]:
@@ -254,9 +273,9 @@ class SlackReplyAdapter:
         """
         if endpoint and not self._is_trusted(endpoint):
             raise UntrustedSlackEndpointError(
-                f"refusing to send the Slack bot token to {endpoint!r}: its origin is "
-                f"neither the configured Slack origin "
-                f"{self._default_base_url or REAL_SLACK_BASE_URL!r} nor a configured "
+                f"refusing to send the Slack bot token to {_redacted(endpoint)}: its "
+                f"origin is neither the configured Slack origin "
+                f"{_redacted(self._default_base_url or REAL_SLACK_BASE_URL)} nor a configured "
                 "trusted dev origin (CURIE_SLACK_TRUSTED_ORIGINS)"
             )
         base_url = endpoint or self._default_base_url
@@ -328,10 +347,10 @@ class SlackReplyAdapter:
         except _UNREACHABLE_ERRORS as exc:
             if has_distinct_default:
                 logger.warning(
-                    "%s: reply endpoint %r is unreachable (%s); falling back to the "
+                    "%s: reply endpoint %s is unreachable (%s); falling back to the "
                     "default Slack transport",
                     describe,
-                    endpoint,
+                    _redacted(endpoint),
                     exc,
                 )
                 return await op(self._client_for(None))
@@ -352,11 +371,11 @@ class SlackReplyAdapter:
             # for #708.
             if best_effort_unreachable and self._default_base_url is None:
                 logger.warning(
-                    "%s: reply endpoint %r is unreachable (%s) with no default "
+                    "%s: reply endpoint %s is unreachable (%s) with no default "
                     "transport; completing the resume turn best-effort without "
                     "delivering the reply",
                     describe,
-                    endpoint,
+                    _redacted(endpoint),
                     exc,
                 )
                 return cast(_T, None)

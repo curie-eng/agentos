@@ -7,9 +7,16 @@ has to be a recorded fact about the ORIGINAL turn, not something re-derived from
 phase 2 exists to close, at its least observable point.
 
 `reply_adapter` rides the same revision: the durable twin of
-`ReplyHandle.adapter`, plain nullable with NO backfill. Every approval predating
-this migration was Slack-routed or is unreconstructable, and Slack legitimately
-has no adapter, so NULL is the correct and only honest value.
+`ReplyHandle.adapter`, plain nullable with NO backfill HERE. Slack legitimately
+has no adapter, so NULL is the correct value for a Slack-routed row; a NON-Slack
+row is a different matter, because an approval reconstructed with a kind but no
+adapter resumes to the HTTP sink with no credential selector and fails closed
+mid-resume. That backfill-or-refuse cannot live in this revision: the column it
+would read, `agent_channels.adapter`, does not exist until 0024. It is therefore
+judged in **0024**, immediately after the route columns are created: since that
+revision creates them NULL, no non-Slack approval has adapter provenance, and
+0024 REFUSES and names those rows instead of leaving them unresumable. The two
+halves of one rule are split by column order alone.
 
 **The backfill is BY PROVENANCE, and refuses rather than guesses.** Each approval
 joins `agent_channels` on `approvals.reply_channel = agent_channels.address`. A

@@ -26,6 +26,16 @@ non-Slack kind REQUIRES both. The database states the invariant true for every
 kind; the schema layer states the kind-specific policy. A CHECK that knew what
 `slack` meant would be the schema layer, in the wrong place.
 
+**This revision also finishes 0022's backfill**, because it owns the column that
+one needed. 0022 gave every approval a `reply_kind` and left `reply_adapter` NULL;
+NULL is honest for Slack and a latent failure for any other kind, whose resume
+would reach the HTTP sink with no egress credential named. Once `adapter` exists
+here, a non-Slack approval can be judged: since this revision creates `adapter`
+NULL, none of them has adapter provenance anywhere, so the migration REFUSES and
+names them rather than leaving a row that resumes with no credential. Slack rows
+keep their NULL by design. That is 0022's discipline -- refuse, never guess --
+applied to the half of the routing identity that lives on this revision.
+
 `downgrade` REFUSES in TWO directions, both of which the drop would destroy
 silently:
 
@@ -53,6 +63,7 @@ Create Date: 2026-08-13
 """
 
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 import sqlalchemy as sa
 from alembic import op
@@ -64,13 +75,39 @@ depends_on: str | Sequence[str] | None = None
 
 SCHEMA = "curie"
 TABLE = "agent_channels"
+APPROVALS = "approvals"
+
+# The one kind whose reply route is legitimately implicit: Slack replies go
+# through the worker's configured Slack origin, so a Slack approval with no
+# adapter is complete, and any other kind with no adapter is not.
+SLACK = "slack"
 
 # Named explicitly, following 0021's discipline, so the API can translate it and
 # the test can look it up by identity rather than by shape.
 ROUTE_PAIR_CHECK = "agent_channels_route_pair_ck"
 
 
+def _redacted(endpoint: str | None) -> str:
+    """An endpoint reduced to scheme and host, for a message a human will read.
+
+    An endpoint can carry a token in its path or query (the write path forbids
+    userinfo, but a row written out of band predates that rule), and a migration
+    failure is copied into tickets and CI logs. Scheme plus host is enough for an
+    operator to recognize which route is meant.
+    """
+
+    if not endpoint:
+        return "unset"
+    parsed = urlsplit(endpoint)
+    if not parsed.scheme or not parsed.hostname:
+        return "an unparseable endpoint"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
 def upgrade() -> None:
+    conn = op.get_bind()
+
     op.add_column(TABLE, sa.Column("endpoint", sa.String(), nullable=True), schema=SCHEMA)
     op.add_column(TABLE, sa.Column("adapter", sa.String(), nullable=True), schema=SCHEMA)
     op.add_column(
@@ -85,6 +122,62 @@ def upgrade() -> None:
         "(endpoint IS NULL) = (adapter IS NULL)",
         schema=SCHEMA,
     )
+
+    # 0022's other half, landed here because `adapter` did not exist until three
+    # statements ago. 0022 gave every approval a `reply_kind` by provenance and
+    # left `reply_adapter` NULL for all of them. NULL is right for a Slack row,
+    # and WRONG for any other kind: `resumequeue` rebuilds the resume turn from
+    # the approval row, so a non-Slack approval with no adapter reaches the
+    # worker's HTTP sink with no egress-credential selector, fails closed
+    # mid-resume, and escalates far from anything an operator can connect it to.
+    #
+    # There is no backfill arm, only a refusal: `adapter` was created NULL three
+    # statements up, and `downgrade` refuses while any route is set, so no
+    # database reaching this line can have a binding that names an adapter. A
+    # pre-existing non-Slack approval therefore has no adapter provenance
+    # ANYWHERE in the schema, and the only honest answer is to stop.
+    unroutable = conn.execute(
+        sa.text(
+            f"""
+            SELECT ap.id AS id,
+                   ap.reply_channel AS reply_channel,
+                   ap.reply_kind AS reply_kind,
+                   ap.status AS status
+            FROM {SCHEMA}.{APPROVALS} ap
+            WHERE ap.reply_kind <> :slack
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {SCHEMA}.{TABLE} c
+                  WHERE c.kind = ap.reply_kind
+                    AND c.address = ap.reply_channel
+                    AND c.adapter IS NOT NULL
+              )
+            ORDER BY ap.id
+            """
+        ),
+        {"slack": SLACK},
+    ).all()
+    if unroutable:
+        detail = "; ".join(
+            f"{row.id} (reply_channel {row.reply_channel!r}, kind "
+            f"{row.reply_kind!r}, status {row.status})"
+            for row in unroutable
+        )
+        raise RuntimeError(
+            "cannot complete the approval routing backfill (#1459): these "
+            "approvals were raised on a non-Slack channel and no binding names "
+            f"the egress identity their reply must be authenticated with -- {detail}. "
+            "A pre-existing non-Slack approval has no adapter provenance anywhere "
+            "in the schema; resuming it would POST the reply with no credential "
+            "and fail closed inside the worker, days after the fact and far from "
+            "any request. Remediation is to DRAIN them, exactly as the quiescent "
+            "cutover's step does: settle each approval above (POST "
+            "/approvals/{id}/resolve, or let it expire) and confirm it has "
+            "resumed or been abandoned, then re-run this migration. Configuring "
+            "the bindings first is NOT an option -- the endpoint and adapter "
+            "columns those routes live in are created by this very revision, so "
+            "no route can exist until it completes."
+        )
 
 
 def downgrade() -> None:
@@ -102,7 +195,8 @@ def downgrade() -> None:
     ).all()
     if routed:
         detail = "; ".join(
-            f"{row.kind}:{row.address} (endpoint {row.endpoint}, adapter {row.adapter})"
+            f"{row.kind}:{row.address} (endpoint {_redacted(row.endpoint)}, "
+            f"adapter {row.adapter})"
             for row in routed
         )
         raise RuntimeError(

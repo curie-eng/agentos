@@ -26,6 +26,7 @@ import json
 import logging
 from collections.abc import Mapping
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import aiohttp
 from channel_protocol.reply import ReplyAck, ReplyEvent
@@ -41,6 +42,16 @@ ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
 
+# The most acknowledgement body the worker will read off an adapter. The ack
+# carries one optional ``ref`` string, so 64 KiB is orders of magnitude more than
+# any honest adapter needs -- and the ceiling matters because the endpoint is
+# operator-configured and answers on the worker's own heap: an unbounded read of
+# a hostile (or merely broken) adapter's response is a worker OOM per turn, and
+# the worker holds the kernel's locks. Oversize is a DELIVERY FAILURE, not a
+# truncation: a body this large is not a reply the platform can interpret, and
+# silently reading its first 64 KiB would hand ``_ref_from`` a half-parsed handle.
+MAX_ACK_BODY_BYTES = 64 * 1024
+
 # "Unreachable" for the HTTP path: the endpoint's HOST did not answer. A response
 # that arrived and said no (any status) is NOT an unreachability -- it must stay
 # loud even on a best-effort turn, or a rejecting adapter reads as a delivered one.
@@ -50,8 +61,36 @@ _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+def _redacted(endpoint: str | None) -> str:
+    """An endpoint reduced to scheme and host, for a message a human will read.
+
+    An endpoint can carry a token in its path or query, and these messages reach
+    worker logs, dead-letter rows and tickets. Scheme plus host is enough for an
+    operator to recognize which adapter is meant. Same shape as the API side's
+    helper (``alembic/versions/0024_...``), deliberately: one redaction form
+    across the two halves of the binding route.
+    """
+
+    if not endpoint:
+        return "unset"
+    parsed = urlsplit(endpoint)
+    if not parsed.scheme or not parsed.hostname:
+        return "an unparseable endpoint"
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+
 class MissingAdapterCredentialError(RuntimeError):
     """Platform egress had no credential (or no target) and sent nothing."""
+
+
+class OversizedAdapterResponseError(RuntimeError):
+    """The adapter's acknowledgement body exceeded ``MAX_ACK_BODY_BYTES``.
+
+    A delivery FAILURE, deliberately: the turn is retried or dead-lettered like
+    any other rejected response rather than being recorded as delivered off a
+    body the worker refused to finish reading.
+    """
 
 
 class RedirectedAdapterEndpointError(RuntimeError):
@@ -119,7 +158,7 @@ class HttpReplyAdapter:
             )
         if not route.adapter:
             raise MissingAdapterCredentialError(
-                f"platform egress to {route.endpoint!r} has no adapter identity; "
+                f"platform egress to {_redacted(route.endpoint)} has no adapter identity; "
                 "refusing to send an unauthenticated request"
             )
         secret = self._credentials.get(route.adapter)
@@ -151,19 +190,31 @@ class HttpReplyAdapter:
                 ) as response:
                     if 300 <= response.status < 400:
                         raise RedirectedAdapterEndpointError(
-                            f"adapter endpoint {endpoint!r} answered "
+                            f"adapter endpoint {_redacted(endpoint)} answered "
                             f"{response.status} (redirect); refusing to re-send the "
                             "egress credential to the redirect target"
                         )
                     response.raise_for_status()
-                    payload = await response.text()
+                    # Read the cap plus one byte, never ``.text()``: the whole
+                    # point is that the body is never fully buffered, and the
+                    # extra byte is what tells "exactly at the cap" (fine) from
+                    # "there is more coming" (refused). Content-Length is not
+                    # consulted -- it is absent on a chunked response and is the
+                    # attacker's own number besides.
+                    payload = await response.content.read(MAX_ACK_BODY_BYTES + 1)
+                    if len(payload) > MAX_ACK_BODY_BYTES:
+                        raise OversizedAdapterResponseError(
+                            f"adapter endpoint {_redacted(endpoint)} answered with more than "
+                            f"{MAX_ACK_BODY_BYTES} bytes; refusing to buffer it and "
+                            "treating the delivery as failed"
+                        )
         except _UNREACHABLE_ERRORS as exc:
             if best_effort_unreachable:
                 logger.warning(
-                    "%s: adapter endpoint %r is unreachable (%s); completing the turn "
+                    "%s: adapter endpoint %s is unreachable (%s); completing the turn "
                     "best-effort without delivering the event",
                     event.event,
-                    endpoint,
+                    _redacted(endpoint),
                     exc,
                 )
                 return ReplyAck(ref=None)
@@ -171,7 +222,7 @@ class HttpReplyAdapter:
         return ReplyAck(ref=_ref_from(payload))
 
 
-def _ref_from(payload: str) -> str | None:
+def _ref_from(payload: bytes) -> str | None:
     """The adapter-minted handle off its response, if it minted one.
 
     A channel with nothing addressable to hand back (email has no editable

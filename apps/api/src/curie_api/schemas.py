@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 # The approval-request and eval-report payloads are declared once in the frozen
 # ACI package (#492) and re-exported here, so this module stays the single import
@@ -242,6 +243,44 @@ def _validate_channel_binding(kind: str, address: str) -> str:
     if not shape.match(address):
         raise ValueError(explain(address))
     return address
+
+
+def _validate_channel_endpoint(endpoint: str) -> str:
+    """Enforce that a reply endpoint is a URL the worker can actually POST to.
+
+    Unlike an address, an endpoint is not opaque: the worker hands it to
+    `aiohttp` with the platform's egress credential attached, so "configured" has
+    to mean more than "a non-empty string". An empty value, a bare hostname, a
+    `file://` URL or a `mailto:` all pass the both-or-neither pair rule, mint a
+    token, pass ingress, and only then fail closed inside the worker -- E17's
+    failure one layer later, and the reason this check lives on the write path
+    every caller (UI, API, CLI) shares.
+
+    Userinfo is rejected on its own footing: a credential embedded in the stored
+    URL is disclosed by every place the route is read back, and `adapter` is the
+    field that names an egress credential.
+
+    Neither the endpoint nor any fragment of it appears in the message: it can
+    carry a token in its path or query, and this text is returned to the caller
+    and written to logs.
+    """
+
+    parsed = urlsplit(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            "channel endpoint is not a reply route: the worker POSTs the reply "
+            "to it, so it must be an absolute http:// or https:// URL with a "
+            "host (e.g. 'http://curie-mail-adapter:8080/'). The value is not "
+            "echoed here because an endpoint can carry a credential."
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            "channel endpoint must not embed credentials: a user:password in the "
+            "URL is stored on the binding and disclosed everywhere the route is "
+            "read back. Name the egress identity in 'adapter' instead, and let "
+            "the worker attach its configured credential."
+        )
+    return endpoint
 
 
 class AppConfig(BaseModel):
@@ -638,6 +677,19 @@ class ChannelBindingWrite(ChannelBinding):
       it is a CONFIG-MAP KEY on the worker
       (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a
       space or a `:` is a config-injection shape, not a name.
+    - **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The
+      worker POSTs the platform's AUTHENTICATED reply to this value, so an empty
+      string or a nonsense URL is a binding that mints tokens and passes ingress
+      and then fails closed mid-turn in the worker -- the same E17 failure the
+      route pair exists to foreclose, arriving one layer later. Userinfo
+      (`https://user:pass@host/`) is refused separately: a credential in the
+      stored URL is one git-grep, one log line and one error message away from
+      disclosure, and the `adapter` field is where a credential belongs.
+
+    Neither the value nor any part of it appears in the messages below. An
+    endpoint can carry a token in its path or query, so error text -- which is
+    returned to the caller and written to logs -- names the FIELD and states the
+    rule instead of echoing what was sent.
     """
 
     endpoint: str | None = None
@@ -662,6 +714,8 @@ class ChannelBindingWrite(ChannelBinding):
                 "the reply and is used as a config key by the worker, so it must "
                 "be a lowercase slug (e.g. 'agentmail-sandbox', 'ms-teams')."
             )
+        if self.endpoint is not None:
+            _validate_channel_endpoint(self.endpoint)
         return self
 
 
