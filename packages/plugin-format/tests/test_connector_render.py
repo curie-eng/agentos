@@ -398,20 +398,16 @@ def test_sealed_secret_names_join_the_other_forms() -> None:
     assert spec.resolved_secrets() == ["PLAIN"]
 
 
-def test_a_declared_sealed_secret_is_accepted_now_that_decryption_exists() -> None:
-    """The refusal was a placeholder while nothing could decrypt.
-
-    It was deliberately strict: accepting the field early would have deployed a
-    connector with no credential -- a pod that starts, passes its health check,
-    and 401s every call. The worker decrypts now, so the field is real.
-    """
-
+def test_a_declared_sealed_secret_is_refused_until_decryption_exists() -> None:
     parsed, errors = validate_connectors(
         {"connectors": {"grafana": {"image": "x", "sealed_secrets": {"TOKEN": "AgB"}}}}
     )
-    assert [code for code, _ in errors] == []
-    assert parsed is not None
-    assert parsed.connectors["grafana"].sealed_secrets == {"TOKEN": "AgB"}
+    assert "connectors.sealed_secrets_unsupported" in [code for code, _ in errors]
+    assert parsed is None
+    diagnostic = next(
+        message for code, message in errors if code == "connectors.sealed_secrets_unsupported"
+    )
+    assert "secrets:" in diagnostic
 
 
 def test_an_empty_sealed_blob_is_reported_on_its_own() -> None:
