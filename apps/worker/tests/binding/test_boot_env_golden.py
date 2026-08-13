@@ -28,11 +28,7 @@ from __future__ import annotations
 
 import uuid
 
-from curie_worker.binding import (
-    BindingResolver,
-    ResolvedDeployment,
-    inject_connector_secrets,
-)
+from curie_worker.binding import BindingResolver, ResolvedDeployment, inject_connector_secrets
 from curie_worker.config import WorkerConfig
 from curie_worker.sandbox_token import verify
 
@@ -197,23 +193,6 @@ def test_fully_loaded_run_renders_the_frozen_boot_env() -> None:
         "CURIE_MODEL": "agent-pinned",
     }
     assert set(minted) == set(_MINTED)
-
-
-def test_name_only_cluster_binding_adds_no_boot_env_secret_marker() -> None:
-    env, _minted = _split_minted(
-        _boot_env(
-            WorkerConfig(agent_pool_prefix="curie-agent"),
-            _resolved(secrets=["GITHUB_TOKEN", "JIRA_TOKEN"]),
-        )
-    )
-    generic, _generic_minted = _split_minted(
-        _boot_env(WorkerConfig(agent_pool_prefix="curie-agent"), _resolved())
-    )
-
-    assert env == generic
-    assert "GITHUB_TOKEN" not in env
-    assert "JIRA_TOKEN" not in env
-    assert "CURIE_CONNECTOR_SECRET_KEYS" not in env
 
 
 def test_no_api_key_path_mints_no_state_token() -> None:

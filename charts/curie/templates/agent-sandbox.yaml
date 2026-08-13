@@ -128,14 +128,23 @@ roleRef:
   name: agent-sandbox-controller-networkpolicies
   apiGroup: rbac.authorization.k8s.io
 {{- end }}
-{{- if .Values.agentSandbox.deploy }}
+{{- define "curie.sandboxTemplate" -}}
+{{- $agent := .agent -}}
+{{- $secrets := .secrets -}}
+{{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
 {{- $bf := $runner.bundleFetch }}
+{{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
+{{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
+{{- if $agent }}
+{{- $templateName = printf "%s-agent-%s-runner" (include "curie.fullname" .) $agent }}
+{{- $poolName = printf "%s-agent-%s-runner-pool" (include "curie.fullname" .) $agent }}
+{{- end }}
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
-  name: {{ include "curie.fullname" . }}-runner
+  name: {{ $templateName }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
@@ -164,6 +173,9 @@ spec:
     metadata:
       labels:
         {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 8 }}
+        {{- if $agent }}
+        curietech.ai/agent: {{ $agent | quote }}
+        {{- end }}
     spec:
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
@@ -417,7 +429,7 @@ spec:
             {{- toYaml $runner.liteLLM.resources | nindent 12 }}
         {{- end }}
         - name: runner
-          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" $.Chart.AppVersion) | quote }}
+          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ $runner.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
@@ -429,6 +441,17 @@ spec:
             {{- if $runner.hardening.enabled }}
             - name: HOME
               value: {{ $runner.hardening.home | quote }}
+            {{- end }}
+            {{- if $agent }}
+            {{- $secretName := printf "%s-agent-%s-connector-secrets" (include "curie.fullname" .) $agent }}
+            {{- range $name := keys $secrets | sortAlpha }}
+            - name: {{ $name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ $name }}
+                  optional: false
+            {{- end }}
             {{- end }}
             {{- if and $runner.fakeModel (not .Values.inference.deploy) }}
             - name: CURIE_FAKE_MODEL
@@ -527,7 +550,7 @@ gotcha).
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
 metadata:
-  name: {{ include "curie.fullname" . }}-runner-pool
+  name: {{ $poolName }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
@@ -536,5 +559,19 @@ spec:
   updateStrategy:
     type: {{ .Values.agentSandbox.warmPool.updateStrategy }}
   sandboxTemplateRef:
-    name: {{ include "curie.fullname" . }}-runner
+    name: {{ $templateName }}
+{{- end }}
+{{- end }}
+{{- if .Values.agentSandbox.deploy }}
+{{- $root := . }}
+{{- $connectorSecrets := .Values.agentSandbox.connectorSecrets | default dict }}
+{{- range $agent := keys $connectorSecrets | sortAlpha }}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
+{{- fail (printf "agentSandbox.connectorSecrets.%s has an invalid agent name" $agent) }}
+{{- end }}
+{{- end }}
+{{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}
+{{- range $agent := keys $connectorSecrets | sortAlpha }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent)) | nindent 0 }}
+{{- end }}
 {{- end }}

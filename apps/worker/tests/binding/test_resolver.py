@@ -29,13 +29,11 @@ from curie_worker.binding import (
     CONNECTOR_SECRET_KEYS_ENV,
     HISTORY_TOKEN_ENV,
     MEMORY_TOKEN_ENV,
-    BindingResult,
     BindingResolver,
     ResolvedDeployment,
     warn_if_multiple_agents_bound,
 )
 from curie_worker.config import WorkerConfig
-from curie_worker.sandbox.types import ClaimRouting
 from curie_worker.sandbox_token import verify
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
@@ -56,7 +54,7 @@ async def _seed_agent(
     max_tokens: int | None,
     approval_tools: list[str] | None = None,
     approval_routes: dict | None = None,
-    secrets: dict | list | None = None,
+    secrets: dict | None = None,
     schema: str = _SCHEMA,
 ) -> uuid.UUID:
     agent_id = uuid.uuid4()
@@ -136,11 +134,8 @@ async def _cleanup(engine: AsyncEngine, agent_ids: list[uuid.UUID]) -> None:
             )
 
 
-def _resolver(engine: AsyncEngine, *, agent_pool_prefix: str = "") -> BindingResolver:
-    config_values: dict[str, object] = {"db_schema": _SCHEMA}
-    if agent_pool_prefix:
-        config_values["agent_pool_prefix"] = agent_pool_prefix
-    return BindingResolver(engine, WorkerConfig(**config_values))
+def _resolver(engine: AsyncEngine) -> BindingResolver:
+    return BindingResolver(engine, WorkerConfig(db_schema=_SCHEMA))
 
 
 def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
@@ -867,145 +862,12 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
                 assert resolved.secrets == {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_seeded"}
                 env = resolver.boot_env(resolved, thread_key="t1")
                 assert env["GITHUB_PERSONAL_ACCESS_TOKEN"] == "ghp_seeded"
-                # binding_for resolves the same name and map for the eval lane.
-                by_id = await resolver.binding_for(agent_id)
-                assert by_id == BindingResult(
-                    agent_name=f"agent-{token}",
-                    secrets={"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_seeded"},
-                )
+                # secrets_for resolves the same map by agent_id (the eval lane).
+                by_id = await resolver.secrets_for(agent_id)
+                assert by_id == {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_seeded"}
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
-            await engine.dispose()
-
-    asyncio.run(go())
-
-
-def test_name_only_bindings_route_run_and_eval_to_distinct_agent_pools() -> None:
-    async def go() -> None:
-        engine = create_async_engine(_DB_URL)
-        agent_ids: list[uuid.UUID] = []
-        try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
-
-            resolver = _resolver(engine, agent_pool_prefix="curie-agent")
-            observed: list[ClaimRouting] = []
-            suffix = uuid.uuid4().hex[:8]
-            for agent_name in (f"acme-a-{suffix}", f"acme-b-{suffix}"):
-                channel = f"C-{uuid.uuid4().hex[:8]}"
-                agent_id = await _seed_agent(
-                    engine,
-                    channel=channel,
-                    name=agent_name,
-                    max_usd=None,
-                    max_tokens=None,
-                    secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
-                )
-                agent_ids.append(agent_id)
-                await _seed_deployment(
-                    engine,
-                    agent_id=agent_id,
-                    environment="prod",
-                    bundle_ref=f"bundles/{agent_name}.zip",
-                )
-
-                resolved = await resolver.resolve(channel)
-                assert resolved is not None
-                assert resolved.secrets == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
-                run_routing = resolver.claim_routing(resolved)
-
-                eval_binding = await resolver.binding_for(agent_id)
-                assert eval_binding == BindingResult(
-                    agent_name=agent_name,
-                    secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
-                )
-                eval_routing = resolver.claim_routing(eval_binding)
-
-                expected = ClaimRouting(
-                    warm_pool_ref=f"curie-agent-{agent_name}-runner-pool",
-                    additional_pod_labels={"curietech.ai/agent": agent_name},
-                )
-                assert run_routing == expected
-                assert eval_routing == expected
-                observed.append(expected)
-
-            assert observed[0].warm_pool_ref != observed[1].warm_pool_ref
-            assert observed[0].additional_pod_labels != observed[1].additional_pod_labels
-        finally:
-            if agent_ids:
-                await _cleanup(engine, agent_ids)
-            await engine.dispose()
-
-    asyncio.run(go())
-
-
-def test_empty_or_local_value_bindings_have_no_cluster_claim_routing() -> None:
-    engine = create_async_engine(_DB_URL)
-    try:
-        resolver = _resolver(engine, agent_pool_prefix="curie-agent")
-        empty = ResolvedDeployment(
-            agent_id=uuid.uuid4(),
-            agent_name="acme-empty",
-            version_id=uuid.uuid4(),
-            version_label="v1",
-            bundle_ref=None,
-            max_usd_per_day=None,
-            max_output_tokens_per_run=None,
-            secrets=[],
-        )
-        local = empty.model_copy(
-            update={"secrets": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp-local"}}
-        )
-
-        assert resolver.claim_routing(empty) is None
-        assert resolver.claim_routing(local) is None
-        assert resolver.boot_env(local, "thread-local")[
-            "GITHUB_PERSONAL_ACCESS_TOKEN"
-        ] == "ghp-local"
-    finally:
-        asyncio.run(engine.dispose())
-
-
-def test_malformed_name_only_binding_fails_closed_during_resolution() -> None:
-    async def go() -> None:
-        engine = create_async_engine(_DB_URL)
-        agent_id: uuid.UUID | None = None
-        try:
-            try:
-                async with engine.connect():
-                    pass
-            except SQLAlchemyError as exc:
-                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
-
-            channel = f"C-{uuid.uuid4().hex[:8]}"
-            agent_name = f"acme-invalid-{uuid.uuid4().hex[:8]}"
-            agent_id = await _seed_agent(
-                engine,
-                channel=channel,
-                name=agent_name,
-                max_usd=None,
-                max_tokens=None,
-                secrets=["GITHUB_PERSONAL_ACCESS_TOKEN", "not-valid"],
-            )
-            await _seed_deployment(
-                engine,
-                agent_id=agent_id,
-                environment="prod",
-                bundle_ref="bundles/invalid.zip",
-            )
-
-            resolver = _resolver(engine, agent_pool_prefix="curie-agent")
-            with pytest.raises(ValueError):
-                await resolver.resolve(channel)
-            with pytest.raises(ValueError):
-                await resolver.binding_for(agent_id)
-        finally:
-            if agent_id is not None:
-                await _cleanup(engine, [agent_id])
             await engine.dispose()
 
     asyncio.run(go())

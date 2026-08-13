@@ -505,9 +505,6 @@ class _TokenBinding:
     def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
-    def claim_routing(self, _resolved: object) -> None:
-        return None
-
     def packs_for(self, _resolved: object) -> BehaviorPacks:
         return BehaviorPacks()
 

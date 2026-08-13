@@ -290,24 +290,6 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
     }
 }
 
-#[test]
-fn cluster_deploy_exposes_cluster_secret_delivery_inputs() {
-    let output = run_help(&["cluster", "deploy"]);
-    assert!(
-        output.status.success(),
-        "expected cluster deploy help\n{}",
-        output_text(&output)
-    );
-    let text = output_text(&output);
-    let flags = help_flags(&["cluster", "deploy"]);
-    assert!(flags.contains("--secret"), "missing --secret\n{text}");
-    assert!(flags.contains("--chart"), "missing --chart\n{text}");
-    assert!(
-        !text.contains("NOT yet delivered") && !text.contains("not supported"),
-        "cluster help still describes secret delivery as unavailable\n{text}"
-    );
-}
-
 fn to_argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_string()).collect()
 }

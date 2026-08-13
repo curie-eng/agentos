@@ -9,14 +9,12 @@ named entries fails ``test_bundle_ref_targets_init_containers_by_name``.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
     KubernetesSandboxClient,
 )
-from curie_worker.sandbox.types import ClaimRouting
 
 
 class _FakeApi:
@@ -40,20 +38,11 @@ def _env_entries(api: _FakeApi) -> list[dict[str, str]]:
     return api.created[0]["spec"]["env"]
 
 
-def _routing(
-    pool: str = "pool", labels: dict[str, str] | None = None
-) -> ClaimRouting:
-    return ClaimRouting(
-        warm_pool_ref=pool,
-        additional_pod_labels=labels or {},
-    )
-
-
 def test_bundle_ref_targets_init_containers_by_name() -> None:
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
-        routing=_routing(),
+        pool="pool",
         env={"CURIE_BUNDLE_REF": "bundles/x.tar.gz", "CURIE_BUDGET": "{}"},
     )
     entries = _env_entries(api)
@@ -72,15 +61,11 @@ def test_bundle_ref_targets_init_containers_by_name() -> None:
 def test_no_named_env_without_bundle_ref() -> None:
     api = _FakeApi()
     _client(api).create_claim(
-        "claim-1",
-        routing=_routing(),
-        env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"},
+        "claim-1", pool="pool", env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"}
     )
     entries = _env_entries(api)
     assert entries  # the main-container env is still present
     assert all("containerName" not in e for e in entries)
-    assert api.created[0]["spec"]["warmPoolRef"] == {"name": "pool"}
-    assert "additionalPodMetadata" not in api.created[0]["spec"]
 
 
 def test_credential_is_never_written_to_the_claim() -> None:
@@ -89,7 +74,7 @@ def test_credential_is_never_written_to_the_claim() -> None:
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
-        routing=_routing(),
+        pool="pool",
         env={"CURIE_BUDGET": "{}", "CURIE_CREDENTIALS": "super-secret-token"},
     )
     entries = _env_entries(api)
@@ -106,7 +91,7 @@ def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
-        routing=_routing(),
+        pool="pool",
         env={
             "CURIE_BUDGET": "{}",
             "CURIE_RUNNER_TOKEN": "tok-26",
@@ -126,7 +111,7 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     api = _FakeApi()
     _client(api).create_claim(
         "claim-1",
-        routing=_routing(),
+        pool="pool",
         env={
             "CURIE_BUDGET": "{}",
             "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_super_secret",
@@ -144,37 +129,3 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     assert "CURIE_CONNECTOR_SECRET_KEYS" not in names
     # Non-secret boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
-
-
-def test_agent_routing_is_serialized_without_secret_material() -> None:
-    api = _FakeApi()
-    _client(api).create_claim(
-        "claim-1",
-        routing=_routing(
-            "curie-agent-acme-a-runner-pool",
-            {"curietech.ai/agent": "acme-a"},
-        ),
-        env={
-            "CURIE_BUDGET": "{}",
-            "GITHUB_PERSONAL_ACCESS_TOKEN": "sentinel-value-440",
-            "CURIE_CONNECTOR_SECRET_KEYS": "GITHUB_PERSONAL_ACCESS_TOKEN",
-        },
-        labels={"curietech.ai/thread-hash": "abc123"},
-    )
-
-    claim = api.created[0]
-    assert claim["spec"]["warmPoolRef"] == {
-        "name": "curie-agent-acme-a-runner-pool"
-    }
-    assert claim["spec"]["additionalPodMetadata"] == {
-        "labels": {"curietech.ai/agent": "acme-a"}
-    }
-    assert claim["metadata"]["labels"] == {
-        "curietech.ai/managed-by": "curie-sandbox-substrate",
-        "curietech.ai/thread-hash": "abc123",
-    }
-
-    serialized = json.dumps(claim, sort_keys=True)
-    assert "sentinel-value-440" not in serialized
-    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in serialized
-    assert "CURIE_CONNECTOR_SECRET_KEYS" not in serialized
