@@ -255,6 +255,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
 
+      # A default worker missing these values runs eval suites that cannot
+      # record or report results.
+      - name: helm render assertions (worker eval wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-eval-wiring-assertions.sh
+
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail
