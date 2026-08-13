@@ -24,6 +24,16 @@ from aci_protocol import Final, OutboundEvent, SessionStatus
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from channel_protocol import OutboundMessage
+from channel_protocol.reply import (
+    NavAffordance,
+    ReplyAck,
+    ReplyEvent,
+    ReplyPost,
+    ReplyUpdate,
+    SettledOutcome,
+    TurnCompleted,
+    TurnStatus,
+)
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -37,14 +47,13 @@ from curie_test_support.valkey import (
     connect_or_skip,
 )
 from curie_worker.approval_cards import ApprovalCardStore
-from curie_worker.behaviorpacks import NavPack
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import Kernel
 from curie_worker.markers import Markers
+from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, SandboxView
-from curie_worker.slack_sink import SettledCard, SlackSink
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
 
@@ -96,16 +105,43 @@ def make_config(names: dict[str, str], **overrides: object) -> WorkerConfig:
     return WorkerConfig(**base)
 
 
-# --- Fake Slack sink ----------------------------------------------------------
+# --- Fake reply sink ----------------------------------------------------------
 
 
-class FakeSink(SlackSink):
-    """Records every chat.update and status-clear the kernel makes."""
+class FakeSink:
+    """Records every neutral reply event the kernel emits.
+
+    A ``ReplySink`` (EB-B2, ADR-0096 phase 2): ONE ``emit`` over the four
+    channel-protocol events, with the target route as a kwarg rather than a wire
+    field. The five Slack-shaped methods it replaced (``update``, ``set_status``,
+    ``clear_status``, ``post``, ``update_message``) are gone.
+
+    The Slack-shaped RECORDERS below survive on purpose, reconstructed from the
+    neutral events: the wire changed, what the kernel is supposed to do did not,
+    so the suite's existing assertions must keep asserting the same behavior
+    across the seam swap instead of being rewritten (and quietly weakened)
+    alongside it. Their tuple shapes are unchanged, with the address in the old
+    ``channel`` slot and the opaque ``reply_ref`` in the old ``ts`` slot.
+
+    ``events`` is the neutral log for tests that assert on the wire itself.
+    """
 
     def __init__(self) -> None:
+        # The neutral log: (event, route, best_effort_unreachable) per emit, in
+        # emission order. This is the source of truth; everything below is a
+        # projection of it.
+        self.events: list[tuple[ReplyEvent, TargetRoute, bool]] = []
+        # Event names whose emit must RAISE, so a test can drive the failure
+        # window the completion outbox exists to survive (T-B12(a), T-B8).
+        self.fail_events: set[str] = set()
         self.updates: list[tuple[str, str, str]] = []
-        # The nav pack (if any) threaded to each update, parallel to ``updates``.
-        self.update_navs: list[NavPack | None] = []
+        # The navigation affordance (if any) carried by each reply.update,
+        # parallel to ``updates``. The WIRE form (finding 16): ``NavPack`` is
+        # worker-local and cannot cross into channel_protocol, so the kernel's
+        # sink layer maps it to ``NavAffordance`` and the Slack adapter renders
+        # the hub button from that. Recording the mapped value is what makes a
+        # dropped mapping visible (T-B11) instead of silently losing navigation.
+        self.update_navs: list[NavAffordance | None] = []
         # The per-turn reply endpoint threaded to each update (issue #19),
         # parallel to ``updates``.
         self.update_endpoints: list[str | None] = []
@@ -134,8 +170,13 @@ class FakeSink(SlackSink):
         # renders the buttonless settled card below the seam. ``settled`` is the
         # semantic outcome and is what distinguishes the two forms.
         self.card_updates: list[
-            tuple[str, str, OutboundMessage, str | None, SettledCard | None]
+            tuple[str, str, OutboundMessage, str | None, SettledOutcome | None]
         ] = []
+        # Terminal completions (EB-B6): the ``turn.completed`` events, in order.
+        # Emitted at the durable terminal markers and NOWHERE else -- never in
+        # the terminal ``finally``, which runs for every exception while the
+        # stream entry stays pending for retry (T-B8).
+        self.completions: list[TurnCompleted] = []
         # #708 test infra: endpoints whose HOST is dead (a CLI stub that exited).
         # A reply-delivery ``update`` to one models the pure-offline local loop --
         # no distinct default transport -- so it RAISES the same aiohttp transport
@@ -147,71 +188,93 @@ class FakeSink(SlackSink):
         # Reply deliveries that were swallowed best-effort (channel, ts, text).
         self.swallowed: list[tuple[str, str, str]] = []
 
-    async def update(
+    async def emit(
         self,
+        event: ReplyEvent,
         *,
-        channel: str,
-        ts: str,
-        text: str,
-        nav: NavPack | None = None,
-        endpoint: str | None = None,
+        route: TargetRoute,
         best_effort_unreachable: bool = False,
-    ) -> None:
+    ) -> ReplyAck:
+        endpoint = route.endpoint
         if endpoint is not None and endpoint in self.dead_endpoints:
             if best_effort_unreachable:
-                self.swallowed.append((channel, ts, text))
-                return
+                self.swallowed.append(
+                    (
+                        event.target.address,
+                        event.target.reply_ref or "",
+                        getattr(event, "text", None) or "",
+                    )
+                )
+                return ReplyAck(ref=None)
             raise aiohttp.ClientError(f"reply endpoint {endpoint!r} is unreachable")
-        self.updates.append((channel, ts, text))
-        self.update_navs.append(nav)
-        self.update_endpoints.append(endpoint)
+        if event.event in self.fail_events:
+            raise RuntimeError(f"injected {event.event} delivery failure")
+        self.events.append((event, route, best_effort_unreachable))
+        return self._record(event, endpoint)
 
-    async def set_status(
-        self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
-    ) -> None:
-        self.status_sets.append((channel, thread_ts, status))
-        self.status_calls.append(("set", thread_ts, status))
-
-    async def clear_status(
-        self, *, channel: str, thread_ts: str, endpoint: str | None = None
-    ) -> None:
-        self.status_clears.append((channel, thread_ts))
-        self.status_calls.append(("clear", thread_ts, ""))
-
-    async def post(
-        self,
-        *,
-        channel: str,
-        message: OutboundMessage,
-        requested_by: str,
-        thread_ts: str | None = None,
-        endpoint: str | None = None,
-    ) -> str | None:
-        self.posts.append((channel, message, requested_by, thread_ts, endpoint))
-        return f"posted-{len(self.posts)}"
-
-    async def update_message(
-        self,
-        *,
-        channel: str,
-        ts: str,
-        message: OutboundMessage,
-        endpoint: str | None = None,
-        settled: SettledCard | None = None,
-    ) -> None:
-        # ``settled`` is RECORDED, not accepted and dropped (#1084). It carries
-        # the whole difference between an expired card and a resolved one, so a
-        # fake that swallowed it would let the resolve path regress to rendering
-        # an expiry while every assertion in the suite stayed green.
-        self.card_updates.append((channel, ts, message, endpoint, settled))
+    def _record(self, event: ReplyEvent, endpoint: str | None) -> ReplyAck:
+        """Project one neutral event onto the Slack-shaped recorders."""
+        target = event.target
+        if isinstance(event, TurnStatus):
+            # An empty status IS the clear (EB-B6(a)): the terminal ``finally``
+            # lowers the shimmer as ``TurnStatus(status="")``, so set-vs-clear is
+            # a property of the value, not of which method was called.
+            if event.status:
+                self.status_sets.append((target.address, target.conversation_id, event.status))
+                self.status_calls.append(("set", target.conversation_id, event.status))
+            else:
+                self.status_clears.append((target.address, target.conversation_id))
+                self.status_calls.append(("clear", target.conversation_id, ""))
+            return ReplyAck(ref=None)
+        if isinstance(event, ReplyUpdate):
+            if event.message is not None:
+                # Settling an already-posted platform message (the approval card:
+                # expired in #419, resolved in #1084). ``settled`` is RECORDED,
+                # not accepted and dropped: it carries the whole difference
+                # between an expired card and a resolved one, so a fake that
+                # swallowed it would let the resolve path regress to rendering an
+                # expiry while every assertion in the suite stayed green.
+                self.card_updates.append(
+                    (
+                        target.address,
+                        target.reply_ref or "",
+                        event.message,
+                        endpoint,
+                        event.settled,
+                    )
+                )
+                return ReplyAck(ref=target.reply_ref)
+            self.updates.append((target.address, target.reply_ref or "", event.text or ""))
+            self.update_navs.append(event.nav)
+            self.update_endpoints.append(endpoint)
+            return ReplyAck(ref=target.reply_ref)
+        if isinstance(event, ReplyPost):
+            self.posts.append(
+                (
+                    target.address,
+                    event.message,
+                    event.requested_by,
+                    target.conversation_id,
+                    endpoint,
+                )
+            )
+            return ReplyAck(ref=f"posted-{len(self.posts)}")
+        if isinstance(event, TurnCompleted):
+            self.completions.append(event)
+            return ReplyAck(ref=None)
+        raise AssertionError(f"unmodelled reply event {event!r}")
 
     @property
     def last_text(self) -> str | None:
         return self.updates[-1][2] if self.updates else None
 
     @property
-    def last_nav(self) -> NavPack | None:
+    def last_nav(self) -> NavAffordance | None:
         return self.update_navs[-1] if self.update_navs else None
+
+    def routes_for(self, event_name: str) -> list[TargetRoute]:
+        """Every route the kernel emitted a given event over, in order."""
+        return [route for event, route, _ in self.events if event.event == event_name]
 
 
 # --- Fake Kubernetes client (sandboxes resolve to 127.0.0.1) ------------------
@@ -401,8 +464,10 @@ def make_harness(
 
     Closes over the per-test names and the sync Valkey client so tests need no
     conftest import (which importlib mode makes fragile). Optional kwargs:
-    ``binding`` (a resolver injected into the kernel) and ``with_killswitch``
-    (build a real KillSwitch wired to the kernel); the rest are config overrides."""
+    ``binding`` (a resolver injected into the kernel), ``with_killswitch``
+    (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
+    -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
+    the rest are config overrides."""
 
     def factory(**overrides: object) -> contextlib.AbstractAsyncContextManager[Harness]:
         return kernel_harness(names, sync_redis, **overrides)
@@ -419,6 +484,7 @@ async def kernel_harness(
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
+    sink: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -446,13 +512,13 @@ async def kernel_harness(
     async_redis: AsyncRedis = AsyncRedis(
         host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None, decode_responses=True
     )
-    sink = FakeSink()
+    reply_sink = FakeSink() if sink is None else sink
     runner_client = RunnerClient(total_timeout_s=30.0)
     card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
         substrate=substrate,
         runner=runner_client,
-        sink=sink,
+        sink=reply_sink,  # type: ignore[arg-type]
         lock=ThreadLock(
             async_redis,
             ttl_ms=config.lock_ttl_ms,
@@ -476,7 +542,7 @@ async def kernel_harness(
         yield Harness(
             substrate,
             kernel,
-            sink,
+            reply_sink,  # type: ignore[arg-type]
             fake_runner,
             config,
             async_redis,
