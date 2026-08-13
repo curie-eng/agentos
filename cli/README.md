@@ -422,9 +422,9 @@ replay `--stream`, `--listen-port`, `--valkey-local-port`, `--api-local-port`,
 or `--user`, so pass any of those again explicitly if the original turn used a
 non-default value.
 
-The worker binds a channel to an agent by exact equality on
-`agents.slack_channel`, so a random synthetic channel can never reach a
-deployed agent. Use `--channel <id>` to target a specific channel: pass the
+The worker binds a channel to an agent by exact equality on the channel
+address stored in `agent_channels`, so a random synthetic channel can never
+reach a deployed agent. Use `--channel <id>` to target a specific channel: pass the
 same value you gave `cluster deploy --slack-channel` and the worker routes the
 turn to that agent.
 

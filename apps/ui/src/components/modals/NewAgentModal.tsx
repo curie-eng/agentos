@@ -4,7 +4,7 @@ import { Button, CliHint, cliCommand } from "../../primitives";
 import { SkillEditor } from "../SkillEditor";
 import { useStore } from "../../state/store";
 import { useWired } from "../../state/wired";
-import { createAgent, createVersion, uploadBundle, BundleValidationError } from "../../api/client";
+import { createAgent, createVersion, uploadBundle, BundleValidationError, SLACK_ADDRESS_RE } from "../../api/client";
 import { buildBundleZip } from "../../api/bundle";
 
 // The classic create-agent modal: template picker + skill.md editor + Deploy.
@@ -40,11 +40,6 @@ approval request in its channel.
 - If no matching CRM record exists, refuse and ask for the
   deal id. Do not guess.`;
 
-// The worker resolves agents.slack_channel against the Slack channel ID, not the
-// name, so the field captures the ID. This is a soft check: non-matching values
-// warn but still deploy (the CLI's synthetic channels are arbitrary strings).
-const CHANNEL_ID_RE = /^[CDG][A-Z0-9]+$/;
-
 export function NewAgentModal() {
   const { state, dispatch } = useStore();
   const wired = useWired();
@@ -54,7 +49,11 @@ export function NewAgentModal() {
   const [skill, setSkill] = useState(SKILL);
   const modelValue = model.trim();
   const channelValue = channel.trim();
-  const channelLooksOff = channelValue !== "" && !CHANNEL_ID_RE.test(channelValue);
+  // The worker resolves an agent's binding against the Slack channel ID, not the
+  // name, so the field captures the ID. This is a soft check: non-matching values
+  // warn but still deploy (the CLI's synthetic channels are arbitrary strings).
+  // "slack" is the only kind the console can create today (E4/EB-20).
+  const channelLooksOff = channelValue !== "" && !SLACK_ADDRESS_RE.test(channelValue);
   // A blank channel can never match a Slack mention, so deploy requires one.
   // This is distinct from the format warning above, which never blocks: arbitrary
   // non-ID strings (the CLI's synthetic channels) still deploy — empty does not.
@@ -71,7 +70,7 @@ export function NewAgentModal() {
       // default (CURIE_MODEL unset) rather than pinning an empty string.
       const agent = await createAgent({
         name,
-        slack_channel: channelValue,
+        channel: { kind: "slack", address: channelValue },
         ...(modelValue !== "" ? { model: modelValue } : {}),
       });
       const version = await createVersion(agent.id, { version_label: "v0.1.0", created_by: "ui" });

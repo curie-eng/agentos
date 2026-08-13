@@ -3158,7 +3158,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
 
     let ui = crate::ui::ui();
     if let Some(channel) = opts.slack_channel.as_deref() {
-        validate_slack_channel(channel)?;
+        validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
@@ -4023,7 +4023,7 @@ pub struct ApprovalCmd {
 /// `apps/api/src/curie_api/schemas.py`. The API is the gate for every caller and
 /// re-checks all of these; these exist only so a typo is answered locally with a
 /// fix hint instead of a round trip (the same split the API's own
-/// `_validate_slack_channel_id` docstring describes).
+/// `_validate_channel_binding` docstring describes).
 static SLACK_CHANNEL_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[CDG][A-Z0-9]{7,}$").expect("channel id re"));
 static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
@@ -4763,16 +4763,20 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
     ))
 }
 
-/// Reject a Slack channel value that is a `#name` rather than a channel ID.
+/// Reject a channel binding this CLI can cheaply prove is wrong before a round
+/// trip. Dispatches on `kind`, mirroring the API's kind-dispatched
+/// `_validate_channel_binding`: a kind with no local rule passes here and is
+/// answered authoritatively by the API.
 ///
-/// Real Slack events carry the channel **ID** (e.g. `C0123ABCD`), and the
-/// worker's binding resolver matches on that ID, so a `#name` value is stored
-/// verbatim and never routes -- a silently dead binding. Fail the deploy up
-/// front instead.
-fn validate_slack_channel(channel: &str) -> Result<()> {
-    if channel.trim_start().starts_with('#') {
+/// The `slack` arm rejects a `#name` rather than a channel ID: real Slack
+/// events carry the channel **ID** (e.g. `C0123ABCD`), and the worker's
+/// binding resolver matches on that ID, so a `#name` value is stored verbatim
+/// and never routes -- a silently dead binding. Fail the deploy up front
+/// instead.
+fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
+    if kind == "slack" && address.trim_start().starts_with('#') {
         return Err(crate::exit::usage(format!(
-            "slack channel {channel:?} is a name, not an ID: real Slack events carry the \
+            "slack channel {address:?} is a name, not an ID: real Slack events carry the \
              channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name binding \
              never receives messages. Pass the channel ID instead -- find it in the \
              channel's About tab, or the channel URL (.../archives/C0123ABCD)."
@@ -5431,7 +5435,7 @@ mod tests {
         plan_recorded_teardown, plan_skill_down, replace_first_line, report_sweep,
         resolve_cases_path, resolve_env_file_credentials, seed_env_if_missing,
         select_in_force_deployment, select_passthrough_env, sweep_json_row, sweep_table_row,
-        validate_slack_channel, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
+        validate_channel_binding, ApprovalGateDecl, DownPlan, EnvSeed, RecordedStatePlan,
         RecordedTeardown, SweepRow,
     };
     use serde::Deserialize;
@@ -5805,7 +5809,7 @@ mod tests {
 
     #[test]
     fn default_channel_passes_local_validation() {
-        assert!(validate_slack_channel(crate::api::DEFAULT_SLACK_CHANNEL).is_ok());
+        assert!(validate_channel_binding("slack", crate::api::DEFAULT_SLACK_CHANNEL).is_ok());
     }
 
     #[test]
@@ -5916,18 +5920,27 @@ mod tests {
 
     #[test]
     fn rejects_hash_prefixed_channel_name() {
-        let err = validate_slack_channel("#testing").unwrap_err().to_string();
+        let err = validate_channel_binding("slack", "#testing")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("channel ID"), "{err}");
     }
 
     #[test]
     fn accepts_channel_id() {
-        assert!(validate_slack_channel("C0EXAMPLE4").is_ok());
+        assert!(validate_channel_binding("slack", "C0EXAMPLE4").is_ok());
     }
 
     #[test]
     fn rejects_leading_whitespace_hash() {
-        assert!(validate_slack_channel("  #testing").is_err());
+        assert!(validate_channel_binding("slack", "  #testing").is_err());
+    }
+
+    #[test]
+    fn a_kind_with_no_local_rule_passes_locally() {
+        // No local shape rule for a non-slack kind; the API is the authoritative
+        // gate for it.
+        assert!(validate_channel_binding("webhook", "#anything").is_ok());
     }
 
     /// A fully-credentialed host, for the cases below that are not about which

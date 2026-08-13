@@ -19,7 +19,7 @@ fn route(method: &str, path: &str) -> Response {
         ("POST", "/agents") => Response::json(
             201,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#local-dev","created_at":"2026-07-05T00:00:00Z"}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#local-dev"}},"created_at":"2026-07-05T00:00:00Z"}}"##
             ),
         ),
         ("POST", p) if p == format!("/agents/{AGENT_ID}/versions") => Response::json(
@@ -114,7 +114,7 @@ async fn reuses_an_existing_agent_instead_of_creating() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","slack_channel":"#x","created_at":"2026-07-05T00:00:00Z"}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channel":{{"kind":"slack","address":"#x"}},"created_at":"2026-07-05T00:00:00Z"}}]"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -165,7 +165,7 @@ fn agent_json(id: &str, name: &str, channel: &str, repo: Option<&str>) -> String
         None => String::new(),
     };
     format!(
-        r#"{{"id":"{id}","name":"{name}","slack_channel":"{channel}","created_at":"2026-07-05T00:00:00Z"{bound}}}"#
+        r#"{{"id":"{id}","name":"{name}","channel":{{"kind":"slack","address":"{channel}"}},"created_at":"2026-07-05T00:00:00Z"{bound}}}"#
     )
 }
 
@@ -319,8 +319,9 @@ async fn deploy_binds_an_unbound_agents_repo() {
         "expected exactly one PATCH, got {patches:?}"
     );
     assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
+    // The binding travels as one object under `channel` ({kind, address}).
     assert!(
-        patches[0].get("slack_channel").is_none(),
+        patches[0].get("channel").is_none(),
         "no channel was passed, so the PATCH must not carry one: {}",
         patches[0]
     );
@@ -357,7 +358,10 @@ async fn deploy_binds_the_repo_while_also_moving_the_channel() {
         1,
         "one PATCH carries both changes: {patches:?}"
     );
-    assert_eq!(patches[0]["slack_channel"], "#new");
+    // The binding travels as one object under `channel`; both sub-fields are
+    // asserted so a bare string cannot pass as a channel move.
+    assert_eq!(patches[0]["channel"]["kind"], "slack");
+    assert_eq!(patches[0]["channel"]["address"], "#new");
     assert_eq!(patches[0]["repo_full_name"], "acme/bundle");
     assert_eq!(
         outcome.channel,
@@ -507,7 +511,10 @@ async fn deploy_without_repo_never_sends_the_field() {
         1,
         "expected exactly one PATCH, got {patches:?}"
     );
-    assert_eq!(patches[0]["slack_channel"], "#new");
+    // The binding travels as one object under `channel`; both sub-fields are
+    // asserted so a bare string cannot pass as a channel move.
+    assert_eq!(patches[0]["channel"]["kind"], "slack");
+    assert_eq!(patches[0]["channel"]["address"], "#new");
     assert!(
         patches[0].get("repo_full_name").is_none(),
         "the key must be ABSENT, not null: {}",

@@ -398,6 +398,9 @@ class Kernel:
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
             if self._binding is not None:
+                # `resolve` takes the channel address positionally (ADR-0096,
+                # #1459): the queue wire carries no channel kind, so routing is
+                # on address alone until a later change adds it.
                 resolved = await self._binding.resolve(qevent.reply_handle.channel)
                 if resolved is None:
                     await self._drop_with_message(

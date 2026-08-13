@@ -1,6 +1,7 @@
 """Pydantic v2 request/response models for the API surface."""
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Callable
@@ -40,6 +41,18 @@ _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
 # distinction between a user group and a channel.
 _SLACK_USERGROUP_ID = re.compile(r"^S[A-Z0-9]{7,}$")
 _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
+
+# Channel kinds are lowercase slugs: the value names the owning adapter, and
+# `Slack`, `slack ` and `slack` must not be three different kinds. Shape only --
+# membership is deliberately unchecked (see `_CHANNEL_ADDRESS_SHAPES`).
+_CHANNEL_KIND = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+
+# Any whitespace at all in an address. An address is an opaque routing key the
+# worker matches on equality, so a stray space is never meaningful and always
+# means the value was pasted wrong.
+_ADDRESS_WHITESPACE = re.compile(r"\s")
+
+logger = logging.getLogger(__name__)
 
 
 def _nullable_override_validator(field: str, examples: str) -> Callable[[str | None], str | None]:
@@ -98,7 +111,7 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
         # agent's NEXT turn, long after the command that stored it exited 0.
         #
         # This is the API's job because the API is the gate every client passes
-        # through -- the same reasoning `_validate_slack_channel_id` states for
+        # through -- the same reasoning `_validate_channel_binding` states for
         # itself ("the authoritative gate for every caller (UI, API, CLI)"). The
         # console already trimmed and the CLI did not, so the same paste stored
         # two different values depending on which surface an operator used;
@@ -117,24 +130,118 @@ _validate_model_override = _nullable_override_validator(
 )
 
 
+def _slack_shape_error(value: str) -> str:
+    """#143's actionable guidance, in one place so its two callers cannot drift.
+
+    `curie deploy --slack-channel '#name'` stored the literal name, reported
+    success, and never routed, because the worker matches on the channel ID. The
+    text below -- naming the About tab and the `/archives/` URL form -- IS that
+    fix; a validator that keeps the rejection and drops the guidance re-opens
+    #143 while the status code stays green.
+    """
+
+    return (
+        f"slack channel {value!r} is not a Slack channel ID: real Slack "
+        "events carry the channel ID (e.g. C0123ABCD) and the worker "
+        "routes on it, so a #name or bare-name binding never receives "
+        "messages. Pass the channel ID instead -- find it in the channel's "
+        "About tab, or the channel URL (.../archives/C0123ABCD)."
+    )
+
+
+# Channel kind -> the address shape that kind requires, paired with the message
+# a violation earns (ADR-0096, #1459).
+#
+# A kind ABSENT from this table is not rejected: it validates on the generic
+# rule in `_validate_channel_binding` instead. That fallback is what makes
+# "an agent binds a non-Slack channel kind without schema changes" true rather
+# than aspirational -- a registry would put a code change in front of every new
+# adapter, which is the coupling ADR-0096 removes. Adding an entry here is how a
+# kind EARNS a stricter shape once its adapter exists, not a precondition of
+# binding one.
+#
+# The message rides WITH the shape rather than in a second lookup: the shape is
+# only half the deliverable (#143), and a kind that gains a rule and no guidance
+# tells an operator their value is wrong without telling them what is right.
+_CHANNEL_ADDRESS_SHAPES: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
+    "slack": (_SLACK_CHANNEL_ID, _slack_shape_error),
+}
+
+
 def _validate_slack_channel_id(value: str | None) -> str | None:
-    """Enforce a Slack channel-ID shape on a binding. Slack events carry the
-    channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name or
-    bare-name binding never receives messages. This is the authoritative gate
-    for every caller (UI, API, CLI); the CLI keeps a fast local check purely
-    for UX. Reused by AgentCreate and AgentUpdate so create and PATCH validate
-    identically; None (an omitted PATCH field) passes through as a no-op."""
+    """Enforce a Slack channel-ID shape on an APPROVAL ROUTE's destination.
+
+    Scoped to `ApprovalRouteBinding` since ADR-0096 (#1459). The agent's channel
+    binding is validated by `_validate_channel_binding` below instead: an
+    approval route's channel is a different concept that merely shared this
+    validator (bf717203d), so it keeps a Slack-specific rule of its own rather
+    than being dragged through a kind dispatch it has no kind for. Making it
+    neutral is #1460's work, not this one's.
+
+    None (an omitted PATCH field) passes through as a no-op.
+    """
     if value is None:
         return value
     if not _SLACK_CHANNEL_ID.match(value):
-        raise ValueError(
-            f"slack channel {value!r} is not a Slack channel ID: real Slack "
-            "events carry the channel ID (e.g. C0123ABCD) and the worker "
-            "routes on it, so a #name or bare-name binding never receives "
-            "messages. Pass the channel ID instead -- find it in the channel's "
-            "About tab, or the channel URL (.../archives/C0123ABCD)."
-        )
+        raise ValueError(_slack_shape_error(value))
     return value
+
+
+def _validate_channel_binding(kind: str, address: str) -> str:
+    """Enforce the address shape a channel KIND requires, and return the address.
+
+    The authoritative gate for every caller (UI, API, CLI): the CLI and the
+    console keep fast local checks purely for UX, which is only defensible while
+    this one is authoritative. Reused by `AgentCreate` and `AgentUpdate` through
+    `ChannelBinding`, so create and PATCH validate identically.
+
+    Dispatch, not a chain of `if kind ==`: a registered kind (today only
+    `slack`) validates on its own shape, and an UNREGISTERED kind validates on
+    the generic rule -- non-empty, no whitespace -- rather than being rejected or
+    silently borrowing Slack's `^[CDG][A-Z0-9]{7,}$`. Borrowing it would make
+    every new adapter a schema change, which is exactly the coupling ADR-0096
+    removes.
+
+    Args:
+        kind: the channel kind naming the owning adapter (a lowercase slug).
+        address: the routing key the worker matches on equality.
+
+    Returns:
+        The validated address, unchanged.
+
+    Raises:
+        ValueError: the kind is not a slug, or the address fails its shape.
+    """
+
+    if not _CHANNEL_KIND.match(kind):
+        raise ValueError(
+            f"channel kind {kind!r} is not a channel kind: a kind names the "
+            "adapter that owns the binding and must be a lowercase slug "
+            "(e.g. 'slack', 'webhook', 'ms-teams')."
+        )
+    registered = _CHANNEL_ADDRESS_SHAPES.get(kind)
+    if registered is None:
+        # A typo'd kind ('slak') is a well-formed slug with no adapter behind
+        # it, so it creates a binding nothing will ever resolve. Nothing can
+        # reject it without a kind registry -- deliberately not built (ADR-0096
+        # decision 5) -- so say it once, here, at write time, instead of leaving
+        # an operator to debug dead routing later.
+        logger.info(
+            "channel kind %r has no registered address shape; validating %r on the generic rule",
+            kind,
+            address,
+        )
+        if not address or _ADDRESS_WHITESPACE.search(address):
+            raise ValueError(
+                f"channel address {address!r} is not routable: an address is "
+                "matched on equality by the worker, so it must be non-empty and "
+                "contain no whitespace."
+            )
+        return address
+    shape, explain = registered
+    if not shape.match(address):
+        raise ValueError(explain(address))
+    return address
 
 
 class AppConfig(BaseModel):
@@ -405,9 +512,108 @@ def _validate_route_names(
     return value
 
 
+def _reject_retired_binding_keys(data: Any) -> Any:
+    """Refuse retired agent-binding keys on an agent write (#1459).
+
+    Two keys are named here, both superseded by the channel-neutral binding:
+
+    - `slack_channel` WAS the agent's binding until migration 0021 replaced it
+      with `channel: {kind, address}`.
+    - `channels` (plural) never was: ADR-0096/ADR-0089 fix the binding as
+      singular (one agent, one channel), so a caller sending the plural key
+      is describing a shape this API has never had.
+
+    These models inherit pydantic's `extra="ignore"`, so without this a
+    `PATCH /agents/{id}` carrying either key validates into an EMPTY
+    `AgentUpdate` and returns 200 having changed nothing -- the caller is told
+    its rebind succeeded while the agent still answers on the old binding.
+    Silent misrouting is the #38 shadow failure the binding rules exist to
+    prevent, so the removal has to be loud.
+
+    Narrow on purpose: the keys are named, not `extra="forbid"`. Forbidding
+    ALL unknown keys would also turn every FUTURE field into a hard 422
+    against an older platform, and the CLI leans on that tolerance today -- it
+    sends `repo_full_name` to platforms that predate #1194 and reads the
+    RESPONSE to tell whether the field landed (`cli/src/api.rs`). This model
+    rejects only the keys whose meaning was deliberately withdrawn or never
+    existed; unknown-key tolerance across releases is untouched.
+
+    Runs `mode="before"`, since by `mode="after"` the extra key is already gone.
+    """
+
+    if isinstance(data, dict):
+        if "slack_channel" in data:
+            raise ValueError(
+                "slack_channel is no longer an agent field: it was replaced by "
+                "the channel-neutral binding (ADR-0096), so sending it would "
+                'leave the agent bound where it already was. Send channel: '
+                '{"kind": "slack", "address": "C0123ABCD"} instead.'
+            )
+        if "channels" in data:
+            raise ValueError(
+                "channels is not an agent field: an agent binds exactly one "
+                "channel (ADR-0089), so sending the plural key would leave "
+                'the agent bound where it already was. Send channel: {"kind": '
+                '"slack", "address": "C0123ABCD"} instead.'
+            )
+    return data
+
+
+def _channel_schema_omittable_not_null(schema: dict[str, Any]) -> None:
+    """Publish `AgentUpdate.channel` as omittable but NOT nullable.
+
+    The annotation is `ChannelBinding | None` because `None` is how an OMITTED
+    field arrives, but `_reject_explicit_null_channel` 422s an explicit null. Left
+    alone, generation reads the annotation literally and the committed
+    `openapi.json` advertises `channel: null` as valid -- so a generated client
+    sends the value the published contract blessed and gets a validation error.
+    Collapsing the `anyOf` (and dropping the `null` default with it) makes the
+    exported schema say what the model actually accepts.
+    """
+
+    options = [option for option in schema.get("anyOf", []) if option.get("type") != "null"]
+    if len(options) == 1:
+        schema.pop("anyOf")
+        schema.pop("default", None)
+        schema.update(options[0])
+
+
+class ChannelBinding(BaseModel):
+    """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
+
+    Singular wherever it appears -- one agent binds one channel (ADR-0089) --
+    so `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT
+    and there is no plural surface anywhere on this API.
+
+    `kind` names the adapter that owns the binding and selects the address-shape
+    check; it does not route. `address` is the routing key the worker matches on
+    equality (a Slack channel id for `kind="slack"`).
+    """
+
+    # A typo'd `adress` or a stray `channels` nested here is a misunderstanding
+    # of the contract, not a partially-honored request: accepting it would store
+    # a binding the operator did not describe, and an agent bound to the wrong
+    # address looks deployed and answers nothing.
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    kind: str
+    address: str
+
+    @model_validator(mode="after")
+    def _check_binding(self) -> "ChannelBinding":
+        # Model-level, not two field validators: the address rule is CHOSEN BY
+        # the kind, so neither field can be judged alone.
+        _validate_channel_binding(self.kind, self.address)
+        return self
+
+
 class AgentCreate(BaseModel):
     name: str
-    slack_channel: str
+    # Required, and singular. Every create path supplies exactly one binding
+    # today (the CLI defaults to C0LOCALDEV), and an agent with no binding
+    # cannot receive a turn -- it would look deployed and healthy while
+    # answering nothing, which is #38's silent-shadow failure.
+    channel: ChannelBinding
     repo_full_name: str | None = None
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
@@ -430,10 +636,10 @@ class AgentCreate(BaseModel):
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
-    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
 
 
 class AgentUpdate(BaseModel):
@@ -450,7 +656,21 @@ class AgentUpdate(BaseModel):
     many agents now, so binding is a routing fact, not a name.
     """
 
-    slack_channel: str | None = None
+    # The agent's channel binding (ADR-0096, #1459). OMITTED leaves the current
+    # binding unchanged; a value REPLACES it (an agent holds exactly one).
+    #
+    # Explicit JSON null is REJECTED, deliberately breaking the convention its
+    # neighbours `model` and `thinking` follow two fields down. Their null means
+    # "fall back to the platform default"; there is no default binding to fall
+    # back to, so a null here would strand the agent -- deployed,
+    # healthy-looking, and unable to receive a turn. `None` is therefore only
+    # ever "omitted", never "sent as null" (see `_reject_explicit_null_channel`).
+    # `json_schema_extra` keeps the PUBLISHED contract honest about that: the
+    # annotation has to admit `None` for the omitted case, but the exported
+    # OpenAPI must not offer `null` as a value a client may send.
+    channel: ChannelBinding | None = Field(
+        default=None, json_schema_extra=_channel_schema_omittable_not_null
+    )
     # New per-agent model id (#254). OMITTED leaves the current model unchanged;
     # explicit null clears it back to the platform default (#1310).
     model: str | None = None
@@ -476,10 +696,30 @@ class AgentUpdate(BaseModel):
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)
-    _check_slack_channel = field_validator("slack_channel")(_validate_slack_channel_id)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
     _check_approval_routes = field_validator("approval_routes")(_validate_route_names)
     _check_secrets = field_validator("secrets")(_validate_secret_map)
+    _reject_retired_channel_keys = model_validator(mode="before")(_reject_retired_binding_keys)
+
+    @model_validator(mode="after")
+    def _reject_explicit_null_channel(self) -> "AgentUpdate":
+        """Refuse `{"channel": null}`; see the field comment for why.
+
+        Keyed on `model_fields_set` for the same reason the router is (#1310):
+        `is None` alone cannot tell "the client did not mention this field" from
+        "the client explicitly sent null", and here those two must not mean the
+        same thing.
+        """
+
+        if "channel" in self.model_fields_set and self.channel is None:
+            raise ValueError(
+                "channel must not be null: unlike model and thinking, there is "
+                "no platform-default binding to fall back to, so clearing it "
+                "would leave the agent unable to receive a turn. Omit the field "
+                "to leave the binding unchanged, or send a new "
+                "{kind, address} to move it."
+            )
+        return self
 
 
 class AgentOut(BaseModel):
@@ -487,7 +727,11 @@ class AgentOut(BaseModel):
 
     id: uuid.UUID
     name: str
-    slack_channel: str
+    # Serialized from the singular `Agent.channel` relationship. Ordering is
+    # moot because there is exactly one, which is a second reason the surface is
+    # an object rather than a list; the LOADING strategy is not moot, and lives
+    # on the relationship (`models.Agent.channel`, lazy="selectin").
+    channel: ChannelBinding
     repo_full_name: str | None
     behavior_packs: dict[str, Any] | None
     model: str | None

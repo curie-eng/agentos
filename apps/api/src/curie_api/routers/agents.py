@@ -32,9 +32,10 @@ router = APIRouter(prefix="/agents", tags=["agents"], dependencies=[Depends(requ
 # exception -- there is no psycopg-style `.diag` namespace.
 _UNIQUE_VIOLATION = "23505"
 
-# The real unique constraints on `agents` (from the alembic migrations), mapped
-# to the human message for each. Any other unique violation falls back to a
-# generic message.
+# The real unique constraints an agent write can violate -- on `agents` and on
+# its `agent_channels` binding (from the alembic migrations) -- mapped to the
+# human message for each. Any other unique violation falls back to a generic
+# message.
 _UNIQUE_CONSTRAINT_MESSAGES = {
     "agents_name_key": "an agent with that name already exists",
     # ix_agents_repo_full_name stopped being unique in 0018 (ADR-0091): one
@@ -47,11 +48,23 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "several agents (ADR-0091) -- run `alembic upgrade head` to apply "
         "migration 0018, which drops this constraint"
     ),
-    # #38: one agent per channel. Without this the create succeeded and the
-    # second agent was silently shadowed by the worker's resolver at runtime.
-    "agents_slack_channel_key": (
-        "another agent is already bound to that Slack channel; one agent per "
-        "channel (move or delete the other agent, or pick another channel)"
+    # #38: one agent per channel address, carried onto `agent_channels` by
+    # migration 0021. Without this the create succeeded and the second agent was
+    # silently shadowed by the worker's resolver at runtime. Stated without the
+    # word "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
+    # belong to every channel kind.
+    "agent_channels_address_key": (
+        "another agent is already bound to that channel address; one agent per "
+        "address (move or delete the other agent, or pick another address)"
+    ),
+    # The reverse direction, which the old scalar column got for free and a
+    # child table would silently discard (ADR-0089: "one agent still binds one
+    # channel"). A different operator mistake from the one above, so a different
+    # message: sharing one message would misdiagnose both.
+    "agent_channels_agent_id_key": (
+        "that agent already has a channel binding; one agent binds one channel "
+        "(ADR-0089), so PATCH the agent's channel to move it rather than adding "
+        "a second binding"
     ),
 }
 
@@ -130,21 +143,23 @@ async def get_agent(agent_id: uuid.UUID, session: SessionDep) -> AgentOut:
 
 @router.patch("/{agent_id}", response_model=AgentOut)
 async def update_agent(agent_id: uuid.UUID, data: AgentUpdate, session: SessionDep) -> AgentOut:
-    # Lets a redeploy move an existing agent's Slack channel (the CLI only sends
-    # this when --slack-channel was passed explicitly). An omitted field is a
-    # no-op so the agent's current channel is preserved.
+    # Lets a redeploy move an existing agent's channel (the CLI only sends this
+    # when a channel was passed explicitly). An omitted field is a no-op so the
+    # agent's current binding is preserved; an explicit null is refused by the
+    # schema rather than clearing it (there is no default binding to fall back
+    # to), so `is not None` here means exactly "the client sent a binding".
     agent = await crud.get_agent(session, agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if data.slack_channel is not None:
-        # slack_channel is unique (one agent per channel, #38), so this is the one
-        # PATCHable field that can collide with another agent. Classify it the same
-        # way create does -- a caller conflict is a 409, not an opaque 500 -- so the
-        # constraint cannot be sidestepped by creating on a free channel and then
-        # moving onto a taken one. (Before #38 no PATCHable field was unique, which
-        # is why this path had no IntegrityError handler.)
+    if data.channel is not None:
+        # The binding's address is unique (one agent per address, #38), so this is
+        # the one PATCHable field that can collide with another agent. Classify it
+        # the same way create does -- a caller conflict is a 409, not an opaque 500
+        # -- so the constraint cannot be sidestepped by creating on a free address
+        # and then moving onto a taken one. (Before #38 no PATCHable field was
+        # unique, which is why this path had no IntegrityError handler.)
         try:
-            agent = await crud.update_agent_channel(session, agent, data.slack_channel)
+            agent = await crud.update_agent_binding(session, agent, data.channel)
         except IntegrityError as exc:
             await session.rollback()
             classified = classify_integrity_error(exc)

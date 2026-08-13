@@ -24,7 +24,11 @@ REPO = "octo/trigger-10"
 def _create_agent(client: Any, auth_headers: dict[str, str], name: str) -> dict[str, Any]:
     resp = client.post(
         "/agents",
-        json={"name": name, "slack_channel": "C000000K01", "repo_full_name": REPO},
+        json={
+            "name": name,
+            "channel": {"kind": "slack", "address": "C000000K01"},
+            "repo_full_name": REPO,
+        },
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text

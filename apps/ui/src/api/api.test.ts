@@ -51,10 +51,15 @@ function jsonResponse(status: number, body: unknown): Response {
 describe("api client", () => {
   it("sends the API key and returns the parsed agent", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(201, { id: "a1", name: "deal-desk", slack_channel: "#revenue-ops", created_at: "now" }),
+      jsonResponse(201, {
+        id: "a1",
+        name: "deal-desk",
+        channel: { kind: "slack", address: "#revenue-ops" },
+        created_at: "now",
+      }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const agent = await createAgent({ name: "deal-desk", slack_channel: "#revenue-ops" });
+    const agent = await createAgent({ name: "deal-desk", channel: { kind: "slack", address: "#revenue-ops" } });
     expect(agent.id).toBe("a1");
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/agents");
@@ -191,18 +196,42 @@ describe("agent-detail client calls", () => {
     expect(err.status).toBe(404);
   });
 
-  it("PATCHes the agent's Slack channel and returns the updated agent", async () => {
+  it("PATCHes the agent's channel binding and returns the updated agent", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      jsonResponse(200, { id: "a1", name: "deal-desk", slack_channel: "C9999ZZZZ", created_at: "now" }),
+      jsonResponse(200, {
+        id: "a1",
+        name: "deal-desk",
+        channel: { kind: "slack", address: "C9999ZZZZ" },
+        created_at: "now",
+      }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const agent = await updateAgent("a1", { slack_channel: "C9999ZZZZ" });
-    expect(agent.slack_channel).toBe("C9999ZZZZ");
+    const agent = await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
+    expect(agent.channel.address).toBe("C9999ZZZZ");
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/agents/a1");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body)).toEqual({ slack_channel: "C9999ZZZZ" });
+    expect(JSON.parse(init.body)).toEqual({ channel: { kind: "slack", address: "C9999ZZZZ" } });
     expect((init.headers as Record<string, string>)["X-API-Key"]).toBeTruthy();
+  });
+
+  // One agent binds exactly one channel (ADR-0089), so the wire carries a single
+  // binding object: never an array, and never a plural `channels` field.
+  it("sends the channel binding as a singular object, never an array or a plural field", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        id: "a1",
+        name: "deal-desk",
+        channel: { kind: "slack", address: "C9999ZZZZ" },
+        created_at: "now",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await updateAgent("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(Array.isArray(body.channel)).toBe(false);
+    expect(body.channel).toEqual({ kind: "slack", address: "C9999ZZZZ" });
+    expect(body.channels).toBeUndefined();
   });
 
   it("activates a version by POSTing a deployment", async () => {

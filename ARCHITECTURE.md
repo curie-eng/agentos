@@ -184,7 +184,7 @@ sequenceDiagram
 
     W->>V: XREADGROUP (consumer group)
     W->>V: SET NX PX thread lock (routing CAS)
-    W->>W: binding: resolve agent+version+bundle_ref by slack_channel
+    W->>W: binding: resolve agent+version+bundle_ref by channel address
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
@@ -222,7 +222,7 @@ The pieces, cited:
 
   The Socket Mode handler is at [`apps/dispatcher/src/curie_dispatcher/app.py::SocketModeConnection`](apps/dispatcher/src/curie_dispatcher/app.py). The stream name is configured on [`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`](apps/dispatcher/src/curie_dispatcher/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
 - **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).
-- **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on `slack_channel` against the active deployment ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). This is how one worker serves many agents: the channel selects the bundle.
+- **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on the channel address against the active deployment, joining `agents` -> `agent_channels` -> `deployments` -> `agent_versions` ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). This is how one worker serves many agents: the channel selects the bundle.
 
 ### The four kernel invariants
 
@@ -404,12 +404,14 @@ The worker cannot distinguish the stub from Slack: same queue payload, same
 `chat.update` call. This is what lets most of the verification suite run with
 no Slack workspace at all.
 
-The honest limit: the **per-turn payload** is channel-neutral, but the binding
-surface is not. The catalog grades the channel/ingress seam `C` with one
-implementation. Slack vocabulary (channel ids, thread ts) still reaches the
-control plane — a deployment binds an agent by exact-match on `slack_channel`.
-"The system does not care which channel" is true of a turn in flight. It is not
-yet true of how an agent gets bound to one.
+The honest limit: the **per-turn payload** and the **binding surface** are both
+channel-neutral now (#1459, ADR-0096) — a deployment binds an agent by
+exact-match on a `{kind, address}` channel row, not a Slack-typed column. The
+catalog still grades the channel/ingress seam `C` with one implementation:
+Slack is the only registered `kind`, and there is no multi-channel adapter
+framework yet (#27). "The system does not care which channel" is true of a
+turn in flight and of how an agent gets bound to one; it is not yet true of
+how many channel kinds are wired up.
 
 Net effect: a developer can run the entire product loop — real model call
 included — on a laptop with Docker, no cluster, and no Slack. The code

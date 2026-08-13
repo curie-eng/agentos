@@ -150,7 +150,7 @@ def _register_agent(client: Any, headers: dict[str, str]) -> str:
         "/agents",
         json={
             "name": "gitflow-agent",
-            "slack_channel": "C000000G01",
+            "channel": {"kind": "slack", "address": "C000000G01"},
             "repo_full_name": REPO,
         },
         headers=headers,
@@ -211,7 +211,7 @@ def test_patched_repo_binding_routes_a_push(
 
     created = client.post(
         "/agents",
-        json={"name": "patched-agent", "slack_channel": "C000000G02"},
+        json={"name": "patched-agent", "channel": {"kind": "slack", "address": "C000000G02"}},
         headers=auth_headers,
     )
     assert created.status_code == 201, created.text
@@ -265,7 +265,7 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
         "/agents",
         json={
             "name": "omit-repo-agent",
-            "slack_channel": "C0EXAMPLE3",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE3"},
             "repo_full_name": REPO,
         },
         headers=auth_headers,
@@ -276,7 +276,7 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
 
     patched = client.patch(
         f"/agents/{agent_id}",
-        json={"slack_channel": "C0EXAMPLE4"},
+        json={"channel": {"kind": "slack", "address": "C0EXAMPLE4"}},
         headers=auth_headers,
     )
     assert patched.status_code == 200, patched.text
@@ -288,7 +288,7 @@ def test_patch_omitting_repo_full_name_leaves_the_binding_intact(
     assert fetched.json()["repo_full_name"] == REPO, (
         "omitting repo_full_name from the PATCH must leave the binding unchanged"
     )
-    assert fetched.json()["slack_channel"] == "C0EXAMPLE4", (
+    assert fetched.json()["channel"] == {"kind": "slack", "address": "C0EXAMPLE4"}, (
         "the channel PATCH must still take effect"
     )
 
@@ -534,7 +534,11 @@ TWO_TARGET_FILES = {**VALID_FILES, "deploy.yaml": DEPLOY_YAML}
 def _register(client: Any, headers: dict[str, str], name: str, channel: str) -> str:
     resp = client.post(
         "/agents",
-        json={"name": name, "slack_channel": channel, "repo_full_name": REPO},
+        json={
+            "name": name,
+            "channel": {"kind": "slack", "address": channel},
+            "repo_full_name": REPO,
+        },
         headers=headers,
     )
     assert resp.status_code == 201, resp.text
@@ -623,7 +627,7 @@ def test_a_target_naming_another_repos_agent_is_rejected_end_to_end(
         "/agents",
         json={
             "name": "foreign-bot",
-            "slack_channel": "C000000F01",
+            "channel": {"kind": "slack", "address": "C000000F01"},
             "repo_full_name": "someone-else/their-repo",
         },
         headers=auth_headers,
@@ -660,7 +664,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
 ) -> None:
     """A rejected sha deploys on the next pass after its target is created."""
     from curie_api.commitpoller import CommitPoller
-    from curie_api.schemas import AgentCreate
+    from curie_api.schemas import AgentCreate, ChannelBinding
 
     _register(client, auth_headers, "bootstrap_agent", "C000000R01")
     files = {
@@ -704,7 +708,7 @@ def test_commit_poller_retries_after_routing_topology_is_repaired(
                     session,
                     AgentCreate(
                         name="repairedagent",
-                        slack_channel="C000000R02",
+                        channel=ChannelBinding(kind="slack", address="C000000R02"),
                         repo_full_name=REPO,
                     ),
                 )

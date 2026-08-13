@@ -60,7 +60,7 @@ const mkDep = (
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  slack_channel: "#revenue-ops",
+  channel: { kind: "slack", address: "#revenue-ops" },
   model: null,
   created_at: "2026-06-01T00:00:00Z",
 };

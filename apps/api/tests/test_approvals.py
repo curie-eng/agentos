@@ -651,7 +651,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
         "/agents",
         json={
             "name": f"deal-desk-{uuid.uuid4().hex[:8]}",
-            "slack_channel": "C0LOCALDEV",
+            "channel": {"kind": "slack", "address": "C0LOCALDEV"},
             "approval_routes": {
                 "deal-desk": {
                     "channel": "C0BOUND01",
@@ -1533,7 +1533,7 @@ def _agent_with_routes(
         "/agents",
         json={
             "name": f"routed-{uuid.uuid4().hex[:8]}",
-            "slack_channel": "C0AGENT001",
+            "channel": {"kind": "slack", "address": "C0AGENT001"},
             "approval_routes": routes,
         },
         headers=headers,

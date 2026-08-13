@@ -6,9 +6,11 @@ from typing import Any
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from .models import (
     Agent,
+    AgentChannel,
     AgentVersion,
     Approval,
     ApprovalAuditEntry,
@@ -16,11 +18,30 @@ from .models import (
     Deployment,
     Environment,
 )
-from .schemas import AgentCreate, ApprovalRequest, DeploymentCreate, VersionCreate
+from .schemas import (
+    AgentCreate,
+    ApprovalRequest,
+    ChannelBinding,
+    DeploymentCreate,
+    VersionCreate,
+)
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
     return await session.get(AgentVersion, version_id)
+
+
+async def _refresh_with_channel(session: AsyncSession, agent: Agent) -> Agent:
+    """Commit, then refresh the agent and name the `channel` relationship explicitly.
+
+    The response model reads `agent.channel` after this session is done with, and
+    an unloaded relationship RAISES under asyncio rather than lazy-loading, so
+    the endpoint 500s where a crud-level test (holding a live session) passes.
+    """
+    await session.commit()
+    await session.refresh(agent)
+    await session.refresh(agent, ["channel"])
+    return agent
 
 
 async def attach_bundle(
@@ -39,7 +60,11 @@ async def attach_bundle(
 async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
     agent = Agent(
         name=data.name,
-        slack_channel=data.slack_channel,
+        # Attached through the relationship rather than inserted separately, so
+        # the agent row and its binding are one transaction: a unique-constraint
+        # collision on either rolls BOTH back, and no agent is ever left behind
+        # bound to nothing (#38's silent-shadow state).
+        channel=AgentChannel(kind=data.channel.kind, address=data.channel.address),
         repo_full_name=data.repo_full_name,
         model=data.model,
         thinking=data.thinking,
@@ -55,13 +80,17 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         secrets=data.secrets,
     )
     session.add(agent)
-    await session.commit()
-    await session.refresh(agent)
-    return agent
+    return await _refresh_with_channel(session, agent)
 
 
 async def list_agents(session: AsyncSession) -> list[Agent]:
-    result = await session.scalars(select(Agent).order_by(Agent.created_at))
+    # `selectinload` explicitly, even though the relationship is already
+    # lazy="selectin": the list path is the one where the per-row alternative is
+    # correct AND unboundedly slow, so a hundred-agent install would pay a
+    # hundred round trips to render one page.
+    result = await session.scalars(
+        select(Agent).options(selectinload(Agent.channel)).order_by(Agent.created_at)
+    )
     return list(result)
 
 
@@ -81,19 +110,29 @@ async def agent_has_active_deployment(session: AsyncSession, agent_id: uuid.UUID
 async def delete_agent(session: AsyncSession, agent_id: uuid.UUID) -> None:
     # Remove child rows first, then the agent. Bulk deletes bypass the ORM
     # relationship cascade (which would emit an async lazy-load during flush) and
-    # match the FK ondelete=CASCADE already declared on both child tables. Bundle
+    # match the FK ondelete=CASCADE already declared on every child table. Bundle
     # objects in RustFS are intentionally left in place (out of scope).
+    await session.execute(delete(AgentChannel).where(AgentChannel.agent_id == agent_id))
     await session.execute(delete(Deployment).where(Deployment.agent_id == agent_id))
     await session.execute(delete(AgentVersion).where(AgentVersion.agent_id == agent_id))
     await session.execute(delete(Agent).where(Agent.id == agent_id))
     await session.commit()
 
 
-async def update_agent_channel(session: AsyncSession, agent: Agent, slack_channel: str) -> Agent:
-    agent.slack_channel = slack_channel
-    await session.commit()
-    await session.refresh(agent)
-    return agent
+async def update_agent_binding(
+    session: AsyncSession, agent: Agent, channel: ChannelBinding
+) -> Agent:
+    """Move the agent's single binding to a new kind/address (ADR-0096, #1459).
+
+    Mutated IN PLACE rather than replaced: an agent holds exactly one binding
+    (`agent_channels_agent_id_key`), and assigning a fresh row would make the
+    insert of the replacement race the delete of the original inside one flush,
+    tripping that constraint on a move that is perfectly legal.
+    """
+
+    agent.channel.kind = channel.kind
+    agent.channel.address = channel.address
+    return await _refresh_with_channel(session, agent)
 
 
 async def update_agent_model(session: AsyncSession, agent: Agent, model: str | None) -> Agent:

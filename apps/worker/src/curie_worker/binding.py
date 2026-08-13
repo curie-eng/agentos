@@ -1,28 +1,35 @@
-"""Deployment-to-runtime binding: resolve a Slack channel to the agent, its
+"""Deployment-to-runtime binding: resolve a channel address to the agent, its
 active deployment, and the bundle + budget to boot the sandbox with.
 
 The B1/J1/L1 Postgres tables are the source of truth. Rather than import the API
 package (which would pull FastAPI and its ORM into the worker), this is a thin
 read-only query layer over the same tables via a SQLAlchemy async engine: one
-parameterized SELECT joining agents -> deployments -> agent_versions.
+parameterized SELECT joining agents -> agent_channels -> deployments ->
+agent_versions.
 
-Resolution rule: an agent is bound to a channel (agents.slack_channel). The run
-uses that agent's active deployment (deployments.status = 'active'); when both a
-prod and a dev deployment are active, prod wins, then the most recent. A channel
-with no agent, or an agent with no active deployment, resolves to None -- the
-kernel answers with a polite placeholder and drops the event rather than crashing.
+Resolution rule: an agent is bound to a channel via a row in ``agent_channels``
+(ADR-0096, #1459), one binding per agent. The run uses that agent's active
+deployment (deployments.status = 'active'); when both a prod and a dev
+deployment are active, prod wins, then the most recent. An address with no
+agent, or an agent with no active deployment, resolves to None -- the kernel
+answers with a polite placeholder and drops the event rather than crashing.
 Per-channel dev/prod bot-identity routing (the dispatcher carrying which bot was
 addressed) is a J1/dispatcher refinement noted for later.
 
-Contract (cross-lane, load-bearing): agents.slack_channel MUST store the Slack
-channel ID (e.g. ``C0123ABCD``), because the dispatcher enqueues the Slack
-channel id as ``QueuedTurn.reply_handle.channel``, the kernel passes that value
-into ``resolve()``, and this resolver matches on equality. If the create-agent
-API/UI stores a channel NAME (``#triage``) instead, every real mention resolves
-to None and is dropped. Storing the id at
-agent creation (or translating name->id there) is the API/UI's responsibility;
-this resolver deliberately does not call the Slack API to translate, to avoid
-coupling the worker to a Slack token.
+Contract (cross-lane, load-bearing): ``agent_channels.address`` MUST store the
+channel address the dispatcher enqueues as ``QueuedTurn.reply_handle.channel``,
+because the kernel passes that value into ``resolve()`` and this resolver
+matches on equality. If the create-agent API/UI stores a Slack channel NAME
+(``#triage``) instead of its ID, every real mention resolves to None and is
+dropped. Storing the address correctly at agent creation (or translating it
+there) is the API/UI's responsibility; this resolver deliberately does not
+call any adapter's API to translate, to avoid coupling the worker to a
+per-adapter token.
+
+``agent_channels.kind`` is stored but does NOT route in PR 1: the queue wire
+(``ReplyHandle``) carries no kind, so the predicate below matches on
+``address`` alone. A pair predicate (``kind`` AND ``address``) is PR 1b's
+change, once ``ReplyHandle.kind`` exists (ADR-0096 section 1).
 """
 
 from __future__ import annotations
@@ -169,9 +176,10 @@ SELECT a.id AS agent_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref
 FROM {schema}.agents a
+JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
-WHERE a.slack_channel = :channel
+WHERE c.address = :address
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC
 """
 
@@ -218,8 +226,9 @@ def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
     """Warn when a channel resolves to more than one agent, naming the shadowed.
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
-    Since #38 the API enforces one agent per channel (a unique constraint on
-    agents.slack_channel, migration 0017), so this state is no longer reachable
+    Since #38 the API enforces one agent per channel (the
+    ``agent_channels_address_key`` unique constraint, migration 0021, superseding
+    0017's ``agents_slack_channel_key``), so this state is no longer reachable
     through the write paths. It stays as defense in depth for rows predating the
     constraint or written out of band, and because silently shadowing an agent is
     the failure mode #38 existed to kill.
@@ -255,7 +264,7 @@ def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
 
 
 class BindingResolver:
-    """Resolves a Slack channel to its active agent deployment (read-only)."""
+    """Resolves a channel address to its active agent deployment (read-only)."""
 
     def __init__(self, engine: AsyncEngine, config: WorkerConfig) -> None:
         self._engine = engine
@@ -263,13 +272,13 @@ class BindingResolver:
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
 
-    async def resolve(self, channel: str) -> ResolvedDeployment | None:
+    async def resolve(self, address: str) -> ResolvedDeployment | None:
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"channel": channel})
+            result = await conn.execute(self._sql, {"address": address})
             rows = result.mappings().all()
         if not rows:
             return None
-        warn_if_multiple_agents_bound(channel, rows)
+        warn_if_multiple_agents_bound(address, rows)
         data = dict(rows[0])
         # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
         # trigger SQLAlchemy's json deserializer); decode it to the dict/list the

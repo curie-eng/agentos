@@ -1,12 +1,21 @@
 """BindingResolver against the REAL compose Postgres (never mocked).
 
-Seeds agents / agent_versions / deployments in the curie schema, then checks
-channel resolution, the prod-over-dev preference, unknown-channel -> None, and
-the budget/env construction. Rows are namespaced by a per-test token and cleaned
-up afterwards.
+Seeds agents / agent_channels / agent_versions / deployments in the curie
+schema, then checks address resolution, the prod-over-dev preference,
+unknown-address -> None, and the budget/env construction. Rows are namespaced by
+a per-test token and cleaned up afterwards.
+
+The binding is a row in `agent_channels` carrying `kind` and `address`
+(ADR-0096, #1459), not a column on `agents`. In PR 1 the resolver routes on
+`address` ALONE: the queue wire carries no kind, so `kind` is descriptive
+metadata that selects the write-time address-shape validator and names the
+owning adapter. A resolver that matched on the pair could never be satisfied,
+and one that hardcoded `kind = 'slack'` in its predicate would silently refuse
+every non-Slack binding, which is what
+`test_resolves_a_non_slack_binding_on_address_alone` exists to catch.
 
 The one exception is the shadowed-binding test, which needs two agents on a
-single channel and so cannot use the curie schema at all. It seeds into a
+single address and so cannot use the curie schema at all. It seeds into a
 throwaway schema copied from curie with CREATE TABLE ... (LIKE ...) and cleans up
 by dropping that schema; no curie object and no production invariant is touched.
 """
@@ -56,22 +65,30 @@ async def _seed_agent(
     approval_routes: dict | None = None,
     secrets: dict | None = None,
     schema: str = _SCHEMA,
+    kind: str = "slack",
 ) -> uuid.UUID:
+    """Seed one agent and its single channel binding (ADR-0096, #1459).
+
+    Two inserts, because the binding lives in its own table now: `agents` no
+    longer carries a `slack_channel` column at all. `kind` defaults to `slack`
+    so every existing caller keeps meaning what it meant, and is a parameter so
+    the kind-independence test can seed a binding the resolver has no special
+    knowledge of.
+    """
     agent_id = uuid.uuid4()
     async with engine.begin() as conn:
         await conn.execute(
             text(
                 f"INSERT INTO {schema}.agents "
-                "(id, name, slack_channel, max_usd_per_day, max_output_tokens_per_run, "
+                "(id, name, max_usd_per_day, max_output_tokens_per_run, "
                 "approval_required_tools, approval_routes, secrets) "
-                "VALUES (:id, :name, :channel, :usd, :tokens, "
+                "VALUES (:id, :name, :usd, :tokens, "
                 "CAST(:approval_tools AS jsonb), CAST(:approval_routes AS jsonb), "
                 "CAST(:secrets AS jsonb))"
             ),
             {
                 "id": agent_id,
                 "name": name,
-                "channel": channel,
                 "usd": max_usd,
                 "tokens": max_tokens,
                 "approval_tools": (
@@ -81,6 +98,18 @@ async def _seed_agent(
                     json.dumps(approval_routes) if approval_routes is not None else None
                 ),
                 "secrets": (json.dumps(secrets) if secrets is not None else None),
+            },
+        )
+        await conn.execute(
+            text(
+                f"INSERT INTO {schema}.agent_channels (id, agent_id, kind, address) "
+                "VALUES (:id, :agent_id, :kind, :address)"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "kind": kind,
+                "address": channel,
             },
         )
     return agent_id
@@ -129,6 +158,13 @@ async def _seed_deployment(
 async def _cleanup(engine: AsyncEngine, agent_ids: list[uuid.UUID]) -> None:
     async with engine.begin() as conn:
         for agent_id in agent_ids:
+            # The binding is deleted explicitly rather than via an ON DELETE
+            # cascade, so this teardown does not quietly become the only thing
+            # asserting the FK's delete rule.
+            await conn.execute(
+                text(f"DELETE FROM {_SCHEMA}.agent_channels WHERE agent_id = :id"),
+                {"id": agent_id},
+            )
             await conn.execute(
                 text(f"DELETE FROM {_SCHEMA}.agents WHERE id = :id"), {"id": agent_id}
             )
@@ -170,6 +206,69 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
             assert '"max_output_tokens_per_run":4242' in env[BUDGET_ENV]
 
             await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_resolves_a_non_slack_binding_on_address_alone() -> None:
+    """T5 / AC4: the resolver reads `agent_channels` and routes on the address.
+
+    The mutation this exists to catch is a predicate that carries the old
+    assumption forward as `WHERE c.kind = 'slack' AND c.address = :address`.
+    That version passes every other test in this file, because every other
+    binding here is slack-kind, and then silently refuses to route a single turn
+    for any adapter the platform grows. Seeding a `webhook` kind is what makes
+    the hardcode observable.
+
+    The address is deliberately not Slack-shaped either. `acme-room-7` cannot be
+    a Slack channel id, so a resolver that still parsed the address for a Slack
+    shape somewhere on this path fails here too.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            address = f"acme-room-{token}"
+            agent_id = await _seed_agent(
+                engine,
+                channel=address,
+                name=f"webhook-agent-{token}",
+                max_usd=None,
+                max_tokens=None,
+                kind="webhook",
+            )
+            await _seed_deployment(
+                engine,
+                agent_id=agent_id,
+                environment="prod",
+                bundle_ref=f"bundles/{token}.zip",
+            )
+            try:
+                resolved = await _resolver(engine).resolve(address)
+                assert resolved is not None, (
+                    "a webhook-kind binding did not resolve: the predicate is "
+                    "matching on kind, which PR 1 cannot do because the queue "
+                    "wire carries no kind"
+                )
+                assert resolved.agent_id == agent_id
+                assert resolved.bundle_ref == f"bundles/{token}.zip"
+
+                # The negative sibling path: a sibling address under the same
+                # kind, never bound, still resolves to None. Without this a
+                # resolver that ignored the predicate entirely and returned the
+                # first active deployment would pass the assertion above.
+                assert await _resolver(engine).resolve(f"acme-room-other-{token}") is None
+            finally:
+                await _cleanup(engine, [agent_id])
         finally:
             await engine.dispose()
 
@@ -271,10 +370,11 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
     This closes the coverage gap left by #1022, so deleting the call site in
     binding.py makes this test fail.
 
-    Two agents on one channel are unreachable in the curie schema (slack_channel
-    is unique), so the rows are seeded into a throwaway schema this test creates
-    and drops. No curie object is touched and the production invariant #959
-    protects stays in place for everyone else on the box.
+    Two agents on one address are unreachable in the curie schema
+    (agent_channels_address_key is unique), so the rows are seeded into a
+    throwaway schema this test creates and drops. No curie object is touched and
+    the production invariant #959 protects stays in place for everyone else on
+    the box.
     """
 
     async def go() -> None:
@@ -374,15 +474,25 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
                 async with engine.begin() as conn:
                     # LIKE ... INCLUDING DEFAULTS copies columns, types, NOT NULL
                     # and defaults, and deliberately NOT indexes, unique
-                    # constraints or foreign keys. That is the point: without the
-                    # slack_channel unique two agents can share a channel here,
-                    # and without the FKs the seeded rows need no parent rows in
-                    # curie. INCLUDING ALL or INCLUDING INDEXES would copy the
-                    # unique constraint back and silently break this test.
+                    # constraints or foreign keys. That is the point: without
+                    # agent_channels_address_key two agents can share an address
+                    # here, and without the FKs the seeded rows need no parent
+                    # rows in curie. INCLUDING ALL or INCLUDING INDEXES would
+                    # copy the unique constraint back and silently break this
+                    # test.
                     await conn.execute(
                         text(
                             f"CREATE TABLE {tmp_schema}.agents "
                             f"(LIKE {_SCHEMA}.agents INCLUDING DEFAULTS)"
+                        )
+                    )
+                    # The binding table travels with it: the resolver joins
+                    # through it now, so a copy missing it resolves nothing and
+                    # the shadow branch is never reached.
+                    await conn.execute(
+                        text(
+                            f"CREATE TABLE {tmp_schema}.agent_channels "
+                            f"(LIKE {_SCHEMA}.agent_channels INCLUDING DEFAULTS)"
                         )
                     )
                     await conn.execute(

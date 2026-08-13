@@ -41,6 +41,9 @@
               }
             ]
           },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelBinding"
+          },
           "model": {
             "anyOf": [
               {
@@ -81,10 +84,6 @@
             ],
             "title": "Secrets"
           },
-          "slack_channel": {
-            "title": "Slack Channel",
-            "type": "string"
-          },
           "thinking": {
             "anyOf": [
               {
@@ -99,7 +98,7 @@
         },
         "required": [
           "name",
-          "slack_channel"
+          "channel"
         ],
         "title": "AgentCreate",
         "type": "object"
@@ -143,6 +142,9 @@
               }
             ],
             "title": "Behavior Packs"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelBinding"
           },
           "created_at": {
             "format": "date-time",
@@ -194,10 +196,6 @@
             ],
             "title": "Secrets"
           },
-          "slack_channel": {
-            "title": "Slack Channel",
-            "type": "string"
-          },
           "thinking": {
             "anyOf": [
               {
@@ -213,7 +211,7 @@
         "required": [
           "id",
           "name",
-          "slack_channel",
+          "channel",
           "repo_full_name",
           "behavior_packs",
           "model",
@@ -257,6 +255,9 @@
             ],
             "title": "Approval Routes"
           },
+          "channel": {
+            "$ref": "#/components/schemas/ChannelBinding"
+          },
           "model": {
             "anyOf": [
               {
@@ -292,17 +293,6 @@
               }
             ],
             "title": "Secrets"
-          },
-          "slack_channel": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Slack Channel"
           },
           "thinking": {
             "anyOf": [
@@ -988,6 +978,26 @@
           "size_bytes"
         ],
         "title": "BundleOut",
+        "type": "object"
+      },
+      "ChannelBinding": {
+        "additionalProperties": false,
+        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nSingular wherever it appears -- one agent binds one channel (ADR-0089) --\nso `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT\nand there is no plural surface anywhere on this API.\n\n`kind` names the adapter that owns the binding and selects the address-shape\ncheck; it does not route. `address` is the routing key the worker matches on\nequality (a Slack channel id for `kind=\"slack\"`).",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ChannelBinding",
         "type": "object"
       },
       "ConnectorManifests": {

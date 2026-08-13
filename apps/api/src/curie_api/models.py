@@ -38,10 +38,6 @@ class Agent(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(unique=True)
-    # One agent per Slack channel (#38). The worker resolves a channel to an
-    # agent, so a second agent bound to the same channel could never respond --
-    # it would be silently shadowed. Enforced here so it fails at create time.
-    slack_channel: Mapped[str] = mapped_column(unique=True)
     # The GitHub repo (owner/name) whose pushes deploy this agent (J1).
     #
     # NOT unique (ADR-0091, #1070). One repository legitimately builds several
@@ -50,8 +46,9 @@ class Agent(Base):
     # deploys to is answered by the bundle's `deploy.yaml`, not by the schema.
     # Indexed because git-flow looks agents up by this column on every webhook.
     #
-    # Deliberately asymmetric with `slack_channel` above: two agents sharing a
-    # repository is intended, two sharing a channel is silent shadowing.
+    # Deliberately asymmetric with the `channel` binding below: two agents
+    # sharing a repository is intended, two sharing a channel is silent
+    # shadowing.
     repo_full_name: Mapped[str | None] = mapped_column(default=None, index=True)
     # Per-agent budget (L1). Field names match the frozen ACI SessionConfig
     # CURIE_BUDGET so the worker passes them straight through at sandbox boot;
@@ -106,6 +103,64 @@ class Agent(Base):
     versions: Mapped[list["AgentVersion"]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
+    # The agent's channel binding (ADR-0096, #1459). SINGULAR: one agent binds
+    # one channel (ADR-0089), so this is `uselist=False` rather than a list, and
+    # the API surface is an object rather than an array.
+    #
+    # `lazy="selectin"` is load-bearing, not a preference: every read path builds
+    # `AgentOut` from this attribute after its session has been handed back, and
+    # the default lazy strategy RAISES on attribute access outside an await under
+    # asyncio instead of loading. Dropping it turns all three read endpoints into
+    # 500s while the crud-level tests, which hold a live session, stay green.
+    channel: Mapped["AgentChannel"] = relationship(
+        back_populates="agent",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy="selectin",
+    )
+
+
+class AgentChannel(Base):
+    """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
+
+    Replaces `agents.slack_channel` (migration 0021) so an agent can bind a
+    channel kind the platform has never heard of without a schema change.
+
+    `kind` names the owning adapter and selects the address-shape validator
+    (`schemas._validate_channel_binding`); it does NOT route. The queue wire
+    carries no kind today (`QueuedTurn.reply_handle.channel` is a bare string),
+    so the resolver matches on `address` alone and the uniqueness below is on
+    `address` alone to match. Widening to `(kind, address)` lands with the wire
+    field, not before -- a pair-unique constraint under an address-only lookup
+    lets two agents hold one address and leaves the resolver unable to tell them
+    apart, which is #38's silent misrouting wearing a different hat.
+    """
+
+    __tablename__ = "agent_channels"
+    __table_args__ = (
+        # One agent per address (#38, carried forward from migration 0017's
+        # `agents_slack_channel_key`). The worker resolves an address to an
+        # agent, so a second agent bound to the same address could never respond
+        # -- it would be silently shadowed. Enforced here so it fails at create
+        # time. Generalized off the word "Slack": the failure mode belongs to
+        # every channel kind, not just Slack's.
+        UniqueConstraint("address", name="agent_channels_address_key"),
+        # One binding per agent (ADR-0089: "one agent still binds one channel.
+        # Declaring two targets creates two agents; it does not let one agent
+        # serve two channels."). The old scalar column got this for free; a child
+        # table silently discards it unless it is re-established, and nothing
+        # fails until an operator binds a second channel and finds one dead.
+        UniqueConstraint("agent_id", name="agent_channels_agent_id_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    kind: Mapped[str]
+    address: Mapped[str]
+
+    agent: Mapped[Agent] = relationship(back_populates="channel")
 
 
 class AgentVersion(Base):
