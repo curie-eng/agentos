@@ -1019,6 +1019,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
     let event = synthetic_turn(
+        "slack",
         &channel,
         &opts.user,
         &opts.text,
@@ -1608,6 +1609,7 @@ fn connected_turn(
 ) -> QueuedTurn {
     let conversation_id = explicit_thread.unwrap_or(placeholder_ts);
     synthetic_turn(
+        "slack",
         channel,
         &opts.user,
         &opts.text,
@@ -1798,6 +1800,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
     let event = synthetic_turn(
+        "slack",
         &channel,
         &opts.user,
         &opts.text,
@@ -2194,6 +2197,7 @@ async fn run_eval_turns(
         let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
         let reply_endpoint = stub.base_api_url().to_string();
         let event = synthetic_turn(
+            "slack",
             &channel_id,
             &opts.user,
             &case.input,

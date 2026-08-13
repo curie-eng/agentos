@@ -435,7 +435,7 @@ def test_malformed_packs_blob_still_completes_the_turn(make_harness) -> None:
         # A nested field of the wrong type would raise pydantic.ValidationError
         # if from_config were not defensive.
         binding = StubBinding(
-            {"C-bound": _resolved_with_packs({"nav": {"enabled": "banana"}})}
+            {("slack", "C-bound"): _resolved_with_packs({"nav": {"enabled": "banana"}})}
         )
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]

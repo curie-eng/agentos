@@ -1177,7 +1177,7 @@ def test_reopen_ignores_malformed_and_non_resume_rows(
         conversation_id="th-eval",
         author="system",
         text="not a resume turn",
-        reply_handle=ReplyHandle(channel="C1", placeholder="p-1", endpoint=None),
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1", endpoint=None),
         received_at=datetime.now(UTC).isoformat(),
     )
     valkey.xadd(

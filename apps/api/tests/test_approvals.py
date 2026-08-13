@@ -85,6 +85,10 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "conversation_id": f"th-{uuid.uuid4().hex[:8]}",
         "author": "U1",
         "summary": "Give ACME a 20% discount",
+        # Required since ADR-0096 phase 2 (`ApprovalRequest.reply_kind`): the
+        # durable twin of the turn's routing half, so a resume replays the kind
+        # it was raised on rather than re-deriving it from the binding.
+        "reply_kind": "slack",
         "reply_channel": "C1",
         "reply_placeholder": "p-1",
         "dedupe_key": uuid.uuid4().hex,
@@ -120,6 +124,36 @@ def _seed_raw_approval(approval_id: uuid.UUID, summary: str) -> None:
                         "ph": "p-1",
                         "dedupe": uuid.uuid4().hex,
                     },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def _seed_slack_binding(address: str) -> None:
+    """One agent bound to `address` under kind `slack`, with raw SQL.
+
+    The provenance a pre-0022 approval is backfilled from: migration 0022 joins
+    `approvals.reply_channel` to `agent_channels.address` and refuses to guess a
+    PENDING row's kind when nothing matches.
+    """
+
+    async def _run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                agent_id = uuid.uuid4()
+                await conn.execute(
+                    text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                    {"id": agent_id, "name": f"binding-{agent_id.hex[:8]}"},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+                        "VALUES (:id, :agent, 'slack', :addr)"
+                    ),
+                    {"id": uuid.uuid4(), "agent": agent_id, "addr": address},
                 )
         finally:
             await engine.dispose()
@@ -792,6 +826,12 @@ def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
         permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}'
     )
     _seed_raw_approval(policy_id, "Give ACME a 20% discount")
+    # Migration 0022 backfills `reply_kind` BY PROVENANCE and refuses a PENDING
+    # approval whose `reply_channel` matches no binding (ADR-0096 phase 2), so C1
+    # needs the slack binding a real install would have. Seeded at 0021, the
+    # revision that creates `agent_channels`: the table does not exist at 0014.
+    command.upgrade(cfg, "0021")
+    _seed_slack_binding("C1")
     command.upgrade(cfg, "head")
 
     assert _read_provenance(permission_id) == ("permission", "Bash")
@@ -826,9 +866,10 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
                 await conn.execute(
                     text(
                         "INSERT INTO curie.approvals (id, conversation_id, "
-                        "author, summary, reply_channel, reply_placeholder, "
-                        "dedupe_key, status, gate_kind) VALUES (:id, :conv, "
-                        ":author, :summary, :ch, :ph, :dedupe, 'pending', :gk)"
+                        "author, summary, reply_kind, reply_channel, "
+                        "reply_placeholder, dedupe_key, status, gate_kind) "
+                        "VALUES (:id, :conv, :author, :summary, 'slack', :ch, "
+                        ":ph, :dedupe, 'pending', :gk)"
                     ),
                     {
                         "id": uuid.uuid4(),

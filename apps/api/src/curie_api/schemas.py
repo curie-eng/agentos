@@ -585,9 +585,11 @@ class ChannelBinding(BaseModel):
     so `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT
     and there is no plural surface anywhere on this API.
 
-    `kind` names the adapter that owns the binding and selects the address-shape
-    check; it does not route. `address` is the routing key the worker matches on
-    equality (a Slack channel id for `kind="slack"`).
+    `kind` names the adapter that owns the binding, selects the address-shape
+    check, AND routes: since ADR-0096 phase 2 the worker resolves on the
+    `(kind, address)` PAIR, so the two together are the routing key the worker
+    matches on equality (a Slack channel id for `kind="slack"`). One address can
+    therefore be bound twice under two different kinds.
     """
 
     # A typo'd `adress` or a stray `channels` nested here is a misunderstanding

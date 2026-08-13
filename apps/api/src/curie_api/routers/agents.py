@@ -48,14 +48,17 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "several agents (ADR-0091) -- run `alembic upgrade head` to apply "
         "migration 0018, which drops this constraint"
     ),
-    # #38: one agent per channel address, carried onto `agent_channels` by
-    # migration 0021. Without this the create succeeded and the second agent was
-    # silently shadowed by the worker's resolver at runtime. Stated without the
-    # word "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
+    # #38: one agent per channel ROUTE, carried onto `agent_channels` by
+    # migration 0021 and widened from the address alone to the `(kind, address)`
+    # pair by 0023, once the worker's resolver started routing on the pair too
+    # (ADR-0096 phase 2). Without this the create succeeded and the second agent
+    # was silently shadowed by the resolver at runtime. Stated without the word
+    # "Slack" since ADR-0096: the invariant, and the shadowing it prevents,
     # belong to every channel kind.
-    "agent_channels_address_key": (
-        "another agent is already bound to that channel address; one agent per "
-        "address (move or delete the other agent, or pick another address)"
+    "agent_channels_kind_address_key": (
+        "another agent is already bound to that channel kind and address; one "
+        "agent per route (move or delete the other agent, or pick another "
+        "address)"
     ),
     # The reverse direction, which the old scalar column got for free and a
     # child table would silently discard (ADR-0089: "one agent still binds one

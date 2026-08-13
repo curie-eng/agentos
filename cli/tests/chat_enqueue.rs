@@ -35,6 +35,7 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
     let stream = unique_stream("curie:test:chat:");
 
     let event = synthetic_turn(
+        "slack",
         "C-SIM-x",
         "U-curie-chat",
         "hello world",
@@ -120,6 +121,7 @@ async fn explicit_channel_and_thread_land_verbatim_on_the_wire() {
     );
 
     let event = synthetic_turn(
+        "slack",
         &channel,
         "U-curie-chat",
         "hi",
@@ -163,6 +165,7 @@ async fn absent_channel_and_thread_fall_back_to_synthetic() {
     assert_eq!(micros.len(), 6, "micros width: {thread_ts}");
 
     let event = synthetic_turn(
+        "slack",
         &channel,
         "U-curie-chat",
         "hi",
@@ -197,7 +200,7 @@ async fn diagnostics_reports_stream_length_and_consumer_group_state() {
     };
     let stream = unique_stream("curie:test:chat:");
 
-    let event = synthetic_turn("C-SIM-x", "U-curie-chat", "hi", "1.1", "1.2", None);
+    let event = synthetic_turn("slack", "C-SIM-x", "U-curie-chat", "hi", "1.1", "1.2", None);
     let stream_id = xadd(&mut conn, &stream, &event).await.unwrap();
 
     // The worker's group name; create it at 0 so it sees the existing entry.
@@ -241,7 +244,7 @@ async fn entry_acked_tracks_the_worker_consuming_and_acking() {
         return;
     };
     let stream = unique_stream("curie:test:chat:");
-    let event = synthetic_turn("C-SIM-x", "U-curie-chat", "hi", "1.1", "1.2", None);
+    let event = synthetic_turn("slack", "C-SIM-x", "U-curie-chat", "hi", "1.1", "1.2", None);
     let stream_id = xadd(&mut conn, &stream, &event).await.unwrap();
 
     // No group yet: not acked.

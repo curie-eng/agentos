@@ -372,7 +372,7 @@ class GrantBinding:
         self.grant_tool = grant_tool
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -635,7 +635,7 @@ class RoutedBinding:
         self.routes = routes
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -809,7 +809,7 @@ def _resume_turn(
         conversation_id=thread,
         author=author,
         text=text,
-        reply_handle=ReplyHandle(channel="C1", placeholder="p-1", endpoint=None),
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1", endpoint=None),
         received_at="2026-07-14T00:00:00+00:00",
     )
 
@@ -1759,7 +1759,7 @@ def test_resume_reply_best_effort_completes_offline_when_endpoint_is_dead(
                 author="U9",
                 text="[approval resolved] approved by U9",
                 reply_handle=ReplyHandle(
-                    channel="C1", placeholder="p-1", endpoint=_CLI_STUB
+                    kind="slack", channel="C1", placeholder="p-1", endpoint=_CLI_STUB
                 ),
                 received_at="2026-07-14T00:00:00+00:00",
             )

@@ -15,7 +15,8 @@ can produce and route the same payload:
     conversation_id the conversation/thread key routing keeps one live session per
     author          who authored the message
     text            the message text
-    reply_handle    where the reply is delivered (see ``ReplyHandle``)
+    reply_handle    the routing pair plus where the reply is delivered (see
+                    ``ReplyHandle``)
     received_at     ISO-8601 UTC timestamp of when the adapter received it
 
 For the Slack adapter today, ``event_id`` is the Slack event id, ``conversation_id``
@@ -31,11 +32,20 @@ from .events import _AciModel
 class ReplyHandle(_AciModel):
     """Channel-neutral coordinates for where a turn's reply is delivered.
 
+    ``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind
+    (``slack``, ``email``, ...) plus the address within that kind. Both halves are
+    needed to resolve the binding, because one address can legitimately exist under
+    two kinds. ``kind`` is REQUIRED and deliberately has no default: an optional
+    kind forces the resolver to invent one, and every honest answer there is an
+    address-only fallback or a ``"slack"`` guess -- the silent misroute this field
+    exists to close.
+
     The reply model is edit-in-place: the ingress adapter pre-posts a placeholder
-    message and the worker edits it as the answer streams. For the Slack adapter
-    today, ``channel`` is the Slack channel id (also the key the deployment
-    binding matches an agent on) and ``placeholder`` is the ts of the pre-posted
-    placeholder message.
+    message and the worker edits it as the answer streams. ``placeholder`` is an
+    **opaque, adapter-minted correlation handle** -- the worker never parses it and
+    only ever hands it back to the adapter that minted it. For the Slack adapter it
+    happens to be the ts of the pre-posted placeholder message; for another kind it
+    is whatever that adapter needs to find the same message again.
 
     ``endpoint`` is the per-turn reply target: the base URL of the channel API the
     worker delivers this turn's reply through. It routes the reply back to the
@@ -44,11 +54,22 @@ class ReplyHandle(_AciModel):
     one worker (issue #19). ``None`` means "use the worker's configured default"
     (its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set
     it keeps the pre-#19 behavior.
+
+    ``adapter`` names the egress adapter identity whose credential authenticates
+    the reply, so a sink call made *before* binding resolution can still select the
+    right credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both
+    **platform-set from the binding row** (never accepted from an ingress request
+    body); ``slack`` legitimately carries neither, because its route is the
+    worker's configured Slack origin. ``adapter`` is optional at the schema so a
+    third-party or pre-upgrade producer is not rejected outright, but every
+    first-party mint site sets it explicitly.
     """
 
+    kind: str
     channel: str
     placeholder: str
     endpoint: str | None = None
+    adapter: str | None = None
 
 
 class QueuedTurn(_AciModel):

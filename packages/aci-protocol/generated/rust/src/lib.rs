@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.2.9";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -221,10 +221,13 @@ pub mod env_keys {
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReplyHandle {
+    pub kind: String,
     pub channel: String,
     pub placeholder: String,
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -268,10 +271,13 @@ pub struct ApprovalRequest {
     pub conversation_id: String,
     pub author: String,
     pub summary: String,
+    pub reply_kind: String,
     pub reply_channel: String,
     pub reply_placeholder: String,
     #[serde(default)]
     pub reply_endpoint: Option<String>,
+    #[serde(default)]
+    pub reply_adapter: Option<String>,
     pub dedupe_key: String,
     #[serde(default)]
     pub route: Option<String>,

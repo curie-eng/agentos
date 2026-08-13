@@ -624,7 +624,7 @@
         "type": "object"
       },
       "ApprovalRequest": {
-        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.",
+        "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
         "properties": {
           "agent_id": {
             "anyOf": [
@@ -697,6 +697,17 @@
             ],
             "title": "Granted Tool"
           },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
           "reply_channel": {
             "minLength": 1,
             "title": "Reply Channel",
@@ -712,6 +723,11 @@
               }
             ],
             "title": "Reply Endpoint"
+          },
+          "reply_kind": {
+            "minLength": 1,
+            "title": "Reply Kind",
+            "type": "string"
           },
           "reply_placeholder": {
             "minLength": 1,
@@ -739,6 +755,7 @@
           "conversation_id",
           "author",
           "summary",
+          "reply_kind",
           "reply_channel",
           "reply_placeholder",
           "dedupe_key"
@@ -982,7 +999,7 @@
       },
       "ChannelBinding": {
         "additionalProperties": false,
-        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nSingular wherever it appears -- one agent binds one channel (ADR-0089) --\nso `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT\nand there is no plural surface anywhere on this API.\n\n`kind` names the adapter that owns the binding and selects the address-shape\ncheck; it does not route. `address` is the routing key the worker matches on\nequality (a Slack channel id for `kind=\"slack\"`).",
+        "description": "Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).\n\nSingular wherever it appears -- one agent binds one channel (ADR-0089) --\nso `AgentCreate`, `AgentUpdate` and `AgentOut` all carry a `channel` OBJECT\nand there is no plural surface anywhere on this API.\n\n`kind` names the adapter that owns the binding, selects the address-shape\ncheck, AND routes: since ADR-0096 phase 2 the worker resolves on the\n`(kind, address)` PAIR, so the two together are the routing key the worker\nmatches on equality (a Slack channel id for `kind=\"slack\"`). One address can\ntherefore be bound twice under two different kinds.",
         "properties": {
           "address": {
             "title": "Address",

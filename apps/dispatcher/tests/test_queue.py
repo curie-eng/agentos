@@ -29,7 +29,7 @@ def _event(event_id: str = "Ev1") -> QueuedTurn:
         conversation_id="123.45",
         author="U1",
         text="hello",
-        reply_handle=ReplyHandle(channel="C1", placeholder="999.00"),
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="999.00"),
         received_at="2026-07-05T00:00:00+00:00",
     )
 

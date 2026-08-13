@@ -30,7 +30,7 @@ def _qevent(text: str, *, thread: str = "th-1", event_id: str | None = None) -> 
         conversation_id=thread,
         author="U1",
         text=text,
-        reply_handle=ReplyHandle(channel="C1", placeholder="p-1"),
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1"),
         received_at="2026-07-05T00:00:00+00:00",
     )
 

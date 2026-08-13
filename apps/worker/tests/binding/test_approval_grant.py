@@ -94,6 +94,9 @@ async def _seed_approval(
         "conversation_id",
         "author",
         "summary",
+        # The durable routing half (ADR-0096 phase 2): NOT NULL, so every insert
+        # states which channel kind raised the approval.
+        "reply_kind",
         "reply_channel",
         "reply_placeholder",
         "dedupe_key",
@@ -105,6 +108,7 @@ async def _seed_approval(
         "conversation_id": f"th-{approval_id.hex[:8]}",
         "author": "U1",
         "summary": summary,
+        "reply_kind": "slack",
         "reply_channel": "C1",
         "reply_placeholder": "p-1",
         "dedupe_key": uuid.uuid4().hex,

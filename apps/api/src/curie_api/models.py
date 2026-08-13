@@ -126,25 +126,38 @@ class AgentChannel(Base):
     Replaces `agents.slack_channel` (migration 0021) so an agent can bind a
     channel kind the platform has never heard of without a schema change.
 
-    `kind` names the owning adapter and selects the address-shape validator
-    (`schemas._validate_channel_binding`); it does NOT route. The queue wire
-    carries no kind today (`QueuedTurn.reply_handle.channel` is a bare string),
-    so the resolver matches on `address` alone and the uniqueness below is on
-    `address` alone to match. Widening to `(kind, address)` lands with the wire
-    field, not before -- a pair-unique constraint under an address-only lookup
-    lets two agents hold one address and leaves the resolver unable to tell them
-    apart, which is #38's silent misrouting wearing a different hat.
+    `kind` names the owning adapter, selects the address-shape validator
+    (`schemas._validate_channel_binding`), AND routes: since ADR-0096 phase 2 the
+    queue wire carries a required `ReplyHandle.kind`, so the worker resolves on
+    the PAIR and the uniqueness below widened to match (migration 0023). The
+    widening was only safe once no address-only consumer could run -- a
+    pair-unique constraint under an address-only lookup would let two agents hold
+    one address while the resolver could not tell them apart, which is #38's
+    silent misrouting wearing a different hat. That ordering is why 0023 lands
+    after the cutover proves no old worker is running.
+
+    `endpoint`/`adapter` are the server-controlled reply route: where this kind's
+    replies go back through, and which egress credential authenticates them. They
+    are set here by the platform and never accepted from an ingress request body.
+    `generation` counts rebinds: `update_agent_binding` mutates this row IN PLACE,
+    so the row id is a stable identity and the generation is the only thing that
+    makes a rebind observable to a credential minted before it.
     """
 
     __tablename__ = "agent_channels"
     __table_args__ = (
-        # One agent per address (#38, carried forward from migration 0017's
-        # `agents_slack_channel_key`). The worker resolves an address to an
-        # agent, so a second agent bound to the same address could never respond
-        # -- it would be silently shadowed. Enforced here so it fails at create
-        # time. Generalized off the word "Slack": the failure mode belongs to
-        # every channel kind, not just Slack's.
-        UniqueConstraint("address", name="agent_channels_address_key"),
+        # One agent per ROUTE, the `(kind, address)` pair (#38, widened from
+        # migration 0021's address-only `agent_channels_address_key` by 0023).
+        # The worker resolves a pair to an agent, so a second agent bound to the
+        # same pair could never respond -- it would be silently shadowed.
+        # Enforced here so it fails at create time.
+        #
+        # The pair, not the address alone, ONLY because the resolver now sees the
+        # pair too (`binding._RESOLVE_SQL`). Widening this while any address-only
+        # consumer can still run re-opens the exact ambiguity the constraint
+        # exists to close, which is why the cutover proves no old worker pod is
+        # running before migration 0023 applies.
+        UniqueConstraint("kind", "address", name="agent_channels_kind_address_key"),
         # One binding per agent (ADR-0089: "one agent still binds one channel.
         # Declaring two targets creates two agents; it does not let one agent
         # serve two channels."). The old scalar column got this for free; a child
@@ -159,6 +172,16 @@ class AgentChannel(Base):
     )
     kind: Mapped[str]
     address: Mapped[str]
+    # The server-controlled reply route (migration 0024). Both NULL for `slack`,
+    # whose route is the worker's configured Slack origin; both set together for
+    # any other kind -- `agent_channels_route_pair_ck` states that invariant at
+    # the database so a half-configured route cannot be written out of band.
+    endpoint: Mapped[str | None] = mapped_column(default=None)
+    adapter: Mapped[str | None] = mapped_column(default=None)
+    # Rebind counter (ADR-0096 D5). Bumped on every binding write, including one
+    # that changes nothing: re-asserting a binding is the "something is wrong
+    # with this route" gesture that should invalidate outstanding credentials.
+    generation: Mapped[int] = mapped_column(server_default="0", default=0)
 
     agent: Mapped[Agent] = relationship(back_populates="channel")
 
@@ -235,9 +258,19 @@ class Approval(Base):
     summary: Mapped[str]
     # The reply handle of the requesting turn, replayed onto the resume turn so
     # the resumed run streams into the same placeholder message.
+    #
+    # `reply_kind` is the durable twin of `ReplyHandle.kind` (ADR-0096 phase 2):
+    # NOT NULL with no default, because a resume rebuilt from a fabricated kind
+    # is the silent misroute at its least observable point. Its safety on
+    # pre-existing rows comes from migration 0022's provenance preflight and the
+    # quiescent cutover, not from a claim that every old approval was Slack.
+    # `reply_adapter` is the durable twin of `ReplyHandle.adapter`, nullable
+    # because `slack` legitimately has none.
+    reply_kind: Mapped[str]
     reply_channel: Mapped[str]
     reply_placeholder: Mapped[str]
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
+    reply_adapter: Mapped[str | None] = mapped_column(default=None)
     # The approval route the request named (#247), and the channel the card
     # was actually routed to after binding resolution. The authorizer proves
     # channel membership against card_channel (falling back to reply_channel

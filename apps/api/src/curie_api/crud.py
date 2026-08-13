@@ -128,10 +128,21 @@ async def update_agent_binding(
     (`agent_channels_agent_id_key`), and assigning a fresh row would make the
     insert of the replacement race the delete of the original inside one flush,
     tripping that constraint on a move that is perfectly legal.
+
+    That in-place mutation is exactly why `generation` exists (ADR-0096 D5): the
+    row id is a stable identity, so a credential minted against this binding
+    before the move stays pointed at the row afterwards and would follow it to
+    its NEW owner. The generation is what makes the rebind observable to that
+    credential. It is bumped UNCONDITIONALLY on any binding write, including one
+    whose values are identical -- an operator re-asserting a binding is the "I
+    think something is wrong with this route" gesture that should invalidate
+    outstanding credentials, and guarding the bump on a value change would leave
+    that case silently valid.
     """
 
     agent.channel.kind = channel.kind
     agent.channel.address = channel.address
+    agent.channel.generation += 1
     return await _refresh_with_channel(session, agent)
 
 
@@ -381,9 +392,15 @@ async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> App
         conversation_id=data.conversation_id,
         author=data.author,
         summary=data.summary,
+        # The durable twin of the turn's routing pair and egress selector
+        # (ADR-0096 phase 2). Persisted from the request, never re-derived from
+        # `agent_channels`: an operator may re-bind the address between
+        # suspension and resume, and these are facts about the original turn.
+        reply_kind=data.reply_kind,
         reply_channel=data.reply_channel,
         reply_placeholder=data.reply_placeholder,
         reply_endpoint=data.reply_endpoint,
+        reply_adapter=data.reply_adapter,
         dedupe_key=data.dedupe_key,
         route=data.route,
         card_channel=data.card_channel,

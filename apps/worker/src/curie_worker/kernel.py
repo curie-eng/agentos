@@ -398,13 +398,23 @@ class Kernel:
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
             if self._binding is not None:
-                # `resolve` takes the channel address positionally (ADR-0096,
-                # #1459): the queue wire carries no channel kind, so routing is
-                # on address alone until a later change adds it.
-                resolved = await self._binding.resolve(qevent.reply_handle.channel)
+                # The routing key is the PAIR (ADR-0096 phase 2): the queue wire
+                # carries a required `kind`, and both halves bind into the
+                # resolver's predicate. Never the address alone -- one address
+                # can be bound under two kinds, and dropping the kind here would
+                # answer an unbound kind with the other agent.
+                resolved = await self._binding.resolve(
+                    qevent.reply_handle.kind, qevent.reply_handle.channel
+                )
                 if resolved is None:
+                    # Name BOTH halves: since the kind routes, a kind typo is a
+                    # newly reachable drop, and a message naming only the address
+                    # sends an operator hunting a binding that is right there.
                     await self._drop_with_message(
-                        qevent, "No agent is configured for this channel yet."
+                        qevent,
+                        "No agent is configured for this "
+                        f"{qevent.reply_handle.kind} address "
+                        f"{qevent.reply_handle.channel} yet.",
                     )
                     return
                 if self._killswitch is not None and await self._killswitch.is_killed(
@@ -1191,9 +1201,16 @@ class Kernel:
                     conversation_id=thread,
                     author=qevent.author,
                     summary=summary,
+                    # The durable twin of this turn's routing pair and egress
+                    # selector (ADR-0096 phase 2). Copied off THIS turn at
+                    # creation time, never looked up at resume: an operator may
+                    # re-bind the address between suspension and resume, and the
+                    # persisted values are facts about the original turn.
+                    reply_kind=qevent.reply_handle.kind,
                     reply_channel=qevent.reply_handle.channel,
                     reply_placeholder=qevent.reply_handle.placeholder,
                     reply_endpoint=qevent.reply_handle.endpoint,
+                    reply_adapter=qevent.reply_handle.adapter,
                     dedupe_key=qevent.event_id,
                     route=route,
                     card_channel=card_channel,

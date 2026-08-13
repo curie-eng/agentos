@@ -44,7 +44,9 @@ def _qevent(
         conversation_id=thread,
         author="U1",
         text=text,
-        reply_handle=ReplyHandle(channel="C1", placeholder=placeholder, endpoint=endpoint),
+        reply_handle=ReplyHandle(
+            kind="slack", channel="C1", placeholder=placeholder, endpoint=endpoint
+        ),
         received_at="2026-07-05T00:00:00+00:00",
     )
 
@@ -499,7 +501,7 @@ class _TokenBinding:
         self._token = token
         self._agent_id = agent_id
 
-    async def resolve(self, _channel: str) -> _FakeResolved:
+    async def resolve(self, _kind: str, _channel: str) -> _FakeResolved:
         return _FakeResolved(self._agent_id)
 
     def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:

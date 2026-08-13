@@ -39,9 +39,13 @@ def _resolved(
         conversation_id="C1-thread-0",
         author="U_AE",
         summary=summary,
+        # The durable routing half (ADR-0096 phase 2): NOT NULL with no default,
+        # so every construction site has to state which channel raised the turn.
+        reply_kind="slack",
         reply_channel="C1",
         reply_placeholder="p-1",
         reply_endpoint=None,
+        reply_adapter=None,
         dedupe_key="ev-1",
         status=status,
         resolved_by=resolved_by,

@@ -93,7 +93,7 @@ def test_the_0_2_9_model_parses_a_0_3_0_payload_and_loses_the_kind() -> None:
 
     # (b) And the routing half is simply gone.
     assert not hasattr(old, "kind")
-    assert "kind" not in old.model_fields
+    assert "kind" not in _ReplyHandle_0_2_9.model_fields
     assert "kind" not in old.model_dump()
     assert "adapter" not in old.model_dump()
 
@@ -108,19 +108,19 @@ def test_an_old_consumer_cannot_distinguish_two_kinds_at_one_address() -> None:
     equality is asserting the ambiguity.
     """
 
+    # Identical in every field the 0.2.9 model MODELS, differing only in `kind`.
+    # That isolation is the point: `endpoint` is carried by both versions, so two
+    # turns differing in it would fail this assertion for a reason that has
+    # nothing to do with the kind-dropping tolerance under test.
     shared_address = "C0SHARED01"
     slack_turn = json.loads(
         ReplyHandle(kind="slack", channel=shared_address, placeholder="1.0").model_dump_json()
     )
     email_turn = json.loads(
-        ReplyHandle(
-            kind="email",
-            channel=shared_address,
-            placeholder="1.0",
-            endpoint="http://curie-mail-adapter:8080/",
-            adapter="agentmail-sandbox",
-        ).model_dump_json()
+        ReplyHandle(kind="email", channel=shared_address, placeholder="1.0").model_dump_json()
     )
+    assert slack_turn != email_turn, "the two 0.3.0 payloads must differ, and differ in kind"
+    assert slack_turn["kind"] != email_turn["kind"]
 
     as_seen_by_old_slack = _ReplyHandle_0_2_9.model_validate(slack_turn, context=READER_CONTEXT)
     as_seen_by_old_email = _ReplyHandle_0_2_9.model_validate(email_turn, context=READER_CONTEXT)

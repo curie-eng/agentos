@@ -26,10 +26,24 @@ there) is the API/UI's responsibility; this resolver deliberately does not
 call any adapter's API to translate, to avoid coupling the worker to a
 per-adapter token.
 
-``agent_channels.kind`` is stored but does NOT route in PR 1: the queue wire
-(``ReplyHandle``) carries no kind, so the predicate below matches on
-``address`` alone. A pair predicate (``kind`` AND ``address``) is PR 1b's
-change, once ``ReplyHandle.kind`` exists (ADR-0096 section 1).
+``agent_channels.kind`` ROUTES: since ADR-0096 phase 2 the queue wire
+(``ReplyHandle``) carries a required ``kind``, so the routing key is the PAIR
+(``kind`` AND ``address``) and migration 0023 widens the uniqueness constraint to
+match. There is no address-only overload and no default kind -- either would be
+the silent address-fallback the pair exists to remove. One address can now
+legitimately be bound twice under two different kinds, and each turn reaches its
+own agent.
+
+The binding row also carries the server-controlled reply route: ``endpoint`` (the
+channel API base URL this kind's replies go back through) and ``adapter`` (the
+egress adapter identity whose credential authenticates them). Both are read here
+so the worker gets the route from the same query that resolves the agent, never
+from an ingress request body. ``slack`` legitimately carries neither: its route
+is the worker's configured Slack origin.
+
+A pair that is not bound resolves to None -- a polite drop naming both halves,
+never a fallback to the address alone, because that fallback is exactly the
+silent misroute (#38) this predicate closes.
 """
 
 from __future__ import annotations
@@ -174,12 +188,14 @@ SELECT a.id AS agent_id,
        a.secrets AS secrets,
        v.id AS version_id,
        v.version_label AS version_label,
-       v.bundle_ref AS bundle_ref
+       v.bundle_ref AS bundle_ref,
+       c.endpoint AS endpoint,
+       c.adapter AS adapter
 FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
-WHERE c.address = :address
+WHERE c.kind = :kind AND c.address = :address
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC
 """
 
@@ -220,6 +236,13 @@ class ResolvedDeployment(BaseModel):
     # connector secrets. (Local tier stores values on the agent row; the cluster
     # tier delivers them via a per-agent K8s Secret instead.)
     secrets: dict[str, str] | None = None
+    # The binding row's server-controlled reply route (ADR-0096 phase 2). The
+    # channel API base URL this kind's replies go back through, and the egress
+    # adapter identity whose credential authenticates them. Both NULL for
+    # `slack`, whose route is the worker's configured Slack origin; both set
+    # together for any other kind (`agent_channels_route_pair_ck`).
+    endpoint: str | None = None
+    adapter: str | None = None
 
 
 def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
@@ -272,13 +295,19 @@ class BindingResolver:
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
 
-    async def resolve(self, address: str) -> ResolvedDeployment | None:
+    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+        """Resolve the ``(kind, address)`` routing pair to its active deployment.
+
+        Both halves are required and neither has a default: an address-only
+        overload would silently answer an unbound kind with somebody else's
+        agent, which is #38's misroute wearing the neutral-binding hat.
+        """
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._sql, {"address": address})
+            result = await conn.execute(self._sql, {"kind": kind, "address": address})
             rows = result.mappings().all()
         if not rows:
             return None
-        warn_if_multiple_agents_bound(address, rows)
+        warn_if_multiple_agents_bound(f"{kind}:{address}", rows)
         data = dict(rows[0])
         # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
         # trigger SQLAlchemy's json deserializer); decode it to the dict/list the
