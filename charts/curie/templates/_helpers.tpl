@@ -101,6 +101,18 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.rustfs.scheme" -}}
+{{- if and (not .Values.rustfs.deploy) (eq (printf "%v" .Values.rustfs.port) "443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.rustfs.endpoint" -}}
+{{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+{{- end -}}
+
 {{- define "curie.langfuse.webHost" -}}
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
