@@ -24,7 +24,7 @@ order: 4
 
 The line that makes the communication channel swappable is the pair of contracts at
 the two ends of the run: the ingress payload the dispatcher enqueues (`QueuedTurn`) and
-the egress port the kernel writes replies through (`SlackSink`). Everything between them —
+the egress port the kernel writes replies through (`ReplySink`). Everything between them —
 routing, concurrency, sandboxing — is opinionated core and channel-agnostic. Since #7 and
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
@@ -49,10 +49,12 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
   ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel plus the
   placeholder ts.
-- **Egress** — the `SlackSink` Protocol (`apps/worker/src/curie_worker/slack_sink.py::SlackSink`),
-  whose core method is `async def update(self, *, channel: str, ts: str, text: str)`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.update`) — an edit-in-place on Slack's `chat.update`, plus best-effort
-  `set_status`/`clear_status`. The mrkdwn dialect is confined behind the sink in
+- **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
+  whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
+  (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
+  events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
+  worker-local `TargetRoute`. Slack's edit-in-place `chat.update`, its assistant-thread
+  status, and the mrkdwn dialect all sit BELOW that port, in `SlackReplyAdapter` and
   `to_mrkdwn` (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`).
 - **Binding** — a channel resolves to a deployment by `agent_channels.address`
   equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
@@ -62,7 +64,7 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
 ## Implementations today
 
 One: Slack. Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
-`AsyncSlackSink` (`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink`) on the Slack Web API. The swap proof that the
+`SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack Web API. The swap proof that the
 protocol (not just the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
@@ -79,8 +81,10 @@ routing key that carries no kind.
 - **Fixed (#19).** The reply base URL was worker-global; per-turn reply routing now rides
   `ReplyHandle.endpoint`, so a real Slack workspace and a no-Slack CLI stub can coexist on
   one deployment. `WorkerConfig.slack_api_base_url` (`apps/worker/src/curie_worker/config.py::WorkerConfig`)
-  is now only the default when a turn sets no `endpoint`, fed to `AsyncSlackSink`
-  (`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.__init__`).
+  is now only the default when a turn sets no `endpoint`, fed to `SlackReplyAdapter`
+  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.__init__`) — which
+  also makes it the only TRUSTED Slack origin, so a per-turn endpoint elsewhere is
+  refused rather than handed the platform bot token.
 - **Still leaks — egress semantics.** The reply model is edit-a-placeholder —
   `update(channel, ts, text)` on `chat.update`, not post-a-message — so any channel without
   in-place edit must emulate it.

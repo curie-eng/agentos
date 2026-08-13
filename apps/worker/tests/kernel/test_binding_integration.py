@@ -395,6 +395,7 @@ _REPLY_WITH_BUTTONS = (
 
 
 def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harness) -> None:
+    from channel_protocol.reply import NavAffordance
     from curie_worker.behaviorpacks import NavPack
     from curie_worker.blocks import render
 
@@ -405,13 +406,22 @@ def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harnes
             h.runner.default_script = [Final(text=_REPLY_WITH_BUTTONS, status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tNav"))
 
-            # The sink's final update was threaded the agent's enabled nav pack.
-            assert h.sink.last_nav == NavPack(
-                enabled=True, hub_label="Help", hub_command="help"
-            )
+            # The sink's final update was threaded the agent's enabled nav pack,
+            # in the WIRE form the kernel maps it to (ADR-0096 finding 16).
+            assert h.sink.last_nav == NavAffordance(label="Help", command="help")
             # ...and rendering that final reply with it surfaces the hub button.
+            # ``render`` is below the adapter seam and speaks the platform's own
+            # ``NavPack``, so the affordance is mapped back exactly as
+            # ``SlackReplyAdapter`` does before it renders.
             assert h.sink.last_text is not None
-            _text, blocks = render(h.sink.last_text, nav=h.sink.last_nav)
+            _text, blocks = render(
+                h.sink.last_text,
+                nav=NavPack(
+                    enabled=True,
+                    hub_label=h.sink.last_nav.label,
+                    hub_command=h.sink.last_nav.command,
+                ),
+            )
             assert blocks is not None
             ids = [
                 e["action_id"]

@@ -241,14 +241,14 @@ def test_the_same_turn_through_the_slack_adapter_edits_exactly_one_message(
 
             assert set(capture.methods()) == {"chat.update"}
             assert "chat.postMessage" not in capture.methods()
-            # One target message: every edit names the same placeholder.
-            timestamps = {
-                part.split("ts=")[1].split("&")[0]
-                for r in capture.requests
-                for part in [r["body"]]
-                if "ts=" in part
-            }
-            assert len(timestamps) == 1
+            # One target message, and it is the placeholder the ingress
+            # pre-posted -- not merely "one distinct id", which a worker that
+            # minted its own single id would also satisfy. slack_sdk sends the
+            # call as a JSON body, so the target is read as a key rather than
+            # scanned for out of a form-encoded string.
+            assert capture.requests
+            timestamps = {json.loads(r["body"])["ts"] for r in capture.requests}
+            assert timestamps == {"p-1"}
         finally:
             await server.close()
 

@@ -211,6 +211,18 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: agentCredentials
             {{- end }}
+            # Per-adapter egress credentials (ADR-0096 D4.2). From the chart
+            # Secret, never inlined into the Deployment: these authenticate the
+            # PLATFORM to a channel adapter, so a leaked manifest is a leaked
+            # ability to impersonate Curie to every bound channel. Rendered
+            # unconditionally (unlike agentCredentials) because the worker's
+            # own parser treats empty as "no adapters configured" and fails
+            # closed on the first non-Slack turn, which is the honest signal.
+            - name: CURIE_ADAPTER_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: adapterCredentials
             # No-Slack egress routing: when set, the worker's Slack sink posts its
             # placeholder edits at this base URL (the `curie cluster message` CLI stub)
             # instead of real Slack. Empty (the default) leaves the sink on real

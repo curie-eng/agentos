@@ -15,6 +15,7 @@ field name (VALKEY_HOST, DATABASE_URL, S3_ENDPOINT_URL, LANGFUSE_HOST, ...).
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 from typing import Annotated
@@ -64,6 +65,31 @@ def _parse_bool(value: object) -> bool:
 Bool = Annotated[bool, BeforeValidator(_parse_bool)]
 
 
+def _parse_adapter_credentials(value: object) -> object:
+    """Parse ``CURIE_ADAPTER_CREDENTIALS`` (a JSON object) into a dict.
+
+    A real dict passes through, so kwarg construction in tests is unchanged. A
+    blank env var is an empty map (no adapter credentials configured), which
+    makes every non-Slack egress fail closed rather than send anonymously.
+    Malformed JSON is a startup error on purpose: a worker that silently came up
+    with no credentials would look healthy and deliver nothing.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("CURIE_ADAPTER_CREDENTIALS must be a JSON object")
+        return parsed
+    return value
+
+
+AdapterCredentials = Annotated[
+    dict[str, str], BeforeValidator(_parse_adapter_credentials)
+]
+
+
 class WorkerConfig(BaseSettings):
     """Everything the kernel needs, in one typed object."""
 
@@ -103,6 +129,18 @@ class WorkerConfig(BaseSettings):
     # overrides this per turn, so a real workspace and a no-Slack CLI stub can
     # coexist on one worker instead of contending for this single setting.
     slack_api_base_url: str = ""
+
+    # Per-ADAPTER egress credentials (ADR-0096 D4.2), a JSON object mapping an
+    # operator-chosen adapter slug (the binding row's ``adapter``) to the secret
+    # the worker presents as ``X-Curie-Adapter-Secret``. Per-adapter rather than
+    # per-kind so compromising one adapter yields one secret, for one binding.
+    # An adapter with no entry here makes its egress RAISE rather than send
+    # anonymously: an unauthenticated platform request lets any reachable pod be
+    # impersonated and gives the adapter no way to tell the platform from an
+    # attacker.
+    adapter_credentials: AdapterCredentials = Field(
+        default_factory=dict, validation_alias="CURIE_ADAPTER_CREDENTIALS"
+    )
 
     # Postgres (read-only): resolve channel -> agent -> deployment -> version.
     # Matches the API's DATABASE_URL / DB_SCHEMA so the worker reads the same DB.
@@ -351,6 +389,13 @@ class WorkerConfig(BaseSettings):
     # Markers
     idempotency_ttl_s: int = 86400
 
+    # The completion outbox (ADR-0096 EB-B6). ``grace`` keeps the sweeper out of
+    # the kernel's own emit window, so the normal path is not racing a sweeper on
+    # every turn; ``max_retention`` is how long an undelivered completion is kept
+    # before it is cleared LOUDLY, well beyond any outage worth riding out.
+    completion_sweep_grace_s: float = 60.0
+    completion_max_retention_s: float = 604800.0
+
     # Crash recovery: reclaim stream entries pending longer than this, and run
     # the orphan-claim reaper, on this cadence.
     #
@@ -529,6 +574,18 @@ class WorkerConfig(BaseSettings):
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
+
+    def completion_key(self, event_id: str) -> str:
+        # The durable outbox record for this event's ``turn.completed``. NO TTL:
+        # a payload that expires under a longer-lived set membership is a
+        # completion lost silently (EB-B6(f)).
+        return f"{self.key_prefix}:completion:{event_id}"
+
+    def completions_pending_key(self) -> str:
+        # The sweep index. A SET, not a SCAN over the keyspace: the maintenance
+        # loop must not scan a production Valkey, and a redelivery-only sweep
+        # would never reach a turn whose stream entry was already acked.
+        return f"{self.key_prefix}:completions:pending"
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"

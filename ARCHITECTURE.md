@@ -384,8 +384,9 @@ worker-global setting. `ReplyHandle.endpoint` on the queued turn carries the bas
 URL of the channel API that this turn's reply is delivered through
 ([`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`](packages/aci-protocol/src/aci_protocol/turn.py)).
 The sink builds (and caches) a client per endpoint
-([`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink`](apps/worker/src/curie_worker/slack_sink.py),
-behind the [`SlackSink`](apps/worker/src/curie_worker/slack_sink.py) port).
+([`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`](apps/worker/src/curie_worker/slack_sink.py),
+behind the [`ReplySink`](apps/worker/src/curie_worker/reply_sink.py) port), and refuses
+any endpoint outside the configured Slack origin.
 The worker-global `SLACK_API_BASE_URL`
 ([`apps/worker/src/curie_worker/config.py::WorkerConfig.slack_api_base_url`](apps/worker/src/curie_worker/config.py))
 is now the **fallback**: `endpoint = None` means "use the worker's configured

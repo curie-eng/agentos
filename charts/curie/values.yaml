@@ -838,6 +838,17 @@ worker:
   # --reuse-values` that sets the dispatcher tokens) clears it back to empty in
   # the same command, so that upgrade un-wires any stub routing.
   slackApiBaseUrl: ""
+  # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
+  # shared secret. The slug is the operator-chosen `adapter` on the agent's
+  # channel binding row; the worker presents the matching secret as the
+  # X-Curie-Adapter-Secret header on every reply event it delivers to that
+  # adapter, and the adapter verifies it BEFORE any side effect. Per-adapter
+  # rather than per-kind so compromising one adapter yields one secret, for one
+  # binding. An adapter with no entry here makes its egress RAISE rather than
+  # send anonymously: an unauthenticated platform request lets any reachable pod
+  # be impersonated. Stored in the chart Secret (key adapterCredentials), never
+  # inlined into a manifest.
+  adapterCredentials: {}
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
   # worker override the fixed env block does not cover.

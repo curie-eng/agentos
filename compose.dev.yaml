@@ -516,6 +516,12 @@ services:
       - CURIE_RUNNER_API_URL=http://curie-api:8000
       - SLACK_API_BASE_URL=${SLACK_API_BASE_URL-http://localhost:8155/api/}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}
+      # Per-adapter egress credentials (ADR-0096 D4.2): a JSON object mapping an
+      # adapter slug (the binding row's `adapter`) to the secret the worker
+      # presents as X-Curie-Adapter-Secret when it delivers reply events there.
+      # Empty (the default) means no non-Slack channel can be delivered to: that
+      # egress fails CLOSED rather than sending an unauthenticated request.
+      - CURIE_ADAPTER_CREDENTIALS=${CURIE_ADAPTER_CREDENTIALS:-}
       # The Slack assistant-thread "shimmer" (#1182), on by default. One knob,
       # one consumer: the worker raises and lowers the caption, and the
       # dispatcher does not touch it (#1312), so setting this false here turns

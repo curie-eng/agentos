@@ -88,7 +88,17 @@ def test_an_old_runner_leaves_the_entry_pending_and_completes_nothing(
     # version refusal is deliberately NOT one of those, so it escapes to the
     # consumer, which leaves the entry pending (consumer.py:209-213).
     async def go() -> None:
-        async with make_harness(shimmer=False) as h:
+        # ``max_delivery`` is raised well above the number of reclaims this
+        # window can fit (the harness runs reclaim_interval_s at 0.05). The
+        # property under test is that the entry STAYS pending across
+        # redeliveries; at the shipped cap of 5 it is correctly dead-lettered as
+        # max-delivery-exceeded (#505, ADR-0039) inside the window, and the
+        # pending count then drops to 0 for a reason that has nothing to do with
+        # the version gate. Raising the cap keeps the assertion measuring the
+        # version refusal rather than the delivery cap. It does not weaken it:
+        # an implementation that ACKED the 0.2.9 frame leaves zero pending at
+        # any cap, so the test still fails on the defect it exists to catch.
+        async with make_harness(shimmer=False, max_delivery=50) as h:
             # The fake runner serializes model instances, so an old-runner frame
             # is one built at the old version.
             h.runner.default_script = [

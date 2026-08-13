@@ -96,6 +96,13 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_MAX_ATTEMPTS",
         "CURIE_MAX_DELIVERY",
         "CURIE_SLACK_NO_EDIT_STREAMING",
+        # The per-adapter EGRESS credentials (ADR-0096 D4.2), read from the
+        # WORKER's env by ``build_reply_sink`` and presented to a channel
+        # adapter as ``X-Curie-Adapter-Secret``. Never a sandbox boot key, and
+        # emphatically so: these authenticate the PLATFORM to an adapter, so a
+        # sandbox running agent-authored code holding them could impersonate
+        # the platform to every bound channel.
+        "CURIE_ADAPTER_CREDENTIALS",
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",

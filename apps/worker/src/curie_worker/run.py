@@ -35,6 +35,7 @@ from .heartbeat import run_heartbeat
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
+from .reply_sink import build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
     AffinityStore,
@@ -45,7 +46,6 @@ from .sandbox import (
     SandboxSubstrate,
     SubstrateConfig,
 )
-from .slack_sink import AsyncSlackSink
 from .threadlock import ThreadLock
 
 logger = logging.getLogger(__name__)
@@ -263,7 +263,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
-        sink=AsyncSlackSink(config.slack_bot_token, base_url=config.slack_api_base_url or None),
+        sink=build_reply_sink(config),
         lock=ThreadLock(
             async_redis,
             ttl_ms=config.lock_ttl_ms,

@@ -1,9 +1,21 @@
-"""The Slack output seam: edit the dispatcher's placeholder in place.
+"""The Slack ADAPTER of the neutral reply wire: edit the placeholder in place.
 
 The dispatcher already posted a placeholder message and put its ``ts`` on the
-queue. As the runner streams, the kernel edits that same message via
-``chat.update`` (a throttled live edit), then writes the final text. This is the
-one external service the kernel tests mock; everything else runs for real.
+queue. As the runner streams, the kernel emits ``reply.update`` events and this
+adapter turns each into a ``chat.update`` on that same message (a throttled live
+edit), then writes the final text. This is the one external service the kernel
+tests mock; everything else runs for real.
+
+Everything Slack-shaped lives below ``emit``: the Web API method names, Block Kit
+rendering, the assistant-thread "shimmer" caption, and the #530 transport
+fallback. The kernel above it knows only ``ReplyEvent`` + ``TargetRoute``.
+
+**A per-turn endpoint is honored only at the CONFIGURED Slack origin** (D4.4).
+Before ADR-0096 phase 2 this class built ``AsyncWebClient(token=self._token,
+base_url=<whatever the turn named>)``, so a turn carrying an attacker's endpoint
+captured the platform bot token. An endpoint whose origin differs from
+``slack_api_base_url`` (or from real Slack when that is unset) is now refused
+with ``UntrustedSlackEndpointError`` before any request leaves the process.
 """
 
 from __future__ import annotations
@@ -11,11 +23,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
+from urllib.parse import urlsplit
 
 import aiohttp
 from channel_protocol import ConfirmIntent, OutboundMessage
+from channel_protocol.reply import (
+    NavAffordance,
+    ReplyAck,
+    ReplyEvent,
+    ReplyPost,
+    ReplyUpdate,
+    SettledOutcome,
+    TurnCompleted,
+    TurnStatus,
+)
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
@@ -23,9 +45,51 @@ from slack_sdk.web.async_slack_response import AsyncSlackResponse
 from .behaviorpacks import NavPack
 from .blocks import approval_card, expired_approval_card, render, resolved_approval_card
 
+if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
+    from .reply_sink import TargetRoute
+
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# The SDK's own default base URL, which is the trusted origin when the worker
+# configures none. Kept as a literal so the trust check has a concrete origin to
+# compare against rather than "whatever the SDK happens to pick".
+REAL_SLACK_BASE_URL = "https://slack.com/api/"
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class UntrustedSlackEndpointError(RuntimeError):
+    """A turn named a Slack endpoint outside the configured Slack origin.
+
+    Refused loudly and BEFORE any request: the platform bot token authenticates
+    every Slack call, so honoring an arbitrary per-turn base URL hands that token
+    to whoever named it (D4.4, finding 8).
+    """
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    """Scheme + host + port, so two URLs at different PATHS compare equal."""
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    port = parts.port or _DEFAULT_PORTS.get(scheme, 0)
+    return scheme, (parts.hostname or "").lower(), port
+
+
+def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
+    """The wire affordance in the renderer's own vocabulary.
+
+    ``blocks.render`` (and ``ensure_hub_button`` under it) is the platform-owned
+    append policy and speaks ``NavPack``; the wire owns ``NavAffordance`` because
+    ``behaviorpacks`` cannot cross into ``channel_protocol`` (finding 16). The
+    map is here, at the render call, so the disabled form stays "absent on the
+    wire" rather than "a pack with a false flag".
+    """
+    if nav is None:
+        return None
+    return NavPack(enabled=True, hub_label=nav.label, hub_command=nav.command)
+
 
 # "Unreachable" reply-endpoint errors (#530): the endpoint's HOST did not answer
 # -- a dead CLI stub whose process exited, a wrong port, a network drop. These are
@@ -38,115 +102,17 @@ _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
-@dataclass(frozen=True)
-class SettledCard:
-    """How an approval ended, channel-neutrally, for the settled-card render.
+class SlackReplyAdapter:
+    """A ``ReplySink`` backed by the Slack Web API (chat.update).
 
-    ``decision`` is None when nobody decided, which is the expiry case; a
-    non-None value is the resolved case and brings ``resolver`` with it. The
-    kernel builds this from the durable record, never from the platform-authored
-    resume prose, so the card states what the record says.
-    """
-
-    requested_by: str
-    decision: str | None = None
-    resolver: str | None = None
-    note: str | None = None
-
-
-class SlackSink(Protocol):
-    """Edit a message in place. The kernel throttles how often it calls this.
-
-    ``endpoint`` is the per-turn reply target (a Slack Web API base URL) carried
-    on the queue payload's reply handle (issue #19). ``None`` routes to the sink's
-    configured default, so a real Slack workspace and a no-Slack CLI stub can
-    each finalize their own turns on one worker.
-    """
-
-    async def update(
-        self,
-        *,
-        channel: str,
-        ts: str,
-        text: str,
-        nav: NavPack | None = None,
-        endpoint: str | None = None,
-        best_effort_unreachable: bool = False,
-    ) -> None: ...
-
-    async def set_status(
-        self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
-    ) -> None:
-        """Set the assistant-thread status (the "shimmer" caption) on the thread.
-        Best-effort so it never breaks a turn."""
-        ...
-
-    async def clear_status(
-        self, *, channel: str, thread_ts: str, endpoint: str | None = None
-    ) -> None:
-        """Clear any assistant-thread status (the "shimmer") on the thread. A
-        no-op when shimmering is off; best-effort so it never breaks a turn."""
-        ...
-
-    async def post(
-        self,
-        *,
-        channel: str,
-        message: OutboundMessage,
-        requested_by: str,
-        thread_ts: str | None = None,
-        endpoint: str | None = None,
-    ) -> str | None:
-        """Post a NEW message (the approval card, #246), returning its ts.
-
-        The kernel hands a channel-neutral ``OutboundMessage`` carrying a
-        ``Confirm`` intent (ADR-0020); the adapter renders it into whatever
-        widget the channel supports (Slack: the Block Kit approval card with
-        Approve/Reject buttons). No channel-native markup crosses this seam.
-        ``requested_by`` is the semantic actor id the adapter renders (Slack: a
-        ``<@id>`` mention). Distinct from ``update``: the placeholder-edit reply
-        model stays the norm; posting is reserved for platform-owned messages
-        like the approval card. Raises on failure so the caller decides
-        best-effort."""
-        ...
-
-    async def update_message(
-        self,
-        *,
-        channel: str,
-        ts: str,
-        message: OutboundMessage,
-        endpoint: str | None = None,
-        settled: SettledCard | None = None,
-    ) -> None:
-        """Edit an already-posted platform message in place (settling an
-        approval card: expired in #419, resolved in #1084).
-
-        Like ``post``, the kernel hands a channel-neutral ``OutboundMessage``
-        (ADR-0020) and the adapter renders the settled form. Distinct from
-        ``update`` (which renders streamed reply Markdown): this replaces a known
-        platform message. Best-effort at the call site.
-
-        ``settled`` carries the outcome semantically -- who asked, what was
-        decided, by whom, with what note -- and the adapter turns that into
-        whatever the channel's settled card looks like. ``None`` keeps #419's
-        behavior, the expired form, so an expiry caller needs no change.
-        Deliberately a parameter rather than fields smuggled into
-        ``OutboundMessage``: ``status`` there already means a rendered status
-        line, and overloading it would give one field two meanings depending on
-        which sink method received it."""
-        ...
-
-
-class AsyncSlackSink:
-    """A SlackSink backed by the Slack Web API (chat.update).
-
-    The constructor ``base_url`` is the worker's DEFAULT reply endpoint: unset
-    leaves the SDK default (real Slack); set points the default at a stub. Each
-    call may override it with a per-turn ``endpoint`` (issue #19), so replies
-    route back to the ingress that enqueued the turn instead of a single
-    worker-global endpoint. One ``AsyncWebClient`` is built and cached per distinct
-    base URL, since the SDK binds the endpoint at client construction.
+    The constructor ``base_url`` is the worker's DEFAULT reply endpoint AND the
+    only trusted Slack origin: unset leaves the SDK default (real Slack); set
+    points the default at an explicitly configured dev stub. A turn may override
+    the PATH within that origin (issue #19), so replies route back to the ingress
+    that enqueued the turn instead of a single worker-global endpoint, but an
+    endpoint at any other origin is refused (D4.4). One ``AsyncWebClient`` is
+    built and cached per distinct base URL, since the SDK binds the endpoint at
+    client construction.
     """
 
     def __init__(self, token: str, *, base_url: str | None = None) -> None:
@@ -154,7 +120,64 @@ class AsyncSlackSink:
         # Normalize "" to None so the default and an explicit-empty override map to
         # the same (real-Slack) client.
         self._default_base_url = base_url or None
+        self._trusted_origin = _origin(self._default_base_url or REAL_SLACK_BASE_URL)
         self._clients: dict[str | None, AsyncWebClient] = {}
+
+    async def emit(
+        self,
+        event: ReplyEvent,
+        *,
+        route: TargetRoute,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        """Render one neutral event as the Slack call that expresses it.
+
+        ``turn.completed`` has no Slack expression and deliberately sends
+        nothing: on Slack the edited message IS the delivery, so a completion
+        signal would be a second, contentless message in the thread. The event
+        exists for channels (email) whose reply is only sent at the end.
+        """
+        endpoint = route.endpoint
+        target = event.target
+        if isinstance(event, TurnStatus):
+            await self._set_status(
+                channel=target.address,
+                thread_ts=target.conversation_id or "",
+                status=event.status,
+                endpoint=endpoint,
+            )
+            return ReplyAck(ref=None)
+        if isinstance(event, ReplyUpdate):
+            if event.message is not None:
+                await self._update_message(
+                    channel=target.address,
+                    ts=target.reply_ref or "",
+                    message=event.message,
+                    endpoint=endpoint,
+                    settled=event.settled,
+                )
+                return ReplyAck(ref=target.reply_ref)
+            await self._update(
+                channel=target.address,
+                ts=target.reply_ref or "",
+                text=event.text or "",
+                nav=event.nav,
+                endpoint=endpoint,
+                best_effort_unreachable=best_effort_unreachable,
+            )
+            return ReplyAck(ref=target.reply_ref)
+        if isinstance(event, ReplyPost):
+            ref = await self._post(
+                channel=target.address,
+                message=event.message,
+                requested_by=event.requested_by,
+                thread_ts=target.conversation_id,
+                endpoint=endpoint,
+            )
+            return ReplyAck(ref=ref)
+        if isinstance(event, TurnCompleted):
+            return ReplyAck(ref=None)
+        raise AssertionError(f"unmodelled reply event {event!r}")
 
     def _client_for(self, endpoint: str | None) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.
@@ -162,14 +185,34 @@ class AsyncSlackSink:
         A per-turn ``endpoint`` overrides the default; ``None`` (or empty) uses the
         default. Clients are cached per base URL because the SDK binds the endpoint
         at construction, so this never rebuilds a client for a repeat endpoint.
+
+        An endpoint outside the configured Slack origin raises here, which is the
+        single choke point every Slack call passes through -- so the refusal lands
+        before the transport fallback, before any retry, and before any request
+        leaves the process with the platform bot token attached (D4.4).
         """
+        if endpoint and _origin(endpoint) != self._trusted_origin:
+            raise UntrustedSlackEndpointError(
+                f"refusing to send the Slack bot token to {endpoint!r}: its origin is "
+                f"not the configured Slack origin "
+                f"{self._default_base_url or REAL_SLACK_BASE_URL!r}"
+            )
         base_url = endpoint or self._default_base_url
         client = self._clients.get(base_url)
         if client is None:
+            # ``retry_handlers=[]`` disables the SDK's own connection-error
+            # retry, because THIS class already owns the retry policy for an
+            # unreachable endpoint: ``_with_transport_fallback`` re-sends on the
+            # configured default (#530). Leaving the SDK's handler in place
+            # re-dials the target we have just learned is dead before our
+            # fallback gets a turn, so every dead-stub reply pays a doubled
+            # attempt and the fallback lands one round trip later. A transient
+            # blip against a reachable Slack still reclaims and retries at the
+            # delivery layer, loudly and bounded (ADR-0039).
             client = (
-                AsyncWebClient(token=self._token, base_url=base_url)
+                AsyncWebClient(token=self._token, base_url=base_url, retry_handlers=[])
                 if base_url
-                else AsyncWebClient(token=self._token)
+                else AsyncWebClient(token=self._token, retry_handlers=[])
             )
             self._clients[base_url] = client
         return client
@@ -257,13 +300,13 @@ class AsyncSlackSink:
                 return cast(_T, None)
             raise
 
-    async def update(
+    async def _update(
         self,
         *,
         channel: str,
         ts: str,
         text: str,
-        nav: NavPack | None = None,
+        nav: NavAffordance | None = None,
         endpoint: str | None = None,
         best_effort_unreachable: bool = False,
     ) -> None:
@@ -274,7 +317,7 @@ class AsyncSlackSink:
         # malformed block falls back to text, so partials never show raw JSON.
         # ``nav`` (the agent's hub-button pack, threaded from the kernel) appends
         # the no-dead-ends hub button to a structured reply; None leaves it be.
-        rendered_text, blocks = render(text, nav)
+        rendered_text, blocks = render(text, _nav_pack(nav))
 
         async def op(client: AsyncWebClient) -> None:
             if blocks is not None:
@@ -301,7 +344,7 @@ class AsyncSlackSink:
             best_effort_unreachable=best_effort_unreachable,
         )
 
-    async def post(
+    async def _post(
         self,
         *,
         channel: str,
@@ -356,14 +399,14 @@ class AsyncSlackSink:
         ts = response.get("ts")
         return str(ts) if ts else None
 
-    async def update_message(
+    async def _update_message(
         self,
         *,
         channel: str,
         ts: str,
         message: OutboundMessage,
         endpoint: str | None = None,
-        settled: SettledCard | None = None,
+        settled: SettledOutcome | None = None,
     ) -> None:
         # Render the settled approval card HERE, below the seam (ADR-0020): the
         # kernel hands the channel-neutral summary plus the semantic outcome, and
@@ -401,7 +444,7 @@ class AsyncSlackSink:
             endpoint, op, describe="chat_update(card)"
         )
 
-    async def set_status(
+    async def _set_status(
         self, *, channel: str, thread_ts: str, status: str, endpoint: str | None = None
     ) -> None:
         # Best-effort: a workspace without the assistant feature, or any transient
@@ -412,12 +455,3 @@ class AsyncSlackSink:
             )
         except Exception as exc:  # noqa: BLE001 -- status set is best-effort
             logger.debug("assistant set_status skipped for %s: %s", thread_ts, exc)
-
-    async def clear_status(
-        self, *, channel: str, thread_ts: str, endpoint: str | None = None
-    ) -> None:
-        # Clear the assistant-thread status by setting it empty (Slack only
-        # auto-clears on a posted message, and we edit the placeholder instead).
-        await self.set_status(
-            channel=channel, thread_ts=thread_ts, status="", endpoint=endpoint
-        )

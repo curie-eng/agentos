@@ -22,8 +22,10 @@ from aci_protocol import (
     SideEffectFlag,
     TextDelta,
 )
+from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker import kernel as kernel_module
-from curie_worker.behaviorpacks import BehaviorPacks, NavPack
+from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 
 DONE = SessionStatus.DONE
@@ -484,11 +486,15 @@ def test_order_lock_map_evicts_after_processing(make_harness) -> None:
 
 
 class _FakeResolved:
-    """The minimal resolved deployment the kernel reads (agent_id only; shimmer
-    off, so packs are never sampled)."""
+    """The minimal resolved deployment the kernel reads (agent_id plus the
+    binding row's egress pair; shimmer off, so packs are never sampled)."""
 
     def __init__(self, agent_id: uuid.UUID) -> None:
         self.agent_id = agent_id
+        # Unset on this binding, so the turn keeps the route the server minted
+        # onto its reply handle (ADR-0096 EB-B2).
+        self.endpoint: str | None = None
+        self.adapter: str | None = None
 
 
 class _TokenBinding:
@@ -658,31 +664,26 @@ def test_booting_update_failure_never_fails_the_turn(make_harness) -> None:
             h.runner.default_script = [Final(text="all good", status=DONE)]
 
             booting = h.config.booting_text
-            original_update = h.sink.update
+            original_emit = h.sink.emit
             fired = {"n": 0}
 
-            async def flaky_update(
+            async def flaky_emit(
+                event: ReplyEvent,
                 *,
-                channel: str,
-                ts: str,
-                text: str,
-                nav: NavPack | None = None,
-                endpoint: str | None = None,
+                route: TargetRoute,
                 best_effort_unreachable: bool = False,
-            ) -> None:
+            ) -> ReplyAck:
+                text = getattr(event, "text", None)
                 if text == booting and fired["n"] == 0:
                     fired["n"] += 1
                     raise RuntimeError("injected Slack failure on booting update")
-                await original_update(
-                    channel=channel,
-                    ts=ts,
-                    text=text,
-                    nav=nav,
-                    endpoint=endpoint,
+                return await original_emit(
+                    event,
+                    route=route,
                     best_effort_unreachable=best_effort_unreachable,
                 )
 
-            h.sink.update = flaky_update  # type: ignore[method-assign]
+            h.sink.emit = flaky_emit  # type: ignore[method-assign]
 
             ev = _qevent("hi", thread="tBOOTFAIL", placeholder="ph-boot-fail")
             await h.kernel.process_event(ev)
@@ -923,7 +924,18 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
             def release_order() -> None:
                 released.append(True)
 
-            outcome = await h.kernel._attempt(_qevent("go", thread=thread), release_order)
+            qe = _qevent("go", thread=thread)
+            outcome = await h.kernel._attempt(
+                qe,
+                ReplyTarget(
+                    kind="slack",
+                    address=qe.reply_handle.channel,
+                    conversation_id=thread,
+                    reply_ref=qe.reply_handle.placeholder,
+                ),
+                TargetRoute(),
+                release_order,
+            )
 
             assert outcome.terminal_ok is False
             assert outcome.classification == "runner-error"  # retryable

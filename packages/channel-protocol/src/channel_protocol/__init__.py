@@ -12,9 +12,22 @@ from .models import (
     MessageLink,
     OutboundMessage,
 )
+from .reply import (
+    REPLY_WIRE_VERSION,
+    NavAffordance,
+    ReplyAck,
+    ReplyEvent,
+    ReplyPost,
+    ReplyTarget,
+    ReplyUpdate,
+    SettledOutcome,
+    TurnCompleted,
+    TurnStatus,
+)
 
 __all__ = [
     "MESSAGE_VERSION",
+    "REPLY_WIRE_VERSION",
     "Action",
     "ChannelCapability",
     "ChannelCapabilities",
@@ -23,5 +36,14 @@ __all__ = [
     "InteractionIntent",
     "MessageField",
     "MessageLink",
+    "NavAffordance",
     "OutboundMessage",
+    "ReplyAck",
+    "ReplyEvent",
+    "ReplyPost",
+    "ReplyTarget",
+    "ReplyUpdate",
+    "SettledOutcome",
+    "TurnCompleted",
+    "TurnStatus",
 ]
