@@ -38,8 +38,12 @@ from channel_protocol.reply import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
+    MAX_ACK_BODY_BYTES,
+    HttpReplyAdapter,
     MissingAdapterCredentialError,
+    OversizedAdapterResponseError,
     RedirectedAdapterEndpointError,
+    RejectedAdapterResponseError,
     TargetRoute,
     build_reply_sink,
 )
@@ -828,5 +832,142 @@ def test_a_missing_credential_is_not_swallowed_by_best_effort() -> None:
                 route=TargetRoute(endpoint="http://127.0.0.1:1/a", adapter=None),
                 best_effort_unreachable=True,
             )
+
+    asyncio.run(go())
+
+
+# --- The acknowledgement body is bounded, and errors carry no full URL --------
+
+
+async def _serve(handler, path: str = "/ack"):  # noqa: ANN001, ANN202
+    """A one-route server, for the ack-body shapes ``_Capture`` cannot express."""
+    app = web.Application()
+    app.add_routes([web.post(path, handler)])
+    server = TestServer(app)
+    await server.start_server()
+    return server
+
+
+_SECRET_IN_PATH = "/ack?token=super-secret-token"
+
+
+def test_a_chunked_oversize_ack_is_refused_even_with_a_small_first_chunk() -> None:
+    # The cap must survive a body that arrives in pieces. ``StreamReader.read(n)``
+    # returns whatever has arrived SO FAR, so a chunked adapter that writes a
+    # 16-byte first chunk and then megabytes behind it walks straight past a
+    # single sized read. Mutation: replace the accumulating loop with one
+    # ``read(MAX_ACK_BODY_BYTES + 1)`` and this test passes an unbounded body.
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await response.write(b'{"ref": "x"}')  # a small first chunk
+            # The pause is the point: it lets the client's first read complete
+            # with ONLY that chunk in the buffer, which is exactly the state a
+            # single sized read mistakes for the whole body.
+            await asyncio.sleep(0.05)
+            for _ in range(4):
+                await response.write(b"y" * (MAX_ACK_BODY_BYTES // 2))
+                await asyncio.sleep(0.01)
+            await response.write_eof()
+            return response
+
+        server = await _serve(handler)
+        try:
+            adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+            with pytest.raises(OversizedAdapterResponseError):
+                await adapter.emit(
+                    _update("email"),
+                    route=TargetRoute(
+                        endpoint=f"http://127.0.0.1:{server.port}/ack",
+                        adapter=ADAPTER_A,
+                    ),
+                )
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_an_ack_at_the_cap_is_still_read_and_its_ref_survives() -> None:
+    # The other side of the bound: the cap is a refusal of MORE than the cap, so
+    # an honest adapter answering exactly at it is delivered normally.
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.StreamResponse:
+            head = b'{"ref": "msg_minted", "pad": "' + b"z" * 32 + b'"}'
+            response = web.StreamResponse()
+            await response.prepare(request)
+            await response.write(head)
+            await response.write(b" " * (MAX_ACK_BODY_BYTES - len(head)))
+            await response.write_eof()
+            return response
+
+        server = await _serve(handler)
+        try:
+            adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+            ack = await adapter.emit(
+                _update("email"),
+                route=TargetRoute(
+                    endpoint=f"http://127.0.0.1:{server.port}/ack", adapter=ADAPTER_A
+                ),
+            )
+            assert ack.ref == "msg_minted"
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [401, 500])
+def test_a_rejected_delivery_never_puts_the_endpoint_url_in_the_error(
+    status: int,
+) -> None:
+    # ``raise_for_status()`` raises aiohttp's ``ClientResponseError``, whose
+    # ``str()`` prints ``request_info.real_url`` -- so every upstream logger that
+    # formats the exception re-leaks an endpoint whose path or query can carry a
+    # token. The delivery failure is raised by this module instead, redacted to
+    # scheme://host:port. Mutation: restore ``raise_for_status()`` and the query
+    # string is back in the message.
+    async def go() -> None:
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(status=status, text="nope")
+
+        server = await _serve(handler)
+        try:
+            adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+            endpoint = f"http://127.0.0.1:{server.port}{_SECRET_IN_PATH}"
+            with pytest.raises(RejectedAdapterResponseError) as caught:
+                await adapter.emit(
+                    _update("email"),
+                    route=TargetRoute(endpoint=endpoint, adapter=ADAPTER_A),
+                )
+            message = str(caught.value)
+            assert "super-secret-token" not in message
+            assert f"http://127.0.0.1:{server.port}" in message
+            assert str(status) in message
+            # And nothing aiohttp built is chained in behind it.
+            assert caught.value.__cause__ is None
+            assert caught.value.__context__ is None
+        finally:
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
+    # The same redaction on the fail-closed path (finding 7's worker half): the
+    # message an operator reads must identify the route without reprinting a
+    # credential-bearing path or query.
+    async def go() -> None:
+        adapter = HttpReplyAdapter({ADAPTER_A: SECRET_A})
+        with pytest.raises(MissingAdapterCredentialError) as caught:
+            await adapter.emit(
+                _update("email"),
+                route=TargetRoute(
+                    endpoint=f"http://adapter.example{_SECRET_IN_PATH}", adapter=None
+                ),
+            )
+        assert "super-secret-token" not in str(caught.value)
+        assert "http://adapter.example" in str(caught.value)
 
     asyncio.run(go())

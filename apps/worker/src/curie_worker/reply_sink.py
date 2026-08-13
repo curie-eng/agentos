@@ -84,6 +84,18 @@ class MissingAdapterCredentialError(RuntimeError):
     """Platform egress had no credential (or no target) and sent nothing."""
 
 
+class RejectedAdapterResponseError(RuntimeError):
+    """The adapter answered with an error status.
+
+    Raised INSTEAD of ``ClientResponse.raise_for_status``: aiohttp's
+    ``ClientResponseError`` carries ``request_info.real_url`` and prints the full
+    URL in ``str(exc)``, so every upstream logger that formats the exception
+    re-leaks the endpoint's path and query -- exactly what redaction here exists
+    to prevent. The aiohttp exception is never constructed, never chained, and
+    never reaches a log.
+    """
+
+
 class OversizedAdapterResponseError(RuntimeError):
     """The adapter's acknowledgement body exceeded ``MAX_ACK_BODY_BYTES``.
 
@@ -194,20 +206,15 @@ class HttpReplyAdapter:
                             f"{response.status} (redirect); refusing to re-send the "
                             "egress credential to the redirect target"
                         )
-                    response.raise_for_status()
-                    # Read the cap plus one byte, never ``.text()``: the whole
-                    # point is that the body is never fully buffered, and the
-                    # extra byte is what tells "exactly at the cap" (fine) from
-                    # "there is more coming" (refused). Content-Length is not
-                    # consulted -- it is absent on a chunked response and is the
-                    # attacker's own number besides.
-                    payload = await response.content.read(MAX_ACK_BODY_BYTES + 1)
-                    if len(payload) > MAX_ACK_BODY_BYTES:
-                        raise OversizedAdapterResponseError(
-                            f"adapter endpoint {_redacted(endpoint)} answered with more than "
-                            f"{MAX_ACK_BODY_BYTES} bytes; refusing to buffer it and "
-                            "treating the delivery as failed"
+                    if response.status >= 400:
+                        # NOT ``raise_for_status()``: see
+                        # ``RejectedAdapterResponseError``. The status is the
+                        # whole diagnostic; the URL is the part that leaks.
+                        raise RejectedAdapterResponseError(
+                            f"adapter endpoint {_redacted(endpoint)} answered "
+                            f"{response.status}; the delivery failed"
                         )
+                    payload = await _read_capped(response, endpoint)
         except _UNREACHABLE_ERRORS as exc:
             if best_effort_unreachable:
                 logger.warning(
@@ -220,6 +227,29 @@ class HttpReplyAdapter:
                 return ReplyAck(ref=None)
             raise
         return ReplyAck(ref=_ref_from(payload))
+
+
+async def _read_capped(response: aiohttp.ClientResponse, endpoint: str) -> bytes:
+    """The acknowledgement body, or refuse it once it passes the cap.
+
+    A LOOP, not one sized read: ``StreamReader.read(n)`` returns whatever has
+    arrived so far, so a chunked response answers a short first buffer and a
+    single read would let a body of any size through behind it. The running
+    total is checked per chunk, so the refusal happens on the chunk that crosses
+    the cap and the process never holds more than the cap plus one chunk.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.content.iter_any():
+        total += len(chunk)
+        if total > MAX_ACK_BODY_BYTES:
+            raise OversizedAdapterResponseError(
+                f"adapter endpoint {_redacted(endpoint)} answered with more than "
+                f"{MAX_ACK_BODY_BYTES} bytes; refusing to buffer it and treating "
+                "the delivery as failed"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _ref_from(payload: bytes) -> str | None:
