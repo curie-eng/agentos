@@ -162,6 +162,14 @@ down` (or `docker compose -f compose.dev.yaml down`) and confirm with
 stack up owns tearing it down — a blocked or crashed test agent never cleans up
 after itself, so do not assume someone else will.
 
+**The inverse is equally not optional: do not tear down what you did not start.**
+Ownership runs both ways. Several threads share this box, so a broad cleanup
+(`docker rm -f $(docker ps -aq)`, `docker volume prune`, killing a process
+holding a well-known port) will take out a stack another session is mid-test on,
+and the victim sees only an inexplicable failure. Before removing anything you
+did not bring up, confirm it is yours. Scope the teardown to the specific
+containers, volumes, and ports your own run created.
+
 **Do stack testing from a worktree, not the main checkout.** If a local test
 requires code edits, make them in a git worktree cut from the release train base
 selected below and land them as a PR. Never edit `main` or `next` in place to
@@ -492,7 +500,22 @@ protection before accepting PRs against it.
   range the script cannot resolve is a hard failure naming the range, not a silent
   pass. It checks only the PR's own commits, so pre-gate history is not
   retroactively enforced.
-- No dashes/emdashes in prose content; no emojis in code or docs.
+- No dashes/emdashes in prose content; no emojis in code or docs. CI enforces
+  this on every PR; check before pushing with:
+
+  ```bash
+  scripts/check-prose-style.sh origin/<base>..HEAD
+  scripts/check-prose-style.sh --self-test
+  ```
+
+  The gate flags the em-dash and the en-dash in markdown prose, and emoji
+  anywhere it looks. It deliberately does not flag the ASCII hyphen, which is
+  every flag, filename, and kebab-case identifier in the repo, and it skips
+  fenced code blocks, where captured CLI output and quoted model responses are
+  not ours to rewrite. Like the commit-message gate it checks only the lines a
+  PR adds, so existing files are not retroactively enforced; clean them up when
+  you are already editing them. For a genuinely quoted or generated line, put
+  `prose:ignore-line` on it or the line above.
 
 ## Ticket implementation
 
@@ -505,6 +528,24 @@ The active provider implements the change. An independently available provider
 performs read only plan or diff review where that improves confidence. The
 repository's instructions remain authoritative for branching, tests, reviews,
 runtime verification, commits, and pull requests.
+
+**Every sub-agent spawn names its model.** A spawn that omits the model
+inherits the parent session's, so an expensive parent silently bills the whole
+fan-out at its own tier and the transcript shows nothing unusual. Pass the model
+explicitly on every spawn: the default tier for judgement-bearing work
+(planning, review, implementation), the cheap tier for read only locate, fetch,
+and report spawns. An agent definition's frontmatter pin does not satisfy this,
+because a spawn-time model overrides frontmatter. A local PreToolUse hook
+enforces it where the harness supports hooks; CI cannot, since a spawn leaves no
+artifact in the diff.
+
+```bash
+.claude/hooks/require-agent-model.sh --self-test
+```
+
+For a deliberate inherit, export `CLAUDE_ALLOW_INHERITED_MODEL=1` in the
+launching shell rather than editing `.claude/settings.json`, which would turn
+the gate off for everyone.
 
 ## Decisions: ADR vs. GitHub issue
 

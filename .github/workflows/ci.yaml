@@ -636,6 +636,46 @@ jobs:
           bash scripts/check-commit-messages.sh \
             "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
 
+  # The fourth commit-convention rule in AGENTS.md ("no dashes/emdashes in prose
+  # content; no emojis in code or docs") was the only one with no enforcement,
+  # sitting directly beneath two rules that have it. Same scoping decision as
+  # commit-messages above and for the same reason: 103 tracked .md files already
+  # carry an em-dash, so this checks the lines a PR ADDS and never the tree.
+  # Measured over the 200 commits before it landed, it would have flagged 173
+  # added lines across 23 files, all genuine.
+  prose-style:
+    name: Prose style (no em-dashes, no emoji)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          # The range needs both endpoints present locally.
+          fetch-depth: 0
+      # Prove the matcher still separates an em-dash from an ASCII hyphen, and
+      # still respects code fences, before trusting its verdict.
+      - name: Gate self-test (negative control)
+        run: bash scripts/check-prose-style.sh --self-test
+      - name: Check the lines this PR adds
+        run: |
+          bash scripts/check-prose-style.sh \
+            "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  # The agent-model hook is a local PreToolUse gate, so CI cannot exercise the
+  # thing it guards. What CI can do is prove the gate still blocks and still
+  # lets correct spawns through, which is what AGENTS.md's outcome-tested-guards
+  # rule asks of any new gate.
+  agent-model-gate:
+    name: Agent model gate (self-test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Gate self-test (negative control)
+        run: bash .claude/hooks/require-agent-model.sh --self-test
+
   # The three image builds here are GHA-layer-cached via a buildx builder that
   # is created but NOT made the default (`setup-buildx-action` with
   # `use: false`): two of the tags are consumed as Dockerfile FROM bases by a
