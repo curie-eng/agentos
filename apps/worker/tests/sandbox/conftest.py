@@ -20,6 +20,7 @@ from curie_test_support.valkey import (
 )
 from curie_worker.sandbox import (
     AffinityStore,
+    ClaimRouting,
     ClaimView,
     SandboxView,
     SubstrateConfig,
@@ -95,6 +96,7 @@ class FakeClaim:
     name: str
     env: dict[str, str]
     labels: dict[str, str]
+    routing: ClaimRouting
     sandbox_name: str
     ready: bool = True
 
@@ -122,13 +124,14 @@ class FakeSandboxClient:
     sandboxes: dict[str, FakeSandbox] = field(default_factory=dict)
     bind_ready: bool = True
     created: list[str] = field(default_factory=list)
+    created_routings: list[ClaimRouting] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
     def create_claim(
         self,
         name: str,
         *,
-        pool: str,
+        routing: ClaimRouting,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
@@ -137,6 +140,7 @@ class FakeSandboxClient:
             name=name,
             env=dict(env or {}),
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
+            routing=routing,
             sandbox_name=sandbox_name,
             ready=self.bind_ready,
         )
@@ -145,6 +149,7 @@ class FakeSandboxClient:
             service_fqdn=f"{sandbox_name}.{self.namespace}.svc.cluster.local",
         )
         self.created.append(name)
+        self.created_routings.append(routing)
 
     def get_claim(self, name: str) -> ClaimView | None:
         claim = self.claims.get(name)

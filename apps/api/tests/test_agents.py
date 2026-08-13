@@ -471,6 +471,114 @@ def test_agent_secrets_round_trip_exposes_names_only(
     assert "ghp_x" not in patched.text
 
 
+def test_agent_secret_names_round_trip_sorted_without_values(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    created = client.post(
+        "/agents",
+        json={"name": "cluster-secret-agent", "slack_channel": "C0EXAMPLE2"},
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    bound = client.patch(
+        f"/agents/{agent_id}",
+        json={"secret_names": ["ZETA_TOKEN", "ALPHA_TOKEN"]},
+        headers=auth_headers,
+    )
+    assert bound.status_code == 200, bound.text
+    assert bound.json()["secrets"] == ["ALPHA_TOKEN", "ZETA_TOKEN"]
+
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["secrets"] == ["ALPHA_TOKEN", "ZETA_TOKEN"]
+
+
+def test_agent_secret_values_and_names_are_mutually_exclusive(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    created = client.post(
+        "/agents",
+        json={"name": "exclusive-secret-agent", "slack_channel": "C0EXAMPLE3"},
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    rejected = client.patch(
+        f"/agents/{created.json()['id']}",
+        json={
+            "secrets": {"ALPHA_TOKEN": "local_value_must_not_survive"},
+            "secret_names": ["ALPHA_TOKEN"],
+        },
+        headers=auth_headers,
+    )
+    assert rejected.status_code == 422, rejected.text
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "github-token",
+        "CURIE_BUDGET",
+        "ANTHROPIC_API_KEY",
+        "HTTPS_PROXY",
+    ],
+)
+def test_agent_secret_names_reuse_value_map_validation(
+    client: Any, auth_headers: dict[str, str], clean_db: None, name: str
+) -> None:
+    created = client.post(
+        "/agents",
+        json={"name": "invalid-cluster-secret-agent", "slack_channel": "C0EXAMPLE4"},
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+
+    rejected = client.patch(
+        f"/agents/{created.json()['id']}",
+        json={"secret_names": [name]},
+        headers=auth_headers,
+    )
+    assert rejected.status_code == 422, f"{name!r} was accepted: {rejected.text}"
+
+
+def test_agent_secret_names_empty_list_clears_at_api_boundary(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    created = client.post(
+        "/agents",
+        json={
+            "name": "clear-cluster-secret-agent",
+            "slack_channel": "C0EXAMPLE5",
+            "secrets": {"ALPHA_TOKEN": "local_value_before_cluster_binding"},
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    cluster_bound = client.patch(
+        f"/agents/{agent_id}",
+        json={"secret_names": ["ALPHA_TOKEN"]},
+        headers=auth_headers,
+    )
+    assert cluster_bound.status_code == 200, cluster_bound.text
+    assert cluster_bound.json()["secrets"] == ["ALPHA_TOKEN"]
+
+    cleared = client.patch(
+        f"/agents/{agent_id}",
+        json={"secret_names": []},
+        headers=auth_headers,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["secrets"] == []
+    assert "local_value_before_cluster_binding" not in cleared.text
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["secrets"] == []
+
+
 def test_agent_non_env_var_secret_name_is_422(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:

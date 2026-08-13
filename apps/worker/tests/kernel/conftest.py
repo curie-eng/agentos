@@ -43,7 +43,7 @@ from curie_worker.kernel import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimRouting, ClaimView, SandboxView
 from curie_worker.slack_sink import SettledCard, SlackSink
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
@@ -222,6 +222,7 @@ class _FakeClaim:
     name: str
     sandbox_name: str
     labels: dict[str, str]
+    routing: ClaimRouting
     ready: bool = True
 
 
@@ -239,21 +240,24 @@ class FakeK8s:
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     sandboxes: dict[str, _FakeSandbox] = field(default_factory=dict)
     claim_envs: list[dict[str, str] | None] = field(default_factory=list)
+    claim_routings: list[ClaimRouting] = field(default_factory=list)
 
     def create_claim(
         self,
         name: str,
         *,
-        pool: str,
+        routing: ClaimRouting,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
         self.claim_envs.append(env)
+        self.claim_routings.append(routing)
         sandbox_name = f"sbx-{name}"
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=sandbox_name,
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
+            routing=routing,
         )
         self.sandboxes[sandbox_name] = _FakeSandbox(name=sandbox_name)
 

@@ -19,8 +19,13 @@ from curie_worker.sandbox.docker import (
     DockerSandboxClient,
     RunnerHardening,
 )
+from curie_worker.sandbox.types import ClaimRouting
 
 from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
+
+
+def _routing() -> ClaimRouting:
+    return ClaimRouting(warm_pool_ref="pool", additional_pod_labels={})
 
 
 def _plugin_tar_gz(wrapper: str | None) -> bytes:
@@ -45,7 +50,7 @@ def test_create_claim_argv_carries_boot_env() -> None:
     )
     client.create_claim(
         "thread-abc",
-        pool="pool",
+        routing=_routing(),
         env={
             "CURIE_BUDGET": '{"max_usd_per_day":5.0}',
             "CURIE_SESSION_ID": "sess-1",
@@ -72,12 +77,37 @@ def test_create_claim_argv_carries_boot_env() -> None:
     assert argv[-1] == "curie-runner"
 
 
+def test_local_secret_values_are_unchanged_and_pod_labels_are_ignored() -> None:
+    client = _RecordingDocker(
+        image="curie-runner",
+        bundle_store=_FakeBundleStore(),
+    )
+    client.create_claim(
+        "thread-local",
+        routing=ClaimRouting(
+            warm_pool_ref="curie-agent-acme-a-runner-pool",
+            additional_pod_labels={"curietech.ai/agent": "acme-a"},
+        ),
+        env={
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp-local-value",
+            "CURIE_CONNECTOR_SECRET_KEYS": "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "CURIE_FAKE_MODEL": "1",
+        },
+    )
+
+    argv = client.calls[0]
+    envs = _flag_values(argv, "-e")
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN=ghp-local-value" in envs
+    assert "CURIE_CONNECTOR_SECRET_KEYS=GITHUB_PERSONAL_ACCESS_TOKEN" in envs
+    assert "curietech.ai/agent=acme-a" not in _flag_values(argv, "--label")
+
+
 def test_create_claim_fetches_and_unwraps_bundle() -> None:
     store = _FakeBundleStore(_plugin_tar_gz(wrapper="deal-desk"))
     client = _RecordingDocker(image="curie-runner", bundle_store=store)
     client.create_claim(
         "t1",
-        pool="pool",
+        routing=_routing(),
         env={"CURIE_BUNDLE_REF": "bundles/b.tar.gz", "CURIE_PLUGIN_DIR": "/bundles/current"},
     )
     assert store.requested == ["bundles/b.tar.gz"]  # the worker fetched the bundle
@@ -94,7 +124,7 @@ def test_create_claim_fetches_and_unwraps_bundle() -> None:
 
 def test_create_claim_without_bundle_ref_mounts_nothing() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     assert _flag_values(client.calls[0], "-v") == []
 
 
@@ -106,7 +136,7 @@ def test_sdk_credential_forwarded_by_name_only() -> None:
         bundle_store=_FakeBundleStore(),
         environ={"CLAUDE_CODE_OAUTH_TOKEN": "sk-PLACEHOLDER-never-real"},
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_BUDGET": "{}"})
     argv = client.calls[0]
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" in envs  # forwarded by name
@@ -115,7 +145,7 @@ def test_sdk_credential_forwarded_by_name_only() -> None:
 
 def test_sdk_credential_not_forwarded_when_absent() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore(), environ={})
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     envs = _flag_values(client.calls[0], "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs
     assert "ANTHROPIC_API_KEY" not in envs
@@ -131,7 +161,11 @@ def test_curie_credentials_forwarded_by_name_never_as_value() -> None:
     )
     # The worker also hands it in the boot env (from config.credentials); it must
     # still never be emitted as a -e KEY=value pair.
-    client.create_claim("t1", pool="pool", env={"CURIE_CREDENTIALS": "sk-ant-PLACEHOLDER-secret"})
+    client.create_claim(
+        "t1",
+        routing=_routing(),
+        env={"CURIE_CREDENTIALS": "sk-ant-PLACEHOLDER-secret"},
+    )
     argv = client.calls[0]
     envs = _flag_values(argv, "-e")
     assert "CURIE_CREDENTIALS" in envs  # forwarded by name
@@ -154,7 +188,7 @@ def test_ambient_sdk_creds_not_forwarded_when_curie_credentials_set() -> None:
             "CURIE_CREDENTIALS": "sk-or-PLACEHOLDER-byo",
         },
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_BUDGET": "{}"})
     argv = client.calls[0]
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient OAuth token not forwarded by name
@@ -176,7 +210,7 @@ def test_ambient_sdk_creds_forwarded_when_curie_credentials_empty() -> None:
             "CLAUDE_CODE_OAUTH_TOKEN": "sk-PLACEHOLDER-oauth",
         },
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_BUDGET": "{}"})
     argv = client.calls[0]
     envs = _flag_values(argv, "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" in envs  # ambient OAuth token forwarded by name
@@ -203,7 +237,11 @@ def test_no_credential_forwarded_under_fake_model() -> None:
             "CURIE_CREDENTIALS": "sk-ant-PLACEHOLDER",
         },
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1", "CURIE_BUDGET": "{}"})
+    client.create_claim(
+        "t1",
+        routing=_routing(),
+        env={"CURIE_FAKE_MODEL": "1", "CURIE_BUDGET": "{}"},
+    )
     envs = _flag_values(client.calls[0], "-e")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in envs  # ambient SDK token not forwarded
     assert "ANTHROPIC_API_KEY" not in envs
@@ -222,7 +260,7 @@ def test_ambient_sdk_creds_not_forwarded_under_local_model() -> None:
     )
     client.create_claim(
         "t1",
-        pool="pool",
+        routing=_routing(),
         env={"ANTHROPIC_BASE_URL": "http://ollama:11434", "CURIE_BUDGET": "{}"},
     )
     envs = _flag_values(client.calls[0], "-e")
@@ -246,7 +284,7 @@ def test_explicit_credential_forwarded_under_base_url_override() -> None:
     )
     client.create_claim(
         "t1",
-        pool="pool",
+        routing=_routing(),
         env={"ANTHROPIC_BASE_URL": "https://openrouter.ai/api", "CURIE_BUDGET": "{}"},
     )
     envs = _flag_values(client.calls[0], "-e")
@@ -361,7 +399,7 @@ def test_runner_token_forwarded_as_docker_env() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.create_claim(
         "t1",
-        pool="pool",
+        routing=_routing(),
         env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "tok-25"},
     )
     envs = _flag_values(client.calls[0], "-e")
@@ -379,7 +417,7 @@ def test_runner_token_forwarded_even_when_credentials_selected() -> None:
     )
     client.create_claim(
         "t1",
-        pool="pool",
+        routing=_routing(),
         env={
             "CURIE_CREDENTIALS": "sk-PLACEHOLDER-byo",
             "CURIE_RUNNER_TOKEN": "tok-25b",
@@ -475,7 +513,7 @@ def test_create_claim_applies_container_hardening_by_default() -> None:
     # A default client hardens every runner: read-only rootfs + tmpfs for the
     # writable paths, all caps dropped, no-new-privileges, bounded pids/mem/cpu.
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     argv = client.calls[0]
     assert "--read-only" in argv
     tmpfs = _flag_values(argv, "--tmpfs")
@@ -498,7 +536,7 @@ def test_runner_never_receives_the_docker_socket() -> None:
         bundle_store=_FakeBundleStore(),
         environ={"CLAUDE_CODE_OAUTH_TOKEN": "sk-PLACEHOLDER"},
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_BUDGET": "{}"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_BUDGET": "{}"})
     assert all("docker.sock" not in m for m in _flag_values(client.calls[0], "-v"))
 
 
@@ -510,7 +548,7 @@ def test_hardening_disabled_emits_no_hardening_flags() -> None:
         bundle_store=_FakeBundleStore(),
         hardening=RunnerHardening.from_env({"CURIE_RUNNER_HARDENING": "0"}),
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     argv = client.calls[0]
     assert "--read-only" not in argv
     assert _flag_values(argv, "--cap-drop") == []
@@ -533,7 +571,7 @@ def test_hardening_env_overrides_limits_and_paths() -> None:
         bundle_store=_FakeBundleStore(),
         hardening=hardening,
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     argv = client.calls[0]
     assert "2g" in _flag_values(argv, "--memory")
     assert "2" in _flag_values(argv, "--cpus")
@@ -551,7 +589,7 @@ def test_hardening_read_only_opt_out_keeps_other_rails() -> None:
         bundle_store=_FakeBundleStore(),
         hardening=RunnerHardening.from_env({"CURIE_RUNNER_READ_ONLY": "false"}),
     )
-    client.create_claim("t1", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim("t1", routing=_routing(), env={"CURIE_FAKE_MODEL": "1"})
     argv = client.calls[0]
     assert "--read-only" not in argv
     assert _flag_values(argv, "--tmpfs") == []  # no read-only -> no tmpfs needed

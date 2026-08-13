@@ -242,6 +242,70 @@ async fn run_deploy(
 }
 
 #[tokio::test]
+async fn local_secret_binding_keeps_the_value_map_wire_contract() {
+    const LOCAL_SENTINEL: &str = "local_value_map_sentinel_440";
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","slack_channel":"#old","secrets":["ALPHA_TOKEN"],"created_at":"2026-07-05T00:00:00Z"}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let secrets =
+        std::collections::BTreeMap::from([("ALPHA_TOKEN".to_string(), LOCAL_SENTINEL.to_string())]);
+
+    let agent = client
+        .update_agent_secrets(AGENT_ID, &secrets)
+        .await
+        .unwrap();
+
+    assert_eq!(agent.secrets, Some(vec!["ALPHA_TOKEN".to_string()]));
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"secrets": {"ALPHA_TOKEN": LOCAL_SENTINEL}})
+    );
+}
+
+#[tokio::test]
+async fn cluster_secret_binding_sends_sorted_names_and_no_values() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r##"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","slack_channel":"#old","secrets":["ALPHA_TOKEN","ZETA_TOKEN"],"created_at":"2026-07-05T00:00:00Z"}}"##
+            ),
+        ),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let names = vec!["ZETA_TOKEN".to_string(), "ALPHA_TOKEN".to_string()];
+
+    let agent = client
+        .update_agent_secret_names(AGENT_ID, &names)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        agent.secrets,
+        Some(vec!["ALPHA_TOKEN".to_string(), "ZETA_TOKEN".to_string()])
+    );
+    let requests = server.recorded();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"secret_names": ["ALPHA_TOKEN", "ZETA_TOKEN"]})
+    );
+    assert!(body.get("secrets").is_none(), "cluster PATCH was {body}");
+}
+
+#[tokio::test]
 async fn redeploy_with_explicit_channel_patches_the_existing_agent() {
     // An existing agent on #old + `--slack-channel #new` must PATCH the agent to
     // move the channel (the audit MAJOR: the channel was silently ignored).

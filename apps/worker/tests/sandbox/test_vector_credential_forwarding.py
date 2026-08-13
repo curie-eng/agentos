@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from curie_worker.sandbox.types import ClaimRouting
+
 from .conftest import _FakeBundleStore, _flag_values, _RecordingDocker
 
 _VECTORS = (
@@ -90,7 +92,11 @@ def _run_vector(vector: dict[str, object]) -> list[str]:
     client = _RecordingDocker(
         image="curie-runner", bundle_store=_FakeBundleStore(), environ=environ
     )
-    client.create_claim("t1", pool="pool", env=env)
+    client.create_claim(
+        "t1",
+        routing=ClaimRouting(warm_pool_ref="pool", additional_pod_labels={}),
+        env=env,
+    )
     argv = client.calls[0]
     assert all("PLACEHOLDER" not in a for a in argv)  # no credential value in argv
     # The by-name forwards: `-e NAME` args, not the `-e KEY=VALUE` pairs the

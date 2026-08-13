@@ -19,6 +19,7 @@ from curie_worker.binding import (
     ResolvedDeployment,
 )
 from curie_worker.killswitch import kill_key
+from curie_worker.sandbox.types import ClaimRouting
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -42,19 +43,34 @@ class StubBinding:
             env[BUNDLE_REF_ENV] = resolved.bundle_ref
         return env
 
+    def claim_routing(self, resolved: ResolvedDeployment) -> ClaimRouting | None:
+        if not isinstance(resolved.secrets, list) or not resolved.secrets:
+            return None
+        return ClaimRouting(
+            warm_pool_ref=f"curie-agent-{resolved.agent_name}-runner-pool",
+            additional_pod_labels={"curietech.ai/agent": resolved.agent_name},
+        )
+
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         return BehaviorPacks.from_config(resolved.behavior_packs)
 
 
-def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> ResolvedDeployment:
+def _resolved(
+    agent_id: uuid.UUID,
+    *,
+    bundle: str | None = "bundles/x.zip",
+    agent_name: str = "test-agent",
+    secrets: dict[str, str] | list[str] | None = None,
+) -> ResolvedDeployment:
     return ResolvedDeployment(
         agent_id=agent_id,
-        agent_name="test-agent",
+        agent_name=agent_name,
         version_id=uuid.uuid4(),
         version_label="v1",
         bundle_ref=bundle,
         max_usd_per_day=None,
         max_output_tokens_per_run=None,
+        secrets=secrets,
     )
 
 
@@ -113,6 +129,75 @@ def test_bound_channel_claims_sandbox_with_boot_env(make_harness) -> None:
             assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
             assert env[PLUGIN_DIR_ENV] == "/bundles/current"
             assert "max_usd_per_day" in env[BUDGET_ENV]
+
+    asyncio.run(go())
+
+
+def test_two_name_bound_runs_select_distinct_claim_routes_and_no_secret_env(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        resolved_a = _resolved(
+            uuid.uuid4(),
+            agent_name="acme-a",
+            secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        )
+        resolved_b = _resolved(
+            uuid.uuid4(),
+            agent_name="acme-b",
+            secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        )
+        binding = StubBinding({"C-a": resolved_a, "C-b": resolved_b})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("first", channel="C-a", thread="thread-a")
+            )
+            await h.kernel.process_event(
+                _qevent("second", channel="C-b", thread="thread-b")
+            )
+
+            assert h.fake_k8s.claim_routings == [
+                ClaimRouting(
+                    warm_pool_ref="curie-agent-acme-a-runner-pool",
+                    additional_pod_labels={"curietech.ai/agent": "acme-a"},
+                ),
+                ClaimRouting(
+                    warm_pool_ref="curie-agent-acme-b-runner-pool",
+                    additional_pod_labels={"curietech.ai/agent": "acme-b"},
+                ),
+            ]
+            for env in h.fake_k8s.claim_envs:
+                assert env is not None
+                assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env
+                assert "CURIE_CONNECTOR_SECRET_KEYS" not in env
+
+    asyncio.run(go())
+
+
+def test_bound_resume_preserves_claim_routing(make_harness) -> None:
+    async def go() -> None:
+        resolved = _resolved(
+            uuid.uuid4(),
+            agent_name="acme-a",
+            secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        )
+        binding = StubBinding({"C-bound": resolved})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="answer", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("first", channel="C-bound", thread="thread-resume")
+            )
+            h.substrate.suspend("thread-resume", history_ref="history-ref")
+            await h.kernel.process_event(
+                _qevent("second", channel="C-bound", thread="thread-resume")
+            )
+
+            expected = ClaimRouting(
+                warm_pool_ref="curie-agent-acme-a-runner-pool",
+                additional_pod_labels={"curietech.ai/agent": "acme-a"},
+            )
+            assert h.fake_k8s.claim_routings == [expected, expected]
 
     asyncio.run(go())
 

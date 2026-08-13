@@ -37,7 +37,13 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     VALKEY_PW as _VPW,
 )
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    MODEL_ENV,
+    THINKING_ENV,
+    BindingResult,
+)
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
 from curie_worker.eval import (
@@ -53,7 +59,7 @@ from curie_worker.eval import (
 )
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
-from curie_worker.sandbox.types import ClaimView, SandboxView
+from curie_worker.sandbox.types import ClaimRouting, ClaimView, SandboxView
 from redis.asyncio import Redis as AsyncRedis
 
 CONTAINS = GraderKind.CONTAINS
@@ -71,17 +77,23 @@ async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
 class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
-    def __init__(self, *, thinking: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        thinking: str | None = None,
+        agent_name: str = "test-agent",
+        secrets: dict[str, str] | list[str] | None = None,
+    ) -> None:
         self._thinking = thinking
+        self._agent_name = agent_name
+        self._secrets = secrets
         self.thinking_agent_id: uuid.UUID | None = None
 
     async def repo_full_name(self, _agent_id: uuid.UUID) -> str:
         return "owner/repo"
 
-    async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
-        # No connector secrets in the eval stub; a real BindingResolver returns
-        # the agent's secrets so an authed-MCP bundle authenticates during eval.
-        return None
+    async def binding_for(self, _agent_id: uuid.UUID) -> BindingResult:
+        return BindingResult(agent_name=self._agent_name, secrets=self._secrets)
 
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         self.thinking_agent_id = agent_id
@@ -110,6 +122,7 @@ class _FakeClaim:
     sandbox_name: str
     labels: dict[str, str]
     env: dict[str, str]
+    routing: ClaimRouting
 
 
 @dataclass
@@ -117,22 +130,25 @@ class _FakeK8s:
     namespace: str = "test-ns"
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     claim_envs: list[dict[str, str]] = field(default_factory=list)
+    claim_routings: list[ClaimRouting] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
     def create_claim(
         self,
         name: str,
         *,
-        pool: str,
+        routing: ClaimRouting,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
+        self.claim_routings.append(routing)
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=f"sbx-{name}",
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             env=dict(env or {}),
+            routing=routing,
         )
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -682,12 +698,17 @@ def test_provisioned_runner_end_to_end(
             )
             token = uuid.uuid4().hex[:8]
             if platform_thinking is None:
-                cfg = _cfg(f"test:evals:{token}", f"g-{token}")
+                cfg = _cfg(
+                    f"test:evals:{token}",
+                    f"g-{token}",
+                    agent_pool_prefix="curie-agent",
+                )
             else:
                 cfg = _cfg(
                     f"test:evals:{token}",
                     f"g-{token}",
                     thinking=platform_thinking,
+                    agent_pool_prefix="curie-agent",
                 )
             sandbox_prefix = f"test:curie:sandbox:{token}"
             sync_client = redis.Redis(
@@ -710,7 +731,11 @@ def test_provisioned_runner_end_to_end(
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
             reports: list[dict[str, Any]] = []
             async with httpx.AsyncClient(timeout=30.0) as lf_client:
-                repo_lookup = _StubRepo(thinking=agent_thinking)
+                repo_lookup = _StubRepo(
+                    thinking=agent_thinking,
+                    agent_name="acme-eval",
+                    secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+                )
                 consumer = _build_consumer(
                     redis_client=client,
                     cfg=cfg,
@@ -741,6 +766,10 @@ def test_provisioned_runner_end_to_end(
                 assert fake_k8s.claim_envs, "substrate.claim was never called"
                 assert fake_k8s.claim_envs[0][BUNDLE_REF_ENV] == bundle_ref
                 assert BUDGET_ENV in fake_k8s.claim_envs[0]
+                assert fake_k8s.claim_routings[0] == ClaimRouting(
+                    warm_pool_ref="curie-agent-acme-eval-runner-pool",
+                    additional_pod_labels={"curietech.ai/agent": "acme-eval"},
+                )
                 if expected_thinking is None:
                     assert THINKING_ENV not in fake_k8s.claim_envs[0]
                 else:
@@ -873,8 +902,18 @@ class _TokenSubstrate:
     def __init__(self, token: str) -> None:
         self._token = token
         self.released: list[str] = []
+        self.routings: list[ClaimRouting | None] = []
+        self.envs: list[dict[str, str]] = []
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self,
+        _key: str,
+        *,
+        routing: ClaimRouting | None,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHandle:
+        self.routings.append(routing)
+        self.envs.append(dict(env or {}))
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str) -> None:
@@ -903,6 +942,35 @@ def test_eval_boot_env_mints_runner_token() -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     env = consumer._boot_env(item)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
+
+
+def test_eval_name_only_binding_selects_agent_route_without_secret_env() -> None:
+    substrate = _TokenSubstrate("tok")
+    consumer = _consumer(
+        WorkerConfig(agent_pool_prefix="curie-agent"),
+        substrate=substrate,
+        repo_lookup=_StubRepo(
+            agent_name="acme-b",
+            secrets=["GITHUB_PERSONAL_ACCESS_TOKEN"],
+        ),
+    )
+    item = _item(
+        suite="s",
+        sha="deadbeef",
+        bundle_ref="bundles/x.zip",
+        target_url=None,
+    )
+
+    asyncio.run(consumer._acquire_target(item))
+
+    assert substrate.routings == [
+        ClaimRouting(
+            warm_pool_ref="curie-agent-acme-b-runner-pool",
+            additional_pod_labels={"curietech.ai/agent": "acme-b"},
+        )
+    ]
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in substrate.envs[0]
+    assert "CURIE_CONNECTOR_SECRET_KEYS" not in substrate.envs[0]
 
 
 def test_eval_requested_model_boots_and_tags_that_model() -> None:
@@ -1016,7 +1084,14 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self,
+        _key: str,
+        *,
+        routing: ClaimRouting | None,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHandle:
+        assert routing is None
         with self._lock:
             self._live += 1
             self.claims += 1

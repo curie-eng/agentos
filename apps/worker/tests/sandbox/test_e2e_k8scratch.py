@@ -35,6 +35,7 @@ import redis
 from curie_worker.sandbox import (
     HISTORY_ENV,
     AffinityStore,
+    ClaimRouting,
     KubernetesSandboxClient,
     SandboxHandle,
     SandboxSubstrate,
@@ -50,6 +51,10 @@ NAMESPACE = os.environ.get("CURIE_SANDBOX_E2E_NAMESPACE", "curie-g1")
 # Matches what the chart renders for release curie-g1 (fullname collapses the
 # repeated chart name): <fullname>-runner-pool.
 POOL = os.environ.get("CURIE_SANDBOX_E2E_POOL", "curie-g1-runner-pool")
+AGENT = os.environ.get("CURIE_SANDBOX_E2E_AGENT", "acme-a")
+AGENT_POOL = os.environ.get(
+    "CURIE_SANDBOX_E2E_AGENT_POOL", f"curie-g1-agent-{AGENT}-runner-pool"
+)
 
 
 def _kubectl(*args: str) -> str:
@@ -131,15 +136,15 @@ def substrate() -> Iterator[SandboxSubstrate]:
     client.close()
 
 
-def _await_pool_ready(timeout: float = 180.0) -> None:
+def _await_pool_ready(pool: str = POOL, timeout: float = 180.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        raw = _kubectl("get", "sandboxwarmpool", POOL, "-o", "json")
+        raw = _kubectl("get", "sandboxwarmpool", pool, "-o", "json")
         status = json.loads(raw).get("status") or {}
         if status.get("readyReplicas", 0) >= 1:
             return
         time.sleep(2)
-    raise AssertionError(f"warm pool {POOL} never became ready")
+    raise AssertionError(f"warm pool {pool} never became ready")
 
 
 def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
@@ -148,7 +153,7 @@ def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
 
     # 1. Warm claim binds sub-second.
     started = time.monotonic()
-    handle: SandboxHandle = substrate.claim(thread)
+    handle: SandboxHandle = substrate.claim(thread, routing=None)
     claim_latency = time.monotonic() - started
     print(f"\nEVIDENCE claim_latency_seconds={claim_latency:.3f}")
     assert claim_latency < 1.0, f"warm claim took {claim_latency:.3f}s (>= 1s)"
@@ -168,7 +173,7 @@ def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
         # 3. Consecutive turn, same claim -> same pod, same process.
         frames2 = _post_event(base, "second turn, same session")
         assert [f.get("type") for f in frames2][-1] == "final"
-        again = substrate.claim(thread)
+        again = substrate.claim(thread, routing=None)
         assert again.sandbox_name == handle.sandbox_name
     pod_after_turns = _pod_of_sandbox(handle.sandbox_name)
     assert pod_after_turns["metadata"]["uid"] == uid_before  # type: ignore[index]
@@ -188,7 +193,7 @@ def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
         raise AssertionError("suspended sandbox pod was never deleted")
     print("EVIDENCE suspend_deleted_pod=true")
 
-    resumed = substrate.resume(thread)
+    resumed = substrate.resume(thread, routing=None)
     assert resumed.claim_name != handle.claim_name
     assert resumed.history_ref == "e2e-history-ref-123"
     resumed_pod = _pod_of_sandbox(resumed.sandbox_name)
@@ -215,3 +220,36 @@ def test_full_lifecycle_on_cluster(substrate: SandboxSubstrate) -> None:
         raise AssertionError("released sandbox pod was never deleted")
     assert substrate.lookup(thread) is None
     print("EVIDENCE release_reaped_pod=true")
+
+
+def test_per_agent_claim_and_resume_keep_pool_and_pod_label(
+    substrate: SandboxSubstrate,
+) -> None:
+    routing = ClaimRouting(
+        warm_pool_ref=AGENT_POOL,
+        additional_pod_labels={"curietech.ai/agent": AGENT},
+    )
+    _await_pool_ready(AGENT_POOL)
+    thread = f"e2e-agent-{int(time.time())}"
+
+    handle = substrate.claim(thread, routing=routing)
+    try:
+        claim = json.loads(
+            _kubectl("get", "sandboxclaim", handle.claim_name, "-o", "json")
+        )
+        assert claim["spec"]["warmPoolRef"]["name"] == AGENT_POOL
+        assert claim["spec"]["additionalPodMetadata"]["labels"] == {
+            "curietech.ai/agent": AGENT
+        }
+
+        substrate.suspend(thread, history_ref="e2e-agent-history")
+        resumed = substrate.resume(thread, routing=routing)
+        resumed_claim = json.loads(
+            _kubectl("get", "sandboxclaim", resumed.claim_name, "-o", "json")
+        )
+        assert resumed_claim["spec"]["warmPoolRef"]["name"] == AGENT_POOL
+        assert resumed_claim["spec"]["additionalPodMetadata"]["labels"] == {
+            "curietech.ai/agent": AGENT
+        }
+    finally:
+        substrate.release(thread)

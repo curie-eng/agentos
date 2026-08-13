@@ -24,14 +24,23 @@ PROBE_IMAGE="${CURIE_NETPOL_PROBE_IMAGE:-curlimages/curl:8.10.1}"
 # The deny target must actually LISTEN, so a blocked attempt is a timeout rather
 # than an ambiguous connection-refused that a missing listener would also give.
 TARGET_IMAGE="${CURIE_NETPOL_TARGET_IMAGE:-hashicorp/http-echo:1.0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHART="${CURIE_NETPOL_CHART:-$SCRIPT_DIR/../charts/curie}"
 
 SANDBOX_POD="netpol-probe-sandbox"
 OUTSIDE_POD="netpol-probe-outside"
 DENY_TARGET_POD="netpol-probe-deny-target"
+AGENT_A="netpol-agent-a"
+AGENT_B="netpol-agent-b"
+AGENT_A_POD="netpol-probe-${AGENT_A}"
+AGENT_B_POD="netpol-probe-${AGENT_B}"
+AGENT_A_TARGET_POD="netpol-probe-${AGENT_A}-target"
+AGENT_B_TARGET_POD="netpol-probe-${AGENT_B}-target"
 
 # Non-blocking on the way out: the run is over, nothing waits on the pods.
 cleanup() {
   kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
+    "$AGENT_A_POD" "$AGENT_B_POD" "$AGENT_A_TARGET_POD" "$AGENT_B_TARGET_POD" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 # BLOCKING before the apply. A previous run's pod may still be terminating, and
@@ -40,6 +49,7 @@ cleanup() {
 # after it fails for reasons that have nothing to do with policy.
 cleanup_and_settle() {
   kubectl -n "$NS" delete pod "$SANDBOX_POD" "$OUTSIDE_POD" "$DENY_TARGET_POD" \
+    "$AGENT_A_POD" "$AGENT_B_POD" "$AGENT_A_TARGET_POD" "$AGENT_B_TARGET_POD" \
     --ignore-not-found --wait=true --timeout=90s >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -96,14 +106,99 @@ spec:
     - name: probe
       image: $TARGET_IMAGE
       args: ["-listen=:8000", "-text=reachable"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $AGENT_A_POD
+  labels:
+    app.kubernetes.io/name: $APP
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: $AGENT_A
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: $PROBE_IMAGE
+      command: ["sleep", "600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $AGENT_B_POD
+  labels:
+    app.kubernetes.io/name: $APP
+    app.kubernetes.io/instance: $RELEASE
+    app.kubernetes.io/component: runner-sandbox
+    curietech.ai/agent: $AGENT_B
+spec:
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: $PROBE_IMAGE
+      command: ["sleep", "600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $AGENT_A_TARGET_POD
+  labels:
+    app.kubernetes.io/name: netpol-probe-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: target
+      image: $TARGET_IMAGE
+      args: ["-listen=:8000", "-text=agent-a"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $AGENT_B_TARGET_POD
+  labels:
+    app.kubernetes.io/name: netpol-probe-target
+spec:
+  restartPolicy: Never
+  containers:
+    - name: target
+      image: $TARGET_IMAGE
+      args: ["-listen=:8000", "-text=agent-b"]
 YAML
 
 kubectl -n "$NS" wait --for=condition=Ready \
-  "pod/$SANDBOX_POD" "pod/$OUTSIDE_POD" "pod/$DENY_TARGET_POD" --timeout=180s >/dev/null \
+  "pod/$SANDBOX_POD" "pod/$OUTSIDE_POD" "pod/$DENY_TARGET_POD" \
+  "pod/$AGENT_A_POD" "pod/$AGENT_B_POD" \
+  "pod/$AGENT_A_TARGET_POD" "pod/$AGENT_B_TARGET_POD" --timeout=180s >/dev/null \
   || fail "probe pods did not become ready"
 
 DENY_TARGET_IP="$(kubectl -n "$NS" get pod "$DENY_TARGET_POD" -o jsonpath='{.status.podIP}')"
 [ -n "$DENY_TARGET_IP" ] || fail "could not read the deny target's pod IP"
+AGENT_A_TARGET_IP="$(kubectl -n "$NS" get pod "$AGENT_A_TARGET_POD" -o jsonpath='{.status.podIP}')"
+AGENT_B_TARGET_IP="$(kubectl -n "$NS" get pod "$AGENT_B_TARGET_POD" -o jsonpath='{.status.podIP}')"
+[ -n "$AGENT_A_TARGET_IP" ] || fail "could not read the ${AGENT_A} target pod IP"
+[ -n "$AGENT_B_TARGET_IP" ] || fail "could not read the ${AGENT_B} target pod IP"
+
+cidr_for_ip() {
+  local ip="$1"
+  if [[ "$ip" == *:* ]]; then
+    printf '%s/128' "$ip"
+  else
+    printf '%s/32' "$ip"
+  fi
+}
+
+# The target pods exist before this upgrade so their exact pod IPs can become
+# the scoped policy inputs. This proves the actual per-agent CIDR selectors,
+# rather than a hand-written NetworkPolicy that merely resembles the chart.
+helm upgrade "$RELEASE" "$CHART" --namespace "$NS" --reuse-values \
+  --set-string "security.networkPolicy.agentAllowedEgress.${AGENT_A}[0].cidr=$(cidr_for_ip "$AGENT_A_TARGET_IP")" \
+  --set-string "security.networkPolicy.agentAllowedEgress.${AGENT_A}[0].ports[0].protocol=TCP" \
+  --set "security.networkPolicy.agentAllowedEgress.${AGENT_A}[0].ports[0].port=8000" \
+  --set-string "security.networkPolicy.agentAllowedEgress.${AGENT_B}[0].cidr=$(cidr_for_ip "$AGENT_B_TARGET_IP")" \
+  --set-string "security.networkPolicy.agentAllowedEgress.${AGENT_B}[0].ports[0].protocol=TCP" \
+  --set "security.networkPolicy.agentAllowedEgress.${AGENT_B}[0].ports[0].port=8000" \
+  >/dev/null || fail "Helm could not render and apply per-agent egress policies"
 
 # ---------------------------------------------------------------------------
 # GATE: the deny must hold. Everything below is meaningless without this.
@@ -156,6 +251,39 @@ if ! kubectl -n "$NS" exec "$SANDBOX_POD" -- \
   fail "the sandbox cannot resolve DNS; ${RELEASE}-runner-allow-dns is not effective"
 fi
 echo "  ok  allow holds -- the sandbox can resolve DNS"
+
+# Per-agent connector egress is a separate additive policy. The two policy
+# targets differ, so a generic runner reaching either target would prove the
+# agent selector is missing, and either named runner reaching the other's target
+# would prove the selectors have been merged or widened.
+assert_reaches() {
+  local pod="$1"
+  local ip="$2"
+  local expected="$3"
+  local output
+  output="$(kubectl -n "$NS" exec "$pod" -- \
+    curl -fsS -m 8 "http://${ip}:8000/" 2>/dev/null)" \
+    || fail "${pod} could not reach its allowed per-agent target ${ip}:8000"
+  [[ "$output" == *"$expected"* ]] \
+    || fail "${pod} reached ${ip}:8000 but received the wrong target response"
+}
+
+assert_blocked() {
+  local pod="$1"
+  local ip="$2"
+  if kubectl -n "$NS" exec "$pod" -- \
+       curl -fsS -m 8 -o /dev/null "http://${ip}:8000/" 2>/dev/null; then
+    fail "${pod} reached per-agent target ${ip}:8000 that its label must not allow"
+  fi
+}
+
+assert_reaches "$AGENT_A_POD" "$AGENT_A_TARGET_IP" agent-a
+assert_blocked "$AGENT_A_POD" "$AGENT_B_TARGET_IP"
+assert_reaches "$AGENT_B_POD" "$AGENT_B_TARGET_IP" agent-b
+assert_blocked "$AGENT_B_POD" "$AGENT_A_TARGET_IP"
+assert_blocked "$SANDBOX_POD" "$AGENT_A_TARGET_IP"
+assert_blocked "$SANDBOX_POD" "$AGENT_B_TARGET_IP"
+echo "  ok  per-agent CIDR egress is isolated for ${AGENT_A}, ${AGENT_B}, and an unlabeled runner"
 
 # Every connector Service is exercised in both directions. A missing Service
 # makes the connector policy check vacuous and is therefore fatal.

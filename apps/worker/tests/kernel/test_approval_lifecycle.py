@@ -275,7 +275,7 @@ def test_resume_injects_boot_env_into_replacement_claim(make_harness) -> None:
                 "CURIE_BUNDLE_REF": "bundles/agent-v7.tgz",
                 "CURIE_BUDGET": '{"max_output_tokens_per_run": 1, "max_usd_per_day": 1.0}',
             }
-            handle = await h.kernel._claim_or_resume(thread, boot_env)
+            handle = await h.kernel._claim_or_resume(thread, boot_env, None)
             assert handle is not None
 
             resumed_env = h.fake_k8s.claim_envs[-1]
@@ -328,6 +328,9 @@ class GrantBinding:
 
     def boot_env(self, resolved, thread_key):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
+
+    def claim_routing(self, resolved):  # noqa: ANN001, ANN201
+        return None
 
     async def approval_grant_tool(self, event_id: str, agent_id):  # noqa: ANN001, ANN201
         return self.grant_tool if event_id == self.grant_event_id else None
@@ -592,6 +595,9 @@ class RoutedBinding:
 
     def boot_env(self, resolved, thread_key):  # noqa: ANN001, ANN201
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
+
+    def claim_routing(self, resolved):  # noqa: ANN001, ANN201
+        return None
 
 
 def test_routed_approval_cards_go_to_the_bound_channel(make_harness) -> None:
