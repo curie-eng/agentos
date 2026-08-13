@@ -495,7 +495,7 @@ enum Command {
 enum DevAction {
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
-    /// Render-assert the Helm chart (`bash charts/curie/ci/render-assertions.sh`).
+    /// Discover and run every executable shell assertion directly in charts/curie/ci.
     ChartCheck,
     /// Run the scripted CLI end-to-end test (`bash cli/scripts/e2e.sh`).
     E2e,
@@ -1981,9 +1981,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         },
         Some(Command::Dev { action }) => match action {
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh").await,
-            DevAction::ChartCheck => {
-                commands::dev_script("charts/curie/ci/render-assertions.sh").await
-            }
+            DevAction::ChartCheck => commands::chart_check().await,
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh").await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh").await,
             DevAction::ChartRuntimeE2e => {
