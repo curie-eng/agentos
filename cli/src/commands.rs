@@ -591,10 +591,10 @@ fn seed_env_if_missing(root: &Path) -> Result<EnvSeed> {
 }
 
 /// `curie dev <script>`: run a repo dev script by relative path. Thin wrapper
-/// -- finds the repo root, confirms the script exists, shells `bash <script>`
+/// -- finds the repo root, confirms the script exists, shells `bash <script> [args]`
 /// from the root, streams its output, and propagates its exit code. A release
 /// binary has no scripts, so this errors clearly outside a checkout.
-pub async fn dev_script(rel_path: &str) -> Result<()> {
+pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     let ui = crate::ui::ui();
     let root = find_repo_root().context(
         "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
@@ -607,6 +607,7 @@ pub async fn dev_script(rel_path: &str) -> Result<()> {
     ui.note(&format!("=== bash {rel_path} (in {}) ===", root.display()));
     let status = tokio::process::Command::new("bash")
         .arg(rel_path)
+        .args(args)
         .current_dir(&root)
         .status()
         .await

@@ -3922,6 +3922,27 @@
           "name": "chart-check"
         },
         {
+          "about": "Prove a changed test fails when only the change's product hunks are reversed",
+          "args": [
+            {
+              "global": false,
+              "help": "Commit or pull request to verify",
+              "id": "change",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Changed test selector to run before and after reversal",
+              "id": "selector",
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "verify-fix-pin"
+        },
+        {
           "about": "Run the scripted CLI end-to-end test (`bash cli/scripts/e2e.sh`)",
           "hidden": false,
           "name": "e2e"
