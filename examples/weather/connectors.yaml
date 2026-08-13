@@ -1,0 +1,20 @@
+# The weather bundle carries this hosted connector so the cluster NetworkPolicy
+# enforcement gate exercises a real connector Service. It is a probe fixture,
+# not part of the weather skill's forecast behavior.
+connectors:
+  netpol-probe:
+    image: grafana/mcp-grafana@sha256:d5b51db0c8eaafc6ed3fede5bfcc8d67b2384a40cf3d493086e378855ceba882
+    args:
+      [
+        "-t",
+        "streamable-http",
+        "--address",
+        "0.0.0.0:8000",
+        "--endpoint-path",
+        "/mcp",
+        "--allowed-hosts",
+        "${CURIE_ALLOWED_HOSTS}",
+        "-disable-write",
+      ]
+    env:
+      GRAFANA_URL: "http://grafana.example.com"
