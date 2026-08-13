@@ -103,6 +103,46 @@ if [ "$1" = get ] && [ "$2" = values ]; then
     exit 0
 fi
 if [ "$1" = template ]; then
+    if [ "${CURIE_TEST_HELM_MIXED_STATEFULSETS:-}" = 1 ]; then
+        cat <<'YAML'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-rustfs
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: rustfs
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-postgres
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-valkey
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: valkey
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-clickhouse
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: clickhouse
+YAML
+        exit 0
+    fi
     cat <<'YAML'
 apiVersion: apps/v1
 kind: StatefulSet
@@ -245,6 +285,7 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_STS")
             .env_remove("CURIE_TEST_KUBECTL_FAIL")
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
+            .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
             .env_remove("CURIE_MODEL")
             .env_remove("CURIE_TEST_PROVIDER_EGRESS_JSON")
             .env_remove("CURIE_APPLY_TEST_MODEL_KEY")
@@ -460,6 +501,32 @@ fn live_minio_statefulset() -> String {
             "metadata": {"name": "parity-minio"},
             "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
         }]
+    })
+    .to_string()
+}
+
+fn live_mixed_store_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "parity-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            },
+            {
+                "metadata": {"name": "parity-valkey"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "valkey"}}}
+            },
+            {
+                "metadata": {"name": "parity-clickhouse"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "clickhouse"}}}
+            }
+        ]
     })
     .to_string()
 }
@@ -717,6 +784,42 @@ fn migrate_store_alone_still_migrates() {
     assert!(
         calls.contains("KUBECTL_CALL: delete pod"),
         "a verified migration releases the staging pod:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_mixed_removed_and_renamed_batch() {
+    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let live_statefulsets = live_mixed_store_statefulsets();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_HELM_MIXED_STATEFULSETS", "1"),
+            ("CURIE_TEST_KUBECTL_STS", &live_statefulsets),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "apply --migrate-store");
+    let message = error["error"].as_str().expect("apply error message string");
+    assert!(
+        message.contains("nameOverride"),
+        "a renamed StatefulSet must direct the operator to nameOverride:\n{message}"
+    );
+    assert!(
+        message.contains("parity-minio")
+            && message.contains("parity-postgres")
+            && message.contains("parity-curie-postgres"),
+        "the refusal must include the removed store and renamed StatefulSet:\n{message}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: run "),
+        "a mixed batch must stop before the migration export:\n{calls}"
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "a mixed batch must stop before the upgrade:\n{calls}"
     );
 }
 
