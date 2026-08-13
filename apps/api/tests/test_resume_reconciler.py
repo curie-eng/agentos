@@ -45,7 +45,7 @@ from curie_test_support.valkey import (
 from curie_test_support.valkey import (
     connect_or_skip,
 )
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -108,7 +108,13 @@ def _run_async[T](
     return asyncio.run(_main())
 
 
-def _detached_approval(status: str, *, resolved_by: str | None = "U9") -> Approval:
+def _detached_approval(
+    status: str,
+    *,
+    resolved_by: str | None = "U9",
+    reply_kind: str = "slack",
+    reply_adapter: str | None = None,
+) -> Approval:
     """An unpersisted ``Approval`` in a chosen status, for the pure-unit selector
     test: the turn builders read the record's fields only, so no DB round-trip is
     needed to exercise the status -> builder mapping.
@@ -123,8 +129,14 @@ def _detached_approval(status: str, *, resolved_by: str | None = "U9") -> Approv
         conversation_id=f"th-{uuid.uuid4().hex[:8]}",
         author="U1",
         summary="Give ACME a 20% discount",
+        # The routing half of the durable record (ADR-0096 phase 2, EB-A7). NOT
+        # NULL with no server_default, so every construction site states it: an
+        # approval that cannot say which channel raised it cannot be resumed to
+        # the right one.
+        reply_kind=reply_kind,
         reply_channel="C1",
         reply_placeholder="p-1",
+        reply_adapter=reply_adapter,
         dedupe_key=uuid.uuid4().hex,
         status=status,
         resolved_by=resolved_by,
@@ -139,13 +151,23 @@ async def _insert_approval(
     resumed_at: datetime | None,
     resolved_by: str | None = "U9",
     reply_endpoint: str | None = None,
+    reply_kind: str = "slack",
+    reply_channel: str | None = None,
+    reply_adapter: str | None = None,
 ) -> uuid.UUID:
     """Insert an approval row in a chosen lifecycle state (bypassing the resolve
     endpoint), so a test can construct the exact stranded/settled/expired shapes
     the reconciler must include or exclude."""
 
-    approval = _detached_approval(status, resolved_by=resolved_by)
+    approval = _detached_approval(
+        status,
+        resolved_by=resolved_by,
+        reply_kind=reply_kind,
+        reply_adapter=reply_adapter,
+    )
     approval.reply_endpoint = reply_endpoint
+    if reply_channel is not None:
+        approval.reply_channel = reply_channel
     approval.resolved_at = resolved_at
     approval.resumed_at = resumed_at
 
@@ -227,6 +249,202 @@ def test_reconciler_skips_already_resumed_record(
     assert count == 0
     assert valkey.xrange(runs_stream) == []
     assert resumed_at is not None
+
+
+async def _seed_binding(
+    sessionmaker: async_sessionmaker[AsyncSession], *, kind: str, address: str
+) -> uuid.UUID:
+    """One agent and its `agent_channels` binding, written directly.
+
+    Used only by the re-point test below: the point is to move a LIVE binding
+    out from under a suspended approval, which needs a real row for the rejected
+    lookup-at-resume design to have found.
+    """
+
+    agent_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        await session.execute(
+            text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+            {"id": agent_id, "name": f"agent-{agent_id.hex[:8]}"},
+        )
+        await session.execute(
+            text(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+                "VALUES (:id, :agent, :kind, :addr)"
+            ),
+            {"id": uuid.uuid4(), "agent": agent_id, "kind": kind, "addr": address},
+        )
+        await session.commit()
+    return agent_id
+
+
+async def _repoint_binding(
+    sessionmaker: async_sessionmaker[AsyncSession], *, address: str, kind: str
+) -> None:
+    """Re-point a live binding to another kind, as `crud.update_agent_binding`
+    does in place on an ordinary PATCH."""
+
+    async with sessionmaker() as session:
+        await session.execute(
+            text("UPDATE curie.agent_channels SET kind = :kind WHERE address = :addr"),
+            {"kind": kind, "addr": address},
+        )
+        await session.commit()
+
+
+def test_the_resume_carries_the_persisted_kind_after_the_binding_moved(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """T-A8 / AC3, THE decision-proving test (plan edge case E6).
+
+    An approval is raised on an `email` binding and suspended. While it waits, an
+    operator re-points that address at a `webhook` adapter -- an ordinary PATCH,
+    not an exotic state. The resume must carry `kind == "email"`: the persisted
+    value is a FACT ABOUT THE ORIGINAL TURN, and the human on the other end of
+    that email thread is still waiting there.
+
+    This is the test that fails under the rejected design. Replace
+    `kind=approval.reply_kind` in `resumequeue._build_turn` with a fresh lookup
+    against `agent_channels` and every other resume test still passes -- the
+    lookup agrees with the record in every case except this one, which is
+    precisely why it would have shipped.
+    """
+
+    address = "ops@example.test"
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> uuid.UUID:
+        await _seed_binding(sessionmaker, kind="email", address=address)
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            reply_kind="email",
+            reply_channel=address,
+            reply_adapter="agentmail-sandbox",
+        )
+        # The binding moves out from under the suspended approval.
+        await _repoint_binding(sessionmaker, address=address, kind="webhook")
+
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 1
+        return approval_id
+
+    approval_id = _run_async(steps, runs_stream)
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.reply_handle.kind == "email", (
+        "the resume re-derived the kind from the CURRENT binding; it must replay "
+        "the kind persisted on the approval"
+    )
+    assert turn.reply_handle.channel == address
+
+
+def test_both_resume_flavors_replay_the_adapter_from_the_record(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """T-A18 / AC10f (plan EB-A8, round-5 item 2).
+
+    `_build_turn` is the SINGLE constructor for both resume flavors -- the
+    resolve re-enqueue (`resumequeue.py:138`) and the expiry re-enqueue (`:166`)
+    -- so a dropped `adapter` there loses the egress-credential selector for
+    every resumed non-Slack turn at once, and only ever surfaces on a resumed
+    email turn hitting the pre-resolution escalate path.
+
+    Both flavors are driven in one test precisely because they share that
+    constructor: asserting only the resolve flavor would leave a future split
+    (say, an expiry-specific builder) free to drop it on the quieter lane.
+
+    Mutation: drop `adapter=approval.reply_adapter` from `_build_turn` and BOTH
+    assertions below fail.
+    """
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        resolved_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            reply_kind="email",
+            reply_channel="resolve@example.test",
+            reply_endpoint="http://curie-mail-adapter:8080/",
+            reply_adapter="agentmail-sandbox",
+        )
+        expired_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.expired,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            resolved_by=None,
+            reply_kind="email",
+            reply_channel="expiry@example.test",
+            reply_endpoint="http://curie-mail-adapter:8080/",
+            reply_adapter="agentmail-sandbox",
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 2
+        return resolved_id, expired_id
+
+    resolved_id, expired_id = _run_async(steps, runs_stream)
+
+    enqueued = [
+        QueuedTurn.model_validate(json.loads(fields["payload"]))
+        for _, fields in valkey.xrange(runs_stream)
+    ]
+    turns = {turn.event_id: turn for turn in enqueued}
+    assert set(turns) == {
+        f"approval-{resolved_id}-resolved",
+        f"approval-{expired_id}-resolved",
+    }
+
+    for event_id, turn in turns.items():
+        assert turn.reply_handle.kind == "email", event_id
+        assert turn.reply_handle.adapter == "agentmail-sandbox", event_id
+        assert turn.reply_handle.endpoint == "http://curie-mail-adapter:8080/", event_id
+
+
+def test_a_slack_resume_replays_no_adapter(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """T-A18, the sibling lane. A Slack approval persists NULL and must replay
+    NULL: fabricating a slug here would make the worker look up a credential for
+    an adapter that does not own this turn, and D4.4 already says Slack's route
+    is the worker's configured origin.
+    """
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> uuid.UUID:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        assert await reconciler.reconcile_once() == 1
+        return approval_id
+
+    _run_async(steps, runs_stream)
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.reply_handle.kind == "slack"
+    assert turn.reply_handle.adapter is None
 
 
 def test_reconciler_reenqueues_stranded_expired_record(

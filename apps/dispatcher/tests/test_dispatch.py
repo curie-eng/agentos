@@ -280,6 +280,44 @@ def test_button_click_enqueues_a_turn(
     assert queued.event_id == "action-trig-env-1"
 
 
+def test_both_mint_sites_stamp_kind_slack_and_no_adapter(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """T-A17 / AC1 (plan EB-A19, round-5 item 2). The Slack mint, BOTH lanes.
+
+    The dispatcher has two `QueuedTurn` producers -- the message handler and the
+    block-action handler -- and they are the sibling pair this repo's dominant
+    bug class drifts apart: a `kind` added to one lane leaves the other minting a
+    turn a 0.3.0 worker dead-letters, and only for button clicks. Both are driven
+    here, in one test, so neither can be fixed alone.
+
+    `kind` is the literal `"slack"`, not config-derived: a Socket Mode dispatcher
+    that could claim another kind is itself a misrouting vector. `adapter` is
+    None because Slack's egress route is the worker's configured origin (D4.4),
+    and it is asserted rather than left unmentioned so a later change cannot
+    quietly start stamping a slug the worker would then look a credential up
+    under.
+    """
+
+    app, _ = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _events_api_request("env-msg", "Ev-kind-1", _mention_event()))
+    handler.handle(sock, _block_action_request("env-btn", action_id="reports"))
+    _drain(app)
+
+    entries = redis_client.xrange(config.stream)
+    assert len(entries) == 2, entries
+    minted = [from_stream_fields(fields) for _, fields in entries]
+    by_event = {turn.event_id: turn for turn in minted}
+    assert set(by_event) == {"Ev-kind-1", "action-trig-env-btn"}, by_event.keys()
+
+    for event_id, turn in by_event.items():
+        assert turn.reply_handle.kind == "slack", event_id
+        assert turn.reply_handle.adapter is None, event_id
+
+
 def test_button_click_prefers_value_over_action_id(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:

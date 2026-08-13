@@ -25,13 +25,19 @@ IDLE = SessionStatus.IDLE_AWAITING_INPUT
 
 
 class StubBinding:
-    """A BindingResolver-shaped stub with canned per-channel resolutions."""
+    """A BindingResolver-shaped stub with canned per-ROUTE resolutions.
 
-    def __init__(self, by_channel: dict[str, ResolvedDeployment]) -> None:
-        self._by_channel = by_channel
+    Keyed on the `(kind, address)` pair, mirroring the real resolver since phase
+    2 (ADR-0096, plan EB-A4/EB-A5). Keying it on the address alone would let the
+    kernel pass a wrong kind and still get a hit, which is precisely the
+    misroute the pair predicate exists to close.
+    """
 
-    async def resolve(self, channel: str) -> ResolvedDeployment | None:
-        return self._by_channel.get(channel)
+    def __init__(self, by_route: dict[tuple[str, str], ResolvedDeployment]) -> None:
+        self._by_route = by_route
+
+    async def resolve(self, kind: str, address: str) -> ResolvedDeployment | None:
+        return self._by_route.get((kind, address))
 
     def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
         env = {
@@ -59,14 +65,22 @@ def _resolved(agent_id: uuid.UUID, *, bundle: str | None = "bundles/x.zip") -> R
 
 
 def _qevent(
-    text: str, *, channel: str, thread: str = "th-1", placeholder: str = "p-1"
+    text: str,
+    *,
+    channel: str,
+    thread: str = "th-1",
+    placeholder: str = "p-1",
+    kind: str = "slack",
+    adapter: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=uuid.uuid4().hex,
         conversation_id=thread,
         author="U1",
         text=text,
-        reply_handle=ReplyHandle(channel=channel, placeholder=placeholder),
+        reply_handle=ReplyHandle(
+            kind=kind, channel=channel, placeholder=placeholder, adapter=adapter
+        ),
         received_at="2026-07-05T00:00:00+00:00",
     )
 
@@ -94,11 +108,46 @@ def test_unmapped_channel_is_a_polite_drop(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_a_kind_that_is_not_bound_is_a_polite_drop_naming_both_halves(make_harness) -> None:
+    """T-A5, kernel half / edge case E2. A kind typo drops, and SAYS SO.
+
+    The address is bound -- under `slack`. An `email` turn for it resolves to
+    nothing, so the kernel drops politely (never a crash, never a misroute). The
+    drop message must name BOTH halves of the pair: this failure is newly
+    reachable through a kind typo (`Email` vs `email`), and a message naming only
+    the address sends the operator hunting a binding that is right there in the
+    table.
+
+    Two things are asserted together, because either alone is satisfiable by the
+    wrong implementation: the kernel passed the turn's kind into `resolve` (a
+    kernel that dropped the kind would find the slack binding and answer with the
+    WRONG agent, so `runner.opened == []` is load-bearing), and the message it
+    left behind names the pair.
+    """
+
+    async def go() -> None:
+        agent_id = uuid.uuid4()
+        binding = StubBinding({("slack", "C-shared"): _resolved(agent_id)})
+        async with make_harness(binding=binding) as h:
+            h.runner.default_script = [Final(text="hi", status=DONE)]
+            ev = _qevent("hello", channel="C-shared", kind="email")
+            await h.kernel.process_event(ev)
+
+            # The slack agent bound to this very address never ran.
+            assert h.runner.opened == []
+            assert h.sink.last_text is not None
+            assert "email" in h.sink.last_text
+            assert "C-shared" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
 def test_bound_channel_claims_sandbox_with_boot_env(make_harness) -> None:
     async def go() -> None:
         agent_id = uuid.uuid4()
         resolved = _resolved(agent_id, bundle="bundles/x.zip")
-        binding = StubBinding({"C-bound": resolved})
+        binding = StubBinding({("slack", "C-bound"): resolved})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="answer", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="th-1"))
@@ -120,7 +169,7 @@ def test_bound_channel_claims_sandbox_with_boot_env(make_harness) -> None:
 def test_killed_agent_refuses_new_runs(make_harness) -> None:
     async def go() -> None:
         agent_id = uuid.uuid4()
-        binding = StubBinding({"C-bound": _resolved(agent_id)})
+        binding = StubBinding({("slack", "C-bound"): _resolved(agent_id)})
         async with make_harness(binding=binding, with_killswitch=True) as h:
             await h.async_redis.set(kill_key(agent_id), "1")  # operator killed it
             h.runner.default_script = [Final(text="answer", status=DONE)]
@@ -149,7 +198,7 @@ class _StubKillSwitch:
 def test_kill_between_precheck_and_register_is_caught(make_harness) -> None:
     async def go() -> None:
         agent_id = uuid.uuid4()
-        binding = StubBinding({"C-bound": _resolved(agent_id)})
+        binding = StubBinding({("slack", "C-bound"): _resolved(agent_id)})
         async with make_harness(binding=binding) as h:
             # Precheck sees the agent alive; by the time the turn is registered the
             # kill has landed. The post-register recheck must interrupt it.
@@ -169,7 +218,7 @@ def test_kill_between_precheck_and_register_is_caught(make_harness) -> None:
 def test_kill_interrupts_a_live_turn(make_harness) -> None:
     async def go() -> None:
         agent_id = uuid.uuid4()
-        binding = StubBinding({"C-bound": _resolved(agent_id)})
+        binding = StubBinding({("slack", "C-bound"): _resolved(agent_id)})
         async with make_harness(binding=binding, with_killswitch=True) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
@@ -212,7 +261,7 @@ def test_shimmer_caption_uses_the_agents_load_pack(make_harness) -> None:
             "load": {"enabled": True, "lines": ["Crunching the numbers..."]},
             "tips": {"enabled": True, "tips": ["I can rank leaks by $"]},
         }
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding, shimmer=True) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tSh"))
@@ -240,7 +289,7 @@ def test_the_generic_caption_is_set_when_the_agent_has_no_load_or_tips(
     """
 
     async def go() -> None:
-        binding = StubBinding({"C-bound": _resolved_with_packs({})})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})
         async with make_harness(
             binding=binding, shimmer=True, status_text="is working on your request..."
         ) as h:
@@ -259,7 +308,7 @@ def test_a_blank_status_text_raises_no_generic_caption(make_harness) -> None:
     nothing -- while a per-agent pack line, if configured, still wins."""
 
     async def go() -> None:
-        binding = StubBinding({"C-bound": _resolved_with_packs({})})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})
         async with make_harness(binding=binding, shimmer=True, status_text="") as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound"))
@@ -284,7 +333,7 @@ def test_the_caption_is_raised_before_it_is_lowered_even_on_a_fast_turn(
     """
 
     async def go() -> None:
-        binding = StubBinding({"C-bound": _resolved_with_packs({})})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})
         async with make_harness(
             binding=binding, shimmer=True, status_text="is working..."
         ) as h:
@@ -308,7 +357,7 @@ def test_shimmer_off_raises_and_lowers_nothing(make_harness) -> None:
 
     async def go() -> None:
         packs = {"load": {"enabled": True, "lines": ["Working..."]}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding, shimmer=False) as h:
             h.runner.default_script = [Final(text="done", status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound"))
@@ -320,7 +369,7 @@ def test_shimmer_off_raises_and_lowers_nothing(make_harness) -> None:
 def test_shimmer_off_never_sets_a_caption(make_harness) -> None:
     async def go() -> None:
         packs = {"load": {"enabled": True, "lines": ["Working..."]}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         # Explicitly OFF: shimmer now defaults ON (#1182), so leaning on the
         # default here would silently stop exercising the off path.
         async with make_harness(binding=binding, shimmer=False) as h:
@@ -351,7 +400,7 @@ def test_bound_agent_with_enabled_nav_gets_hub_button_on_final_reply(make_harnes
 
     async def go() -> None:
         packs = {"nav": {"enabled": True, "hub_label": "Help", "hub_command": "help"}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text=_REPLY_WITH_BUTTONS, status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tNav"))
@@ -408,7 +457,7 @@ def test_bound_agent_without_nav_gets_no_hub_button(make_harness) -> None:
     from curie_worker.blocks import render
 
     async def go() -> None:
-        binding = StubBinding({"C-bound": _resolved_with_packs({})})  # nav absent
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs({})})  # nav absent
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text=_REPLY_WITH_BUTTONS, status=DONE)]
             await h.kernel.process_event(_qevent("hi", channel="C-bound", thread="tNoNav"))
@@ -461,7 +510,7 @@ def test_fresh_thread_greeting_short_circuits_no_sandbox_no_model(make_harness) 
     # the placeholder with the agent's canned greeting -- no sandbox, no model.
     async def go() -> None:
         packs = {"greeting": {"enabled": True, "phrases": ["hi", "hello"], "reply": _GREET}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             # If the short-circuit did NOT fire, the runner would serve this and the
             # turn would complete with "MODEL"; the assertions below would then fail
@@ -491,7 +540,7 @@ def test_mid_live_thread_greeting_steers_and_is_not_short_circuited(make_harness
     # would deliver the canned greeting and drop the steer -> this test fails.
     async def go() -> None:
         packs = {"greeting": {"enabled": True, "phrases": ["hi", "hello"], "reply": _GREET}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             hold = asyncio.Event()
             h.runner.hold = hold
@@ -527,7 +576,7 @@ def test_fresh_thread_help_short_circuits_no_sandbox_no_model(make_harness) -> N
     # answered canned (greeting-then-help chain; greeting absent here, help fires).
     async def go() -> None:
         packs = {"help": {"enabled": True, "phrases": ["help", "what can you do"], "reply": _HELP}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="MODEL", status=DONE)]
             ev = _qevent("help", channel="C-bound", thread="tHelp")
@@ -547,7 +596,7 @@ def test_fresh_thread_non_matching_message_runs_a_normal_turn(make_harness) -> N
     # even with the greeting pack enabled, claims a sandbox and runs the model.
     async def go() -> None:
         packs = {"greeting": {"enabled": True, "phrases": ["hi", "hello"], "reply": _GREET}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [
                 TextDelta(text="Your pipeline "),
@@ -572,7 +621,7 @@ def test_disabled_greeting_pack_never_short_circuits(make_harness) -> None:
     # (match_greeting returns None for a disabled pack).
     async def go() -> None:
         packs = {"greeting": {"enabled": False, "phrases": ["hi", "hello"], "reply": _GREET}}
-        binding = StubBinding({"C-bound": _resolved_with_packs(packs)})
+        binding = StubBinding({("slack", "C-bound"): _resolved_with_packs(packs)})
         async with make_harness(binding=binding) as h:
             h.runner.default_script = [Final(text="MODEL", status=DONE)]
             ev = _qevent("hi", channel="C-bound", thread="tOff")

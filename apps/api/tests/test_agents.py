@@ -10,14 +10,18 @@ authority ("one agent still binds one channel"), so there is no plural surface
 and no list anywhere on this API.
 """
 
+import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_api.config import get_settings
 from sqlalchemy import event
+from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 # The committed, exported contract -- the artifact every generated client and
 # every drift gate reads, not the in-process Pydantic model.
@@ -32,6 +36,34 @@ def _slack(address: str) -> dict[str, str]:
 
 def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
     return client.post("/agents", json=fields, headers=headers)
+
+
+def _binding_row(agent_id: str) -> Any:
+    """The agent's `agent_channels` row, read straight from Postgres.
+
+    `generation` (ADR-0096 phase 2, D5/EB-A16) is deliberately NOT on the API's
+    response shape -- it is a token-validation fact, not an operator-facing one
+    -- so the only honest way to assert it is against the durable row. Follows
+    `test_crud.py`'s fresh-engine-per-query pattern, which keeps the query off
+    the TestClient's portal loop.
+    """
+
+    async def run() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    sql_text(
+                        "SELECT kind, address, generation, endpoint, adapter "
+                        "FROM curie.agent_channels WHERE agent_id = :aid"
+                    ),
+                    {"aid": agent_id},
+                )
+                return result.mappings().one()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
 
 
 def test_duplicate_name_is_409(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
@@ -237,38 +269,61 @@ def test_the_slack_address_shape_check_survives_the_rename(
     assert "archives/C0123ABCD" in bad.text, bad.text
 
 
-def test_the_address_is_identity_and_the_kind_is_not(
+def test_the_pair_is_identity_and_the_address_alone_is_not(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """T4 / AC3. PR 1's uniqueness is on `address` ALONE.
+    """T-A6 / AC5. The INVERSION PR 1 promised, now that the wire carries kind.
 
-    `kind` is stored descriptive metadata that selects the address-shape
-    validator; it does not route, because the queue wire carries no kind
-    (`QueuedTurn.reply_handle.channel` is a bare string). A `(kind, address)`
-    unique constraint would permit two agents to hold the same address under
-    different kinds while the resolver, which sees only the address, could not
-    tell them apart -- ambiguous by construction, and #38's silent misrouting
-    wearing a different hat.
+    This is the rewrite of `test_the_address_is_identity_and_the_kind_is_not`,
+    which asserted that a second kind on a taken address was a 409. That was
+    correct while the resolver saw only the address and could not have told the
+    two rows apart. Phase 2's resolver routes on the pair (T-A4), so the
+    constraint widens to `(kind, address)` in migration 0023 and the second kind
+    is now legal. Rewritten, never deleted: this inversion is the observable
+    proof that kind actually reached the wire rather than only the schema.
 
-    This test INVERTS in PR 1b, once `ReplyHandle.kind` exists and the constraint
-    widens to the pair. That inversion is the observable proof PR 1b actually put
-    kind on the wire rather than only in the schema, so PR 1b rewrites this test
-    and must not simply delete it.
+    Both halves are asserted in one test on purpose. Widening the constraint
+    while forgetting to remap the API's 409 message (the constraint name changes
+    from `agent_channels_address_key` to `agent_channels_kind_address_key`, and
+    `routers/agents.py` keys its message map on that literal) turns #38's
+    user-facing conflict into an opaque 500 -- and a test that only checked the
+    new success case would never notice.
     """
 
-    # A Slack-shaped address, because agent A's binding has to pass the slack
-    # arm of the write-time validator before the constraint can be reached.
+    # A Slack-shaped address, because the slack binding has to pass the slack arm
+    # of the write-time validator before any constraint can be reached.
     first = _create(client, auth_headers, name="kind-a", channel=_slack("C0SHARED1"))
     assert first.status_code == 201, first.text
 
+    # The widening: a DIFFERENT kind at the same address is a distinct route.
     other_kind = _create(
         client,
         auth_headers,
         name="kind-b",
-        channel={"kind": "webhook", "address": "C0SHARED1"},
+        channel={"kind": "email", "address": "C0SHARED1"},
     )
-    assert other_kind.status_code == 409, other_kind.text
-    assert "already bound" in other_kind.json()["detail"]
+    assert other_kind.status_code == 201, other_kind.text
+    assert other_kind.json()["channel"] == {"kind": "email", "address": "C0SHARED1"}
+
+    # And the pair itself is still identity: the SAME pair still conflicts, with
+    # the guidance that names the fix (#38's error map), not a bare 500.
+    dup_pair = _create(client, auth_headers, name="kind-c", channel=_slack("C0SHARED1"))
+    assert dup_pair.status_code == 409, dup_pair.text
+    detail = dup_pair.json()["detail"]
+    assert "already bound" in detail, detail
+    assert "move or delete" in detail, detail
+
+    # The PATCH seam is fenced identically -- the constraint cannot be sidestepped
+    # by binding a free pair and then moving onto a taken one.
+    free = _create(client, auth_headers, name="kind-d", channel=_slack("C0SHARED2"))
+    assert free.status_code == 201, free.text
+    moved = client.patch(
+        f"/agents/{free.json()['id']}",
+        json={"channel": _slack("C0SHARED1")},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 409, moved.text
+    assert "already bound" in moved.json()["detail"]
 
 
 def test_one_agent_cannot_hold_a_second_binding(
@@ -302,6 +357,62 @@ def test_one_agent_cannot_hold_a_second_binding(
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.json()["channel"] == {"kind": "webhook", "address": "moved-here"}
+
+
+def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T-A13 / AC13 (plan D5, EB-A16, finding 10).
+
+    A `chn` ingress token claims `{channel_id, generation}`, not `(kind,
+    address)`, because `update_agent_binding` mutates the binding row IN PLACE:
+    without a generation, a token minted before a rebind stays valid against the
+    row's NEW owner. The generation is what makes a rebind observable to a token
+    that never saw it.
+
+    The no-op PATCH is the load-bearing half, and the one an implementation gets
+    wrong by writing `if channel.address != agent.channel.address`. A rebind to
+    the SAME value is still a rebind for token purposes -- an operator
+    re-asserting a binding is exactly the "I think something is wrong with this
+    route" gesture that should invalidate outstanding credentials. Guarding the
+    bump on a value change makes T-C8 pass on the moved case and silently fail on
+    this one.
+    """
+
+    created = _create(client, auth_headers, name="gen-agent", channel=_slack("C0GENAAA1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    fresh = _binding_row(agent_id)
+    assert fresh["generation"] == 0, "a newly created binding starts at generation 0"
+
+    moved = client.patch(
+        f"/agents/{agent_id}",
+        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 200, moved.text
+    after_move = _binding_row(agent_id)
+    assert after_move["generation"] == 1
+    assert after_move["kind"] == "email"
+
+    # A PATCH that changes nothing at all still counts.
+    same = client.patch(
+        f"/agents/{agent_id}",
+        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        headers=auth_headers,
+    )
+    assert same.status_code == 200, same.text
+    assert _binding_row(agent_id)["generation"] == 2
+
+    # A PATCH that does not touch the binding at all does NOT bump it: the
+    # generation tracks rebinds, and bumping on every unrelated write would
+    # invalidate live adapter tokens on a model change.
+    unrelated = client.patch(
+        f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
+    )
+    assert unrelated.status_code == 200, unrelated.text
+    assert _binding_row(agent_id)["generation"] == 2
 
 
 def test_an_explicit_null_channel_is_rejected_on_patch(

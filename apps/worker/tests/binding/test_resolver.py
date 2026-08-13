@@ -6,13 +6,19 @@ unknown-address -> None, and the budget/env construction. Rows are namespaced by
 a per-test token and cleaned up afterwards.
 
 The binding is a row in `agent_channels` carrying `kind` and `address`
-(ADR-0096, #1459), not a column on `agents`. In PR 1 the resolver routes on
-`address` ALONE: the queue wire carries no kind, so `kind` is descriptive
-metadata that selects the write-time address-shape validator and names the
-owning adapter. A resolver that matched on the pair could never be satisfied,
-and one that hardcoded `kind = 'slack'` in its predicate would silently refuse
-every non-Slack binding, which is what
-`test_resolves_a_non_slack_binding_on_address_alone` exists to catch.
+(ADR-0096, #1459), not a column on `agents`. Since phase 2 the ROUTING KEY IS
+THE PAIR: `ReplyHandle.kind` rides the queue wire (required, D1), so
+`resolve(kind, address)` binds both halves into the predicate and migration 0023
+widens uniqueness to `(kind, address)`. There is no address-only overload and no
+default for `kind` -- either would be the silent-address-fallback compatibility
+path phase 2 exists to remove.
+
+Two failure shapes are asserted rather than assumed: a predicate that hardcodes
+`kind = 'slack'` (caught by
+`test_resolves_a_non_slack_binding_on_the_kind_address_pair`) and one that
+reverts to matching on `address` alone (caught by
+`test_two_agents_share_one_address_under_different_kinds` and
+`test_an_unbound_kind_on_a_bound_address_resolves_to_none`).
 
 The one exception is the shadowed-binding test, which needs two agents on a
 single address and so cannot use the curie schema at all. It seeds into a
@@ -193,7 +199,7 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
             )
 
-            resolved = await _resolver(engine).resolve(channel)
+            resolved = await _resolver(engine).resolve("slack", channel)
             assert resolved is not None
             assert resolved.agent_id == agent_id
             assert resolved.bundle_ref == f"bundles/{token}.zip"
@@ -212,15 +218,14 @@ def test_resolves_channel_to_active_deployment_and_builds_env() -> None:
     asyncio.run(go())
 
 
-def test_resolves_a_non_slack_binding_on_address_alone() -> None:
-    """T5 / AC4: the resolver reads `agent_channels` and routes on the address.
-
-    The mutation this exists to catch is a predicate that carries the old
-    assumption forward as `WHERE c.kind = 'slack' AND c.address = :address`.
-    That version passes every other test in this file, because every other
-    binding here is slack-kind, and then silently refuses to route a single turn
-    for any adapter the platform grows. Seeding a `webhook` kind is what makes
-    the hardcode observable.
+def test_resolves_a_non_slack_binding_on_the_kind_address_pair() -> None:
+    """T-A4, kind-independence half / AC4. Rewritten from PR 1's
+    `test_resolves_a_non_slack_binding_on_address_alone`, which asserted the
+    address-only predicate this change replaces. It is rewritten rather than
+    deleted because its original mutation target still stands: a predicate
+    hardcoded to `WHERE c.kind = 'slack'` passes every other test in this file
+    (every other binding here is slack-kind) and then silently refuses to route a
+    single turn for any adapter the platform grows.
 
     The address is deliberately not Slack-shaped either. `acme-room-7` cannot be
     a Slack channel id, so a resolver that still parsed the address for a Slack
@@ -253,11 +258,10 @@ def test_resolves_a_non_slack_binding_on_address_alone() -> None:
                 bundle_ref=f"bundles/{token}.zip",
             )
             try:
-                resolved = await _resolver(engine).resolve(address)
+                resolved = await _resolver(engine).resolve("webhook", address)
                 assert resolved is not None, (
                     "a webhook-kind binding did not resolve: the predicate is "
-                    "matching on kind, which PR 1 cannot do because the queue "
-                    "wire carries no kind"
+                    "hardcoding a kind instead of binding the caller's"
                 )
                 assert resolved.agent_id == agent_id
                 assert resolved.bundle_ref == f"bundles/{token}.zip"
@@ -266,7 +270,143 @@ def test_resolves_a_non_slack_binding_on_address_alone() -> None:
                 # kind, never bound, still resolves to None. Without this a
                 # resolver that ignored the predicate entirely and returned the
                 # first active deployment would pass the assertion above.
-                assert await _resolver(engine).resolve(f"acme-room-other-{token}") is None
+                assert (
+                    await _resolver(engine).resolve("webhook", f"acme-room-other-{token}")
+                ) is None
+            finally:
+                await _cleanup(engine, [agent_id])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_two_agents_share_one_address_under_different_kinds() -> None:
+    """T-A4 / AC4, the decision-proving half: the ROUTING KEY IS THE PAIR.
+
+    Two agents, one address, two kinds. Each turn reaches its own agent, which is
+    only expressible once `ReplyHandle.kind` is on the wire (D1) and migration
+    0023 has widened uniqueness from `address` to `(kind, address)`.
+
+    Mutation: revert `_RESOLVE_SQL` to `WHERE c.address = :address` and this
+    fails -- both lookups return whichever row the ORDER BY happens to pick, and
+    that indeterminacy IS #38's silent misroute wearing the neutral-binding hat.
+
+    It is deliberately the same address string for both bindings, not two
+    lookalikes: a resolver comparing anything other than the exact pair (say,
+    prefixing the kind onto the address, or matching case-insensitively) would
+    still pass a two-different-addresses version of this test.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            shared = f"shared-{token}"
+            slack_agent = await _seed_agent(
+                engine,
+                channel=shared,
+                name=f"slack-agent-{token}",
+                max_usd=None,
+                max_tokens=None,
+                kind="slack",
+            )
+            email_agent = await _seed_agent(
+                engine,
+                channel=shared,
+                name=f"email-agent-{token}",
+                max_usd=None,
+                max_tokens=None,
+                kind="email",
+            )
+            try:
+                await _seed_deployment(
+                    engine,
+                    agent_id=slack_agent,
+                    environment="prod",
+                    bundle_ref=f"bundles/slack-{token}.zip",
+                )
+                await _seed_deployment(
+                    engine,
+                    agent_id=email_agent,
+                    environment="prod",
+                    bundle_ref=f"bundles/email-{token}.zip",
+                )
+
+                by_slack = await _resolver(engine).resolve("slack", shared)
+                by_email = await _resolver(engine).resolve("email", shared)
+
+                assert by_slack is not None and by_email is not None
+                assert by_slack.agent_id == slack_agent
+                assert by_email.agent_id == email_agent
+                assert by_slack.agent_id != by_email.agent_id
+                assert by_slack.bundle_ref == f"bundles/slack-{token}.zip"
+                assert by_email.bundle_ref == f"bundles/email-{token}.zip"
+            finally:
+                await _cleanup(engine, [slack_agent, email_agent])
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_an_unbound_kind_on_a_bound_address_resolves_to_none() -> None:
+    """T-A5, resolver half / edge case E2. A kind typo is a DROP, not a misroute.
+
+    `("slack", X)` exists; `("email", X)` does not. The email lookup must return
+    None so the kernel politely drops (its half of E2 is asserted by
+    `test_a_kind_that_is_not_bound_is_a_polite_drop_naming_both_halves` in
+    apps/worker/tests/kernel/test_binding_integration.py, which asserts the drop
+    message names both halves of the pair).
+
+    Under the old address-only predicate this lookup returned the SLACK agent --
+    a real turn for an unconfigured email address answered by somebody else's
+    agent. That is the failure this whole change exists to close, so the
+    assertion is `is None`, never "does not raise".
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            try:
+                async with engine.connect():
+                    pass
+            except SQLAlchemyError as exc:
+                pytest.skip(f"Postgres not reachable at {_DB_URL}: {exc}")
+
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-{token}"
+            agent_id = await _seed_agent(
+                engine,
+                channel=channel,
+                name=f"slack-only-{token}",
+                max_usd=None,
+                max_tokens=None,
+                kind="slack",
+            )
+            try:
+                await _seed_deployment(
+                    engine,
+                    agent_id=agent_id,
+                    environment="prod",
+                    bundle_ref=f"bundles/{token}.zip",
+                )
+
+                assert await _resolver(engine).resolve("email", channel) is None
+                # The kind is compared exactly, so a casing typo does not route
+                # either -- `Email` and `email` are two different kinds.
+                assert await _resolver(engine).resolve("Email", channel) is None
+                # The positive control: the bound pair still resolves, so the
+                # assertions above cannot be satisfied by a resolver that
+                # returns None for everything.
+                bound = await _resolver(engine).resolve("slack", channel)
+                assert bound is not None and bound.agent_id == agent_id
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -297,7 +437,7 @@ def test_prod_deployment_wins_over_dev() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref="bundles/prod.zip"
             )
 
-            resolved = await _resolver(engine).resolve(channel)
+            resolved = await _resolver(engine).resolve("slack", channel)
             assert resolved is not None
             assert resolved.bundle_ref == "bundles/prod.zip"  # prod wins
 
@@ -562,7 +702,7 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
                 with caplog.at_level(
                     "WARNING", logger="curie_worker.binding"
                 ):
-                    resolved = await resolver.resolve(channel)
+                    resolved = await resolver.resolve("slack", channel)
 
                 assert resolved is not None
                 # Behavioral only: a WARNING from the binding logger naming both
@@ -671,7 +811,7 @@ def test_deployment_pointing_at_another_agents_version_does_not_resolve() -> Non
                 )
 
             # The agent-scoped join refuses B's bundle for A's channel.
-            resolved = await _resolver(engine).resolve(channel)
+            resolved = await _resolver(engine).resolve("slack", channel)
             assert resolved is None
 
             await _cleanup(engine, [agent_a, agent_b])
@@ -712,7 +852,7 @@ def test_behavior_packs_round_trip_and_parse() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref="bundles/x.zip"
             )
 
-            resolved = await _resolver(engine).resolve(channel)
+            resolved = await _resolver(engine).resolve("slack", channel)
             assert resolved is not None
             packs = _resolver(engine).packs_for(resolved)
             assert packs.greeting.enabled is True
@@ -743,7 +883,7 @@ def test_no_packs_parses_to_all_off_default() -> None:
             await _seed_deployment(
                 engine, agent_id=agent_id, environment="dev", bundle_ref="bundles/x.zip"
             )
-            resolved = await _resolver(engine).resolve(channel)
+            resolved = await _resolver(engine).resolve("slack", channel)
             assert resolved is not None
             assert resolved.behavior_packs is None
             packs = _resolver(engine).packs_for(resolved)
@@ -766,7 +906,7 @@ def test_unknown_channel_resolves_to_none() -> None:
                     pass
             except SQLAlchemyError as exc:
                 pytest.skip(f"Postgres not reachable: {exc}")
-            resolved = await _resolver(engine).resolve(f"C-nonexistent-{uuid.uuid4().hex}")
+            resolved = await _resolver(engine).resolve("slack", f"C-nonexistent-{uuid.uuid4().hex}")
             assert resolved is None
         finally:
             await engine.dispose()
@@ -800,7 +940,7 @@ def test_resolves_approval_required_tools_into_boot_env() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
             )
             try:
-                resolved = await _resolver(engine).resolve(channel)
+                resolved = await _resolver(engine).resolve("slack", channel)
                 assert resolved is not None
                 assert resolved.approval_required_tools == [
                     "Bash",
@@ -839,7 +979,7 @@ def test_boot_env_forwards_scoped_state_tokens_not_the_raw_key() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
             )
             try:
-                resolved = await _resolver(engine).resolve(channel)
+                resolved = await _resolver(engine).resolve("slack", channel)
                 assert resolved is not None
                 env = _resolver(engine).boot_env(resolved, "thread-1")
 
@@ -928,7 +1068,7 @@ def test_resolves_approval_routes_from_the_agent_row() -> None:
                 engine, agent_id=agent_id, environment="prod", bundle_ref=f"b/{token}.zip"
             )
             try:
-                resolved = await _resolver(engine).resolve(channel)
+                resolved = await _resolver(engine).resolve("slack", channel)
                 assert resolved is not None
                 assert resolved.approval_routes == {"managers": {"channel": "C_MGRS"}}
             finally:
@@ -967,7 +1107,7 @@ def test_resolves_connector_secrets_into_boot_env() -> None:
             )
             try:
                 resolver = _resolver(engine)
-                resolved = await resolver.resolve(channel)
+                resolved = await resolver.resolve("slack", channel)
                 assert resolved is not None
                 assert resolved.secrets == {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_seeded"}
                 env = resolver.boot_env(resolved, thread_key="t1")
@@ -1063,7 +1203,7 @@ def test_reserved_connector_secret_is_dropped_order_independently() -> None:
             )
             try:
                 resolver = _resolver(engine)
-                resolved = await resolver.resolve(channel)
+                resolved = await resolver.resolve("slack", channel)
                 assert resolved is not None
                 env = resolver.boot_env(resolved, thread_key="t1")
 
