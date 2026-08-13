@@ -1890,9 +1890,11 @@ data:
     }
 }
 
-/// The user-supplied values helm recorded for a release, or `None` when the
-/// release does not exist. The read-only half of [`fetch_existing_values`],
-/// exposed for `curie diff`.
+/// The user supplied values Helm recorded for a release. `None` means Helm
+/// positively reported that the release does not exist. Read failures and
+/// malformed values fail closed before callers can plan a mutation or diff.
+/// This is the read only half of [`fetch_existing_values`], exposed for
+/// `curie diff`.
 pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
     fetch_existing_values(o).await
 }
@@ -2045,19 +2047,56 @@ fn helm_get_values_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-/// The user-supplied values of an existing release, or `None` when the release
-/// does not exist yet (or helm cannot reach it -- treated as a fresh install;
-/// the subsequent `helm upgrade --install` surfaces any real connectivity
-/// error). `helm get values` prints `null` for a release with no user values,
-/// which parses to `Value::Null` and yields no reusable secrets.
+/// Whether Helm positively reported that the requested release does not exist.
+/// Other failures must remain errors because the release state is unknown.
+fn helm_release_is_absent(stderr: &str) -> bool {
+    failure_reason(stderr) == "Error: release: not found"
+}
+
+/// The user supplied values of an existing release, or `None` only when Helm
+/// positively reports that the release does not exist. A valid JSON object or
+/// `null` is returned as `Some`; failed reads, malformed JSON, and other JSON
+/// shapes fail closed. Helm prints `null` for an existing release with no user
+/// supplied values.
 async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
-    let (ok, out, _err) = run_capture(&helm_get_values_cmd(o)).await?;
+    let (ok, out, err) = run_capture(&helm_get_values_cmd(o)).await?;
+    let fix = format!(
+        "verify the release and cluster access with `helm status {} -n {}`, then retry",
+        o.release, o.namespace
+    );
     if !ok {
-        return Ok(None);
+        if helm_release_is_absent(&err) {
+            return Ok(None);
+        }
+        let reason = failure_reason(&err);
+        let message = format!(
+            "could not read Helm values for release {} in namespace {}: {reason}",
+            o.release, o.namespace
+        );
+        let error = if is_connectivity_failure(&err) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        };
+        return Err(error.with_fix(fix).into());
     }
-    Ok(Some(
-        serde_json::from_str(out.trim()).unwrap_or(serde_json::Value::Null),
-    ))
+
+    let values: serde_json::Value = serde_json::from_str(out.trim()).map_err(|error| {
+        crate::exit::CliError::failure(format!(
+            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON ({error})",
+            o.release, o.namespace
+        ))
+        .with_fix(fix.clone())
+    })?;
+    if !values.is_object() && !values.is_null() {
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
+            o.release, o.namespace
+        ))
+        .with_fix(fix)
+        .into());
+    }
+    Ok(Some(values))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
