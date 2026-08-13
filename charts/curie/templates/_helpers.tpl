@@ -93,6 +93,55 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.clickhouse.loggingConfig" -}}
+<clickhouse>
+  <logger>
+    <level>{{ .Values.clickhouse.logLevel }}</level>
+    <!-- Also to stdout, so `kubectl logs` works. The image logs only to
+         files under /var/log/clickhouse-server/, which in Kubernetes means
+         the diagnostics live inside the container and die with the pod,
+         exactly when you most want them. Cheap at `warning`. -->
+    <console>1</console>
+  </logger>
+  <!-- text_log is KEPT, and level-filtered rather than removed.
+       The image ships <text_log><level>trace</level></text_log>, and that
+       `level` is the whole problem: an hour of it produced 253,727 Debug
+       and 58,186 Trace rows against 15 Information. Filtering to
+       `{{ .Values.clickhouse.logLevel }}` drops the volume by ~4 orders of
+       magnitude while keeping the table queryable, and a queryable
+       text_log is precisely what diagnosed the incident this fixes. It also
+       outlives the pod, which the log file does not. -->
+  <text_log>
+    <level>{{ .Values.clickhouse.logLevel }}</level>
+    <ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl>
+  </text_log>
+{{- if .Values.clickhouse.systemLogs.enabled }}
+  <!-- Profiling and per-second resource sampling, on but TTL-bounded. -->
+  <trace_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></trace_log>
+  <metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></metric_log>
+  <asynchronous_metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></asynchronous_metric_log>
+{{- else }}
+  <!-- Removed. Unlike text_log these have no level filter; they sample on
+       a timer regardless of whether anything is happening, so the only
+       lever is on/off. metric_log was the table whose merge wedged and
+       started the spiral. Prometheus and node metrics already cover what
+       they measure, from outside the process that is failing. -->
+  <trace_log remove="1"/>
+  <metric_log remove="1"/>
+  <asynchronous_metric_log remove="1"/>
+{{- end }}
+  <!-- Kept regardless: low volume, useful when ClickHouse itself
+       misbehaves. TTL'd so none can become the next text_log.
+       processors_profile_log is here because a live boot showed the image
+       creates it too. It is easy to miss precisely because it is small
+       today, which is what text_log also was once. -->
+  <query_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></query_log>
+  <part_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></part_log>
+  <error_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></error_log>
+  <processors_profile_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></processors_profile_log>
+</clickhouse>
+{{- end }}
+
 {{- define "curie.rustfs.host" -}}
 {{- if .Values.rustfs.deploy -}}
 {{- printf "%s-rustfs" (include "curie.fullname" .) -}}
