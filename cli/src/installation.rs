@@ -807,8 +807,8 @@ enum GuardVerdict {
     /// Nothing the release runs would be deleted by this apply.
     Clear,
     /// This apply would delete stateful component(s), carrying the operator
-    /// facing refusal text.
-    WouldRemove(String),
+    /// facing causes.
+    WouldRemove(Vec<crate::ops::StatefulRemoval>),
 }
 
 /// Decide whether an apply would delete a stateful component the release runs.
@@ -839,9 +839,7 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict>
     if removed.is_empty() {
         return Ok(GuardVerdict::Clear);
     }
-    Ok(GuardVerdict::WouldRemove(stateful_removal_message(
-        &removed,
-    )))
+    Ok(GuardVerdict::WouldRemove(removed))
 }
 
 /// The refusal text, factored out so its ordering is testable with no cluster.
@@ -900,12 +898,20 @@ fn stateful_removal_message(removed: &[crate::ops::StatefulRemoval]) -> String {
         .iter()
         .any(|r| r.cause == RemovalCause::ComponentGone)
     {
-        msg.push_str(
-            "Component(s) the chart does not render at all usually mean a chart version \
-             renamed or removed them. Re-run with --migrate-store and apply will carry \
-             the data across itself: it stages every object, upgrades, loads them back, \
-             and verifies per object.\n\n",
-        );
+        if renamed.is_empty() {
+            msg.push_str(
+                "Component(s) the chart does not render at all usually mean a chart version \
+                 renamed or removed them. Re-run with --migrate-store and apply will carry \
+                 the data across itself: it stages every object, upgrades, loads them back, \
+                 and verifies per object.\n\n",
+            );
+        } else {
+            msg.push_str(
+                "After fixing the renames, re-run with --migrate-store and apply will carry \
+                 the data across itself: it stages every object, upgrades, loads them back, \
+                 and verifies per object.\n\n",
+            );
+        }
     }
 
     msg.push_str("Use --allow-stateful-removal only to proceed WITHOUT the data.");
@@ -983,8 +989,17 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     } else {
         match guard_stateful_removal(&up).await? {
             GuardVerdict::Clear => false,
-            GuardVerdict::WouldRemove(_) if migrate_store => true,
-            GuardVerdict::WouldRemove(msg) => bail!("{msg}"),
+            GuardVerdict::WouldRemove(removed)
+                if migrate_store
+                    && removed.iter().all(|removal| {
+                        matches!(&removal.cause, crate::ops::RemovalCause::ComponentGone)
+                    }) =>
+            {
+                true
+            }
+            GuardVerdict::WouldRemove(removed) => {
+                bail!("{}", stateful_removal_message(&removed))
+            }
         }
     };
 
@@ -1570,13 +1585,16 @@ mod stateful_guard_message_tests {
                 cause: crate::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
             },
         ]);
-        assert!(msg.contains("nameOverride"), "{msg}");
-        assert!(msg.contains("--migrate-store"), "{msg}");
+        let rename = msg.find("nameOverride").unwrap();
+        let migrate = msg.find("--migrate-store").unwrap();
         let discard = msg.find("--allow-stateful-removal").unwrap();
         assert!(
-            msg.find("--migrate-store").unwrap() < discard
-                && msg.find("nameOverride").unwrap() < discard,
-            "the data-preserving remedies must still come before the discard flag:\n{msg}"
+            rename < migrate && migrate < discard,
+            "the rename fix must come before migration, and both must come before the discard flag:\n{msg}"
+        );
+        assert!(
+            msg.contains("After fixing the renames, re-run with --migrate-store"),
+            "the migration guidance must make the rename prerequisite explicit:\n{msg}"
         );
     }
 }
