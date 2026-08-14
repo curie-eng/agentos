@@ -162,6 +162,34 @@ http
 {{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 {{- end -}}
 
+{{/* Whether the object-store clients (api, worker, and the sandbox
+     bundle-fetch init container) present static credentials.
+
+     Non-empty when `rustfs.auth.accessKey` is set, which is the default and the
+     only mode the in-chart RustFS supports. Empty when the operator cleared it,
+     which is the BYO key-free path (#1325): every credential env var is omitted
+     so the AWS SDK falls through its provider chain to the web-identity
+     provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`), fed by a
+     projected ServiceAccount token.
+
+     Web identity is the ONLY key-free path this chart supports, deliberately.
+     The instinct on AWS is to drop the keys and let the node's instance role
+     answer, and that must not be made to work here: Rail 1 denies
+     169.254.169.254 by construction, and `security-networkpolicy.yaml` computes
+     an `except` so a broad operator `allowedEgress` CIDR cannot re-permit the
+     metadata address. NetworkPolicy selects pods, not containers, so opening
+     IMDS for the bundle-fetch init container would also open it for the runner
+     -- a prompt-injectable agent -- handing it the node's IAM role. Web
+     identity reads a mounted token instead of a network endpoint, so it needs
+     no metadata access and leaves Rail 1 intact. */}}
+{{- define "curie.rustfs.staticCredentials" -}}
+{{- if .Values.rustfs.auth.accessKey -}}
+true
+{{- else if .Values.rustfs.deploy -}}
+{{- fail "rustfs.auth.accessKey is empty but rustfs.deploy is true. The in-chart RustFS is configured with those static credentials and has no web-identity path, so clearing the key would leave every bundle read and write unauthenticated against it. Either set rustfs.auth.accessKey, or set rustfs.deploy=false and point rustfs.host at an external store that accepts the ServiceAccount's projected token (see the chart README, 'Key-free object store auth')." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.langfuse.webHost" -}}
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}

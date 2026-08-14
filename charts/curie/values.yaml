@@ -397,6 +397,25 @@ rustfs:
   port: 9000
   consolePort: 9001
   bucket: langfuse
+  # Static credentials, and the only mode the in-chart RustFS supports.
+  #
+  # Clearing `accessKey` selects the key-free path (#1325), valid only with
+  # `deploy: false` and an external store: every S3 credential env var is
+  # omitted from the api, the worker, and the sandbox bundle-fetch init
+  # container, so the AWS SDK falls through its provider chain to the
+  # web-identity provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed
+  # by a projected ServiceAccount token. Bind the role with the
+  # `serviceAccount.annotations` blocks on `api`, `worker`, and
+  # `agentSandbox.runner`. Clearing it with `deploy: true` is refused at render.
+  #
+  # The instance role is NOT an option here, deliberately. Rail 1 denies
+  # 169.254.169.254 by construction and computes an `except` so a broad
+  # `allowedEgress` CIDR cannot re-permit it. NetworkPolicy selects pods rather
+  # than containers, so opening IMDS for the bundle-fetch init container also
+  # opens it for the runner -- a prompt-injectable agent -- which would hand it
+  # the node's IAM role. Web identity reads a mounted token instead, needs no
+  # metadata access, and so leaves Rail 1 intact. Chart README, "Key-free object
+  # store auth", has the full setup.
   auth:
     accessKey: rustfs
     secretKey: rustfssecret
@@ -513,6 +532,14 @@ api:
     digest: ""
     pullPolicy: Always
   imagePullSecrets: []
+  # The API gets a ServiceAccount with a narrow read-only Role for the runner-log
+  # observability proxy (see templates/api-rbac.yaml). It is created with the
+  # API, so there is no `create` toggle here.
+  serviceAccount:
+    # Extra annotations on the API ServiceAccount. The key-free object store
+    # path (#1325) binds its IAM role here, e.g.
+    # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
+    annotations: {}
   # Deploy environment the API boots as (`dev` or `prod`), rendered as
   # ENVIRONMENT on the api container. `prod` arms the API production boot gate,
   # which refuses to start on the dev-default `apiKey`/`githubWebhookSecret`
@@ -746,6 +773,10 @@ worker:
   # (see templates/worker.yaml). Its token IS mounted (unlike the runner SA).
   serviceAccount:
     create: true
+    # Extra annotations on the worker ServiceAccount. The key-free object store
+    # path (#1325) binds its IAM role here, e.g.
+    # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
+    annotations: {}
   # Declarative connector hosting (ADR-0090): the worker converges each agent's
   # connector Deployment/Service/Secret/NetworkPolicy toward what its in-force
   # bundle declares, so an agent repo needs no CLI near the cluster.
@@ -1226,6 +1257,16 @@ agentSandbox:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
       automountToken: false
+      # Extra annotations on the runner ServiceAccount. The key-free object
+      # store path (#1325) binds the bundle-fetch IAM role here, e.g.
+      # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`. The
+      # projected web-identity token is a separate volume from the SA's own API
+      # token, so this composes with `automountToken: false`.
+      #
+      # Scope that role to the bundle bucket, read-only: NetworkPolicy selects
+      # pods and not containers, so an identity the bundle-fetch init container
+      # can reach is also reachable by the runner, which is prompt-injectable.
+      annotations: {}
 
 # ---------------------------------------------------------------------------
 # Security rails. The four security-boundary rails shipped ON by default. They

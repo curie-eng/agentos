@@ -19,5 +19,18 @@ metadata:
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
+  {{- with .Values.agentSandbox.runner.serviceAccount.annotations }}
+  # Where a key-free object store binds the bundle-fetch identity (#1325): an
+  # IRSA install annotates this SA with `eks.amazonaws.com/role-arn`. The
+  # projected web-identity token is a separate volume from the SA's own API
+  # token, so this composes with `automountToken: false` below -- the runner
+  # still cannot reach the Kubernetes API.
+  #
+  # Scope this role to the bundle bucket, read-only. NetworkPolicy selects pods
+  # and not containers, so any identity reachable by the bundle-fetch init
+  # container is also reachable by the runner, which is prompt-injectable.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 automountServiceAccountToken: {{ .Values.agentSandbox.runner.serviceAccount.automountToken }}
 {{- end }}
