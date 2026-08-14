@@ -246,4 +246,5 @@ commits = [
   # repository's existence and name as disclosed.
   "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
   "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
+  "33505bd401c915ed7254ab6172a4f337eeeb5f77",  # object store role examples, scrubbed from HEAD
 ]
