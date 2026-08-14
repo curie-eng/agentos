@@ -339,8 +339,8 @@ _VERSION_TESTS = """    #[test]
     }
 
     #[test]
-    fn rejects_incompatible_minor() {
-        let raw = r#"{"type":"final","version":"@INCOMPATIBLE_MINOR@","text":"x","status":"done"}"#;
+    fn rejects_incompatible_near_version() {
+        let raw = r#"{"type":"final","version":"@INCOMPATIBLE_NEAR@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
@@ -363,16 +363,19 @@ def _version_tests() -> str:
     """Render the version-gate tests with fixtures derived from PROTOCOL_VERSION.
 
     Compatibility is same ``major.minor`` under 0.x (same ``major`` from 1.0 on),
-    so the compatible fixture differs only in the patch component and the
-    incompatible one bumps the minor. ``9.9.9`` stands in for a version from a
-    wholly different line. Deterministic: every fixture is a pure function of
-    PROTOCOL_VERSION.
+    so the compatible fixture differs only in the patch component. The near-miss
+    incompatible fixture follows the same split: under 0.x a minor bump is the
+    breaking axis, so it is ``{major}.{minor + 1}.0``; from 1.0 on a minor bump
+    is compatible and only a major bump breaks, so it is ``{major + 1}.0.0``.
+    ``9.9.9`` stands in for a version from a wholly different line.
+    Deterministic: every fixture is a pure function of PROTOCOL_VERSION.
     """
 
     major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    near_incompatible = f"{major}.{minor + 1}.0" if major == 0 else f"{major + 1}.0.0"
     return (
         _VERSION_TESTS.replace("@INCOMPATIBLE@", "9.9.9")
-        .replace("@INCOMPATIBLE_MINOR@", f"{major}.{minor + 1}.0")
+        .replace("@INCOMPATIBLE_NEAR@", near_incompatible)
         .replace("@COMPATIBLE_PATCH@", f"{major}.{minor}.{patch + 1}")
         .replace("@CURRENT@", PROTOCOL_VERSION)
     )

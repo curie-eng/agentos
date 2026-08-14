@@ -423,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incompatible_minor() {
+    fn rejects_incompatible_near_version() {
         let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
