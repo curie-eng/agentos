@@ -28,9 +28,11 @@
 #       module's docstring claims this file enforces that; this is the claim.
 #   (f) Nothing the reconciler grants is cluster-scoped, and it never mentions
 #       pods.
-#   (g) The RBAC and the worker's env are switched by the SAME flag. Half the
-#       pair is the worst outcome: the grant without the env is unused
-#       authority, and the env without the grant is a loop that 403s forever.
+#   (g) The reconciler's RBAC and API key are switched by the same flag. A
+#       grant without matching reconciler env is unused authority, and a
+#       credential without matching grant loops on authorization failure. The
+#       worker API URL is intentionally present in both states because worker
+#       API calls do not depend on reconciliation.
 #   (h) The reconciler is pointed at the namespace and release the worker
 #       already tells the runner about, so the Service it creates is the one the
 #       agent dials.
@@ -167,14 +169,17 @@ if grep -q "pods" <<<"$ENABLED_RULES"; then
   fail f "the connector Role mentions pods; it manages objects, never pods directly"
 fi
 
-# (g) The RBAC and the env are switched by the SAME flag. Half of the pair is
-#     the worst outcome: the grant without the env is unused authority, and the
-#     env without the grant is a loop that 403s every pass forever.
-for required in CURIE_CONNECTOR_RECONCILE CURIE_CONNECTOR_APP_NAME CURIE_API_URL CURIE_API_KEY; do
+# (g) The connector gate keeps the extra authority and API credential together.
+# A grant without matching reconciler env is unused authority, and a credential
+# without matching grant loops on authorization failure. The API URL is always
+# present because worker API calls do not depend on reconciliation.
+for required in CURIE_CONNECTOR_RECONCILE CURIE_CONNECTOR_APP_NAME CURIE_API_KEY; do
   grep -q "$required" <<<"$ENABLED" || fail g "enabling the reconciler did not render $required"
   grep -q "$required" <<<"$DISABLED" &&
     fail g "$required renders with the reconciler disabled; the env gate is not working"
 done
+grep -q "CURIE_API_URL" <<<"$ENABLED" || fail g "enabled render is missing CURIE_API_URL"
+grep -q "CURIE_API_URL" <<<"$DISABLED" || fail g "disabled render is missing CURIE_API_URL"
 
 # (h) The worker reconciles the namespace and release it already tells the
 #     runner about. Two settings could disagree, and the symptom would be a

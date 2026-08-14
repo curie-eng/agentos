@@ -333,13 +333,16 @@ service:
       key: valkeyPassword
 {{- end -}}
 
-{{/* Platform-API connection env for the first-party services that CALL the API
-     (today the dispatcher; the chart worker's identical gap is a tracked
-     follow-up). Exists as a helper for the same reason curie.env.postgres and
-     curie.env.valkey do: the API URL env has now been forgotten three
-     times on new callers, while the store envs never recurred, because those had
-     a helper to include and this did not. Wire a new API caller by including
-     this rather than re-deriving the URL inline.
+{{/* Platform API connection env for first party services that call the API.
+     Keep the URL and key as separate helpers so callers can include only the
+     credentials they need. The composed helper preserves the existing
+     dispatcher contract.
+
+     The API URL env has been forgotten three times on new callers because
+     those callers had a shared helper to include and the worker did not.
+     New API callers should include the granular URL helper rather than derive
+     the URL inline. This follows the same shared helper pattern as
+     `curie.env.postgres` and `curie.env.valkey`.
 
      The BYO override is .Values.dispatcher.apiBaseUrl. Note the deliberate
      absence of a `required` call for the api.deploy=false case that the sibling
@@ -347,7 +350,7 @@ service:
      CrashLoopBackOff by design (documented in NOTES.txt and the README), not a
      render-time failure. Include with `nindent 12` to land at a container's env
      column. */}}
-{{- define "curie.env.api" -}}
+{{- define "curie.env.apiUrl" -}}
 # Where the platform API lives. The dispatcher POSTs an approval
 # resolve here when someone clicks Approve in Slack, so an unwired
 # value means the click dead-ends: the code default
@@ -358,6 +361,9 @@ service:
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
   value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+{{- end -}}
+
+{{- define "curie.env.apiKey" -}}
 # The same chart Secret key api.yaml consumes as API_KEY, so the
 # caller and the API cannot drift apart. By reference only: an inline
 # value would put the shared platform key into `helm get manifest`
@@ -367,6 +373,11 @@ service:
     secretKeyRef:
       name: {{ include "curie.secretName" . }}
       key: apiKey
+{{- end -}}
+
+{{- define "curie.env.api" -}}
+{{- include "curie.env.apiUrl" . }}
+{{ include "curie.env.apiKey" . }}
 {{- end -}}
 
 {{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP
