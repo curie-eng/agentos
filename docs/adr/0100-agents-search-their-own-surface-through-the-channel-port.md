@@ -94,15 +94,49 @@ Marketplace would fall under the May 2025 limits, 1 request per minute and
 15 messages per page, and this ADR's cost model collapses. Distribution is
 therefore an architectural commitment, not an onboarding convenience.
 
+Because the assumption is load-bearing, the adapter states what it does when
+the assumption is false: it detects the constrained case and refuses the verb,
+declaring the capability absent through the existing `ChannelCapability` path.
+Under the constrained limits a paginated search would not fail. It would return
+whatever it managed to page before the budget ran out, and a partial result
+presented as a search result is worse than a refusal, because the agent cannot
+tell the difference and will answer confidently from a fraction of the history.
+A broken deployment must report a missing capability instead.
+
 ### Exposure and enablement
 
 The verbs surface to the agent as tools in ordinary turns, part of the
 normal skill. Enablement is a bundle option, off by default in v1: the
 author who wants their agent to search its channel declares it, next to
-everything else the bundle declares. Background turns get the same tools
-under the same flag; nothing here is memory-specific, and ADR-0095's escape
-valve becomes one caller of `resolve_reference` and `search` rather than its
-own mechanism.
+everything else the bundle declares. Nothing here is memory-specific, and
+ADR-0095's escape valve becomes one caller of `resolve_reference` and `search`
+rather than its own mechanism.
+
+### Background turns get the verbs, on a different argument
+
+Background turns (ADR-0099) get the same tools under the same flag. Reading the
+bound surface is much of the point of background work, and the same bundle
+author writes the hook, its standing prompt, and this enablement flag, so the
+platform does not fence one against the other. But the safety case above does
+not extend to them unchanged, and inheriting it silently would be the error.
+
+The permission argument is replaced, not carried over. Invoker visibility
+bounds nothing when there is no invoker. What authorizes a hook turn's read is
+the bundle author's declared standing prompt, deployed and reviewed as part of
+the bundle, running against a channel an operator deliberately bound the agent
+to. That is a real authorization and it is a different one, so it is stated
+here rather than assumed.
+
+The injection mitigation is weaker for these turns, and this ADR records that
+rather than papering it. Provenance framing works partly because a user-started
+turn produces a reply a human reads, so a steered turn has a witness. A hook
+turn has no reply handle, so an unattended turn can read planted history and
+act through its tools with nothing appearing in the channel. That is the 2024
+incident shape with the witness removed, and v1 accepts it: the author who
+enabled both surfaces is the party who chose it, the run record makes the fire
+itself visible, and the classifier screen named below is the hardening lane
+when this stops being acceptable. What v1 does not do is claim the
+invoker-visibility argument covers it.
 
 The agent reaches the verbs through the platform API with the turn's scoped
 state token ([ADR-0033](0033-scoped-sandbox-state-token.md)), the same
@@ -113,6 +147,11 @@ the credential-forwarding posture is unchanged.
 
 - **Scope**: the bound channel only, structural per the adapter design
   above.
+- **Refusal is not an oracle**: a reference outside the bound scope and a
+  reference that does not exist return the same result. A distinguishable
+  refusal would confirm the existence of out-of-scope messages to anyone who
+  can get the agent to dereference a guessed permalink, and it is one sentence
+  now against an awkward change later.
 - **Result cap**: default 20 items per call. The ecosystem converges here
   (Slack's own agent search API caps at 20; comparable federated connectors
   default to 25).
@@ -158,7 +197,13 @@ better memory, never an index.
   any future cross-channel capability (multi-channel agents, Epic #27)
   cannot inherit these verbs without a new decision, because reading a
   channel the invoker cannot read is exactly the escalation this design
-  excludes.
+  excludes. It is also scoped to user-started turns, so a path that reaches
+  these verbs with no invoker carries the standing-prompt authorization stated
+  above and not this one.
+- An unattended turn that reads history, acts through tools, and posts nothing
+  is reachable in v1 by enabling one bundle flag on a hook. That is a known and
+  accepted exposure, owned by the author who enabled both, and it is the
+  concrete trigger for promoting the classifier screen out of future hardening.
 
 ## Alternatives considered
 
