@@ -118,6 +118,20 @@ fire. It is never retried within the fire, and never an input the agent may
 plan around; the documented pathology here is a denial becoming a recursive
 spawn trigger.
 
+The kill switch and the budget are fail closed for hook fires. A fire for an
+agent that is killed, or whose budget is spent, records `blocked` and never
+starts a turn. Both mechanisms exist today
+(`apps/worker/src/curie_worker/killswitch.py` and the platform budget), and an
+unattended schedule is exactly where a killed agent that kept firing would be
+discovered late, so an implementer should not have to derive the answer.
+
+A hook turn gets the agent's ordinary tools, including the channel read verbs
+(ADR-0100) when the bundle enables them. Reading the bound surface is much of
+the point of background work, and the same author writes the hook, the standing
+prompt, and the enablement flag, so the platform fences neither against the
+other. That ADR carries the residual exposure this creates and the hardening
+lane for it.
+
 ### Silence and the run record
 
 A hook turn has no reply handle. Nothing appears in the channel unless the
@@ -125,9 +139,18 @@ turn's own tools deliberately post (a digest hook posting its digest is a tool
 action like any other, subject to the same approval policy).
 
 The durable output is the turn's side effects plus a run record: agent, hook,
-trigger kind, fire time, outcome (`ran`, `skipped`, `failed`), duration, and
-usage. A run that started and exited is not a task that succeeded, so the
-outcome is recorded from the turn's exit status, not its existence.
+trigger kind, fire time, outcome (`ran`, `skipped`, `blocked`, `reclaimed`,
+`failed`), duration, and usage. A run that started and exited is not a task
+that succeeded, so the outcome is recorded from the turn's exit status, not its
+existence.
+
+The outcome members stay distinct rather than collapsing into one non-run
+value, because the question a run record has to answer is why a hook has not
+run since Tuesday: `skipped` is a fire that overlapped a live run, `blocked` is
+a fire the kill switch or a spent budget refused, `reclaimed` is a claim
+recovered past its lease, and `failed` is a turn that ran and exited badly.
+Each has a different fix and a query that cannot tell them apart sends the
+operator looking in the wrong place.
 Observability stays lightweight: the run record, queryable through the
 platform API and CLI, plus the OTel the runner already emits. No bespoke
 dashboards in v1, but "silent" never means "invisible": a hook that failed
@@ -141,6 +164,16 @@ fire is a recorded outcome, never a silent no-op. The mechanism is a CAS
 claim on the run record, the same replica-safe shape the approval sweeper
 uses. Skip is the right member of the standard overlap vocabulary here
 because a missed maintenance pass self-heals and a doubled one corrupts.
+
+The claim carries a lease, and a claim held past its lease is reclaimable by
+the next fire, which records `reclaimed` and proceeds. Without one, a run that
+never settles because a worker died or a sandbox wedged holds the claim
+forever and every later fire skips: visible in a query, but a permanent stall
+that no component resolves on its own. The worker already solved this class for
+stream deliveries (`reclaim_min_idle_ms` and `XAUTOCLAIM` in
+`apps/worker/src/curie_worker/stream_consumer.py`); the lease is that shape
+applied to the run claim. Making the reclaim its own recorded outcome is what
+keeps the stall diagnosable rather than inferred from a gap.
 
 ### Model, prompt, and credentials
 
@@ -160,8 +193,12 @@ hooks included.
 
 There is deliberately no platform frequency floor or daily run cap in v1. The
 bundle author's schedule burns the bundle author's keys, so the author owns
-the trade. The first deployment model where someone else pays (multi-tenancy,
-Epic #158) must revisit this before it ships.
+that trade. The trade is narrower than it sounds: the author's keys cover model
+spend, and the operator carries the sandbox, the queue, and the scheduler (see
+Consequences). What is rejected here is a platform wide floor, not an
+operator's ability to set one for their own cluster. The first deployment model
+where someone else pays for the tokens too (multi-tenancy, Epic #158) must
+revisit this before it ships.
 
 ### Test-fire from the CLI
 
@@ -171,6 +208,10 @@ an agent. A test fire runs the hook immediately, bypassing the schedule but
 not the serialization or the run record, and prints the record when the turn
 settles. An author must be able to kick a hook and read its outcome before a
 schedule ever runs it unattended.
+
+At the skill tier the fire verb is the whole surface. That tier has no API and
+no Postgres, so it runs the hook against the local session and prints the
+turn's outcome with no durable record behind it (see Consequences).
 
 ## Consequences
 
@@ -185,9 +226,29 @@ schedule ever runs it unattended.
 - ADR-0095's bootstrap and compaction become the first `bind` and `cron`
   hooks. That ADR remains the memory decision; this one is the machinery it
   deferred.
-- The scheduler is an API-side loop, so hooks fire wherever the API runs:
-  skill, local, and cluster tiers all get them without substrate-specific
-  plumbing.
+- The scheduler is an API-side loop, so hooks fire wherever the API runs, which
+  is the `local` and `cluster` tiers, without substrate-specific plumbing. The
+  skill tier has neither an API nor Postgres (`curie skill message` drives a
+  local runner container directly, bypassing the dispatcher and worker by
+  design), so it has no loop to host the scheduler and no table to hold a run
+  record. It gets manual test-fire only: no schedule, no durable record, and
+  the schedule and record verbs report the capability unavailable by design,
+  the same shape
+  [ADR-0077](0077-skill-tier-durable-approvals-stay-unavailable.md) set for
+  durable approvals. That keeps the tier-parity rule honest rather than
+  quietly unmet.
+- The scheduler loop, the queue traffic, and a fresh sandbox per fire are borne
+  by the cluster operator, not the bundle author, so "the author pays" is true
+  of model spend and of nothing else. That asymmetry does not wait for
+  multi-tenancy; it exists as soon as the author and the operator are different
+  people, which is the ordinary case for a deployed agent.
+- ADR-0079's optional placeholder changes a closed field on the frozen ACI
+  contract (`ReplyHandle.placeholder` is `placeholder: str` with no default
+  today), so that prerequisite bumps `PROTOCOL_VERSION` and regenerates the
+  three language artifacts under that package's own frozen-interface rule,
+  gated by `test_schema_compat.py` and `test_wire_lock.py`. The closed-schema
+  rules in ADR-0101 and ADR-0103 govern the agent-facing CLI result schemas, a
+  different namespace, and do not decide this one.
 - Failure handling is intentionally minimal: no retry, no backoff, no
   dead-letter queue for hook fires in v1. The next fire is the retry.
 
@@ -205,7 +266,8 @@ schedule ever runs it unattended.
   comparable products ship them (Claude Code Routines enforces an hourly
   floor and a daily cap). Rejected while the author pays with their own
   keys; recorded as the first requirement of any payer-splitting deployment
-  model.
+  model. The operator-borne share of the cost is named in Consequences rather
+  than fixed by a platform floor in v1.
 - **A separate tiny ADR for cron versus event hooks.** Considered, since a
   cron is not conceptually a lifecycle event. Kept together because the two
   share every semantic except the trigger: declaration, authorization,
