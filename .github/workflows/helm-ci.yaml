@@ -254,19 +254,6 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
 
-      # Prove the API and the worker agree on the object store. The API WRITES
-      # each uploaded bundle there and the worker READS it back, so a
-      # disagreement means the write lands somewhere the read never looks --
-      # and worker.yaml shipped with none of the four variables set, so the
-      # worker used its compose default (http://localhost:29000) and every
-      # bundle fetch got ECONNREFUSED. It surfaced as ClaimTimeoutError blaming
-      # a CPU-saturated node on a box idling at 11%, and as a post-deploy eval
-      # that silently stopped running with "unresolvable suite/bundle".
-      - name: helm render assertions (worker/api object store agree)
-        run: |
-          set -euo pipefail
-          bash charts/curie/ci/worker-object-store-assertions.sh
-
       - name: helm template + kubeconform (values-dev overlay)
         run: |
           set -euo pipefail

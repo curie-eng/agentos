@@ -575,7 +575,7 @@ they error clearly -- a release binary has no dev scripts.
 | Command | What it does |
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
-| `curie dev chart-check` | `bash charts/curie/ci/render-assertions.sh` -- render-assert the Helm chart. |
+| `curie dev chart-check` | Run every assertion script in `charts/curie/ci/`, the same set helm-ci runs -- render-assert the Helm chart. Reports per-script pass or fail and exits non-zero if any failed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
 | `curie dev field-parity` | `bash cli/scripts/check-field-parity.sh` -- assert CLI `api.rs` mirror structs cover their platform API model fields (#691), and CLI `commands.rs`/`spec.rs` mirror structs cover the frozen `packages/plugin-format` schema's fields (#701). |
