@@ -26,9 +26,9 @@ from plugin_format import (
     safe_extract,
     validate_bundle,
 )
-from plugin_format.connectors import ConnectorsFile, validate_connectors
+from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
-from plugin_format.validate import CONNECTORS_FILE, DEPLOY_FILE
+from plugin_format.validate import DEPLOY_FILE
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to

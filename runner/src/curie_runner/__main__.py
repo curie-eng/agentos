@@ -164,9 +164,14 @@ def build_runner(
             grant_tool=config.approval_grant_tool,
             grantable_by_route=resolution.grantable_by_route,
             # Bundle identity so an operator mcp__<server>__<tool> shorthand
-            # normalizes to its effective plugin-prefixed runtime name (#703).
+            # normalizes to its effective plugin-prefixed runtime name (#703),
+            # and the connectors.yaml servers so a gate on a connector tool --
+            # whose live name is the bare mcp__<connector>__<tool> the SDK gives
+            # a directly-mounted server -- verifies instead of failing closed
+            # (#1495).
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
         )
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths

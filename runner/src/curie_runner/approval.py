@@ -48,6 +48,7 @@ from claude_agent_sdk.types import (
 from plugin_format import (
     ApprovalPolicy,
     PluginManifest,
+    connector_server_names,
     declared_mcp_server_names,
     effective_operator_gate,
     grantable_routes,
@@ -613,12 +614,19 @@ class ApprovalPolicyResolution:
     ``mcp_servers`` is ``None`` when the declared-server set is unknowable (the
     ``declared_mcp_server_names`` poison), which fails an ``mcp__`` shorthand
     closed. Both are ``None`` when there is no bundle/manifest to read.
+
+    ``connector_servers`` is the ``connectors.yaml`` half of the same tool surface
+    (#1495), carried separately because a connector's live tool name is
+    ``mcp__<connector>__<tool>`` -- the bare form, since the runner mounts it on
+    ``ClaudeAgentOptions.mcp_servers`` rather than loading it as a plugin. Same
+    ``None`` poison meaning.
     """
 
     route_by_tool: dict[str, str]
     grantable_by_route: dict[str, str]
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
+    connector_servers: set[str] | None = None
 
 
 def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
@@ -676,9 +684,14 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     name = raw.get("name") if isinstance(raw, dict) else None
     bundle_name = name if isinstance(name, str) else None
     mcp_servers = declared_mcp_server_names(root)
+    connectors = connector_server_names(root)
     if not isinstance(raw, dict) or raw.get("approvalPolicy") is None:
         return ApprovalPolicyResolution(
-            {}, {}, bundle_name=bundle_name, mcp_servers=mcp_servers
+            {},
+            {},
+            bundle_name=bundle_name,
+            mcp_servers=mcp_servers,
+            connector_servers=connectors,
         )
     # An approvalPolicy IS declared. From here every failure is fail-closed:
     # the intent is established and a parse error cannot revoke it.
@@ -713,7 +726,11 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     # it, so this is belt-and-braces, not the enforcement point.
     grantable_by_route, _ambiguous = grantable_routes(policy.gates)
     return ApprovalPolicyResolution(
-        routes, grantable_by_route, bundle_name=bundle_name, mcp_servers=mcp_servers
+        routes,
+        grantable_by_route,
+        bundle_name=bundle_name,
+        mcp_servers=mcp_servers,
+        connector_servers=connectors,
     )
 
 
@@ -737,6 +754,7 @@ def build_approval_gate(
     grantable_by_route: dict[str, str] | None = None,
     bundle_name: str | None = None,
     mcp_servers: set[str] | None = None,
+    connector_servers: set[str] | None = None,
 ) -> ApprovalGate | None:
     """Merge the operator's gated tools with the bundle's declared gates.
 
@@ -784,14 +802,18 @@ def build_approval_gate(
         name = raw_name.strip()
         if not name:
             continue
-        effective = effective_operator_gate(bundle_name, mcp_servers, name)
+        effective = effective_operator_gate(
+            bundle_name, mcp_servers, name, connector_servers=connector_servers
+        )
         if effective is None:
             raise ApprovalPolicyError(
                 f"operator approval gate {name!r} names an MCP tool that cannot be"
                 " resolved to a declared bundle server; refusing to boot with a"
                 " gate that would arm nothing. Namespace it to its live"
-                " mcp__plugin_<bundle>_<server>__<tool> name, or check the bundle"
-                f" declares that server (declared servers: {mcp_servers})"
+                " mcp__plugin_<bundle>_<server>__<tool> name (or, for a"
+                " connectors.yaml connector, mcp__<connector>__<tool>), or check the"
+                f" bundle declares that server (declared MCP servers: {mcp_servers},"
+                f" declared connectors: {connector_servers})"
             )
         # A bare (non-mcp__) name is armed VERBATIM as a built-in tool name,
         # never rewritten or checked (#712): `effective_operator_gate` has no

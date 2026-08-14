@@ -32,6 +32,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# The file this module parses. Defined here, with the parser, so every reader
+# (the deploy validator, the approval-policy gate-name derivation, the API's
+# bundle reader) names one constant rather than its own copy of the string.
+CONNECTORS_FILE = "connectors.yaml"
+
 # A connector name becomes a Kubernetes object name and a DNS label, so it is
 # held to the stricter of those: lowercase alphanumeric and dashes, starting and
 # ending alphanumeric. Rejecting here beats a confusing apply-time failure.

@@ -7,6 +7,8 @@ escalates to the orchestrator.
 """
 
 from .approval_policy import (
+    connector_server_names,
+    connector_tool_prefix,
     declared_mcp_server_names,
     effective_operator_gate,
     grantable_routes,
@@ -56,6 +58,8 @@ __all__ = [
     "ApprovalGate",
     "grantable_routes",
     "declared_mcp_server_names",
+    "connector_server_names",
+    "connector_tool_prefix",
     "effective_operator_gate",
     "validate_bundle",
     "ValidationResult",
