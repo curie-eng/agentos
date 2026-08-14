@@ -112,6 +112,11 @@ fn process_help_routes_positive_forms() {
         &["cluster", "eval"],
         &["cluster", "deploy"],
         &["try"],
+        &["adapter", "scaffold"],
+        &["adapter", "validate"],
+        &["adapter", "bind"],
+        &["adapter", "token"],
+        &["adapter", "smoke-test"],
         &["init"],
         &["interactive"],
         &["secrets", "set"],
@@ -179,6 +184,7 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
     let text = output_text(&output);
 
     for needle in [
+        "adapter",
         "skill",
         "local",
         "cluster",

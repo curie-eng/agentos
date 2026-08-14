@@ -10,6 +10,36 @@
       "version": "1.1"
     },
     {
+      "result": "AdapterBindOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-bind.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterScaffoldOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-scaffold.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterSmokeTestOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-smoke-test.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterTokenOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-token.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AdapterValidateOutput",
+      "kind": "CliOutput",
+      "schema": "adapter-validate.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",
