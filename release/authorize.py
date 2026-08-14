@@ -15,9 +15,9 @@ pipeline, and it fails closed on either of two questions:
             entry successful (or neutral)? An explicit allowlist,
             not "some checks, all green" (issue #733): a commit with only an
             unrelated passing check-run and no sign its real CI ever ran
-            must be refused, the same as one that is on main but was never
-            checked, or was checked and failed. Zero check-runs is also a
-            failure -- absence of checks is not evidence they passed. A
+            must be refused, the same as one that is on a reviewed branch but
+            was never checked, or was checked and failed. Zero check-runs is
+            also a failure -- absence of checks is not evidence they passed. A
             required check-run that concluded `skipped` is refused too
             (issue #1470): a job-level `if:` on the job, or a failed job in
             its `needs:`, both make GitHub record that required check as
