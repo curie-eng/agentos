@@ -28,11 +28,3 @@ be962e4a37f8644539244e2e872937f2fd8371a0:AGENTS.md:curl-auth-user:105
 # allowlisted here. The lines on main carry inline gitleaks:allow markers.
 c8b1ccb28faa51d3ec996d60883fde48a303b0bd:AGENTS.md:curl-auth-user:154
 c8b1ccb28faa51d3ec996d60883fde48a303b0bd:docs/adr/0079-inbound-triggers-as-a-new-event-kind.md:generic-api-key:46
-
-# A private org repo slug that reached a test fixture and was edited away again.
-# Ignored by FINGERPRINT rather than added to an allowlist: the rule exists to
-# catch exactly this shape, and widening it would retire the protection instead
-# of retiring the one occurrence. The slug is absent from the tree; only the
-# commit that introduced it still carries it, and history is not rewritten for a
-# fixture name that was never a credential.
-2adab2fc53b64ca6b80adf794e90c0fdf1e9754e:apps/api/tests/test_gitflow_targets.py:downstream-repo-slug:22
