@@ -340,55 +340,13 @@ jobs:
           for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
             kind load docker-image "$img" --name curie-e2e
           done
-      # The graded install. Unlike ci.yaml's cluster job (which seals the
-      # install credential-free, the plumbing-only path ADR-0055 bounds), this
-      # install is armed: no seal flag, the OpenRouter credential supplied via
-      # CURIE_CREDENTIALS env (cluster up masks it and adds fakeModel=false
-      # automatically), CURIE_MODEL env baked into the release as the runner's
-      # model (cluster up reads it from env; it has no --model flag), and
-      # --allow-egress-host openrouter (the provider KEYWORD, resolved to a /32
-      # host route at install time) so the default-deny runner sandbox can
-      # reach OpenRouter. The --set overrides repoint every first-party image at
-      # the just-loaded local tags with pullPolicy Never, force gVisor off (no
-      # runsc on kind nodes -- a real-model install fails closed without this),
-      # and drop the dispatcher (no Slack; its presence would trip the
-      # `cluster message` reply-hijack guard). The secret travels in env, never
-      # on argv.
-      - name: Install the platform (curie cluster up, graded)
-        env:
-          CURIE_BIN: cli/target/release/curie
-          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
-          CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
-        run: |
-          set -euo pipefail
-          "$CURIE_BIN" cluster up \
-            --chart charts/curie \
-            --dev \
-            --allow-egress-host openrouter \
-            --set security.gvisor.mode=off \
-            --set dispatcher.deploy=false \
-            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
-            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
-            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
-            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
-            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
-      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
-      # wait for the rollouts the round trip depends on before driving it.
-      # Langfuse and ClickHouse are intentionally NOT waited on -- a single
-      # graded turn does not need traces flushed, and they are the slowest pods
-      # to settle.
-      - name: Wait for the platform to become ready
-        run: |
-          set -euo pipefail
-          kubectl rollout status deploy/curie-api -n curie --timeout=300s
-          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
-          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
-          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The pod-reachable host for the reply stub: the kind Docker network
       # gateway. Every node container sits on this bridge, so a pod egressing
       # through its node reaches the host here; the stub binds 0.0.0.0 and
       # answers on it. Auto-detection (loopback API server) cannot produce this
-      # value on kind.
+      # value on kind. Resolved before the install now that the install trusts
+      # the stub origin, and it only needs the kind node container, which is
+      # already running by here.
       - name: Resolve the pod-reachable host for the reply stub
         run: |
           set -euo pipefail
@@ -417,6 +375,54 @@ jobs:
           fi
           echo "kind network gateway (worker->stub reply host): $gw"
           echo "CURIE_E2E_LISTEN_HOST=$gw" >> "$GITHUB_ENV"
+      # The graded install. Unlike ci.yaml's cluster job (which seals the
+      # install credential-free, the plumbing-only path ADR-0055 bounds), this
+      # install is armed: no seal flag, the OpenRouter credential supplied via
+      # CURIE_CREDENTIALS env (cluster up masks it and adds fakeModel=false
+      # automatically), CURIE_MODEL env baked into the release as the runner's
+      # model (cluster up reads it from env; it has no --model flag), and
+      # --allow-egress-host openrouter (the provider KEYWORD, resolved to a /32
+      # host route at install time) so the default-deny runner sandbox can
+      # reach OpenRouter. The --set overrides repoint every first-party image at
+      # the just-loaded local tags with pullPolicy Never, force gVisor off (no
+      # runsc on kind nodes -- a real-model install fails closed without this),
+      # and drop the dispatcher (no Slack; its presence would trip the
+      # `cluster message` reply-hijack guard). The secret travels in env, never
+      # on argv. worker.slackTrustedOrigins is a CI-only widening that lets the
+      # worker answer the host-side reply stub (port = STUB_PORT in
+      # cli/scripts/e2e-ladder.sh); the chart default stays empty and
+      # fail-closed.
+      - name: Install the platform (curie cluster up, graded)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
+          CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --allow-egress-host openrouter \
+            --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
+      # wait for the rollouts the round trip depends on before driving it.
+      # Langfuse and ClickHouse are intentionally NOT waited on -- a single
+      # graded turn does not need traces flushed, and they are the slowest pods
+      # to settle.
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The cluster rung only, live: `cluster status` gate -> `cluster deploy`
       # -> `cluster message` (reply asserted). The model is baked at install
       # time, but apply_model_mode still hard-exits under CURIE_E2E_LIVE if no

@@ -1068,47 +1068,13 @@ jobs:
           for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
             kind load docker-image "$img" --name curie-e2e
           done
-      # Helm-install the platform through the operator wrapper. --dev pins the
-      # chart's deterministic published secrets (so `cluster message` can read
-      # them back); --fake-model seals the install credential-free. The --set
-      # overrides repoint every first-party image at the just-loaded local tags
-      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
-      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
-      # presence would trip the `cluster message` reply-hijack guard).
-      - name: Install the platform (curie cluster up)
-        env:
-          CURIE_BIN: cli/target/release/curie
-        run: |
-          set -euo pipefail
-          "$CURIE_BIN" cluster up \
-            --chart charts/curie \
-            --dev \
-            --fake-model \
-            --set security.gvisor.mode=off \
-            --set dispatcher.deploy=false \
-            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
-            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
-            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
-            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
-            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
-      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
-      # wait for the rollouts the round trip depends on before driving it. The
-      # controller-ready preflight already gated the agent-sandbox controller
-      # during install; these cover the app tier and the prewarm cache. Langfuse
-      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
-      # not need traces to have flushed, and they are the slowest pods to settle.
-      - name: Wait for the platform to become ready
-        run: |
-          set -euo pipefail
-          kubectl rollout status deploy/curie-api -n curie --timeout=300s
-          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
-          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
-          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The pod-reachable host for the reply stub: the kind Docker network
       # gateway. Every node container sits on this bridge, so a pod egressing
       # through its node reaches the host here; the stub binds 0.0.0.0 and answers
       # on it. See this job's header for why auto-detection (loopback API server)
-      # cannot produce this value on kind.
+      # cannot produce this value on kind. Resolved before the install now that
+      # the install trusts the stub origin, and it only needs the kind node
+      # container, which is already running by here.
       - name: Resolve the pod-reachable host for the reply stub
         run: |
           set -euo pipefail
@@ -1137,6 +1103,46 @@ jobs:
           fi
           echo "kind network gateway (worker->stub reply host): $gw"
           echo "CURIE_E2E_LISTEN_HOST=$gw" >> "$GITHUB_ENV"
+      # Helm-install the platform through the operator wrapper. --dev pins the
+      # chart's deterministic published secrets (so `cluster message` can read
+      # them back); --fake-model seals the install credential-free. The --set
+      # overrides repoint every first-party image at the just-loaded local tags
+      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
+      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
+      # presence would trip the `cluster message` reply-hijack guard).
+      # worker.slackTrustedOrigins is a CI-only widening that lets the worker
+      # answer the host-side reply stub (port = STUB_PORT in
+      # cli/scripts/e2e-ladder.sh); the chart default stays empty and fail-closed.
+      - name: Install the platform (curie cluster up)
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --fake-model \
+            --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
+      # wait for the rollouts the round trip depends on before driving it. The
+      # controller-ready preflight already gated the agent-sandbox controller
+      # during install; these cover the app tier and the prewarm cache. Langfuse
+      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
+      # not need traces to have flushed, and they are the slowest pods to settle.
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The cluster rung only: `cluster status` gate -> `cluster deploy` ->
       # `cluster message` (reply asserted). Fake model, credential-free.
       - name: Parity ladder (cluster rung, fake model, credential-free)
