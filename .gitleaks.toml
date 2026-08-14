@@ -137,11 +137,13 @@ paths = [
   '''^\.gitleaks\.toml$''',
 ]
 
-# Pre-existing fixture ids. Every one is obviously invented -- it spells a
-# word (C0MANAGERS), repeats a character (C0FFFFFF6), or is mostly zeroes
-# (C000000A01). That is the bar for a new one: a reader must be able to tell
-# at a glance that it is not somebody's channel. Adding to this list should be
-# rare; prefer reusing C0EXAMPLE1.
+# Gitleaks stopwords are case insensitive substring matches, so an entry
+# suppresses any longer identifier containing it, including identifiers
+# prefixed by that entry. Every value is an
+# obviously invented fixture id: it spells a word (C0MANAGERS), repeats a
+# character (C0FFFFFF6), or is mostly zeroes (C000000A01). That is the bar for
+# a new one: a reader must be able to tell at a glance that it is not somebody's
+# channel. Adding to this list should be rare; prefer reusing C0EXAMPLE1.
 stopwords = [
   "C000000A01",
   "C000000A02",
@@ -195,14 +197,12 @@ stopwords = [
   "C01SUPPORT",
   "C024BE91L",
   "C0AAAAAA1",
-  "C0AAAAAAA",
   "C0AGENT001",
   "C0BBBBBB2",
   "C0BOUND01",
   "C0BROAD01",
   "C0CARD001",
   "C0CCCCCC3",
-  "C0DEV2222",
   "C0DDDDDD4",
   "C0EEEEEE5",
   "C0ELSE001",
@@ -216,7 +216,6 @@ stopwords = [
   "C0INTAKE00",
   "C0LOCALDEV",
   "C0MALFORMED",
-  "C0PROD111",
   "C0MANAGERS",
   "C0OLDROOM0",
   "C0REQ0001",
