@@ -154,12 +154,11 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   `secret_env` compose process env channel, and never prints an unmasked token
   in live or dry run output. `--disconnect` clears the real Slack wiring,
   stops the dispatcher, and restores the local stub for `local message`.
-- **`cluster message` self-plumbs and guards against hijacking real Slack.** It manages
-  its own kubectl port-forwards (children killed on exit) and, when wiring the
-  deployed worker to its local stub, refuses if a `<release>-dispatcher`
-  Deployment exists (a real workspace is connected) unless `--force-wire`. Do
-  not drop that guard: the stub wiring is cluster-wide and would divert a live
-  workspace's replies.
+- **`cluster message` follows the deployed transport.** It manages its own
+  kubectl port-forwards (children killed on exit). With a connected dispatcher,
+  it posts a placeholder and routes the reply to the agent's bound Slack
+  channel. Without a dispatcher, it uses the terminal reply stub and waits for
+  the reply.
 - **A new `Deserialize` struct in `cli/src/api.rs` must be declared in
   `cli/api-mirrors.json`** (as a `mirrors` entry with its allowlisted field
   omissions, or a `non_mirrors` entry with a one-line reason). `curie dev

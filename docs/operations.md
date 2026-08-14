@@ -257,7 +257,7 @@ The plugin bundle you just deployed is the agent's backend. There are two
 frontends that can talk to it: your terminal (no Slack involved) or a real
 Slack workspace.
 
-### Without Slack, from the terminal
+### Driving the deployed agent
 
 ```bash
 curie cluster message "hello, are you there?"
@@ -267,16 +267,19 @@ curie cluster message "hello, are you there?"
 |---|---|
 | `--continue` | Reuse the same conversation thread as your last `cluster message` call. |
 | `--thread <id>` | Continue a specific earlier conversation thread by ID, instead of the most recent one. |
-| `--force-wire` | `cluster message` normally refuses to run against a release that's already wired to a real Slack workspace, since driving it would send replies into that workspace instead. Pass `--force-wire` to override that guard. |
 
-This exercises a deployed release end to end with no Slack at all. It:
+When the release has no dispatcher, this exercises it end to end from the
+terminal. It:
 
 - simulates the exact Slack event your bot would receive
 - runs it through the real deployed worker and a real Kubernetes sandbox
-- prints the reply
+- prints the reply in the terminal
 
-`cluster message` handles the port-forwards, channel resolution, and stub
-routing itself, so none of that is something you need to set up. `--continue`
+When the release has a dispatcher connected to Slack, `cluster message` posts a
+placeholder and routes the reply to the agent's bound Slack channel. When no
+dispatcher is connected, it uses the terminal reply stub and prints the reply
+in the terminal. The command handles port-forwards and channel resolution
+itself, so none of that is something you need to set up. `--continue`
 reads its saved context from `.curie/last-turn.json` in the current <!-- doclint:ignore-line -->
 directory.
 
@@ -298,9 +301,9 @@ curie cluster comms --slack
 | `--dry-run` | Print the masked `helm` command without executing (env-backed token values are masked, never printed in full). |
 
 `curie cluster comms --slack` wires your release up to a real Slack
-workspace: it stores the tokens you pass, points the release at Slack
-instead of the local `cluster message` stub, and restarts the affected pods
-so the change takes effect immediately.
+workspace: it stores the tokens you pass and restarts the affected pods so the
+change takes effect immediately. Connected `cluster message` replies go to the
+agent's bound Slack channel; disconnected releases use the terminal stub.
 
 For the `local`-target equivalent (`curie local comms --slack`), see
 [`cli/README.md`](../cli/README.md).

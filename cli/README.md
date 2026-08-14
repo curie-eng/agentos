@@ -324,7 +324,7 @@ runner container on the host Docker daemon instead of a Kubernetes sandbox.
 Channel comes from `--channel` or, when omitted, the sole deployed agent
 looked up on the compose API. `local message` composes with `--channel`,
 `--thread`, and `--timeout-secs`, and rejects the cluster-only flags
-(`--namespace`, `--release`, `--force-wire`, ...) with a clear error.
+(`--namespace`, `--release`, ...) with a clear error.
 
 The compose worker runs the fake model by default (a canned reply, no
 credentials). Export a credential in your shell, or use `--env-file` (see
@@ -339,7 +339,7 @@ present, fake otherwise). `--disconnect` stops the dispatcher and restores
 the local stub; `--dry-run` prints the compose command only.
 
 `--continue` works the same way here as it does for
-[`cluster message`](#curie-cluster-message-drive-the-deployed-cluster-with-zero-slack):
+[`cluster message`](#curie-cluster-message-drive-the-deployed-cluster):
 it reuses the last successful `local message` context from
 `.curie/last-turn.json` in the current working directory, so only the new text
 is required, explicit flags override the saved channel/thread/transport
@@ -358,7 +358,7 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster status` | Report release health, pod readiness, and access URLs (read-only). |
 | `curie cluster observability` | Report the release's observability surfaces (Curie Console, Langfuse UI, Curie API base), using the same NodePort discovery as `cluster status`.<br>• Degrades a missing, ClusterIP, or unresolvable surface to a note instead of failing.<br>• URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser.<br>• `--dry-run` prints the read-only discovery commands. |
 | `curie cluster comms --slack` | Connect or disconnect a real Slack workspace with a thin `helm upgrade --reuse-values`; env-backed tokens are masked in dry-run output. |
-| `curie cluster message "..."` | Drive the deployed release end to end with zero Slack: self plumbs kubectl port forwards, points the deployed worker at a local Slack stub (`helm upgrade --reuse-values`), enqueues, and prints the reply.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
+| `curie cluster message "..."` | Drive the deployed release end to end. With a connected dispatcher, it posts a placeholder and routes the reply to the agent's bound Slack channel. Without a dispatcher, it uses the terminal reply stub and waits for the reply.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
 | `curie cluster eval` | Run the bundle's `evals/cases.json` through the deployed release (self-plumbed port-forwards + per-turn reply stub, one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure.<br>• `--cases` overrides the file.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709).<br>• Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#790). |
 | `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057).<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
@@ -379,39 +379,35 @@ and auto-discovers the release key (ADR-0057), the lifecycle verbs do neither
 `--dry-run` (prints the plan, makes no request); the destructive
 `kill`/`reset-thread`/`delete` also require `--yes`.
 
-##### `curie cluster message`: drive the deployed cluster with zero Slack
+##### `curie cluster message`: drive the deployed cluster
 
-`cluster message` targets a **deployed** Helm release and wires everything
-itself, so a developer building an agent for someone else's Slack workspace can
-exercise the whole deployed machinery (Valkey queue -> worker -> claimed
-sandbox -> the real skill -> the reply) without any Slack access, tokens, or
-workspace.
+`cluster message` targets a **deployed** Helm release and manages its own
+port-forwards. A connected dispatcher sends the placeholder and reply through
+the agent's bound Slack channel. A disconnected release uses the terminal reply
+stub, so a developer can exercise the whole deployed machinery without Slack
+access or tokens.
 
 ```bash
 curie cluster message "summarize the latest deploy"
 curie cluster message --channel CSIM123 "another question"
 ```
 
-What it does: self-manages its own port-forwards and a local reply-stub the
-release can post back to, so no manual `kubectl port-forward` is needed. Then:
+What it does: self-manages its own port-forwards, then follows the release's
+transport. A connected dispatcher receives a placeholder and sends the reply to
+the bound Slack channel. Without a dispatcher, the terminal reply stub receives
+the reply and the command prints it in the terminal.
 
 - **Picks a channel.** With no `--channel`, it looks up the sole deployed
   agent's channel via the API; zero or multiple agents is an error requiring
   `--channel` explicitly (the worker binds a channel to an agent by exact
   equality, so guessing would route nowhere).
-- **Wires the worker at the stub** (`--wire`, the default) via a `helm
-  upgrade`, and waits for the rollout. `--no-wire` instead refuses to run
-  unless the worker is already wired, printing the exact command to apply.
-- **Refuses to hijack a connected workspace.** If the release is already
-  wired to a real Slack workspace, wiring the stub is refused unless you pass
-  `--force-wire` -- this guard exists purely so a stray `cluster message` run
-  can't silently steal a real workspace's replies.
-- **Enqueues the event and waits for the worker's reply**, printing a
-  `continue this conversation: ...` line for follow-ups. A timeout prints
-  stream diagnostics and exits nonzero.
+- **Enqueues the event.** In connected mode, follow the placeholder and reply in
+  the agent's bound Slack channel. In disconnected mode, it waits for the
+  terminal reply and prints a continuation context. A timeout prints stream
+  diagnostics and exits nonzero.
 
-`--dry-run` prints the kubectl/helm command lines, the stub URL, and the enqueue
-description without executing anything.
+`--dry-run` prints the kubectl port-forward details and enqueue description
+without executing anything.
 
 `--continue` reuses the last successful `cluster message` context from
 `.curie/last-turn.json` in the current working directory, so only the new text
@@ -433,25 +429,22 @@ curie cluster deploy --slack-channel CSIM123 ...
 curie cluster message --channel CSIM123 "first question"
 ```
 
-Each turn mints a fresh thread ts (Slack's timestamp-based message id) by
-default. On completion `cluster message` prints a `continue this conversation:
-...` line with the channel and thread ts; copy-paste it, or pass `--thread
-<ts>` yourself, to send the next turn into the same thread:
+In disconnected mode, each turn mints a fresh thread ts by default. On
+completion `cluster message` prints a `continue this conversation: ...` line
+with the channel and thread ts; copy-paste it, or pass `--thread <ts>` yourself,
+to send the next turn into the same thread:
 
 ```bash
 curie cluster message --channel CSIM123 --thread 1720000000.000100 "follow up question"
 ```
 
-Against a **connected** Slack workspace the thread ts is not synthetic: the CLI
-posts a real placeholder message to the channel and the printed thread ts is
-that placeholder's real Slack ts, so you can reply to it in Slack. Passing
-`--thread <ts>` there posts the placeholder into that existing thread, which
-means the ts must name a real message in the channel -- a thread ts carried over
-from a stub run will be rejected by Slack, and the command tells you to drop
-`--thread` to start a new one.
+Against a **connected** Slack workspace the CLI posts a real placeholder to the
+agent's bound channel and routes the reply there. Follow the placeholder in
+Slack for the conversation. A thread ts passed with `--thread <ts>` must name a
+real message in that channel; a thread ts from a disconnected stub run is not
+valid in Slack.
 
-When you're ready to connect a real workspace instead of driving this
-zero-Slack path, use:
+To connect a real workspace so replies route through Slack, use:
 
 ```bash
 SLACK_APP_TOKEN=xapp-... \
@@ -526,6 +519,13 @@ variable instead of prompting:
 ```bash
 curie secrets set GITHUB_PERSONAL_ACCESS_TOKEN --from-env GITHUB_PAT
 ```
+
+During cluster deploy, Curie resolves every connector secret name from the
+environment first and then the host secret store, and delivers the owned keys
+to the agent Kubernetes Secret. This includes connector `secrets` and
+`secret_files`. The host store is install global, so agents using the same
+secret name share one stored value and can collide. Issue #440 tracks the future
+per agent delivery path.
 
 `curie skill up --secret <NAME>` first uses a real environment variable when
 one is already set. If it is missing, the CLI tries the Curie secret store and
