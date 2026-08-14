@@ -185,7 +185,7 @@ def test_the_downgrade_round_trips_when_no_address_is_shared(
 
     cfg = _at_below()
     command.upgrade(cfg, REVISION)
-    _seed_binding("slack-agent", "slack", "C0UNIQUE1")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     _seed_binding("mail-agent", "email", "ops@example.test")
 
     command.downgrade(cfg, BELOW)

@@ -112,7 +112,7 @@ def test_an_old_consumer_cannot_distinguish_two_kinds_at_one_address() -> None:
     # That isolation is the point: `endpoint` is carried by both versions, so two
     # turns differing in it would fail this assertion for a reason that has
     # nothing to do with the kind-dropping tolerance under test.
-    shared_address = "C0SHARED01"
+    shared_address = "C0EXAMPLE1"
     slack_turn = json.loads(
         ReplyHandle(kind="slack", channel=shared_address, placeholder="1.0").model_dump_json()
     )

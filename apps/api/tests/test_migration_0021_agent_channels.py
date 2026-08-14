@@ -146,9 +146,9 @@ def test_the_upgrade_backfills_one_binding_per_agent_and_drops_the_column(
     command.downgrade(cfg, BELOW)
 
     bindings = {
-        _seed_pre_0021_agent("mig-a", "C0MIGAAA1"): "C0MIGAAA1",
-        _seed_pre_0021_agent("mig-b", "C0MIGBBB2"): "C0MIGBBB2",
-        _seed_pre_0021_agent("mig-c", "C0MIGCCC3"): "C0MIGCCC3",
+        _seed_pre_0021_agent("mig-a", "C0EXAMPLE1"): "C0EXAMPLE1",
+        _seed_pre_0021_agent("mig-b", "C0EXAMPLE2"): "C0EXAMPLE2",
+        _seed_pre_0021_agent("mig-c", "C0EXAMPLE3"): "C0EXAMPLE3",
     }
 
     command.upgrade(cfg, "head")
@@ -187,8 +187,8 @@ def test_the_downgrade_restores_the_column_its_not_null_and_its_named_constraint
     command.downgrade(cfg, BELOW)
 
     bindings = {
-        _seed_pre_0021_agent("down-a", "C0DOWNAA1"): "C0DOWNAA1",
-        _seed_pre_0021_agent("down-b", "C0DOWNBB2"): "C0DOWNBB2",
+        _seed_pre_0021_agent("down-a", "C0EXAMPLE1"): "C0EXAMPLE1",
+        _seed_pre_0021_agent("down-b", "C0EXAMPLE2"): "C0EXAMPLE2",
     }
 
     command.upgrade(cfg, "head")
@@ -227,16 +227,16 @@ def test_the_upgrade_is_refused_rather_than_guessed_when_the_column_holds_a_dupl
     command.upgrade(cfg, "head")
     command.downgrade(cfg, BELOW)
 
-    _seed_pre_0021_agent("dupe-a", "C0DUPEAA1")
+    _seed_pre_0021_agent("dupe-a", "C0EXAMPLE1")
     # Reachable only out of band, which is the point: 0017's constraint is what
     # normally forbids it, and this proves 0021 does not simply inherit that
     # assumption unchecked.
     _sql(f"ALTER TABLE curie.agents DROP CONSTRAINT {LEGACY_CONSTRAINT}")
-    _seed_pre_0021_agent("dupe-b", "C0DUPEAA1")
+    _seed_pre_0021_agent("dupe-b", "C0EXAMPLE1")
 
     with pytest.raises(Exception) as caught:
         command.upgrade(cfg, "head")
-    assert "C0DUPEAA1" in str(caught.value), caught.value
+    assert "C0EXAMPLE1" in str(caught.value), caught.value
 
 
 @pytest.mark.parametrize("kind", ["webhook", "teams"])
@@ -252,7 +252,7 @@ def test_the_downgrade_refuses_a_non_slack_binding(
     cfg = _alembic_config()
     command.upgrade(cfg, "head")
     command.downgrade(cfg, BELOW)
-    agent_id = _seed_pre_0021_agent("non-slack", "C0NONSLK1")
+    agent_id = _seed_pre_0021_agent("non-slack", "C0EXAMPLE1")
     command.upgrade(cfg, "head")
 
     _sql(
@@ -284,8 +284,8 @@ def test_the_downgrade_refuses_an_agent_with_no_binding(
     cfg = _alembic_config()
     command.upgrade(cfg, "head")
     command.downgrade(cfg, BELOW)
-    bound = _seed_pre_0021_agent("still-bound", "C0BOUNDAA")
-    orphan = _seed_pre_0021_agent("unbound-agent", "C0ORPHAN1")
+    bound = _seed_pre_0021_agent("still-bound", "C0EXAMPLE1")
+    orphan = _seed_pre_0021_agent("unbound-agent", "C0EXAMPLE2")
     command.upgrade(cfg, "head")
 
     # Reachable only out of band: the API requires a binding on create and

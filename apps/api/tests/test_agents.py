@@ -235,7 +235,7 @@ def test_a_plural_channels_payload_is_rejected(
         client,
         auth_headers,
         name="plural-agent",
-        channels=[{"kind": "slack", "address": "C0PLURAL1"}],
+        channels=[{"kind": "slack", "address": "C0EXAMPLE1"}],
     )
     assert plural.status_code == 422, plural.text
 
@@ -243,7 +243,7 @@ def test_a_plural_channels_payload_is_rejected(
         client,
         auth_headers,
         name="listed-agent",
-        channel=[{"kind": "slack", "address": "C0PLURAL2"}],
+        channel=[{"kind": "slack", "address": "C0EXAMPLE2"}],
     )
     assert listed.status_code == 422, listed.text
 
@@ -292,7 +292,7 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
 
     # A Slack-shaped address, because the slack binding has to pass the slack arm
     # of the write-time validator before any constraint can be reached.
-    first = _create(client, auth_headers, name="kind-a", channel=_slack("C0SHARED1"))
+    first = _create(client, auth_headers, name="kind-a", channel=_slack("C0EXAMPLE1"))
     assert first.status_code == 201, first.text
 
     # The widening: a DIFFERENT kind at the same address is a distinct route.
@@ -300,14 +300,14 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
         client,
         auth_headers,
         name="kind-b",
-        channel={"kind": "email", "address": "C0SHARED1"},
+        channel={"kind": "email", "address": "C0EXAMPLE1"},
     )
     assert other_kind.status_code == 201, other_kind.text
-    assert other_kind.json()["channel"] == {"kind": "email", "address": "C0SHARED1"}
+    assert other_kind.json()["channel"] == {"kind": "email", "address": "C0EXAMPLE1"}
 
     # And the pair itself is still identity: the SAME pair still conflicts, with
     # the guidance that names the fix (#38's error map), not a bare 500.
-    dup_pair = _create(client, auth_headers, name="kind-c", channel=_slack("C0SHARED1"))
+    dup_pair = _create(client, auth_headers, name="kind-c", channel=_slack("C0EXAMPLE1"))
     assert dup_pair.status_code == 409, dup_pair.text
     detail = dup_pair.json()["detail"]
     assert "already bound" in detail, detail
@@ -315,11 +315,11 @@ def test_the_pair_is_identity_and_the_address_alone_is_not(
 
     # The PATCH seam is fenced identically -- the constraint cannot be sidestepped
     # by binding a free pair and then moving onto a taken one.
-    free = _create(client, auth_headers, name="kind-d", channel=_slack("C0SHARED2"))
+    free = _create(client, auth_headers, name="kind-d", channel=_slack("C0EXAMPLE2"))
     assert free.status_code == 201, free.text
     moved = client.patch(
         f"/agents/{free.json()['id']}",
-        json={"channel": _slack("C0SHARED1")},
+        json={"channel": _slack("C0EXAMPLE1")},
         headers=auth_headers,
     )
     assert moved.status_code == 409, moved.text
@@ -338,7 +338,7 @@ def test_one_agent_cannot_hold_a_second_binding(
     an operator binds a second channel and finds one of them dead.
     """
 
-    created = _create(client, auth_headers, name="single-binding", channel=_slack("C0SINGLE1"))
+    created = _create(client, auth_headers, name="single-binding", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
@@ -352,7 +352,7 @@ def test_one_agent_cannot_hold_a_second_binding(
 
     # The move REPLACED the binding; the old address is now free for another
     # agent. If the PATCH had appended, this create would collide.
-    reuse = _create(client, auth_headers, name="reuses-old", channel=_slack("C0SINGLE1"))
+    reuse = _create(client, auth_headers, name="reuses-old", channel=_slack("C0EXAMPLE1"))
     assert reuse.status_code == 201, reuse.text
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
@@ -379,7 +379,7 @@ def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
     this one.
     """
 
-    created = _create(client, auth_headers, name="gen-agent", channel=_slack("C0GENAAA1"))
+    created = _create(client, auth_headers, name="gen-agent", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
@@ -425,7 +425,7 @@ def test_an_explicit_null_channel_is_rejected_on_patch(
     turn. Omitted still means unchanged.
     """
 
-    created = _create(client, auth_headers, name="null-channel", channel=_slack("C0NULLCH1"))
+    created = _create(client, auth_headers, name="null-channel", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
@@ -436,7 +436,7 @@ def test_an_explicit_null_channel_is_rejected_on_patch(
         f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
     )
     assert untouched.status_code == 200, untouched.text
-    assert untouched.json()["channel"] == _slack("C0NULLCH1")
+    assert untouched.json()["channel"] == _slack("C0EXAMPLE1")
 
 
 def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
@@ -457,13 +457,13 @@ def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
     contract violation, not a partial request.
     """
 
-    created = _create(client, auth_headers, name="legacy-patch", channel=_slack("C0LEGACY1"))
+    created = _create(client, auth_headers, name="legacy-patch", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
     legacy = client.patch(
         f"/agents/{agent_id}",
-        json={"slack_channel": "C0LEGACY2"},
+        json={"slack_channel": "C0EXAMPLE2"},
         headers=auth_headers,
     )
     assert legacy.status_code == 422, legacy.text
@@ -471,7 +471,7 @@ def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
     # And the refusal was total: nothing moved, so a caller cannot read the
     # response as "partially applied" either.
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channel"] == _slack("C0LEGACY1")
+    assert after.json()["channel"] == _slack("C0EXAMPLE1")
 
 
 def test_a_plural_channels_patch_is_rejected_not_silently_ignored(
@@ -493,13 +493,13 @@ def test_a_plural_channels_patch_is_rejected_not_silently_ignored(
     shape.
     """
 
-    created = _create(client, auth_headers, name="plural-patch", channel=_slack("C0PLURPT1"))
+    created = _create(client, auth_headers, name="plural-patch", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
     agent_id = created.json()["id"]
 
     plural = client.patch(
         f"/agents/{agent_id}",
-        json={"channels": [{"kind": "slack", "address": "C0PLURPT2"}]},
+        json={"channels": [{"kind": "slack", "address": "C0EXAMPLE2"}]},
         headers=auth_headers,
     )
     assert plural.status_code == 422, plural.text
@@ -508,7 +508,7 @@ def test_a_plural_channels_patch_is_rejected_not_silently_ignored(
     assert "channel" in body, body
 
     after = client.get(f"/agents/{agent_id}", headers=auth_headers)
-    assert after.json()["channel"] == _slack("C0PLURPT1")
+    assert after.json()["channel"] == _slack("C0EXAMPLE1")
 
 
 def test_a_legacy_slack_channel_create_is_rejected(
@@ -523,15 +523,15 @@ def test_a_legacy_slack_channel_create_is_rejected(
     the API happened to prefer, with no signal about which one lost.
     """
 
-    instead = _create(client, auth_headers, name="legacy-create", slack_channel="C0LEGACY3")
+    instead = _create(client, auth_headers, name="legacy-create", slack_channel="C0EXAMPLE1")
     assert instead.status_code == 422, instead.text
 
     alongside = _create(
         client,
         auth_headers,
         name="legacy-both",
-        channel=_slack("C0LEGACY4"),
-        slack_channel="C0LEGACY5",
+        channel=_slack("C0EXAMPLE2"),
+        slack_channel="C0EXAMPLE3",
     )
     assert alongside.status_code == 422, alongside.text
 
@@ -607,18 +607,18 @@ def test_the_binding_serializes_on_every_read_endpoint(
     response, the list, and the by-id fetch.
     """
 
-    created = _create(client, auth_headers, name="reader-a", channel=_slack("C0READER1"))
+    created = _create(client, auth_headers, name="reader-a", channel=_slack("C0EXAMPLE1"))
     assert created.status_code == 201, created.text
-    assert created.json()["channel"] == _slack("C0READER1")
+    assert created.json()["channel"] == _slack("C0EXAMPLE1")
     agent_id = created.json()["id"]
 
     listed = client.get("/agents", headers=auth_headers)
     assert listed.status_code == 200, listed.text
-    assert [a["channel"] for a in listed.json()] == [_slack("C0READER1")]
+    assert [a["channel"] for a in listed.json()] == [_slack("C0EXAMPLE1")]
 
     fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["channel"] == _slack("C0READER1")
+    assert fetched.json()["channel"] == _slack("C0EXAMPLE1")
 
 
 def test_listing_agents_does_not_issue_a_query_per_agent(

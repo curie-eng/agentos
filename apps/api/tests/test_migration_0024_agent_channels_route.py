@@ -155,14 +155,14 @@ def test_the_upgrade_adds_the_route_columns_with_a_null_backfill(
     """
 
     cfg = _at_below()
-    _seed_slack_binding("slack-agent", "C0ROUTE01")
+    _seed_slack_binding("slack-agent", "C0EXAMPLE1")
 
     command.upgrade(cfg, REVISION)
 
     assert set(ROUTE_COLUMNS) <= _columns()
     rows = _sql(
         "SELECT endpoint, adapter, generation FROM curie.agent_channels "
-        "WHERE address = 'C0ROUTE01'"
+        "WHERE address = 'C0EXAMPLE1'"
     )
     assert rows == [(None, None, 0)]
 
@@ -221,7 +221,7 @@ def test_both_set_and_both_absent_are_accepted(isolated_migration_db: None) -> N
         adapter="agentmail-sandbox",
     )
     # Slack's route is legitimately implicit: the worker's configured origin.
-    _insert_binding("slack-agent", "slack", "C0ROUTE02")
+    _insert_binding("slack-agent", "slack", "C0EXAMPLE1")
 
     assert len(_sql("SELECT 1 FROM curie.agent_channels")) == 2
     assert _constraint_named(ROUTE_PAIR_CHECK)
@@ -327,11 +327,11 @@ def test_a_slack_approval_upgrades_with_a_null_reply_adapter(
     )
     _sql(
         "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
-        "VALUES (:id, :agent, 'slack', 'C0ROUTE05')",
+        "VALUES (:id, :agent, 'slack', 'C0EXAMPLE1')",
         {"id": uuid.uuid4(), "agent": agent_id},
     )
     approval = _seed_approval(
-        reply_channel="C0ROUTE05", reply_kind="slack", status=status
+        reply_channel="C0EXAMPLE1", reply_kind="slack", status=status
     )
 
     command.upgrade(cfg, REVISION)
@@ -356,7 +356,7 @@ def test_the_round_trip_succeeds_on_a_slack_only_database(
     """
 
     cfg = _at_below()
-    _seed_slack_binding("slack-agent", "C0ROUTE03")
+    _seed_slack_binding("slack-agent", "C0EXAMPLE1")
 
     command.upgrade(cfg, REVISION)
     command.downgrade(cfg, BELOW)
@@ -391,7 +391,7 @@ def test_the_downgrade_refuses_and_names_any_routed_binding(
         endpoint="http://curie-mail-adapter:8080/",
         adapter="agentmail-sandbox",
     )
-    _seed_slack_binding("slack-agent", "C0ROUTE04")
+    _seed_slack_binding("slack-agent", "C0EXAMPLE1")
 
     with pytest.raises(Exception) as caught:
         command.downgrade(cfg, BELOW)
@@ -400,7 +400,7 @@ def test_the_downgrade_refuses_and_names_any_routed_binding(
     assert "ops@example.test" in message, message
     assert "agentmail-sandbox" in message or "curie-mail-adapter" in message, message
     # The unrouted slack binding is not blamed for its neighbour's state.
-    assert "C0ROUTE04" not in message, message
+    assert "C0EXAMPLE1" not in message, message
     # And the refusal was total: the route survives.
     assert _sql(
         "SELECT adapter FROM curie.agent_channels WHERE address = 'ops@example.test'"
@@ -426,22 +426,22 @@ def test_the_downgrade_refuses_a_rebound_binding_whose_generation_is_nonzero(
 
     cfg = _at_below()
     command.upgrade(cfg, REVISION)
-    _seed_slack_binding("rebound-agent", "C0ROUTE05")
-    _seed_slack_binding("settled-agent", "C0ROUTE06")
+    _seed_slack_binding("rebound-agent", "C0EXAMPLE1")
+    _seed_slack_binding("settled-agent", "C0EXAMPLE2")
     # Two rebinds, exactly as `update_agent_binding` would have counted them.
     _sql(
-        "UPDATE curie.agent_channels SET generation = 2 WHERE address = 'C0ROUTE05'"
+        "UPDATE curie.agent_channels SET generation = 2 WHERE address = 'C0EXAMPLE1'"
     )
 
     with pytest.raises(Exception) as caught:
         command.downgrade(cfg, BELOW)
 
     message = str(caught.value)
-    assert "C0ROUTE05" in message, message
+    assert "C0EXAMPLE1" in message, message
     assert "generation 2" in message, message
     # The never-rebound binding is not blamed for its neighbour's state.
-    assert "C0ROUTE06" not in message, message
+    assert "C0EXAMPLE2" not in message, message
     # And the refusal was total: the generation survives to be rotated against.
     assert _sql(
-        "SELECT generation FROM curie.agent_channels WHERE address = 'C0ROUTE05'"
+        "SELECT generation FROM curie.agent_channels WHERE address = 'C0EXAMPLE1'"
     ) == [(2,)]

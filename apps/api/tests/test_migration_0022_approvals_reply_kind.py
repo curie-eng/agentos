@@ -167,12 +167,12 @@ def test_the_upgrade_backfills_each_approval_from_its_own_binding(
 
     cfg = _at_below()
     _seed_binding("mail-agent", "email", "ops@example.test")
-    _seed_binding("slack-agent", "slack", "C0MIG0001")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     email_approval = _seed_approval(
         reply_channel="ops@example.test", status="pending", summary="send the quote"
     )
     slack_approval = _seed_approval(
-        reply_channel="C0MIG0001", status="pending", summary="give a discount"
+        reply_channel="C0EXAMPLE1", status="pending", summary="give a discount"
     )
 
     command.upgrade(cfg, REVISION)
@@ -213,9 +213,9 @@ def test_the_upgrade_refuses_an_unreconstructable_row_of_any_settled_status(
     """
 
     cfg = _at_below()
-    _seed_binding("slack-agent", "slack", "C0FINE002")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     healthy = _seed_approval(
-        reply_channel="C0FINE002", status=status, summary="resolvable one"
+        reply_channel="C0EXAMPLE1", status=status, summary="resolvable one"
     )
     settled = _seed_approval(
         reply_channel="nobody@example.test", status=status, summary="long since decided"
@@ -244,9 +244,9 @@ def test_the_only_backfill_to_slack_is_a_row_bound_to_a_slack_binding(
     """
 
     cfg = _at_below()
-    _seed_binding("slack-agent", "slack", "C0EARNED1")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
-        reply_channel="C0EARNED1", status=status, summary="ordinary slack"
+        reply_channel="C0EXAMPLE1", status=status, summary="ordinary slack"
     )
 
     command.upgrade(cfg, REVISION)
@@ -271,9 +271,9 @@ def test_the_upgrade_refuses_a_pending_approval_that_matches_no_binding(
     """
 
     cfg = _at_below()
-    _seed_binding("slack-agent", "slack", "C0FINE001")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     healthy = _seed_approval(
-        reply_channel="C0FINE001", status="pending", summary="fine one"
+        reply_channel="C0EXAMPLE1", status="pending", summary="fine one"
     )
     orphan = _seed_approval(
         reply_channel="nobody@example.test", status="pending", summary="orphaned one"
@@ -355,9 +355,9 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
     """
 
     cfg = _at_below()
-    _seed_binding("slack-agent", "slack", "C0MOVED01")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
-        reply_channel="C0MOVED01", status="pending", summary="raised on slack"
+        reply_channel="C0EXAMPLE1", status="pending", summary="raised on slack"
     )
     command.upgrade(cfg, REVISION)
     assert _reply_kind(approval) == "slack"
@@ -366,7 +366,7 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
     # update_agent_binding` mutates the row in place, so this is an ordinary
     # PATCH, not an exotic state).
     _sql(
-        "UPDATE curie.agent_channels SET kind = 'email' WHERE address = 'C0MOVED01'"
+        "UPDATE curie.agent_channels SET kind = 'email' WHERE address = 'C0EXAMPLE1'"
     )
 
     with pytest.raises(Exception) as caught:
@@ -374,7 +374,7 @@ def test_the_downgrade_refuses_a_slack_row_whose_address_now_binds_another_kind(
 
     message = str(caught.value)
     assert str(approval) in message, message
-    assert "C0MOVED01" in message, message
+    assert "C0EXAMPLE1" in message, message
 
 
 def test_the_downgrade_round_trips_when_every_row_is_reconstructable(
@@ -385,9 +385,9 @@ def test_the_downgrade_round_trips_when_every_row_is_reconstructable(
     """
 
     cfg = _at_below()
-    _seed_binding("slack-agent", "slack", "C0PLAIN01")
+    _seed_binding("slack-agent", "slack", "C0EXAMPLE1")
     approval = _seed_approval(
-        reply_channel="C0PLAIN01", status="pending", summary="ordinary slack"
+        reply_channel="C0EXAMPLE1", status="pending", summary="ordinary slack"
     )
 
     command.upgrade(cfg, REVISION)

@@ -317,11 +317,11 @@ def test_the_mint_refuses_a_non_slack_binding_whose_route_is_unset(
         channels_client,
         auth_headers,
         name="slack-agent",
-        channel=_channel("slack", "C0INGRES1"),
+        channel=_channel("slack", "C0EXAMPLE1"),
     )
     slack = channels_client.post(
         "/channels/token",
-        json={"kind": "slack", "address": "C0INGRES1", "ttl_s": 60},
+        json={"kind": "slack", "address": "C0EXAMPLE1", "ttl_s": 60},
         headers=auth_headers,
     )
     assert slack.status_code == 200, slack.text
@@ -361,7 +361,7 @@ def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
         channels_client,
         auth_headers,
         name="routeless-slack",
-        channel=_channel("slack", "C0NOROUT1"),
+        channel=_channel("slack", "C0EXAMPLE1"),
     )
     _bind(
         channels_client,
@@ -391,7 +391,7 @@ def test_the_ingress_refuses_an_unroutable_binding_for_the_platform_key_too(
     assert _turns_on(valkey, runs_stream) == []
 
     slack = _post_turn(
-        channels_client, None, _turn("slack", "C0NOROUT1"), headers=auth_headers
+        channels_client, None, _turn("slack", "C0EXAMPLE1"), headers=auth_headers
     )
     assert slack.status_code == 200, slack.text
 
@@ -578,11 +578,11 @@ def test_a_slack_binding_enqueues_with_neither_endpoint_nor_adapter(
         channels_client,
         auth_headers,
         name="slack-ingress",
-        channel=_channel("slack", "C0INGRES2"),
+        channel=_channel("slack", "C0EXAMPLE1"),
     )
-    token = _mint(channels_client, auth_headers, kind="slack", address="C0INGRES2")
+    token = _mint(channels_client, auth_headers, kind="slack", address="C0EXAMPLE1")
 
-    resp = _post_turn(channels_client, token, _turn("slack", "C0INGRES2"))
+    resp = _post_turn(channels_client, token, _turn("slack", "C0EXAMPLE1"))
     assert resp.status_code == 200, resp.text
 
     (turn,) = _turns_on(valkey, runs_stream)
@@ -1202,7 +1202,7 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
         # A kind the platform has never heard of behaves identically: the rule
         # is about the pair, not about a registry (ADR-0096 decision 5).
         ("webhook", "acme-room-7"),
-        ("slack", "C0IMPLIC1"),
+        ("slack", "C0EXAMPLE1"),
     ):
         created = _create_agent(
             channels_client,
