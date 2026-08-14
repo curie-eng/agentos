@@ -25,8 +25,20 @@ HOSTED = ConnectorSpec(
 REMOTE = ConnectorSpec(url="https://mcp.internal/mcp", headers={"Authorization": "Bearer ${T}"})
 
 
-def _objs(release: str = "acme-bot", app: str = "acme-bot") -> list[dict]:
-    return r.render(release, "acme-bot", "acme-bot", app, "grafana", HOSTED, "conn-secrets")
+def _objs(
+    release: str = "acme-bot",
+    app: str = "acme-bot",
+    spec: ConnectorSpec = HOSTED,
+) -> list[dict]:
+    return r.render(
+        release=release,
+        agent="acme-bot",
+        namespace="acme-bot",
+        app_name=app,
+        connector="grafana",
+        spec=spec,
+        secret_name="conn-secrets",
+    )
 
 
 # Two NetworkPolicies ship per connector now, so selecting "the NetworkPolicy"
@@ -64,7 +76,17 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
     # cannot narrow -- ADR-0067) so the sandbox still cannot reach the
     # connector. Too broad -- e.g. only `component` -- and it also grants egress
     # to every OTHER release's sandboxes in the namespace. Both fail silently.
-    np = _egress_np(r.render("relA", "a", "ns", "acme-bot", "g", HOSTED, "s"))
+    np = _egress_np(
+        r.render(
+            release="relA",
+            agent="a",
+            namespace="ns",
+            app_name="acme-bot",
+            connector="g",
+            spec=HOSTED,
+            secret_name="s",
+        )
+    )
     assert np["spec"]["podSelector"]["matchLabels"] == {
         "app.kubernetes.io/name": "acme-bot",
         "app.kubernetes.io/instance": "relA",
@@ -73,8 +95,28 @@ def test_egress_selects_exactly_the_pods_rail_1_denies() -> None:
 
 
 def test_two_releases_do_not_select_each_others_sandboxes() -> None:
-    a = _egress_np(r.render("relA", "a", "ns", "app", "g", HOSTED, "s"))
-    b = _egress_np(r.render("relB", "a", "ns", "app", "g", HOSTED, "s"))
+    a = _egress_np(
+        r.render(
+            release="relA",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=HOSTED,
+            secret_name="s",
+        )
+    )
+    b = _egress_np(
+        r.render(
+            release="relB",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=HOSTED,
+            secret_name="s",
+        )
+    )
     assert a["spec"]["podSelector"] != b["spec"]["podSelector"]
 
 
@@ -133,7 +175,18 @@ def test_plain_env_is_passed_through() -> None:
 # Remote connectors own no objects
 # --------------------------------------------------------------------------- #
 def test_remote_connector_renders_nothing_to_run() -> None:
-    assert r.render("acme-bot", "a", "ns", "app", "internal", REMOTE, "s") == []
+    assert (
+        r.render(
+            release="acme-bot",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="internal",
+            spec=REMOTE,
+            secret_name="s",
+        )
+        == []
+    )
 
 
 def test_remote_connector_keeps_its_own_url_and_headers() -> None:
@@ -189,11 +242,27 @@ def test_two_agents_in_one_release_do_not_share_object_names() -> None:
     # release-scoped too, handed it the prod token. Nothing errored.
     dev = [
         o["metadata"]["name"]
-        for o in r.render("curie", "acme-dev", "ns", "curie", "grafana", DEV, "s")
+        for o in r.render(
+            release="curie",
+            agent="acme-dev",
+            namespace="ns",
+            app_name="curie",
+            connector="grafana",
+            spec=DEV,
+            secret_name="s",
+        )
     ]
     prod = [
         o["metadata"]["name"]
-        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+        for o in r.render(
+            release="curie",
+            agent="sre-prod",
+            namespace="ns",
+            app_name="curie",
+            connector="grafana",
+            spec=PROD,
+            secret_name="s",
+        )
     ]
     assert not set(dev) & set(prod), f"agents share object names: {dev} vs {prod}"
 
@@ -203,12 +272,28 @@ def test_two_agents_do_not_share_pod_labels() -> None:
     # traffic to the other's pods even with distinct object names.
     dev = next(
         o
-        for o in r.render("curie", "acme-dev", "ns", "curie", "grafana", DEV, "s")
+        for o in r.render(
+            release="curie",
+            agent="acme-dev",
+            namespace="ns",
+            app_name="curie",
+            connector="grafana",
+            spec=DEV,
+            secret_name="s",
+        )
         if o["kind"] == "Service"
     )
     prod = next(
         o
-        for o in r.render("curie", "sre-prod", "ns", "curie", "grafana", PROD, "s")
+        for o in r.render(
+            release="curie",
+            agent="sre-prod",
+            namespace="ns",
+            app_name="curie",
+            connector="grafana",
+            spec=PROD,
+            secret_name="s",
+        )
         if o["kind"] == "Service"
     )
     assert dev["spec"]["selector"] != prod["spec"]["selector"]
@@ -247,7 +332,15 @@ HOSTED_WITH_HOSTS = ConnectorSpec(
 def _dep(agent: str = "acme-dev", spec: ConnectorSpec = HOSTED_WITH_HOSTS) -> dict:
     return next(
         o
-        for o in r.render("acme-bot", agent, "acme-bot", "acme-bot", "grafana", spec, "s")
+        for o in r.render(
+            release="acme-bot",
+            agent=agent,
+            namespace="acme-bot",
+            app_name="acme-bot",
+            connector="grafana",
+            spec=spec,
+            secret_name="s",
+        )
         if o["kind"] == "Deployment"
     )
 
@@ -329,7 +422,15 @@ def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
     spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="TOKEN", from_secret="grafana-mcp")])
     dep = next(
         o
-        for o in r.render("rel", "ag", "ns", "app", "g", spec, "curie-owned")
+        for o in r.render(
+            release="rel",
+            agent="ag",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="curie-owned",
+        )
         if o["kind"] == "Deployment"
     )
     entry = next(
@@ -349,7 +450,15 @@ def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -
     spec = ConnectorSpec(image="x:1", secrets=["OWNED", SecretRef(name="REFD", from_secret="ext")])
     dep = next(
         o
-        for o in r.render("rel", "ag", "ns", "app", "g", spec, "curie-owned")
+        for o in r.render(
+            release="rel",
+            agent="ag",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="curie-owned",
+        )
         if o["kind"] == "Deployment"
     )
     env = {e["name"]: e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
@@ -366,7 +475,17 @@ def test_a_referenced_secret_is_not_optional() -> None:
 
     spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="T", from_secret="ext")])
     dep = next(
-        o for o in r.render("rel", "ag", "ns", "app", "g", spec, "s") if o["kind"] == "Deployment"
+        o
+        for o in r.render(
+            release="rel",
+            agent="ag",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="s",
+        )
+        if o["kind"] == "Deployment"
     )
     entry = next(
         e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
@@ -585,13 +704,13 @@ def test_connector_accepts_traffic_only_from_the_sandbox() -> None:
     # the network is the entire access control.
     np = _ingress_np(
         r.render(
-            "release-r",
-            "agent-a",
-            "namespace-n",
-            "app-name",
-            "connector-c",
-            HOSTED,
-            "connector-secret",
+            release="release-r",
+            agent="agent-a",
+            namespace="namespace-n",
+            app_name="app-name",
+            connector="connector-c",
+            spec=HOSTED,
+            secret_name="connector-secret",
         )
     )
     src = np["spec"]["ingress"][0]["from"]
@@ -610,7 +729,13 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
     # the wrong pod -- the sandbox gains an ingress restriction it does not need
     # while the connector keeps none.
     objs = r.render(
-        "release-r", "agent-a", "namespace-n", "app-name", "connector-c", HOSTED, "connector-secret"
+        release="release-r",
+        agent="agent-a",
+        namespace="namespace-n",
+        app_name="app-name",
+        connector="connector-c",
+        spec=HOSTED,
+        secret_name="connector-secret",
     )
     ing = _ingress_np(objs)
     egr = _egress_np(objs)
@@ -647,8 +772,28 @@ def test_ingress_uses_a_podselector_never_an_ipblock() -> None:
 def test_two_releases_do_not_admit_each_others_sandboxes() -> None:
     # A too-broad source selector would let another release's sandbox read
     # production through this connector, silently.
-    a = _ingress_np(r.render("relA", "a", "ns", "app", "g", HOSTED, "s"))
-    b = _ingress_np(r.render("relB", "a", "ns", "app", "g", HOSTED, "s"))
+    a = _ingress_np(
+        r.render(
+            release="relA",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=HOSTED,
+            secret_name="s",
+        )
+    )
+    b = _ingress_np(
+        r.render(
+            release="relB",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=HOSTED,
+            secret_name="s",
+        )
+    )
     assert a["spec"]["ingress"][0]["from"] != b["spec"]["ingress"][0]["from"]
 
 
@@ -659,4 +804,60 @@ def test_the_two_policies_do_not_collide_on_name() -> None:
 
 def test_a_remote_connector_renders_no_policies() -> None:
     # Nothing is hosted, so there is nothing in-cluster to admit traffic to.
-    assert not [o for o in r.render("rel", "a", "ns", "app", "x", REMOTE, "s")]
+    assert not [
+        o
+        for o in r.render(
+            release="rel",
+            agent="a",
+            namespace="ns",
+            app_name="app",
+            connector="x",
+            spec=REMOTE,
+            secret_name="s",
+        )
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# `spec.port` is read in five places, and every one of them has to read the
+# DECLARED port. The default is 8000, so a reader that hardcodes it keeps
+# working for every connector that never sets `port:` and breaks only for the
+# ones that do -- silently, and with a different symptom per reader. These
+# render at TWO different NON-default ports for exactly that reason: asserting
+# at 8000 would pin nothing, and asserting at one other port would pin nothing
+# against a reader that hardcodes THAT value instead.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("port", [9876, 9999])
+def test_a_wrong_container_port_leaves_the_service_routing_to_a_refused_port(port: int) -> None:
+    # The Service names its targetPort "http", so the container's port NAME is
+    # what resolves it. A containerPort that is not the declared port makes
+    # "http" resolve to a port nothing listens on, and every call is refused.
+    spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", port=port)
+    container = next(o for o in _objs(spec=spec) if o["kind"] == "Deployment")["spec"]["template"][
+        "spec"
+    ]["containers"][0]
+    assert container["ports"] == [{"name": "http", "containerPort": port}]
+
+
+@pytest.mark.parametrize("port", [9876, 9999])
+def test_a_wrong_egress_port_leaves_rail_1_denying_the_port_the_connector_listens_on(
+    port: int,
+) -> None:
+    # Rail 1 is default-deny, so this rule is the only thing that opens the hop.
+    # Opened on the wrong port it denies the real one, and the sandbox's call
+    # times out with no policy error anywhere to say why.
+    spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", port=port)
+    egress = _egress_np(_objs(spec=spec))["spec"]["egress"][0]
+    assert egress["ports"] == [{"protocol": "TCP", "port": port}]
+
+
+@pytest.mark.parametrize("port", [9876, 9999])
+def test_a_wrong_url_port_makes_the_sandbox_dial_a_port_nothing_serves(port: int) -> None:
+    # The author never writes this URL, so a hardcoded port here is not
+    # correctable from the bundle: the sandbox dials the wrong port on the right
+    # pod and the MCP server never answers.
+    spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", port=port)
+    url = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "grafana", spec)["url"]
+    assert url == f"http://acme-rel-acme-bot-mcp-grafana.acme-ns.svc.cluster.local:{port}/mcp"

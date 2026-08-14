@@ -155,7 +155,15 @@ def render_connector_manifests(
     objects: list[dict[str, Any]] = []
     for name, spec in sorted(connectors.connectors.items()):
         objects.extend(
-            connector_render.render(release, agent, namespace, app_name, name, spec, secret_name)
+            connector_render.render(
+                release=release,
+                agent=agent,
+                namespace=namespace,
+                app_name=app_name,
+                connector=name,
+                spec=spec,
+                secret_name=secret_name,
+            )
         )
     return objects
 
