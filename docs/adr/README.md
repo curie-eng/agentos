@@ -138,4 +138,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Draft |
 | 0107 | [An agent reads its own runs through a first-party surface, scoped by structured identity](0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md) | Draft |
 | 0108 | [A deploy target carries its environment's values](0108-a-deploy-target-carries-its-environments-values.md) | Draft |
+| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
 <!-- END GENERATED: adr-index -->
