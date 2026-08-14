@@ -306,7 +306,9 @@ def test_python_pin_revert_is_rejected() -> None:
 
 def test_npm_version_removal_is_rejected() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    for current in _dockerfile_global_npm_operands(dockerfile):
+    npm_operands = _dockerfile_global_npm_operands(dockerfile)
+    assert len(npm_operands) >= 2
+    for current in npm_operands:
         package, version = _split_npm_operand(current)
         assert version and _EXACT_NPM_VERSION.fullmatch(version)
         assert dockerfile.count(current) == 1
