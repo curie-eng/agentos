@@ -73,7 +73,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0041 | [Every verb is answered at every tier](0041-every-verb-is-answered-at-every-tier.md) | Accepted |
 | 0042 | [Adopt LLM-as-a-Verifier: a continuous-score semantic grader and a live progress signal](0042-llm-as-a-verifier-grader-and-progress-signal.md) | Accepted |
 | 0043 | [The interface catalog is generated from declared front-matter and gated in CI](0043-generated-interface-catalog-and-doc-lint-gate.md) | Accepted |
-| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Draft |
+| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Accepted |
 | 0045 | [The status line is the mutable part of an immutable ADR](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) | Accepted |
 | 0046 | [Converged approval gates: durable provenance, loud route resolution, and observe-only resume reconciliation](0046-converged-approval-gates-and-durable-provenance.md) | Accepted |
 | 0047 | [ADR-0047: Canonical env-var names for the API base URL and model credential](0047-canonical-env-var-names.md) | Accepted |
@@ -117,7 +117,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0085 | [Acceptance, not implementation, authorizes an ADR](0085-acceptance-not-implementation-authorizes-an-adr.md) | Accepted |
 | 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Accepted |
 | 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Draft |
-| 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Draft |
+| 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Accepted |
 | 0089 | [Bundles declare their deploy targets](0089-bundles-declare-their-deploy-targets.md) | Accepted |
 | 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Accepted |
 | 0091 | [Git-flow resolves deploy targets, so one repo serves many agents](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md) | Accepted |
@@ -132,5 +132,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
 | 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
-| 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Draft |
+| 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Accepted |
 <!-- END GENERATED: adr-index -->

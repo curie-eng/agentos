@@ -2,7 +2,7 @@
 
 Date: 2026-08-10
 
-Status: Draft
+Status: Accepted
 
 Implements [#1226](https://github.com/curie-eng/curie/issues/1226).
 
