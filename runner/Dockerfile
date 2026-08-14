@@ -36,7 +36,7 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && rm -rf /var/lib/apt/lists/*
 
 # The Claude Code CLI the SDK spawns for a real (non-fake) session.
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code@2.1.231
 
 # Off-the-shelf MCP servers pre-installed at build time so a bundle that
 # declares one starts it from the on-disk binary with NO runtime network fetch
@@ -44,7 +44,7 @@ RUN npm install -g @anthropic-ai/claude-code
 # anyway). Bundles reference these by the package's bin name, e.g.
 # `"command": "mcp-server-github"` -- see examples/github-issues. Add a line here
 # to bless another authed third-party MCP server for the same shape.
-RUN npm install -g @modelcontextprotocol/server-github
+RUN npm install -g @modelcontextprotocol/server-github@2025.4.8
 
 WORKDIR /app
 
@@ -67,8 +67,8 @@ RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir ./packages/aci-protocol ./packages/plugin-format \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && /app/.venv/bin/pip install --no-cache-dir \
-        "claude-agent-sdk==0.2.115" \
-        "aiohttp==3.14.1" \
+        "claude-agent-sdk==0.2.126" \
+        "aiohttp==3.14.3" \
         "opentelemetry-sdk==1.44.0" \
         "opentelemetry-exporter-otlp-proto-http==1.44.0" \
         "anyio==4.14.1"

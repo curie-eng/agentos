@@ -137,11 +137,13 @@ paths = [
   '''^\.gitleaks\.toml$''',
 ]
 
-# Pre-existing fixture ids. Every one is obviously invented -- it spells a
-# word (C0MANAGERS), repeats a character (C0FFFFFF6), or is mostly zeroes
-# (C000000A01). That is the bar for a new one: a reader must be able to tell
-# at a glance that it is not somebody's channel. Adding to this list should be
-# rare; prefer reusing C0EXAMPLE1.
+# Gitleaks stopwords are case insensitive substring matches, so an entry
+# suppresses any longer identifier containing it, including identifiers
+# prefixed by that entry. Every value is an
+# obviously invented fixture id: it spells a word (C0MANAGERS), repeats a
+# character (C0FFFFFF6), or is mostly zeroes (C000000A01). That is the bar for
+# a new one: a reader must be able to tell at a glance that it is not somebody's
+# channel. Adding to this list should be rare; prefer reusing C0EXAMPLE1.
 stopwords = [
   "C000000A01",
   "C000000A02",
@@ -172,6 +174,14 @@ stopwords = [
   "C000000S03",
   "C000000S04",
   "C000000S05",
+  # S06 to S09 exist only in history: the per-agent secret-delivery work
+  # introduced them and later edited them away, but gitleaks scans every
+  # commit, so an id absent from the tree still fails the scan forever.
+  # Registering them is the only fix that does not rewrite history.
+  "C000000S06",
+  "C000000S07",
+  "C000000S08",
+  "C000000S09",
   "C000000X01",
   "C0000BND1",
   "C0000BND2",
@@ -236,4 +246,5 @@ commits = [
   # repository's existence and name as disclosed.
   "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
   "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
+  "33505bd401c915ed7254ab6172a4f337eeeb5f77",  # object store role examples, scrubbed from HEAD
 ]

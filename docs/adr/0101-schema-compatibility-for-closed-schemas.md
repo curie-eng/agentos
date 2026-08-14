@@ -4,6 +4,13 @@ Date: 2026-08-10
 
 Status: Accepted
 
+**Amended by [ADR-0103](0103-previous-schema-shape-gate.md)**
+(back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the gate described in Decision section 4 is overtaken. The shipped gate uses a
+name based comparison of `properties` and `required` against the previous
+committed revision. Type changes, enum narrowings, and const flips are out of
+scope. The rest of this ADR stands.
+
 Implements [#1075](https://github.com/curie-eng/curie/issues/1075).
 
 **Amends ADR-0074** ("Versioned JSON Schemas for every agent-facing CLI result").

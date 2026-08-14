@@ -124,7 +124,11 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Draft |
 | 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Accepted |
 | 0095 | [One tiered memory lifecycle for agent and channel memory](0095-tiered-memory-lifecycle.md) | Draft |
+| 0096 | [A third-party port adapter is a deployed service, not a loaded plugin](0096-port-adapters-are-deployed-services.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
+| 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
+| 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
+| 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Draft |
 <!-- END GENERATED: adr-index -->

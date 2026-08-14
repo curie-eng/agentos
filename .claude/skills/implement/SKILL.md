@@ -64,7 +64,11 @@ Classify from the work, not from a requested process size.
 | Build | Multiple streams, architecture, security, deployment, or unclear interactions | Written plan, separate test and implementation contexts, reviews, and real surface verification when applicable |
 
 Promote a direct or quick change when its real scope exceeds the selected path. Do
-not add a planning artifact for a trivial mechanical change.
+not add a planning artifact for a trivial mechanical change. If a quick change
+turns up an assumption that qualifies for the de risk gate below, promote it to
+build before its first edit. If that assumption only appears after an edit, stop
+and either escalate or restart as a build path change; do not carry those edits
+forward.
 
 ## Build rules
 
@@ -82,6 +86,52 @@ For a build path, write a short plan that identifies behavior sites, affected fi
 test strategy, edge cases, and observable done conditions before implementation.
 Have an independent available provider review the plan when the change is
 architectural or crosses a contract boundary.
+
+## De risk gate
+
+Default to no spike. Evaluate this gate only on the build path, after the plan and
+any plan review, and before the first test is written. A direct or quick change
+never runs a spike.
+
+Run a spike only when all four of these hold:
+
+1. The plan depends on a specific claim that has not been observed.
+2. If that claim is false, the plan, scope, a dependency, or the architecture
+   materially changes.
+3. Documentation, source, existing tests, and prior observed evidence cannot settle
+   the claim confidently.
+4. A bounded experiment is materially cheaper than discovering the false claim
+   during implementation.
+
+If a failed assumption would not change an implementation decision, do not spike.
+Treat the economics as a high bar, not a calculation. There should be a plausible
+chance the assumption is wrong, failure should cost about a day of work or
+invalidate a whole stream, the probe should fit inside thirty minutes, and the
+avoided waste should clearly exceed the probe cost. Do not compute a numeric
+probability.
+
+Choose one of two kinds:
+
+- Tracer, preferred whenever the experiment can safely be the first narrow
+  production slice. It is kept production code and follows the normal test first,
+  review, and verification rules. Run that slice alone: write its test, implement
+  it, and harvest its observable result before releasing any remaining stream.
+- Throwaway, allowed only when execution is required and the evidence cannot come
+  from a safe production slice. Brief exactly one uncertainty, one observable pass
+  or fail result, a scope limited to that question, a cap of thirty minutes, and a
+  written finding. Run it outside the committed tree, never commit it, harvest the
+  evidence, then delete it. Code existing is not a finding.
+
+Run at most two throwaway spikes in one run without explicit user approval. If a
+spike does not settle its question inside the cap, stop it and either halt or
+escalate. Do not let it drift into implementation.
+
+Every finding must confirm, revise, or reject the plan. When a finding materially
+changes the plan, revise the plan and repeat whichever plan review applied to it. A
+throwaway must settle before any test for the change is written. After a tracer, no
+remaining stream proceeds until a revised plan clears that same review. When a
+finding exposes unclear acceptance criteria or product behavior, stop and ask. A
+spike gathers technical evidence and never makes a product decision.
 
 ## Review and verification
 
