@@ -23,12 +23,17 @@ is what makes a rebind observable to a credential minted before it.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import hmac
 import json
 import time
 from dataclasses import dataclass
+
+# The base64url/HMAC primitives, borrowed rather than copied. The sibling-module
+# decision above is about the CLAIMS and the mint/verify surface; these three
+# carry no claims at all, so there is no reason for a second copy of them. The
+# import direction is one-way -- `sandbox_token` is untouched, so its
+# byte-identical api/worker twin still holds.
+from .sandbox_token import _b64url, _b64url_decode, _signature
 
 _PREFIX = "chn"
 
@@ -36,20 +41,6 @@ _PREFIX = "chn"
 # mint site and at the ingress dependency -- the string IS the contract, exactly
 # as `state`/`state.app` are for the sandbox token.
 CHANNEL_ENQUEUE_SCOPE = "channel.enqueue"
-
-
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(seg: str) -> bytes:
-    pad = "=" * (-len(seg) % 4)
-    return base64.urlsafe_b64decode(seg + pad)
-
-
-def _signature(api_key: str, signing_input: str) -> str:
-    digest = hmac.new(api_key.encode(), signing_input.encode(), hashlib.sha256).digest()
-    return _b64url(digest)
 
 
 def mint(

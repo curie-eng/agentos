@@ -26,14 +26,13 @@ import json
 import logging
 from collections.abc import Mapping
 from typing import Protocol
-from urllib.parse import urlsplit
 
 import aiohttp
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from pydantic import BaseModel, ConfigDict
 
 from .config import WorkerConfig
-from .slack_sink import SlackReplyAdapter
+from .slack_sink import SlackReplyAdapter, _redacted
 
 logger = logging.getLogger(__name__)
 
@@ -59,25 +58,6 @@ _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
     aiohttp.ClientConnectionError,
     asyncio.TimeoutError,
 )
-
-
-def _redacted(endpoint: str | None) -> str:
-    """An endpoint reduced to scheme and host, for a message a human will read.
-
-    An endpoint can carry a token in its path or query, and these messages reach
-    worker logs, dead-letter rows and tickets. Scheme plus host is enough for an
-    operator to recognize which adapter is meant. Same shape as the API side's
-    helper (``alembic/versions/0024_...``), deliberately: one redaction form
-    across the two halves of the binding route.
-    """
-
-    if not endpoint:
-        return "unset"
-    parsed = urlsplit(endpoint)
-    if not parsed.scheme or not parsed.hostname:
-        return "an unparseable endpoint"
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
 
 
 class MissingAdapterCredentialError(RuntimeError):
@@ -160,6 +140,29 @@ class HttpReplyAdapter:
     def __init__(self, credentials: Mapping[str, str], *, timeout_s: float = 30.0) -> None:
         self._credentials = dict(credentials)
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
+        # ONE session for the adapter's whole life, mirroring the Slack sibling's
+        # cached ``AsyncWebClient``: a session per emitted event throws away the
+        # connection pool (and its keep-alive) on every streamed reply.update, so
+        # a chatty turn pays a fresh TCP + TLS handshake per edit against the same
+        # endpoint. Built lazily because a ``ClientSession`` binds the running
+        # loop at construction and the adapter is wired at import-time in ``run``.
+        self._session: aiohttp.ClientSession | None = None
+
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        """The cached session, created on first use.
+
+        No lock: this is asyncio, and there is no ``await`` between the check and
+        the assignment, so two concurrent turns cannot both create one.
+        """
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
+    async def aclose(self) -> None:
+        """Release the cached session. Idempotent, and safe when none was built."""
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
 
     def _secret_for(self, route: TargetRoute) -> tuple[str, str]:
         """The (endpoint, secret) pair, or raise having sent nothing."""
@@ -191,30 +194,30 @@ class HttpReplyAdapter:
         endpoint, secret = self._secret_for(route)
         body = event.model_dump_json()
         headers = {"Content-Type": "application/json", ADAPTER_SECRET_HEADER: secret}
+        session = self._ensure_session()
         try:
-            async with aiohttp.ClientSession(timeout=self._timeout) as session:
-                # ``allow_redirects=False``: aiohttp's default replays the request,
-                # secret header and all, at the Location the ENDPOINT chose, so a
-                # redirecting adapter would be a cross-origin credential-exfil
-                # primitive. Refuse the redirect instead of following it.
-                async with session.post(
-                    endpoint, data=body, headers=headers, allow_redirects=False
-                ) as response:
-                    if 300 <= response.status < 400:
-                        raise RedirectedAdapterEndpointError(
-                            f"adapter endpoint {_redacted(endpoint)} answered "
-                            f"{response.status} (redirect); refusing to re-send the "
-                            "egress credential to the redirect target"
-                        )
-                    if response.status >= 400:
-                        # NOT ``raise_for_status()``: see
-                        # ``RejectedAdapterResponseError``. The status is the
-                        # whole diagnostic; the URL is the part that leaks.
-                        raise RejectedAdapterResponseError(
-                            f"adapter endpoint {_redacted(endpoint)} answered "
-                            f"{response.status}; the delivery failed"
-                        )
-                    payload = await _read_capped(response, endpoint)
+            # ``allow_redirects=False``: aiohttp's default replays the request,
+            # secret header and all, at the Location the ENDPOINT chose, so a
+            # redirecting adapter would be a cross-origin credential-exfil
+            # primitive. Refuse the redirect instead of following it.
+            async with session.post(
+                endpoint, data=body, headers=headers, allow_redirects=False
+            ) as response:
+                if 300 <= response.status < 400:
+                    raise RedirectedAdapterEndpointError(
+                        f"adapter endpoint {_redacted(endpoint)} answered "
+                        f"{response.status} (redirect); refusing to re-send the "
+                        "egress credential to the redirect target"
+                    )
+                if response.status >= 400:
+                    # NOT ``raise_for_status()``: see
+                    # ``RejectedAdapterResponseError``. The status is the
+                    # whole diagnostic; the URL is the part that leaks.
+                    raise RejectedAdapterResponseError(
+                        f"adapter endpoint {_redacted(endpoint)} answered "
+                        f"{response.status}; the delivery failed"
+                    )
+                payload = await _read_capped(response, endpoint)
         except _UNREACHABLE_ERRORS as exc:
             if best_effort_unreachable:
                 logger.warning(
@@ -286,6 +289,18 @@ class ReplySinkRouter:
         return await sink.emit(
             event, route=route, best_effort_unreachable=best_effort_unreachable
         )
+
+    async def aclose(self) -> None:
+        """Release every adapter that holds a connection of its own.
+
+        ``getattr``: ``ReplySink`` is the kernel's whole view of egress and does
+        not carry a teardown verb, so an adapter with nothing to release (the
+        Slack one, whose SDK client owns its own transport) simply has no hook.
+        """
+        for sink in (*self._adapters.values(), self._default):
+            closer = getattr(sink, "aclose", None)
+            if closer is not None:
+                await closer()
 
 
 def build_reply_sink(config: WorkerConfig) -> ReplySinkRouter:

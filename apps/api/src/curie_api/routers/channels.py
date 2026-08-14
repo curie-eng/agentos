@@ -55,8 +55,14 @@ from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..deps import SessionDep
+
+# The API's Valkey client is built without `decode_responses`, so values come
+# back as bytes; `_text` is the package's named, documented decode for exactly
+# that, and this router is not the place for a seventh copy of the expression.
+from ..graveyardwatcher import _text
 from ..models import AgentChannel
 from ..schemas import ChannelBinding
+from ..wirebody import read_bounded_body
 
 logger = logging.getLogger(__name__)
 
@@ -203,47 +209,6 @@ class TurnAccepted(BaseModel):
 # --- shared helpers -----------------------------------------------------------
 
 
-async def _read_bounded_body(request: Request, max_bytes: int) -> bytes:
-    """Read the request body, rejecting anything over ``max_bytes`` early.
-
-    The bound is enforced BEFORE the body is buffered, parsed, or authenticated,
-    so an oversized body cannot make the app hold it in memory on a route an
-    adapter reaches from outside the first-party network. A declared
-    ``Content-Length`` over the bound is refused without reading a byte; then the
-    body is read in chunks and refused the moment the accumulated size crosses
-    the bound, so an absent (chunked), understated or unparseable
-    ``Content-Length`` is held to the same limit.
-
-    The same shape as ``routers/github.py``'s ``_read_bounded_body`` and
-    ``routers/bundles.py``'s ``_read_bounded_upload``; each keeps its own message
-    because the surface an operator is reading about differs.
-    """
-
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            declared_len = int(declared)
-        except ValueError:
-            declared_len = -1  # unparseable: fall through to streamed enforcement
-        if declared_len > max_bytes:
-            raise HTTPException(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                "channel turn body exceeds the maximum size",
-            )
-
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(
-                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                "channel turn body exceeds the maximum size",
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
-
-
 def _parse_turn(raw: bytes) -> TurnIn:
     """Validate the raw body as a `TurnIn`, reporting failures as FastAPI would.
 
@@ -368,12 +333,15 @@ def _sha16(delivery_id: str) -> str:
     return hashlib.sha256(delivery_id.encode()).hexdigest()[:16]
 
 
-def _event_id(channel_id: uuid.UUID, delivery_id: str) -> str:
-    return f"chn-{channel_id}-{_sha16(delivery_id)}"
+# Both names below are built from the SAME digest of the same `delivery_id`, so
+# the handler hashes once and hands the digest to each: they name one delivery,
+# and re-deriving it per name is work paid on every ingress request.
+def _event_id(channel_id: uuid.UUID, digest: str) -> str:
+    return f"chn-{channel_id}-{digest}"
 
 
-def _claim_key(channel_id: uuid.UUID, delivery_id: str) -> str:
-    return f"{_CLAIM_PREFIX}:delivery:{channel_id}:{_sha16(delivery_id)}"
+def _claim_key(channel_id: uuid.UUID, digest: str) -> str:
+    return f"{_CLAIM_PREFIX}:delivery:{channel_id}:{digest}"
 
 
 def _verify_credential(x_api_key: str | None) -> channel_token.ChannelClaims | None:
@@ -427,7 +395,7 @@ def _authorize(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
-def _mint_turn(row: AgentChannel, body: TurnIn) -> QueuedTurn:
+def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     """Build the `QueuedTurn` from the BINDING ROW plus the delivery's content.
 
     Three fields the request gets no say in: `kind` (the routing half),
@@ -435,10 +403,14 @@ def _mint_turn(row: AgentChannel, body: TurnIn) -> QueuedTurn:
     authenticates it). This is the only mint site that produces non-Slack turns,
     so leaving `adapter` unset here would leave every production email turn
     without an egress-credential selector on the pre-resolution path.
+
+    `event_id` is passed in rather than re-derived: the handler needs it before
+    the claim (every duplicate answer carries it) and this turn must carry the
+    identical one.
     """
 
     return QueuedTurn(
-        event_id=_event_id(row.id, body.delivery_id),
+        event_id=event_id,
         conversation_id=body.conversation_id,
         author=body.author,
         text=body.text,
@@ -473,10 +445,6 @@ async def _claim_delivery(
     return bool(await client.set(key, owner, nx=True, ex=lease_s))
 
 
-def _as_str(value: Any) -> str:
-    return value.decode() if isinstance(value, bytes) else str(value)
-
-
 async def _enqueue_owned(
     client: redis.Redis,
     *,
@@ -503,7 +471,7 @@ async def _enqueue_owned(
         str(lease_s),
     )
     enqueued, current = result
-    return bool(enqueued), _as_str(current)
+    return bool(enqueued), _text(current)
 
 
 async def _take_backlog_slot(
@@ -572,7 +540,11 @@ async def ingest_turn(
     """
 
     settings = get_settings()
-    raw = await _read_bounded_body(request, settings.channel_turn_max_body_bytes)
+    raw = await read_bounded_body(
+        request,
+        settings.channel_turn_max_body_bytes,
+        subject="channel turn body",
+    )
     body = _parse_turn(raw)
     claims = _verify_credential(x_api_key)
     row = await _resolve_binding(session, body.kind, body.address)
@@ -588,11 +560,12 @@ async def ingest_turn(
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
 
-    turn = _mint_turn(row, body)
+    # One hash of the `delivery_id`, shared by the two names derived from it.
+    digest = _sha16(body.delivery_id)
+    event_id = _event_id(row.id, digest)
     client: redis.Redis = request.app.state.valkey
-    key = _claim_key(row.id, body.delivery_id)
+    key = _claim_key(row.id, digest)
     owner = f"pending:{secrets.token_hex(16)}"
-    payload = turn.model_dump_json()
 
     # The generation, re-read at the LAST moment before the claim. The row above
     # was loaded at the top of the request, and `update_agent_binding` bumps the
@@ -631,7 +604,7 @@ async def ingest_turn(
                 logger.warning(
                     "channel ingress refused event_id=%s kind=%s: binding backlog "
                     "quota of %d per %ds exceeded",
-                    turn.event_id,
+                    event_id,
                     row.kind,
                     settings.channel_binding_backlog_limit,
                     settings.channel_binding_backlog_window_s,
@@ -643,30 +616,36 @@ async def ingest_turn(
                         "Retry-After": str(settings.channel_binding_backlog_window_s)
                     },
                 )
+            # Minted and serialized only once this request holds both the claim
+            # and a quota slot: an adapter retrying an already-enqueued delivery
+            # is the steady state for an at-least-once ingress, and every one of
+            # those requests answers from `event_id` alone and would have thrown
+            # the payload away.
+            turn = _mint_turn(row, body, event_id)
             enqueued, current = await _enqueue_owned(
                 client,
                 key=key,
                 stream=settings.runs_stream,
                 owner=owner,
-                payload=payload,
+                payload=turn.model_dump_json(),
                 lease_s=settings.channel_delivery_lease_s,
             )
             if enqueued:
                 logger.info(
                     "channel ingress enqueued event_id=%s stream_id=%s kind=%s",
-                    turn.event_id,
+                    event_id,
                     current,
                     row.kind,
                 )
                 return TurnAccepted(
-                    event_id=turn.event_id, stream_id=current, duplicate=False
+                    event_id=event_id, stream_id=current, duplicate=False
                 )
             # Branch (c): our lease was re-claimed while we were slow. The other
             # claimant owns the delivery; we do not enqueue on top of it.
-            return _duplicate(turn.event_id, current, response)
+            return _duplicate(event_id, current, response)
         held = await client.get(key)
         if held is not None:
-            return _duplicate(turn.event_id, _as_str(held), response)
+            return _duplicate(event_id, _text(held), response)
 
     response.status_code = status.HTTP_202_ACCEPTED
-    return TurnAccepted(event_id=turn.event_id, stream_id=None, duplicate=True)
+    return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)

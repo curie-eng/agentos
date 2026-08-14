@@ -91,16 +91,19 @@ from .threadlock import ThreadLock
 logger = logging.getLogger(__name__)
 
 
-def _target_for(qevent: QueuedTurn, *, address: str | None = None) -> ReplyTarget:
+def _target_for(qevent: QueuedTurn) -> ReplyTarget:
     """This turn's reply address, in the channel's own (opaque) terms.
 
-    ``address`` overrides only for a policy-routed approval card, which is
-    delivered to a channel the turn never came from.
+    Pure and derived wholly from the turn, so every path that holds a
+    ``QueuedTurn`` calls it rather than being handed the answer. The two targets
+    that are NOT this turn's -- the policy-routed approval card and the settled
+    card, both addressed to a channel the turn may never have come from -- build
+    their own ``ReplyTarget`` inline and deliberately do not come through here.
     """
     handle = qevent.reply_handle
     return ReplyTarget(
         kind=handle.kind,
-        address=address or handle.channel,
+        address=handle.channel,
         conversation_id=qevent.conversation_id,
         reply_ref=handle.placeholder,
     )
@@ -478,12 +481,11 @@ class Kernel:
                 # transport the escalation text went to.
                 await self._escalate(
                     qevent,
-                    target,
                     route,
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
                 )
-                await self._complete(qevent, target, route, "escalated")
+                await self._complete(qevent, route, "escalated")
                 return
 
             # Deployment-to-runtime binding: resolve which agent/version this
@@ -509,7 +511,6 @@ class Kernel:
                     # sends an operator hunting a binding that is right there.
                     await self._drop_with_message(
                         qevent,
-                        target,
                         route,
                         "No agent is configured for this "
                         f"{qevent.reply_handle.kind} address "
@@ -530,7 +531,6 @@ class Kernel:
                 ):
                     await self._drop_with_message(
                         qevent,
-                        target,
                         route,
                         "This agent is paused by an operator. Try again once it resumes.",
                     )
@@ -603,13 +603,13 @@ class Kernel:
                 # in silence. Best-effort and outside the concurrency-critical
                 # section, like the clear below.
                 if self._config.shimmer:
-                    await self._set_shimmer(qevent, target, route, packs)
+                    await self._set_shimmer(qevent, route, packs)
 
             attempt = 0
             while True:
                 attempt += 1
                 outcome = await self._attempt(
-                    qevent, target, route, release_order, boot_env, agent_id, nav, packs
+                    qevent, route, release_order, boot_env, agent_id, nav, packs
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -617,36 +617,34 @@ class Kernel:
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
                     await self._pause_for_approval(
-                        qevent, target, route, outcome, agent_id, approval_routes
+                        qevent, route, outcome, agent_id, approval_routes
                     )
-                    await self._complete(qevent, target, route, "awaiting-approval")
+                    await self._complete(qevent, route, "awaiting-approval")
                     return
 
                 if outcome.terminal_ok:
-                    await self._complete(qevent, target, route, "delivered")
+                    await self._complete(qevent, route, "delivered")
                     return
 
                 if outcome.saw_side_effect:
                     await self._escalate(
                         qevent,
-                        target,
                         route,
                         f"The run hit an error ({outcome.classification or 'unknown'}) after "
                         "starting an action; not retrying automatically. Flagging for a human.",
                     )
-                    await self._complete(qevent, target, route, "escalated")
+                    await self._complete(qevent, route, "escalated")
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
                     await self._escalate(
                         qevent,
-                        target,
                         route,
                         f"The run failed ({outcome.classification or 'unknown'}) after "
                         f"{attempt} attempt(s). Flagging for a human.",
                     )
-                    await self._complete(qevent, target, route, "escalated")
+                    await self._complete(qevent, route, "escalated")
                     return
 
                 await asyncio.sleep(self._backoff(attempt))
@@ -868,14 +866,13 @@ class Kernel:
     async def _drop_with_message(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         message: str,
     ) -> None:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
-        await self._reply(target, route, message)
-        await self._complete(qevent, target, route, "dropped")
+        await self._reply(_target_for(qevent), route, message)
+        await self._complete(qevent, route, "dropped")
 
     async def _reply(
         self,
@@ -900,7 +897,6 @@ class Kernel:
     async def _complete(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         outcome: str,
     ) -> None:
@@ -929,7 +925,7 @@ class Kernel:
             event=TurnCompleted(
                 version=REPLY_WIRE_VERSION,
                 event="turn.completed",
-                target=target,
+                target=_target_for(qevent),
                 event_id=event_id,
                 outcome=cast("Any", outcome),
             ),
@@ -938,7 +934,7 @@ class Kernel:
             done=False,
         )
         generation = await self._markers.mark_completion_pending(event_id, record)
-        await self._markers.mark_done(event_id, also_flag_completion=event_id)
+        await self._markers.mark_done(event_id)
         await self._deliver_completion(record, generation=generation)
 
     async def _deliver_completion(
@@ -1001,8 +997,13 @@ class Kernel:
         )
         await self._markers.drop_pending_member(event_id)
 
-    async def sweep_pending_completions(self) -> int:
-        """Drain the completion outbox. Returns how many completions were sent.
+    async def sweep_pending_completions(self) -> None:
+        """Drain the completion outbox, logging what it recovered.
+
+        A pass that delivers anything is by definition recovering a completion an
+        earlier turn owed and never confirmed, so it says so at INFO rather than
+        answering with a count both callers threw away. A quiet pass -- the
+        normal case -- stays silent.
 
         Called from the consumer's maintenance loop and once at startup, which
         is the case redelivery can NEVER reach: once a stream entry is acked
@@ -1040,7 +1041,13 @@ class Kernel:
         batch = await self._markers.pending_completions(
             self._config.completion_sweep_batch
         )
-        for seen, event_id in enumerate(sorted(batch)):
+        # ONE pipeline for the whole batch's records: the reads are independent
+        # of each other and of every delivery decision below, so paying a round
+        # trip per member (up to completion_sweep_batch of them, on the same
+        # Valkey the kernel's locks live on) bought nothing. The wall-time budget
+        # still bounds the part that is actually slow -- the delivery attempts.
+        stored_batch = await self._markers.read_completions(sorted(batch))
+        for seen, (event_id, stored) in enumerate(stored_batch.items()):
             if time.time() >= deadline:
                 logger.info(
                     "completion sweep budget (%.0fs) reached after %d record(s); "
@@ -1049,10 +1056,8 @@ class Kernel:
                     seen,
                 )
                 break
-            try:
-                stored = await self._markers.read_completion(event_id)
-            except MalformedCompletionError as exc:
-                await self._quarantine_completion(event_id, exc)
+            if isinstance(stored, MalformedCompletionError):
+                await self._quarantine_completion(event_id, stored)
                 continue
             if stored is None:
                 # A member whose payload is gone: some emitter confirmed
@@ -1086,12 +1091,14 @@ class Kernel:
                 continue
             if await self._deliver_completion(record, generation=stored.generation):
                 sent += 1
-        return sent
+        if sent:
+            logger.info(
+                "completion sweep delivered %d owed turn.completed event(s)", sent
+            )
 
     async def _set_shimmer(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         packs: BehaviorPacks,
     ) -> None:
@@ -1124,7 +1131,7 @@ class Kernel:
             # An operator who blanks status_text wants no caption at all; setting
             # an empty status would read as a clear, not as a shimmer.
             return
-        await self._emit_status(target, route, caption)
+        await self._emit_status(_target_for(qevent), route, caption)
 
     async def _emit_status(
         self, target: ReplyTarget, route: TargetRoute, status: str
@@ -1157,7 +1164,6 @@ class Kernel:
     async def _attempt(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         release_order: Callable[[], None],
         boot_env: dict[str, str] | None = None,
@@ -1166,6 +1172,7 @@ class Kernel:
         packs: BehaviorPacks | None = None,
     ) -> TurnOutcome:
         thread = qevent.conversation_id
+        target = _target_for(qevent)
 
         # Surface a booting state on the placeholder so the (up to claim_timeout)
         # cold-boot wait is not silent. Best-effort and outside the per-thread lock:
@@ -1236,7 +1243,7 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
-            return await self._consume(qevent, target, route, routed.turn, nav)
+            return await self._consume(qevent, route, routed.turn, nav)
         finally:
             self._unregister_run(agent_id, thread)
 
@@ -1507,8 +1514,7 @@ class Kernel:
     async def _pause_for_approval(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
-        route_: TargetRoute,
+        route: TargetRoute,
         outcome: TurnOutcome,
         agent_id: uuid.UUID | None,
         approval_routes: dict[str, Any] | None = None,
@@ -1534,17 +1540,20 @@ class Kernel:
         thread = qevent.conversation_id
         summary = outcome.approval_summary or outcome.text or "Approval requested"
 
-        # Resolve the manifest route (#247) to its workspace channel. A named
+        # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
-        route = outcome.approval_route
+        # Named ``route_name``, not ``route``: this is the approval manifest's
+        # route identifier, a different concept from the turn's ``TargetRoute``
+        # above, and one word for the two is what forced the old ``route_``.
+        route_name = outcome.approval_route
         # The card's destination is a (kind, address) PAIR, never an address on
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
         # happens to equal a Slack policy channel as "the requesting channel".
         card_kind = qevent.reply_handle.kind
         card_channel = qevent.reply_handle.channel
-        if route:
-            binding = (approval_routes or {}).get(route)
+        if route_name:
+            binding = (approval_routes or {}).get(route_name)
             bound = binding.get("channel") if isinstance(binding, dict) else None
             if bound:
                 # A policy channel is a Slack channel id by construction
@@ -1556,14 +1565,13 @@ class Kernel:
                 logger.warning(
                     "approval route %r is not bound for agent %s; escalating "
                     "rather than routing the card to the requesting channel",
-                    route,
+                    route_name,
                     agent_id,
                 )
                 await self._escalate(
                     qevent,
-                    target,
-                    route_,
-                    f"The run requested approval via route {route!r}, but that "
+                    route,
+                    f"The run requested approval via route {route_name!r}, but that "
                     "route is not bound to a channel for this agent; flagging for "
                     "a human instead of widening the request to this channel.",
                 )
@@ -1572,8 +1580,7 @@ class Kernel:
         if self._approvals is None:
             await self._escalate(
                 qevent,
-                target,
-                route_,
+                route,
                 "The run requested an approval, but no approval backend is "
                 "configured on this worker; flagging for a human instead of pausing.",
             )
@@ -1597,7 +1604,7 @@ class Kernel:
                     reply_endpoint=qevent.reply_handle.endpoint,
                     reply_adapter=qevent.reply_handle.adapter,
                     dedupe_key=qevent.event_id,
-                    route=route,
+                    route=route_name,
                     card_channel=card_channel,
                     # The ACI ``final`` frame types this as a bare ``str``, so an
                     # unrecognized value only fails when the shared model
@@ -1618,8 +1625,7 @@ class Kernel:
             logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
             await self._escalate(
                 qevent,
-                target,
-                route_,
+                route,
                 "The run requested an approval, but the approval record could "
                 "not be created; flagging for a human instead of pausing.",
             )
@@ -1647,7 +1653,9 @@ class Kernel:
             "The session is paused and will resume once an authorized member "
             "resolves this request."
         )
-        await self._reply(target, route_, f"{base}\n\n{notice}" if base else notice)
+        await self._reply(
+            _target_for(qevent), route, f"{base}\n\n{notice}" if base else notice
+        )
 
         # The card's destination -- kind AND route -- is selected from the
         # channel it POSTS TO, never from the turn that requested it. In the
@@ -1673,7 +1681,7 @@ class Kernel:
             qevent.reply_handle.channel,
         )
         card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
-        card_adapter = route_.adapter if in_requesting_channel else None
+        card_adapter = route.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
@@ -1790,7 +1798,6 @@ class Kernel:
     async def _consume(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         turn: TurnStream,
         nav: NavAffordance | None = None,
@@ -1798,7 +1805,7 @@ class Kernel:
         acc = _StreamAccumulator()
         reply = _ThrottledReply(
             self._sink,
-            target=target,
+            target=_target_for(qevent),
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
@@ -1898,12 +1905,11 @@ class Kernel:
     async def _escalate(
         self,
         qevent: QueuedTurn,
-        target: ReplyTarget,
         route: TargetRoute,
         message: str,
     ) -> None:
         logger.warning("escalating event %s: %s", qevent.event_id, message)
-        await self._reply(target, route, message)
+        await self._reply(_target_for(qevent), route, message)
 
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))

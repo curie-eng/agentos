@@ -23,12 +23,60 @@ accepts as-is. Two properties this preserves deliberately:
 
 Producers are untouched: they construct these models directly, where an unknown
 field is still an error at the source.
+
+The module is the API's request-body seam generally, so ``read_bounded_body``
+lives here too: the pre-auth size guard is one implementation every router that
+reads its own body calls, rather than a copy per router that has to be audited
+separately.
 """
 
 from typing import Annotated, Any
 
 from aci_protocol import READER_CONTEXT, ApprovalRequest, EvalReport
+from fastapi import HTTPException, Request, status
 from pydantic import BaseModel, BeforeValidator
+
+
+async def read_bounded_body(request: Request, max_bytes: int, *, subject: str) -> bytes:
+    """Read the request body, rejecting anything over ``max_bytes`` early.
+
+    The bound is enforced BEFORE the whole body is buffered, parsed, or
+    authenticated (#633), so an unauthenticated oversized request cannot make
+    the app hold an unbounded body in memory. A declared ``Content-Length`` over
+    the bound is refused without reading a byte; then the body is read in chunks
+    and refused the moment the accumulated size crosses the bound, so an absent
+    or lying ``Content-Length`` (including a chunked/streamed request) is held to
+    the same limit. Raises 413 on an oversized body.
+
+    ``subject`` names the surface in the 413 detail (``"webhook body"``,
+    ``"channel turn body"``): the message is the only thing that differed between
+    the per-router copies of this function, and a message is a parameter, not a
+    reason for a second implementation of the pre-auth memory guard.
+    """
+
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_len = int(declared)
+        except ValueError:
+            declared_len = -1  # unparseable: fall through to streamed enforcement
+        if declared_len > max_bytes:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"{subject} exceeds the maximum size",
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"{subject} exceeds the maximum size",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _reader_decode[M: BaseModel](model: type[M]) -> Any:
@@ -47,4 +95,4 @@ def _reader_decode[M: BaseModel](model: type[M]) -> Any:
 ApprovalRequestBody = Annotated[ApprovalRequest, _reader_decode(ApprovalRequest)]
 EvalReportBody = Annotated[EvalReport, _reader_decode(EvalReport)]
 
-__all__ = ["ApprovalRequestBody", "EvalReportBody"]
+__all__ = ["ApprovalRequestBody", "EvalReportBody", "read_bounded_body"]

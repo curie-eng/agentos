@@ -64,6 +64,11 @@ REAL_SLACK_BASE_URL = "https://slack.com/api/"
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
+# A trusted origin: scheme, host, and either a port that must match exactly or
+# ``None``, which matches ANY port on that scheme+host (the dev/CLI stub's
+# ephemeral port, see ``_configured_origins``).
+_TrustedOrigin = tuple[str, str, int | None]
+
 
 class UntrustedSlackEndpointError(RuntimeError):
     """A turn named a Slack endpoint outside the configured Slack origin.
@@ -85,11 +90,15 @@ def _origin(url: str) -> tuple[str, str, int]:
 def _redacted(url: str | None) -> str:
     """A URL reduced to scheme and host, for a message a human will read.
 
-    The twin of ``reply_sink._redacted`` (and of the API side's helper in
-    ``alembic/versions/0024_...``): a per-turn endpoint can carry a token in its
-    path or query, and refusals and unreachability warnings land in worker logs
-    and dead-letter rows. The origin is the whole point of these messages
-    anyway -- the trust check is an ORIGIN check.
+    The ONE definition for the worker's whole egress path -- ``reply_sink``
+    imports this one rather than keeping a byte-identical twin. (The API side's
+    copy in ``alembic/versions/0024_...`` stays separate on purpose: a migration
+    is frozen at the revision that wrote it and must not import live code.)
+
+    A per-turn endpoint can carry a token in its path or query, and refusals and
+    unreachability warnings land in worker logs and dead-letter rows. The origin
+    is the whole point of these messages anyway -- the trust check is an ORIGIN
+    check.
     """
 
     if not url:
@@ -101,32 +110,24 @@ def _redacted(url: str | None) -> str:
     return f"{parts.scheme}://{parts.hostname}{port}"
 
 
-def _split_trusted(
-    origins: Sequence[str],
-) -> tuple[frozenset[tuple[str, str, int]], frozenset[tuple[str, str]]]:
-    """Split configured dev origins into exact ones and any-port ones.
+def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
+    """Configured dev origins as (scheme, host, port-or-None) triples.
 
-    An entry that names a PORT is matched exactly. An entry that omits the port
-    (``http://host.docker.internal``) trusts any port on that scheme+host: the
-    CLI's stub binds an EPHEMERAL port on `curie chat` and on
-    ``cluster message --listen-port 0``, so there is no port an operator could
-    write down in advance. It is a dev affordance and nothing else -- it widens
-    trust to every port on a named host, so it belongs on a loopback or
-    docker-host name, never in production.
+    An entry that names a PORT keeps it and is matched exactly. An entry that
+    omits the port (``http://host.docker.internal``) carries ``None``, which
+    trusts any port on that scheme+host: the CLI's stub binds an EPHEMERAL port
+    on `curie chat` and on ``cluster message --listen-port 0``, so there is no
+    port an operator could write down in advance. It is a dev affordance and
+    nothing else -- it widens trust to every port on a named host, so it belongs
+    on a loopback or docker-host name, never in production.
     """
-    exact: set[tuple[str, str, int]] = set()
-    any_port: set[tuple[str, str]] = set()
+    configured: set[_TrustedOrigin] = set()
     for raw in origins:
         if not raw:
             continue
         parts = urlsplit(raw)
-        scheme = parts.scheme.lower()
-        host = (parts.hostname or "").lower()
-        if parts.port is None:
-            any_port.add((scheme, host))
-        else:
-            exact.add((scheme, host, parts.port))
-    return frozenset(exact), frozenset(any_port)
+        configured.add((parts.scheme.lower(), (parts.hostname or "").lower(), parts.port))
+    return configured
 
 
 def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
@@ -189,10 +190,9 @@ class SlackReplyAdapter:
         # The configured default is ALWAYS matched exactly, port included: it is
         # a full base URL, and reading it as "any port on slack.com" would widen
         # the production origin.
-        extra_exact, self._trusted_any_port = _split_trusted(trusted_origins)
-        self._trusted_origins = frozenset(
-            {_origin(self._default_base_url or REAL_SLACK_BASE_URL)} | extra_exact
-        )
+        trusted: set[_TrustedOrigin] = {_origin(self._default_base_url or REAL_SLACK_BASE_URL)}
+        trusted.update(_configured_origins(trusted_origins))
+        self._trusted_origins = frozenset(trusted)
         self._clients: dict[str | None, AsyncWebClient] = {}
 
     async def emit(
@@ -252,12 +252,17 @@ class SlackReplyAdapter:
         raise AssertionError(f"unmodelled reply event {event!r}")
 
     def _is_trusted(self, endpoint: str) -> bool:
-        """Is this endpoint's ORIGIN one the operator configured as trusted?"""
+        """Is this endpoint's ORIGIN one the operator configured as trusted?
+
+        Two lookups because a configured entry that named no port is stored with
+        ``None`` and trusts every port on its scheme+host.
+        """
         scheme, host, port = _origin(endpoint)
         return (scheme, host, port) in self._trusted_origins or (
             scheme,
             host,
-        ) in self._trusted_any_port
+            None,
+        ) in self._trusted_origins
 
     def _client_for(self, endpoint: str | None) -> AsyncWebClient:
         """The cached client for this turn's endpoint, or the worker default.

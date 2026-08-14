@@ -37,7 +37,7 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from pydantic import BeforeValidator, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
@@ -85,8 +85,12 @@ def _parse_adapter_credentials(value: object) -> object:
     return value
 
 
+# ``NoDecode`` is load-bearing, not decoration: see ``TrustedOrigins`` below.
+# Without it a blank ``CURIE_ADAPTER_CREDENTIALS`` (the documented "none
+# configured" value) is JSON-decoded by the settings source and raises before
+# ``_parse_adapter_credentials`` can map it to ``{}``.
 AdapterCredentials = Annotated[
-    dict[str, str], BeforeValidator(_parse_adapter_credentials)
+    dict[str, str], NoDecode, BeforeValidator(_parse_adapter_credentials)
 ]
 
 
@@ -115,7 +119,15 @@ def _parse_trusted_origins(value: object) -> object:
     return value
 
 
-TrustedOrigins = Annotated[tuple[str, ...], BeforeValidator(_parse_trusted_origins)]
+# ``NoDecode`` hands the validator the RAW env string. pydantic-settings treats
+# a tuple field as "complex" and JSON-decodes it inside the env source, BEFORE
+# any field validator runs -- so the comma list compose.dev.yaml exports
+# ("http://localhost,http://127.0.0.1,...") raised SettingsError and killed the
+# worker at boot, and the BeforeValidator below was only ever reachable when the
+# env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
+TrustedOrigins = Annotated[
+    tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)
+]
 
 
 class WorkerConfig(BaseSettings):

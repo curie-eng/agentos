@@ -424,19 +424,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_minor() {
-        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.2.7","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.3.1","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.2.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

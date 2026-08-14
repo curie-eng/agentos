@@ -883,7 +883,7 @@ def test_a_rebind_landing_after_verification_is_still_caught_at_the_enqueue(
     likely to matter (an operator re-points a route precisely because something
     is wrong with it).
 
-    The rebind is landed at the real seam by wrapping `_mint_turn`, which the
+    The rebind is landed at the real seam by wrapping `_claim_key`, which the
     handler calls between `_authorize` and the re-read. MUTATION: delete the
     re-read (trust the dependency's check alone) and this enqueues a turn.
     """
@@ -895,7 +895,7 @@ def test_a_rebind_landing_after_verification_is_still_caught_at_the_enqueue(
         channel=_email_channel("midflight@example.test"),
     )
     token = _mint(channels_client, auth_headers, kind="email", address="midflight@example.test")
-    real_mint_turn = channels_router._mint_turn
+    real_claim_key = channels_router._claim_key
 
     def _bump_generation() -> None:
         async def run() -> None:
@@ -914,15 +914,15 @@ def test_a_rebind_landing_after_verification_is_still_caught_at_the_enqueue(
 
         asyncio.run(run())
 
-    def mint_turn_then_rebind(*args: Any, **kwargs: Any) -> Any:
-        turn = real_mint_turn(*args, **kwargs)
+    def claim_key_then_rebind(*args: Any, **kwargs: Any) -> Any:
+        key = real_claim_key(*args, **kwargs)
         # A committed rebind, in the window the re-read exists to narrow. Run on
         # another thread because we are inside the app's event loop.
         with ThreadPoolExecutor(1) as pool:
             pool.submit(_bump_generation).result(timeout=30)
-        return turn
+        return key
 
-    monkeypatch.setattr(channels_router, "_mint_turn", mint_turn_then_rebind)
+    monkeypatch.setattr(channels_router, "_claim_key", claim_key_then_rebind)
 
     refused = _post_turn(channels_client, token, _turn("email", "midflight@example.test"))
     assert refused.status_code == 401, refused.text

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 from typing import Any
 
@@ -850,6 +851,21 @@ async def _serve(handler, path: str = "/ack"):  # noqa: ANN001, ANN202
 
 _SECRET_IN_PATH = "/ack?token=super-secret-token"
 
+_URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+
+
+def _urls_in(message: str) -> list[str]:
+    """Every URL the message printed, whole, so a test can assert the EXACT form.
+
+    A substring assertion (``"http://host" in message``) is satisfied just as
+    happily by the UNREDACTED ``http://host/ack?token=...``, so it cannot tell
+    redaction working from redaction broken -- it only proves the origin is in
+    there somewhere. Pulling each URL out and comparing it whole can, and it
+    also fails when redaction drops the endpoint from the message entirely.
+    """
+
+    return [match.group(0).rstrip(".,;:") for match in _URL_IN_TEXT.finditer(message)]
+
 
 def test_a_chunked_oversize_ack_is_refused_even_with_a_small_first_chunk() -> None:
     # The cap must survive a body that arrives in pieces. ``StreamReader.read(n)``
@@ -943,7 +959,7 @@ def test_a_rejected_delivery_never_puts_the_endpoint_url_in_the_error(
                 )
             message = str(caught.value)
             assert "super-secret-token" not in message
-            assert f"http://127.0.0.1:{server.port}" in message
+            assert _urls_in(message) == [f"http://127.0.0.1:{server.port}"]
             assert str(status) in message
             # And nothing aiohttp built is chained in behind it.
             assert caught.value.__cause__ is None
@@ -967,7 +983,8 @@ def test_a_missing_adapter_identity_names_only_the_endpoint_origin() -> None:
                     endpoint=f"http://adapter.example{_SECRET_IN_PATH}", adapter=None
                 ),
             )
-        assert "super-secret-token" not in str(caught.value)
-        assert "http://adapter.example" in str(caught.value)
+        message = str(caught.value)
+        assert "super-secret-token" not in message
+        assert _urls_in(message) == ["http://adapter.example"]
 
     asyncio.run(go())

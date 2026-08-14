@@ -32,14 +32,14 @@ The outbox also carries a DEDUPE consequence, which is what ``is_terminal``
 answers: a record proves its turn finished, so a turn that owns one must not be
 rerun for as long as that record can exist. Completion emit is at-least-once;
 turn SIDE EFFECTS are at-most-once for the whole outbox retention window, and
-that is why ``mark_done`` widens the marker's own TTL to match whenever a record
-is present.
+that is why ``mark_done`` widens the marker's own TTL to match.
 """
 
 from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -142,14 +142,11 @@ class Markers:
         self._redis = redis
         self._config = config
 
-    async def is_done(self, event_id: str) -> bool:
-        return bool(await self._redis.exists(self._config.done_key(event_id)))
-
     async def is_terminal(self, event_id: str) -> bool:
         """Has this event ALREADY been handled to a terminal state?
 
         The dedupe question the kernel actually needs answered, and it is wider
-        than ``is_done``. ``done_key`` is one marker with one TTL; a turn that
+        than the done marker alone. ``done_key`` is one marker with one TTL; a turn that
         wrote an outbox record is also provably terminal, and that record is
         retained for ``completion_max_retention_s`` (7 days) rather than
         ``idempotency_ttl_s`` (1 day). Reading only the marker let a >24h outage
@@ -169,27 +166,26 @@ class Markers:
             return True
         return _as_str(flag) == "1"
 
-    async def mark_done(self, event_id: str, *, also_flag_completion: str | None = None) -> None:
-        """Mark the event durably done, optionally flagging its outbox record.
+    async def mark_done(self, event_id: str) -> None:
+        """Mark the event durably done AND flag its outbox record, in one call.
 
-        ``also_flag_completion`` makes the two writes ONE round trip so they
-        cannot diverge: a record flagged done without the marker would let a
-        sweeper emit for a turn that is about to rerun, and a marker without the
-        flag would strand the record behind a guard that can never pass once
-        ``done_key`` expires at ``idempotency_ttl_s``.
+        The two writes are ONE round trip so they cannot diverge: a record
+        flagged done without the marker would let a sweeper emit for a turn that
+        is about to rerun, and a marker without the flag would strand the record
+        behind a guard that can never pass once ``done_key`` expires at
+        ``idempotency_ttl_s``.
+
+        There is no marker-only form. Every durable terminal outcome goes through
+        ``Kernel._complete``, which writes the outbox record for THIS event id
+        first, so the record key is always this event's own -- the Lua below is a
+        no-op on the record when the sweeper cleared it concurrently, which is
+        the only case where there is nothing to flag.
 
         It also widens the MARKER's own TTL to the outbox retention window, for
         the reason ``is_terminal`` states: the outbox proves this turn finished
         for 7 days, so a dedupe state that lapses after 1 day can rerun a turn
-        whose completion has already been delivered. A ``mark_done`` with no
-        record keeps the 1-day idempotency TTL -- there is no 7-day evidence to
-        stay consistent with.
+        whose completion has already been delivered.
         """
-        if also_flag_completion is None:
-            await self._redis.set(
-                self._config.done_key(event_id), "1", ex=self._config.idempotency_ttl_s
-            )
-            return
         ttl_s = max(
             self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s)
         )
@@ -197,7 +193,7 @@ class Markers:
             _MARK_DONE_LUA,
             2,
             self._config.done_key(event_id),
-            self._config.completion_key(also_flag_completion),
+            self._config.completion_key(event_id),
             str(ttl_s),
             _DONE_FIELD,
         )
@@ -245,23 +241,38 @@ class Markers:
         stored: dict[Any, Any] = await self._redis.hgetall(
             self._config.completion_key(event_id)
         )
-        raw = _as_str(stored.get(_RECORD_FIELD))
-        if not raw:
-            return None
-        record = CompletionRecord.model_validate(json.loads(raw))
-        flag = _as_str(stored.get(_DONE_FIELD))
-        generation = _as_str(stored.get(_GENERATION_FIELD))
-        if flag is None or generation is None:
-            raise MalformedCompletionError(
-                f"completion record {event_id} is missing "
-                f"{'the done flag' if flag is None else 'its generation'}"
-            )
-        done_flag = flag == "1"
-        return StoredCompletion(
-            record=record.model_copy(update={"done": done_flag}),
-            done_flag=done_flag,
-            generation=generation,
-        )
+        return _parse_stored(event_id, stored)
+
+    async def read_completions(
+        self, event_ids: Sequence[str]
+    ) -> dict[str, StoredCompletion | MalformedCompletionError | None]:
+        """A whole sweep batch's records, read in ONE pipeline.
+
+        The sweeper reads up to ``completion_sweep_batch`` (64) members per pass
+        and used to pay a round trip per member before it could decide anything
+        about any of them; the reads are independent, so they go out together.
+        Not a transaction: these are plain reads, and MULTI would only add a
+        blocking window on the same Valkey that holds the kernel's locks.
+
+        A malformed record is returned AS the exception rather than raised,
+        because one corrupt member must not abort the batch -- the caller
+        quarantines that member and carries on with the rest, exactly as it does
+        on the single-record path.
+        """
+        keys = [self._config.completion_key(event_id) for event_id in event_ids]
+        if not keys:
+            return {}
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for key in keys:
+                pipe.hgetall(key)
+            stored_hashes = await pipe.execute()
+        out: dict[str, StoredCompletion | MalformedCompletionError | None] = {}
+        for event_id, stored in zip(event_ids, stored_hashes, strict=True):
+            try:
+                out[event_id] = _parse_stored(event_id, stored)
+            except MalformedCompletionError as exc:
+                out[event_id] = exc
+        return out
 
     async def clear_completion(self, event_id: str, *, generation: str) -> bool:
         """Drop the payload and its set membership together, in one MULTI.
@@ -324,6 +335,31 @@ class Markers:
         if not isinstance(members, list):
             members = [members]
         return {str(_as_str(m)) for m in members}
+
+
+def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | None:
+    """One stored hash as a ``StoredCompletion``, or None when there is none.
+
+    The single reading of the outbox hash, shared by the one-record and the
+    batched read so the two can never drift on what counts as malformed.
+    """
+    raw = _as_str(stored.get(_RECORD_FIELD))
+    if not raw:
+        return None
+    record = CompletionRecord.model_validate(json.loads(raw))
+    flag = _as_str(stored.get(_DONE_FIELD))
+    generation = _as_str(stored.get(_GENERATION_FIELD))
+    if flag is None or generation is None:
+        raise MalformedCompletionError(
+            f"completion record {event_id} is missing "
+            f"{'the done flag' if flag is None else 'its generation'}"
+        )
+    done_flag = flag == "1"
+    return StoredCompletion(
+        record=record.model_copy(update={"done": done_flag}),
+        done_flag=done_flag,
+        generation=generation,
+    )
 
 
 def _as_str(value: Any) -> str | None:

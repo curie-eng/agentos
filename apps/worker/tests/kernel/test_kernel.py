@@ -22,7 +22,7 @@ from aci_protocol import (
     SideEffectFlag,
     TextDelta,
 )
-from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
+from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.reply_sink import TargetRoute
@@ -925,17 +925,7 @@ def test_lock_acquire_timeout_is_a_retryable_turn_start_failure(make_harness) ->
                 released.append(True)
 
             qe = _qevent("go", thread=thread)
-            outcome = await h.kernel._attempt(
-                qe,
-                ReplyTarget(
-                    kind="slack",
-                    address=qe.reply_handle.channel,
-                    conversation_id=thread,
-                    reply_ref=qe.reply_handle.placeholder,
-                ),
-                TargetRoute(),
-                release_order,
-            )
+            outcome = await h.kernel._attempt(qe, TargetRoute(), release_order)
 
             assert outcome.terminal_ok is False
             assert outcome.classification == "runner-error"  # retryable

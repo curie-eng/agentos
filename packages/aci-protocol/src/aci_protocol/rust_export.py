@@ -324,31 +324,58 @@ mod tests {
         assert_eq!(message, decoded);
     }
 
-    #[test]
+"""
+
+# The version-gate tests, kept as a template whose fixture versions are derived
+# from PROTOCOL_VERSION at render time. Hardcoded literals here silently invert
+# on every version bump -- a fixture written as "an incompatible minor" becomes
+# the current version, and the test then asserts the opposite of its own name.
+# The placeholders are substituted, not f-string interpolated, so the Rust stays
+# readable (it is dense with braces).
+_VERSION_TESTS = """    #[test]
     fn rejects_incompatible_version_event() {
-        let raw = r#"{"type":"final","version":"9.9.9","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"@INCOMPATIBLE@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn rejects_incompatible_minor() {
-        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"@INCOMPATIBLE_MINOR@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.2.7","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"@COMPATIBLE_PATCH@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.2.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"@CURRENT@","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
 """
+
+
+def _version_tests() -> str:
+    """Render the version-gate tests with fixtures derived from PROTOCOL_VERSION.
+
+    Compatibility is same ``major.minor`` under 0.x (same ``major`` from 1.0 on),
+    so the compatible fixture differs only in the patch component and the
+    incompatible one bumps the minor. ``9.9.9`` stands in for a version from a
+    wholly different line. Deterministic: every fixture is a pure function of
+    PROTOCOL_VERSION.
+    """
+
+    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    return (
+        _VERSION_TESTS.replace("@INCOMPATIBLE@", "9.9.9")
+        .replace("@INCOMPATIBLE_MINOR@", f"{major}.{minor + 1}.0")
+        .replace("@COMPATIBLE_PATCH@", f"{major}.{minor}.{patch + 1}")
+        .replace("@CURRENT@", PROTOCOL_VERSION)
+    )
 
 
 def render_rust() -> str:
@@ -395,6 +422,7 @@ def render_rust() -> str:
             (TextDelta, ToolNote, Final, ErrorEvent, SideEffectFlag),
         ),
         _TESTS.rstrip("\n"),
+        _version_tests().rstrip("\n"),
     ]
     return "\n\n".join(blocks) + "\n"
 

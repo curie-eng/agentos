@@ -17,7 +17,7 @@ already been got wrong once:
 The ordering EB-B6(c) settles on, at every ``mark_done`` call site:
 
     1. mark_completion_pending(event_id, record)   # durable, BEFORE mark_done
-    2. mark_done(event_id, also_flag_completion=event_id)  # ONE MULTI
+    2. mark_done(event_id)                         # marker + flag, ONE MULTI
     3. emit(TurnCompleted(...), route=record.route)        # may fail
     4. clear_completion(event_id)                          # only on a CONFIRMED emit
 """
@@ -356,10 +356,10 @@ def test_a_sweeper_is_silent_for_a_record_whose_turn_is_not_yet_done(
 def test_the_done_flag_survives_the_done_markers_expiry(make_harness) -> None:
     # (i) the marker-TTL mismatch. ``done_key`` expires at idempotency_ttl_s
     # (86400, config.py:352) while the record is retained for 7 days, so a guard
-    # reading ``is_done`` alone can never pass after day one and the record is
+    # reading ``done_key`` alone can never pass after day one and the record is
     # then discarded by the retention sweep -- completion permanently lost after
     # a >24h outage, which is the failure the 7-day retention existed to prevent.
-    # Mutation: make the sweeper depend on is_done alone and this fails.
+    # Mutation: make the sweeper depend on the done marker alone and this fails.
     async def go() -> None:
         async with make_harness(shimmer=False) as h:
             await Markers(h.async_redis, h.config).mark_completion_pending(

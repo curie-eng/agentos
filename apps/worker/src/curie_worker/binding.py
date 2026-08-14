@@ -245,16 +245,21 @@ class ResolvedDeployment(BaseModel):
     adapter: str | None = None
 
 
-def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
-    """Warn when a channel resolves to more than one agent, naming the shadowed.
+def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) -> None:
+    """Warn when a binding resolves to more than one agent, naming the shadowed.
+
+    Takes the routing PAIR, not a pre-joined string: the pair is what the
+    resolver looked up, and an address means nothing without the kind it was
+    bound under (ADR-0096 -- the same address can legitimately exist under two
+    kinds).
 
     The ORDER BY picks one deterministic winner (prod-first, then most recent).
-    Since #38 the API enforces one agent per channel (the
-    ``agent_channels_address_key`` unique constraint, migration 0021, superseding
-    0017's ``agents_slack_channel_key``), so this state is no longer reachable
-    through the write paths. It stays as defense in depth for rows predating the
-    constraint or written out of band, and because silently shadowing an agent is
-    the failure mode #38 existed to kill.
+    The API enforces one agent per bound pair (``agent_channels_kind_address_key``,
+    migration 0023, superseding 0021's address-only ``agent_channels_address_key``
+    and 0017's ``agents_slack_channel_key``), so this state is no longer
+    reachable through the write paths. It stays as defense in depth for
+    rows predating the constraint or written out of band, and because silently
+    shadowing an agent is the failure mode #38 existed to kill.
 
     One agent with both a dev and a prod deployment active is two rows but one
     agent, so count distinct agents, not rows.
@@ -279,7 +284,7 @@ def warn_if_multiple_agents_bound(channel: str, rows: Sequence[Any]) -> None:
     logger.warning(
         "channel %s has %d agents bound; routing to agent %s and shadowing "
         "%s (only one agent per channel responds; see issue #38)",
-        channel,
+        f"{kind}:{address}",
         len(distinct_agents),
         chosen,
         ", ".join(shadowed),
@@ -307,7 +312,7 @@ class BindingResolver:
             rows = result.mappings().all()
         if not rows:
             return None
-        warn_if_multiple_agents_bound(f"{kind}:{address}", rows)
+        warn_if_multiple_agents_bound(kind, address, rows)
         data = dict(rows[0])
         # asyncpg returns JSONB as a str for a raw-text SELECT (no column type to
         # trigger SQLAlchemy's json deserializer); decode it to the dict/list the

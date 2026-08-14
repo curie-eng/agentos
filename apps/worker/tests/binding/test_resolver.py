@@ -748,10 +748,11 @@ def test_warn_if_multiple_agents_bound_names_the_shadowed_agent(
     rows = [{"agent_id": chosen}, {"agent_id": shadowed}]
 
     with caplog.at_level("WARNING"):
-        warn_if_multiple_agents_bound("C-shadow", rows)
+        warn_if_multiple_agents_bound("slack", "C-shadow", rows)
 
     assert any(
         "agents bound" in r.message
+        and "slack:C-shadow" in r.message
         and str(shadowed) in r.message
         and str(chosen) in r.message
         for r in caplog.records
@@ -768,7 +769,7 @@ def test_warn_if_multiple_agents_bound_is_quiet_for_one_agent() -> None:
 
     logger = logging.getLogger("curie_worker.binding")
     with unittest.mock.patch.object(logger, "warning") as warned:
-        warn_if_multiple_agents_bound("C-single", rows)
+        warn_if_multiple_agents_bound("slack", "C-single", rows)
     warned.assert_not_called()
 
 
