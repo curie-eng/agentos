@@ -1,4 +1,4 @@
-"""A 0.2.9 runner against a 0.3.0 worker fails LOUDLY.
+"""A 0.2.9 runner against a 0.4.0 worker fails LOUDLY.
 
 T-B14 (round-2 finding 4). The ACI bump is a breaking minor (D1), so a runner
 image left at ``0.2.9`` is not "mostly compatible" -- ``ndjson.py:61-68`` refuses
@@ -36,9 +36,9 @@ from curie_worker.consumer import Consumer
 
 DONE = SessionStatus.DONE
 
-# A frame stamped by a runner built at the PREVIOUS contract version, pinned as
-# a literal rather than generated, so this keeps testing the 0.2.9 -> 0.3.0 hop
-# after PROTOCOL_VERSION moves again.
+# A frame stamped by a historical runner, pinned as a literal rather than
+# generated, so this keeps testing the old contract hop after PROTOCOL_VERSION
+# moves again.
 FRAME_0_2_9 = (
     '{"version":"0.2.9","type":"final","text":"an answer from an old runner",'
     '"status":"done"}'
@@ -62,11 +62,13 @@ def _qevent(*, thread: str, event_id: str) -> QueuedTurn:
     )
 
 
-def test_the_worker_build_is_incompatible_with_the_previous_minor() -> None:
+def test_the_worker_build_rejects_historical_and_previous_deployed_minors() -> None:
     # The companion assertion (version.py:42-63). A breaking minor means the
-    # range genuinely excludes the old version -- if this ever reads True again,
-    # the bump was classed wrong and the cutover ordering rests on nothing.
-    assert PROTOCOL_VERSION == "0.3.0"
+    # range genuinely excludes both the previous deployed minor and the older
+    # historical version. If either reads True again, the bump was classed wrong
+    # and the cutover ordering rests on nothing.
+    assert PROTOCOL_VERSION == "0.4.0"
+    assert is_compatible("0.3.0", PROTOCOL_VERSION) is False
     assert is_compatible("0.2.9", PROTOCOL_VERSION) is False
 
 

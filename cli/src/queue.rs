@@ -60,7 +60,7 @@ pub fn synthetic_turn(
         reply_handle: ReplyHandle {
             kind: kind.into(),
             channel: channel.into(),
-            placeholder: placeholder.into(),
+            placeholder: Some(placeholder.into()),
             endpoint,
             // The CLI's stub keeps the Slack shape, so its route is the
             // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
@@ -458,7 +458,7 @@ mod tests {
         );
         assert!(turn.reply_handle.endpoint.is_none());
         // The placeholder is the real Slack ts we posted, not a stub-minted one.
-        assert_eq!(turn.reply_handle.placeholder, "1717.42");
+        assert_eq!(turn.reply_handle.placeholder, Some("1717.42".into()));
         let value: serde_json::Value = serde_json::from_str(&payload_json(&turn).unwrap()).unwrap();
         assert!(value["reply_handle"]["endpoint"].is_null());
         assert_eq!(value["reply_handle"]["placeholder"], "1717.42");
@@ -486,7 +486,7 @@ mod tests {
             reply_handle: ReplyHandle {
                 kind: "slack".into(),
                 channel: "C-SIM-x".into(),
-                placeholder: "1720000000.000200".into(),
+                placeholder: Some("1720000000.000200".into()),
                 endpoint: None,
                 adapter: None,
             },

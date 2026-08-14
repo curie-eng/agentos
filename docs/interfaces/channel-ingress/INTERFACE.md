@@ -42,8 +42,9 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
   session per), `author`, `text`, `received_at`, and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying `channel`,
-  `placeholder` (the pre-posted reply the worker edits in place), and an optional per-turn
-  `endpoint`. The dispatcher serializes it to a single Stream field via `to_stream_fields`
+  required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter
+  currently supplies the pre-posted reply ts that the worker edits in place. The
+  dispatcher serializes it to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
   `STREAM_PAYLOAD_FIELD = "payload"` (`apps/dispatcher/src/curie_dispatcher/queue.py::STREAM_PAYLOAD_FIELD`).
   For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread

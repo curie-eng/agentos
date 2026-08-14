@@ -305,6 +305,27 @@ def test_approval_request_empty_conversation_id_raises() -> None:
         ApprovalRequest(**fields)  # type: ignore[arg-type]
 
 
+def test_approval_request_without_reply_placeholder_raises() -> None:
+    fields = _minimal_approval_request_fields()
+    del fields["reply_placeholder"]
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_approval_request_with_null_reply_placeholder_succeeds() -> None:
+    fields = _minimal_approval_request_fields()
+    fields["reply_placeholder"] = None
+    request = ApprovalRequest.model_validate(fields)
+    assert request.reply_placeholder is None
+
+
+def test_approval_request_with_empty_reply_placeholder_raises() -> None:
+    fields = _minimal_approval_request_fields()
+    fields["reply_placeholder"] = ""
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**fields)  # type: ignore[arg-type]
+
+
 def test_approval_request_zero_expires_in_seconds_raises() -> None:
     with pytest.raises(ValidationError):
         ApprovalRequest(**_minimal_approval_request_fields(), expires_in_seconds=0)  # type: ignore[arg-type]

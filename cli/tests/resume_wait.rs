@@ -34,7 +34,7 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         reply_handle: ReplyHandle {
             kind: "slack".into(),
             channel: "C-SIM-x".into(),
-            placeholder: PLACEHOLDER_TS.into(),
+            placeholder: Some(PLACEHOLDER_TS.into()),
             endpoint: Some(endpoint.to_string()),
             adapter: None,
         },

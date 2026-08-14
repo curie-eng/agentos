@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 
+import pytest
 from aci_protocol import (
     ErrorEvent,
     Final,
@@ -38,7 +39,7 @@ def _qevent(
     *,
     thread: str = "th-1",
     event_id: str | None = None,
-    placeholder: str = "p-1",
+    placeholder: str | None = "p-1",
     endpoint: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
@@ -76,6 +77,22 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
             assert h.runner.opened == ["hi"]
             assert h.sink.last_text == "Hello world"
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_null_placeholder_is_rejected_before_any_sink_or_runner_call(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            event = _qevent("hi", placeholder=None)
+
+            with pytest.raises(ValueError, match=r"reply_handle\.placeholder"):
+                await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            assert h.sink.events == []
 
     asyncio.run(go())
 

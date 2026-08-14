@@ -40,12 +40,13 @@ class ReplyHandle(_AciModel):
     address-only fallback or a ``"slack"`` guess -- the silent misroute this field
     exists to close.
 
-    The reply model is edit-in-place: the ingress adapter pre-posts a placeholder
-    message and the worker edits it as the answer streams. ``placeholder`` is an
-    **opaque, adapter-minted correlation handle** -- the worker never parses it and
-    only ever hands it back to the adapter that minted it. For the Slack adapter it
-    happens to be the ts of the pre-posted placeholder message; for another kind it
-    is whatever that adapter needs to find the same message again.
+    The reply model supports editing an existing reply or carrying no existing
+    reply reference. ``placeholder`` is a required, nullable, opaque correlation
+    handle minted by the adapter. The worker never parses it and only ever hands
+    it back to the adapter that minted it. For the Slack adapter it happens to be
+    the ts of the preposted placeholder message. For another kind it is whatever
+    that adapter needs to find the same message again. ``None`` means this turn
+    has no existing reply to edit.
 
     ``endpoint`` is the per-turn reply target: the base URL of the channel API the
     worker delivers this turn's reply through. It routes the reply back to the
@@ -67,7 +68,7 @@ class ReplyHandle(_AciModel):
 
     kind: str
     channel: str
-    placeholder: str
+    placeholder: str | None
     endpoint: str | None = None
     adapter: str | None = None
 

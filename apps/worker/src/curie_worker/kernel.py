@@ -410,6 +410,8 @@ class Kernel:
         Returns normally once the event is terminally handled; the consumer then
         acks it. Raising leaves the entry pending for crash-recovery reclaim.
         """
+        self._required_placeholder(qevent)
+
         event_id = qevent.event_id
         thread = qevent.conversation_id
         target = _target_for(qevent)
@@ -1914,6 +1916,13 @@ class Kernel:
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
         return min(self._config.retry_backoff_max_s, raw)
+
+    @staticmethod
+    def _required_placeholder(qevent: QueuedTurn) -> str:
+        placeholder = qevent.reply_handle.placeholder
+        if placeholder is None:
+            raise ValueError("reply_handle.placeholder must not be null")
+        return placeholder
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:

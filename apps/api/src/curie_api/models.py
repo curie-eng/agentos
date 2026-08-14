@@ -268,7 +268,7 @@ class Approval(Base):
     # because `slack` legitimately has none.
     reply_kind: Mapped[str]
     reply_channel: Mapped[str]
-    reply_placeholder: Mapped[str]
+    reply_placeholder: Mapped[str | None] = mapped_column(nullable=True)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
     # The approval route the request named (#247), and the channel the card

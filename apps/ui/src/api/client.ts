@@ -715,7 +715,7 @@ export interface ApprovalOut {
   author: string;
   summary: string;
   reply_channel: string;
-  reply_placeholder: string;
+  reply_placeholder: string | null;
   reply_endpoint: string | null;
   dedupe_key: string;
   route: string | null;

@@ -114,6 +114,7 @@ def _detached_approval(
     resolved_by: str | None = "U9",
     reply_kind: str = "slack",
     reply_adapter: str | None = None,
+    reply_placeholder: str | None = "p-1",
 ) -> Approval:
     """An unpersisted ``Approval`` in a chosen status, for the pure-unit selector
     test: the turn builders read the record's fields only, so no DB round-trip is
@@ -135,7 +136,7 @@ def _detached_approval(
         # the right one.
         reply_kind=reply_kind,
         reply_channel="C1",
-        reply_placeholder="p-1",
+        reply_placeholder=reply_placeholder,
         reply_adapter=reply_adapter,
         dedupe_key=uuid.uuid4().hex,
         status=status,
@@ -154,6 +155,7 @@ async def _insert_approval(
     reply_kind: str = "slack",
     reply_channel: str | None = None,
     reply_adapter: str | None = None,
+    reply_placeholder: str | None = "p-1",
 ) -> uuid.UUID:
     """Insert an approval row in a chosen lifecycle state (bypassing the resolve
     endpoint), so a test can construct the exact stranded/settled/expired shapes
@@ -164,6 +166,7 @@ async def _insert_approval(
         resolved_by=resolved_by,
         reply_kind=reply_kind,
         reply_adapter=reply_adapter,
+        reply_placeholder=reply_placeholder,
     )
     approval.reply_endpoint = reply_endpoint
     if reply_channel is not None:
@@ -201,6 +204,7 @@ def test_reconciler_reenqueues_stranded_resolved_record(
             status=ApprovalStatus.approved,
             resolved_at=_naive(120),
             resumed_at=None,
+            reply_placeholder="reply placeholder",
         )
         reconciler = ResumeReconciler(
             sessionmaker,
@@ -219,7 +223,41 @@ def test_reconciler_reenqueues_stranded_resolved_record(
     assert len(entries) == 1
     turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
     assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.reply_handle.placeholder == "reply placeholder"
     assert resumed_at is not None
+
+
+def test_reconciler_preserves_a_post_once_reply_handle(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """A stranded post once approval requeues without inventing a placeholder."""
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession], queue: ResumeQueue
+    ) -> tuple[uuid.UUID, int]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(120),
+            resumed_at=None,
+            reply_endpoint="http://localhost:9999/api/",
+            reply_placeholder=None,
+        )
+        reconciler = ResumeReconciler(
+            sessionmaker, queue, interval_seconds=30, grace_seconds=0, batch_limit=100
+        )
+        return approval_id, await reconciler.reconcile_once()
+
+    approval_id, count = _run_async(steps, runs_stream)
+
+    assert count == 1
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.reply_handle.channel == "C1"
+    assert turn.reply_handle.placeholder is None
+    assert turn.reply_handle.endpoint == "http://localhost:9999/api/"
 
 
 def test_reconciler_skips_already_resumed_record(

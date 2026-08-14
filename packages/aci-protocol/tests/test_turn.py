@@ -164,3 +164,20 @@ def test_adapter_is_optional_and_round_trips_when_a_producer_sets_it() -> None:
     assert restored == routed
     assert restored.adapter == "agentmail-sandbox"
     assert restored.endpoint == "http://curie-mail-adapter:8080/"
+
+
+def test_reply_handle_without_placeholder_raises() -> None:
+    with pytest.raises(ValidationError):
+        ReplyHandle.model_validate({"kind": "slack", "channel": "C1"})
+
+
+def test_reply_handle_with_null_placeholder_succeeds() -> None:
+    handle = ReplyHandle.model_validate(
+        {"kind": "slack", "channel": "C1", "placeholder": None}
+    )
+    assert handle.placeholder is None
+
+
+def test_reply_handle_with_empty_placeholder_succeeds() -> None:
+    handle = ReplyHandle(kind="slack", channel="C1", placeholder="")
+    assert handle.placeholder == ""

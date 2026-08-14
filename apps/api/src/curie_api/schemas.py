@@ -1042,7 +1042,7 @@ class ApprovalOut(BaseModel):
     author: str
     summary: str
     reply_channel: str
-    reply_placeholder: str
+    reply_placeholder: str | None
     reply_endpoint: str | None
     dedupe_key: str
     route: str | None
