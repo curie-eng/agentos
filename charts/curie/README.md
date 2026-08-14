@@ -250,6 +250,73 @@ UI; the project key also feeds the OTel Collector auth header). Override those
 values or supply `langfuse.existingSecret` to clear the gate. It is off by
 default so the zero-secret bare install stays green.
 
+### Key-free object store auth
+
+Pointing the bundle store at a real cloud object store (`rustfs.deploy: false`)
+normally means a scoped IAM user and long-lived keys in a Secret. That works and
+is genuinely least-privilege, but it is not the only option: clearing
+`rustfs.auth.accessKey` selects a key-free path (#1325) in which the chart omits
+every S3 credential from the API, the worker, and the sandbox bundle-fetch init
+container, so the AWS SDK falls through its provider chain to the **web-identity
+provider** (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed by a projected
+ServiceAccount token.
+
+Bind the role through the ServiceAccount annotations. On EKS with IRSA the
+pod-identity webhook reads the annotation and injects the projected token and
+both env vars:
+
+```yaml
+rustfs:
+  deploy: false
+  host: my-bucket.s3.us-east-1.amazonaws.com
+  port: 443
+  auth:
+    accessKey: ""            # selects the key-free path
+api:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-api
+worker:
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-worker
+agentSandbox:
+  runner:
+    serviceAccount:
+      annotations:
+        eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
+```
+
+Scope the runner's role to the bundle bucket, **read-only**. NetworkPolicy
+selects pods rather than containers, so any identity the bundle-fetch init
+container can assume is equally reachable by the runner beside it, and the
+runner is prompt-injectable by design.
+
+Two constraints are worth stating plainly.
+
+**Clearing the key with `rustfs.deploy: true` is refused at render.** The
+in-chart RustFS is configured with those same static credentials and has no
+web-identity path, so the combination would install green and then fail every
+bundle read and write. The chart fails with a message naming both options
+instead.
+
+**The instance role is deliberately unavailable, and this is not an oversight
+to work around.** The instinct on AWS is to drop the keys and let the node's
+IAM role answer via the metadata endpoint. Rail 1 denies `169.254.169.254` by
+construction, and `security-networkpolicy.yaml` computes an `except` so that a
+broad operator `allowedEgress` CIDR cannot re-permit it. Opening it would hand
+the node's IAM role to a prompt-injectable agent, which is strictly worse than a
+bucket-scoped IAM user. Web identity reads a **mounted token** rather than a
+network endpoint, so it needs no metadata access and leaves Rail 1 intact --
+which is exactly why it is the key-free path this chart supports.
+
+Off EKS, there is no pod-identity webhook, so a self-managed cluster (k3s
+included) needs an OIDC provider wired to IAM and the projected token volume
+supplied by the operator before the key-free path resolves to anything. Until
+that is in place, static keys in a Secret remain the supported choice, and they
+are the safer of the two available options rather than a limitation to route
+around.
+
 ## The two preflights
 
 Both run as Helm hooks (blocking a broken install) and are re-runnable via
