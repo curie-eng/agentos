@@ -177,6 +177,42 @@ http
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.otelCollector.config" -}}
+# Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
+# forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
+# silently unsupported), so the collector is the adapter. Langfuse appends
+# /v1/traces to the otlphttp base path itself.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  batch: {}
+exporters:
+  otlphttp/langfuse:
+    endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
+    headers:
+      Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+  debug:
+    verbosity: normal
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/langfuse, debug]
+{{- end }}
+
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
      bootstrap identity still carries the published dev default from values.yaml.
