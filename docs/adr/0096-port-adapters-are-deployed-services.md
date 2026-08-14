@@ -2,7 +2,13 @@
 
 Date: 2026-08-04
 
-Status: Draft
+Status: Accepted
+
+Accepted alongside its implementation under [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md).
+Realizing code path: `apps/api/src/curie_api/models.py` (the channel-neutral
+binding), `apps/worker/src/curie_worker/binding.py` (the resolver),
+`packages/channel-protocol/` (the neutral egress port and its conformance
+kit), and `cli/src/main.rs` (the `curie adapter` verb family).
 
 Generalizes the harness trio to every port.
 [ADR-0060](0060-the-harness-is-a-declared-package.md) decides what a harness is
