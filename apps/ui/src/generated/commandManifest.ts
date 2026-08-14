@@ -932,7 +932,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -1050,7 +1050,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2443,7 +2443,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2612,7 +2612,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
               "id": "channel",
               "long": "channel",
               "positional": false,

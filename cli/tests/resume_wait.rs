@@ -32,9 +32,11 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
         author: "U-curie-message".into(),
         text: "(resumed after approval)".into(),
         reply_handle: ReplyHandle {
+            kind: "slack".into(),
             channel: "C-SIM-x".into(),
             placeholder: PLACEHOLDER_TS.into(),
             endpoint: Some(endpoint.to_string()),
+            adapter: None,
         },
         received_at: "2026-07-21T00:00:00Z".into(),
     }
@@ -101,6 +103,7 @@ async fn await_resume_returns_the_finalized_reply_once_the_resume_entry_is_acked
 
     // The CLI's OWN original turn: its stream id is the exclusive scan cursor.
     let original = synthetic_turn(
+        "slack",
         "C-SIM-x",
         "U-curie-message",
         "do the risky thing",
@@ -181,6 +184,7 @@ async fn await_resume_times_out_when_the_approval_is_never_resolved() {
     // Only the original turn exists; the approval is never resolved, so no resume
     // entry is ever appended.
     let original = synthetic_turn(
+        "slack",
         "C-SIM-x",
         "U-curie-message",
         "do the risky thing",
@@ -259,6 +263,7 @@ async fn a_notice_without_a_card_parks_the_turn_and_the_keepalive_delivers_the_r
     let endpoint = stub.base_api_url().to_string();
 
     let original = synthetic_turn(
+        "slack",
         "C-SIM-x",
         "U-curie-message",
         "do the risky thing",
@@ -364,6 +369,7 @@ async fn a_blank_line_summary_notice_parks_the_turn_and_the_keepalive_delivers_t
     let endpoint = stub.base_api_url().to_string();
 
     let original = synthetic_turn(
+        "slack",
         "C-SIM-x",
         "U-curie-message",
         "do the risky thing",

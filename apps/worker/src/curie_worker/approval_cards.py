@@ -49,6 +49,17 @@ class ApprovalCardRef:
     same across-a-deploy reason as ``requested_by``: an entry written before
     #1199 carries no such key, and an empty value means "cannot be paired",
     which the kernel treats as stampable exactly as it was before.
+
+    ``kind``/``adapter`` joined ``endpoint`` for ADR-0096 phase 2: the card's
+    destination is selected from the channel it POSTS TO, not from the turn that
+    requested it (a policy-routed card belongs to a channel the requesting turn
+    may not even share a transport with), so the settle path must re-use the
+    whole destination rather than rebuild two thirds of it from the resume turn.
+    ``kind`` is the discriminator for a pre-upgrade entry: ``""`` means the
+    destination was never recorded, and the kernel falls back to the resume
+    turn's kind and route exactly as it did before. A non-empty ``kind`` means
+    the triple is authoritative, and ``adapter=None`` there means the worker's
+    default transport for that kind rather than "unknown".
     """
 
     channel: str
@@ -57,6 +68,8 @@ class ApprovalCardRef:
     endpoint: str | None = None
     requested_by: str = ""
     approval_id: str = ""
+    kind: str = ""
+    adapter: str | None = None
 
 
 class ApprovalCardStore:
@@ -79,6 +92,8 @@ class ApprovalCardStore:
         endpoint: str | None,
         approval_id: str,
         requested_by: str = "",
+        kind: str = "",
+        adapter: str | None = None,
     ) -> None:
         # An empty ``approval_id`` is the pre-#1199 compatibility sentinel: the
         # kernel reads it as "cannot be paired" and stamps the ref unchecked.
@@ -102,6 +117,8 @@ class ApprovalCardStore:
                 endpoint=endpoint,
                 requested_by=requested_by,
                 approval_id=approval_id,
+                kind=kind,
+                adapter=adapter,
             ),
         )
 
@@ -189,6 +206,12 @@ class ApprovalCardStore:
                 # the pairing check, so only an absent key may reach "" -- a
                 # present-but-falsy id is rejected outright above.
                 approval_id=str(data.get("approval_id", "")),
+                # ``.get`` for the across-a-deploy reason again: an entry written
+                # before the destination was recorded has neither key, and ``""``
+                # is what tells the kernel to fall back to the resume turn's kind
+                # and route instead of treating ``adapter=None`` as authoritative.
+                kind=str(data.get("kind") or ""),
+                adapter=data.get("adapter"),
             )
         except (ValueError, KeyError, TypeError):
             # A corrupt or shape-drifted entry must not break the resume; treat

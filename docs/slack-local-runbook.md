@@ -75,7 +75,7 @@ on the **worker**, which is the one service that raises and lowers the caption
 
 Connecting Slack is not enough for the bot to reply. The worker resolves an
 inbound Slack event to an agent by matching the event's channel id against
-`agents.slack_channel` on equality (see
+the address stored in `agent_channels` on equality (see
 [`../apps/worker/src/curie_worker/binding.py`](../apps/worker/src/curie_worker/binding.py)).
 So you must both invite the bot to the channel and deploy an agent bound to
 that channel's id.

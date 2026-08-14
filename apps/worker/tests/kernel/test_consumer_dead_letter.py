@@ -58,7 +58,9 @@ def _qevent(text: str, *, thread: str, event_id: str) -> QueuedTurn:
         author="U1",
         text=text,
         # The #505 shape: a reply endpoint that is durably persisted but dead.
-        reply_handle=ReplyHandle(channel="C1", placeholder="p-1", endpoint="http://localhost:8155/api/"),
+        reply_handle=ReplyHandle(
+            kind="slack", channel="C1", placeholder="p-1", endpoint="http://localhost:8155/api/"
+        ),
         received_at="2026-07-05T00:00:00+00:00",
     )
 

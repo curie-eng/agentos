@@ -15,8 +15,21 @@ from .models import (
     MessageLink,
     OutboundMessage,
 )
+from .reply import (
+    NavAffordance,
+    ReplyAck,
+    ReplyPost,
+    ReplyTarget,
+    ReplyUpdate,
+    SettledOutcome,
+    TurnCompleted,
+    TurnStatus,
+)
 
 SCHEMA_ID = "https://curietech.ai/schemas/channel-protocol.schema.json"
+# Every model the drift gate (tests/test_schema_compat.py) can see. A model that
+# is never listed here is invisible to it, so the committed schema would stay
+# "current" while the wire it documents lost half its surface.
 _MODELS = (
     ChannelCapabilities,
     OutboundMessage,
@@ -25,6 +38,14 @@ _MODELS = (
     Action,
     MessageField,
     MessageLink,
+    ReplyTarget,
+    NavAffordance,
+    SettledOutcome,
+    TurnStatus,
+    ReplyUpdate,
+    ReplyPost,
+    TurnCompleted,
+    ReplyAck,
 )
 
 

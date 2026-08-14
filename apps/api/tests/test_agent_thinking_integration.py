@@ -16,7 +16,7 @@ from typing import Any
 def _create_agent(client: Any, auth_headers: dict[str, str], **body: Any) -> dict[str, Any]:
     resp = client.post(
         "/agents",
-        json={"name": "thinking-bot", "slack_channel": "CTHINK001", **body},
+        json={"name": "thinking-bot", "channel": {"kind": "slack", "address": "CTHINK001"}, **body},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text
@@ -59,13 +59,13 @@ def test_patch_sets_thinking(client: Any, auth_headers: dict[str, str], clean_db
 def test_patch_without_thinking_leaves_it_unchanged(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # Omitted means "unchanged", the same convention `model` and slack_channel
+    # Omitted means "unchanged", the same convention `model` and channel
     # follow -- a PATCH that renames an agent must not silently clear its
     # thinking depth.
     agent = _create_agent(client, auth_headers, thinking="adaptive")
     resp = client.patch(
         f"/agents/{agent['id']}",
-        json={"slack_channel": "CTHINK002"},
+        json={"channel": {"kind": "slack", "address": "CTHINK002"}},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -120,7 +120,7 @@ def test_omitting_thinking_still_leaves_it_untouched(
     agent = _create_agent(client, auth_headers, thinking="adaptive")
     resp = client.patch(
         f"/agents/{agent['id']}",
-        json={"slack_channel": "CTHINK009"},
+        json={"channel": {"kind": "slack", "address": "CTHINK009"}},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -144,7 +144,10 @@ def test_the_model_override_clears_the_same_way(
 
     # Omission still leaves it alone.
     agent2 = _create_agent(
-        client, auth_headers, name="model-untouched", slack_channel="CTHINK010",
+        client,
+        auth_headers,
+        name="model-untouched",
+        channel={"kind": "slack", "address": "CTHINK010"},
         model="kimi-k2.1",
     )
     resp = client.patch(
@@ -175,7 +178,11 @@ def test_an_empty_thinking_is_refused_and_the_error_points_at_null(
     # Create is refused identically -- same field, same nonsense, same answer.
     resp = client.post(
         "/agents",
-        json={"name": "empty-thinking", "slack_channel": "CTHINK011", "thinking": "   "},
+        json={
+            "name": "empty-thinking",
+            "channel": {"kind": "slack", "address": "CTHINK011"},
+            "thinking": "   ",
+        },
         headers=auth_headers,
     )
     assert resp.status_code == 422, resp.text

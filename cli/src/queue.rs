@@ -39,7 +39,12 @@ const EVENT_ID_PREFIX: &str = "EvSIM-";
 /// `reply_handle`). ``endpoint`` is this turn's reply target (issue #19): the base
 /// URL the worker delivers the reply through, so the CLI stub receives it without
 /// re-pointing the worker's global setting. ``None`` uses the worker default.
+///
+/// ``kind`` is the routing half of the pair the worker resolves on (ADR-0096
+/// phase 2). It is a required parameter with no defaulted overload: a caller that
+/// could omit it would put the address-only fallback back on the wire.
 pub fn synthetic_turn(
+    kind: impl Into<String>,
     channel: impl Into<String>,
     author: impl Into<String>,
     text: impl Into<String>,
@@ -53,9 +58,13 @@ pub fn synthetic_turn(
         author: author.into(),
         text: text.into(),
         reply_handle: ReplyHandle {
+            kind: kind.into(),
             channel: channel.into(),
             placeholder: placeholder.into(),
             endpoint,
+            // The CLI's stub keeps the Slack shape, so its route is the
+            // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
+            adapter: None,
         },
         received_at: now_rfc3339(),
     }
@@ -375,6 +384,7 @@ mod tests {
     #[test]
     fn payload_json_carries_the_exact_seam_field_names() {
         let turn = synthetic_turn(
+            "slack",
             "C-SIM-x",
             "U-curie-chat",
             "hello",
@@ -412,6 +422,7 @@ mod tests {
         // Issue #19: a CLI-minted turn carries its own reply endpoint so the worker
         // posts back to this stub without re-pointing its global setting.
         let turn = synthetic_turn(
+            "slack",
             "C-SIM-x",
             "U-curie-chat",
             "hi",
@@ -436,7 +447,15 @@ mod tests {
         // #770/ADR-0078: the connected-transport path posts a REAL placeholder and
         // enqueues against its ts with NO per-turn endpoint, so the turn rides the
         // worker's default (connected) transport -- exactly like a real mention.
-        let turn = synthetic_turn("C-real", "U-curie-chat", "hi", "1.1", "1717.42", None);
+        let turn = synthetic_turn(
+            "slack",
+            "C-real",
+            "U-curie-chat",
+            "hi",
+            "1.1",
+            "1717.42",
+            None,
+        );
         assert!(turn.reply_handle.endpoint.is_none());
         // The placeholder is the real Slack ts we posted, not a stub-minted one.
         assert_eq!(turn.reply_handle.placeholder, "1717.42");
@@ -465,9 +484,11 @@ mod tests {
             author: "U-curie-message".into(),
             text: "hi".into(),
             reply_handle: ReplyHandle {
+                kind: "slack".into(),
                 channel: "C-SIM-x".into(),
                 placeholder: "1720000000.000200".into(),
                 endpoint: None,
+                adapter: None,
             },
             received_at: "2026-07-21T00:00:00Z".into(),
         };

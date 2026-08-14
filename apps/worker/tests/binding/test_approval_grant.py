@@ -48,14 +48,26 @@ def _resolver(engine: AsyncEngine) -> BindingResolver:
 
 async def _seed_agent(engine: AsyncEngine, agent_id: uuid.UUID) -> None:
     # The approvals.agent_id FK references agents.id, so a non-NULL grant-bound
-    # approval needs a real agent row. Minimal columns only (id/name/channel).
+    # approval needs a real agent row. Minimal columns only (id/name), plus the
+    # single agent_channels binding that replaced agents.slack_channel
+    # (ADR-0096, #1459). The binding's address is per-agent unique, so it is
+    # derived from the agent id rather than being the shared literal "C1" the
+    # old column carried -- several of these tests seed two agents.
     async with engine.begin() as conn:
         await conn.execute(
+            text(f"INSERT INTO {_SCHEMA}.agents (id, name) VALUES (:id, :name)"),
+            {"id": agent_id, "name": f"agent-{agent_id.hex[:8]}"},
+        )
+        await conn.execute(
             text(
-                f"INSERT INTO {_SCHEMA}.agents (id, name, slack_channel) "
-                "VALUES (:id, :name, :channel)"
+                f"INSERT INTO {_SCHEMA}.agent_channels (id, agent_id, kind, address) "
+                "VALUES (:id, :agent_id, 'slack', :address)"
             ),
-            {"id": agent_id, "name": f"agent-{agent_id.hex[:8]}", "channel": "C1"},
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "address": f"C{agent_id.hex[:8].upper()}",
+            },
         )
 
 
@@ -82,6 +94,9 @@ async def _seed_approval(
         "conversation_id",
         "author",
         "summary",
+        # The durable routing half (ADR-0096 phase 2): NOT NULL, so every insert
+        # states which channel kind raised the approval.
+        "reply_kind",
         "reply_channel",
         "reply_placeholder",
         "dedupe_key",
@@ -93,6 +108,7 @@ async def _seed_approval(
         "conversation_id": f"th-{approval_id.hex[:8]}",
         "author": "U1",
         "summary": summary,
+        "reply_kind": "slack",
         "reply_channel": "C1",
         "reply_placeholder": "p-1",
         "dedupe_key": uuid.uuid4().hex,
@@ -126,9 +142,16 @@ async def _cleanup_approvals(engine: AsyncEngine, ids: list[uuid.UUID]) -> None:
 
 
 async def _cleanup_agents(engine: AsyncEngine, ids: list[uuid.UUID]) -> None:
-    # Deleting the agent CASCADEs to any approvals still bound to it.
+    # Deleting the agent CASCADEs to any approvals still bound to it. The
+    # channel binding is removed explicitly rather than relying on a cascade, so
+    # this teardown does not quietly become the only thing asserting the new
+    # FK's delete rule.
     async with engine.begin() as conn:
         for agent_id in ids:
+            await conn.execute(
+                text(f"DELETE FROM {_SCHEMA}.agent_channels WHERE agent_id = :id"),
+                {"id": agent_id},
+            )
             await conn.execute(
                 text(f"DELETE FROM {_SCHEMA}.agents WHERE id = :id"), {"id": agent_id}
             )

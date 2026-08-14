@@ -519,3 +519,96 @@ def test_eval_max_concurrent_claims_rejects_zero(
 
     with pytest.raises(ValueError):
         WorkerConfig()
+
+
+# --- Raw-string ingestion of complex-typed fields -----------------------------
+#
+# ``slack_trusted_origins`` (tuple) and ``adapter_credentials`` (dict) are
+# "complex" types, which pydantic-settings JSON-decodes INSIDE the env source,
+# BEFORE any field validator runs. Their BeforeValidators accept a bare
+# comma-list and a blank string respectively, but those never got the chance:
+# the source raised ``SettingsError`` first and the worker died at boot on the
+# exact value compose.dev.yaml exports. ``NoDecode`` on the annotated type
+# suppresses that decode so the raw env string reaches the validator.
+#
+# These MUST go through the real settings source (env, not kwargs) -- kwarg
+# construction bypasses the env source entirely and passed all along.
+
+
+def test_trusted_origins_parsed_from_a_bare_comma_list_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose.dev.yaml value: a comma list, not JSON."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv(
+        "CURIE_SLACK_TRUSTED_ORIGINS",
+        "http://localhost,http://127.0.0.1,http://host.docker.internal",
+    )
+
+    config = WorkerConfig()
+
+    assert config.slack_trusted_origins == (
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://host.docker.internal",
+    )
+
+
+def test_trusted_origins_tolerates_whitespace_around_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv(
+        "CURIE_SLACK_TRUSTED_ORIGINS", " http://localhost:8080 , , http://a.b "
+    )
+
+    config = WorkerConfig()
+
+    assert config.slack_trusted_origins == ("http://localhost:8080", "http://a.b")
+
+
+def test_trusted_origins_empty_env_is_the_closed_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blank means "no extra trusted origins" -- fail closed, never a boot crash."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_SLACK_TRUSTED_ORIGINS", "")
+
+    config = WorkerConfig()
+
+    assert config.slack_trusted_origins == ()
+
+
+def test_adapter_credentials_empty_env_is_an_empty_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same defect class: a blank ``CURIE_ADAPTER_CREDENTIALS`` is "none
+    configured" (every non-Slack egress then fails closed), not a boot crash."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", "")
+
+    config = WorkerConfig()
+
+    assert config.adapter_credentials == {}
+
+
+def test_adapter_credentials_still_parsed_from_json_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", '{"acme": "s3cret"}')
+
+    config = WorkerConfig()
+
+    assert config.adapter_credentials == {"acme": "s3cret"}
+
+
+def test_adapter_credentials_malformed_json_is_a_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing closed on garbage is deliberate; it must stay a failure."""
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_ADAPTER_CREDENTIALS", "not-json")
+
+    with pytest.raises(ValueError):
+        WorkerConfig()

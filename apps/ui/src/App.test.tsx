@@ -22,7 +22,7 @@ vi.mock("./api/client", async (importOriginal) => {
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  slack_channel: "C0123ABCD",
+  channel: { kind: "slack", address: "C0123ABCD" },
   model: null,
   created_at: "2026-07-01T00:00:00Z",
 };

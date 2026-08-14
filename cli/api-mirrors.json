@@ -22,9 +22,14 @@
         },
         {
           "field": "created_at",
-          "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/slack_channel only."
+          "why": "No CLI verb prints an agent's creation timestamp; the deploy summary and lifecycle verbs render id/name/channel only."
         }
       ]
+    },
+    {
+      "struct": "ChannelBinding",
+      "schema": "ChannelBinding",
+      "omissions": []
     },
     {
       "struct": "ApprovalRouteBinding",
@@ -259,11 +264,11 @@
         },
         {
           "field": "repo_full_name",
-          "why": "Same reason as slack_channel: a routing fact owned by the git-flow binding (ADR-0091), not part of the override pair this result is about."
+          "why": "Same reason as `channel`: a routing fact owned by the git-flow binding (ADR-0091), not part of the override pair this result is about."
         },
         {
-          "field": "slack_channel",
-          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel binding is a different concern with its own surface (`deploy --slack-channel`), and emitting it here would imply this verb can change it."
+          "field": "channel",
+          "why": "The verb reads and writes the two nullable model/thinking overrides; an agent's channel binding (kind + address) is a different concern with its own surface (`deploy --slack-channel`), and emitting it here would imply this verb can change it."
         }
       ]
     }

@@ -65,11 +65,21 @@ pub struct ConnectorManifests {
     pub mcp_entries: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+/// One agent's channel binding (ADR-0096, #1459): `kind` names the ingress
+/// (`"slack"` today) and `address` is the kind-specific identifier the worker
+/// resolver matches turns against. Singular per ADR-0089's one-agent-one-channel
+/// rule, mirroring the committed `ChannelBinding`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChannelBinding {
+    pub kind: String,
+    pub address: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     pub id: String,
     pub name: String,
-    pub slack_channel: String,
+    pub channel: ChannelBinding,
     /// The repository whose pushes deploy this agent (ADR-0014). Set at
     /// creation via `--repo`, or bound later by PATCH since `AgentUpdate`
     /// carries the field (#1194). ADR-0091 dropped the unique index, so
@@ -465,7 +475,10 @@ fn agent_create_body(
     slack_channel: &str,
     repo_full_name: Option<&str>,
 ) -> serde_json::Value {
-    let mut body = json!({"name": name, "slack_channel": slack_channel});
+    let mut body = json!({
+        "name": name,
+        "channel": {"kind": "slack", "address": slack_channel},
+    });
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
     }
@@ -487,7 +500,7 @@ fn agent_update_body(
 ) -> serde_json::Value {
     let mut body = json!({});
     if let Some(channel) = slack_channel {
-        body["slack_channel"] = json!(channel);
+        body["channel"] = json!({"kind": "slack", "address": channel});
     }
     if let Some(repo) = repo_full_name {
         body["repo_full_name"] = json!(repo);
@@ -671,7 +684,7 @@ impl ApiClient {
                 // than sent away to be built again from scratch (#1212). An
                 // agent already bound elsewhere is NOT moved: a deploy must not
                 // silently reroute which repository's pushes reach it.
-                let channel_move = slack_channel.filter(|c| *c != agent.slack_channel.as_str());
+                let channel_move = slack_channel.filter(|c| *c != agent.channel.address.as_str());
                 let current_repo = agent.repo_full_name.as_deref();
                 let (repo_bind, mut repo_note) = match (repo_full_name, current_repo) {
                     (Some(want), None) => (Some(want), None),
@@ -693,7 +706,7 @@ impl ApiClient {
                 // the channel-uniqueness 409 aborts before repo_full_name is
                 // reached. The server still commits per field, so the two
                 // fields are not applied atomically.
-                let previous_channel = channel_move.map(|_| agent.slack_channel.clone());
+                let previous_channel = channel_move.map(|_| agent.channel.address.clone());
                 let agent = if channel_move.is_some() || repo_bind.is_some() {
                     let body = agent_update_body(channel_move, repo_bind);
                     self.update_agent(&agent.id, &body).await?
@@ -719,10 +732,10 @@ impl ApiClient {
                 let outcome = match previous_channel {
                     Some(from) => ChannelOutcome::Updated {
                         from,
-                        to: agent.slack_channel.clone(),
+                        to: agent.channel.address.clone(),
                     },
                     None => ChannelOutcome::Unchanged {
-                        channel: agent.slack_channel.clone(),
+                        channel: agent.channel.address.clone(),
                         passed: slack_channel.is_some(),
                     },
                 };
@@ -731,7 +744,7 @@ impl ApiClient {
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
                 let agent = self.create_agent(name, channel, repo_full_name).await?;
-                let outcome = ChannelOutcome::Created(agent.slack_channel.clone());
+                let outcome = ChannelOutcome::Created(agent.channel.address.clone());
                 Ok((agent, outcome, None))
             }
         }
@@ -1335,7 +1348,8 @@ mod tests {
         // unsolicited value would silently bind rather than 409.
         let body = agent_create_body("bot", "C123", None);
         assert_eq!(body["name"], "bot");
-        assert_eq!(body["slack_channel"], "C123");
+        assert_eq!(body["channel"]["kind"], "slack");
+        assert_eq!(body["channel"]["address"], "C123");
         assert!(body.get("repo_full_name").is_none());
     }
 
@@ -1365,15 +1379,17 @@ mod tests {
         // and an omitted key identically, so a null would read as "omitted"
         // while looking on the wire like an intent to clear (#1071).
         let channel = agent_update_body(Some("C123"), None);
-        assert_eq!(channel["slack_channel"], "C123");
+        assert_eq!(channel["channel"]["kind"], "slack");
+        assert_eq!(channel["channel"]["address"], "C123");
         assert!(channel.get("repo_full_name").is_none(), "was {channel}");
 
         let repo = agent_update_body(None, Some("acme/bundle"));
         assert_eq!(repo["repo_full_name"], "acme/bundle");
-        assert!(repo.get("slack_channel").is_none(), "was {repo}");
+        assert!(repo.get("channel").is_none(), "was {repo}");
 
         let both = agent_update_body(Some("C123"), Some("acme/bundle"));
-        assert_eq!(both["slack_channel"], "C123");
+        assert_eq!(both["channel"]["kind"], "slack");
+        assert_eq!(both["channel"]["address"], "C123");
         assert_eq!(both["repo_full_name"], "acme/bundle");
     }
 

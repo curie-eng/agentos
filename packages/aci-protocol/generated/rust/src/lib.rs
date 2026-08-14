@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.2.9";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -221,10 +221,13 @@ pub mod env_keys {
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReplyHandle {
+    pub kind: String,
     pub channel: String,
     pub placeholder: String,
     #[serde(default)]
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -268,10 +271,13 @@ pub struct ApprovalRequest {
     pub conversation_id: String,
     pub author: String,
     pub summary: String,
+    pub reply_kind: String,
     pub reply_channel: String,
     pub reply_placeholder: String,
     #[serde(default)]
     pub reply_endpoint: Option<String>,
+    #[serde(default)]
+    pub reply_adapter: Option<String>,
     pub dedupe_key: String,
     #[serde(default)]
     pub route: Option<String>,
@@ -418,19 +424,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_minor() {
-        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.2.7","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.3.1","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.2.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

@@ -1,7 +1,7 @@
 {
   "$defs": {
     "ApprovalRequest": {
-      "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.",
+      "description": "A durable approval request (#244), created by the worker when a run ends\nawaiting-approval.\n\n``dedupe_key`` is the triggering event id, so a redelivered turn adopts the\nexisting record instead of forking a second one. ``route``/``card_channel``\n(#247) record the manifest route the request named and the channel the worker\nrouted the card to after binding resolution; the authorizer proves membership\nagainst ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate\nprovenance (#544, Decision C) written by the runner; both stay optional for\nthe rolling-deploy window.\n\n``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s\nrouting pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress\nselector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:\nan absent kind puts the silent misroute back on the resume path, where it is\nleast observable, and ADR-0096 phase 2 buys the right to reject it with a\nquiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is\nnullable because ``slack`` legitimately has no adapter -- its route is the\nworker's configured Slack origin.",
       "properties": {
         "agent_id": {
           "anyOf": [
@@ -79,6 +79,18 @@
           "default": null,
           "title": "Granted Tool"
         },
+        "reply_adapter": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply Adapter"
+        },
         "reply_channel": {
           "minLength": 1,
           "title": "Reply Channel",
@@ -95,6 +107,11 @@
           ],
           "default": null,
           "title": "Reply Endpoint"
+        },
+        "reply_kind": {
+          "minLength": 1,
+          "title": "Reply Kind",
+          "type": "string"
         },
         "reply_placeholder": {
           "minLength": 1,
@@ -124,6 +141,7 @@
         "conversation_id",
         "dedupe_key",
         "reply_channel",
+        "reply_kind",
         "reply_placeholder",
         "summary"
       ],
@@ -1035,8 +1053,20 @@
       "type": "object"
     },
     "ReplyHandle": {
-      "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\nThe reply model is edit-in-place: the ingress adapter pre-posts a placeholder\nmessage and the worker edits it as the answer streams. For the Slack adapter\ntoday, ``channel`` is the Slack channel id (also the key the deployment\nbinding matches an agent on) and ``placeholder`` is the ts of the pre-posted\nplaceholder message.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.",
+      "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model is edit-in-place: the ingress adapter pre-posts a placeholder\nmessage and the worker edits it as the answer streams. ``placeholder`` is an\n**opaque, adapter-minted correlation handle** -- the worker never parses it and\nonly ever hands it back to the adapter that minted it. For the Slack adapter it\nhappens to be the ts of the pre-posted placeholder message; for another kind it\nis whatever that adapter needs to find the same message again.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` legitimately carries neither, because its route is the\nworker's configured Slack origin. ``adapter`` is optional at the schema so a\nthird-party or pre-upgrade producer is not rejected outright, but every\nfirst-party mint site sets it explicitly.",
       "properties": {
+        "adapter": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Adapter"
+        },
         "channel": {
           "title": "Channel",
           "type": "string"
@@ -1053,6 +1083,10 @@
           "default": null,
           "title": "Endpoint"
         },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
         "placeholder": {
           "title": "Placeholder",
           "type": "string"
@@ -1060,6 +1094,7 @@
       },
       "required": [
         "channel",
+        "kind",
         "placeholder"
       ],
       "title": "ReplyHandle",
@@ -1243,6 +1278,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.2.9",
-  "title": "ACI Protocol v0.2.9"
+  "protocolVersion": "0.3.0",
+  "title": "ACI Protocol v0.3.0"
 }

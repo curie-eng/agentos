@@ -20,7 +20,7 @@ from sqlalchemy import make_url
 def _agent(client: Any, headers: dict[str, str]) -> str:
     resp = client.post(
         "/agents",
-        json={"name": "memory-agent", "slack_channel": "C000000M01"},
+        json={"name": "memory-agent", "channel": {"kind": "slack", "address": "C000000M01"}},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text

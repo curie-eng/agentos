@@ -938,7 +938,7 @@ enum LocalAction {
         /// The user message text.
         text: String,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel (errors
+        /// channel. Omit to use the sole deployed agent's channel (errors
         /// if zero or multiple agents are deployed).
         #[arg(long)]
         channel: Option<String>,
@@ -989,7 +989,7 @@ enum LocalAction {
         #[arg(long)]
         cases: Option<PathBuf>,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel.
+        /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
         channel: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
@@ -1507,7 +1507,7 @@ enum ClusterAction {
         /// The user message text.
         text: String,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel (errors
+        /// channel. Omit to use the sole deployed agent's channel (errors
         /// if zero or multiple agents are deployed).
         #[arg(long)]
         channel: Option<String>,
@@ -1584,7 +1584,7 @@ enum ClusterAction {
         #[arg(long)]
         cases: Option<PathBuf>,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel.
+        /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
         channel: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.

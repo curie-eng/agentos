@@ -60,9 +60,18 @@ def _build_turn(approval: Approval, *, author: str, text: str) -> QueuedTurn:
         author=author,
         text=text,
         reply_handle=ReplyHandle(
+            # The persisted routing pair and egress selector, replayed verbatim
+            # (ADR-0096 phase 2). NEVER a lookup against `agent_channels`: an
+            # operator may re-bind the address between suspension and resume, and
+            # these are facts about the ORIGINAL turn. `_build_turn` is the single
+            # constructor for both resume flavors (the resolve re-enqueue and the
+            # expiry re-enqueue), so dropping `adapter` here would lose the egress
+            # selector for every resumed non-Slack turn at once.
+            kind=approval.reply_kind,
             channel=approval.reply_channel,
             placeholder=approval.reply_placeholder,
             endpoint=approval.reply_endpoint,
+            adapter=approval.reply_adapter,
         ),
         received_at=datetime.now(UTC).isoformat(),
     )

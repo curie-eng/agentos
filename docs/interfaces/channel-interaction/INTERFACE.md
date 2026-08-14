@@ -111,7 +111,7 @@ back into the contract:
    The approval card (ADR-0010) travels the same seam: the kernel emits a
    `confirm` intent and the adapter renders it below the line via
    `apps/worker/src/curie_worker/blocks.py::approval_card` inside
-   `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.post` (its
+   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` (its
    settled/expired form via
    `apps/worker/src/curie_worker/blocks.py::expired_approval_card`), so no Block
    Kit is built above the seam. `allow_free_text` on that intent is rendered here

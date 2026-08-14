@@ -3,22 +3,74 @@
 Real Postgres round-trip (the disposable-DB conftest provisions and migrates a
 throwaway database per run); name and repo_full_name are unique columns, so a
 collision must surface as a caller conflict, not an opaque server error.
+
+An agent's channel binding is the neutral `{kind, address}` object of ADR-0096
+(#1459), carried on a SINGULAR `channel` field. Cardinality is 1:1 on ADR-0089's
+authority ("one agent still binds one channel"), so there is no plural surface
+and no list anywhere on this API.
 """
 
+import asyncio
+import json
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
+from curie_api.config import get_settings
+from sqlalchemy import event
+from sqlalchemy import text as sql_text
+from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import create_async_engine
+
+# The committed, exported contract -- the artifact every generated client and
+# every drift gate reads, not the in-process Pydantic model.
+OPENAPI = Path(__file__).resolve().parents[1] / "openapi.json"
+
+
+def _slack(address: str) -> dict[str, str]:
+    """The Slack-kind binding literal, so a shape change lands in one place."""
+
+    return {"kind": "slack", "address": address}
 
 
 def _create(client: Any, headers: dict[str, str], **fields: Any) -> Any:
     return client.post("/agents", json=fields, headers=headers)
 
 
+def _binding_row(agent_id: str) -> Any:
+    """The agent's `agent_channels` row, read straight from Postgres.
+
+    `generation` (ADR-0096 phase 2, D5/EB-A16) is deliberately NOT on the API's
+    response shape -- it is a token-validation fact, not an operator-facing one
+    -- so the only honest way to assert it is against the durable row. Follows
+    `test_crud.py`'s fresh-engine-per-query pattern, which keeps the query off
+    the TestClient's portal loop.
+    """
+
+    async def run() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    sql_text(
+                        "SELECT kind, address, generation, endpoint, adapter "
+                        "FROM curie.agent_channels WHERE agent_id = :aid"
+                    ),
+                    {"aid": agent_id},
+                )
+                return result.mappings().one()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
 def test_duplicate_name_is_409(client: Any, auth_headers: dict[str, str], clean_db: None) -> None:
-    first = _create(client, auth_headers, name="dup-name", slack_channel="C0AAAAAA1")
+    first = _create(client, auth_headers, name="dup-name", channel=_slack("C0AAAAAA1"))
     assert first.status_code == 201, first.text
 
-    dup = _create(client, auth_headers, name="dup-name", slack_channel="C0BBBBBB2")
+    dup = _create(client, auth_headers, name="dup-name", channel=_slack("C0BBBBBB2"))
     assert dup.status_code == 409, dup.text
     assert dup.json()["detail"] == "an agent with that name already exists"
 
@@ -39,7 +91,7 @@ def test_two_agents_may_share_one_repository(
         client,
         auth_headers,
         name="repo-agent-a",
-        slack_channel="C0CCCCCC3",
+        channel={"kind": "slack", "address": "C0CCCCCC3"},
         repo_full_name="octo/shared-repo",
     )
     assert first.status_code == 201, first.text
@@ -48,7 +100,7 @@ def test_two_agents_may_share_one_repository(
         client,
         auth_headers,
         name="repo-agent-b",
-        slack_channel="C0DDDDDD4",
+        channel={"kind": "slack", "address": "C0DDDDDD4"},
         repo_full_name="octo/shared-repo",
     )
     assert second.status_code == 201, second.text
@@ -67,7 +119,7 @@ def test_two_agents_may_not_share_one_channel(
             client,
             auth_headers,
             name="chan-agent-a",
-            slack_channel="C0EEEEEE5",
+            channel={"kind": "slack", "address": "C0EEEEEE5"},
             repo_full_name="octo/one-repo",
         ).status_code
         == 201
@@ -76,46 +128,536 @@ def test_two_agents_may_not_share_one_channel(
         client,
         auth_headers,
         name="chan-agent-b",
-        slack_channel="C0EEEEEE5",
+        channel={"kind": "slack", "address": "C0EEEEEE5"},
         repo_full_name="octo/other-repo",
     )
     assert clash.status_code == 409, clash.text
 
 
-def test_duplicate_slack_channel_is_409(
+def test_duplicate_address_is_409_on_create(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """#38: one agent per channel. A second agent on a taken channel is refused
-    at create time, rather than being accepted and then silently shadowed by the
-    worker's resolver (which routes a channel to exactly one agent)."""
+    """T3, create half. #38: one agent per address. A second agent on a taken
+    address is refused at create time, rather than being accepted and then
+    silently shadowed by the worker's resolver (which routes an address to
+    exactly one agent).
 
-    first = _create(client, auth_headers, name="chan-agent-a", slack_channel="C0EEEEEE5")
+    409 specifically, not "not 201": the failure mode the constraint rename
+    invites is an unmapped constraint name, which turns this into an opaque 500
+    and hands the operator nothing. The guidance is asserted for the same
+    reason -- naming the fix IS the deliverable of #38's error map -- while
+    "Slack" deliberately is NOT asserted, because the invariant now holds for
+    every channel kind and a Slack-only message would misdescribe it.
+    """
+
+    first = _create(client, auth_headers, name="chan-agent-a", channel=_slack("C0EEEEEE5"))
     assert first.status_code == 201, first.text
 
-    dup = _create(client, auth_headers, name="chan-agent-b", slack_channel="C0EEEEEE5")
+    dup = _create(client, auth_headers, name="chan-agent-b", channel=_slack("C0EEEEEE5"))
     assert dup.status_code == 409, dup.text
-    assert "already bound to that Slack channel" in dup.json()["detail"]
+    detail = dup.json()["detail"]
+    assert "already bound" in detail, detail
+    assert "move or delete" in detail, detail
 
 
-def test_patch_onto_taken_slack_channel_is_409(
+def test_patch_onto_taken_address_is_409(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    """The update seam is fenced identically to create (#143's posture): the
-    constraint cannot be sidestepped by creating on a free channel and then
-    PATCHing onto a taken one."""
+    """T3, PATCH half. The update seam is fenced identically to create (#143's
+    posture): the constraint cannot be sidestepped by creating on a free address
+    and then PATCHing onto a taken one."""
 
-    first = _create(client, auth_headers, name="patch-chan-a", slack_channel="C0FFFFFF6")
+    first = _create(client, auth_headers, name="patch-chan-a", channel=_slack("C0FFFFFF6"))
     assert first.status_code == 201, first.text
-    second = _create(client, auth_headers, name="patch-chan-b", slack_channel="C0FFFFFF7")
+    second = _create(client, auth_headers, name="patch-chan-b", channel=_slack("C0FFFFFF7"))
     assert second.status_code == 201, second.text
 
     moved = client.patch(
         f"/agents/{second.json()['id']}",
-        json={"slack_channel": "C0FFFFFF6"},
+        json={"channel": _slack("C0FFFFFF6")},
         headers=auth_headers,
     )
     assert moved.status_code == 409, moved.text
-    assert "already bound to that Slack channel" in moved.json()["detail"]
+    detail = moved.json()["detail"]
+    assert "already bound" in detail, detail
+    assert "move or delete" in detail, detail
+
+
+# --- ADR-0096 / #1459: the channel-neutral binding ----------------------------
+
+
+def test_a_non_slack_kind_binds_and_reads_back_through_the_api(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T1 / AC1, the acceptance criterion stated as a command.
+
+    An agent binds a channel kind the platform has never heard of, with no
+    schema change and no migration between the write and the read. `webhook` has
+    no registered address shape, so it validates on the generic rule; that is
+    exactly what makes "without schema changes" true rather than aspirational.
+
+    The read-back asserts the binding is a singular OBJECT. A list would satisfy
+    "the binding round-trips" while breaking ADR-0089's one-agent-one-channel
+    rule, so the shape is asserted, not just the values.
+    """
+
+    created = _create(
+        client,
+        auth_headers,
+        name="webhook-agent",
+        channel={"kind": "webhook", "address": "acme-room-7"},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["channel"] == {"kind": "webhook", "address": "acme-room-7"}
+
+    fetched = client.get(f"/agents/{created.json()['id']}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    binding = fetched.json()["channel"]
+    assert not isinstance(binding, list), binding
+    assert binding == {"kind": "webhook", "address": "acme-room-7"}
+
+
+def test_a_plural_channels_payload_is_rejected(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T1's singular-contract pin. ADR-0089: "one agent still binds one channel.
+    Declaring two targets creates two agents; it does not let one agent serve two
+    channels." A create that names `channels` is therefore not a partially-honored
+    request, it is a misunderstanding of the contract, and it must be refused
+    rather than silently creating an agent with no binding at all -- which would
+    look deployed and answer nothing, #38's exact failure mode.
+
+    Two payloads, because they fail for different reasons: the first omits the
+    required `channel` entirely, the second sends a list where an object belongs.
+    """
+
+    plural = _create(
+        client,
+        auth_headers,
+        name="plural-agent",
+        channels=[{"kind": "slack", "address": "C0EXAMPLE1"}],
+    )
+    assert plural.status_code == 422, plural.text
+
+    listed = _create(
+        client,
+        auth_headers,
+        name="listed-agent",
+        channel=[{"kind": "slack", "address": "C0EXAMPLE2"}],
+    )
+    assert listed.status_code == 422, listed.text
+
+
+def test_the_slack_address_shape_check_survives_the_rename(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T2 / AC2. #143's regression: `--slack-channel '#name'` stored the literal
+    name, reported success, and never routed, because the worker matches on the
+    channel ID. The validator's actionable text IS the fix, so the assertion is
+    on the guidance, not merely on the 422. A kind-dispatched validator that
+    forgot to keep Slack's arm re-opens #143 while the status code stays green.
+    """
+
+    ok = _create(client, auth_headers, name="slack-ok", channel=_slack("C0123ABCD"))
+    assert ok.status_code == 201, ok.text
+    assert ok.json()["channel"] == {"kind": "slack", "address": "C0123ABCD"}
+
+    bad = _create(client, auth_headers, name="slack-bad", channel=_slack("#general"))
+    assert bad.status_code == 422, bad.text
+    # The About tab and the /archives/ URL form are the guidance #143 shipped.
+    assert "About tab" in bad.text, bad.text
+    assert "archives/C0123ABCD" in bad.text, bad.text
+
+
+def test_the_pair_is_identity_and_the_address_alone_is_not(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T-A6 / AC5. The INVERSION PR 1 promised, now that the wire carries kind.
+
+    This is the rewrite of `test_the_address_is_identity_and_the_kind_is_not`,
+    which asserted that a second kind on a taken address was a 409. That was
+    correct while the resolver saw only the address and could not have told the
+    two rows apart. Phase 2's resolver routes on the pair (T-A4), so the
+    constraint widens to `(kind, address)` in migration 0023 and the second kind
+    is now legal. Rewritten, never deleted: this inversion is the observable
+    proof that kind actually reached the wire rather than only the schema.
+
+    Both halves are asserted in one test on purpose. Widening the constraint
+    while forgetting to remap the API's 409 message (the constraint name changes
+    from `agent_channels_address_key` to `agent_channels_kind_address_key`, and
+    `routers/agents.py` keys its message map on that literal) turns #38's
+    user-facing conflict into an opaque 500 -- and a test that only checked the
+    new success case would never notice.
+    """
+
+    # A Slack-shaped address, because the slack binding has to pass the slack arm
+    # of the write-time validator before any constraint can be reached.
+    first = _create(client, auth_headers, name="kind-a", channel=_slack("C0EXAMPLE1"))
+    assert first.status_code == 201, first.text
+
+    # The widening: a DIFFERENT kind at the same address is a distinct route.
+    other_kind = _create(
+        client,
+        auth_headers,
+        name="kind-b",
+        channel={"kind": "email", "address": "C0EXAMPLE1"},
+    )
+    assert other_kind.status_code == 201, other_kind.text
+    assert other_kind.json()["channel"] == {"kind": "email", "address": "C0EXAMPLE1"}
+
+    # And the pair itself is still identity: the SAME pair still conflicts, with
+    # the guidance that names the fix (#38's error map), not a bare 500.
+    dup_pair = _create(client, auth_headers, name="kind-c", channel=_slack("C0EXAMPLE1"))
+    assert dup_pair.status_code == 409, dup_pair.text
+    detail = dup_pair.json()["detail"]
+    assert "already bound" in detail, detail
+    assert "move or delete" in detail, detail
+
+    # The PATCH seam is fenced identically -- the constraint cannot be sidestepped
+    # by binding a free pair and then moving onto a taken one.
+    free = _create(client, auth_headers, name="kind-d", channel=_slack("C0EXAMPLE2"))
+    assert free.status_code == 201, free.text
+    moved = client.patch(
+        f"/agents/{free.json()['id']}",
+        json={"channel": _slack("C0EXAMPLE1")},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 409, moved.text
+    assert "already bound" in moved.json()["detail"]
+
+
+def test_one_agent_cannot_hold_a_second_binding(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T4, the reverse direction of the uniqueness (edge case E3).
+
+    Migration 0017 got one-binding-per-agent for free from the column being
+    scalar; a child table silently discards it unless it is re-established. So
+    PATCHing a binding MOVES the agent's single binding, and never adds a second.
+    Losing this is the quiet regression the rename invites: nothing fails until
+    an operator binds a second channel and finds one of them dead.
+    """
+
+    created = _create(client, auth_headers, name="single-binding", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    moved = client.patch(
+        f"/agents/{agent_id}",
+        json={"channel": {"kind": "webhook", "address": "moved-here"}},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["channel"] == {"kind": "webhook", "address": "moved-here"}
+
+    # The move REPLACED the binding; the old address is now free for another
+    # agent. If the PATCH had appended, this create would collide.
+    reuse = _create(client, auth_headers, name="reuses-old", channel=_slack("C0EXAMPLE1"))
+    assert reuse.status_code == 201, reuse.text
+
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.json()["channel"] == {"kind": "webhook", "address": "moved-here"}
+
+
+def test_every_rebind_bumps_the_generation_including_a_no_op_patch(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T-A13 / AC13 (plan D5, EB-A16, finding 10).
+
+    A `chn` ingress token claims `{channel_id, generation}`, not `(kind,
+    address)`, because `update_agent_binding` mutates the binding row IN PLACE:
+    without a generation, a token minted before a rebind stays valid against the
+    row's NEW owner. The generation is what makes a rebind observable to a token
+    that never saw it.
+
+    The no-op PATCH is the load-bearing half, and the one an implementation gets
+    wrong by writing `if channel.address != agent.channel.address`. A rebind to
+    the SAME value is still a rebind for token purposes -- an operator
+    re-asserting a binding is exactly the "I think something is wrong with this
+    route" gesture that should invalidate outstanding credentials. Guarding the
+    bump on a value change makes T-C8 pass on the moved case and silently fail on
+    this one.
+    """
+
+    created = _create(client, auth_headers, name="gen-agent", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    fresh = _binding_row(agent_id)
+    assert fresh["generation"] == 0, "a newly created binding starts at generation 0"
+
+    moved = client.patch(
+        f"/agents/{agent_id}",
+        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        headers=auth_headers,
+    )
+    assert moved.status_code == 200, moved.text
+    after_move = _binding_row(agent_id)
+    assert after_move["generation"] == 1
+    assert after_move["kind"] == "email"
+
+    # A PATCH that changes nothing at all still counts.
+    same = client.patch(
+        f"/agents/{agent_id}",
+        json={"channel": {"kind": "email", "address": "ops@example.test"}},
+        headers=auth_headers,
+    )
+    assert same.status_code == 200, same.text
+    assert _binding_row(agent_id)["generation"] == 2
+
+    # A PATCH that does not touch the binding at all does NOT bump it: the
+    # generation tracks rebinds, and bumping on every unrelated write would
+    # invalidate live adapter tokens on a model change.
+    unrelated = client.patch(
+        f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
+    )
+    assert unrelated.status_code == 200, unrelated.text
+    assert _binding_row(agent_id)["generation"] == 2
+
+
+def test_an_explicit_null_channel_is_rejected_on_patch(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Edge case E1. `model` and `thinking` treat explicit null as "clear back to
+    the platform default", and this field deliberately does NOT follow that
+    neighbouring convention: there is no default binding to fall back to, so a
+    null would strand the agent -- deployed, healthy-looking, unable to receive a
+    turn. Omitted still means unchanged.
+    """
+
+    created = _create(client, auth_headers, name="null-channel", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    cleared = client.patch(f"/agents/{agent_id}", json={"channel": None}, headers=auth_headers)
+    assert cleared.status_code == 422, cleared.text
+
+    untouched = client.patch(
+        f"/agents/{agent_id}", json={"model": "claude-sonnet-5"}, headers=auth_headers
+    )
+    assert untouched.status_code == 200, untouched.text
+    assert untouched.json()["channel"] == _slack("C0EXAMPLE1")
+
+
+def test_a_legacy_slack_channel_patch_is_rejected_not_silently_ignored(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The rename must break loudly for a caller that never got the memo.
+
+    Pydantic's default `extra="ignore"` makes `{"slack_channel": "..."}` parse
+    into an AgentUpdate with NOTHING set, so the PATCH returns 200 having done
+    nothing at all. Every layer then agrees the move succeeded: the API says
+    200, the operator's script exits 0, and the agent stays on its old address,
+    answering in a channel nobody is watching. That is #38's silent-shadow
+    failure re-entered through the write path, and a 200 is strictly worse than
+    a 500 here because nothing anywhere reports it.
+
+    A released CLI, a shell script, or a curl in a runbook is exactly this
+    caller. The contract is one shape, and a request in the old shape is a
+    contract violation, not a partial request.
+    """
+
+    created = _create(client, auth_headers, name="legacy-patch", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    legacy = client.patch(
+        f"/agents/{agent_id}",
+        json={"slack_channel": "C0EXAMPLE2"},
+        headers=auth_headers,
+    )
+    assert legacy.status_code == 422, legacy.text
+
+    # And the refusal was total: nothing moved, so a caller cannot read the
+    # response as "partially applied" either.
+    after = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert after.json()["channel"] == _slack("C0EXAMPLE1")
+
+
+def test_a_plural_channels_patch_is_rejected_not_silently_ignored(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """The plural surface never existed, and PATCH is where saying so matters.
+
+    On create, `channels` already fails loudly, but only as collateral: the
+    required singular `channel` is missing, so the 422 names the ABSENT field
+    and says nothing about the plural one the caller actually sent. PATCH has no
+    required field, so the same payload is an ignored unknown key and returns
+    200 having changed nothing -- a caller who believes they just rebound the
+    agent, and an agent still answering on its old address.
+
+    Rejecting it is not pedantry about a typo: `channels: [...]` is a caller
+    acting on ADR-0089's rejected model (one agent serving several channels).
+    The error must name the plural key and point at the singular one, or the
+    operator reads the 422 as "my JSON was malformed" and retries the same
+    shape.
+    """
+
+    created = _create(client, auth_headers, name="plural-patch", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    plural = client.patch(
+        f"/agents/{agent_id}",
+        json={"channels": [{"kind": "slack", "address": "C0EXAMPLE2"}]},
+        headers=auth_headers,
+    )
+    assert plural.status_code == 422, plural.text
+    body = plural.text
+    assert "channels" in body, body
+    assert "channel" in body, body
+
+    after = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert after.json()["channel"] == _slack("C0EXAMPLE1")
+
+
+def test_a_legacy_slack_channel_create_is_rejected(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """Create is fenced identically to PATCH (#143's posture).
+
+    The second case is the dangerous one and the reason this is not just a
+    missing-required-field test: `channel` present AND `slack_channel` present
+    would otherwise be a clean 201 with the legacy key silently dropped. An
+    operator migrating a manifest half-way gets an agent bound to whichever key
+    the API happened to prefer, with no signal about which one lost.
+    """
+
+    instead = _create(client, auth_headers, name="legacy-create", slack_channel="C0EXAMPLE1")
+    assert instead.status_code == 422, instead.text
+
+    alongside = _create(
+        client,
+        auth_headers,
+        name="legacy-both",
+        channel=_slack("C0EXAMPLE2"),
+        slack_channel="C0EXAMPLE3",
+    )
+    assert alongside.status_code == 422, alongside.text
+
+
+def test_the_published_schema_does_not_advertise_a_nullable_channel() -> None:
+    """A contract pin on the exported artifact, because the artifact IS the
+    contract.
+
+    `AgentUpdate.channel` is `ChannelBinding | None` in Python, and Pydantic
+    exports that as `anyOf: [$ref ChannelBinding, {type: null}]` -- publishing
+    "null is a valid value for this field". It is not: an explicit null is
+    refused with a 422, deliberately, because unlike `model` and `thinking`
+    there is no platform default binding to fall back to and a null would strand
+    the agent. So the published schema promises something the server refuses.
+
+    That gap is not cosmetic. Generated clients and the CLI's field-parity gate
+    read this file, not the Python: a generated client types the field as
+    nullable and hands its users a call that always 422s, and no runtime test
+    catches it because no runtime test sends the null a generated client would.
+    Optional (omittable) and nullable are different things, and only the first
+    is true here.
+
+    A structural assertion on the JSON is the right shape ONLY here, where the
+    published document is itself the deliverable. Everything else in this file
+    asserts through HTTP.
+    """
+
+    schemas = json.loads(OPENAPI.read_text(encoding="utf-8"))["components"]["schemas"]
+    field = schemas["AgentUpdate"]["properties"]["channel"]
+
+    variants = field.get("anyOf", field.get("oneOf", [field]))
+    assert {"type": "null"} not in variants, (
+        "openapi.json advertises null as a valid AgentUpdate.channel, but the "
+        "API refuses an explicit null with 422 (a binding has no platform "
+        f"default to clear back to). Published shape: {field!r}"
+    )
+    # The field still resolves to the binding object, so this cannot be
+    # satisfied by deleting the property or loosening it to a bare object.
+    assert json.dumps(field).count("#/components/schemas/ChannelBinding") == 1, field
+
+
+@pytest.fixture
+def statement_log() -> Iterator[list[str]]:
+    """Every SQL statement the app issues, captured at the driver.
+
+    Listens on the Engine CLASS rather than on an instance because the app builds
+    its own engine inside its lifespan, which the TestClient owns. Used only to
+    bound a query COUNT; nothing asserts on statement text.
+    """
+
+    captured: list[str] = []
+
+    def _record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        captured.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        yield captured
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
+
+
+def test_the_binding_serializes_on_every_read_endpoint(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """T14 / AC10, and it must hit HTTP, not `crud`.
+
+    `AgentOut.model_validate` on a relationship that was never loaded raises
+    under asyncio instead of lazy-loading. A crud-level test holds its own live
+    session open and passes against exactly that bug; only the endpoint, whose
+    session is already closed by the time the response model is built, provokes
+    it. So all three read paths are exercised through the app: the create
+    response, the list, and the by-id fetch.
+    """
+
+    created = _create(client, auth_headers, name="reader-a", channel=_slack("C0EXAMPLE1"))
+    assert created.status_code == 201, created.text
+    assert created.json()["channel"] == _slack("C0EXAMPLE1")
+    agent_id = created.json()["id"]
+
+    listed = client.get("/agents", headers=auth_headers)
+    assert listed.status_code == 200, listed.text
+    assert [a["channel"] for a in listed.json()] == [_slack("C0EXAMPLE1")]
+
+    fetched = client.get(f"/agents/{agent_id}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["channel"] == _slack("C0EXAMPLE1")
+
+
+def test_listing_agents_does_not_issue_a_query_per_agent(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    statement_log: list[str],
+) -> None:
+    """T14's N+1 half / AC10.
+
+    A relationship loaded per row is correct and unboundedly slow: the list
+    endpoint would issue one extra query per agent, so a hundred-agent install
+    pays a hundred round trips to render one page. Measured at two sizes and
+    asserted EQUAL rather than against a magic number, so the test states the
+    property (the cost does not grow with the number of agents) instead of
+    pinning an implementation's exact query count, which a legitimate refactor
+    could change.
+    """
+
+    def _cost(count: int, prefix: str) -> int:
+        for index in range(count):
+            resp = _create(
+                client,
+                auth_headers,
+                name=f"{prefix}-{index}",
+                channel=_slack(f"C0{prefix.upper()}{index:04d}"),
+            )
+            assert resp.status_code == 201, resp.text
+        statement_log.clear()
+        listed = client.get("/agents", headers=auth_headers)
+        assert listed.status_code == 200, listed.text
+        return sum(1 for s in statement_log if "agent_channels" in s)
+
+    small = _cost(2, "few")
+    large = _cost(6, "many")
+    assert small == large, (
+        f"listing 2 agents cost {small} agent_channels queries and listing 8 cost "
+        f"{large}: the binding is being loaded per row (N+1), not eagerly"
+    )
 
 
 def test_agent_approval_required_tools_round_trip(
@@ -126,7 +668,7 @@ def test_agent_approval_required_tools_round_trip(
         "/agents",
         json={
             "name": "gated-agent",
-            "slack_channel": "C000000G01",
+            "channel": {"kind": "slack", "address": "C000000G01"},
             "approval_required_tools": ["Bash", "mcp__github__create_issue"],
         },
         headers=auth_headers,
@@ -173,7 +715,7 @@ def test_agent_approval_required_tools_rejects_bad_names(
             "/agents",
             json={
                 "name": f"bad-{bad[0].strip() or 'blank'}",
-                "slack_channel": "C000000G02",
+                "channel": {"kind": "slack", "address": "C000000G02"},
                 "approval_required_tools": bad,
             },
             headers=auth_headers,
@@ -188,7 +730,7 @@ def test_agent_approval_routes_round_trip(
         "/agents",
         json={
             "name": "routed-agent",
-            "slack_channel": "C000000R01",
+            "channel": {"kind": "slack", "address": "C000000R01"},
             "approval_routes": {"managers": {"channel": "C000000R02"}},
         },
         headers=auth_headers,
@@ -223,7 +765,7 @@ def test_agent_approval_routes_rejects_bad_bindings(
             "/agents",
             json={
                 "name": f"bad-routes-{list(routes)[0].strip() or 'blank'}",
-                "slack_channel": "C000000R05",
+                "channel": {"kind": "slack", "address": "C000000R05"},
                 "approval_routes": routes,
             },
             headers=auth_headers,
@@ -253,7 +795,7 @@ def test_agent_approval_routes_with_approvers_round_trip(
         "/agents",
         json={
             "name": "approvers-agent",
-            "slack_channel": "C000000A01",
+            "channel": {"kind": "slack", "address": "C000000A01"},
             "approval_routes": {
                 "managers": {"channel": "C000000A02", "approvers": {"group": "S000000G1"}}
             },
@@ -298,7 +840,7 @@ def test_agent_approval_routes_accepts_both_users_and_group(
         "/agents",
         json={
             "name": "both-approvers-agent",
-            "slack_channel": "C000000B01",
+            "channel": {"kind": "slack", "address": "C000000B01"},
             "approval_routes": {
                 "managers": {
                     "channel": "C000000B02",
@@ -347,7 +889,7 @@ def test_agent_approval_routes_rejects_bad_approvers(
             "/agents",
             json={
                 "name": f"bad-approvers-{index}",
-                "slack_channel": "C000000C01",
+                "channel": {"kind": "slack", "address": "C000000C01"},
                 "approval_routes": {"managers": {"channel": "C000000C02", "approvers": approvers}},
             },
             headers=auth_headers,
@@ -385,7 +927,7 @@ def test_agent_approval_routes_rejects_unknown_keys(
             "/agents",
             json={
                 "name": f"unknown-key-{index}",
-                "slack_channel": "C000000E01",
+                "channel": {"kind": "slack", "address": "C000000E01"},
                 "approval_routes": {"managers": binding},
             },
             headers=auth_headers,
@@ -401,7 +943,7 @@ def test_agent_approval_routes_patch_rejects_unknown_keys(
 
     created = client.post(
         "/agents",
-        json={"name": "patch-unknown-key-agent", "slack_channel": "C000000F01"},
+        json={"name": "patch-unknown-key-agent", "channel": _slack("C000000F01")},
         headers=auth_headers,
     )
     assert created.status_code == 201, created.text
@@ -427,7 +969,7 @@ def test_agent_approval_routes_patch_rejects_bad_approvers(
 
     created = client.post(
         "/agents",
-        json={"name": "patch-approvers-agent", "slack_channel": "C000000D01"},
+        json={"name": "patch-approvers-agent", "channel": _slack("C000000D01")},
         headers=auth_headers,
     )
     assert created.status_code == 201, created.text
@@ -450,7 +992,7 @@ def test_agent_secrets_round_trip_exposes_names_only(
         "/agents",
         json={
             "name": "secret-agent",
-            "slack_channel": "C000000S01",
+            "channel": {"kind": "slack", "address": "C000000S01"},
             "secrets": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_supersecret"},
         },
         headers=auth_headers,
@@ -478,7 +1020,7 @@ def test_agent_non_env_var_secret_name_is_422(
         "/agents",
         json={
             "name": "bad-secret-agent",
-            "slack_channel": "C000000S02",
+            "channel": {"kind": "slack", "address": "C000000S02"},
             "secrets": {"github-token": "x"},
         },
         headers=auth_headers,
@@ -494,7 +1036,7 @@ def test_agent_reserved_secret_name_is_422(
         "/agents",
         json={
             "name": "reserved-secret-agent",
-            "slack_channel": "C000000S03",
+            "channel": {"kind": "slack", "address": "C000000S03"},
             "secrets": {"CURIE_BUDGET": "x"},
         },
         headers=auth_headers,
@@ -521,7 +1063,7 @@ def test_agent_reserved_credential_secret_name_is_422(
         "/agents",
         json={
             "name": "cred-secret-agent",
-            "slack_channel": "C000000S04",
+            "channel": {"kind": "slack", "address": "C000000S04"},
             "secrets": {name: "x"},
         },
         headers=auth_headers,
@@ -547,7 +1089,7 @@ def test_agent_reserved_redirect_capture_secret_name_is_422(
         "/agents",
         json={
             "name": "redirect-secret-agent",
-            "slack_channel": "C000000S05",
+            "channel": {"kind": "slack", "address": "C000000S05"},
             "secrets": {name: "x"},
         },
         headers=auth_headers,
@@ -563,7 +1105,7 @@ def test_agent_legitimate_secret_name_still_creates(
         "/agents",
         json={
             "name": "ok-secret-agent",
-            "slack_channel": "C000000S05",
+            "channel": {"kind": "slack", "address": "C000000S05"},
             "secrets": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_x"},
         },
         headers=auth_headers,

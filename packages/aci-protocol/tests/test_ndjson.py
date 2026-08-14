@@ -115,8 +115,8 @@ def test_unknown_field_is_ignored_on_inbound_read() -> None:
 
 def test_compatible_patch_version_is_accepted() -> None:
     # AC: a same-major-minor patch difference is not an error. Build speaks
-    # 0.2.0; a 0.2.7 line decodes fine.
-    line = json.dumps({"type": "final", "version": "0.2.7", "text": "x", "status": "done"})
+    # 0.3.0; a 0.3.7 line decodes fine.
+    line = json.dumps({"type": "final", "version": "0.3.7", "text": "x", "status": "done"})
     decoded = parse_ndjson_line(line)
     assert isinstance(decoded, Final)
     assert decoded.text == "x"
@@ -125,11 +125,11 @@ def test_compatible_patch_version_is_accepted() -> None:
 def test_incompatible_minor_is_rejected_naming_both_versions() -> None:
     # AC: rejects an incompatible version with a message naming both versions.
     # The assertion is on the message content, not just the exception type.
-    line = json.dumps({"type": "final", "version": "0.3.0", "text": "x", "status": "done"})
+    line = json.dumps({"type": "final", "version": "0.4.0", "text": "x", "status": "done"})
     with pytest.raises(ProtocolVersionError) as excinfo:
         parse_ndjson_line(line)
     message = str(excinfo.value)
-    assert "0.3.0" in message
+    assert "0.4.0" in message
     assert PROTOCOL_VERSION in message
 
 

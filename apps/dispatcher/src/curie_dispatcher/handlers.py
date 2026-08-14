@@ -117,7 +117,14 @@ def process_event(
         conversation_id=thread_ts,
         author=event.get("user", ""),
         text=event.get("text", ""),
-        reply_handle=ReplyHandle(channel=channel, placeholder=placeholder_ts),
+        # The literal "slack" is this dispatcher stating what it is; it never
+        # comes from config, because a Slack Socket Mode dispatcher that could
+        # claim another kind is a misrouting vector. `adapter=None` is explicit
+        # rather than defaulted so a reader sees that Slack's route is the
+        # worker's configured origin, not an oversight (ADR-0096 D4.4).
+        reply_handle=ReplyHandle(
+            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
+        ),
         received_at=clock(),
     )
     stream_id = enqueue(redis_client, config, queued)
@@ -201,7 +208,10 @@ def process_action(
         conversation_id=thread_ts,
         author=user,
         text=command,
-        reply_handle=ReplyHandle(channel=channel, placeholder=placeholder["ts"]),
+        # Same literal, same reason, on the sibling lane (ADR-0096 D4.4).
+        reply_handle=ReplyHandle(
+            kind="slack", channel=channel, placeholder=placeholder["ts"], adapter=None
+        ),
         received_at=clock(),
     )
     stream_id = enqueue(redis_client, config, queued)

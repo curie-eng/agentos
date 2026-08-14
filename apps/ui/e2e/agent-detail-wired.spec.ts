@@ -5,7 +5,7 @@ import { test, expect, type Page } from "@playwright/test";
 // the create-path sequence (POST version + PUT bundle + activate deployment).
 // The backend is stubbed with real-shaped responses, so this runs stackless.
 
-const AGENT = { id: "a1", name: "deal-desk", slack_channel: "C0123ABCD", created_at: "2026-07-01T00:00:00Z" };
+const AGENT = { id: "a1", name: "deal-desk", channel: { kind: "slack", address: "C0123ABCD" }, created_at: "2026-07-01T00:00:00Z" };
 
 const SKILL_V1 =
   "---\nname: deal-desk\ndescription: Approves deals\ntools: [slack]\n---\n# Policy\nAuto-approve up to 15%.";

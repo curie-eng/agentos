@@ -68,9 +68,18 @@ def _seed_agent(name: str, channel: str, model: str | None, thinking: str | None
     The point is to create rows the validator would refuse today, which is
     exactly the state a database written by a released image can be in.
 
+    Still writes `agents.slack_channel`, and that is correct after migration
+    0021 removed the column (ADR-0096, #1459): every test in this module
+    downgrades to 0019 BEFORE seeding, so the schema under the insert is always
+    the pre-0021 one that still has it. Rewriting these inserts to
+    `agent_channels` would fail against the schema they actually run on, and
+    that is the intermittent, migration-state-dependent failure EB-23 flags.
+    The forward path is covered too: `command.upgrade(cfg, "head")` below now
+    runs 0021 as well, so 0020's repair is asserted through 0021's backfill.
+
     Args:
         name: agent name (unique).
-        channel: Slack channel id (unique).
+        channel: Slack channel id (unique on the pre-0021 schema).
         model: the raw `model` value to store.
         thinking: the raw `thinking` value to store.
 

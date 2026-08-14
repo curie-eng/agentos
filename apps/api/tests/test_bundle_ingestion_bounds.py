@@ -42,7 +42,10 @@ def _tar_plain(files: dict[str, bytes], top: str = "demo-plugin") -> bytes:
 def _create_version(client: Any, headers: dict[str, str]) -> tuple[str, str]:
     agent = client.post(
         "/agents",
-        json={"name": "bundle-bounds-agent", "slack_channel": "C0000BND1"},
+        json={
+            "name": "bundle-bounds-agent",
+            "channel": {"kind": "slack", "address": "C0000BND1"},
+        },
         headers=headers,
     ).json()
     version = client.post(
@@ -322,7 +325,10 @@ def test_version_with_no_bundle_yet_deploys_without_revalidation(
     blocked by the revalidation -- it is a no-op when bundle_ref is None."""
     agent = client.post(
         "/agents",
-        json={"name": "bundleless-agent", "slack_channel": "C0000BND2"},
+        json={
+            "name": "bundleless-agent",
+            "channel": {"kind": "slack", "address": "C0000BND2"},
+        },
         headers=auth_headers,
     ).json()
     version = client.post(

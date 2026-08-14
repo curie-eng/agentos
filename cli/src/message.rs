@@ -417,7 +417,7 @@ pub fn local_api_base(api_url: Option<&str>) -> String {
 }
 
 /// Pick the channel to send as: an explicit `--channel` wins; otherwise the sole
-/// deployed agent's `slack_channel`. Zero or multiple agents is an error naming
+/// deployed agent's channel. Zero or multiple agents is an error naming
 /// them and requiring `--channel`, because the worker binds a channel to an
 /// agent by exact equality -- guessing would silently route nowhere.
 pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String> {
@@ -429,11 +429,11 @@ pub fn select_channel(agents: &[Agent], explicit: Option<&str>) -> Result<String
             "no agents are deployed on the platform API; deploy one with `curie local deploy` \
              or `curie cluster deploy`, or pass --channel <id>"
         ),
-        [only] => Ok(only.slack_channel.clone()),
+        [only] => Ok(only.channel.address.clone()),
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.slack_channel))
+                .map(|a| format!("{} -> {}", a.name, a.channel.address))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -517,7 +517,7 @@ pub fn dry_run_lines(opts: &MessageOpts, advertise_host: &str) -> Vec<String> {
     let channel = opts
         .channel
         .clone()
-        .unwrap_or_else(|| "<the sole deployed agent's slack_channel>".to_string());
+        .unwrap_or_else(|| "<the sole deployed agent's channel>".to_string());
     lines.push(format!(
         "enqueue a synthetic QueuedTurn (reply endpoint {url}) for channel {channel} \
          on stream {}",
@@ -1019,6 +1019,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
     let event = synthetic_turn(
+        "slack",
         &channel,
         &opts.user,
         &opts.text,
@@ -1608,6 +1609,7 @@ fn connected_turn(
 ) -> QueuedTurn {
     let conversation_id = explicit_thread.unwrap_or(placeholder_ts);
     synthetic_turn(
+        "slack",
         channel,
         &opts.user,
         &opts.text,
@@ -1798,6 +1800,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let (channel, thread_ts, placeholder_ts) =
         resolve_targets(Some(&channel), opts.thread.as_deref());
     let event = synthetic_turn(
+        "slack",
         &channel,
         &opts.user,
         &opts.text,
@@ -2194,6 +2197,7 @@ async fn run_eval_turns(
         let (channel_id, thread_ts, placeholder_ts) = resolve_targets(Some(channel), None);
         let reply_endpoint = stub.base_api_url().to_string();
         let event = synthetic_turn(
+            "slack",
             &channel_id,
             &opts.user,
             &case.input,
@@ -2291,15 +2295,15 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
 const SWEEP_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Resolve the target agent's id for the trigger plane. Mirrors `select_channel`
-/// (explicit `--channel` matches an agent's `slack_channel`, else the sole
+/// (explicit `--channel` matches an agent's channel, else the sole
 /// deployed agent), but returns the agent id the trigger endpoint keys on.
 pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String> {
     if let Some(channel) = channel {
         return agents
             .iter()
-            .find(|a| a.slack_channel == channel)
+            .find(|a| a.channel.address == channel)
             .map(|a| a.id.clone())
-            .ok_or_else(|| anyhow::anyhow!("no deployed agent has slack_channel {channel:?}"));
+            .ok_or_else(|| anyhow::anyhow!("no deployed agent has channel {channel:?}"));
     }
     match agents {
         [] => bail!(
@@ -2310,7 +2314,7 @@ pub fn select_agent_id(agents: &[Agent], channel: Option<&str>) -> Result<String
         many => {
             let listed = many
                 .iter()
-                .map(|a| format!("{} -> {}", a.name, a.slack_channel))
+                .map(|a| format!("{} -> {}", a.name, a.channel.address))
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!("multiple agents are deployed; pass --channel <id> to pick one ({listed})")
@@ -2993,7 +2997,10 @@ mod tests {
         Agent {
             id: format!("id-{name}"),
             name: name.to_string(),
-            slack_channel: channel.to_string(),
+            channel: crate::api::ChannelBinding {
+                kind: "slack".to_string(),
+                address: channel.to_string(),
+            },
             repo_full_name: None,
             approval_required_tools: None,
             approval_routes: None,
@@ -3485,7 +3492,9 @@ mod tests {
             "no --channel -> api forward: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("slack_channel")),
+            lines
+                .iter()
+                .any(|l| l.contains("the sole deployed agent's channel")),
             "channel placeholder when omitted: {lines:?}"
         );
     }
@@ -3745,7 +3754,10 @@ mod tests {
             Agent {
                 id: "a1".into(),
                 name: "one".into(),
-                slack_channel: "C1".into(),
+                channel: crate::api::ChannelBinding {
+                    kind: "slack".into(),
+                    address: "C1".into(),
+                },
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,
@@ -3755,7 +3767,10 @@ mod tests {
             Agent {
                 id: "a2".into(),
                 name: "two".into(),
-                slack_channel: "C2".into(),
+                channel: crate::api::ChannelBinding {
+                    kind: "slack".into(),
+                    address: "C2".into(),
+                },
                 repo_full_name: None,
                 approval_required_tools: None,
                 approval_routes: None,

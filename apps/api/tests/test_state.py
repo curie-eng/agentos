@@ -18,7 +18,7 @@ _PAST = 1000000000  # 2001, expired at test time
 def _agent(client: Any, headers: dict[str, str]) -> str:
     resp = client.post(
         "/agents",
-        json={"name": "state-agent", "slack_channel": "C000000S01"},
+        json={"name": "state-agent", "channel": {"kind": "slack", "address": "C000000S01"}},
         headers=headers,
     )
     assert resp.status_code == 201, resp.text

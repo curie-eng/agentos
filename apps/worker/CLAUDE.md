@@ -60,10 +60,14 @@ simplification.
   and acks. Only an exhausted budget dead-letters.
 - **Exception (#708): approval-resume reply is best-effort in the pure-offline
   loop.** When an approval-resume turn's reply endpoint is unreachable AND no
-  default Slack transport is configured, `AsyncSlackSink` swallows the
-  unreachable error instead of raising -- the turn ACKs without delivering the
-  reply instead of dead-lettering. A configured default transport, or any
-  non-resume turn, still raises and dead-letters normally.
+  default transport is configured, the adapter swallows the unreachable error
+  instead of raising -- the turn ACKs without delivering the reply instead of
+  dead-lettering. Both adapters honor it: `SlackReplyAdapter` when no default
+  Slack transport is configured, `HttpReplyAdapter` by logging and returning
+  with no fallback target at all (a fallback there would post an email reply
+  into a Slack workspace). A configured default transport, or any non-resume
+  turn, still raises and dead-letters normally. A MISSING egress credential is
+  never swallowed: fail-closed outranks best-effort.
 - **The graveyard has no consumer group, but it IS bounded** by an approximate
   `MAXLEN` (`CURIE_DEAD_LETTER_MAXLEN`, default 10000) on every `XADD`. The
   unparseable path dead-letters per inbound entry, so an unbounded graveyard hands

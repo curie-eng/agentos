@@ -1647,6 +1647,31 @@ mod tests {
         assert!(compose.contains("      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-xoxb-dev}"));
     }
 
+    /// The dev trio of trusted Slack origins (ADR-0096 D4.4) must stay on the
+    /// compose worker, overridable by the operator. `local message` binds its
+    /// reply stub on `localhost`/`127.0.0.1` (native Linux) or
+    /// `host.docker.internal` (Docker Desktop), and the single
+    /// `SLACK_API_BASE_URL` above cannot name all three, so without these the
+    /// worker's origin pin refuses the local reply loop and the turn never
+    /// finalizes. `compose/generate_release_compose.py` derives
+    /// compose.release.yaml from this file by text transform, so the release
+    /// asset (and the `local-release` ladder rung) inherits whatever this line
+    /// says -- the two move together by construction, and this test is what
+    /// keeps the dev half from being dropped. DEV ONLY: the chart's
+    /// `worker.slackTrustedOrigins` default stays empty.
+    #[test]
+    fn compose_file_trusts_the_local_stub_origins() {
+        let compose = read_compose("compose.dev.yaml");
+        assert!(
+            compose.contains(
+                "      - CURIE_SLACK_TRUSTED_ORIGINS=${CURIE_SLACK_TRUSTED_ORIGINS-\
+                 http://localhost,http://127.0.0.1,http://host.docker.internal}"
+            ),
+            "compose.dev.yaml must trust the local stub origins so the release \
+             compose derived from it does too"
+        );
+    }
+
     #[test]
     fn compose_file_declares_slack_dispatcher_profile() {
         let compose = read_compose("compose.dev.yaml");

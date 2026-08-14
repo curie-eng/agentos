@@ -11,16 +11,23 @@ from .config import WorkerConfig
 from .consumer import Consumer
 from .kernel import RETRYABLE_CLASSIFICATIONS, Kernel, TurnOutcome
 from .killswitch import KillSwitch
-from .markers import Markers
+from .markers import CompletionRecord, Markers
+from .reply_sink import (
+    HttpReplyAdapter,
+    ReplySink,
+    ReplySinkRouter,
+    TargetRoute,
+    build_reply_sink,
+)
 from .runner_client import RunnerClient, RunnerError, TurnStream
-from .slack_sink import AsyncSlackSink, SlackSink
+from .slack_sink import SlackReplyAdapter
 from .threadlock import LockAcquireTimeout, ThreadLock
 
 __version__ = "0.0.0"
 
 __all__ = [
     "RETRYABLE_CLASSIFICATIONS",
-    "AsyncSlackSink",
+    "CompletionRecord",
     "BindingResolver",
     "Consumer",
     "Kernel",
@@ -30,7 +37,12 @@ __all__ = [
     "ResolvedDeployment",
     "RunnerClient",
     "RunnerError",
-    "SlackSink",
+    "HttpReplyAdapter",
+    "ReplySink",
+    "ReplySinkRouter",
+    "SlackReplyAdapter",
+    "TargetRoute",
+    "build_reply_sink",
     "ThreadLock",
     "TurnOutcome",
     "TurnStream",
