@@ -133,7 +133,8 @@ async def _truncate() -> None:
             await conn.execute(
                 text(
                     "TRUNCATE curie.approvals, curie.deployments, "
-                    "curie.agent_versions, curie.agents CASCADE"
+                    "curie.agent_versions, curie.agents, "
+                    "curie.console_sessions CASCADE"
                 )
             )
     finally:
