@@ -218,7 +218,7 @@ class WorkerConfig(BaseSettings):
     # default (#717) -- an end user talking to an agent should never see curie's
     # own architecture terms in a status line.
     booting_text: str = Field(
-        default="Working on it...",
+        default="…",
         validation_alias="CURIE_BOOTING_TEXT",
     )
 

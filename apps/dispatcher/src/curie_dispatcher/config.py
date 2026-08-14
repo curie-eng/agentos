@@ -110,7 +110,7 @@ class DispatcherConfig(BaseSettings):
     )
 
     placeholder_text: str = Field(
-        default="On it. Working on your request.",
+        default="…",
         validation_alias="CURIE_PLACEHOLDER_TEXT",
     )
     # CURIE_SHIMMER and CURIE_STATUS_TEXT are deliberately NOT read here (#1312).

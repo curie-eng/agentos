@@ -72,7 +72,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `CURIE_STREAM` | `curie:runs` | Stream the jobs land on |
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |
 | `CURIE_DEDUPE_TTL_SECONDS` | `3600` | dedupe guard TTL |
-| `CURIE_PLACEHOLDER_TEXT` | `On it. Working on your request.` | placeholder reply text |
+| `CURIE_PLACEHOLDER_TEXT` | `…` | placeholder reply text |
 | `CURIE_BACKOFF_INITIAL_SECONDS` | `1.0` | first reconnect backoff |
 | `CURIE_BACKOFF_MAX_SECONDS` | `30.0` | backoff cap |
 | `CURIE_BACKOFF_MULTIPLIER` | `2.0` | backoff growth factor |

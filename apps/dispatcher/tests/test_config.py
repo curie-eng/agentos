@@ -128,7 +128,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.stream == "curie:runs"
     assert config.dedupe_prefix == "curie:dedupe:"
     assert config.dedupe_ttl_seconds == 3600
-    assert config.placeholder_text == "On it. Working on your request."
+    assert config.placeholder_text == "…"
     assert config.backoff_initial_seconds == 1.0
     assert config.backoff_max_seconds == 30.0
     assert config.backoff_multiplier == 2.0
