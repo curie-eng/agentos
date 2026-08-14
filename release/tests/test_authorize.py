@@ -2,8 +2,8 @@
 
 The gate is the deterministic check behind issue #628: a `v*` tag must not be
 able to start the publish pipeline unless its commit is reachable from
-`origin/main` and that commit's required checks are all green. These tests
-drive both functions directly -- `commit_is_on_reviewed_main` against a real,
+`origin/main` or `origin/next` and that commit's required checks are all green. These tests
+drive both functions directly -- `commit_is_on_reviewed_branch` against a real,
 disposable git repo (no network needed for ancestry) and
 `missing_required_checks` against constructed
 check-run lists -- plus `authorize()`, which combines them and is what
@@ -11,6 +11,7 @@ check-run lists -- plus `authorize()`, which combines them and is what
 """
 
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -62,12 +63,32 @@ def git_repo(tmp_path) -> Path:
     return repo
 
 
+@pytest.fixture
+def reviewed_refs_repo(git_repo) -> tuple[Path, dict[str, str]]:
+    """A history with commits unique to main, next, and an unmerged feature."""
+    base = run_git(git_repo, "rev-parse", "HEAD")
+
+    run_git(git_repo, "checkout", "-q", "-b", "next")
+    next_commit = commit(git_repo, "next-only.txt")
+    run_git(git_repo, "update-ref", "refs/remotes/origin/next", next_commit)
+
+    run_git(git_repo, "checkout", "-q", "main")
+    main_commit = commit(git_repo, "main-only.txt")
+    run_git(git_repo, "update-ref", "refs/remotes/origin/main", main_commit)
+
+    run_git(git_repo, "checkout", "-q", "-b", "feature", base)
+    feature_commit = commit(git_repo, "feature-only.txt")
+
+    return git_repo, {"main": main_commit, "next": next_commit, "feature": feature_commit}
+
+
 # A required-name set distinct from the real, larger production
 # REQUIRED_CHECK_NAMES (issue #733). Most tests in this file exercise the
 # *logic* of required-check matching and should not need updating every time
 # a ci.yaml job is renamed or added; the production constant itself gets its
 # own coverage in TestRequiredCheckAllowlist below.
 TEST_REQUIRED_NAMES = frozenset({"CI", "CodeQL"})
+REVIEWED_REFS = ("origin/main", "origin/next")
 
 CHECK_RUNS_ALL_GREEN = [
     {"name": "CI", "conclusion": "success"},
@@ -104,30 +125,41 @@ GATE_OWN_IN_PROGRESS = check_run(
 )
 
 
-class TestCommitIsOnReviewedMain:
+class TestCommitIsOnReviewedBranch:
+    def test_reviewed_branch_ref_has_no_default(self):
+        parameters = inspect.signature(
+            authorize_module.commit_is_on_reviewed_branch
+        ).parameters
+
+        assert parameters["reviewed_ref"].default is inspect.Parameter.empty
+
     def test_head_of_main_is_reachable(self, git_repo):
         sha = run_git(git_repo, "rev-parse", "HEAD")
 
-        assert authorize_module.commit_is_on_reviewed_main(sha, "main", cwd=git_repo)
+        assert authorize_module.commit_is_on_reviewed_branch(sha, "main", cwd=git_repo)
 
     def test_ancestor_of_main_is_reachable(self, git_repo):
         first = run_git(git_repo, "rev-parse", "HEAD")
         commit(git_repo, "later-on-main.txt")
 
-        assert authorize_module.commit_is_on_reviewed_main(first, "main", cwd=git_repo)
+        assert authorize_module.commit_is_on_reviewed_branch(first, "main", cwd=git_repo)
 
     def test_commit_only_on_an_unmerged_branch_is_refused(self, git_repo):
         run_git(git_repo, "checkout", "-q", "-b", "feature")
         unmerged = commit(git_repo, "feature-only.txt")
 
-        assert not authorize_module.commit_is_on_reviewed_main(
+        assert not authorize_module.commit_is_on_reviewed_branch(
             unmerged, "main", cwd=git_repo
         )
 
-    def test_unknown_sha_is_refused_not_raised(self, git_repo):
-        assert not authorize_module.commit_is_on_reviewed_main(
-            "0" * 40, "main", cwd=git_repo
-        )
+    def test_unknown_sha_refuses_as_indeterminate_reachability(self, git_repo):
+        sha = "0" * 40
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.commit_is_on_reviewed_branch(sha, "main", cwd=git_repo)
+
+        assert sha in str(exc_info.value)
+        assert "main" in str(exc_info.value)
 
 
 class TestRequiredCheckSatisfaction:
@@ -206,22 +238,78 @@ class TestMissingRequiredChecks:
 
 
 class TestAuthorize:
-    def test_reviewed_and_green_commit_is_authorized(self, git_repo):
-        sha = run_git(git_repo, "rev-parse", "HEAD")
+    def test_reviewed_ref_collection_has_no_default(self):
+        parameters = inspect.signature(authorize_module.authorize).parameters
 
+        assert "main_ref" not in parameters
+        assert parameters["reviewed_refs"].default is inspect.Parameter.empty
+
+    def test_commit_reachable_only_from_next_is_authorized(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
         authorize_module.authorize(
-            sha, CHECK_RUNS_ALL_GREEN, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            commits["next"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
         )
 
-    def test_unreviewed_commit_is_refused_even_with_green_checks(self, git_repo):
-        run_git(git_repo, "checkout", "-q", "-b", "feature")
-        unmerged = commit(git_repo, "feature-only.txt")
+    def test_commit_reachable_only_from_main_is_authorized(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
 
-        with pytest.raises(authorize_module.AuthorizationError, match="not reachable"):
+        authorize_module.authorize(
+            commits["main"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+        )
+
+    def test_commit_reachable_from_neither_reviewed_ref_is_refused(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
             authorize_module.authorize(
-                unmerged,
+                commits["feature"],
                 CHECK_RUNS_ALL_GREEN,
-                "main",
+                REVIEWED_REFS,
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+            )
+
+        assert "origin/main" in str(exc_info.value)
+        assert "origin/next" in str(exc_info.value)
+
+    def test_matching_ref_does_not_hide_an_unresolvable_ref(self, reviewed_refs_repo):
+        git_repo, commits = reviewed_refs_repo
+        unresolvable_ref = "origin/not-a-ref"
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.authorize(
+                commits["main"],
+                CHECK_RUNS_ALL_GREEN,
+                ("origin/main", unresolvable_ref),
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+            )
+
+        assert commits["main"] in str(exc_info.value)
+        assert unresolvable_ref in str(exc_info.value)
+
+    def test_empty_reviewed_ref_collection_is_refused(self, git_repo):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+
+        with pytest.raises(authorize_module.AuthorizationError, match="reviewed ref"):
+            authorize_module.authorize(
+                sha,
+                CHECK_RUNS_ALL_GREEN,
+                (),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
@@ -233,7 +321,7 @@ class TestAuthorize:
             authorize_module.authorize(
                 sha,
                 CHECK_RUNS_ONE_FAILED,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
@@ -269,7 +357,9 @@ class TestRequiredCheckAllowlist:
         with pytest.raises(
             authorize_module.AuthorizationError, match="required check-run"
         ):
-            authorize_module.authorize(sha, self.UNRELATED_BUT_GREEN, "main", cwd=git_repo)
+            authorize_module.authorize(
+                sha, self.UNRELATED_BUT_GREEN, ("main",), cwd=git_repo
+            )
 
     def test_every_required_check_present_and_green_authorizes(self, git_repo):
         sha = run_git(git_repo, "rev-parse", "HEAD")
@@ -278,7 +368,7 @@ class TestRequiredCheckAllowlist:
             for name in authorize_module.REQUIRED_CHECK_NAMES
         ]
 
-        authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+        authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
     def test_a_single_missing_required_check_among_an_otherwise_full_set_is_refused(
         self, git_repo
@@ -291,7 +381,7 @@ class TestRequiredCheckAllowlist:
         with pytest.raises(
             authorize_module.AuthorizationError, match=re.escape(dropped)
         ):
-            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
     def test_authorize_refuses_a_failed_chart_check_when_every_other_check_passes(
         self, git_repo
@@ -309,7 +399,7 @@ class TestRequiredCheckAllowlist:
         with pytest.raises(
             authorize_module.AuthorizationError, match=re.escape(chart_check)
         ):
-            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
 
 class TestFetchCheckRuns:
@@ -429,7 +519,7 @@ class TestFetchCheckRunsPagination:
             )
 
         authorize_module.authorize(
-            sha, runs, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
         )
 
     def test_stops_when_a_page_reports_nothing_even_if_total_count_implied_more(
@@ -486,7 +576,7 @@ class TestAuthorizeExcludesCurrentRun:
         authorize_module.authorize(
             sha,
             runs,
-            "main",
+            ("main",),
             cwd=git_repo,
             exclude_run_id=CURRENT_RUN_ID,
             required_names=TEST_REQUIRED_NAMES,
@@ -508,7 +598,7 @@ class TestAuthorizeExcludesCurrentRun:
         authorize_module.authorize(
             sha,
             runs,
-            "main",
+            ("main",),
             cwd=git_repo,
             exclude_run_id=CURRENT_RUN_ID,
             required_names=TEST_REQUIRED_NAMES,
@@ -526,7 +616,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -544,7 +634,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -563,7 +653,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -622,7 +712,7 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 0
@@ -640,7 +730,7 @@ class TestMain:
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 0
@@ -661,7 +751,7 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", OTHER_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 1
@@ -691,7 +781,7 @@ class TestMainLookupFailures:
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
         return authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
     def test_gh_api_failure_refuses_with_a_message_naming_the_lookup(
@@ -759,6 +849,7 @@ class TestMainLookupFailures:
 
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 HELM_CI_YAML = REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml"
+RELEASE_YAML = REPO_ROOT / ".github" / "workflows" / "release.yaml"
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
 
@@ -795,6 +886,96 @@ def ci_job_check_run_names() -> set[str]:
 def helm_ci_job_check_run_names() -> set[str]:
     doc = yaml.safe_load(HELM_CI_YAML.read_text())
     return {job["name"] for job in doc["jobs"].values() if job.get("name")}
+
+
+class TestReleaseWorkflowContract:
+    def test_release_branch_sources_are_anchored_and_wired_to_authorization(self):
+        source = RELEASE_YAML.read_text()
+        workflow = yaml.load(source, Loader=yaml.BaseLoader)
+        trigger = workflow["on"]["push"]
+
+        assert trigger["branches"] == ["main", "next"]
+        assert trigger["tags"] == ["v*"]
+
+        trigger_source = re.search(
+            r"(?ms)^on:\n  push:\n(?P<body>.*?)(?=^permissions:)", source
+        )
+        assert trigger_source is not None
+        anchors = {}
+        for branch in ("main", "next"):
+            anchor = re.search(
+                rf"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s+['\"]?{branch}['\"]?",
+                trigger_source.group("body"),
+            )
+            assert anchor is not None
+            anchors[branch] = anchor.group("name")
+        assert len(set(anchors.values())) == 2
+
+        authorization_source = re.search(
+            r"(?ms)^  authorize-release:\n(?P<body>.*?)(?=^  build:)", source
+        )
+        assert authorization_source is not None
+        env_source = re.search(
+            r"(?ms)^    env:\n(?P<body>(?:^      [^\n]+\n)+)",
+            authorization_source.group("body"),
+        )
+        assert env_source is not None
+        aliases = dict(
+            re.findall(
+                r"^      (?P<name>[A-Za-z_][A-Za-z0-9_]*): \*(?P<anchor>[^\s]+)\s*$",
+                env_source.group("body"),
+                re.MULTILINE,
+            )
+        )
+        assert set(aliases.values()) == set(anchors.values())
+
+        authorization = workflow["jobs"]["authorize-release"]
+        authorization_env = authorization["env"]
+        assert set(authorization_env) == set(aliases)
+        assert {authorization_env[name] for name in aliases} == {"main", "next"}
+
+        command = next(
+            step["run"]
+            for step in authorization["steps"]
+            if "release/authorize.py" in step.get("run", "")
+        )
+        reviewed_ref_envs = re.findall(
+            r"--reviewed-ref\s+origin/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}",
+            command,
+        )
+        assert "--main-ref" not in command
+        assert set(reviewed_ref_envs) == set(authorization_env)
+        assert len(reviewed_ref_envs) == len(authorization_env) == 2
+        assert {authorization_env[name] for name in reviewed_ref_envs} == {"main", "next"}
+
+        overlay = re.search(
+            r"git checkout origin/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\s+-- release/",
+            authorization_source.group("body"),
+        )
+        assert overlay is not None
+        assert authorization_env[overlay.group(1)] == "main"
+
+    def test_continuous_metadata_and_worker_local_base_use_the_push_sha(self):
+        workflow = yaml.load(RELEASE_YAML.read_text(), Loader=yaml.BaseLoader)
+
+        for job_name in ("merge", "worker-local-merge"):
+            metadata = next(
+                step
+                for step in workflow["jobs"][job_name]["steps"]
+                if step.get("name") == "Image metadata"
+            )
+            tags = metadata["with"]["tags"]
+            assert "type=sha,format=long" in tags
+            assert "type=raw,value=latest,enable={{is_default_branch}}" in tags
+
+        base_tag_script = next(
+            step["run"]
+            for step in workflow["jobs"]["worker-local-build"]["steps"]
+            if step.get("name") == "Compute base tag"
+        )
+        assert 'echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"' in base_tag_script
+        assert 'echo "v=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"' in base_tag_script
+        assert 'echo "v=latest" >> "$GITHUB_OUTPUT"' not in base_tag_script
 
 
 class TestRequiredNamesMatchCiWorkflows:
@@ -894,7 +1075,7 @@ class TestMixedPassFailRequiredCheck:
             authorize_module.authorize(
                 sha,
                 self.MIXED_CI,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
@@ -955,7 +1136,7 @@ class TestSkippedRequiredCheck:
         with pytest.raises(
             authorize_module.AuthorizationError, match="required check-run"
         ):
-            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
     def test_a_required_name_with_both_a_success_and_a_skipped_run_is_refused(
         self, git_repo
@@ -976,7 +1157,7 @@ class TestSkippedRequiredCheck:
             authorize_module.AuthorizationError, match="required check-run"
         ):
             authorize_module.authorize(
-                sha, runs, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+                sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
             )
 
 
@@ -1005,7 +1186,7 @@ class TestLegitimateSkips:
         authorize_module.authorize(
             sha,
             CHECK_RUNS_ALL_GREEN,
-            "main",
+            ("main",),
             cwd=git_repo,
             required_names=TEST_REQUIRED_NAMES,
         )

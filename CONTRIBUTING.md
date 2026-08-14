@@ -189,11 +189,20 @@ CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag v0.7.0 from `main` only after both commands pass, then delete `next` or
-recreate it from `main` for the next approved feature train. Only an
-administrator may retire `next`, by temporarily removing protection after the
-tag while `main` remains protected. If `next` is recreated, restore its full
-protection before accepting PRs against it.
+Tag v0.7.0 from `main` only after both commands pass. Only an administrator may
+retire `next`. Before deleting it, the administrator must merge one release
+workflow and contract test change that removes `next` from the workflow trigger
+branch list, removes the `RELEASE_NEXT_BRANCH` environment alias, removes the
+`--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
+`release/tests/test_authorize.py`. After that change lands, the administrator
+may temporarily remove protection and delete `next`, while keeping `main`
+protected. To recreate `next` for the next approved feature train, the
+administrator must first restore full protection for `next`, then create it
+from `main`. Only after those steps may the administrator merge one release
+workflow and contract test change that adds `next` to the workflow trigger
+branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
+`--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
+`release/tests/test_authorize.py` before accepting PRs against it.
 
 - **Commit messages**: a short imperative summary line, then detail bullets.
 - **Reference the issue in the PR body** with `Closes #123` (or `Ref #123`). Do
