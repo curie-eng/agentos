@@ -12,6 +12,7 @@ check-run lists -- plus `authorize()`, which combines them and is what
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -897,3 +898,234 @@ class TestMixedPassFailRequiredCheck:
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
+
+
+class TestSkippedRequiredCheck:
+    """A required check-run that concluded `skipped` is not a pass (#1470).
+
+    `skipped` used to sit in `PASSING_CONCLUSIONS` alongside `success` and
+    `neutral`, so a required check that never actually ran authorized a
+    release. Two routes produce it, and both are live risks here:
+
+      * a job-level `if:` added to the job. Adding one to helm-ci.yaml's
+        `helm` job would make GitHub record
+        `Chart (lint + template + kubeconform)` as `skipped` on every
+        releasable push, and the gate would then authorize a release whose
+        chart was never rendered, linted, or kubeconform-validated.
+      * a failed job in the job's `needs:`. ci.yaml's `rust-build` and
+        `changes` are not themselves required names, so a FAILED `rust-build`
+        skips the three ladder jobs -- which ARE required names -- into
+        `conclusion: skipped`, and that authorized a release too.
+
+    Measured live against the real `authorize()` before this change, with the
+    chart check varied and all 15 other required checks `success`:
+    `success` authorized, `failure` raised, `skipped` AUTHORIZED (the defect),
+    `cancelled` raised, `neutral` authorized, `None` raised, and an absent
+    entry raised. Only the `skipped` row changes here; a workflow whose
+    triggers never match produces NO check-run at all and is still correctly
+    refused as absent.
+    """
+
+    def test_a_required_name_whose_only_run_was_skipped_is_reported_missing(self):
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CodeQL", "conclusion": "skipped"},
+        ]
+
+        assert authorize_module.missing_required_checks(
+            runs, TEST_REQUIRED_NAMES
+        ) == {"CodeQL"}
+
+    def test_authorize_refuses_a_skipped_chart_check_when_every_other_check_passes(
+        self, git_repo
+    ):
+        # The exact scenario a job-level `if:` on helm-ci.yaml's `helm` job
+        # would produce, driven against the real production
+        # REQUIRED_CHECK_NAMES.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        chart_check = "Chart (lint + template + kubeconform)"
+        runs = [
+            {
+                "name": name,
+                "conclusion": "skipped" if name == chart_check else "success",
+            }
+            for name in authorize_module.REQUIRED_CHECK_NAMES
+        ]
+
+        with pytest.raises(
+            authorize_module.AuthorizationError, match="required check-run"
+        ):
+            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+
+    def test_a_required_name_with_both_a_success_and_a_skipped_run_is_refused(
+        self, git_repo
+    ):
+        # Fail-closed, consistent with the mixed pass/fail behavior above: one
+        # green run does not excuse a same-named run that never executed.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "skipped"},
+            {"name": "CodeQL", "conclusion": "success"},
+        ]
+
+        assert "CI" in authorize_module.missing_required_checks(
+            runs, TEST_REQUIRED_NAMES
+        )
+        with pytest.raises(
+            authorize_module.AuthorizationError, match="required check-run"
+        ):
+            authorize_module.authorize(
+                sha, runs, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            )
+
+
+class TestLegitimateSkips:
+    """Why refusing skipped required checks does not over-reject (#1470).
+
+    There is exactly ONE legitimate `skipped` conclusion, enumerated below: a
+    check-run whose name is not in the required set, which the gate ignores
+    entirely. It needs no blanket allowance and does not put `skipped` back in
+    `PASSING_CONCLUSIONS`.
+
+    The two ci.yaml tests here are not a second legitimate skip. They pin the
+    only place a required job carries a job-level `if:` -- the conditional
+    ladder jobs -- so that it cannot conclude `skipped` on a releasable push,
+    which is what keeps the stricter gate from blocking every release.
+    """
+
+    def test_a_skipped_check_run_outside_the_required_set_does_not_block(
+        self, git_repo
+    ):
+        # CHECK_RUNS_ALL_GREEN carries `Secret Scan` at `skipped`, which is not
+        # a required name. Non-required entries are ignored entirely, so this
+        # still authorizes -- the only legitimate skip.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+
+        authorize_module.authorize(
+            sha,
+            CHECK_RUNS_ALL_GREEN,
+            "main",
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+        )
+
+    def test_every_conditional_required_ci_job_gates_only_on_the_ladder_output(self):
+        """A required ci.yaml job may carry no `if:` but the ladder gate.
+
+        Exactly two required jobs are conditional today -- `e2e-ladder`
+        (`E2E parity ladder (skill + local, fake model)`) and
+        `e2e-ladder-release` (`E2E parity ladder (local-release, fake model)`)
+        -- and both gate solely on `needs.changes.outputs.ladder == 'true'`,
+        which the `changes` job forces true on push (pinned behaviorally by the
+        test below). Any other expression reopens the hole: adding a
+        `github.event_name == 'pull_request'` conjunct, for instance, would
+        conclude those required checks `skipped` on every push and block every
+        release, while the `changes` job still faithfully wrote `ladder=true`.
+
+        Filtered on `REQUIRED_CHECK_NAMES` rather than over all jobs because
+        `e2e-ladder-cluster` and `commit-messages` also declare an `if:` but
+        their names are not required, so a skip there cannot reach the gate;
+        they are out of this assertion by construction. Asserted over every
+        matching job rather than the two known ids, so a newly-added
+        conditional required job is covered without editing this test.
+        """
+        doc = yaml.safe_load(CI_YAML.read_text())
+        offenders = {
+            job_id: str(job["if"]).strip()
+            for job_id, job in doc["jobs"].items()
+            if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
+            and "if" in job
+            and str(job["if"]).strip() != "needs.changes.outputs.ladder == 'true'"
+        }
+
+        assert not offenders, (
+            "ci.yaml required job(s) carry a job-level `if:` other than the "
+            "ladder gate, so their required check-run can conclude `skipped` on "
+            f"a release train push and block every release: {sorted(offenders.items())}"
+        )
+
+    def test_the_changes_filter_step_emits_ladder_true_when_executed_as_a_push(
+        self, tmp_path
+    ):
+        """The push short-circuit is what makes the conditional jobs safe.
+
+        The `changes` job's filter step emits `ladder=true` unconditionally on
+        a push to a release train branch, before ever consulting the
+        changed-file filter, so the required ladder jobs gated on that output
+        always run and never report `skipped` on a releasable push. Remove the
+        short-circuit and a docs-only push skips both required checks, and this
+        gate refuses every release.
+
+        Executed rather than grepped: a harmless shell rewrite of the same
+        behavior would fail a text scan, and a scan that finds the literal
+        `ladder=true` in a branch that no longer runs would pass while the
+        safety was gone. Interpolations are substituted first --
+        `github.event_name` becomes `push`, every other expression becomes
+        empty -- so without the short-circuit the script falls through to
+        `git fetch --quiet origin ""` under `set -euo pipefail` and exits
+        non-zero. It runs in `tmp_path` so it cannot touch this repo.
+        """
+        doc = yaml.safe_load(CI_YAML.read_text())
+        filter_step = next(
+            step
+            for step in doc["jobs"]["changes"]["steps"]
+            if step.get("id") == "filter"
+        )
+        script = re.sub(
+            r"\$\{\{\s*(.*?)\s*\}\}",
+            lambda m: "push" if m.group(1) == "github.event_name" else "",
+            filter_step["run"],
+        )
+        script_path = tmp_path / "filter.sh"
+        script_path.write_text(script)
+        github_output = tmp_path / "github_output"
+        github_output.touch()
+
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            cwd=tmp_path,
+            env={**os.environ, "GITHUB_OUTPUT": str(github_output)},
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, (
+            "ci.yaml's `changes` filter step no longer short-circuits on push -- "
+            "it fell through to the changed-file filter and failed: "
+            f"{result.stderr}"
+        )
+        assert "ladder=true" in github_output.read_text(), (
+            "ci.yaml's `changes` job no longer forces ladder=true on push, so the "
+            "`if: needs.changes.outputs.ladder == 'true'` required jobs can report "
+            f"`skipped` on a release train push: {github_output.read_text()!r}"
+        )
+
+
+class TestHelmCiJobsCarryNoJobLevelIf:
+    """No helm-ci.yaml job may carry a job-level `if:` (#1470).
+
+    A job-level `if:` on the `helm` job makes GitHub record
+    `Chart (lint + template + kubeconform)` -- a required check name -- with
+    `conclusion: skipped` on every releasable push. The gate now refuses a
+    skipped required check, so every release would be blocked with the chart
+    never rendered; before that change it silently AUTHORIZED instead, which is
+    strictly worse. Either way the job must simply run on push.
+
+    `TestHelmCiWorkflowTriggers` pins the trigger-level route into the same
+    hole (a filtered `push:` trigger produces no check-run at all); this pins
+    the job-level route. Asserted over every job in the workflow, not just
+    `helm`, so a future job added there is covered without editing this test.
+    """
+
+    def test_no_helm_ci_job_declares_a_job_level_if(self):
+        doc = yaml.safe_load(HELM_CI_YAML.read_text())
+        conditional = sorted(
+            job_id for job_id, job in doc["jobs"].items() if "if" in job
+        )
+
+        assert not conditional, (
+            "helm-ci.yaml job(s) carry a job-level `if:`, which makes their "
+            "check-run `skipped` on releasable pushes and blocks every release "
+            f"with the chart never rendered: {conditional}"
+        )

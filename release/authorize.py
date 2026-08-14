@@ -11,12 +11,19 @@ pipeline, and it fails closed on either of two questions:
             merged PR is refused here, before any image builds.
 
   checks    Does that commit's check-runs list show every REQUIRED_CHECK_NAMES
-            entry successful (or neutral/skipped)? An explicit allowlist,
+            entry successful (or neutral)? An explicit allowlist,
             not "some checks, all green" (issue #733): a commit with only an
             unrelated passing check-run and no sign its real CI ever ran
             must be refused, the same as one that is on main but was never
             checked, or was checked and failed. Zero check-runs is also a
-            failure -- absence of checks is not evidence they passed. The
+            failure -- absence of checks is not evidence they passed. A
+            required check-run that concluded `skipped` is refused too
+            (issue #1470): a job-level `if:` on the job, or a failed job in
+            its `needs:`, both make GitHub record that required check as
+            `skipped`, and a chart that was never rendered, linted, or
+            kubeconform-validated must not authorize a release. A skipped
+            check-run whose name is NOT required is still ignored, like any
+            other non-required check. The
             gate's own workflow run is excluded from that list (issue #732):
             it is itself an in-progress check-run on the tagged SHA and
             would otherwise wait on itself forever.
@@ -37,7 +44,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
+PASSING_CONCLUSIONS = {"success", "neutral"}
 
 # The check-run names that must be present and green before a tag may
 # publish (issue #733). These are the job `name:` fields from
@@ -109,8 +116,13 @@ def missing_required_checks(
     """Which `required_names` have no passing check-run for this commit?
 
     A name only counts as satisfied if some check-run with that exact `name`
-    concluded `success`/`neutral`/`skipped` AND no check-run with that name is
-    still running, failed, or otherwise non-passing. A required name with two
+    concluded `success`/`neutral` AND no check-run with that name is
+    still running, failed, skipped, or otherwise non-passing. `skipped` is not
+    a pass for a required name (issue #1470): GitHub records that conclusion
+    both when a job-level `if:` excludes the job and when a job in its
+    `needs:` failed, so treating it as passing authorized releases whose chart
+    was never rendered, linted, or kubeconform-validated, and whose ladder
+    jobs never ran because their upstream build failed. A required name with two
     check-runs -- one success and one failure (a re-run with mixed states) --
     is left in the returned set: for a fail-closed release gate any non-passing
     run of a required name masks nothing and blocks the tag. A same-named entry
@@ -118,7 +130,9 @@ def missing_required_checks(
     the returned set. Names outside `required_names` are ignored entirely -- an
     unrelated check-run, passing or not, has no bearing on this gate (issue
     #733): the point is asserting the checks that matter actually ran and
-    passed, not that everything present happened to be green.
+    passed, not that everything present happened to be green. That still holds
+    for a `skipped` NON-required check-run, which is ignored like any other
+    non-required entry; only a skipped *required* name blocks.
 
     `required_names` defaults to the module-level `REQUIRED_CHECK_NAMES`,
     looked up here rather than bound as the parameter's default value so that
