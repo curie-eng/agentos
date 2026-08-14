@@ -107,6 +107,12 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $hasWorkerApiUrl := false }}
+      {{- range .Values.worker.extraEnv }}
+      {{- if eq .name "CURIE_API_URL" }}
+      {{- $hasWorkerApiUrl = true }}
+      {{- end }}
+      {{- end }}
       containers:
         - name: worker
           image: {{ include "curie.image" (dict "repository" .Values.worker.image.repository "tag" .Values.worker.image.tag "digest" .Values.worker.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -117,6 +123,9 @@ spec:
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
             {{- include "curie.env.valkey" . | nindent 12 }}
+            {{- if not $hasWorkerApiUrl }}
+            {{- include "curie.env.apiUrl" . | nindent 12 }}
+            {{- end }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -163,11 +172,10 @@ spec:
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
             # The reconciler fetches rendered objects from the API rather than
-            # re-deriving them (ADR-0090), so it needs to reach it. Included only
-            # on this branch: wiring it unconditionally would also switch on the
-            # worker's eval reporting, which is unwired today, and that is a
-            # behaviour change this flag did not ask for.
-            {{- include "curie.env.api" . | nindent 12 }}
+            # deriving them again (ADR-0090), so it needs the API key. The general
+            # worker API URL is rendered separately without making this key
+            # unconditional.
+            {{- include "curie.env.apiKey" . | nindent 12 }}
 {{- end }}
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
