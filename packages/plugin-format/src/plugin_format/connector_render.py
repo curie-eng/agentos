@@ -398,6 +398,7 @@ def render_ingress_networkpolicy(
 
 
 def render(
+    *,
     release: str,
     agent: str,
     namespace: str,
@@ -406,7 +407,20 @@ def render(
     spec: ConnectorSpec,
     secret_name: str,
 ) -> list[dict[str, Any]]:
-    """Every object needed to run one hosted connector. Empty for a remote one."""
+    """Every object needed to run one hosted connector. Empty for a remote one.
+
+    Keyword-only, deliberately. Four of the seven parameters are strings that
+    look interchangeable at a call site -- release, agent, namespace, app_name --
+    and they are not: in a real install `curie cluster up --namespace my-agent
+    --release my-agent` against a chart whose `nameOverride` is empty leaves
+    app_name as `curie` while release and namespace are both `my-agent`, so no
+    one value can stand in for all four. Swapping release and app_name
+    positionally makes `sandbox_selector` emit `app.kubernetes.io/name: my-agent`
+    instead of `curie`, and both NetworkPolicies then parse, apply, and select
+    no pod: every connector tool call dies as a bare connection timeout with no
+    policy error anywhere. A positional call site cannot express that mistake
+    here because there is no positional call site.
+    """
 
     if not spec.is_hosted:
         return []
