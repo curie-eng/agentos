@@ -222,11 +222,12 @@ Flipping any to `false` removes its resources from the render; consumers
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
 `helm install` (the default) AUTO-GENERATES a strong random per release for the
-nine chart-owned credentials (the backing-store passwords, the Langfuse
-salt/encryptionKey/nextauthSecret, and the api/webhook keys) rather than shipping
-the published dev defaults. The generated values are persisted via a `lookup` of
-the release Secret, so `helm upgrade` re-uses them and never rotates a live store
-credential (the Bitnami lookup-persist convention). Set
+eleven chart-owned credentials (the backing-store passwords, the Langfuse
+salt/encryptionKey/nextauthSecret and init project secret key/user password, and
+the api/webhook keys) rather than shipping the published dev defaults. The
+generated values are persisted via a `lookup` of the release Secret, so
+`helm upgrade` re-uses them and never rotates a live store credential (the
+Bitnami lookup-persist convention). Set
 `security.allowDevDefaults: true` (values-dev.yaml, i.e. `curie cluster up
 --dev`) to keep the deterministic published defaults for dev/CI. A per-store
 `existingSecret` and explicit `--set` overrides still win in every mode -- an
@@ -235,6 +236,9 @@ install AND upgrade (matching Bitnami's provided-value-first precedence), so
 rotation/recovery works; point `langfuse.existingSecret` (and each store's
 `existingSecret`) at your own Secrets to bring your own. `langfuse.encryptionKey`
 must be 64 hex chars (`openssl rand -hex 32`).
+
+When no OTel auth header override is supplied, the collector derives its header
+from the resolved Langfuse project secret key.
 
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's

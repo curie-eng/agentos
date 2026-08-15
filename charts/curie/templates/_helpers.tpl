@@ -244,11 +244,11 @@ service:
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
      bootstrap identity still carries the published dev default from values.yaml.
-     Unlike the nine store/control-plane secrets, these init identities seed the
-     org/project on first boot (a different lifecycle), so #57 deliberately
-     excludes them from its render-time gate; this closes that gap. The published
-     admin password is a Langfuse admin-takeover risk on a reachable UI, and the
-     project secret key also feeds the OTel Collector auth header. The operator
+     These init identities are included in the eleven managed chart credentials,
+     but this gate intentionally evaluates their raw values before managed secret
+     resolution. They seed the org/project on first boot (a different lifecycle).
+     The published admin password is a Langfuse admin-takeover risk on a reachable
+     UI, and the project secret key also feeds the OTel Collector auth header. The operator
      clears the gate by overriding the value or supplying langfuse.existingSecret
      (the #169 secretKeyRef escape carries both keys).
 

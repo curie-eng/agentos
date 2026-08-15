@@ -78,7 +78,8 @@ langfuse:
   nextauthSecret: dev-nextauth-secret-change-me
   existingSecret: ""
   # Headless bootstrap: seeds a fixed org/project + keys on first boot so the
-  # OTel trace path authenticates with no manual key-minting. Dev values.
+  # OTel trace path authenticates with no manual key-minting. The default OTel
+  # header derives from the resolved project secret key. Dev values.
   init:
     orgId: curie
     orgName: Curie
@@ -1377,14 +1378,16 @@ security:
   # langfuse.existingSecret (the secretKeyRef escape, keys langfuseInitProjectSecretKey
   # + langfuseInitUserPassword). Off by default so the flagship zero-secret bare
   # install stays green and the dev/e2e overlays render unchanged; flip it on for a
-  # shared/production cluster. (#57 will extend this same gate to the nine
-  # store/control-plane secrets once its design pass lands.)
+  # shared/production cluster. (#57 will extend this same gate to the remaining
+  # chart credentials once its design pass lands. This gate evaluates
+  # the raw values above, before managed secret resolution.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` GENERATES a strong random per release for the nine
-  # chart-owned credentials (postgres, valkey, clickhouse, and RustFS secrets, the
-  # Langfuse salt/encryptionKey/nextauthSecret, and the api/webhook keys) instead
-  # of shipping the published dev defaults. Generated values are persisted via a
+  # no-override `helm install` GENERATES a strong random per release for the eleven
+  # chart-owned credentials (the backing-store passwords, the Langfuse
+  # salt/encryptionKey/nextauthSecret and init project secret key/user password,
+  # and the api/webhook keys) instead of shipping the published dev defaults.
+  # Generated values are persisted via a
   # `lookup` of the release Secret, so `helm upgrade` re-uses them and never
   # rotates a live store credential. Set true (values-dev.yaml does) for a
   # deterministic dev/CI render that keeps the published defaults byte-for-byte.
