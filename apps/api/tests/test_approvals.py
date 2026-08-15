@@ -203,6 +203,23 @@ def _read_resumed_at(approval_id: str) -> datetime | None:
     return asyncio.run(_run())
 
 
+def _read_reply_placeholder(approval_id: str) -> str | None:
+    """Read the stored reply target without relying on the API response model."""
+
+    async def _run() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                approval = await session.get(Approval, uuid.UUID(approval_id))
+                assert approval is not None
+                return approval.reply_placeholder
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
 def test_resolve_endpoint_stays_200_when_enqueue_fails(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -369,6 +386,7 @@ def test_create_get_list_round_trip(
         headers=auth_headers,
     )
     assert [a["id"] for a in listed.json()] == [body["id"]]
+    assert listed.json()[0]["reply_placeholder"] == payload["reply_placeholder"]
 
 
 def test_create_tolerates_unknown_field_from_a_newer_worker(
@@ -413,6 +431,47 @@ def test_create_is_idempotent_on_dedupe_key(
     replay = approvals_client.post("/approvals", json=payload, headers=auth_headers)
     assert replay.status_code == 200
     assert replay.json()["id"] == first.json()["id"]
+
+
+def test_create_round_trips_a_post_once_reply_target(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A reply without a placeholder keeps its explicit channel and endpoint."""
+
+    payload = _payload(
+        reply_channel="C_POST_ONCE",
+        reply_placeholder=None,
+        reply_endpoint="http://localhost:9999/api/",
+    )
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["reply_channel"] == payload["reply_channel"]
+    assert body["reply_placeholder"] is None
+    assert body["reply_endpoint"] == payload["reply_endpoint"]
+    assert _read_reply_placeholder(body["id"]) is None
+
+    fetched = approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["reply_placeholder"] is None
+
+    listed = approvals_client.get(
+        "/approvals",
+        params={"status_filter": "pending", "conversation_id": payload["conversation_id"]},
+        headers=auth_headers,
+    )
+    assert [approval["id"] for approval in listed.json()] == [body["id"]]
+    assert listed.json()[0]["reply_placeholder"] is None
+
+    existing = approvals_client.post(
+        "/approvals",
+        json=_payload(reply_placeholder="p-existing"),
+        headers=auth_headers,
+    )
+    assert existing.status_code == 201, existing.text
+    assert existing.json()["reply_placeholder"] == "p-existing"
+    assert _read_reply_placeholder(existing.json()["id"]) == "p-existing"
 
 
 def test_resolve_once_and_enqueue_resume_turn(

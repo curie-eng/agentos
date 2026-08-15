@@ -36,12 +36,14 @@ would break that property.
 mirror had bare types, so it could construct a payload the API 422-rejects --
 the live bug stranding the durable-approval path. Resolved strict:
 
-- ``conversation_id``, ``author``, ``summary``, ``reply_channel``,
-  ``reply_placeholder``, ``dedupe_key``: ``min_length=1``. An empty string now
-  raises **at the worker**, at construction, instead of producing a 422 from the
-  API. Nothing that previously *succeeded* now fails -- those payloads were
-  already being rejected downstream. The failure just moves to the source with a
-  clear message.
+- ``conversation_id``, ``author``, ``summary``, ``reply_channel``, and
+  ``dedupe_key``: ``min_length=1``. An empty string now raises **at the worker**,
+  at construction, instead of producing a 422 from the API. Nothing that
+  previously *succeeded* now fails -- those payloads were already being rejected
+  downstream. The failure just moves to the source with a clear message.
+- ``reply_placeholder``: required ``str | None`` with ``min_length=1`` for a
+  nonnull value. ``None`` explicitly represents no placeholder to edit; omitting
+  the key remains invalid, and an empty nonnull string remains invalid.
 - ``gate_kind``: ``str | None`` -> ``GateKind | None``. A worker sending an
   unrecognized string now raises locally rather than 422ing. Per #544/ADR-0046
   this field is **authority-bearing** (it decides whether a gate may grant), so
@@ -139,7 +141,7 @@ class ApprovalRequest(_AciModel):
     summary: str = Field(min_length=1)
     reply_kind: str = Field(min_length=1)
     reply_channel: str = Field(min_length=1)
-    reply_placeholder: str = Field(min_length=1)
+    reply_placeholder: str | None = Field(min_length=1)
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
     dedupe_key: str = Field(min_length=1)

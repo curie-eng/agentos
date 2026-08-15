@@ -3383,7 +3383,8 @@ mod tests {
         let placeholder_ts = "1717171717.000900";
         let turn = connected_turn("C-real", &opts(Some("C-real")), None, placeholder_ts);
         assert_eq!(
-            turn.conversation_id, turn.reply_handle.placeholder,
+            turn.reply_handle.placeholder.as_deref(),
+            Some(turn.conversation_id.as_str()),
             "the connected turn must thread on the placeholder we actually posted"
         );
         assert_eq!(turn.conversation_id, placeholder_ts);
@@ -3407,7 +3408,10 @@ mod tests {
             placeholder_ts,
         );
         assert_eq!(turn.conversation_id, thread);
-        assert_eq!(turn.reply_handle.placeholder, placeholder_ts);
+        assert_eq!(
+            turn.reply_handle.placeholder.as_deref(),
+            Some(placeholder_ts)
+        );
         assert!(turn.reply_handle.endpoint.is_none());
     }
 

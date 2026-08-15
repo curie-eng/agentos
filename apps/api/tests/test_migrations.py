@@ -10,11 +10,18 @@ against the session's freshly-created, migrated disposable DB (conftest's
 """
 
 import asyncio
+import uuid
+from pathlib import Path
 
+import pytest
+from alembic import command
+from alembic.config import Config
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+
+ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 
 
 def _column(sql: str) -> list[str]:
@@ -24,6 +31,73 @@ def _column(sql: str) -> list[str]:
             async with engine.connect() as conn:
                 result = await conn.execute(text(sql))
                 return [row[0] for row in result.fetchall()]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+def _insert_approval(approval_id: uuid.UUID, reply_placeholder: str | None) -> None:
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.approvals (id, conversation_id, author, "
+                        "summary, reply_kind, reply_channel, reply_placeholder, "
+                        "dedupe_key, status) "
+                        "VALUES (:id, :conversation_id, :author, :summary, :reply_kind, "
+                        ":reply_channel, :reply_placeholder, :dedupe_key, 'pending')"
+                    ),
+                    {
+                        "id": approval_id,
+                        "conversation_id": f"th-{approval_id.hex[:8]}",
+                        "author": "U1",
+                        "summary": "Approve the change",
+                        "reply_kind": "slack",
+                        "reply_channel": "C1",
+                        "reply_placeholder": reply_placeholder,
+                        "dedupe_key": uuid.uuid4().hex,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _set_reply_placeholder(approval_id: uuid.UUID, placeholder: str) -> None:
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE curie.approvals SET reply_placeholder = :placeholder "
+                        "WHERE id = :id"
+                    ),
+                    {"id": approval_id, "placeholder": placeholder},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _reply_placeholder(approval_id: uuid.UUID) -> str | None:
+    async def run() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT reply_placeholder FROM curie.approvals WHERE id = :id"
+                    ),
+                    {"id": approval_id},
+                )
+                row = result.one()
+                return row[0]
         finally:
             await engine.dispose()
 
@@ -45,3 +119,58 @@ def test_public_schema_is_empty_after_migration(migrated: None) -> None:
         "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
     )
     assert public_tables == [], public_tables
+
+
+def test_reply_placeholder_becomes_nullable_without_rewriting_existing_strings(
+    isolated_migration_db: None,
+) -> None:
+    """The post once migration preserves old edit targets while allowing new ones."""
+
+    cfg = Config()
+    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+
+    # Target the revision immediately before this migration. A relative revision
+    # would silently stop testing this migration once a later one lands.
+    command.upgrade(cfg, "0024")
+    existing_id = uuid.uuid4()
+    _insert_approval(existing_id, "p-existing")
+
+    command.upgrade(cfg, "0025")
+
+    nullable = _column(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'curie' AND table_name = 'approvals' "
+        "AND column_name = 'reply_placeholder'"
+    )
+    assert nullable == ["YES"], nullable
+    assert _reply_placeholder(existing_id) == "p-existing"
+
+    post_once_id = uuid.uuid4()
+    _insert_approval(post_once_id, None)
+    assert _reply_placeholder(post_once_id) is None
+
+
+def test_reply_placeholder_downgrade_refuses_null_rows(
+    isolated_migration_db: None,
+) -> None:
+    cfg = Config()
+    cfg.set_main_option("script_location", str(ALEMBIC_DIR))
+    command.upgrade(cfg, "0025")
+
+    approval_id = uuid.uuid4()
+    _insert_approval(approval_id, None)
+
+    with pytest.raises(RuntimeError, match="cannot restore a required reply placeholder"):
+        command.downgrade(cfg, "0024")
+
+    assert _reply_placeholder(approval_id) is None
+    _set_reply_placeholder(approval_id, "p-fixed")
+    command.downgrade(cfg, "0024")
+
+    nullable = _column(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'curie' AND table_name = 'approvals' "
+        "AND column_name = 'reply_placeholder'"
+    )
+    assert nullable == ["NO"], nullable
+    assert _reply_placeholder(approval_id) == "p-fixed"

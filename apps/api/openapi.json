@@ -542,8 +542,15 @@
             "title": "Reply Endpoint"
           },
           "reply_placeholder": {
-            "title": "Reply Placeholder",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
           },
           "resolution_note": {
             "anyOf": [
@@ -730,9 +737,16 @@
             "type": "string"
           },
           "reply_placeholder": {
-            "minLength": 1,
-            "title": "Reply Placeholder",
-            "type": "string"
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
           },
           "route": {
             "anyOf": [

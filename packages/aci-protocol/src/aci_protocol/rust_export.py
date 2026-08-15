@@ -162,12 +162,15 @@ def _struct_fields(model: type[BaseModel], skip: set[str], public: bool) -> list
         if field_name in skip:
             continue
         rust = _rust_type(field.annotation)
+        _, nullable = _split_optional(field.annotation)
         if field_name == WIRE_VERSION_FIELD:
             # The version field is mandatory and compatibility-checked on decode,
             # matching the NDJSON decoder. Detected by name (WIRE_VERSION_FIELD),
             # not by type, so dropping the old Literal does not silently remove
             # the guard and let #[serde(default)] make version optional.
             out.append('    #[serde(deserialize_with = "require_compatible_protocol_version")]')
+        elif field.is_required() and nullable:
+            out.append('    #[serde(deserialize_with = "deserialize_required_nullable")]')
         elif not field.is_required():
             # Any other field with a Pydantic default is omittable on the wire,
             # so Rust accepts it missing too.
@@ -271,6 +274,17 @@ where
 }"""
 
 
+_REQUIRED_NULLABLE_DESERIALIZER = """fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}"""
+
+
 _TESTS = """#[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +336,24 @@ mod tests {
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: InboundMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn reply_handle_accepts_explicit_null_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test","placeholder":null,"endpoint":"https://adapter.example/hook","adapter":"agentmail_sandbox"}"#;
+        let decoded: ReplyHandle = serde_json::from_str(raw).unwrap();
+        assert_eq!(decoded.kind, "email");
+        assert_eq!(decoded.channel, "agent@example.test");
+        assert_eq!(decoded.placeholder, None);
+        assert_eq!(decoded.endpoint.as_deref(), Some("https://adapter.example/hook"));
+        assert_eq!(decoded.adapter.as_deref(), Some("agentmail_sandbox"));
+    }
+
+    #[test]
+    fn reply_handle_rejects_omitted_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test"}"#;
+        let error = serde_json::from_str::<ReplyHandle>(raw).unwrap_err();
+        assert!(error.to_string().contains("missing field `placeholder`"));
     }
 
 """
@@ -399,6 +431,7 @@ def render_rust() -> str:
         f'pub const EVAL_CONSUMER_GROUP_DEFAULT: &str = "{EVAL_CONSUMER_GROUP_DEFAULT}";',
         f'pub const STREAM_PAYLOAD_FIELD: &str = "{STREAM_PAYLOAD_FIELD}";',
         _VERSION_GUARD,
+        _REQUIRED_NULLABLE_DESERIALIZER,
         _string_enum(
             "SessionStatus",
             tuple(m.value for m in SessionStatus),

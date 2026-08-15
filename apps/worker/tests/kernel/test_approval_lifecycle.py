@@ -34,9 +34,11 @@ class RecordingApprovals:
 
     def __init__(self, *, fail: bool = False) -> None:
         self.requests: list[ApprovalRequest] = []
+        self.create_calls = 0
         self.fail = fail
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        self.create_calls += 1
         if self.fail:
             raise ApprovalBackendError("approval API unavailable")
         self.requests.append(request)
@@ -80,7 +82,7 @@ def _qevent(
     *,
     thread: str = "th-appr",
     event_id: str | None = None,
-    placeholder: str = "p-1",
+    placeholder: str | None = "p-1",
     endpoint: str | None = None,
     kind: str = "slack",
     adapter: str | None = None,
@@ -234,6 +236,31 @@ def test_a_slack_turns_record_carries_slack_and_no_adapter(make_harness) -> None
             req = approvals.requests[0]
             assert req.reply_kind == "slack"
             assert req.reply_adapter is None
+
+    asyncio.run(go())
+
+
+def test_null_placeholder_rejects_before_sink_runner_or_approval_persistence(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            event = _qevent(
+                "please discount",
+                placeholder=None,
+                endpoint="http://adapter.example.test/",
+                kind="email",
+                adapter="agentmail",
+            )
+
+            with pytest.raises(ValueError, match=r"reply_handle\.placeholder"):
+                await h.kernel.process_event(event)
+
+            assert h.runner.opened == []
+            assert h.sink.events == []
+            assert approvals.create_calls == 0
 
     asyncio.run(go())
 

@@ -14,7 +14,7 @@ pins, so a drifted schema is caught here before TypeScript can diverge.
 """
 
 from aci_protocol.rust_export import crate_dir, render_rust
-from aci_protocol.schema_export import render_schema, schema_path
+from aci_protocol.schema_export import build_schema, render_schema, schema_path
 
 
 def test_committed_json_schema_is_current() -> None:
@@ -29,3 +29,29 @@ def test_committed_rust_is_current() -> None:
     assert render_rust() == committed, (
         "generated Rust is stale; run scripts/check-contracts.sh and commit"
     )
+
+
+def test_reply_placeholders_are_required_nullable_strings() -> None:
+    definitions = build_schema()["$defs"]
+    reply_handle = definitions["ReplyHandle"]
+    approval_request = definitions["ApprovalRequest"]
+
+    assert "placeholder" in reply_handle["required"]
+    assert "reply_placeholder" in approval_request["required"]
+
+    handle_placeholder = reply_handle["properties"]["placeholder"]
+    approval_placeholder = approval_request["properties"]["reply_placeholder"]
+    assert "anyOf" in handle_placeholder
+    assert "anyOf" in approval_placeholder
+
+    handle_variants = handle_placeholder["anyOf"]
+    approval_variants = approval_placeholder["anyOf"]
+    assert {variant["type"] for variant in handle_variants} == {"null", "string"}
+    assert {variant["type"] for variant in approval_variants} == {"null", "string"}
+
+    handle_string = next(variant for variant in handle_variants if variant["type"] == "string")
+    approval_string = next(
+        variant for variant in approval_variants if variant["type"] == "string"
+    )
+    assert "minLength" not in handle_string
+    assert approval_string["minLength"] == 1

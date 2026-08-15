@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -59,6 +59,16 @@ where
         )));
     }
     Ok(value)
+}
+
+fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -223,7 +233,8 @@ pub mod env_keys {
 pub struct ReplyHandle {
     pub kind: String,
     pub channel: String,
-    pub placeholder: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub placeholder: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
@@ -246,6 +257,7 @@ pub struct EvalJob {
     pub version_id: String,
     pub sha: String,
     pub suite: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub bundle_ref: Option<String>,
     #[serde(default)]
     pub target_url: Option<String>,
@@ -273,7 +285,8 @@ pub struct ApprovalRequest {
     pub summary: String,
     pub reply_kind: String,
     pub reply_channel: String,
-    pub reply_placeholder: String,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub reply_placeholder: Option<String>,
     #[serde(default)]
     pub reply_endpoint: Option<String>,
     #[serde(default)]
@@ -417,6 +430,24 @@ mod tests {
     }
 
     #[test]
+    fn reply_handle_accepts_explicit_null_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test","placeholder":null,"endpoint":"https://adapter.example/hook","adapter":"agentmail_sandbox"}"#;
+        let decoded: ReplyHandle = serde_json::from_str(raw).unwrap();
+        assert_eq!(decoded.kind, "email");
+        assert_eq!(decoded.channel, "agent@example.test");
+        assert_eq!(decoded.placeholder, None);
+        assert_eq!(decoded.endpoint.as_deref(), Some("https://adapter.example/hook"));
+        assert_eq!(decoded.adapter.as_deref(), Some("agentmail_sandbox"));
+    }
+
+    #[test]
+    fn reply_handle_rejects_omitted_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test"}"#;
+        let error = serde_json::from_str::<ReplyHandle>(raw).unwrap_err();
+        assert!(error.to_string().contains("missing field `placeholder`"));
+    }
+
+    #[test]
     fn rejects_incompatible_version_event() {
         let raw = r#"{"type":"final","version":"9.9.9","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
@@ -424,19 +455,19 @@ mod tests {
 
     #[test]
     fn rejects_incompatible_near_version() {
-        let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.0","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.3.1","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.1","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
