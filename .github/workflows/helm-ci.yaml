@@ -110,6 +110,19 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
+      # Prove the tenant capacity ceiling actually binds the pods it is meant to.
+      # The quota is PriorityClass-scoped, so if its scope is not the name the
+      # sandbox pods carry it matches nothing and enforces nothing -- silently,
+      # because the object exists and `used: 0` reads as "nothing consumed"
+      # rather than "matching nothing". Observed live: a sandbox holding
+      # `limits.cpu: 1` running while the quota reported used 0, with the scoped
+      # class absent from the cluster entirely (#1534). Compares the two rendered
+      # objects against each other, not a value against itself.
+      - name: helm render assertions (sandbox quota scope)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sandbox-quota-scope-assertions.sh
+
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
       # and the pods actually start on an enforcing cluster.
