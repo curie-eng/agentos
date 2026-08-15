@@ -40,13 +40,38 @@ existing PriorityClass object at ResourceQuota-admission time. So this quota
 renders and behaves correctly whether #759 has landed yet or not:
   - #759 not yet merged / no pod sets this priorityClassName: the scope simply
     matches no pods yet (an inert-but-present quota), never an error.
-  - #759 merged with a DIFFERENT sandbox PriorityClass name than the default
-    guessed here (`resourceQuota.sandboxPriorityClassName`, default
-    "curie-sandbox"): override this value (or align the two names) so the
-    scope actually matches; see the PR notes for the coordination point.
+  - #759 merged with a DIFFERENT sandbox PriorityClass name: the scope now
+    DERIVES from `priorityClasses.sandbox.name`, the same value
+    agent-sandbox.yaml stamps on the sandbox pod template, so a rename
+    propagates to both sides at once and cannot desynchronize them.
+
+The derivation is the fix for a silent fail-open (#1534). The scope used to read
+`resourceQuota.sandboxPriorityClassName` independently of the name the pods
+actually carry, so renaming the PriorityClass -- without knowing to override a
+second, differently-named value -- left the quota scoped to a class nothing
+carried. Observed on a live install: a sandbox holding `limits.cpu: 1` running
+while the quota reported `used: {limits.cpu: "0", pods: "0"}`, with the scoped
+class absent from `kubectl get priorityclass` entirely. The whole tenant capacity
+ceiling was inert, and it presented as healthy -- the object exists, and `used: 0`
+reads as "nothing consumed" rather than "matching nothing".
+
+`sandboxPriorityClassName` remains as an EXPLICIT override for the one case
+deriving cannot serve: a PriorityClass managed outside this chart
+(`priorityClasses.sandbox.create: false`) whose name differs from
+`priorityClasses.sandbox.name`. Left unset -- the default -- it derives, which is
+what every in-chart install wants. Setting it is now a deliberate act rather than
+a silent prerequisite nobody knew about.
 */}}
 {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
 {{- $rq := .Values.resourceQuota }}
+{{/*
+  Derive from the name the sandbox pods actually carry. An explicit
+  `sandboxPriorityClassName` still wins, for an externally-managed class.
+*/}}
+{{- $sandboxPriorityClass := $rq.sandboxPriorityClassName | default .Values.priorityClasses.sandbox.name }}
+{{- if not $sandboxPriorityClass }}
+{{- fail "resourceQuota.enabled is true but no sandbox PriorityClass name resolves: set priorityClasses.sandbox.name, or resourceQuota.sandboxPriorityClassName for an externally-managed class. A quota scoped to an empty name matches no pods and silently enforces nothing." }}
+{{- end }}
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -60,7 +85,7 @@ spec:
       - operator: In
         scopeName: PriorityClass
         values:
-          - {{ $rq.sandboxPriorityClassName | quote }}
+          - {{ $sandboxPriorityClass | quote }}
   # Only cpu/memory/pods: a PriorityClass-scoped quota cannot list
   # ephemeral-storage (see the header). Per-pod ephemeral limits x the pods cap
   # give the aggregate disk ceiling instead.
