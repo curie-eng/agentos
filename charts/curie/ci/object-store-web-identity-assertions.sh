@@ -31,10 +31,29 @@
 set -euo pipefail
 
 CHART=${CHART:-charts/curie}
+
+# The cleanup trap is installed BEFORE the first mktemp, not after the last one.
+# Every command between the first temp file and the trap runs unprotected, and
+# under `set -e` any of them can end the script -- a failed `helm template`, a
+# full disk, an interrupted CI step -- leaking whatever had already been
+# created. Declaring the names empty first keeps `set -u` happy, and the
+# `${VAR:-}` expansions mean a trap that fires before a given mktemp ran passes
+# `rm -f` an empty argument it ignores rather than an unbound variable.
+STATIC_RENDERED=""
+WEB_IDENTITY_RENDERED=""
+WEB_IDENTITY_VALUES=""
+WEB_IDENTITY_TOKEN=""
+trap 'rm -f "${STATIC_RENDERED:-}" "${WEB_IDENTITY_RENDERED:-}" "${WEB_IDENTITY_VALUES:-}" "${WEB_IDENTITY_TOKEN:-}"' EXIT
+
 STATIC_RENDERED=$(mktemp)
 WEB_IDENTITY_RENDERED=$(mktemp)
 WEB_IDENTITY_VALUES=$(mktemp)
-trap 'rm -f "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$WEB_IDENTITY_VALUES"' EXIT
+# Stands in for the projected ServiceAccount token the EKS pod-identity webhook
+# mounts. Its CONTENT is never read here: the web-identity provider hands back
+# deferred credentials and only exchanges the token at the first signed call, so
+# a placeholder is enough to observe which provider won and this stays offline.
+WEB_IDENTITY_TOKEN=$(mktemp)
+printf 'placeholder-projected-service-account-token' > "$WEB_IDENTITY_TOKEN"
 
 cat > "$WEB_IDENTITY_VALUES" <<'EOF'
 rustfs:
@@ -227,5 +246,288 @@ assert_static(sys.argv[1])
 assert_web_identity(sys.argv[2])
 PY
 
+# Everything above reads the rendered YAML. That is necessary and not
+# sufficient: an absent env var only means the chart stopped SUPPLYING a
+# credential, and the thing that actually has to happen is that the SDK then
+# RESOLVES one from the web-identity provider. Those are different claims, and
+# the gap between them is exactly where this feature was inert -- the manifests
+# were already clean while the api crashlooped at boot, because the settings
+# objects carry non-empty `rustfs`/`rustfssecret` DEFAULTS and the client
+# builder passes them unconditionally. Omitting the env var just falls back to
+# the default, and botocore reads that default as an explicit credential.
+#
+# So this second block stops asserting about fields and starts asserting about
+# an outcome: build the real production objects under the env each rendered
+# workload would actually get, and ask the constructed boto3 client which
+# provider won. `.method` is that answer, and it is the only check here that
+# cannot be satisfied by a rename or a moved field:
+#
+#   * "assume-role-with-web-identity" -- the chain was walked and the projected
+#     token provider supplied the identity. This is the feature working.
+#   * "explicit" -- a credential was handed to the client constructor, so
+#     botocore short-circuited at the first resolver and never reached the
+#     provider chain at all. An empty string counts: botocore treats
+#     `aws_access_key_id=""` as a supplied credential, not an absent one, so
+#     "we blanked the credential" is NOT the same fix as "we passed None".
+#
+# It goes through `BundleStore` rather than the shared `build_s3_client` helper
+# on purpose. `BundleStore` is what production constructs; testing the helper
+# alone would stay green if a store grew its own credential handling on top.
+#
+# Offline by construction: the web-identity provider returns deferred
+# credentials and defers the STS exchange to the first signed request, which
+# never happens here. No network, no cluster, no bucket.
+uv run --python 3.13 python - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$WEB_IDENTITY_TOKEN" <<'PY'
+import base64, os, sys, boto3, yaml
+
+ROLE_ANNOTATION = "eks.amazonaws.com/role-arn"
+
+
+def load_manifest(path):
+    """Index the workloads, Secrets, and ServiceAccounts of one rendered chart."""
+    deployments, secrets, service_accounts = {}, {}, {}
+    with open(path) as fh:
+        for doc in yaml.safe_load_all(fh):
+            if not doc:
+                continue
+            kind = doc.get("kind")
+            name = doc.get("metadata", {}).get("name", "")
+            if kind == "Deployment":
+                deployments[name] = doc
+            elif kind == "Secret":
+                values = {
+                    key: base64.b64decode(encoded).decode()
+                    for key, encoded in (doc.get("data") or {}).items()
+                }
+                values.update(doc.get("stringData") or {})
+                secrets[name] = values
+            elif kind == "ServiceAccount":
+                service_accounts[name] = doc["metadata"].get("annotations") or {}
+    return deployments, secrets, service_accounts
+
+
+def deployment_for(deployments, name):
+    """The Deployment by its exact rendered name.
+
+    Named exactly rather than by suffix because the chart also renders
+    `curie-langfuse-worker`, so a `-worker` suffix match picks up two workloads
+    and whichever one document order happens to leave last.
+    """
+    assert name in deployments, (
+        f"Deployment {name} was not rendered (rendered {sorted(deployments)})"
+    )
+    return deployments[name]
+
+
+def container_named(label, deployment, container_name):
+    """The container this workload actually runs, chosen by name, never by index.
+
+    Indexing `containers[0]` reads whichever container the pod spec happens to
+    list first, and that is not the same claim as "the application container".
+    A sidecar prepended to the spec -- a proxy, a log shipper, a mesh injector
+    -- would carry no S3 credential env at all, so both lanes would read a clean
+    environment and pass while the real api or worker container kept its
+    explicit keys. The gate would then assert about a container nobody stores a
+    bundle from.
+
+    Missing is a hard failure rather than a fallback to index 0 for the same
+    reason: a silent fallback restores exactly the positional read this exists
+    to remove, and a container rename is a real change to what the gate covers.
+    """
+    containers = deployment["spec"]["template"]["spec"].get("containers", []) or []
+    matches = [c for c in containers if c.get("name") == container_name]
+    assert len(matches) == 1, (
+        f"{label}: Deployment {deployment['metadata']['name']} must run exactly one "
+        f"container named {container_name!r}, but it renders "
+        f"{[c.get('name') for c in containers]}. This gate asserts about the "
+        "application container specifically, so it will not guess which one that is."
+    )
+    return matches[0]
+
+
+def resolve_env(label, deployment, container_name, secrets):
+    """The env the kubelet would hand this container, secretKeyRefs included.
+
+    Reading only inline `value` entries is the trap here. On the static path the
+    api and the worker carry `S3_ACCESS_KEY` inline but source `S3_SECRET_KEY`
+    from a secretKeyRef, so a value-only reader produces an access key with no
+    secret -- which botocore rejects with PartialCredentialsError, a failure
+    that looks like a broken gate rather than the passing static lane it is.
+    """
+    container = container_named(label, deployment, container_name)
+    resolved = {}
+    for entry in container.get("env", []) or []:
+        name = entry["name"]
+        if "value" in entry:
+            resolved[name] = str(entry["value"])
+            continue
+        source = (entry.get("valueFrom") or {}).get("secretKeyRef")
+        if source is None:
+            # fieldRef, resourceFieldRef and friends are pod metadata, never a
+            # credential, so they cannot steer provider resolution.
+            continue
+        secret = secrets.get(source["name"])
+        assert secret is not None, (
+            f"{label} env {name} references Secret {source['name']}, which the chart "
+            "did not render"
+        )
+        assert source["key"] in secret, (
+            f"{label} env {name} references key {source['key']} of Secret "
+            f"{source['name']}, which holds {sorted(secret)}"
+        )
+        resolved[name] = secret[source["key"]]
+    return resolved
+
+
+def resolve_role_arn(label, deployment, service_accounts):
+    """The role ARN bound to THIS workload, via the ServiceAccount it names.
+
+    Follows serviceAccountName rather than suffix-matching an account, because
+    the api and the worker bind different roles and picking the wrong one would
+    silently assert against an identity the workload never gets.
+    """
+    account = deployment["spec"]["template"]["spec"].get("serviceAccountName")
+    assert account, f"{label} Deployment names no serviceAccountName"
+    assert account in service_accounts, (
+        f"{label} binds ServiceAccount {account}, which the chart did not render "
+        f"(rendered {sorted(service_accounts)})"
+    )
+    arn = service_accounts[account].get(ROLE_ANNOTATION)
+    assert arn, (
+        f"ServiceAccount {account} carries no {ROLE_ANNOTATION} annotation, so {label} "
+        "has no identity to assume"
+    )
+    return arn
+
+
+def apply_env(manifest_env, overrides):
+    """Scrub every ambient AWS_/S3_ key, then apply only manifest-derived values.
+
+    Load-bearing, not hygiene. A developer box or a CI runner with an ambient
+    AWS_PROFILE, an instance role, or a leftover AWS_ACCESS_KEY_ID would decide
+    the provider chain instead of the chart, and the key-free assertion would
+    then pass or fail for a reason that has nothing to do with this chart.
+    """
+    for key in [key for key in os.environ if key.startswith(("AWS_", "S3_"))]:
+        del os.environ[key]
+    for key, value in manifest_env.items():
+        if key.startswith(("AWS_", "S3_")):
+            os.environ[key] = value
+    os.environ.update(overrides)
+
+
+def api_client():
+    from curie_api.config import Settings
+    from curie_api.storage import BundleStore
+
+    # `_env_file=None` is mandatory: Settings declares `env_file=".env"`, so a
+    # stray dotenv in the checkout would otherwise supply credentials and quietly
+    # decide the result of this gate.
+    return BundleStore(Settings(_env_file=None))._client
+
+
+def worker_client():
+    from curie_worker.bundle_store import BundleStore
+    from curie_worker.config import WorkerConfig
+
+    # WorkerConfig declares no env file, so there is nothing to suppress.
+    return BundleStore(WorkerConfig())._client
+
+
+def credentials_of(label, client):
+    credentials = client._request_signer._credentials
+    assert credentials is not None, (
+        f"{label} resolved no credentials at all; the provider chain was walked and "
+        "came back empty"
+    )
+    return credentials
+
+
+static_deployments, static_secrets, static_accounts = load_manifest(sys.argv[1])
+free_deployments, free_secrets, free_accounts = load_manifest(sys.argv[2])
+token_file = sys.argv[3]
+
+# Release name is fixed at `curie` by the two `helm template` calls above, and
+# the container name is spelled out beside the Deployment name rather than
+# derived from the label, so a chart-side rename of either one fails loudly here
+# instead of quietly re-pointing the gate at a different container.
+WORKLOADS = (
+    ("api", "curie-api", "api", api_client),
+    ("worker", "curie-worker", "worker", worker_client),
+)
+
+# `boto3.DEFAULT_SESSION = None` before every client build is load-bearing, not
+# defensive tidiness, and it is the half of the isolation `apply_env` cannot do.
+# `build_s3_client` calls `boto3.client(...)`, which is a method on boto3's
+# GLOBAL default session, and a session caches the credentials it resolves for
+# the life of the process. All four clients below are built in ONE interpreter,
+# so without this reset the first resolution wins and every later iteration is
+# handed the cached credential object rather than resolving under the
+# environment that iteration just applied. The whole point of scrubbing and
+# reapplying the env per workload is that each lane resolves from scratch; a
+# reused session silently turns the second, third, and fourth assertions into
+# restatements of the first, and they would keep passing while asserting
+# nothing. Dropping the reference forces boto3 to build a new session, and a new
+# session starts with an empty credential cache. Verified by the objects: with
+# the reset the api and worker resolve to distinct credential instances, without
+# it they are the same object.
+
+# Static lane. Same web-identity env present, so this also proves the key-free
+# path is selected by the ABSENCE of configured keys and not by the ambient
+# environment: a default install must keep signing with its own credentials even
+# on a cluster where a role happens to be bound.
+for label, workload, container_name, build_client in WORKLOADS:
+    deployment = deployment_for(static_deployments, workload)
+    manifest_env = resolve_env(label, deployment, container_name, static_secrets)
+    expected_key = manifest_env["S3_ACCESS_KEY"]
+    apply_env(
+        manifest_env,
+        {
+            "AWS_ROLE_ARN": "arn:aws:iam::000000000000:role/curie-unused",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": token_file,
+            "AWS_REGION": "us-east-1",
+        },
+    )
+    boto3.DEFAULT_SESSION = None
+    credentials = credentials_of(label, build_client())
+    assert credentials.method == "explicit", (
+        f"static: {label} resolved credentials via {credentials.method!r}; the default "
+        "install signs with the in-chart RustFS keys, which no provider chain can supply"
+    )
+    # The method alone would still pass if the store signed with the wrong key,
+    # so pin the value the manifest actually carries.
+    assert credentials.access_key == expected_key, (
+        f"static: {label} signs with access key {credentials.access_key!r}, but the "
+        f"rendered manifest carries {expected_key!r}"
+    )
+    print(f"ok: static: {label} signs explicitly with the rendered access key")
+
+# Key-free lane. AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are the two vars
+# the EKS pod-identity webhook injects; together they are the entire input to
+# the provider this path depends on.
+for label, workload, container_name, build_client in WORKLOADS:
+    deployment = deployment_for(free_deployments, workload)
+    apply_env(
+        resolve_env(label, deployment, container_name, free_secrets),
+        {
+            "AWS_ROLE_ARN": resolve_role_arn(label, deployment, free_accounts),
+            "AWS_WEB_IDENTITY_TOKEN_FILE": token_file,
+            "AWS_REGION": "us-east-1",
+        },
+    )
+    boto3.DEFAULT_SESSION = None
+    method = credentials_of(label, build_client()).method
+    assert method == "assume-role-with-web-identity", (
+        f"key-free: {label} built a client whose credentials resolved via {method!r}, "
+        "not 'assume-role-with-web-identity'. 'explicit' means a credential was passed "
+        "to the client constructor, so botocore stopped at the first resolver and the "
+        "web-identity provider was never reached -- the key-free path is inert no "
+        "matter how clean the rendered manifest looks. Note that an empty-string "
+        "credential is still explicit to botocore; the constructor has to receive no "
+        "credential at all."
+    )
+    print(f"ok: key-free: {label} resolves credentials via {method}")
+PY
+
 echo
-echo "PASS: the default install keeps static object-store credentials; clearing rustfs.auth.accessKey omits every credential env and shell export across api, worker, and bundle-fetch, binds identity through ServiceAccount annotations, is refused against the in-chart RustFS, and leaves Rail 1's IMDS denial intact."
+echo "PASS: the default install keeps static object-store credentials and still signs with the access key its manifest carries; clearing rustfs.auth.accessKey omits every credential env and shell export across api, worker, and bundle-fetch, binds identity through ServiceAccount annotations, is refused against the in-chart RustFS, leaves Rail 1's IMDS denial intact, and makes the api and worker BundleStore objects resolve real credentials through the web-identity provider rather than an explicit key."
