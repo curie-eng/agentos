@@ -236,6 +236,16 @@ rotation/recovery works; point `langfuse.existingSecret` (and each store's
 `existingSecret`) at your own Secrets to bring your own. `langfuse.encryptionKey`
 must be 64 hex chars (`openssl rand -hex 32`).
 
+Upgrade note for `langfuse.existingSecret`: that Secret must now also carry an
+`otlpAuthHeader` key holding the full header value the OTel Collector sends to
+Langfuse, `Basic <base64(publicKey:secretKey)>`. The collector follows
+`langfuse.existingSecret` like every other Langfuse consumer instead of reading a
+chart-derived header it could not authenticate with, so an install already on
+this path must add that key (or set `otelCollector.otlpAuthHeader`) before
+upgrading. Without it the collector pod fails to start with
+`CreateContainerConfigError`, which is the deliberate replacement for a silent
+401 on every trace export.
+
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
 client-side Helm (no live API lookup) regenerates these values on every sync and
@@ -246,8 +256,13 @@ Guard against shipping those dev defaults to a shared/production cluster with
 `--set security.checkDefaultCredentials=true`: the chart then refuses to render
 while `langfuse.init.projectSecretKey` or `langfuse.init.userPassword` still
 carries its published dev default (a Langfuse admin-takeover risk on a reachable
-UI; the project key also feeds the OTel Collector auth header). Override those
-values or supply `langfuse.existingSecret` to clear the gate. It is off by
+UI; the project key also feeds the OTel Collector auth header on the
+non-`existingSecret` path). Override those values or supply
+`langfuse.existingSecret` to clear those two checks. A third condition fails the
+render whenever `otelCollector.otlpAuthHeader` is set to the published dev header
+`Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`; `langfuse.existingSecret`
+does not clear it, because an explicit override is what the collector sends
+regardless of where the Langfuse credential comes from. It is off by
 default so the zero-secret bare install stays green.
 
 ### Key-free object store auth

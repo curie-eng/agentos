@@ -62,7 +62,7 @@ spec:
             - name: LANGFUSE_OTLP_AUTH_HEADER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
+                  name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
           ports:
             - name: otlp-grpc
