@@ -813,7 +813,10 @@ def build_approval_gate(
                 " mcp__plugin_<bundle>_<server>__<tool> name (or, for a"
                 " connectors.yaml connector, mcp__<connector>__<tool>), or check the"
                 f" bundle declares that server (declared MCP servers: {mcp_servers},"
-                f" declared connectors: {connector_servers})"
+                f" declared connectors: {connector_servers}). A gate is also refused"
+                " when it is ambiguous -- a declared connector name and a declared MCP"
+                " server name collide, so the gate resolves to two different live tool"
+                " names with no principled winner; rename one of them"
             )
         # A bare (non-mcp__) name is armed VERBATIM as a built-in tool name,
         # never rewritten or checked (#712): `effective_operator_gate` has no

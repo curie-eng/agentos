@@ -264,7 +264,11 @@ def effective_operator_gate(
       bundle declares in ``connectors.yaml`` (#1495). A connector rides the SDK's
       ``mcp_servers`` map directly, so that shorthand IS already the live runtime
       name: it is verified against the declared connectors and returned unchanged,
-      never rewritten to the plugin form the runtime never produces;
+      never rewritten to the plugin form the runtime never produces. Both the
+      connector rule and the plugin-shorthand rule test the SAME ``mcp__<server>__``
+      prefix shape, so ONE name can match both sets; the two candidates compete on
+      SPECIFICITY (the longest matched server name wins) rather than on which check
+      runs first (#1564);
     - ``name`` verbatim only for a built-in with no ``mcp__`` prefix (armed by raw
       name), OR for an already ``mcp__plugin_``-prefixed name that MATCHES an
       expected prefix ``mcp__plugin_<bundle>_<server>__`` for a declared server
@@ -276,8 +280,11 @@ def effective_operator_gate(
       declared server or connector: an undeclared server, no declared servers,
       ``servers`` or ``connector_servers`` being ``None`` (unknowable), a falsy
       ``bundle_name`` (cannot construct the plugin prefix to verify), an empty tool
-      remainder, or an already-prefixed name matching no expected
-      prefix. The operator override is never deploy-validated, so this runtime
+      remainder, an already-prefixed name matching no expected
+      prefix, or an AMBIGUOUS name matching a connector and a declared MCP server at
+      EQUAL specificity (#1564) -- the two live forms differ and there is no
+      principled winner, so refuse rather than pick one silently. The operator
+      override is never deploy-validated, so this runtime
       check is its sole defense -- "cannot verify" fails CLOSED, not through. The
       caller fails closed on ``None``.
     """
@@ -292,12 +299,35 @@ def effective_operator_gate(
     if servers is None or connector_servers is None:
         return None
     # A connectors.yaml server is mounted straight onto the SDK's mcp_servers map
-    # (ADR-0086), so mcp__<connector>__<tool> is ALREADY the live runtime name.
-    # Checked BEFORE the plugin branch: a connector may legally be named `plugin`,
-    # and its mcp__plugin__<tool> would otherwise fall into the plugin branch and be
-    # rejected. The reverse cannot happen -- a connector name is an RFC 1123 label,
-    # so it never contains the `_` that mcp__plugin_<bundle>_<server>__ requires.
-    if _longest_matching_server(name, connector_servers, connector_tool_prefix) is not None:
+    # (ADR-0086), so mcp__<connector>__<tool> is ALREADY the live runtime name; a
+    # plugin server's mcp__<server>__<tool> shorthand must be REWRITTEN to
+    # mcp__plugin_<bundle>_<server>__<tool>. Both rules test the SAME
+    # mcp__<server>__ prefix shape (connector_tool_prefix vs the shorthand template
+    # below), so ONE name can match both sets -- with connector `git` and MCP server
+    # `git__hub` both declared, mcp__git__hub__create_pr matches each. Compute BOTH
+    # candidates and arbitrate on SPECIFICITY: the longest matched server name wins,
+    # exactly as _longest_matching_server arbitrates WITHIN one set. Deciding by
+    # which check runs first would let the connector shadow the plugin server and
+    # arm the un-rewritten literal, which the runtime never produces -- the #453
+    # fail-open, in reverse (#1564).
+    connector = _longest_matching_server(name, connector_servers, connector_tool_prefix)
+    shorthand = _longest_matching_server(name, servers, lambda s: f"mcp__{s}__")
+    # Equal specificity means the connector and the MCP server carry the SAME name
+    # (equal-length prefixes of one name under one template are the same string),
+    # and their live forms differ. There is no principled winner, so refuse rather
+    # than pick one silently: the caller turns None into a loud boot error (#520).
+    # validate._reject_connector_name_collisions already rejects this at deploy, but
+    # the operator env knob is never deploy-validated, which is what this defends.
+    if connector is not None and shorthand is not None and len(connector) == len(shorthand):
+        return None
+    # The connector won on specificity (or is the only match): return the name
+    # unchanged (#1495). Resolved BEFORE the already-prefixed literal branch below,
+    # because a connector may legally be named `plugin` and its mcp__plugin__<tool>
+    # would otherwise fall into that branch and be rejected. The RFC 1123 argument
+    # ("a connector name never contains `_`") is why the literal branch cannot steal
+    # a connector name -- it says nothing about the shorthand branch, which shares
+    # the connector's exact prefix shape and needs the contest above.
+    if connector is not None and (shorthand is None or len(connector) > len(shorthand)):
         return name
     # The plugin form needs the bundle name to construct the prefix to verify
     # against; without it nothing can be verified, so fail closed.
@@ -311,12 +341,11 @@ def effective_operator_gate(
             name, servers, lambda s: effective_tool_prefix(bundle_name, s)
         )
         return name if matched is not None else None
-    # An mcp__<server>__<tool> shorthand: resolve <server> by matching against the
-    # declared servers rather than splitting at the first __ (a server name may
-    # contain __). Prefer the longest match to disambiguate when one server name is
-    # a prefix of another; require a non-empty tool remainder.
-    best_server = _longest_matching_server(name, servers, lambda s: f"mcp__{s}__")
-    if best_server is None:
+    # An mcp__<server>__<tool> shorthand: <server> was resolved above by matching
+    # against the declared servers rather than splitting at the first __ (a server
+    # name may contain __), preferring the longest match; require a non-empty tool
+    # remainder.
+    if shorthand is None:
         return None
-    tool = name[len(f"mcp__{best_server}__") :]
-    return f"mcp__plugin_{bundle_name}_{best_server}__{tool}"
+    tool = name[len(f"mcp__{shorthand}__") :]
+    return f"mcp__plugin_{bundle_name}_{shorthand}__{tool}"
