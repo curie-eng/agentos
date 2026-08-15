@@ -91,7 +91,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0059 | [The sandbox is a bounded resource envelope; capacity is a tenant boundary](0059-sandbox-is-a-bounded-resource-envelope.md) | Accepted |
 | 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Accepted |
 | 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft |
-| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Draft |
+| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Accepted |
 | 0063 | [Message-driven approval reply surface](0063-message-driven-approval-reply-surface.md) | Accepted |
 | 0064 | [Fail-forward cluster teardown](0064-fail-forward-cluster-teardown.md) | Accepted |
 | 0065 | [Tag protection, not the workflow gate, binds a write actor](0065-tag-protection-not-the-workflow-gate-binds-a-write-actor.md) | Accepted |
@@ -116,13 +116,13 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0084 | [Publish a verification contract for agents driving Curie](0084-publish-a-verification-contract-for-agents-driving-curie.md) | Accepted |
 | 0085 | [Acceptance, not implementation, authorizes an ADR](0085-acceptance-not-implementation-authorizes-an-adr.md) | Accepted |
 | 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Accepted |
-| 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Draft |
+| 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Accepted |
 | 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Accepted |
 | 0089 | [Bundles declare their deploy targets](0089-bundles-declare-their-deploy-targets.md) | Accepted |
 | 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Accepted |
 | 0091 | [Git-flow resolves deploy targets, so one repo serves many agents](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md) | Accepted |
 | 0092 | [A GitHub App gives the platform its own repository identity](0092-a-github-app-gives-the-platform-its-own-repository-identity.md) | Accepted |
-| 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Draft |
+| 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Accepted |
 | 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Accepted |
 | 0095 | [One tiered memory lifecycle for agent and channel memory](0095-tiered-memory-lifecycle.md) | Draft |
 | 0096 | [A third-party port adapter is a deployed service, not a loaded plugin](0096-port-adapters-are-deployed-services.md) | Accepted |

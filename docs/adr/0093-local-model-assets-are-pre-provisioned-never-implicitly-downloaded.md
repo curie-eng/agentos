@@ -2,7 +2,11 @@
 
 Date: 2026-08-03
 
-Status: Draft
+Status: Accepted
+
+Realized by `preflight_local_model` in `cli/src/docker.rs`, which both tiers call
+from `cli/src/local.rs` before anything is brought up, and by the opt-in fetch
+flag that keeps the old behaviour available for anyone who wants it.
 
 ## Context
 
