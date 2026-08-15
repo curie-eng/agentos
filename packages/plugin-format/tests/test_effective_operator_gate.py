@@ -277,6 +277,67 @@ def test_connector_named_plugin_is_matched_before_the_plugin_branch() -> None:
     )
 
 
+# --- a connector and a plugin server can match the SAME name (#1564) -------------
+#
+# Both rules build the byte-identical prefix shape mcp__<server>__, so ONE gate
+# name can match a declared connector AND a declared MCP server. Deciding by which
+# check runs first lets the connector shadow the plugin server and arm the
+# un-rewritten literal the runtime never produces. The two candidates must compete
+# on SPECIFICITY, and an equal-specificity tie must refuse.
+
+
+def test_connector_does_not_shadow_a_longer_matching_plugin_server() -> None:
+    # The #1564 defect: connector `git` and MCP server `git__hub` both match
+    # mcp__git__hub__create_pr. The MCP server is the LONGER, more specific match,
+    # so the name must be rewritten to the live plugin form. Returning it verbatim
+    # arms a literal the SDK never emits -- a total fail-open on the gate.
+    assert (
+        effective_operator_gate(
+            "b", {"git__hub"}, "mcp__git__hub__create_pr", connector_servers={"git"}
+        )
+        == "mcp__plugin_b_git__hub__create_pr"
+    )
+
+
+def test_connector_wins_when_it_is_the_more_specific_match() -> None:
+    # The mirror image, so the contest is proven symmetric rather than a hardcoded
+    # "plugins win": connector `git__hub` is the longer match against MCP server
+    # `git`, so the connector's live bare name is returned verbatim (#1495).
+    assert (
+        effective_operator_gate(
+            "b", {"git"}, "mcp__git__hub__create_pr", connector_servers={"git__hub"}
+        )
+        == "mcp__git__hub__create_pr"
+    )
+
+
+def test_equal_length_connector_and_server_match_is_ambiguous_and_refuses() -> None:
+    # Equal specificity means the connector and the MCP server carry the SAME name,
+    # and their live forms differ (bare vs plugin-prefixed). There is no principled
+    # winner, so refuse rather than pick one silently -- the caller turns None into
+    # a loud boot error (#520 fail-closed).
+    assert (
+        effective_operator_gate("b", {"git"}, "mcp__git__create_pr", connector_servers={"git"})
+        is None
+    )
+
+
+def test_connector_still_wins_verbatim_when_bundle_name_is_falsy() -> None:
+    # Regression pin for #1495: a connectors-only bundle with no bundle name still
+    # arms the connector gate verbatim, so the connector match must keep resolving
+    # BEFORE the `if not bundle_name` guard. This ordering is load-bearing.
+    assert (
+        effective_operator_gate("", set(), "mcp__grafana__query", connector_servers={"grafana"})
+        == "mcp__grafana__query"
+    )
+
+
+def test_ambiguous_match_refuses_even_when_bundle_name_is_falsy() -> None:
+    # The tie must not be reachable-around by an empty bundle name: refusing has to
+    # happen before the connector-verbatim path, not only after it.
+    assert effective_operator_gate("", {"git"}, "mcp__git__x", connector_servers={"git"}) is None
+
+
 # --- connector_server_names: read connectors.yaml, poison to None ----------------
 
 

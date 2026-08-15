@@ -2386,3 +2386,104 @@ def test_operator_gate_naming_an_undeclared_connector_still_fails_closed(tmp_pat
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
         )
+
+
+# --- a connector must not shadow a plugin server it prefixes (#1564) -------------
+#
+# A connectors.yaml connector and a plugin-loaded MCP server produce the SAME
+# mcp__<server>__ prefix shape, so one operator gate name can match both -- but
+# only one of the two live tool names is real. build_can_use_tool compares by
+# exact string equality, so arming the wrong one is a total fail-open: the SDK
+# hands over the live name, it is not in gate.required, and the call is ALLOWED
+# with no block recorded and nothing logged.
+
+_GIT_CONNECTORS = "connectors:\n  git:\n    image: ghcr.io/example/git-mcp:1.0.0\n"
+
+
+def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None:
+    """Connector `git` + plugin MCP server `git__hub`, gate mcp__git__hub__create_pr.
+
+    The MCP server is the more specific match, so the gate must arm the live
+    plugin-namespaced name and deny the real call. Arming the connector's bare
+    form instead arms a literal the SDK never emits.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git__hub": {"command": "gh-server"}}}), encoding="utf-8"
+    )
+    live = "mcp__plugin_acme-bot_git__hub__create_pr"
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=["mcp__git__hub__create_pr"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({live})
+        result = await build_can_use_tool(gate)(live, {"title": "..."}, ToolPermissionContext())
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_connector_gate_on_a_connector_tool_still_denies_alongside_a_prefixed_server(
+    tmp_path,
+) -> None:
+    """The #1495 property survives in the very bundle that triggers the contest.
+
+    Gate mcp__git__status names a genuine connector tool: no declared MCP server
+    matches it, so it stays the bare live name and the real call is denied.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git__hub": {"command": "gh-server"}}}), encoding="utf-8"
+    )
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=["mcp__git__status"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({"mcp__git__status"})
+        result = await build_can_use_tool(gate)(
+            "mcp__git__status", {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_ambiguous_connector_and_server_gate_refuses_to_boot(tmp_path) -> None:
+    """Connector `git` and MCP server `git` both match mcp__git__create_pr.
+
+    The two live forms differ and neither is more specific, so there is no
+    principled winner. validate_bundle rejects this bundle at deploy, but the
+    operator env knob is never deploy-validated -- the runtime must refuse on its
+    own, loudly and with a message that names the ambiguity rather than claiming
+    the gate resolved to nothing.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git": {"command": "git-server"}}}), encoding="utf-8"
+    )
+    resolution = resolve_approval_policy(root)
+    with pytest.raises(ApprovalPolicyError, match="ambiguous"):
+        build_approval_gate(
+            operator_tools=["mcp__git__create_pr"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
