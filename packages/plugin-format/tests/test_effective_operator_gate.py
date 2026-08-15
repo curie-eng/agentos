@@ -300,18 +300,6 @@ def test_connector_and_longer_plugin_server_both_armed() -> None:
     ) == frozenset({"mcp__git__hub__create_pr", "mcp__plugin_b_git__hub__create_pr"})
 
 
-def test_connector_and_shorter_plugin_server_both_armed() -> None:
-    # The mirror image, so the rule is proven symmetric rather than a hardcoded
-    # "plugins win" or "connectors win": connector `git__hub` and MCP server `git`
-    # both match, and both live forms are armed. Before #1564's follow-up this
-    # returned the connector's bare name alone, on the theory that the longer
-    # matched server name was the more specific match -- but a server name's length
-    # carries no information about which server hosts the tool.
-    assert effective_operator_gates(
-        "b", {"git"}, "mcp__git__hub__create_pr", connector_servers={"git__hub"}
-    ) == frozenset({"mcp__git__hub__create_pr", "mcp__plugin_b_git__hub__create_pr"})
-
-
 def test_connector_tool_containing_double_underscore_stays_armed() -> None:
     # The regression the length tiebreak produced: connector `deploy` exposes a tool
     # named `prod__apply`, so mcp__deploy__prod__apply is ALREADY the live name --
@@ -361,6 +349,55 @@ def test_ambiguous_match_refuses_even_when_bundle_name_is_falsy() -> None:
     # The tie must not be reachable-around by an empty bundle name: refusing has to
     # happen before the connector-verbatim path, not only after it.
     assert effective_operator_gates("", {"git"}, "mcp__git__x", connector_servers={"git"}) is None
+
+
+# --- the already-prefixed reading is a UNION member, not a winner (#1564) --------
+#
+# mcp__plugin_-prefixed names have TWO readings whenever a declared server name
+# itself starts with `plugin_`: the already-effective live form, and the
+# mcp__<server>__<tool> shorthand for that server. Returning on whichever branch
+# ran first picked one by ordering, exactly the defect the connector/shorthand pair
+# above exists to close.
+
+
+def test_already_prefixed_name_also_armed_as_shorthand_for_plugin_named_server() -> None:
+    # The fail-OPEN half. mcp__plugin_b_github__update_issue is the live form for
+    # server `github` AND the shorthand for a server literally named
+    # `plugin_b_github`, whose live form is mcp__plugin_b_plugin_b_github__update_issue.
+    # Arming only the first left the second ungated: build_can_use_tool compares by
+    # exact string equality, so if `plugin_b_github` is the server that hosts
+    # update_issue, the call ran with no approval at all.
+    assert effective_operator_gates(
+        "b",
+        {"github", "plugin_b_github"},
+        "mcp__plugin_b_github__update_issue",
+        connector_servers=set(),
+    ) == frozenset(
+        {"mcp__plugin_b_github__update_issue", "mcp__plugin_b_plugin_b_github__update_issue"}
+    )
+
+
+def test_already_prefixed_shape_resolves_as_shorthand_when_only_that_reading_verifies() -> None:
+    # The fail-CLOSED half of the same early return. mcp__plugin_x__do LOOKS already
+    # prefixed but verifies against no expected prefix; it IS a valid shorthand for
+    # declared server `plugin_x`. The early return refused the whole name, so a
+    # legitimate gate refused to boot. The union resolves it to the one live form.
+    assert effective_operator_gates(
+        "b", {"plugin_x"}, "mcp__plugin_x__do", connector_servers=set()
+    ) == frozenset({"mcp__plugin_b_plugin_x__do"})
+
+
+def test_already_prefixed_name_matching_no_reading_still_fails_closed() -> None:
+    # The union must not become arm-anything: a mcp__plugin_-prefixed name that
+    # verifies against NOTHING -- no expected prefix, no shorthand server, no
+    # connector -- keeps failing CLOSED, same input shape as
+    # test_already_prefixed_name_for_undeclared_prefix_fails_closed.
+    assert (
+        effective_operator_gates(
+            "b", {"github"}, "mcp__plugin_wrongbundle_wrongserver__tool", connector_servers=set()
+        )
+        is None
+    )
 
 
 # --- connector_server_names: read connectors.yaml, poison to None ----------------

@@ -251,9 +251,29 @@ def effective_operator_gates(
     ``mcp__plugin_<bundle>_<server>__<tool>``. An operator who writes the natural
     shorthand ``mcp__<server>__<tool>`` in ``CURIE_APPROVAL_REQUIRED_TOOLS`` must
     have it rewritten to that effective form, or the gate arms a literal that the
-    runtime name never matches (a silent fail-open). Returns a NON-EMPTY
-    ``frozenset`` of the live names to arm, or ``None`` for "cannot verify":
+    runtime name never matches (a silent fail-open).
 
+    Every naming rule below CONTRIBUTES to one union; none of them returns on its own
+    match. That shape is the whole point of this function, and an early return is the
+    defect it keeps having: the rules all read the same ``mcp__<...>__<tool>`` shape,
+    so one gate name routinely satisfies several of them, and NOTHING in the inputs
+    says which server actually hosts the tool. Returning on the first rule that
+    matches therefore picks a reading by branch ORDERING, and ``build_can_use_tool``
+    matches by exact string equality, so every live name the ordering did not pick
+    gates nothing at all, silently (#1495, #1564). Arming an extra name costs at most
+    one approval card for a tool nobody calls; missing one is a total fail-open. Do
+    not reintroduce an early return here.
+
+    Returns the NON-EMPTY ``frozenset`` of live names to arm -- the union of:
+
+    - ``{name}`` for a built-in with no ``mcp__`` prefix, armed by raw name and never
+      server-checked. The one rule that short-circuits, because a name without the
+      ``mcp__`` prefix can satisfy no other rule;
+    - ``{name}`` when ``name`` is ``mcp__<connector>__<tool>`` naming a connector the
+      bundle declares in ``connectors.yaml`` (#1495). A connector rides the SDK's
+      ``mcp_servers`` map directly, so that shorthand IS already the live runtime
+      name: it is verified against the declared connectors and armed unchanged, never
+      rewritten to the plugin form the runtime never produces;
     - ``{rewritten}`` when ``name`` is ``mcp__<server>__<tool>`` and ``<server>`` is
       a declared bundle server. ``<server>`` is resolved by MATCHING the shorthand
       against the declared servers (a server name may itself contain ``__``, so
@@ -261,41 +281,44 @@ def effective_operator_gates(
       ``foo``); the longest matching server name wins when one is a prefix of
       another. The effective prefix is built exactly as ``validate.py`` constructs
       ``expected_prefixes``;
-    - ``{name}`` for an ``mcp__<connector>__<tool>`` naming a connector the bundle
-      declares in ``connectors.yaml`` (#1495). A connector rides the SDK's
-      ``mcp_servers`` map directly, so that shorthand IS already the live runtime
-      name: it is verified against the declared connectors and returned unchanged,
-      never rewritten to the plugin form the runtime never produces;
-    - ``{name, rewritten}`` -- BOTH live forms -- when ``name`` matches a declared
-      connector AND a declared MCP server of a DIFFERENT name (#1564). The two rules
-      test the SAME ``mcp__<server>__`` prefix shape, so one gate name can match
-      both sets, and NOTHING in the inputs says which server actually hosts the
-      tool. Arming both is fail-CLOSED (at worst one extra approval card for a tool
-      nobody calls); arming one is a coin flip that fails OPEN half the time;
-    - ``{name}`` for a built-in with no ``mcp__`` prefix (armed by raw name), OR for
-      an already ``mcp__plugin_``-prefixed name that MATCHES an expected prefix
-      ``mcp__plugin_<bundle>_<server>__`` for a declared server (with a non-empty
-      tool remainder), mirroring ``validate.py``'s ``expected_prefixes`` check -- an
-      already-prefixed name is NOT trusted blindly (a typo'd
+    - ``{name}`` when ``name`` is already ``mcp__plugin_``-prefixed AND matches an
+      expected prefix ``mcp__plugin_<bundle>_<server>__`` for a declared server (with
+      a non-empty tool remainder), mirroring ``validate.py``'s ``expected_prefixes``
+      check -- an already-prefixed name is NOT trusted blindly (a typo'd
       ``mcp__plugin_wrongbundle_wrongserver__tool`` would arm a literal the runtime
-      never matches, a fail-open);
-    - ``None`` when ``name`` is ``mcp__``-shaped and cannot be verified against a
-      declared server or connector: an undeclared server, no declared servers,
-      ``servers`` or ``connector_servers`` being ``None`` (unknowable), a falsy
-      ``bundle_name`` (cannot construct the plugin prefix to verify or to build),
-      an empty tool remainder, an already-prefixed name matching no expected prefix,
-      or a name matching a connector and a declared MCP server of the SAME name
-      (#1564) -- that is an invalid CONFIGURATION, not an unknowable one, and it
-      must keep failing loudly. The operator override is never deploy-validated, so
-      this runtime check is its sole defense -- "cannot verify" fails CLOSED, not
-      through. The caller fails closed on ``None``.
+      never matches, a fail-open).
+
+    The last two rules can BOTH read one name, which is why the prefixed rule joins
+    the union instead of returning: ``mcp__plugin_b_github__update_issue`` is the live
+    form for server ``github`` AND the shorthand for a server named
+    ``plugin_b_github`` (live form ``mcp__plugin_b_plugin_b_github__update_issue``),
+    so both are armed (#1564). Likewise the connector and shorthand rules, for a
+    connector and an MCP server of DIFFERENT names.
+
+    Returns ``None`` -- "cannot verify", which the caller turns into a loud
+    fail-closed boot error (#520) -- when the union comes out empty, or when the
+    inputs are refused outright:
+
+    - ``servers`` or ``connector_servers`` is ``None`` (an unreadable MCP or
+      connectors declaration), so no ``mcp__``-shaped name is verifiable;
+    - ``name`` matches a declared connector AND a declared MCP server of the SAME
+      name (#1564): an invalid CONFIGURATION, not an unknowable one, which must keep
+      failing loudly rather than arming a union;
+    - that same double match with a falsy ``bundle_name``: the plugin half cannot be
+      constructed, and arming the connector half alone would re-create the shadow;
+    - an ``mcp__``-shaped name no rule verifies: an undeclared server, no declared
+      servers, an empty tool remainder, a falsy ``bundle_name`` on a name only the
+      plugin rules could read, or an already-prefixed name matching no expected
+      prefix. The operator override is never deploy-validated, so this runtime check
+      is its sole defense -- "cannot verify" fails CLOSED, not through.
 
     An empty ``frozenset`` is never returned: it would read as "armed nothing",
     which is the fail-open shape this helper exists to prevent. Refusal is ``None``.
     """
 
     # A built-in tool (Bash, Write, ...) carries no mcp__ prefix: armed by raw
-    # name, never rewritten and never server-checked.
+    # name, never rewritten and never server-checked. No rule in the union below can
+    # read such a name, so there is nothing to union it with.
     if not name.startswith("mcp__"):
         return frozenset({name})
     # Every mcp__-shaped name is verified against the declared-server sets. Without
@@ -308,8 +331,8 @@ def effective_operator_gates(
     # plugin server's mcp__<server>__<tool> shorthand must be REWRITTEN to
     # mcp__plugin_<bundle>_<server>__<tool>. Both rules test the SAME
     # mcp__<server>__ prefix shape (connector_tool_prefix vs the shorthand template
-    # below), so ONE name can match both sets -- with connector `git` and MCP server
-    # `git__hub` both declared, mcp__git__hub__create_pr matches each.
+    # below), so ONE name can match both sets -- with connector `deploy` and MCP
+    # server `deploy__prod` both declared, mcp__deploy__prod__apply matches each.
     connector = _longest_matching_server(name, connector_servers, connector_tool_prefix)
     shorthand = _longest_matching_server(name, servers, lambda s: f"mcp__{s}__")
     if connector is not None and shorthand is not None:
@@ -322,50 +345,53 @@ def effective_operator_gates(
         # what this defends.
         if len(connector) == len(shorthand):
             return None
-        # Two DIFFERENT servers each match this one gate name, and which one the
-        # operator meant is unknowable from the inputs. Do NOT arbitrate on the
-        # length of the matched server name: a name's length says nothing about
-        # which server actually hosts the tool. With connector `deploy` exposing a
-        # tool `prod__apply` and an MCP server `deploy__prod` declared,
-        # mcp__deploy__prod__apply is ALREADY live for the connector while the
-        # longer server name would rewrite it into a literal the SDK never emits.
-        # Picking either side by length just inverts which one gets shadowed, and
-        # build_can_use_tool matches by exact string equality, so the shadowed side
-        # gates nothing at all, silently. Arm BOTH live forms instead: gate.required
-        # is a frozenset, so over-arming costs at most one approval card for a tool
-        # nobody calls, while under-arming is a total fail-open (#1564).
+        # Two DIFFERENT servers each match this one gate name. The plugin half of
+        # the pair cannot be constructed without a bundle name, and arming the
+        # connector half alone would re-create the very shadow the union closes, so
+        # refuse outright rather than arm a partial union.
         if not bundle_name:
-            # The plugin half cannot be constructed, so arming both is impossible;
-            # arming only the connector half would re-create the shadow. Refuse.
             return None
-        tool = name[len(f"mcp__{shorthand}__") :]
-        return frozenset({name, f"mcp__plugin_{bundle_name}_{shorthand}__{tool}"})
-    # The connector is the ONLY match: return the name unchanged (#1495). Resolved
-    # BEFORE the already-prefixed literal branch below, because a connector may
-    # legally be named `plugin` and its mcp__plugin__<tool> would otherwise fall
-    # into that branch and be rejected. The RFC 1123 argument ("a connector name
-    # never contains `_`") is why the literal branch cannot steal a connector name
-    # -- it says nothing about the shorthand branch, which shares the connector's
-    # exact prefix shape and is handled by the arm-both rule above.
+
+    # THE union. Every rule below ADDS the live name it would arm and none of them
+    # returns, because a single gate name can legitimately be read by several of
+    # them and nothing here says which server hosts the tool. Do NOT convert any of
+    # these into an early return: build_can_use_tool matches by exact string
+    # equality, so a live form the union omits gates nothing at all, silently, while
+    # an extra one costs at most one approval card for a tool nobody calls (#1564).
+    # A set dedupes when two readings land on the same literal, so the readings need
+    # no special-casing when they agree.
+    resolved: set[str] = set()
+    # A connectors.yaml server is mounted straight onto the SDK's mcp_servers map
+    # (ADR-0086), so its shorthand IS already the live name: armed unchanged, never
+    # rewritten (#1495). This rule needs no bundle name, which is why a
+    # connectors-only bundle without one still arms its gates.
     if connector is not None:
-        return frozenset({name})
-    # The plugin form needs the bundle name to construct the prefix to verify
-    # against; without it nothing can be verified, so fail closed.
-    if not bundle_name:
+        resolved.add(name)
+    if bundle_name:
+        # An mcp__<server>__<tool> shorthand for a declared plugin server: <server>
+        # was resolved above by matching against the declared servers rather than
+        # splitting at the first __ (a server name may contain __), preferring the
+        # longest match, with a non-empty tool remainder required.
+        if shorthand is not None:
+            tool = name[len(f"mcp__{shorthand}__") :]
+            resolved.add(f"mcp__plugin_{bundle_name}_{shorthand}__{tool}")
+        # Already the effective plugin-namespaced form: verify it matches an
+        # expected prefix mcp__plugin_<bundle>_<server>__ for a declared server
+        # (non-empty tool remainder), exactly as validate.py asserts. NOT trusted
+        # verbatim -- a typo'd mcp__plugin_wrongbundle_wrongserver__tool would arm a
+        # literal the runtime never emits. A connector may legally be named `plugin`
+        # (RFC 1123 forbids `_` in a connector name, so the reverse cannot happen),
+        # and its mcp__plugin__<tool> lands here too: it adds nothing when no
+        # expected prefix matches, and the connector rule above already armed it.
+        if name.startswith("mcp__plugin_"):
+            bundle = bundle_name
+            matched = _longest_matching_server(
+                name, servers, lambda s: effective_tool_prefix(bundle, s)
+            )
+            if matched is not None:
+                resolved.add(name)
+    # An empty union means no rule verified this name: fail CLOSED with None rather
+    # than return an empty frozenset, which would read as "armed nothing".
+    if not resolved:
         return None
-    # Already the effective plugin-namespaced form: verify it matches an expected
-    # prefix mcp__plugin_<bundle>_<server>__ for a declared server (with a non-empty
-    # tool remainder), exactly as validate.py asserts. Do NOT trust it verbatim.
-    if name.startswith("mcp__plugin_"):
-        matched = _longest_matching_server(
-            name, servers, lambda s: effective_tool_prefix(bundle_name, s)
-        )
-        return frozenset({name}) if matched is not None else None
-    # An mcp__<server>__<tool> shorthand: <server> was resolved above by matching
-    # against the declared servers rather than splitting at the first __ (a server
-    # name may contain __), preferring the longest match; require a non-empty tool
-    # remainder.
-    if shorthand is None:
-        return None
-    tool = name[len(f"mcp__{shorthand}__") :]
-    return frozenset({f"mcp__plugin_{bundle_name}_{shorthand}__{tool}"})
+    return frozenset(resolved)
