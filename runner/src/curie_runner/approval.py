@@ -50,7 +50,7 @@ from plugin_format import (
     PluginManifest,
     connector_server_names,
     declared_mcp_server_names,
-    effective_operator_gate,
+    effective_operator_gates,
     grantable_routes,
     resolve_manifest,
 )
@@ -802,7 +802,7 @@ def build_approval_gate(
         name = raw_name.strip()
         if not name:
             continue
-        effective = effective_operator_gate(
+        effective = effective_operator_gates(
             bundle_name, mcp_servers, name, connector_servers=connector_servers
         )
         if effective is None:
@@ -813,10 +813,13 @@ def build_approval_gate(
                 " mcp__plugin_<bundle>_<server>__<tool> name (or, for a"
                 " connectors.yaml connector, mcp__<connector>__<tool>), or check the"
                 f" bundle declares that server (declared MCP servers: {mcp_servers},"
-                f" declared connectors: {connector_servers})"
+                f" declared connectors: {connector_servers}). A gate is also refused"
+                " when it is ambiguous -- a declared connector name and a declared MCP"
+                " server name collide, so the gate resolves to two different live tool"
+                " names with no principled winner; rename one of them"
             )
         # A bare (non-mcp__) name is armed VERBATIM as a built-in tool name,
-        # never rewritten or checked (#712): `effective_operator_gate` has no
+        # never rewritten or checked (#712): `effective_operator_gates` has no
         # way to tell a real built-in ("Bash") from an operator's mistaken bare
         # MCP tool name ("resolve_leak" meant as shorthand for an in-bundle MCP
         # tool). That second case silently arms a literal the SDK's
@@ -828,7 +831,7 @@ def build_approval_gate(
         # warn when the name isn't among the well-known Claude Code built-ins,
         # naming the mcp__<server>__<tool> form the operator likely meant.
         if (
-            effective == name
+            effective == frozenset({name})
             and not name.startswith("mcp__")
             and name not in _KNOWN_BUILTIN_TOOLS
         ):
@@ -842,7 +845,11 @@ def build_approval_gate(
                 mcp_servers,
                 name,
             )
-        normalized.append(effective)
+        # One gate name can resolve to MORE than one live tool name when a declared
+        # connector and a declared MCP server both match it and nothing says which
+        # hosts the tool (#1564). Arm every returned form: over-arming costs an
+        # extra approval card, under-arming is a silent fail-open.
+        normalized.extend(effective)
 
     operator = frozenset(normalized)
     redefined = sorted(operator & set(policy_routes))
