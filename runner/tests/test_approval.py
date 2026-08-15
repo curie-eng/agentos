@@ -2403,9 +2403,10 @@ _GIT_CONNECTORS = "connectors:\n  git:\n    image: ghcr.io/example/git-mcp:1.0.0
 def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None:
     """Connector `git` + plugin MCP server `git__hub`, gate mcp__git__hub__create_pr.
 
-    The MCP server is the more specific match, so the gate must arm the live
-    plugin-namespaced name and deny the real call. Arming the connector's bare
-    form instead arms a literal the SDK never emits.
+    Both declared servers match the one gate name and nothing says which hosts the
+    tool, so BOTH live forms are armed and either real call is denied. Arming only
+    the connector's bare form arms a literal the SDK never emits when the tool
+    lives on the plugin server.
     """
 
     root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
@@ -2424,9 +2425,54 @@ def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({live})
+        assert gate.required == frozenset({live, "mcp__git__hub__create_pr"})
         result = await build_can_use_tool(gate)(live, {"title": "..."}, ToolPermissionContext())
         assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_connector_tool_with_double_underscore_is_denied_alongside_its_plugin_twin(
+    tmp_path,
+) -> None:
+    """The fail-open a length tiebreak leaves behind, driven end to end.
+
+    Connector `deploy` exposes a tool named `prod__apply`, so
+    mcp__deploy__prod__apply is ALREADY the live name -- and MCP server
+    `deploy__prod` is merely the LONGER matched name. Preferring the longer match
+    rewrote the gate into mcp__plugin_acme-bot_deploy__prod__apply, which the SDK
+    never emits for the connector, and build_can_use_tool's exact-string match let
+    the real connector call run unapproved with nothing logged. Neither name's
+    length says which server hosts the tool, so both live forms must be armed and
+    both calls must be denied.
+    """
+
+    root = _connector_bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot"}),
+        "connectors:\n  deploy:\n    image: ghcr.io/example/deploy-mcp:1.0.0\n",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"deploy__prod": {"command": "deploy-server"}}}),
+        encoding="utf-8",
+    )
+    connector_live = "mcp__deploy__prod__apply"
+    plugin_live = "mcp__plugin_acme-bot_deploy__prod__apply"
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=[connector_live],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        callback = build_can_use_tool(gate)
+        for live in (connector_live, plugin_live):
+            result = await callback(live, {"env": "prod"}, ToolPermissionContext())
+            assert isinstance(result, PermissionResultDeny), live
 
     anyio.run(go)
 
