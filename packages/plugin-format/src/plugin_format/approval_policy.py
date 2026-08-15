@@ -17,8 +17,10 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
+import yaml
 from pydantic import ValidationError
 
+from .connectors import CONNECTORS_FILE, validate_connectors
 from .manifest import resolve_manifest
 from .models import ApprovalGate, McpConfig, PluginManifest
 
@@ -84,6 +86,25 @@ def effective_tool_prefix(bundle_name: str, server: str) -> str:
     """
 
     return f"mcp__plugin_{bundle_name}_{server}__"
+
+
+def connector_tool_prefix(server: str) -> str:
+    """The live tool-name prefix a ``connectors.yaml`` server produces (#1495).
+
+    A connector is NOT a plugin-loaded MCP server. The runner mounts it directly
+    on ``ClaudeAgentOptions.mcp_servers`` (``curie_runner.connectors``,
+    ADR-0086), on the same channel as Curie's own platform servers ``curie`` and
+    ``curie-state``, so the SDK names its tools ``mcp__<server>__<tool>`` with NO
+    ``plugin_<bundle>_`` infix -- exactly like
+    ``approval.APPROVAL_TOOL_NAME``. Giving connectors the plugin prefix would
+    arm a literal the runtime never produces: a gate that validates green and
+    silently never fires, the #453 fail-open shape.
+
+    One definition, shared by the deploy validator and the runtime loader, for
+    the same anti-drift reason as ``effective_tool_prefix``.
+    """
+
+    return f"mcp__{server}__"
 
 
 def _longest_matching_server(
@@ -179,8 +200,50 @@ def declared_mcp_server_names(root: str | Path) -> set[str] | None:
     return servers
 
 
+def connector_server_names(root: str | Path) -> set[str] | None:
+    """The MCP server names the bundle's ``connectors.yaml`` supplies, or ``None`` (#1495).
+
+    The THIRD source of a bundle's tool surface, alongside the manifest's inline
+    ``mcpServers`` and the root ``.mcp.json`` that ``declared_mcp_server_names``
+    reads. It is a separate function, not another branch of that one, because a
+    connector's live tool name is namespaced DIFFERENTLY
+    (``connector_tool_prefix``, no ``plugin_<bundle>_`` infix): folding the two
+    name sets together would build the wrong prefix for one of them.
+
+    Parsing goes through ``connectors.validate_connectors`` -- the same parser the
+    deploy validator and the runner's connector mount use -- so the names a gate
+    may be namespaced to are exactly the names Curie will mount.
+
+    ``None`` is the same poison value ``declared_mcp_server_names`` returns: a
+    ``connectors.yaml`` exists but could not be read or did not validate, so the
+    connector-server set is unknowable and a gate cross-check must fail closed
+    rather than assert against a partial set. ``_validate_connectors`` already
+    errors on that file, so the gate check stays silent rather than stacking a
+    second, misleading error. An empty set is the distinct fact that the bundle
+    declares no connectors.
+    """
+
+    path = Path(root) / CONNECTORS_FILE
+    if not path.is_file():
+        return set()
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    parsed, errors = validate_connectors(data)
+    if parsed is None or errors:
+        # A rejected connectors.yaml is never mounted, so its names are not a
+        # tool surface a gate may be namespaced to.
+        return None
+    return set(parsed.connectors)
+
+
 def effective_operator_gate(
-    bundle_name: str | None, servers: set[str] | None, name: str
+    bundle_name: str | None,
+    servers: set[str] | None,
+    name: str,
+    *,
+    connector_servers: set[str] | None,
 ) -> str | None:
     """Map an operator gate name to its effective runtime tool name (#703).
 
@@ -197,6 +260,11 @@ def effective_operator_gate(
       ``mcp__foo__bar__do`` as server ``foo``); the longest matching server name
       wins when one is a prefix of another. The effective prefix is built exactly
       as ``validate.py`` constructs ``expected_prefixes``;
+    - ``name`` verbatim for an ``mcp__<connector>__<tool>`` naming a connector the
+      bundle declares in ``connectors.yaml`` (#1495). A connector rides the SDK's
+      ``mcp_servers`` map directly, so that shorthand IS already the live runtime
+      name: it is verified against the declared connectors and returned unchanged,
+      never rewritten to the plugin form the runtime never produces;
     - ``name`` verbatim only for a built-in with no ``mcp__`` prefix (armed by raw
       name), OR for an already ``mcp__plugin_``-prefixed name that MATCHES an
       expected prefix ``mcp__plugin_<bundle>_<server>__`` for a declared server
@@ -205,9 +273,10 @@ def effective_operator_gate(
       (a typo'd ``mcp__plugin_wrongbundle_wrongserver__tool`` would arm a literal the
       runtime never matches, a fail-open);
     - ``None`` when ``name`` is ``mcp__``-shaped and cannot be verified against a
-      declared server: an undeclared server, no declared servers, ``servers is
-      None`` or a falsy ``bundle_name`` (cannot construct the prefix to verify), an
-      empty tool remainder, or an already-prefixed name matching no expected
+      declared server or connector: an undeclared server, no declared servers,
+      ``servers`` or ``connector_servers`` being ``None`` (unknowable), a falsy
+      ``bundle_name`` (cannot construct the plugin prefix to verify), an empty tool
+      remainder, or an already-prefixed name matching no expected
       prefix. The operator override is never deploy-validated, so this runtime
       check is its sole defense -- "cannot verify" fails CLOSED, not through. The
       caller fails closed on ``None``.
@@ -217,11 +286,22 @@ def effective_operator_gate(
     # name, never rewritten and never server-checked.
     if not name.startswith("mcp__"):
         return name
-    # Every mcp__-shaped name is verified against the declared-server set. Without
-    # it (unreadable declaration, or no bundle name to build the prefix) nothing can
-    # be verified, so fail closed -- this runtime check is the operator override's
-    # only defense.
-    if servers is None or not bundle_name:
+    # Every mcp__-shaped name is verified against the declared-server sets. Without
+    # them (an unreadable MCP or connectors declaration) nothing can be verified, so
+    # fail closed -- this runtime check is the operator override's only defense.
+    if servers is None or connector_servers is None:
+        return None
+    # A connectors.yaml server is mounted straight onto the SDK's mcp_servers map
+    # (ADR-0086), so mcp__<connector>__<tool> is ALREADY the live runtime name.
+    # Checked BEFORE the plugin branch: a connector may legally be named `plugin`,
+    # and its mcp__plugin__<tool> would otherwise fall into the plugin branch and be
+    # rejected. The reverse cannot happen -- a connector name is an RFC 1123 label,
+    # so it never contains the `_` that mcp__plugin_<bundle>_<server>__ requires.
+    if _longest_matching_server(name, connector_servers, connector_tool_prefix) is not None:
+        return name
+    # The plugin form needs the bundle name to construct the prefix to verify
+    # against; without it nothing can be verified, so fail closed.
+    if not bundle_name:
         return None
     # Already the effective plugin-namespaced form: verify it matches an expected
     # prefix mcp__plugin_<bundle>_<server>__ for a declared server (with a non-empty

@@ -2010,6 +2010,7 @@ def test_operator_shorthand_gate_denies_the_effective_runtime_name() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert gate is not None
         callback = build_can_use_tool(gate)
@@ -2062,6 +2063,7 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert builtin is not None
         assert isinstance(
@@ -2077,6 +2079,7 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert effective is not None
         assert isinstance(
@@ -2274,4 +2277,112 @@ def test_already_prefixed_operator_gate_naming_wrong_bundle_fails_closed() -> No
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+        )
+
+
+# --- connectors.yaml tools are gateable end to end (#1495) ----------------------
+#
+# A connector rides ClaudeAgentOptions.mcp_servers (curie_runner.connectors), so
+# the SDK hands can_use_tool the bare mcp__<connector>__<tool>. The gate must arm
+# that exact literal: rewriting it to the plugin form would arm a name the SDK
+# never produces and the call would run unapproved.
+
+_K8S_TOOL = "mcp__kubernetes-admin__resources_create_or_update"
+
+
+def _connector_bundle(tmp_path, manifest: str, connectors: str) -> str:
+    plugin = tmp_path / ".claude-plugin"
+    plugin.mkdir(exist_ok=True)
+    (plugin / "plugin.json").write_text(manifest, encoding="utf-8")
+    (tmp_path / "connectors.yaml").write_text(connectors, encoding="utf-8")
+    return str(tmp_path)
+
+
+_K8S_CONNECTORS = "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n"
+
+
+def test_resolution_carries_connector_server_names(tmp_path) -> None:
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+    resolution = resolve_approval_policy(root)
+    assert resolution.connector_servers == {"kubernetes-admin"}
+
+
+def test_manifest_gate_on_a_connector_tool_denies_the_live_call(tmp_path) -> None:
+    """The end-to-end property: a manifest gate naming a connector tool blocks it.
+
+    Driven through the public can_use_tool callback with the exact name the SDK
+    emits for a directly-mounted server, not a set-membership peek.
+    """
+
+    root = _connector_bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "sre-bot",
+                "approvalPolicy": {"gates": [{"gate": _K8S_TOOL, "route": "sre-oncall"}]},
+            }
+        ),
+        _K8S_CONNECTORS,
+    )
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=None,
+            policy_routes=resolution.route_by_tool,
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+        # And the blocked call carries the manifest route to the approving audience.
+        assert gate.route_by_tool[_K8S_TOOL] == "sre-oncall"
+
+    anyio.run(go)
+
+
+def test_operator_gate_on_a_connector_tool_arms_the_bare_name(tmp_path) -> None:
+    """The operator env-knob half: armed VERBATIM, never plugin-prefixed.
+
+    Before #1495 this raised ApprovalPolicyError (the connector is not a declared
+    MCP server), so an operator could not gate a connector tool at all. Rewriting
+    it to mcp__plugin_<bundle>_<connector>__<tool> would be worse: the gate would
+    arm green and the live call would sail through.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=[_K8S_TOOL],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({_K8S_TOOL})
+        result = await build_can_use_tool(gate)(
+            _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_operator_gate_naming_an_undeclared_connector_still_fails_closed(tmp_path) -> None:
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+    resolution = resolve_approval_policy(root)
+    with pytest.raises(ApprovalPolicyError):
+        build_approval_gate(
+            operator_tools=["mcp__ghost__do_it"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
         )

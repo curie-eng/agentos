@@ -735,3 +735,107 @@ def test_confusable_key_alongside_allowed_tools_validates_clean(tmp_path: Path, 
 
     result = validate_bundle(bundle)
     assert result.valid, result.errors
+
+
+# --- a gate may name a connectors.yaml connector's tool (#1495) -----------------
+#
+# A bundle that declares its tool surface through connectors.yaml has no
+# mcpServers and no .mcp.json, so before #1495 the accepted-name set was empty and
+# EVERY gate it could write was rejected as not-namespaced: a connector tool could
+# not be gated at all. The connector's live name is the bare
+# mcp__<connector>__<tool> (it rides ClaudeAgentOptions.mcp_servers, not the plugin
+# loader), so that -- and NOT the plugin form -- is what validates.
+
+
+def _write_connectors(bundle: Path, text: str) -> Path:
+    path = bundle / "connectors.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_gate_naming_a_connectors_yaml_server_passes(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "mcp__kubernetes-admin__resources_create_or_update", '
+        '"route": "sre-oncall"}]}}',
+    )
+    _write_connectors(
+        bundle,
+        "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n",
+    )
+
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_connector_gate_in_the_plugin_form_is_rejected(tmp_path: Path) -> None:
+    # The inverse of the case above, and the reason the two sources cannot share
+    # one prefix: a connector is NOT plugin-namespaced at runtime, so the plugin
+    # form arms a literal the SDK never produces -- green deploy, silent no-op.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "mcp__plugin_demo_kubernetes-admin__resources_create_or_update", '
+        '"route": "sre-oncall"}]}}',
+    )
+    _write_connectors(
+        bundle,
+        "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n",
+    )
+
+    assert _GATE_CODE in _codes(bundle)
+
+
+def test_gate_naming_an_undeclared_connector_is_still_rejected(tmp_path: Path) -> None:
+    # The new source widens the accepted set, it does not open it: a server named
+    # by neither connectors.yaml nor the MCP config is still not namespaced.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "mcp__ghost__resources_create_or_update", "route": "sre-oncall"}]}}',
+    )
+    _write_connectors(
+        bundle,
+        "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n",
+    )
+
+    result = validate_bundle(bundle)
+    assert not result.valid
+    messages = _gate_errors(bundle)
+    assert len(messages) == 1, result.errors
+    # Actionable: it names the connector form the author should have used.
+    assert "mcp__kubernetes-admin__<tool>" in messages[0]
+
+
+def test_both_surfaces_each_validate_under_their_own_prefix(tmp_path: Path) -> None:
+    # A bundle with an MCP server AND a connector: each gate must use ITS source's
+    # namespacing rule, and crossing them fails.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "mcpServers": {"crm": {"command": "crm-server"}}, '
+        '"approvalPolicy": {"gates": ['
+        '{"gate": "mcp__plugin_demo_crm__send_contract", "route": "legal"}, '
+        '{"gate": "mcp__grafana__query", "route": "sre-oncall"}]}}',
+    )
+    _write_connectors(bundle, "connectors:\n  grafana:\n    url: https://mcp.internal/mcp\n")
+
+    result = validate_bundle(bundle)
+    assert result.valid, result.errors
+
+
+def test_gate_check_stays_silent_when_connectors_yaml_is_unreadable(tmp_path: Path) -> None:
+    # An unparseable connectors.yaml makes the accepted set unknowable. The file
+    # error already fires; the gate check must not stack a second, misleading error
+    # telling the author their correct gate names an undeclared server.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "approvalPolicy": {"gates": ['
+        '{"gate": "mcp__kubernetes-admin__resources_create_or_update", '
+        '"route": "sre-oncall"}]}}',
+    )
+    _write_connectors(bundle, "connectors: [oops\n")
+
+    codes = _codes(bundle)
+    assert "connectors.unreadable" in codes
+    assert _GATE_CODE not in codes

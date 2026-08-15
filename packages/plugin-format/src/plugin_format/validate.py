@@ -13,8 +13,14 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from .approval_policy import declared_mcp_server_names, effective_tool_prefix, grantable_routes
-from .connectors import ConnectorsFile, validate_connectors
+from .approval_policy import (
+    connector_server_names,
+    connector_tool_prefix,
+    declared_mcp_server_names,
+    effective_tool_prefix,
+    grantable_routes,
+)
+from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from .deploy_targets import validate_deploy_targets
 from .manifest import resolve_manifest
 from .models import (
@@ -80,7 +86,7 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         mcp_servers = _validate_mcp(root, manifest, c)
         _validate_hooks(root, manifest, c)
         _validate_triggers(manifest, c)
-        _validate_approval_policy(manifest, mcp_servers, c)
+        _validate_approval_policy(manifest, mcp_servers, connector_server_names(root), c)
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)
@@ -89,7 +95,6 @@ def validate_bundle(path: str | Path) -> ValidationResult:
     return c.result()
 
 
-CONNECTORS_FILE = "connectors.yaml"
 DEPLOY_FILE = "deploy.yaml"
 
 
@@ -425,7 +430,10 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
 
 
 def _validate_approval_policy(
-    manifest: PluginManifest, mcp_servers: set[str] | None, c: _Collector
+    manifest: PluginManifest,
+    mcp_servers: set[str] | None,
+    connector_servers: set[str] | None,
+    c: _Collector,
 ) -> None:
     """Validate the manifest ``approvalPolicy`` declaration (deploy-time, #273).
 
@@ -441,6 +449,17 @@ def _validate_approval_policy(
     reject it here. ``None`` means the MCP declaration could not be read, so the
     cross-check stays silent rather than stacking a misleading error on top of the
     MCP error that already fired.
+
+    ``connector_servers`` is the ``connectors.yaml`` half of the same tool surface
+    (#1495). A connector is mounted on the SDK's ``mcp_servers`` map rather than
+    loaded as a plugin, so its live tool name is ``mcp__<connector>__<tool>`` with
+    NO ``plugin_<bundle>_`` infix -- a DIFFERENT namespacing rule, which is why the
+    two sets stay separate and each builds its own prefix
+    (``connector_tool_prefix`` vs ``effective_tool_prefix``). Without this source a
+    bundle that declares its whole tool surface through ``connectors.yaml`` has an
+    empty accepted set, so every gate it could write is rejected here and no
+    connector tool can be gated at all. ``None`` carries the same
+    read-it-or-stay-silent meaning as ``mcp_servers``.
     """
 
     declared = manifest.approvalPolicy
@@ -465,9 +484,15 @@ def _validate_approval_policy(
     # parsing the gate to extract a server name: a bundle name cannot contain '_'
     # (_NAME_RE) but a server key can, so parsing mcp__plugin_a_b_c__t is
     # ambiguous. Constructing and testing startswith sidesteps that entirely.
+    # Each source contributes its OWN prefix form: a plugin-loaded server gets
+    # mcp__plugin_<bundle>_<server>__, a connectors.yaml server gets the bare
+    # mcp__<connector>__ the SDK produces for a directly-mounted server (#1495).
+    # A single unreadable source makes the accepted set unknowable, so either
+    # being None suppresses the check rather than asserting against half of it.
     expected_prefixes: set[str] | None = (
         {effective_tool_prefix(manifest.name, s) for s in mcp_servers}
-        if mcp_servers is not None
+        | {connector_tool_prefix(s) for s in connector_servers}
+        if mcp_servers is not None and connector_servers is not None
         else None
     )
 
@@ -499,7 +524,12 @@ def _validate_approval_policy(
         ):
             c.error(
                 "approval_policy.gate_not_namespaced",
-                _gate_not_namespaced_message(stripped_gate, manifest.name, mcp_servers or set()),
+                _gate_not_namespaced_message(
+                    stripped_gate,
+                    manifest.name,
+                    mcp_servers or set(),
+                    connector_servers or set(),
+                ),
                 loc,
             )
 
@@ -520,18 +550,25 @@ def _validate_approval_policy(
         )
 
 
-def _gate_not_namespaced_message(gate: str, bundle: str, mcp_servers: set[str]) -> str:
+def _gate_not_namespaced_message(
+    gate: str, bundle: str, mcp_servers: set[str], connector_servers: set[str]
+) -> str:
     """Actionable message for a gate whose mcp__ name is not a live tool name."""
 
-    if mcp_servers:
-        declared = "Expected one of: " + ", ".join(
-            sorted(f"{effective_tool_prefix(bundle, s)}<tool>" for s in mcp_servers)
-        )
+    expected = sorted(
+        [f"{effective_tool_prefix(bundle, s)}<tool>" for s in mcp_servers]
+        + [f"{connector_tool_prefix(s)}<tool>" for s in connector_servers]
+    )
+    if expected:
+        declared = "Expected one of: " + ", ".join(expected)
     else:
-        declared = "This bundle declares no MCP servers"
+        declared = f"This bundle declares no MCP servers and no {CONNECTORS_FILE} connectors"
     return (
         f"approval gate {gate!r} is not a live MCP tool name. A bundle-declared "
-        f"MCP tool's live name is mcp__plugin_{bundle}_<server>__<tool>. "
+        f"MCP tool's live name is mcp__plugin_{bundle}_<server>__<tool>. A "
+        f"{CONNECTORS_FILE} connector is mounted directly instead of loaded as a "
+        "plugin, so ITS live name is mcp__<connector>__<tool>, with no "
+        f"plugin_{bundle}_ infix. "
         f"{declared}. A built-in tool gate (e.g. Bash) carries no mcp__ prefix. "
         "A MANIFEST approvalPolicy gate must be the fully-namespaced live name "
         "(this deploy gate does not normalize it). The per-agent "
