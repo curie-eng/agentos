@@ -33,8 +33,10 @@ helper scripts. Repository instructions and available tools are authoritative.
 
 1. Read the ticket and its linked requirements. Do not infer scope from an ID alone.
 2. Read the repository instructions and the relevant architecture or component docs.
-3. Check for an existing branch or worktree for the ticket. Otherwise select the
-   target release train before creating work:
+3. Check for an existing branch or worktree for the ticket. If one exists, read
+   `.projects/plans/<branch-name>.state.json` inside it and resume from the stage
+   it records rather than repeating finished work. See Run state below. Otherwise
+   select the target release train before creating work:
 
    | Work | Base and PR target |
    | --- | --- |
@@ -52,6 +54,35 @@ helper scripts. Repository instructions and available tools are authoritative.
    the target clear, stop and ask.
 4. Run the focused existing tests, type checks, and lint for the affected area. Stop
    on a relevant baseline failure. Record unrelated failures without widening scope.
+
+## Run state
+
+Keep a small state file inside the worktree at
+`.projects/plans/<branch-name>.state.json`, beside the plan when there is one.
+`.projects/` is git ignored, so it never reaches a commit.
+
+```json
+{
+  "branch": "task/short-description",
+  "ticket": "<id or null>",
+  "path": "direct | quick | build",
+  "stage": "setup | triage | plan | de risk | build | review | done check | finish",
+  "status": "in progress | blocked | done",
+  "open_findings": ["<review finding not yet fixed>"],
+  "updated": "<ISO8601 UTC>"
+}
+```
+
+Update it at each stage boundary, including `open_findings` as reviews produce
+findings and fixes clear them. A run gets interrupted: a session ends, a context
+fills, a day passes. Without this file the next run either repeats finished stages
+or skips an unfinished one, and outstanding findings that lived only in a lost
+context are lost with it. A direct path change finishes with nothing to resume, so
+the file is optional there.
+
+When a blocker or an unresolvable ambiguity appears after triage, set `status` to
+blocked, record the open question, surface it, and stop. The resume check in Setup
+picks the run up from there.
 
 ## Triage
 
@@ -86,6 +117,18 @@ For a build path, write a short plan that identifies behavior sites, affected fi
 test strategy, edge cases, and observable done conditions before implementation.
 Have an independent available provider review the plan when the change is
 architectural or crosses a contract boundary.
+
+## Context discipline
+
+Where the environment supports delegation, every brief tells its agent to return
+under about three hundred words and to write anything longer to a file and return
+the path. An agent's report stays in the caller's context and is re read on every
+later turn, so a long report is paid for again on each one. This governs where
+output goes and never what an agent checks or builds.
+
+The same rule binds the caller. Send test suite output, diffs, reviews, and log
+sweeps to a file and read back a count or a tail. Do not read a large artifact into
+the caller's own context in order to check it.
 
 ## De risk gate
 
@@ -139,6 +182,14 @@ Every behavior changing change receives a code review and a scope review after t
 affected tests pass. Reviewers are read only. Route findings back to the executor,
 then rerun the relevant checks.
 
+Each reviewer writes its full findings to
+`.projects/plans/<branch-name>.findings.<reviewer>.md` and returns only a routing
+index: how many findings, in which areas, touching which files. Fixes read the
+detail back out of that file. A review is not complete until its findings file
+exists, and that holds when the count is zero. A review whose only record is the
+claim that it passed leaves nothing to check, and a skipped review looks exactly
+the same from the outside.
+
 Add a security review for authorization, secrets, payments, personally identifiable
 information, or tenant boundaries. Verify user facing, deployment, runtime, chart,
 or integration changes through the real affected surface. Static checks alone do not
@@ -147,6 +198,19 @@ prove a runtime acceptance criterion.
 Before completion, run the full affected test suite plus the relevant type check and
 lint. Check sibling paths when the change touches a known seam or guard. Demonstrate
 that a new or modified guard rejects violating input through its real consumer path.
+
+## Stop and escalate
+
+Hand the decision back rather than pressing on when reviews cannot converge after
+three rounds, when implementation reveals an approach the plan did not cover, when
+real surface verification shows the shape is wrong, or when a choice needs
+authority the ticket does not carry.
+
+Stop for the same reason when the run itself stops converging: repeated fix and
+review rounds without the review stage closing, an agent or a spawn count far past
+what the change warrants, or a context that keeps hitting its limit. A run that
+reports it is not converging is a successful outcome; a run that keeps spending is
+not. Neither stop ever skips a review or weakens a gate.
 
 ## Finish
 
