@@ -32,6 +32,7 @@ manifest_for() {
 render default
 render existing --set langfuse.existingSecret='my-langfuse'
 render override --set langfuse.existingSecret='my-langfuse' --set otelCollector.otlpAuthHeader='Basic YXNzZXJ0OmFzc2VydA=='
+render selfnamed --set langfuse.existingSecret='curie-secrets'
 
 python3 - \
   "$(manifest_for "$TMP/default" otel-collector.yaml)" \
@@ -39,7 +40,9 @@ python3 - \
   "$(manifest_for "$TMP/existing" otel-collector.yaml)" \
   "$(manifest_for "$TMP/existing" secrets.yaml)" \
   "$(manifest_for "$TMP/override" otel-collector.yaml)" \
-  "$(manifest_for "$TMP/override" secrets.yaml)" <<'PY'
+  "$(manifest_for "$TMP/override" secrets.yaml)" \
+  "$(manifest_for "$TMP/selfnamed" otel-collector.yaml)" \
+  "$(manifest_for "$TMP/selfnamed" secrets.yaml)" <<'PY'
 import base64
 import sys
 
@@ -89,6 +92,8 @@ existing_ref = collector_secret_ref(sys.argv[3])
 _, existing_secret = secret_entries(sys.argv[4])
 override_ref = collector_secret_ref(sys.argv[5])
 _, override_secret = secret_entries(sys.argv[6])
+selfnamed_ref = collector_secret_ref(sys.argv[7])
+_, selfnamed_secret = secret_entries(sys.argv[8])
 
 # T1: the default render keeps reading the chart-managed Secret, which carries
 # the header derived from the langfuse.init keys.
@@ -138,6 +143,26 @@ assert override_secret.get("otlpAuthHeader") == OVERRIDE_HEADER, (
     "T3: the chart-managed Secret must carry the otelCollector.otlpAuthHeader override verbatim "
     f"({OVERRIDE_HEADER!r}), got {override_secret.get('otlpAuthHeader')!r}"
 )
+
+# T6: langfuse.existingSecret may name the chart's own Secret. Then the Secret
+# the collector reads IS the chart-managed one, so the key must be emitted and
+# carry a real header. The secretKeyRef and the emission condition are the same
+# decision, and they must not disagree (issue #1563).
+assert selfnamed_ref["name"] == "curie-secrets", (
+    "T6: with langfuse.existingSecret=curie-secrets the collector must read the chart-managed "
+    f"Secret curie-secrets, but secretKeyRef.name is {selfnamed_ref['name']!r}"
+)
+assert "otlpAuthHeader" in selfnamed_secret, (
+    "T6: the collector's secretKeyRef resolves to the chart-managed Secret curie-secrets, but "
+    "that Secret omits the otlpAuthHeader key. The secretKeyRef site and the secrets.yaml "
+    "emission condition disagree about which Secret carries the header, so the collector pod "
+    "would enter CreateContainerConfigError"
+)
+assert selfnamed_secret["otlpAuthHeader"], (
+    "T6: the chart-managed Secret is the one the collector reads, so its otlpAuthHeader must be "
+    "non-empty, but it is empty. The collector would start with an empty Authorization header "
+    "and 401 to Langfuse in silence"
+)
 PY
 
 gate_rc() {
@@ -162,5 +187,20 @@ grep -qF 'langfuse.init.projectSecretKey' "$TMP/dev-defaults.stderr" || fail "T5
 
 rc="$(gate_rc existing-secret --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse')"
 [[ "$rc" == "0" ]] || fail "T5: security.checkDefaultCredentials=true with langfuse.existingSecret set and no dev header override must still render. The langfuse.init credential checks must stay exempt on the BYO Secret path. stderr was: $(cat "$TMP/existing-secret.stderr")"
+
+# T7: reach the userPassword check. T5 renders with both published defaults, so
+# projectSecretKey fails first and that check is never exercised; overriding
+# projectSecretKey is what makes this assertion pin the second one.
+rc="$(gate_rc dev-password --set security.checkDefaultCredentials=true --set langfuse.init.projectSecretKey=sk-owned)"
+[[ "$rc" != "0" ]] || fail "T7: security.checkDefaultCredentials=true rendered successfully with langfuse.init.userPassword still the published dev default curie-dev-password, which allows Langfuse admin takeover on a reachable UI"
+grep -qF 'langfuse.init.userPassword' "$TMP/dev-password.stderr" || fail "T7: the render failed but its message never names langfuse.init.userPassword. stderr was: $(cat "$TMP/dev-password.stderr")"
+
+# T8: the same dev credential written without base64 padding is still accepted
+# by the receiver, so an exact-string gate that only matches the padded literal
+# leaves the hole open. langfuse.existingSecret is set for the same reason as in
+# T4, so the failure can only come from the otlpAuthHeader check.
+rc="$(gate_rc dev-header-unpadded --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set otelCollector.otlpAuthHeader='Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg')"
+[[ "$rc" != "0" ]] || fail "T8: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential with the base64 padding stripped. That header decodes to pk-lf-curie-dev:sk-lf-curie-dev and Langfuse accepts it, so dropping two '=' characters defeats the gate"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-unpadded.stderr" || fail "T8: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-unpadded.stderr")"
 
 echo "Collector follows langfuse.existingSecret, the chart Secret ships no stale dev header, the override still wins, and the default-credential gate refuses the published dev header: OK"
