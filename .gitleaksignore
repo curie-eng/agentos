@@ -28,3 +28,23 @@ be962e4a37f8644539244e2e872937f2fd8371a0:AGENTS.md:curl-auth-user:105
 # allowlisted here. The lines on main carry inline gitleaks:allow markers.
 c8b1ccb28faa51d3ec996d60883fde48a303b0bd:AGENTS.md:curl-auth-user:154
 c8b1ccb28faa51d3ec996d60883fde48a303b0bd:docs/adr/0079-inbound-triggers-as-a-new-event-kind.md:generic-api-key:46
+
+# UI mockup placeholder provider keys, from the pre-rename prototype. Both files
+# (apps/ui/src/views/Settings.tsx, AgentOS.html) are gone from the tree; the
+# value sat in a hardcoded PROVIDERS array beside an equally fake
+# sk-ant-api03-... placeholder, and carries 25 characters where a real
+# OpenRouter key carries 64 hex. Ignored by FINGERPRINT, not by value, so the
+# same string in any new commit still fails the gate.
+0ae07c486bfc5684217d38766bf8e363aa6a2b09:AgentOS.html:generic-api-key:180
+2a40c46f44ae3b93678cd129d4776f65dde9d780:apps/ui/src/views/Settings.tsx:generic-api-key:15
+
+# The documented Langfuse dev-default bootstrap keys, in their pre-rename
+# (agentos) spelling. The curie-named equivalents are already registered above.
+ab80948feb8fee545ac7a755d8242904f9b031d3:CLAUDE.md:curl-auth-user:75
+
+# A TypeScript struct field naming a p95 latency metric, not a credential -- the
+# same line as the two RealMetrics.tsx entries already registered at the top of
+# this file. Described rather than quoted: writing the literal out here trips the
+# generic-api-key rule inside this file, which .gitleaks.toml exempts for itself
+# but not for this one.
+de945b33ecb0930990c5af669c52d26b6fa2cfd3:apps/ui/src/views/obs/RealMetrics.tsx:generic-api-key:11
