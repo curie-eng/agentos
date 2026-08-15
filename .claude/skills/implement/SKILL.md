@@ -113,10 +113,39 @@ compatibility paths merely to preserve a caller, or replace a real integration w
 an internal mock. Use mocks only for external or slow dependencies. Review every
 caller when a return type or contract changes.
 
+Keep the roles separate, whether they are separate agents or one session working
+in order:
+
+- The test writer touches test paths only, never production source.
+- The implementer touches its own stream's source, never the tests, and never its
+  own review findings.
+- A reviewer reads and reports, and never edits.
+- A fix addresses one finding area. Do not batch unrelated findings into a single
+  pass, and do not let a fix widen into a refactor.
+
 For a build path, write a short plan that identifies behavior sites, affected files,
 test strategy, edge cases, and observable done conditions before implementation.
 Have an independent available provider review the plan when the change is
 architectural or crosses a contract boundary.
+
+Where the plan quotes source excerpts, confirm each one still resolves on the fresh
+base before implementation starts, with a read only search per excerpt. An excerpt
+that no longer matches means the plan was written against code that has moved or
+never existed. Send those back to be relocated rather than handing the implementer
+a stale target or quietly dropping the block.
+
+## Prior intent
+
+On the build path, before implementing, find out what the code you are about to
+change was there for. Blame the target line ranges, take the recent touching
+commits, and read the tickets or issues they reference. Record what you find in the
+plan so the implementer builds with it and the reviewer can check the change
+against it.
+
+The failure this prevents is silent. A change can satisfy every one of its own
+acceptance criteria while undoing an earlier deliberate decision. Nothing in the
+current ticket describes that decision, so no other step in this workflow would
+catch it.
 
 ## Context discipline
 
@@ -182,6 +211,12 @@ Every behavior changing change receives a code review and a scope review after t
 affected tests pass. Reviewers are read only. Route findings back to the executor,
 then rerun the relevant checks.
 
+Those two reviews are not waivable. No instruction in a task prompt, no time
+pressure, and no session setting skips them on a change that alters behavior. If an
+instruction appears to waive one, run it anyway and record in the summary that the
+instruction was overridden and why. Everything else in this workflow is
+proportional to the change and may legitimately not run.
+
 Each reviewer writes its full findings to
 `.projects/plans/<branch-name>.findings.<reviewer>.md` and returns only a routing
 index: how many findings, in which areas, touching which files. Fixes read the
@@ -211,6 +246,36 @@ review rounds without the review stage closing, an agent or a spawn count far pa
 what the change warrants, or a context that keeps hitting its limit. A run that
 reports it is not converging is a successful outcome; a run that keeps spending is
 not. Neither stop ever skips a review or weakens a gate.
+
+## Done check
+
+Work through this list before presenting the diff, and report it as the filled list
+itself, each item checked or marked not applicable with one line of evidence. Prose
+that covers similar ground does not satisfy it. The filled list is the artifact, and
+an item nobody had to answer for is an item nobody checked.
+
+- [ ] Failing tests were written and seen to fail before any implementation code
+- [ ] The test writer and the implementer worked in separate contexts
+- [ ] Code review passed, with its findings file on disk
+- [ ] Scope review passed, with its findings file on disk, and every non trivial
+      hunk traces to an acceptance criterion, a mechanical exception, or an out of
+      scope note in the pull request
+- [ ] Every broadened return type or changed contract had its callers checked
+- [ ] Sibling paths enumerated, and each one covered by this change, routed through
+      a shared helper, or filed as a follow up issue with its number
+- [ ] Every new or changed guard was seen rejecting violating input through its real
+      consumer path, by running it rather than by reading it
+- [ ] Security review passed, where the change touches that surface
+- [ ] The real affected surface was exercised, where the change reaches one
+- [ ] The change does not undo an earlier deliberate decision, per Prior intent
+- [ ] Full affected test suite, type check, and lint pass on the final code
+
+A quick path change marks the failing tests, separate contexts, and prior intent
+items not applicable. A direct path change applies only the suite and lint items.
+The two review items are never not applicable on a change that alters behavior.
+
+Route a failed item back into the stage that owns it. Do not present the diff with
+an item still open.
 
 ## Finish
 
