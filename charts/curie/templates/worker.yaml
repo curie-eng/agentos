@@ -104,6 +104,7 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       {{- if .Values.worker.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-worker
       {{- end }}

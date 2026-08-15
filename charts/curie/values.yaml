@@ -760,6 +760,7 @@ dispatcher:
 worker:
   deploy: true
   replicas: 1
+  terminationGracePeriodSeconds: 1800
   image:
     repository: ghcr.io/curie-eng/curie-worker
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
