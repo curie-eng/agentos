@@ -114,6 +114,16 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      # Prove the collector's Langfuse credential and the Secret that carries it
+      # stay the same decision (issue #1563): under `langfuse.existingSecret` the
+      # collector follows the operator's Secret, the chart-managed Secret ships no
+      # stale dev-derived header for it to read, and the default-credential gate
+      # refuses the published dev header on that path instead of going green.
+      - name: helm render assertions (collector langfuse secret wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
+
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
       # and the pods actually start on an enforcing cluster.
