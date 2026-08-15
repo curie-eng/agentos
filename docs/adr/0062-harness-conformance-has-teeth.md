@@ -2,7 +2,19 @@
 
 Date: 2026-07-21
 
-Status: Draft
+Status: Accepted
+
+Realized by the import-linter contracts in `pyproject.toml`, run as
+`uv run lint-imports` in `.github/workflows/ci.yaml`, so a forbidden import fails
+the build rather than being caught in review.
+
+Two of the three contracts this ADR asks for are live. The third, decision 1's
+full ban on importing `claude_agent_sdk` anywhere outside the Claude harness
+package, cannot pass yet: nine `curie_runner` modules still import it directly,
+and confining them is the refactor that decision 2 depends on. The two contracts
+that are live gate the boundaries already clean, so they cannot rot back before
+that lands. Acceptance records the decision; the third contract is added when the
+refactor does.
 
 Follows [ADR-0060](0060-the-harness-is-a-declared-package.md) (a harness is a
 declared package) and [ADR-0061](0061-out-of-process-harness-boundary.md) (the
