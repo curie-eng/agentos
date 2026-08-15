@@ -7,12 +7,18 @@
 #
 #   1. A SEALED render (security.allowDevDefaults defaults false, `lookup` empty
 #      offline under `helm template`) GENERATES a strong random value for each of
-#      the nine chart-owned secret keys instead of shipping the published dev
-#      default. The generated langfuseEncryptionKey is 64 lowercase-hex chars.
+#      the eleven chart-owned secret keys instead of shipping the published dev
+#      default. The generated langfuseEncryptionKey is 64 lowercase-hex chars,
+#      and the two Langfuse init credentials are 32 alphanumeric chars.
 #   2. The DEV overlay (values-dev.yaml sets allowDevDefaults=true) keeps the
 #      deterministic published defaults, so the dev/e2e path renders unchanged.
 #   3. An explicit `--set` override that differs from the published default is
 #      honored on the sealed path (override wins over generation).
+#   4. The OTel Basic auth header uses the resolved Langfuse project secret
+#      unless the operator supplies an explicit header override.
+#
+# Issue #1569 extends this contract to the two Langfuse init credentials and
+# adds an executed negative control for their published values.
 #
 # Issue #488 (freeze the boot env in the contract), Assertions 6-7. The Helm
 # template cannot import the frozen contract crate, so its hand-typed boot-env
@@ -36,7 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$CHART/../.." && pwd)"
 
-# The nine chart-owned secret keys, each with its published dev default.
+# The eleven chart-owned secret keys, each with its published dev default.
 KEYS=(
   postgresPassword
   valkeyPassword
@@ -45,6 +51,8 @@ KEYS=(
   langfuseSalt
   langfuseEncryptionKey
   langfuseNextauthSecret
+  langfuseInitProjectSecretKey
+  langfuseInitUserPassword
   apiKey
   githubWebhookSecret
 )
@@ -56,6 +64,8 @@ declare -A DEFAULTS=(
   [langfuseSalt]="dev-salt-change-me"
   [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
   [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
+  [langfuseInitProjectSecretKey]="sk-lf-curie-dev"
+  [langfuseInitUserPassword]="curie-dev-password"
   [apiKey]="curie-dev-key"
   [githubWebhookSecret]="dev-webhook-secret"
 )
@@ -92,14 +102,43 @@ fail() {
   exit 1
 }
 
-echo "=== Assertion 1: sealed render GENERATES (no published default) ==="
-for key in "${KEYS[@]}"; do
-  val="$(read_key "$SEALED" "$key")"
+check_generated_key() {
+  # $1 = rendered Secret, $2 = key, $3 = render label
+  local out="$1" key="$2" label="$3" val def
+  val="$(read_key "$out" "$key")"
   def="${DEFAULTS[$key]}"
   if [[ "$val" == "$def" ]]; then
-    fail "sealed render still emits the published dev default for '$key' (value == '$def'); expected a generated value."
+    echo "$label still emits the published dev default for '$key' (value == '$def'); expected a generated value." >&2
+    return 1
   fi
   echo "  ok: $key was generated (not the published default)"
+}
+
+echo "=== Assertion 1: sealed render GENERATES (no published default) ==="
+for key in "${KEYS[@]}"; do
+  check_generated_key "$SEALED" "$key" "sealed render" \
+    || fail "sealed render did not generate '$key'; see the message above."
+done
+
+echo "=== Assertion 1 negative control: published Langfuse init values FAIL the sealed detector ==="
+for key in langfuseInitProjectSecretKey langfuseInitUserPassword; do
+  negative_output=""
+  if negative_output="$(check_generated_key "$DEV" "$key" "development negative control" 2>&1)"; then
+    fail "negative control did not fire: published '$key' passed the sealed generation detector."
+  fi
+  if [[ "$negative_output" != *"published dev default for '$key'"* ]]; then
+    fail "negative control for '$key' failed for an unexpected reason: $negative_output"
+  fi
+  echo "  ok: published $key is rejected (the detector can fail)"
+done
+
+echo "=== Assertion 1: sealed Langfuse init credentials are 32 alphanumeric chars ==="
+for key in langfuseInitProjectSecretKey langfuseInitUserPassword; do
+  val="$(read_key "$SEALED" "$key")"
+  if [[ ! "$val" =~ ^[[:alnum:]]{32}$ ]]; then
+    fail "sealed $key must match ^[[:alnum:]]{32}$; got '${val}' (length ${#val})."
+  fi
+  echo "  ok: $key is 32 alphanumeric chars"
 done
 
 echo "=== Assertion 2: sealed langfuseEncryptionKey is 64 lowercase-hex chars ==="
@@ -124,13 +163,52 @@ echo "=== Assertion 4: explicit override wins on the sealed path ==="
 # `--set` that differs from the published default must be honored verbatim rather
 # than generated -- this proves the override branch sits ahead of generation.
 OVERRIDE="$TMP/override.yaml"
-helm template "$CHART" --set api.apiKey=override-sentinel-xyz \
+helm template "$CHART" \
+  --set api.apiKey=override-sentinel-xyz \
+  --set langfuse.init.projectSecretKey=override-project-secret-1569 \
+  --set langfuse.init.userPassword=override-user-password-1569 \
   --show-only templates/secrets.yaml > "$OVERRIDE"
 got="$(read_key "$OVERRIDE" apiKey)"
 if [[ "$got" != "override-sentinel-xyz" ]]; then
   fail "explicit --set api.apiKey override must be honored on the sealed path; expected 'override-sentinel-xyz', got '$got'."
 fi
 echo "  ok: explicit apiKey override honored (override wins over generation)"
+got="$(read_key "$OVERRIDE" langfuseInitProjectSecretKey)"
+if [[ "$got" != "override-project-secret-1569" ]]; then
+  fail "explicit --set langfuse.init.projectSecretKey override must be honored on the sealed path; expected 'override-project-secret-1569', got '$got'."
+fi
+echo "  ok: explicit Langfuse init project secret override honored"
+got="$(read_key "$OVERRIDE" langfuseInitUserPassword)"
+if [[ "$got" != "override-user-password-1569" ]]; then
+  fail "explicit --set langfuse.init.userPassword override must be honored on the sealed path; expected 'override-user-password-1569', got '$got'."
+fi
+echo "  ok: explicit Langfuse init user password override honored"
+
+assert_otlp_auth_agrees() {
+  # $1 = rendered Secret, $2 = expected public key, $3 = render label
+  local out="$1" public_key="$2" label="$3" project_secret got expected
+  project_secret="$(read_key "$out" langfuseInitProjectSecretKey)"
+  got="$(read_key "$out" otlpAuthHeader)"
+  expected="Basic $(printf '%s' "$public_key:$project_secret" | base64 | tr -d '\n')"
+  if [[ "$got" != "$expected" ]]; then
+    fail "$label OTel Basic auth must use the rendered langfuseInitProjectSecretKey; expected '$expected', got '$got'."
+  fi
+  echo "  ok: $label OTel Basic auth agrees with the rendered project secret"
+}
+
+echo "=== Assertion 4: default OTel auth uses the resolved Langfuse project secret ==="
+assert_otlp_auth_agrees "$SEALED" "pk-lf-curie-dev" "sealed render"
+assert_otlp_auth_agrees "$OVERRIDE" "pk-lf-curie-dev" "credential override render"
+
+OTLP_OVERRIDE="$TMP/otlp-override.yaml"
+helm template "$CHART" \
+  --set-string 'otelCollector.otlpAuthHeader=Basic explicit-otel-sentinel-1569' \
+  --show-only templates/secrets.yaml > "$OTLP_OVERRIDE"
+got="$(read_key "$OTLP_OVERRIDE" otlpAuthHeader)"
+if [[ "$got" != "Basic explicit-otel-sentinel-1569" ]]; then
+  fail "explicit --set otelCollector.otlpAuthHeader must be honored; expected 'Basic explicit-otel-sentinel-1569', got '$got'."
+fi
+echo "  ok: explicit OTel auth override honored"
 
 echo "=== Assertion 5: quoted \"false\" does NOT disable generation (fail closed) ==="
 # Go templates treat any non-empty string as truthy, so a quoted
@@ -753,4 +831,4 @@ assert_worker_api_url override curie http://operator.example:9000 -f "$WORKER_AP
 echo "  ok: default, release name, configured port, BYO API, and operator override render one worker API URL"
 
 echo
-echo "PASS: sealed render generates strong values for all 9 keys (encryptionKey 64-hex); dev overlay keeps published defaults; explicit override wins on the sealed path; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; and the worker renders exactly one API URL in the default, release name, configured port, BYO API, and operator override cases."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; and the worker renders exactly one API URL in the default, release name, configured port, BYO API, and operator override cases."
