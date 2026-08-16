@@ -32,9 +32,19 @@ redefine them.
 
 ## Current contract
 
-A second implementation is an **ACI server** — an HTTP process that accepts the three endpoints
-(`docs/diagrams/aci.md`): `POST /v1/event` opens a turn, `POST /v1/steer` injects into the
-live turn (409 if none running), `POST /v1/interrupt` hard-stops it. It streams the outbound
+A second implementation is an **ACI server**, an HTTP process serving
+the four POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+turn, `POST /v1/steer` injects into the live turn (409 if none running),
+`POST /v1/interrupt` hard-stops it, and `POST /v1/reset` discards the conversation so the
+next turn starts fresh (409 while a turn is active). Two GETs sit alongside them and stay
+unauthenticated, `GET /healthz` and `GET /status`, because the chart's readiness probe
+sends no auth header. `/v1/reset` carries no ACI wire frame (it is a runner control route,
+like the GETs, and takes no body), but it is not optional: it is the per-case isolation
+guarantee the worker's eval driver depends on (#550,
+`apps/worker/src/curie_worker/eval/runner.py::EvalRunner._isolate` over
+`apps/worker/src/curie_worker/runner_client.py::RunnerClient.reset`), and the CLI's eval
+path calls the same route (`cli/src/runner.rs`). A second server that omits it fails every
+eval case that has not opted into `shared_history`. It streams the outbound
 NDJSON discriminated union `OutboundEvent` (`packages/aci-protocol/src/aci_protocol/events.py::OutboundEvent`):
 `TextDelta` (`packages/aci-protocol/src/aci_protocol/events.py::TextDelta`, `text_delta`),
 `ToolNote` (`packages/aci-protocol/src/aci_protocol/events.py::ToolNote`, `tool_note`),
@@ -63,8 +73,13 @@ CI-guarded by `packages/aci-protocol/tests/test_schema_compat.py`.
 
 Plugin-format entanglement: the ACI server must interpret Claude Code plugin bundles mounted at
 `CURIE_PLUGIN_DIR` (see the [bundle-format seam](../bundle-format/INTERFACE.md)), so a genuinely
-foreign harness inherits that shape too — the A- is docked for exactly this and for the
-SDK-shaped resume. Otherwise the line is clean and frozen: a producer constructs strictly (stray
+foreign harness inherits that shape too — the A- is docked for exactly this. Rehydration is no
+longer a second dock: ADR-0029 retired the SDK-shaped resume, so the boot path passes
+`resume=None` (`runner/src/curie_runner/__main__.py`) and the thread's transcript arrives from
+the durable state store named by `CURIE_HISTORY_REF`, replayed as a boot-time system-prompt
+preamble (`runner/src/curie_runner/history.py::format_conversation_preamble`). A second harness
+rehydrates by reusing that state-store contract, with nothing SDK-specific in the path.
+Otherwise the line is clean and frozen: a producer constructs strictly (stray
 keys are rejected at construction), while a consumer tolerates unknown fields and rejects only an
 **incompatible** wire version, raising `ProtocolVersionError` naming both versions (see ADR-0036).
 
