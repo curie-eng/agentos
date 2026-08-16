@@ -31,6 +31,13 @@ from .conftest import REPO_ROOT, Regenerate, RunLint, write
 
 _HARNESS_DOC = "docs/interfaces/harness-modelsession/INTERFACE.md"
 _CLI_OUTPUT_DOC = "docs/interfaces/cli-output/INTERFACE.md"
+_ACI_DOC = "docs/interfaces/aci-producer/INTERFACE.md"
+_ACI_GUIDE = "docs/interfaces/aci-producer/implementing-an-aci-server.md"
+_RELATIONAL_DB_DOC = "docs/interfaces/relational-db/INTERFACE.md"
+_STATE_DOC = "docs/interfaces/workflow-state/INTERFACE.md"
+
+_ACI_SERVER = "runner/src/curie_runner/server.py"
+_STATE_ROUTER = "apps/api/src/curie_api/routers/state.py"
 
 
 def _sdk_module(name: str) -> tuple[str, str]:
@@ -58,18 +65,55 @@ def _harness_prose(count: str) -> str:
     )
 
 
-def _cli_output_prose(schemas: str, tests: str) -> str:
-    """The cli-output seam's two sentences, in the house phrasing.
+def _cli_output_prose(schemas: str, tests: str, impls: str = "zero") -> str:
+    """The cli-output seam's three sentences, in the house phrasing.
 
-    Both are written every time: the doc carries two claims, so omitting one
-    would (rightly) trip its vacuity guard and bury the claim under test.
+    All three are written every time: the doc carries three claims, so omitting
+    one would (rightly) trip its vacuity guard and bury the claim under test.
+    ``impls`` defaults to zero because a miniature tree carries no ``cli/src``,
+    so zero is the truthful count there.
     """
     return (
         f"There are {schemas} committed schemas under `cli/schema/` with an index.\n"
         f"All are validated against real `to_json()` output across {tests} tests in\n"
         "`cli/tests/json_contract.rs`.\n"
+        f"{impls} `CliOutput` implementations, all in the CLI crate, by module:\n"
         "An agent is coupled to shapes enforced by committed schemas and a drift gate.\n"
     )
+
+
+def _cli_output_impl(name: str, qualified: bool) -> tuple[str, str]:
+    """A CLI module carrying one ``CliOutput`` implementation.
+
+    The crate writes the trait both bare and path-qualified, so both spellings
+    are exercised: a counter that saw only one would undercount silently.
+    """
+    trait = "crate::ui::CliOutput" if qualified else "CliOutput"
+    return f"cli/src/{name}.rs", f"impl {trait} for {name.title()}Output {{}}\n"
+
+
+def _aci_prose(count: str) -> str:
+    """The ACI seam's endpoint sentence, in the house phrasing."""
+    return f"A second implementation must serve the {count} POST endpoints it publishes.\n"
+
+
+def _aci_guide_prose(count: str) -> str:
+    """The ACI guide's endpoint sentence, in the house phrasing.
+
+    The real guide wraps this line, so the count and its noun phrase are split
+    across a newline here too: the pattern has to survive the house wrapping.
+    """
+    return f"An ACI server is an HTTP process that exposes {count} POST\nroutes.\n"
+
+
+def _state_prose(count: str) -> str:
+    """The workflow-state seam's route sentence, in the house phrasing."""
+    return f"The router exposes\n{count} state routes, covering get / put / list / delete.\n"
+
+
+def _relational_db_prose(count: str) -> str:
+    """The relational-DB seam's JSONB sentence, in the house phrasing."""
+    return f"`JSONB` is imported from the dialect and used on **{count}** columns.\n"
 
 
 # --- the count disagrees with the tree: the named drift class --------------
@@ -163,6 +207,11 @@ def test_a_missing_seam_doc_is_reported_under_the_catalog_root(tmp_path: Path) -
     assert [(finding.doc, finding.citation) for finding in findings] == [
         (_CLI_OUTPUT_DOC, "committed CLI result schemas"),
         (_CLI_OUTPUT_DOC, "json_contract output-validation tests"),
+        (_CLI_OUTPUT_DOC, "CliOutput implementations in the CLI crate"),
+        (_ACI_DOC, "ACI POST endpoints"),
+        (_ACI_GUIDE, "ACI POST endpoints, in the implementer's guide"),
+        (_RELATIONAL_DB_DOC, "JSONB columns in the API models"),
+        (_STATE_DOC, "workflow-state HTTP routes"),
     ]
     for finding in findings:
         assert "moved" in finding.reason
@@ -203,8 +252,11 @@ def test_a_renamed_doc_cannot_launder_a_false_count(tmp_path: Path) -> None:
         _cli_output_prose(schemas="999", tests="777"),
     )
     write(tmp_path, str(_CATALOG_MARKER), "")
-    findings = check_counts(tmp_path)
-    assert [finding.doc for finding in findings] == [_CLI_OUTPUT_DOC, _CLI_OUTPUT_DOC]
+    # Scoped to the renamed doc's own claims: the other seam docs are absent
+    # from this miniature tree too and report for that reason, which is a
+    # different assertion (made just above) than the laundering one here.
+    findings = [f for f in check_counts(tmp_path) if f.doc == _CLI_OUTPUT_DOC]
+    assert len(findings) == 3
     # The point being pinned: the gate reports the claim at its declared path
     # rather than silently validating the renamed doc's false prose. If either
     # false count leaked into a reason, the rename would have laundered it.
@@ -283,6 +335,134 @@ def test_json_contract_test_count_is_read_from_the_test_file(tmp_path: Path) -> 
     assert len(findings) == 1
     assert "'5'" in findings[0].reason
     assert "2" in findings[0].reason
+
+
+# --- the claims the 2026-08-14 seam audit found stale by hand ---------------
+#
+# Each of these was a count a human had to read the code to falsify. They are
+# the same class #938 gates, arriving by the slow route, so they are gated the
+# same way. Every one counts a surface that grows whenever the product does.
+
+
+def test_aci_post_route_count_excludes_the_unauthenticated_gets(tmp_path: Path) -> None:
+    # The seam doc said "three endpoints" long after `/v1/reset` landed. The
+    # two GETs (`/healthz`, `/status`) sit in the same route table and are a
+    # different claim, so a counter that read the whole table would say five
+    # and the gate would be wrong in the opposite direction.
+    write(
+        tmp_path,
+        _ACI_SERVER,
+        'web.get("/healthz", _healthz),\n'
+        'web.get("/status", _status),\n'
+        'web.post("/v1/event", _event),\n'
+        'web.post("/v1/reset", _reset),\n',
+    )
+    write(tmp_path, _ACI_DOC, _aci_prose("two"))
+    assert check_counts(tmp_path) == []
+
+
+def test_a_new_aci_post_route_drifts_the_guide_too(tmp_path: Path) -> None:
+    # Both the seam doc and the implementer's guide state this count, and the
+    # guide is the one a second implementer actually builds from. Gating only
+    # the seam doc would leave the guide free to keep saying three.
+    write(tmp_path, _ACI_SERVER, 'web.post("/v1/event", _e),\nweb.post("/v1/reset", _r),\n')
+    write(tmp_path, _ACI_DOC, _aci_prose("three"))
+    write(tmp_path, _ACI_GUIDE, _aci_guide_prose("three"))
+    findings = check_counts(tmp_path)
+    assert [finding.doc for finding in findings] == [_ACI_DOC, _ACI_GUIDE]
+
+
+def test_the_aci_guide_pattern_ignores_its_auth_sentences(tmp_path: Path) -> None:
+    # The guide says "the POST routes" twice more, about which routes need a
+    # bearer token. An `(\S+) POST routes` pattern reads "the" as the count and
+    # reports drift against prose that states no count at all, so the anchor
+    # carries `exposes`. This is the guard on that choice.
+    write(tmp_path, _ACI_SERVER, 'web.post("/v1/event", _e),\n')
+    write(
+        tmp_path,
+        _ACI_GUIDE,
+        _aci_guide_prose("one") + "Send a bearer token on the POST routes only.\n",
+    )
+    assert check_counts(tmp_path) == []
+
+
+def test_state_route_count_reads_the_router_decorators(tmp_path: Path) -> None:
+    # "exactly the five verbs" survived `list_namespaces` making it six. Every
+    # decorator in that module is a state route, so no exclusion list is needed
+    # -- but a decorator quoted in a docstring is not one, hence the anchor.
+    write(
+        tmp_path,
+        _STATE_ROUTER,
+        '@router.put("/x")\ndef put_state(): ...\n'
+        '@router.get("/x")\ndef get_state(): ...\n'
+        '"""An example: @router.delete("/x") is documented, not declared."""\n',
+    )
+    write(tmp_path, _STATE_DOC, _state_prose("two"))
+    assert check_counts(tmp_path) == []
+
+
+def test_the_state_pattern_ignores_the_memory_bypass_sentence(tmp_path: Path) -> None:
+    # The same doc says the memory router reaches the store "rather than
+    # calling its own state routes". A bare `(\S+) state routes` pattern reads
+    # "own" as the count and fails on prose that is not a count, so the anchor
+    # carries `exposes`. This is the guard on that choice.
+    write(tmp_path, _STATE_ROUTER, '@router.get("/x")\ndef get_state(): ...\n')
+    write(
+        tmp_path,
+        _STATE_DOC,
+        _state_prose("one") + "The memory router mutates rows rather than calling\n"
+        "its own state routes.\n",
+    )
+    assert check_counts(tmp_path) == []
+
+
+def test_cli_output_impls_are_counted_in_both_spellings(tmp_path: Path) -> None:
+    # `impls: 9` against a crate holding 38 was the worst-drifted count the
+    # audit found. The crate writes the trait bare and path-qualified, so both
+    # count; an impl nested inside a test module does not, which is why the
+    # pattern is anchored at column 0.
+    write(tmp_path, *_cli_output_impl("kill", qualified=False))
+    write(tmp_path, *_cli_output_impl("resume", qualified=True))
+    write(
+        tmp_path,
+        "cli/src/fixtures.rs",
+        "#[cfg(test)]\nmod tests {\n    impl CliOutput for FakeOutput {}\n}\n",
+    )
+    write(tmp_path, "cli/schema/kill.json", "{}\n")
+    write(tmp_path, "cli/tests/json_contract.rs", "#[test]\nfn a() {}\n")
+    write(tmp_path, _CLI_OUTPUT_DOC, _cli_output_prose(schemas="1", tests="one", impls="two"))
+    assert check_counts(tmp_path) == []
+
+
+def test_a_new_cli_output_impl_drifts_the_inventory(tmp_path: Path) -> None:
+    # The recurrence itself: a new verb ships an output and the prose still
+    # states the old total. This is the edit that made the count wrong 29 times
+    # over without anyone noticing.
+    write(tmp_path, *_cli_output_impl("kill", qualified=False))
+    write(tmp_path, *_cli_output_impl("resume", qualified=True))
+    write(tmp_path, *_cli_output_impl("budget", qualified=True))
+    write(tmp_path, "cli/schema/kill.json", "{}\n")
+    write(tmp_path, "cli/tests/json_contract.rs", "#[test]\nfn a() {}\n")
+    write(tmp_path, _CLI_OUTPUT_DOC, _cli_output_prose(schemas="1", tests="one", impls="two"))
+    findings = check_counts(tmp_path)
+    assert len(findings) == 1
+    assert findings[0].citation == "CliOutput implementations in the CLI crate"
+    assert "3" in findings[0].reason
+
+
+def test_jsonb_column_count_excludes_the_import_line(tmp_path: Path) -> None:
+    # The relational-DB doc's only remaining number. `JSONB` appears in the
+    # dialect import as well as on every column, so a bare-name pattern would
+    # over-count by one on a tree with any JSONB at all.
+    write(
+        tmp_path,
+        "apps/api/src/curie_api/models.py",
+        "from sqlalchemy.dialects.postgresql import JSONB, UUID\n"
+        "secrets = mapped_column(JSONB)\n"
+        "evidence = mapped_column(JSONB)\n",
+    )
+    write(tmp_path, _RELATIONAL_DB_DOC, _relational_db_prose("two"))
+    assert check_counts(tmp_path) == []
 
 
 # --- wired into the linter, not dead code ----------------------------------
