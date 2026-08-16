@@ -240,8 +240,13 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.eval_consumer_group == "curie-eval-workers"
     # RustFS / S3
     assert config.s3_endpoint_url == "http://localhost:29000"
-    assert config.s3_access_key == "rustfs"
-    assert config.s3_secret_key == "rustfssecret"
+    # Empty by default (#1559): a baked-in dev key is still an explicit credential
+    # to boto3, so it shadows the ambient cloud identity (IRSA, instance role) the
+    # key-free BYO object-store path relies on. Do not restore the RustFS dev pair
+    # here; compose supplies it via env, and the S3_ACCESS_KEY/S3_SECRET_KEY
+    # override entries above stay the guard that an operator value still wins.
+    assert config.s3_access_key == ""
+    assert config.s3_secret_key == ""
     assert config.s3_region == "us-east-1"
     assert config.bundle_bucket == "curie-bundles"
     # Platform API

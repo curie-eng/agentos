@@ -408,9 +408,19 @@ class WorkerConfig(BaseSettings):
     )
     # RustFS / S3 for plugin bundles (mirrors the API's env names). The consumer
     # fetches a version's bundle by bundle_ref and loads its evals/ suite.
+    # The credentials default to EMPTY on purpose (#1559): an empty credential
+    # selects the AWS provider chain, which is the key-free BYO path the chart
+    # README documents under "Key-free object store auth" (IRSA, an instance
+    # role, an ambient profile). The dev static credential now lives in
+    # `.env.example` and `compose.dev.yaml`, which set S3_ACCESS_KEY /
+    # S3_SECRET_KEY explicitly for the compose stack's RustFS. Never reintroduce
+    # a non-empty value as a default here: a baked-in key is precisely what made
+    # the key-free path inert, because it is handed to boto3 as an explicit
+    # credential and the provider chain is never consulted. This block is a
+    # parity seam with the API's `Settings`, so the two must stay identical.
     s3_endpoint_url: str = "http://localhost:29000"
-    s3_access_key: str = "rustfs"
-    s3_secret_key: str = "rustfssecret"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
     # Bundle extraction bounds (ADR-0059 decision 3), applied by the Docker
