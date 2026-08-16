@@ -1386,10 +1386,11 @@ security:
   # feeds the OTel Collector auth header. Clear those two checks by overriding
   # those values or supplying
   # langfuse.existingSecret (the secretKeyRef escape, keys langfuseInitProjectSecretKey
-  # + langfuseInitUserPassword + otlpAuthHeader). A third check refuses
-  # otelCollector.otlpAuthHeader set to the published dev header and is NOT
-  # cleared by langfuse.existingSecret, since an explicit override reaches the
-  # collector on every path. Off by default so the flagship zero-secret bare
+  # + langfuseInitUserPassword + otlpAuthHeader). A third check refuses the
+  # published dev header on whatever the collector would actually send, whether
+  # set directly via otelCollector.otlpAuthHeader or composed by the chart from
+  # the langfuse.init keys, and is NOT cleared by langfuse.existingSecret, since
+  # that header reaches the collector on every path. Off by default so the flagship zero-secret bare
   # install stays green and the dev/e2e overlays render unchanged; flip it on for a
   # shared/production cluster. (#57 will extend this same gate to the nine
   # store/control-plane secrets once its design pass lands.)

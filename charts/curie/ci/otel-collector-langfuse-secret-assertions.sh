@@ -203,4 +203,22 @@ rc="$(gate_rc dev-header-unpadded --set security.checkDefaultCredentials=true --
 [[ "$rc" != "0" ]] || fail "T8: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential with the base64 padding stripped. That header decodes to pk-lf-curie-dev:sk-lf-curie-dev and Langfuse accepts it, so dropping two '=' characters defeats the gate"
 grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-unpadded.stderr" || fail "T8: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-unpadded.stderr")"
 
+# T9: the chart itself composes and ships the dev header on this path. No
+# operator override is set, and langfuse.existingSecret names the chart's own
+# Secret, so curie.otlpAuthHeaderSecretName resolves back to curie-secrets and
+# the header is derived from the langfuse.init keys (T6 renders this exact
+# configuration and asserts the dev header is present). A gate that only reads
+# the otelCollector.otlpAuthHeader input never sees it.
+rc="$(gate_rc selfnamed-dev-header --set security.checkDefaultCredentials=true --set langfuse.existingSecret='curie-secrets')"
+[[ "$rc" != "0" ]] || fail "T9: security.checkDefaultCredentials=true rendered successfully with langfuse.existingSecret=curie-secrets, where the chart composes the published dev header out of the langfuse.init keys and ships it to the collector in its own Secret. The gate must judge the header the collector would send, not just the otelCollector.otlpAuthHeader input"
+grep -qF 'langfuse.init.projectPublicKey' "$TMP/selfnamed-dev-header.stderr" || fail "T9: the render failed but its message never names langfuse.init.projectPublicKey, so the operator cannot tell the header was composed by the chart rather than set as an override. stderr was: $(cat "$TMP/selfnamed-dev-header.stderr")"
+
+# T10: a trailing space is a plausible copy/paste artifact, not only a
+# deliberate bypass. The receiver splits the Authorization header on a space and
+# reads element 1, so the padding whitespace is discarded and the dev credential
+# is accepted exactly as if it had been pasted cleanly.
+rc="$(gate_rc dev-header-trailing-space --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set otelCollector.otlpAuthHeader='Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg== ')"
+[[ "$rc" != "0" ]] || fail "T10: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev header with a trailing space. Langfuse ignores the surrounding whitespace and accepts pk-lf-curie-dev:sk-lf-curie-dev, so a stray space defeats the gate"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-trailing-space.stderr" || fail "T10: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-trailing-space.stderr")"
+
 echo "Collector follows langfuse.existingSecret, the chart Secret ships no stale dev header, the override still wins, and the default-credential gate refuses the published dev header: OK"

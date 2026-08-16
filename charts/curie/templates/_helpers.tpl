@@ -280,10 +280,11 @@ service:
      escape carries both keys, and on that path the operator's Secret supplies
      otlpAuthHeader directly).
 
-     The third check, on otelCollector.otlpAuthHeader (issue #1563), is
-     unconditional: langfuse.existingSecret does NOT clear it, because an
-     explicit override ships to the collector whatever the Langfuse credential
-     source is.
+     The third check, on the rendered collector header (issue #1563), is
+     unconditional: langfuse.existingSecret does NOT clear it, because that
+     header ships to the collector whatever the Langfuse credential source is,
+     whether it came from an otelCollector.otlpAuthHeader override or the chart
+     composed it from the langfuse.init keys.
 
      Off by default so the flagship zero-secret bare install stays green and the
      dev/e2e overlays render unchanged; flip it on for a shared/production
@@ -299,16 +300,24 @@ service:
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.userPassword is still the published dev default \"curie-dev-password\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- the published admin password allows Langfuse admin takeover on a reachable UI." -}}
 {{- end -}}
 {{- end -}}
-{{/* Outside the existingSecret guard on purpose (issue #1563): an explicit
-     override reaches the collector on every path, so a BYO Langfuse Secret does
-     not make the published header safe. Composed via b64enc rather than pasted
-     so it cannot drift from curie.otlpAuthHeader. Both sides are compared with
-     base64 padding stripped: the receiver accepts the unpadded spelling of the
-     same credential, so an exact-string match would leave that spelling through.
-     b64dec is not usable here, since sprig returns an error string rather than
-     the plaintext for unpadded input. */}}
-{{- if eq (trimAll "=" .Values.otelCollector.otlpAuthHeader) (trimAll "=" (printf "Basic %s" (b64enc "pk-lf-curie-dev:sk-lf-curie-dev"))) -}}
-{{- fail "security.checkDefaultCredentials is on but otelCollector.otlpAuthHeader is still the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" (base64 padding aside). The OTel Collector would authenticate to Langfuse with the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. Set a header derived from your own project keys, or clear the override and supply otlpAuthHeader via langfuse.existingSecret." -}}
+{{/* Outside the existingSecret guard on purpose (issue #1563): the header
+     reaches the collector on every path, so a BYO Langfuse Secret does not make
+     the published header safe. The operand is the RENDERED header
+     (curie.otlpAuthHeader), not the otelCollector.otlpAuthHeader input, because
+     the chart composes and ships that same dev header out of the langfuse.init
+     keys whenever the chart-managed Secret is the one the collector reads, with
+     the input left empty. Reading the input would judge a value the collector
+     may never see and miss the header it actually gets. Composed via b64enc
+     rather than pasted so it cannot drift from curie.otlpAuthHeader. Both sides
+     are compared with surrounding whitespace and then base64 padding stripped,
+     in that order: a trailing space leaves the last character non-"=", so
+     trimAll would strip no padding at all. Both spellings matter because the
+     receiver splits the header on a space and accepts the unpadded credential,
+     so an exact-string match would leave either through. b64dec is not usable
+     here, since sprig returns an error string rather than the plaintext for
+     unpadded input. */}}
+{{- if eq (trimAll "=" (trim (include "curie.otlpAuthHeader" .))) (trimAll "=" (printf "Basic %s" (b64enc "pk-lf-curie-dev:sk-lf-curie-dev"))) -}}
+{{- fail "security.checkDefaultCredentials is on but the Authorization header the OTel Collector would send to Langfuse is still the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" (surrounding whitespace and base64 padding aside). The collector would authenticate with the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

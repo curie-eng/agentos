@@ -259,10 +259,12 @@ carries its published dev default (a Langfuse admin-takeover risk on a reachable
 UI; the project key also feeds the OTel Collector auth header on the
 non-`existingSecret` path). Override those values or supply
 `langfuse.existingSecret` to clear those two checks. A third condition fails the
-render whenever `otelCollector.otlpAuthHeader` is set to the published dev header
-`Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`; `langfuse.existingSecret`
-does not clear it, because an explicit override is what the collector sends
-regardless of where the Langfuse credential comes from. It is off by
+render whenever the header the collector would actually send is the published dev
+header `Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`, whether
+`otelCollector.otlpAuthHeader` is set to it directly or the chart composed it
+from the `langfuse.init` keys; `langfuse.existingSecret` does not clear it,
+because that header is what the collector sends regardless of where the Langfuse
+credential comes from. It is off by
 default so the zero-secret bare install stays green.
 
 ### Key-free object store auth
