@@ -10,8 +10,8 @@
 # @anthropic-ai/claude-code CLI alongside the Python runner. With
 # CURIE_FAKE_MODEL=1 the container answers synthetic events offline (no CLI/model
 # call), which is how the container smoke round-trips without a credential.
-# Python 3.13 is required by the frozen workspace packages; Node 22 is required
-# by the Claude Code CLI the SDK spawns. Base on python:3.13 and add Node.
+# The frozen workspace packages require the Python base below; Node 22 is
+# required by the Claude Code CLI the SDK spawns. Add Node to the Python base.
 # Node comes from the official image rather than NodeSource's apt repo. That
 # repo's setup script (`deb.nodesource.com/setup_22.x`) started returning 403 to
 # everyone on 2026-07-27, which broke every runner-image build repo-wide: curl
@@ -51,27 +51,22 @@ WORKDIR /app
 # The three source trees the runner needs: the two frozen workspace packages and
 # the runner itself. Copied by path so the image is reproducible from the lockfile
 # above them (root pyproject/uv.lock are the workspace source of truth).
+COPY uv.lock ./uv.lock
 COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
 COPY runner ./runner
 
 # One venv. Install the local packages first, then the runner without redeps,
-# then its third-party deps. The versions are pinned == to the tested workspace
-# uv.lock (source of truth: root uv.lock) so a rebuild ships exactly what CI
-# exercised rather than resolving a newer SDK/aiohttp/OTel at build time. Keep
-# these pins in lockstep with uv.lock when the runner's deps move. The local
-# packages are installed by path first so the "aci-protocol"/"plugin-format"
-# requirements resolve to the copied trees, not a same-named PyPI distribution.
+# then its direct registry dependencies exported from the tested workspace
+# uv.lock. The local packages are installed by path first so the
+# "aci-protocol"/"plugin-format" requirements resolve to the copied trees, not
+# a same-named PyPI distribution.
 RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
     && /app/.venv/bin/pip install --no-cache-dir ./packages/aci-protocol ./packages/plugin-format \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
-    && /app/.venv/bin/pip install --no-cache-dir \
-        "claude-agent-sdk==0.2.135" \
-        "aiohttp==3.14.3" \
-        "opentelemetry-sdk==1.44.0" \
-        "opentelemetry-exporter-otlp-proto-http==1.44.0" \
-        "anyio==4.14.1"
+    && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
+    && /app/.venv/bin/pip install --no-cache-dir -r /tmp/runner-dependency-pins.txt
 
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import shlex
+import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,9 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOCKERFILE = _REPO_ROOT / "runner" / "Dockerfile"
+_EXPORTER = _REPO_ROOT / "runner" / "export_dependency_pins.py"
 _UV_LOCK = _REPO_ROOT / "uv.lock"
+_REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
 _EXACT_NPM_VERSION = re.compile(
     r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
 )
@@ -117,30 +121,6 @@ def _dockerfile_python_pins(instructions: list[str]) -> dict[str, list[str]]:
     return pins
 
 
-def _dockerfile_python_operands(dockerfile_text: str) -> dict[str, str]:
-    operands: dict[str, str] = {}
-    controls = {"&&", "||", ";"}
-    for instruction in _logical_instructions(dockerfile_text):
-        tokens = _shell_tokens(instruction)
-        if not tokens or tokens[0].upper() != "RUN":
-            continue
-        for index, token in enumerate(tokens[:-1]):
-            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
-                tokens[index + 1] != "install"
-            ):
-                continue
-            for operand in tokens[index + 2 :]:
-                if operand in controls:
-                    break
-                if operand.startswith("-") or "==" not in operand:
-                    continue
-                name, _ = operand.split("==", 1)
-                package = _normalize_python_name(name)
-                assert package not in operands, f"Dockerfile must pin {package} exactly once"
-                operands[package] = operand
-    return operands
-
-
 def _split_npm_operand(operand: str) -> tuple[str, str | None]:
     version_at = operand.rfind("@")
     if version_at <= 0:
@@ -243,12 +223,102 @@ def _find_violations(lock_text: str, dockerfile_text: str) -> list[Violation]:
     return sorted(violations, key=lambda violation: (violation.package, violation.message))
 
 
-def test_actual_runner_dockerfile_matches_locked_dependencies() -> None:
-    violations = _find_violations(
-        _UV_LOCK.read_text(encoding="utf-8"),
-        _DOCKERFILE.read_text(encoding="utf-8"),
+def _run_dependency_exporter(lock_text: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_EXPORTER)],
+        input=lock_text,
+        capture_output=True,
+        check=False,
+        text=True,
     )
-    assert violations == []
+
+
+def _export_runner_dependencies(lock_text: str) -> list[str]:
+    result = _run_dependency_exporter(lock_text)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.splitlines()
+
+
+def _effective_runner_python_operands(lock_text: str) -> dict[str, str]:
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    instructions = _logical_instructions(dockerfile)
+    assert any(
+        "python3 runner/export_dependency_pins.py < uv.lock "
+        f"> {_REQUIREMENTS_PATH}" in instruction
+        and f"pip install --no-cache-dir -r {_REQUIREMENTS_PATH}" in instruction
+        for instruction in instructions
+    )
+    operands: dict[str, str] = {}
+    for operand in _export_runner_dependencies(lock_text):
+        package, _ = operand.split("==", 1)
+        normalized = _normalize_python_name(package)
+        assert normalized not in operands, f"runner requirements must pin {normalized} once"
+        operands[normalized] = operand
+    return operands
+
+
+def _replace_locked_package_version(
+    lock_text: str, package: str, replacement: str
+) -> str:
+    pattern = re.compile(
+        rf'(?m)(^\[\[package\]\]\nname = "{re.escape(package)}"\nversion = ")[^"]+("$)'
+    )
+    updated, count = pattern.subn(
+        lambda match: f"{match.group(1)}{replacement}{match.group(2)}",
+        lock_text,
+    )
+    assert count == 1, f"uv.lock must contain exactly one {package} record"
+    return updated
+
+
+def _dockerfile_with_python_pins(pins: dict[str, str]) -> str:
+    operands = " \\\n    ".join(f'"{package}=={version}"' for package, version in pins.items())
+    return f"RUN pip install --no-cache-dir \\\n    {operands}\n"
+
+
+def test_dependency_exporter_emits_sorted_direct_registry_pins() -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    expected = _locked_runner_dependencies(lock_text)
+
+    assert _export_runner_dependencies(lock_text) == [
+        f"{package}=={version}" for package, version in sorted(expected.items())
+    ]
+
+
+def test_dependency_exporter_reflects_a_lock_version_bump() -> None:
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    expected = _locked_runner_dependencies(lock_text)
+    replacement = f"{expected['claude-agent-sdk']}.post1"
+    bumped_lock = _replace_locked_package_version(
+        lock_text, "claude-agent-sdk", replacement
+    )
+
+    pins = _export_runner_dependencies(bumped_lock)
+
+    assert "claude-agent-sdk==" + replacement in pins
+    assert f"claude-agent-sdk=={expected['claude-agent-sdk']}" not in pins
+
+
+def test_dependency_exporter_rejects_malformed_lock_input() -> None:
+    result = _run_dependency_exporter("[[package]\nname = ")
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "invalid uv.lock" in result.stderr
+
+
+def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> None:
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    instructions = _logical_instructions(dockerfile)
+
+    assert "COPY uv.lock ./uv.lock" in instructions
+    assert any(
+        "python3 runner/export_dependency_pins.py < uv.lock "
+        f"> {_REQUIREMENTS_PATH}" in instruction
+        and f"pip install --no-cache-dir -r {_REQUIREMENTS_PATH}" in instruction
+        for instruction in instructions
+    )
+    assert _dockerfile_python_pins(instructions) == {}
 
 
 def test_prechange_drift_reports_all_four_violations() -> None:
@@ -290,11 +360,9 @@ RUN /app/.venv/bin/pip install \\
 def test_python_pin_revert_is_rejected() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
-    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    current = _dockerfile_python_operands(dockerfile)["claude-agent-sdk"]
-    assert dockerfile.count(current) == 1
     stale_version = f"{expected['claude-agent-sdk']}.stale"
-    mutated = dockerfile.replace(current, f"claude-agent-sdk=={stale_version}")
+    pins = expected | {"claude-agent-sdk": stale_version}
+    mutated = _dockerfile_with_python_pins(pins)
 
     violations = _find_violations(lock_text, mutated)
     assert Violation(
@@ -334,8 +402,7 @@ def test_npm_global_install_aliases_require_exact_versions(command: str) -> None
 @pytest.mark.parametrize("executable", ["pip", "pip3"])
 def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    operands = _dockerfile_python_operands(dockerfile)
+    operands = _effective_runner_python_operands(lock_text)
     synthetic = "RUN " + executable + " install " + " ".join(
         f'"{operand}"' for operand in operands.values()
     )
@@ -345,9 +412,8 @@ def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> Non
 
 def test_python_pin_set_must_match_all_direct_registry_dependencies() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
-    operands = _dockerfile_python_operands(dockerfile)
+    operands = _effective_runner_python_operands(lock_text)
     assert operands.keys() == expected.keys()
     baseline = "RUN pip install " + " ".join(
         f'"{operand}"' for operand in operands.values()
