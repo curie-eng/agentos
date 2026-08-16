@@ -406,6 +406,11 @@ Contract notes the kernel must know:
   pod). Routes that expire in Valkey leave orphaned claims; `reap_orphans()`
   lists claims labeled `curietech.ai/managed-by=curie-sandbox-substrate` and
   deletes any not referenced by a live route. Run it on a periodic worker tick.
+  It additionally spares any claim younger than `claim_timeout_seconds` plus a
+  fixed margin: a claim still inside its bind window has no route yet, so "no
+  live route" alone would read as litter and reaping it would delete a live
+  sandbox out from under a blocked turn. A claim whose age is unknown is spared
+  and logged at WARNING.
 - The client seam (`SandboxClient` protocol) is sync; wrap calls in a thread if
   the kernel goes async. Unit tests fake only this protocol (the K8s control
   plane); Valkey is never mocked. The env-gated e2e

@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import logging
 import tarfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from curie_worker.bundle_store import extract_bundle
@@ -259,7 +260,7 @@ def test_explicit_credential_forwarded_under_base_url_override() -> None:
 def test_get_sandbox_reports_published_port_and_mode() -> None:
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     client.outputs = {
-        "inspect": "running\t{}",
+        "inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z",
         "port": "127.0.0.1:49173\n",
     }
     view = client.get_sandbox("t1")
@@ -268,10 +269,33 @@ def test_get_sandbox_reports_published_port_and_mode() -> None:
     assert view.port == 49173
     assert view.operating_mode == "Running"
 
-    client.outputs["inspect"] = "paused\t{}"
+    client.outputs["inspect"] = "paused\t{}\t2026-08-16T12:00:00.123456789Z"
     paused = client.get_sandbox("t1")
     assert paused is not None
     assert paused.operating_mode == "Suspended"
+
+
+def test_get_claim_surfaces_the_container_created_at() -> None:
+    # The local tier's reaper reads its bind-window grace off this value, so a
+    # claim whose age never arrives is an orphan that is never reaped. The
+    # nine-digit fraction in the fixture is not a synthetic edge case: it is
+    # the RFC3339Nano form docker actually emits for .Created. On this repo's
+    # Python, datetime.fromisoformat parses it and truncates to microseconds,
+    # and production relies on exactly that, so this pins that the parser is
+    # handed the real docker format and keeps microsecond precision. Do not
+    # reintroduce a manual truncation step ahead of it.
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.outputs = {"inspect": "running\t{}\t2026-08-16T12:00:00.123456789Z", "port": ""}
+
+    view = client.get_claim("t1")
+    assert view is not None
+    created = view.created_at
+    assert created is not None
+    assert created.utcoffset() == timedelta(0)  # tz-aware UTC, never naive
+    # Asserted to the microsecond, not to the second: dropping the fraction
+    # instead of truncating it reads a container up to a second early, which is
+    # a second of grace the reaper never gives back at the boundary.
+    assert created == datetime(2026, 8, 16, 12, 0, 0, 123456, tzinfo=UTC)
 
 
 def test_get_sandbox_none_when_container_absent() -> None:
@@ -285,7 +309,10 @@ def test_get_sandbox_treats_dead_container_as_gone() -> None:
     # the substrate evicts the stale route instead of dialing a dead runner.
     client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
     for dead in ("exited", "dead", "created", "restarting"):
-        client.outputs = {"inspect": f"{dead}\t{{}}", "port": ""}
+        client.outputs = {
+            "inspect": f"{dead}\t{{}}\t2026-08-16T12:00:00.123456789Z",
+            "port": "",
+        }
         assert client.get_sandbox("t1") is None, dead
 
 
@@ -301,7 +328,7 @@ class _NetworkAwareDocker(DockerSandboxClient):
         if args and args[0] == "inspect":
             if any("NetworkSettings.Networks" in a for a in args):
                 return self._networks_json
-            return "running\t{}"
+            return "running\t{}\t2026-08-16T12:00:00.123456789Z"
         if args and args[0] == "port":
             return "127.0.0.1:49173\n"
         return ""

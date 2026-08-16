@@ -48,6 +48,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aci_protocol import BootEnv
@@ -113,6 +114,32 @@ _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 _WORKER_OWNED_ENV = frozenset(
     {BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV}
 )
+
+
+def _parse_created(raw: str) -> datetime | None:
+    """A container's ``.Created`` as tz-aware UTC, or None when unreadable.
+
+    Docker emits RFC3339Nano, for example ``2026-08-16T12:00:00.123456789Z``.
+    On this project's Python (>=3.13) ``datetime.fromisoformat`` parses that
+    directly, ``Z`` and nine fractional digits included, truncating the
+    fraction to microseconds itself.
+
+    Normalizing to aware UTC is load-bearing: the reaper compares this against
+    ``datetime.now(UTC)``, and a naive value raises TypeError inside a
+    maintenance tick whose caller swallows exceptions, silently ending reaping.
+    An unreadable value returns None so one odd container cannot kill the tick.
+    """
+
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -371,7 +398,7 @@ class DockerSandboxClient:
         inspected = self._inspect(name)
         if inspected is None:
             return None
-        status, _ = inspected
+        status, _labels, created = inspected
         ready = status == "running" and self._healthz_ok(name)
         return ClaimView(
             name=name,
@@ -379,6 +406,10 @@ class DockerSandboxClient:
             # The container is its own sandbox; expose the name once it exists so
             # the substrate can advance to awaiting the dial target.
             sandbox_name=name,
+            # The container's own creation instant is this tier's claim age: the
+            # substrate runs one reaper over both tiers, so returning None here
+            # would silently stop reaping local orphans.
+            created_at=created,
         )
 
     def delete_claim(self, name: str) -> None:
@@ -411,7 +442,9 @@ class DockerSandboxClient:
         inspected = self._inspect(name)
         if inspected is None:
             return None
-        status, _labels = inspected
+        # A Sandbox has no age question; this unpacks three only because
+        # get_claim shares the same single inspect call.
+        status, _labels, _created = inspected
         # Only a running or paused container is a live/suspended sandbox. An
         # exited/dead/created/restarting container is NOT live: report it gone
         # (None) so the substrate evicts the stale route and re-claims rather than
@@ -473,18 +506,29 @@ class DockerSandboxClient:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def _inspect(self, name: str) -> tuple[str, dict[str, str]] | None:
-        """(status, labels) for the container, or None when it does not exist."""
+    def _inspect(self, name: str) -> tuple[str, dict[str, str], datetime | None] | None:
+        """(status, labels, created) for the container, or None when it does not
+        exist.
+
+        One docker call carries all three: the creation instant rides along with
+        the status read rather than costing a second inspect per poll.
+        """
         out = self._docker(
-            ["inspect", "--format", "{{.State.Status}}\t{{json .Config.Labels}}", name],
+            [
+                "inspect",
+                "--format",
+                "{{.State.Status}}\t{{json .Config.Labels}}\t{{.Created}}",
+                name,
+            ],
             check=False,
         )
         if not out.strip():
             return None
-        status, _, labels_json = out.strip().partition("\t")
+        status, _, rest = out.strip().partition("\t")
+        labels_json, _, created_raw = rest.partition("\t")
         labels_raw = json.loads(labels_json) if labels_json and labels_json != "null" else {}
         labels = {str(k): str(v) for k, v in labels_raw.items()}
-        return status, labels
+        return status, labels, _parse_created(created_raw)
 
     def _published_port(self, name: str) -> int | None:
         out = self._docker(["port", name, f"{RUNNER_CONTAINER_PORT}/tcp"], check=False)
