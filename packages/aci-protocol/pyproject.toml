@@ -5,7 +5,7 @@ description = "Frozen ACI session protocol and NDJSON event types (Pydantic sour
 requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.9",
-    "pydantic-settings>=2.7",
+    "pydantic-settings>=2.15.0",
 ]
 
 [build-system]
