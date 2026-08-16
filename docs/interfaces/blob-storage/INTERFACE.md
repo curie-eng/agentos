@@ -39,10 +39,31 @@ Azure Blob) satisfies the Protocol without being boto3/S3. What speaks boto3 S3 
 backing today, and a config-only swap that stays *within* the S3-compatible family (AWS S3 or
 Cloudflare R2) needs no code, only env/settings:
 
-- **Env/settings** (`apps/api/src/curie_api/config.py::Settings`): `s3_endpoint_url`,
+- **Env/settings** (`apps/api/src/curie_api/config.py::Settings`, mirrored field for
+  field by `apps/worker/src/curie_worker/config.py::WorkerConfig`): `s3_endpoint_url`,
   `s3_access_key`, `s3_secret_key`, `s3_region`, `bundle_bucket` (env vars
   `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `BUNDLE_BUCKET`).
-- **Client construction** (`apps/api/src/curie_api/storage.py::build_s3_client`): `boto3.client("s3", endpoint_url=..., config=BotoConfig(s3={"addressing_style": "path"}))`.
+  The two credential fields default to the **empty string** on both sides; see
+  credential resolution below for why that default is load-bearing rather than a
+  placeholder. The dev static credential lives in `.env.example` and `compose.dev.yaml`.
+- **Client construction** (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`,
+  #501): the single `boto3.client("s3", endpoint_url=..., config=BotoConfig(s3={"addressing_style": "path"}))`
+  in the repo. It takes primitives, not either app's config object, so it couples to
+  neither `Settings` nor `WorkerConfig`. Both lanes import it: the API through a thin
+  `Settings`-shaped adapter (`apps/api/src/curie_api/storage.py::build_s3_client`,
+  kept as a named function because callers import it from that module), the worker
+  directly (`apps/worker/src/curie_worker/bundle_store.py::BundleStore`).
+- **Credential resolution is part of the contract** (#1325, #1559). An empty
+  `access_key`/`secret_key` is not a blank credential, it is the request to resolve an
+  identity through the AWS provider chain, and `build_s3_client` is what turns that
+  emptiness into `None`, boto3's documented provider-chain signal. An empty *string* is
+  an explicit credential to botocore: it stops at the first resolver and signs with an
+  empty identity, so passing it straight through made the key-free path inert. Both
+  halves are load bearing, which is why the config defaults are empty as well: a non-empty
+  default would arrive at the builder as a real credential and the chain would never be
+  consulted. Half a pair (one value set, the other empty) still raises
+  `PartialCredentialsError` at construction rather than quietly resolving an ambient
+  identity.
 - **Operations used** (`apps/api/src/curie_api/storage.py::BundleStore`): `head_bucket`, `create_bucket`,
   `head_object`, `put_object` (with `Body`, `ContentType`), `get_object` (reads
   `obj["Body"].read()`). The current S3 backing uses exactly these five calls, path-style;
@@ -50,7 +71,8 @@ Cloudflare R2) needs no code, only env/settings:
 
 ## Implementations today
 
-One backend (S3/RustFS) behind the port, plus the chart's AWS CLI init:
+One backend (S3/RustFS) behind the port, reached by one boto3 builder and three
+AWS CLI shell sites:
 
 - **`ObjectStore` port** — `apps/api/src/curie_api/storage.py` (`Protocol`: the
   five ops + the write-once contract). Consumers (`deps`/`gitflow`/`deploy`) type
@@ -61,16 +83,55 @@ One backend (S3/RustFS) behind the port, plus the chart's AWS CLI init:
   Protocol (the read-only slice of the port; the worker does not import the API
 package) with `BundleStore` as its S3/RustFS backing.
 - **Chart bundle-fetch init** — `charts/curie/templates/agent-sandbox.yaml`
-  uses the AWS CLI, still a third dialect of the same S3 protocol.
+  uses the AWS CLI (`aws s3 cp` after `aws configure set default.s3.addressing_style path`),
+  a second dialect of the same S3 protocol. It has its own key-free branch, gated on
+  the same `curie.rustfs.staticCredentials` helper (`charts/curie/templates/_helpers.tpl`)
+  the api and worker Deployments use.
+- **Chart bucket bootstrap** — `charts/curie/templates/rustfs.yaml`, a post-install
+  hook Job running `aws s3api head-bucket`/`create-bucket` against the in-chart store.
+  Renders only under `rustfs.deploy: true`, which is the static-credential case by
+  construction, so the key-free path never reaches it.
+- **Operator store migration** — `curie cluster migrate-store`
+  (`cli/src/migrate_store.rs`, its export/import/listing command builders):
+  `aws s3 sync`/`mb`/`ls` run by `kubectl exec` inside a staging pod, deliberately
+  with no S3 client in the CLI itself. Also in-cluster-store only (it addresses the
+  chart's own `minio`/`rustfs` StatefulSet and reads that store's password from the
+  release Secret), so it likewise never sees the key-free path.
 
 ## Known leakage
 
-The port now names the contract, but two physically separate S3 clients remain
-(API/worker) plus the chart's AWS CLI init. Fully unifying the client construction
-and the AWS CLI path is left for when a second, non-S3 backend actually lands, at
-which point the adapter is a drop-in `ObjectStore`/`BundleReader` rather than a
-three-site sweep. Building that adapter ahead of a real non-S3 customer is still
-out of scope (ADR-0007, ADR-0026).
+**Client construction is no longer a leak.** The two hand-aligned boto3 sites (API
+and worker, plus a worker eval fixture) collapsed into one shared builder in #501:
+`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client` is the only
+`boto3.client("s3", ...)` call in the repo, and every Python consumer imports it. A
+second, non-S3 backend has one Python construction site to displace, not three.
+
+**The AWS CLI is the remaining dialect, in three shell sites.** The sandbox
+bundle-fetch init (`charts/curie/templates/agent-sandbox.yaml`), the in-chart bucket
+bootstrap Job (`charts/curie/templates/rustfs.yaml`), and the operator migration verb
+(`cli/src/migrate_store.rs`) each speak S3 as `aws` shell invocations that no Python
+port can cover. Only the first of the three is on the hot path of a BYO store: the
+other two address the chart's own in-cluster store, which cannot be swapped without
+replacing those templates anyway. So a non-S3 backend breaks the bundle-fetch init
+container, and `curie cluster migrate-store` is an S3-only operator path that has no
+meaning against it at all. Unifying that path is still deferred until a real non-S3
+backend lands (ADR-0007, ADR-0026); building the adapter first is out of scope.
+
+**Key-free auth is contract the Protocol does not carry** (#1325, #1559). The
+"empty credential means resolve an ambient identity" rule lives in construction and
+config, not in `ObjectStore`, which has no credential surface at all. A second backend
+therefore inherits the obligation without the port stating it: an operator who clears
+`rustfs.auth.accessKey` expects the chart to omit every credential env var and the
+backend to fall through to a mounted web-identity token, not to run unauthenticated.
+The chart enforces the omission through one helper
+(`charts/curie/templates/_helpers.tpl`'s `curie.rustfs.staticCredentials`), which also
+refuses the clear-the-key-while-`rustfs.deploy`-is-true combination at render, since
+the in-chart RustFS has no web-identity path. The Python side then has to translate
+that omission into `None` rather than an empty string, because botocore treats the
+empty string as an explicit credential. Both halves are behavior a second backend must
+reproduce, and neither is expressible in the five-method Protocol. See
+`charts/curie/README.md` ("Key-free object store auth") for the operator-facing shape,
+including why the instance role and IMDS are deliberately unavailable.
 
 A second non-S3 backend is **two adapters, not one**: the API owns the full **async**
 `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`, `async` methods),
