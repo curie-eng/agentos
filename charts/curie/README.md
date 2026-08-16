@@ -247,9 +247,18 @@ Secrets to bring your own. `langfuse.encryptionKey` must be 64 hex chars
 (`openssl rand -hex 32`).
 
 With chart-managed init credentials and no OTel header override, the collector
-derives its header from the resolved Langfuse project secret key. With
-`langfuse.existingSecret`, provide a matching explicit
-`otelCollector.otlpAuthHeader`.
+derives its header from the resolved Langfuse project secret key, so a sealed
+install ships the generated credential rather than a published default.
+
+Upgrade note for `langfuse.existingSecret`: that Secret must now also carry an
+`otlpAuthHeader` key holding the full header value the OTel Collector sends to
+Langfuse, `Basic <base64(publicKey:secretKey)>`. The collector follows
+`langfuse.existingSecret` like every other Langfuse consumer instead of reading a
+chart-derived header it could not authenticate with, so an install already on
+this path must add that key (or set `otelCollector.otlpAuthHeader`) before
+upgrading. Without it the collector pod fails to start with
+`CreateContainerConfigError`, which is the deliberate replacement for a silent
+401 on every trace export.
 
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
@@ -258,11 +267,22 @@ would rotate live store credentials -- pin them via `--set`/`existingSecret` (or
 use the `helm install/upgrade` path / `curie cluster up`) in that case.
 
 Guard against supplied development values on a shared/production cluster with
-`--set security.checkDefaultCredentials=true`. This check compares the chart
-inputs before fresh install credential generation, so it does not inspect the
-generated Secret. It is off by default so the zero-secret bare install stays
-green. Supply explicit init values or `langfuse.existingSecret` when enabling
-the check.
+`--set security.checkDefaultCredentials=true`: the chart then refuses to render
+while `langfuse.init.projectSecretKey` or `langfuse.init.userPassword` still
+carries its published dev default (a Langfuse admin-takeover risk on a reachable
+UI; the project key also feeds the OTel Collector auth header on the
+non-`existingSecret` path). Those two checks compare the chart inputs before
+fresh-install credential generation, so they do not inspect the generated Secret.
+Override those values, or point `langfuse.existingSecret` at a Secret this chart
+does not manage, to clear them. Naming the chart's own Secret does not clear
+them, because the chart still fills those keys from those very values. A third
+condition fails the render whenever the header the collector would actually send
+is the published dev header `Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`,
+whether `otelCollector.otlpAuthHeader` is set to it directly or the chart
+composed it from the `langfuse.init` keys; `langfuse.existingSecret` does not
+clear it, because that header is what the collector sends regardless of where the
+Langfuse credential comes from. It is off by default so the zero-secret bare
+install stays green.
 
 ### Key-free object store auth
 
