@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 9 outputs behind one trait
+impls: 38 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 9 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 38 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -65,22 +65,43 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-Nine, all in the CLI crate:
+38 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
   so operator dry-run output stayed byte-identical when the seam landed. Lines come
   from `OpsCommand::display()` (already credential-masked), so this type never
   re-derives argv or reads a raw secret. It is also **composed** rather than
-  duplicated: the other outputs carry a `DryRun` variant that delegates to it.
-- **Eight command outputs** (`cli/src/commands.rs`) — `KillOutput`, `ResumeOutput`,
-  `BudgetOutput`, `OverridesOutput`, `DeleteOutput`, `VersionsOutput`, `MemoryOutput`,
-  `ApprovalsOutput`.
+  duplicated: the outputs whose verbs take `--dry-run` are enums carrying a `DryRun`
+  variant that delegates to it instead of re-rendering the plan.
+- **`cli/src/commands.rs`**, the largest group, covering the skill and agent verbs
+  and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ListAgentsOutput`,
+  `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`, `EvalOutput`,
+  `DeployOutput`, `KillOutput`, `ResumeOutput`, `BudgetOutput`, `ResetThreadOutput`,
+  `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `ApprovalsOutput`,
+  `SkillApprovalsOutput`, `OverridesOutput`.
+- **`cli/src/local.rs`** and **`cli/src/ops.rs`**, the operator verbs, one output per
+  verb per tier: `LocalUpOutput`, `LocalRebuildOutput`, `LocalStatusOutput`,
+  `LocalDownOutput`; `ClusterUpOutput`, `ClusterStatusOutput`, `ClusterDownOutput`.
+- **`cli/src/message.rs`**: `MessageDryRunOutput` and `MessageOutcomeOutput`, the
+  multi-variant outcome whose covered variant set the enum-variant walk derives (see
+  Known leakage).
+- **`cli/src/installation.rs`**: `ApplyOutput`, `DiffOutput`.
 - **`ObservabilityOutput`** (`cli/src/observability.rs`) — the tier-aware
   observability surfaces (#460). Notable as the shape the seam is for: both the local
   and cluster tiers resolve their own `Endpoint` values and return *the same* output
   type, so tier parity is structural rather than two hand-aligned printers. That
   module is a deliberate leaf and never bypasses `CliOutput`.
+- **One output each** in `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
+  (`DoctorOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
+  (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
+  `cli/src/seal.rs` (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
+
+That set is not hand-maintained prose: `cli/schema/index.json` carries one
+`CliOutput` entry per implementation, and the `syn` walk in
+`cli/tests/support/schema_inventory.rs` fails the gate
+(`cli/tests/schema_inventory.rs`) from either side, an impl with no entry
+(`UndeclaredResult`) or an entry with no impl (`ResultNotFound`).
 
 ## Known leakage
 

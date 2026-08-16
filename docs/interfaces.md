@@ -29,7 +29,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |
 | Triggers | SOFT | 3 hardcoded (Slack, GH push, commit poll) | not separately graded | #29 | [Triggers](interfaces/triggers/INTERFACE.md) |
-| CLI output (agent-facing `--json`) | CLEAN | 9 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
+| CLI output (agent-facing `--json`) | CLEAN | 38 outputs behind one trait | not separately graded | #456 | [CLI output (agent-facing `--json`)](interfaces/cli-output/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend

@@ -72,9 +72,27 @@ in code now:
   only keeps a redelivery of an already-terminally-handled turn from re-running; it does not
   collapse a duplicate landing while the resumed turn is still in flight. Cadence is `approval_sweep_interval_s` (env
   `APPROVAL_SWEEP_INTERVAL_S`, Helm `api.approvalSweepIntervalSeconds`, default 30s; `<= 0`
-  disables). Known gap: a failure after the flip but before the audit/enqueue (a Valkey blip,
-  a pod shutdown mid-batch) can still drop that one wakeup, since the flipped record is no
-  longer re-selected; a durable outbox to close this is tracked as follow-up.
+  disables). A failure after the flip but before the audit/enqueue (a Valkey blip, a pod
+  shutdown mid-batch) no longer drops that wakeup. Both expiry paths mark `resumed_at` only
+  once the enqueue succeeded (`crud.mark_approval_resumed`), so a flipped record with a NULL
+  `resumed_at` is an owed wake, and #418 widened the reconciler's work-list
+  (`apps/api/src/curie_api/crud.py::list_resolved_unresumed`) to include `expired` rows, which
+  the pending-guarded sweeper can never re-select. The backstop is the resume reconciler
+  (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler`, #411), which re-enqueues
+  every owed wake past a grace horizon (`resume_reconciler_grace_seconds`, default 900s,
+  deliberately longer than the worker's maximum single turn so a re-enqueue cannot steer a
+  live one) and, since #532, first runs
+  `ResumeReconciler.reopen_dead_lettered_resumes` to re-open an approval whose *delivered*
+  resume turn died at the worker's ADR-0039 delivery cap and was dead-lettered (`resumed_at`
+  set, so the NULL-gated finder alone would never re-select it). Residual: the backstop is a
+  separate switch (`resume_reconciler_enabled`, env `RESUME_RECONCILER_ENABLED`, Helm
+  `api.resumeReconciler.enabled`, default on), and with it off nothing retries a lost expiry
+  wake at all, which the sweeper's own failure log states outright (the resolve endpoint
+  compensates for the same switch by re-raising its enqueue failure as a 500 instead of
+  deferring, `apps/api/src/curie_api/routers/approvals.py`, but a sweeper flip has no caller
+  to raise to). The reconciler is a backstop, not an unconditional exactly-once guarantee: a
+  worker retry loop can keep a turn live past the grace after an inline mark failure, for
+  which a worker-side in-flight lease is the named follow-up.
 - **The permission gate (landed, #245).** Per-agent config
   (`agents.approval_required_tools`, forwarded as `CURIE_APPROVAL_REQUIRED_TOOLS` by the
   worker binding) marks tools approval-required; the runner intercepts those calls
@@ -144,6 +162,21 @@ in code now:
   the legitimate text-only decision and false-passes on an incidental non-allowlisted tool. A
   signal this weak must not gate a terminal status, so it ships observe-only and earns data for
   a later enforce decision (#559).
+- **The resume-boot decision fact (landed, #889, ADR-0076 Stone 3).** A third resume-boot key,
+  `CURIE_APPROVAL_DECISION` (`DECISION_ENV`,
+  `apps/worker/src/curie_worker/binding.py::BindingResolver.approval_decision`), completes the
+  resume-boot env contract alongside `GRANT_TOOL_ENV` and `RESUMED_KIND_ENV`. Like
+  `RESUMED_KIND_ENV` it is **authority-free**: it confers nothing and only reports an outcome
+  the worker already resolved. It differs from that marker in two ways. It carries all three
+  terminal statuses (`approved`, `rejected`, `expired`), not just the approved case, so a
+  rejected or expired gate is observable too; `pending` is never returned. And it is consumed
+  purely as telemetry, stamped on the turn's root span as `gen_ai.approval.decision`
+  (`runner/src/curie_runner/otel.py`), which is what closes the "did an approval get requested"
+  gap ADR-0038 named open. It is **agent-bound** on the same terms as the grant: an unknown
+  approval, one belonging to another agent, a non-approval event id, or a still-pending record
+  all yield None and inject nothing, so a channel rebind cannot leak the fact across agents. It
+  is a declared `BootEnv` field on the frozen ACI contract
+  (`packages/aci-protocol/src/aci_protocol/session.py::BootEnv`), not a runner-local knob.
 - **The policy/route/audit layer (landed, #247; route resolution hardened, #544, ADR-0046).**
   The bundle manifest's `approvalPolicy`
   gates (schema + deploy validation from #273) are consumed at runner boot
@@ -195,17 +228,44 @@ runtime name. For a bundle-declared MCP tool that live name is
 .claude-plugin/plugin.json `name` and `<server>` is the `.mcp.json` server key,
 for example `mcp__plugin_github-issues_github__create_issue`.
 
+A bundle's `connectors.yaml` connectors (ADR-0086) are the exception, and they
+are namespaced differently: the runner mounts a connector straight onto the
+SDK's `mcp_servers` map rather than loading it as a plugin, so its live name is
+the bare `mcp__<connector>__<tool>` with no `plugin_<bundle>_` infix (#1495).
+
 **Since #703**, `build_approval_gate` (`runner/src/curie_runner/approval.py`)
-normalizes each operator-supplied name to its effective form before arming:
-a bare `mcp__<server>__<tool>` shorthand is rewritten to the
-`mcp__plugin_<bundle>_<server>__<tool>` name when `<server>` matches a
-bundle-declared MCP server. Built-in tool names and already-effective
-`mcp__plugin_...` names pass through verbatim. There is no verbatim carve-out
-for an `mcp__`-shaped name that names no other server form. If an
-`mcp__`-shaped name cannot be resolved to a declared bundle server, the
-runner refuses to boot with `ApprovalPolicyError` rather than arming nothing
--- previously this failed open: an unresolvable shorthand silently never
-matched and the gated tool ran with no approval whatsoever.
+normalizes each operator-supplied name to its effective runtime form before
+arming, delegating to
+`packages/plugin-format/src/plugin_format/approval_policy.py::effective_operator_gates`.
+That helper is deliberately SHARED with the deploy-time validator, so a gate
+name that validates green resolves identically at runtime rather than the two
+paths normalizing separately and disagreeing.
+
+**Normalization returns a UNION of live names, not one rewrite (#1564).** Every
+naming rule contributes the live name it would arm and none of them returns on
+its own match: a built-in (no `mcp__` prefix) arms verbatim and short-circuits,
+since no other rule can read it; a `mcp__<server>__<tool>` naming a declared
+`connectors.yaml` server arms unchanged; the same shape naming a declared bundle
+MCP server arms the rewritten `mcp__plugin_<bundle>_<server>__<tool>`; and an
+already-`mcp__plugin_`-prefixed name arms verbatim **only when it matches an
+expected `mcp__plugin_<bundle>_<server>__` prefix for a declared server**, never
+blindly. One name routinely satisfies several of those rules and nothing in the
+inputs says which server actually hosts the tool, so returning on the first
+match would pick a reading by branch ordering. Because `build_can_use_tool`
+compares by exact string equality, every live name the ordering skipped would
+gate nothing at all, silently. Over-arming costs at most one approval card for a
+tool nobody calls; under-arming is a total fail-open. Where a server name itself
+contains `__`, the server is resolved by matching against the declared set
+(longest match wins) rather than splitting at the first `__`.
+
+There is no verbatim carve-out for an `mcp__`-shaped name that no rule can
+verify. When the union comes out empty, or the inputs are refused outright (an
+unreadable `.mcp.json`/manifest/`connectors.yaml`, or a declared connector and a
+declared MCP server colliding on the same name, which has two different live
+forms and no principled winner), the runner refuses to boot with
+`ApprovalPolicyError` rather than arming nothing -- previously this failed open:
+an unresolvable shorthand silently never matched and the gated tool ran with no
+approval whatsoever.
 
 Confirm the exact live name before arming a gate rather than guessing it.
 `curie skill check` prints a `match: <server> -> plugin:<bundle>:<server>`
@@ -404,4 +464,4 @@ actor is established*.
 
 - **Epic(s):** [#22](https://github.com/curie-eng/curie/issues/22) — approval gates and human-in-the-loop; adds the durable record, `awaiting-approval` status, `canUseTool` gate, and the authorizer interface.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — not one of the six graded jobs; a cross-cutting core lifecycle change, not separately graded.
-- **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Proposed); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).
+- **ADR(s):** [ADR-0010](../../adr/0010-approval-gates-and-human-in-the-loop.md) — Approval gates and human-in-the-loop (Accepted); grounds this intended line, including the authorizer sequence (channel membership first, then user-group, explicit user-list, platform-RBAC). [ADR-0034](../../adr/0034-approval-authorizers-resolve-membership-in-the-api.md) — Approval authorizers resolve membership in the API (Accepted); adds the user-group and user-list sets, the API-resident membership lookup, the scoped fail-closed rule, and fresh-read binding resolution. Supersedes ADR-0010's framing of those four as `Authorizer` implementations: they are approver SETS behind one authorizer, and platform-RBAC becomes the fourth set. Composes with [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) (stateless-first suspend/resume, the pause mechanism).

@@ -83,13 +83,43 @@ key. `NullMemoryStore` is the no-ref sink.
   `StateApiMemoryStore.replace` is a blind PUT of the log key; `NullMemoryStore`
   and any read-only backing make consolidation a reporting-only no-op. Automatic
   learned-record *extraction* remains later work.
-- **No query.** There is still no query language on the port. The load-bearing
-  constraint remains: **memory lives OUTSIDE the sandbox** (ADR-0003) — the store
-  is network-reachable and rehydratable, not pod-local state.
+- **An operator read/write plane sits below the port, not on it.** The
+  inspect, trace-back, edit, and delete surface (#266, #267) is
+  `apps/api/src/curie_api/routers/memory.py`
+  (`apps/api/src/curie_api/routers/memory.py::list_memory`,
+  `apps/api/src/curie_api/routers/memory.py::memory_trace_back`,
+  `apps/api/src/curie_api/routers/memory.py::edit_memory`,
+  `apps/api/src/curie_api/routers/memory.py::delete_memory`), and it never goes
+  through `MemoryStore`. It reads and mutates the backing
+  `apps/api/src/curie_api/models.py::WorkflowStateEntry` row with SQLAlchemy
+  directly (edit and delete are compare-and-set on that row's `version`), keeps
+  its own copy of the log coordinates
+  (`apps/api/src/curie_api/routers/memory.py::MEMORY_NAMESPACE` and
+  `apps/api/src/curie_api/routers/memory.py::MEMORY_LOG_KEY`, mirroring the
+  runner's `runner/src/curie_runner/memory.py::MEMORY_LOG_KEY`), re-declares the
+  `{content, provenance}` item shape in
+  `apps/api/src/curie_api/routers/memory.py::_records_of`, and borrows the state
+  router's size caps (`apps/api/src/curie_api/routers/state.py::_enforce_caps`).
+  Its consumers are the CLI (`cli/src/api.rs`, behind `curie local memory` and
+  `curie cluster memory`) and the console (`apps/ui/src/api/client.ts`). Unlike
+  the sandbox path it is platform-key-only (`require_api_key`), so the scoped
+  memory token cannot reach it. This is coherent today (one loader, one backing
+  store, and the router says so in its own docstring), but it is the precise leak
+  a real second loader would trip over: an `s3://` store would satisfy the port
+  and still leave every operator read returning an empty list and every edit and
+  delete 404ing, because the operator plane is addressing a Postgres row that
+  loader never writes.
+- **No query on the port; the query and edit surface lives below it.** The port
+  is still `load`/`append` (plus optional `replace`), with no query language, and
+  the runner reads the whole log. Listing, trace-back, edit, and delete do exist
+  in the system, as the operator plane above rather than as port methods. The
+  load-bearing constraint remains: **memory lives OUTSIDE the sandbox**
+  (ADR-0003) — the store is network-reachable and rehydratable, not pod-local
+  state.
 
 ## Cross-links
 
 - **Epic(s):** [#28](https://github.com/curie-eng/curie/issues/28) — the memory port, `CURIE_MEMORY_REF` resolution, provenance record shape
 - **Issue:** [#264](https://github.com/curie-eng/curie/issues/264) — this first loader
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — memory is not one of the six swap-readiness Jobs; not separately graded
-- **ADR(s):** [ADR-0025](../../adr/0025-memory-port-and-first-loader.md) — the port + first loader; [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) — stateless-first; rehydrate on resume; externalize session state
+- **ADR(s):** [ADR-0025](../../adr/0025-memory-port-and-first-loader.md) — the port + first loader; [ADR-0003](../../adr/0003-stateless-first-rehydrate-on-resume.md) — stateless-first; rehydrate on resume; externalize session state; [ADR-0095](../../adr/0095-tiered-memory-lifecycle.md) (**Draft**, would supersede ADR-0025 on acceptance) — a tiered agent-plus-channel memory lifecycle; Draft, so nothing here is built to it yet
