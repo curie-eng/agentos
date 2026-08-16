@@ -103,6 +103,37 @@ if [ "$1" = get ] && [ "$2" = values ]; then
     exit 0
 fi
 if [ "$1" = template ]; then
+    case " $* " in
+        *" --show-only templates/priorityclass.yaml "*)
+            case " $* " in
+                *" --set priorityClasses.sandbox.create=false "*)
+                    cat <<'YAML'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: curie-platform
+value: 1000000
+globalDefault: false
+YAML
+                    ;;
+                *" --set priorityClasses.platform.create=false "*)
+                    cat <<'YAML'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: curie-sandbox
+value: 100000
+globalDefault: false
+YAML
+                    ;;
+                *)
+                    printf 'unexpected PriorityClass render: %s\n' "$*" >&2
+                    exit 64
+                    ;;
+            esac
+            exit 0
+            ;;
+    esac
     if [ "${CURIE_TEST_HELM_MIXED_STATEFULSETS:-}" = 1 ]; then
         cat <<'YAML'
 apiVersion: apps/v1
@@ -200,6 +231,10 @@ unexpected() {{
     exit 64
 }}
 case "$verb $object" in
+'get priorityclass')
+    # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
+    :
+    ;;
 'get statefulset')
     if [ "${{CURIE_TEST_KUBECTL_FAIL:-}}" = 1 ]; then
         printf '%s\n' '{KUBECTL_UNREACHABLE}' >&2
