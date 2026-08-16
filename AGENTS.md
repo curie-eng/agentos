@@ -457,20 +457,28 @@ Before accepting PRs against either branch, an administrator must protect both
 and must prohibit force pushes and branch deletion. Do not use an unprotected
 release train branch.
 
-After a fix merges to `main`, merge `main` forward into `next` promptly through
-a PR. Do not routinely cherry pick fixes between release lines. When v0.7 is
-ready, merge `next` into `main`, then run every parity ladder rung on the
-resulting `main` commit:
+Bug fixes, security fixes, and anything shared by both lines land on the stable
+`main` line first. v0.7 features land on `next`.
+
+To cut a v0.7.0 release candidate, merge `main` into `next` through a PR, tag
+the release candidate on `next`, and test that candidate extensively. The
+forward merge from `main` into `next` happens at release candidate prep, not
+after every individual fix. Do not routinely cherry pick fixes between release
+lines.
+
+When a release candidate is accepted, merge `next` into `main`, then run every
+parity ladder rung on the resulting `main` commit:
 
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag v0.7.0 from `main` only after both commands pass. Only an administrator may
-retire `next`. Before deleting it, the administrator must merge one release
-workflow and contract test change that removes `next` from the workflow trigger
-branch list, removes the `RELEASE_NEXT_BRANCH` environment alias, removes the
+Tag the final v0.7.0 release on `main` only after both commands pass. Only an
+administrator may retire `next`. Before deleting it, the administrator must
+merge one release workflow and contract test change that removes `next` from the
+workflow trigger branch list, removes the `RELEASE_NEXT_BRANCH` environment
+alias, removes the
 `--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
 `release/tests/test_authorize.py`. After that change lands, the administrator
 may temporarily remove protection and delete `next`, while keeping `main`
@@ -483,7 +491,11 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 `release/tests/test_authorize.py` before accepting PRs against it.
 
 - Commit message format: a short imperative summary line, then detail bullets.
-- Reference the relevant issue in the PR body (e.g. `Closes #123`).
+- Reference the relevant issue in the PR body (e.g. `Closes #123`). GitHub only
+  auto closes an issue when the PR merges into the default branch, so a closing
+  keyword in a PR that targets `next` never fires on its own. Issues referenced
+  by a `next` targeted PR are closed at the `next` into `main` merge, where the
+  magic words fire once on the default branch.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
   CI enforces this on every PR (issue #962); check before pushing with:
