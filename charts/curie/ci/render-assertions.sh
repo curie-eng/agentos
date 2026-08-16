@@ -114,13 +114,13 @@ check_generated_key() {
   echo "  ok: $key was generated (not the published default)"
 }
 
-echo "=== Assertion 1: sealed render GENERATES (no published default) ==="
+echo "=== Assertion 1a: sealed render GENERATES (no published default) ==="
 for key in "${KEYS[@]}"; do
   check_generated_key "$SEALED" "$key" "sealed render" \
     || fail "sealed render did not generate '$key'; see the message above."
 done
 
-echo "=== Assertion 1 negative control: published Langfuse init values FAIL the sealed detector ==="
+echo "=== Assertion 1b negative control: published Langfuse init values FAIL the sealed detector ==="
 for key in langfuseInitProjectSecretKey langfuseInitUserPassword; do
   negative_output=""
   if negative_output="$(check_generated_key "$DEV" "$key" "development negative control" 2>&1)"; then
@@ -132,7 +132,12 @@ for key in langfuseInitProjectSecretKey langfuseInitUserPassword; do
   echo "  ok: published $key is rejected (the detector can fail)"
 done
 
-echo "=== Assertion 1: sealed Langfuse init credentials are 32 alphanumeric chars ==="
+# Langfuse accepts this generated shape: its env schema defines
+# LANGFUSE_INIT_PROJECT_SECRET_KEY as an optional string, without an `sk`
+# prefix constraint, and initialization passes it through as the predefined
+# project secret key. See https://github.com/langfuse/langfuse/blob/bf78bcefd23f43bbd8d04c263f31b70ca2f1ec29/web/src/env.mjs and
+# https://github.com/langfuse/langfuse/blob/bf78bcefd23f43bbd8d04c263f31b70ca2f1ec29/web/src/initialize.ts.
+echo "=== Assertion 1c: sealed Langfuse init credentials are 32 alphanumeric chars ==="
 for key in langfuseInitProjectSecretKey langfuseInitUserPassword; do
   val="$(read_key "$SEALED" "$key")"
   if [[ ! "$val" =~ ^[[:alnum:]]{32}$ ]]; then
@@ -158,7 +163,7 @@ for key in "${KEYS[@]}"; do
   echo "  ok: $key == published default (deterministic dev path)"
 done
 
-echo "=== Assertion 4: explicit override wins on the sealed path ==="
+echo "=== Assertion 4a: explicit override wins on the sealed path ==="
 # On the sealed path (no allowDevDefaults, empty offline `lookup`), an operator
 # `--set` that differs from the published default must be honored verbatim rather
 # than generated -- this proves the override branch sits ahead of generation.
@@ -196,7 +201,7 @@ assert_otlp_auth_agrees() {
   echo "  ok: $label OTel Basic auth agrees with the rendered project secret"
 }
 
-echo "=== Assertion 4: default OTel auth uses the resolved Langfuse project secret ==="
+echo "=== Assertion 4b: default OTel auth uses the resolved Langfuse project secret ==="
 assert_otlp_auth_agrees "$SEALED" "pk-lf-curie-dev" "sealed render"
 assert_otlp_auth_agrees "$OVERRIDE" "pk-lf-curie-dev" "credential override render"
 
@@ -682,7 +687,7 @@ helm template runner-api-render "$CHART" --namespace runner-api-namespace \
 python3 "$RUNNER_API_CHECK" "$RUNNER_API_OFF_OUT" absent \
   || fail "api.deploy=false did not remove the runner sandbox API egress allowance."
 
-echo "=== Assertion 12: api.githubToken is passed through, never generated (#1109, #1124) ==="
+echo "=== Assertion 12a: api.githubToken is passed through, never generated (#1109, #1124) ==="
 # The one OPTIONAL credential in this Secret. curie.managedSecret GENERATES when
 # the value equals its default, which for an optional token means 32 characters
 # of noise sent to GitHub as a bearer token, failing auth in a way that reads
@@ -728,7 +733,7 @@ for key in "${KEYS[@]}"; do
 done
 echo "  ok: githubToken is not in the generated-key list"
 
-echo "=== Assertion 12 negative control: routing githubToken through curie.managedSecret FAILS ==="
+echo "=== Assertion 12b negative control: routing githubToken through curie.managedSecret FAILS ==="
 # Mandatory, per Assertion 7's convention: an assert that has never been shown
 # failing is not a pin, and the three checks above all pass at base. Mutate a
 # TEMP COPY of the chart (never the real template) into exactly the #1109
@@ -754,7 +759,7 @@ if check_github_token_empty "$GHT_MUTANT_RENDER" "mutant (githubToken via curie.
 fi
 echo "  ok: a generated githubToken is rejected (the assert can fail)"
 
-echo "=== Assertion 12: worker API URL wiring (#1529) ==="
+echo "=== Assertion 12c: worker API URL wiring (#1529) ==="
 WORKER_API_CHECK="$TMP/check_worker_api_url.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'
 import sys
