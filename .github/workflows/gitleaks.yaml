@@ -32,8 +32,9 @@ jobs:
           persist-credentials: false
           # fetch-depth: 0 pulls the entire history so `gitleaks detect` scans
           # every commit, not just the tip. Pull request scans use an explicit
-          # base to head range below; push, scheduled, and manual scans remain
-          # full history.
+          # base to head range below, and push scans use the pushed commit's own
+          # history; scheduled and manual scans remain full history across every
+          # ref.
           fetch-depth: 0
       # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
       # third-party dependency (a tool binary, an image, a registry session, a
@@ -74,6 +75,16 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           echo "GITLEAKS_LOG_OPTS=--log-opts=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_ENV"
+      # Without a log range gitleaks scans every ref the `fetch-depth: 0`
+      # checkout pulled down, so a push to a release branch also scanned every
+      # unmerged feature branch and a finding on one of them reddened the
+      # release branch (#1592). Scoping to the pushed commit's own history keeps
+      # the branch answerable for what is actually on it, and stays full history
+      # for that branch so a secret added and later deleted is still caught.
+      - name: Scope gitleaks to the pushed branch history
+        if: github.event_name == 'push'
+        run: |
+          echo "GITLEAKS_LOG_OPTS=--log-opts=--full-history ${{ github.sha }}" >> "$GITHUB_ENV"
       # Run gitleaks from its official public image rather than the marketplace
       # action: the action requires a paid GITLEAKS_LICENSE for organization
       # accounts, while the CLI/image is MIT-licensed and free. Pinned to an
@@ -87,8 +98,39 @@ jobs:
       # reference now lives in this job's `env:` block as `GITLEAKS_IMAGE`, so
       # the pull step above and the scan below share one pinned tag and digest.
       - name: Run gitleaks
+        id: scan
         run: |
           docker run --rm -v "${{ github.workspace }}:/repo" \
             "$GITLEAKS_IMAGE" \
             detect --source /repo --redact --verbose --exit-code 1 \
+            --report-path /repo/gitleaks-report.json \
             ${GITLEAKS_LOG_OPTS:+"$GITLEAKS_LOG_OPTS"}
+      # The scheduled sweep and manual dispatches stay deliberately wide, so a
+      # finding there can come from any ref and the commit alone does not say
+      # which. Mapping each reported commit back to the refs that contain it is
+      # what makes a red sweep actionable instead of a hunt.
+      #
+      # `git for-each-ref --contains`, not `git branch --all --contains`: the
+      # wide sweep walks every ref the `fetch-depth: 0` checkout pulled down,
+      # tags included, and this repository carries `v0.1.0` through `v0.6.0`
+      # plus `backup/*` refs. A finding on a commit reachable only from a tag
+      # (or whose branch has since been deleted) printed a bare colon with
+      # nothing after it under the branch-only form, which is exactly the
+      # non-actionable output this step exists to prevent. The empty case is
+      # spelled out for the same reason.
+      #
+      # Keyed on `conclusion`, not `outcome`: the scan carries no
+      # `continue-on-error` so the two read the same here, and `steps.*.outcome`
+      # is the retry-guard marker the eligibility gate polices
+      # (tools/ci-retry-gate). This step reports on a failure, it never reruns
+      # the scan, and it must not read as a retry wrap around it.
+      - name: Name the refs each finding came from
+        if: failure() && steps.scan.conclusion == 'failure'
+        run: |
+          set -euo pipefail
+          test -f gitleaks-report.json || exit 0
+          jq -r '.[].Commit' gitleaks-report.json | sort -u | while read -r sha; do
+            refs=$(git for-each-ref --contains "$sha" --format='%(refname:short)' \
+              refs/heads refs/remotes refs/tags | paste -sd', ' - || true)
+            echo "$sha appears on: ${refs:-no ref contains this commit (unreachable or dangling object)}"
+          done
