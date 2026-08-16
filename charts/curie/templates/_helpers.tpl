@@ -202,6 +202,16 @@ true
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Base URL of the platform API for a first-party service that calls it. Call
+     with a dict: root (the top context) and baseUrl (the caller's own BYO
+     override). An empty override derives the in-chart API Service; a set value
+     renders verbatim and is the BYO answer, including when api.deploy is false.
+     Keep this separate from curie.env.api so callers such as the mail adapter
+     can receive the API URL without also receiving the platform API key. */}}
+{{- define "curie.api.url" -}}
+{{- .baseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .root) .root.Values.api.service.port) -}}
+{{- end -}}
+
 {{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
      and the operand the default-credential gate judges. The header this chart
      actually emits is resolved in secrets.yaml, from the managed-secret value
@@ -613,7 +623,7 @@ service:
 # the only correct one when api.deploy is false. The port comes from
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
-  value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+  value: {{ include "curie.api.url" (dict "root" . "baseUrl" .Values.dispatcher.apiBaseUrl) | quote }}
 {{- end -}}
 
 {{- define "curie.env.apiKey" -}}
