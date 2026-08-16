@@ -115,12 +115,19 @@ helm install curie-dev charts/curie -n curie-dev --create-namespace \
 kubectl get pods -n curie-dev -w
 ```
 
-Reach the Langfuse UI:
+Reach the Langfuse UI after a stock install:
 
 ```bash
 kubectl port-forward -n curie svc/curie-langfuse-web 3000:3000
-# http://localhost:3000  -- dev keys: pk-lf-curie-dev / sk-lf-curie-dev
+# http://localhost:3000
+kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitProjectSecretKey}' | base64 -d; echo
+kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitUserPassword}' | base64 -d; echo
 ```
+
+Log in as `dev@curie.local` with the retrieved admin password. The first
+command retrieves the project secret key for API and OTel authentication.
+The development overlay retains the published development keys
+`pk-lf-curie-dev` and `sk-lf-curie-dev`.
 
 App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
 straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
@@ -221,20 +228,28 @@ Flipping any to `false` removes its resources from the render; consumers
 (Langfuse env, the collector config) repoint at the BYO host automatically.
 
 Secrets: all credentials are written to one `<release>-secrets` Secret. A sealed
-`helm install` (the default) AUTO-GENERATES a strong random per release for the
-nine chart-owned credentials (the backing-store passwords, the Langfuse
-salt/encryptionKey/nextauthSecret, and the api/webhook keys) rather than shipping
-the published dev defaults. The generated values are persisted via a `lookup` of
-the release Secret, so `helm upgrade` re-uses them and never rotates a live store
-credential (the Bitnami lookup-persist convention). Set
-`security.allowDevDefaults: true` (values-dev.yaml, i.e. `curie cluster up
---dev`) to keep the deterministic published defaults for dev/CI. A per-store
-`existingSecret` and explicit `--set` overrides still win in every mode -- an
-override that differs from the published default beats the persisted value on
-install AND upgrade (matching Bitnami's provided-value-first precedence), so
-rotation/recovery works; point `langfuse.existingSecret` (and each store's
-`existingSecret`) at your own Secrets to bring your own. `langfuse.encryptionKey`
-must be 64 hex chars (`openssl rand -hex 32`).
+`helm install` (the default) generates strong random values for all eleven
+chart owned credentials: the backing store passwords, Langfuse
+salt/encryptionKey/nextauthSecret, the two Langfuse init credentials, and the
+api/webhook keys. Set `security.allowDevDefaults: true` (values-dev.yaml, i.e.
+`curie cluster up --dev`) to keep the deterministic published defaults for
+dev/CI.
+
+The nine non init credentials persist through `lookup`, so `helm upgrade`
+re-uses them. Their explicit `--set` overrides and per store `existingSecret`
+values take precedence for rotation or recovery. The Langfuse init project
+secret and user password are first boot inputs. A fresh install generates them,
+but changing them during an upgrade does not rotate records already initialized
+in Langfuse. Existing releases need Langfuse side rotation and coordinated
+consumer Secret updates. This chart does not perform that migration. Point
+`langfuse.existingSecret` (and each store's `existingSecret`) at your own
+Secrets to bring your own. `langfuse.encryptionKey` must be 64 hex chars
+(`openssl rand -hex 32`).
+
+With chart-managed init credentials and no OTel header override, the collector
+derives its header from the resolved Langfuse project secret key. With
+`langfuse.existingSecret`, provide a matching explicit
+`otelCollector.otlpAuthHeader`.
 
 Caveat: generation relies on Helm `lookup`, which is empty under client-side
 rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
@@ -242,13 +257,12 @@ client-side Helm (no live API lookup) regenerates these values on every sync and
 would rotate live store credentials -- pin them via `--set`/`existingSecret` (or
 use the `helm install/upgrade` path / `curie cluster up`) in that case.
 
-Guard against shipping those dev defaults to a shared/production cluster with
-`--set security.checkDefaultCredentials=true`: the chart then refuses to render
-while `langfuse.init.projectSecretKey` or `langfuse.init.userPassword` still
-carries its published dev default (a Langfuse admin-takeover risk on a reachable
-UI; the project key also feeds the OTel Collector auth header). Override those
-values or supply `langfuse.existingSecret` to clear the gate. It is off by
-default so the zero-secret bare install stays green.
+Guard against supplied development values on a shared/production cluster with
+`--set security.checkDefaultCredentials=true`. This check compares the chart
+inputs before fresh install credential generation, so it does not inspect the
+generated Secret. It is off by default so the zero-secret bare install stays
+green. Supply explicit init values or `langfuse.existingSecret` when enabling
+the check.
 
 ### Key-free object store auth
 
