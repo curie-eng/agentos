@@ -82,8 +82,10 @@ langfuse:
   salt: dev-salt-change-me
   nextauthSecret: dev-nextauth-secret-change-me
   existingSecret: ""
-  # Headless bootstrap: seeds a fixed org/project + keys on first boot so the
-  # OTel trace path authenticates with no manual key-minting. Dev values.
+  # Headless bootstrap seeds a fixed org/project on first boot. The project
+  # secret key and user password are first boot inputs. Fresh chart installs
+  # generate them unless development defaults are enabled; changing them during
+  # an upgrade does not rotate Langfuse records already initialized. Dev values.
   init:
     orgId: curie
     orgName: Curie
@@ -481,10 +483,12 @@ otelCollector:
   image: otel/opentelemetry-collector-contrib:0.119.0
   # Full `Authorization` header, `Basic <base64(publicKey:secretKey)>`, in three
   # branches. Set here, it always wins and is stored in the chart-managed Secret.
-  # Left empty with langfuse.existingSecret set, the collector reads an
-  # otlpAuthHeader key from that Secret and the chart emits none of its own.
-  # Left empty with no existingSecret, it is derived from the langfuse.init keys
-  # at render time. Setting it to the published dev header trips
+  # Left empty with chart managed init credentials, it is derived from the
+  # resolved project key at render time, so a sealed install ships the generated
+  # credential. Left empty with langfuse.existingSecret set, the collector reads
+  # an otlpAuthHeader key from that Secret and the chart emits none of its own --
+  # that Secret must carry the key or the collector pod fails with
+  # CreateContainerConfigError. Setting it to the published dev header trips
   # security.checkDefaultCredentials.
   otlpAuthHeader: ""
   service:
@@ -770,6 +774,7 @@ dispatcher:
 worker:
   deploy: true
   replicas: 1
+  terminationGracePeriodSeconds: 1800
   image:
     repository: ghcr.io/curie-eng/curie-worker
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -1383,32 +1388,31 @@ security:
   # langfuse.init.userPassword) still carries the published dev default from this
   # file -- the published admin password is a Langfuse admin-takeover risk on a
   # reachable UI, and on the non-existingSecret path the project secret key also
-  # feeds the OTel Collector auth header. Clear those two checks by overriding
-  # those values or by pointing
-  # langfuse.existingSecret at a Secret this chart does not manage (the secretKeyRef
-  # escape, keys langfuseInitProjectSecretKey
+  # feeds the OTel Collector auth header. These two checks compare chart inputs
+  # before managed secret resolution. Clear them by overriding those values or by
+  # pointing langfuse.existingSecret at a Secret this chart does not manage (the
+  # secretKeyRef escape, keys langfuseInitProjectSecretKey
   # + langfuseInitUserPassword + otlpAuthHeader). Naming the chart's own Secret does
   # NOT clear them: the chart still fills those keys from these very values, so the
-  # published defaults would still reach Langfuse and the collector. A third check refuses the
-  # published dev header on whatever the collector would actually send, whether
-  # set directly via otelCollector.otlpAuthHeader or composed by the chart from
-  # the langfuse.init keys, and is NOT cleared by langfuse.existingSecret, since
-  # that header reaches the collector on every path. Off by default so the flagship zero-secret bare
+  # published defaults would still reach Langfuse and the collector. A third check
+  # refuses the published dev header on whatever the collector would actually send,
+  # whether set directly via otelCollector.otlpAuthHeader or composed by the chart
+  # from the langfuse.init keys, and is NOT cleared by langfuse.existingSecret,
+  # since that header reaches the collector on every path. Off by default so the flagship zero-secret bare
   # install stays green and the dev/e2e overlays render unchanged; flip it on for a
-  # shared/production cluster. (#57 will extend this same gate to the nine
-  # store/control-plane secrets once its design pass lands.)
+  # shared/production cluster. (#57 will extend this same gate to the remaining
+  # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` GENERATES a strong random per release for the nine
-  # chart-owned credentials (postgres, valkey, clickhouse, and RustFS secrets, the
-  # Langfuse salt/encryptionKey/nextauthSecret, and the api/webhook keys) instead
-  # of shipping the published dev defaults. Generated values are persisted via a
-  # `lookup` of the release Secret, so `helm upgrade` re-uses them and never
-  # rotates a live store credential. Set true (values-dev.yaml does) for a
-  # deterministic dev/CI render that keeps the published defaults byte-for-byte.
-  # A per-store `existingSecret` and explicit `--set` overrides still win in every
-  # mode -- an override that differs from the published default beats the persisted
-  # value on install AND upgrade, so rotation/recovery works.
+  # no-override `helm install` generates strong random values for the eleven
+  # chart owned credentials: the backing store passwords, Langfuse
+  # salt/encryptionKey/nextauthSecret, the two init credentials, and the
+  # api/webhook keys. Set true (values-dev.yaml does) for a deterministic dev/CI
+  # render that keeps the published defaults byte-for-byte. The nine non init
+  # credentials persist via `lookup`, so `helm upgrade` re-uses them. Their
+  # explicit `--set` overrides and per store `existingSecret` values support
+  # rotation and recovery. The two Langfuse init credentials are first boot
+  # inputs: changing them during an upgrade does not rotate initialized records.
   # Caveat: generation relies on Helm `lookup`, which is empty under client-side
   # rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
   # client-side Helm (no live API lookup) regenerates these values on every sync

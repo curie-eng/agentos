@@ -106,8 +106,48 @@ carry a **non-empty** placeholder key, `NO_OP_API_KEY = "not-needed"`
 non-`sk-` placeholder passes the auth gate without being mistakable for a credential.
 The credential value is never logged.
 
+The real bleed-through is above the seam: three separate copies of provider knowledge
+live outside the runner, and each can drift from it.
+
+- **A second, lagging provider registry in the CLI.** `--allow-egress-host` accepts
+  only `anthropic` and `openrouter` (the `EGRESS_PROVIDERS` table behind
+  `parse_egress_provider` in `cli/src/ops.rs`), while the runner ships `zhipu`,
+  `moonshot`, `deepseek`, and `openrouter`
+  (`runner/src/curie_runner/sdk_auth.py::PROVIDER_BASE_URLS`). The three
+  provider-native endpoints in the table above therefore have no provider name to
+  pass, so a cluster agent on Zhipu, Moonshot, or DeepSeek has to open its sandbox
+  egress with a raw `--allow-web-egress` CIDR instead. The doc comment on that table
+  still describes those three as runtime support the runner has yet to gain, which it
+  has since shipped.
+- **The CLI paste gate knows only the two prefix-routed shapes.**
+  `check_model_credential` (`cli/src/credcheck.rs`) accepts a pasted value only when
+  it starts with `sk-ant-` or `sk-or-`, so the interactive "Save Model Credential"
+  prompt (`cli/src/interactive.rs`) refuses every provider-native key the table above
+  documents: Zhipu's non-`sk-` `id.secret`, and Moonshot's and DeepSeek's bare `sk-`
+  keys. The runner accepts all three under a base-URL override, so this is a
+  paste-time check disagreeing with the resolver, not a real restriction; supplying
+  the credential through the environment or a saved secret short-circuits the prompt
+  before the check runs.
+- **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
+  for the `sk-ant-oat` prefix
+  (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`), and it is already
+  declared per harness rather than hardcoded
+  (`runner/src/curie_runner/harness/contribution.py::AuthSpec`, field
+  `oauth_token_prefix`). Above the seam the CLI (`cli/src/commands.rs`) and the
+  worker's Docker sandbox
+  (`apps/worker/src/curie_worker/sandbox/docker.py::_OAUTH_TOKEN_PREFIX`) each
+  re-declare the literal so they can decide whether to forward a credential into a
+  sandbox. The three are pinned together by the shared vector file
+  `tests/vectors/model-credential-forwarding.json`, read by
+  `apps/worker/tests/sandbox/test_vector_credential_forwarding.py` and by the vector
+  loop in the `cli/src/commands.rs` test module, so a lane that changes the rule
+  without changing the file fails its own test. That gate makes the duplication safe,
+  not absent: a second harness declaring a different `oauth_token_prefix` would leave
+  both above-seam mirrors hardcoded to Claude's.
+
 ## Cross-links
 
 - **Epic(s):** #24 — bring your own model (OpenRouter + native Anthropic-format endpoints), the seam's forward work; #46 (closed) — the Ollama local-model demo mode, which also exercises this base-URL-override + credential path.
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — core config seam, not one of the six swappable jobs.
+- **Harness declaration:** the credential shapes a harness accepts are declared, not assumed: `runner/src/curie_runner/harness/contribution.py::AuthSpec` carries `credential_env_keys` and `oauth_token_prefix`, and `build_spawn_env` is the hook the Claude harness wires to `resolve_sdk_env` (`runner/src/curie_runner/harness/claude.py::CLAUDE_CONTRIBUTION`). See [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md).
 - **ADR(s):** [ADR-0009](../../adr/0009-per-agent-connector-auth.md) — per-agent secrets and connector credentials (the model credential is the one credential the platform resolves today, via prefix mapping in `sdk_auth.py`); [ADR-0048](../../adr/0048-declared-model-wire-protocol-and-credential-keys.md) — the endpoint's wire protocol and the credential's source env var are declared rather than assumed.

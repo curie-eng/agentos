@@ -67,7 +67,7 @@ RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir ./packages/aci-protocol ./packages/plugin-format \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && /app/.venv/bin/pip install --no-cache-dir \
-        "claude-agent-sdk==0.2.126" \
+        "claude-agent-sdk==0.2.135" \
         "aiohttp==3.14.3" \
         "opentelemetry-sdk==1.44.0" \
         "opentelemetry-exporter-otlp-proto-http==1.44.0" \

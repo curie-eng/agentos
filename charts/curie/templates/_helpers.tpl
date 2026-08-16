@@ -194,8 +194,14 @@ true
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
-{{/* base64("<publicKey>:<secretKey>") for the OTel Collector's Authorization
-     header, in three branches (issue #1563):
+{{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
+     and the operand the default-credential gate judges. The header this chart
+     actually emits is resolved in secrets.yaml, from the managed-secret value
+     of the Langfuse init project secret key; this helper composes from the raw
+     .Values inputs instead, so a generated per-release credential does not
+     churn the checksum.
+
+     Three branches (issue #1563):
        1. the operator override wins whenever it is set;
        2. when the collector reads a Secret this chart does not manage, this
           renders EMPTY. The header lives in the operator's Secret, which a
@@ -205,8 +211,7 @@ true
           what keeps this helper and the secrets.yaml emission condition the
           same decision;
        3. otherwise the chart-managed Secret is the one the collector reads, so
-          the header derives from the Langfuse init keys and the trace path
-          authenticates with no manual step. */}}
+          the header derives from the Langfuse init keys. */}}
 {{- define "curie.otlpAuthHeader" -}}
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- .Values.otelCollector.otlpAuthHeader -}}
@@ -269,16 +274,21 @@ service:
 
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
-     bootstrap identity still carries the published dev default from values.yaml.
-     Unlike the nine store/control-plane secrets, these init identities seed the
-     org/project on first boot (a different lifecycle), so #57 deliberately
-     excludes them from its render-time gate; this closes that gap. The published
-     admin password is a Langfuse admin-takeover risk on a reachable UI, and on
-     the non-existingSecret path the project secret key also feeds the OTel
-     Collector auth header. The operator clears these two checks by overriding
-     the value or pointing langfuse.existingSecret at a Secret this chart does
-     not manage (the #169 secretKeyRef escape carries both keys, and on that path
-     the operator's Secret supplies otlpAuthHeader directly).
+     chart input for a bootstrap identity still carries the published dev default
+     from values.yaml. The first two checks compare INPUTS, before managed secret
+     resolution: with security.allowDevDefaults on, that input is what ships, and
+     an operator who leaves the published value in a values file has said what
+     they intend regardless of what the sealed path would have generated. These
+     init identities seed the org/project on first boot (a different lifecycle
+     from the nine store/control-plane secrets), so #57 deliberately excludes them
+     from its render-time gate; this closes that gap. The published admin password
+     is a Langfuse admin-takeover risk on a reachable UI, and on the path where
+     the chart-managed Secret is the one the collector reads, the project secret
+     key also feeds the OTel Collector auth header. The operator clears these two
+     checks by overriding the value or pointing langfuse.existingSecret at a
+     Secret this chart does not manage (the #169 secretKeyRef escape carries both
+     keys, and on that path the operator's Secret supplies otlpAuthHeader
+     directly).
 
      The guard is "does the chart-managed Secret still supply these credentials",
      written with the same existingSecret-defaults-to-our-own-Secret idiom every
@@ -310,13 +320,19 @@ service:
 {{- end -}}
 {{/* Outside the existingSecret guard on purpose (issue #1563): the header
      reaches the collector on every path, so a BYO Langfuse Secret does not make
-     the published header safe. The operand is the RENDERED header
-     (curie.otlpAuthHeader), not the otelCollector.otlpAuthHeader input, because
-     the chart composes and ships that same dev header out of the langfuse.init
-     keys whenever the chart-managed Secret is the one the collector reads, with
-     the input left empty. Reading the input would judge a value the collector
-     may never see and miss the header it actually gets. Composed via b64enc
-     rather than pasted so it cannot drift from curie.otlpAuthHeader.
+     the published header safe. That is the case this check exists for: with a
+     foreign langfuse.existingSecret the two checks above are skipped entirely,
+     and an otelCollector.otlpAuthHeader carrying the published dev credential
+     would otherwise render unchallenged.
+
+     The operand is the RENDERED header (curie.otlpAuthHeader), not the
+     otelCollector.otlpAuthHeader input, so the same expression covers the
+     override and the composed-from-langfuse.init spellings without enumerating
+     them. The composed spelling is in practice preempted by the projectSecretKey
+     check above, which fires first on exactly the inputs that would compose it;
+     reading the rendered header keeps the two in agreement rather than relying
+     on that ordering. Composed via b64enc rather than pasted so it cannot drift
+     from curie.otlpAuthHeader.
 
      THREAT MODEL, so the next reader stops enumerating spellings: this guards
      against an operator shipping this repository's published credential by
@@ -379,12 +395,12 @@ service:
           quoted `--set security.allowDevDefaults="false"` would otherwise read as
           truthy and ship the published default -- a fail-OPEN regression.
        2. Explicit override: if the operator/CLI supplied a value that differs from
-          the published default (`ne value default`), it WINS -- even on `helm
-          upgrade`. This is operator intent (a rotation, a recovery, a `--set`, or
-          an `existingSecret`-equivalent value), so it must beat the persisted
-          value; matches Bitnami's `providedPasswordValue`-first precedence. It
-          MUST sit ahead of the persist branch or an explicit rotation on
-          upgrade would be silently ignored.
+          the published default (`ne value default`), it wins even on `helm
+          upgrade`. For the nine non init credentials, this supports rotation or
+          recovery. The Langfuse init credentials are first boot inputs, so an
+          upgrade only changes the Secret; it does not rotate Langfuse records.
+          The override must sit ahead of the persist branch or an explicit value
+          on upgrade would be silently ignored.
        3. Persist existing: no override, so if a prior install already GENERATED
           this key, re-use it. `helm upgrade` must NEVER rotate a live store
           credential (Postgres would reject the new password against its persisted

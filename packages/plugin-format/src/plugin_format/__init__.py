@@ -10,7 +10,7 @@ from .approval_policy import (
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
-    effective_operator_gate,
+    effective_operator_gates,
     grantable_routes,
 )
 from .archive import (
@@ -60,7 +60,7 @@ __all__ = [
     "declared_mcp_server_names",
     "connector_server_names",
     "connector_tool_prefix",
-    "effective_operator_gate",
+    "effective_operator_gates",
     "validate_bundle",
     "ValidationResult",
     "ValidationIssue",

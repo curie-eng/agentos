@@ -1014,9 +1014,20 @@ class TestHelmCiWorkflowTriggers:
         assert "paths" not in triggers["push"]
         assert "paths-ignore" not in triggers["push"]
         assert triggers["pull_request"]["branches"] == ["main", "next"]
+        # The Python paths are not strays to tidy up: the object-store
+        # web-identity gate executes those repository files against each
+        # rendered workload, so a PR touching only them (a revert of the
+        # credential fix) must still match this filter or the gate never runs.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
             ".github/workflows/helm-ci.yaml",
+            "packages/aci-protocol/src/aci_protocol/s3.py",
+            "apps/api/src/curie_api/config.py",
+            "apps/api/src/curie_api/storage.py",
+            "apps/worker/src/curie_worker/config.py",
+            "apps/worker/src/curie_worker/bundle_store.py",
+            "uv.lock",
+            "pyproject.toml",
         ]
 
 

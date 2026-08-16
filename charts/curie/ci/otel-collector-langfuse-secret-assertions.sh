@@ -42,22 +42,60 @@ python3 - \
   "$(manifest_for "$TMP/override" otel-collector.yaml)" \
   "$(manifest_for "$TMP/override" secrets.yaml)" \
   "$(manifest_for "$TMP/selfnamed" otel-collector.yaml)" \
-  "$(manifest_for "$TMP/selfnamed" secrets.yaml)" <<'PY'
+  "$(manifest_for "$TMP/selfnamed" secrets.yaml)" \
+  "$(manifest_for "$TMP/default" langfuse.yaml)" \
+  "$(manifest_for "$TMP/selfnamed" langfuse.yaml)" <<'PY'
 import base64
 import sys
 
 import yaml
 
-DEV_HEADER = "Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg=="
 OVERRIDE_HEADER = "Basic YXNzZXJ0OmFzc2VydA=="
-# The header the chart must derive on the selfnamed render, composed from the
-# langfuse.init keys in effect there (the values.yaml defaults) rather than
-# pasted, so it cannot drift from what curie.otlpAuthHeader composes.
-SELFNAMED_DERIVED = "Basic " + base64.b64encode(b"pk-lf-curie-dev:sk-lf-curie-dev").decode()
 
 
 def docs(path):
     return [doc for doc in yaml.safe_load_all(open(path)) if doc]
+
+
+def init_project_public_key(path):
+    values = {
+        env.get("value")
+        for doc in docs(path)
+        for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+        for env in container.get("env", [])
+        if env.get("name") == "LANGFUSE_INIT_PROJECT_PUBLIC_KEY"
+    }
+    assert len(values) == 1, (
+        f"{path}: expected exactly one LANGFUSE_INIT_PROJECT_PUBLIC_KEY value on the Langfuse "
+        f"web deployment, found {sorted(values)}"
+    )
+    return values.pop()
+
+
+def header_halves(label, header):
+    """Split `Basic <base64(public:secret)>` into its two halves.
+
+    The chart no longer ships a literal published credential on a sealed
+    install: curie.managedSecret generates the init project secret key per
+    release. So the assertion that catches a desync is structural -- the header
+    must decode to the public key Langfuse is seeded with, paired with the
+    secret key this very Secret carries.
+    """
+    scheme, sep, credential = header.partition(" ")
+    assert sep and scheme == "Basic", (
+        f"{label}: the collector header must be `Basic <base64>`, got {header!r}"
+    )
+    try:
+        decoded = base64.b64decode(credential, validate=True).decode()
+    except Exception as exc:  # noqa: BLE001 - the message is the assertion
+        raise AssertionError(
+            f"{label}: the collector header credential {credential!r} is not valid base64 ({exc})"
+        ) from exc
+    public, sep, secret = decoded.partition(":")
+    assert sep, (
+        f"{label}: the decoded credential must be `<publicKey>:<secretKey>`, got {decoded!r}"
+    )
+    return public, secret
 
 
 def collector_secret_ref(path):
@@ -98,9 +136,14 @@ override_ref = collector_secret_ref(sys.argv[5])
 _, override_secret = secret_entries(sys.argv[6])
 selfnamed_ref = collector_secret_ref(sys.argv[7])
 _, selfnamed_secret = secret_entries(sys.argv[8])
+default_public_key = init_project_public_key(sys.argv[9])
+selfnamed_public_key = init_project_public_key(sys.argv[10])
 
 # T1: the default render keeps reading the chart-managed Secret, which carries
-# the header derived from the langfuse.init keys.
+# the header composed from the project public key and the RESOLVED init project
+# secret key. That resolution generates a random per release on a sealed install
+# (issue #195), so the assertion is that the header and the Secret agree, not
+# that either carries a particular literal.
 assert default_ref["name"] == "curie-secrets", (
     "T1: on the default render the collector must read otlpAuthHeader from the chart-managed "
     f"Secret curie-secrets, but secretKeyRef.name is {default_ref['name']!r}"
@@ -115,9 +158,17 @@ assert "otlpAuthHeader" in default_secret, (
     "T1: the chart-managed Secret dropped otlpAuthHeader on the default path, so the collector "
     "would fail to start with CreateContainerConfigError on a plain install"
 )
-assert default_secret["otlpAuthHeader"] == DEV_HEADER, (
-    "T1: the default chart-managed Secret must carry the header derived from the langfuse.init "
-    f"keys ({DEV_HEADER!r}), got {default_secret['otlpAuthHeader']!r}"
+default_public, default_secret_half = header_halves("T1", default_secret["otlpAuthHeader"])
+assert default_public == default_public_key, (
+    "T1: the collector header's public half must be the project public key Langfuse is seeded "
+    f"with ({default_public_key!r}), got {default_public!r}. A mismatch authenticates the trace "
+    "export against a project that does not exist"
+)
+assert default_secret_half == default_secret.get("langfuseInitProjectSecretKey"), (
+    "T1: the collector header's secret half must be the langfuseInitProjectSecretKey this very "
+    f"Secret carries ({default_secret.get('langfuseInitProjectSecretKey')!r}), got "
+    f"{default_secret_half!r}. That is the desync issue #1563 closes: the collector would "
+    "authenticate with a key Langfuse was never seeded with and 401 on every trace export"
 )
 
 # T2: langfuse.existingSecret redirects the collector and the chart stops
@@ -162,11 +213,17 @@ assert "otlpAuthHeader" in selfnamed_secret, (
     "emission condition disagree about which Secret carries the header, so the collector pod "
     "would enter CreateContainerConfigError"
 )
-assert selfnamed_secret["otlpAuthHeader"] == SELFNAMED_DERIVED, (
-    "T6: the chart-managed Secret is the one the collector reads, so its otlpAuthHeader must be "
-    "the header the chart derives from the langfuse.init keys in effect on this path "
-    f"({SELFNAMED_DERIVED!r}), got {selfnamed_secret['otlpAuthHeader']!r}. A non-empty but "
-    "unrelated value lets the collector start and 401 to Langfuse in silence"
+selfnamed_public, selfnamed_secret_half = header_halves("T6", selfnamed_secret["otlpAuthHeader"])
+assert selfnamed_public == selfnamed_public_key, (
+    "T6: the chart-managed Secret is the one the collector reads, so its otlpAuthHeader must "
+    f"carry the project public key Langfuse is seeded with ({selfnamed_public_key!r}), got "
+    f"{selfnamed_public!r}"
+)
+assert selfnamed_secret_half == selfnamed_secret.get("langfuseInitProjectSecretKey"), (
+    "T6: the chart-managed Secret is the one the collector reads, so its otlpAuthHeader must "
+    "carry the langfuseInitProjectSecretKey emitted alongside it "
+    f"({selfnamed_secret.get('langfuseInitProjectSecretKey')!r}), got {selfnamed_secret_half!r}. "
+    "A non-empty but unrelated value lets the collector start and 401 to Langfuse in silence"
 )
 PY
 
@@ -212,7 +269,7 @@ grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-unpadded.stderr" || fai
 # operator override is set, and langfuse.existingSecret names the chart's own
 # Secret, so curie.otlpAuthHeaderSecretName resolves back to curie-secrets and
 # the header is derived from the langfuse.init keys (T6 renders this exact
-# configuration and asserts the dev header is present). A gate that only reads
+# configuration and asserts the header agrees with the Secret). A gate that only reads
 # the otelCollector.otlpAuthHeader input never sees it. The chart composes that
 # header only out of both published dev init keys, so the projectSecretKey check
 # now covers this render too and, running first, is the message the operator

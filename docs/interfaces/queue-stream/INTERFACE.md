@@ -48,8 +48,11 @@ A second broker must honor the stream key, the payload encoding, and the Stream 
   (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`) and reconstructed by
   `from_stream_fields` (`apps/dispatcher/src/curie_dispatcher/queue.py::from_stream_fields`)
   into a `QueuedTurn`.
-- **Consumer verbs** — the worker reads with `xreadgroup` over a consumer group
-  (`apps/worker/src/curie_worker/consumer.py::Consumer._read_loop`), rebuilds the model at
+- **Consumer verbs** — the worker reads with `xreadgroup` over a consumer group; the
+  sacred subclass supplies the loop spec and handler
+  (`apps/worker/src/curie_worker/consumer.py::Consumer._read_loop`) and the base issues the
+  verb (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._consume`). It
+  rebuilds the model at
   `apps/worker/src/curie_worker/consumer.py::Consumer._handle`, and acknowledges with `xack`
   (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._ack`). The group is
   `"curie-workers"` (`WorkerConfig.consumer_group`, `apps/worker/src/curie_worker/config.py::WorkerConfig`).
@@ -75,8 +78,11 @@ Idempotency lives beside the stream, not in it: `claim_event` does a
 One, redis-py against Valkey. The dispatcher `XADD`s
 (`apps/dispatcher/src/curie_dispatcher/queue.py::enqueue`); the worker runs
 a consumer group with `XREADGROUP`/`XACK`, crash-recovery `XAUTOCLAIM`, and the
-delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`
-(`apps/worker/src/curie_worker/consumer.py`). A second, sibling stream
+delivery-cap dead-letter path's `XPENDING`/`XRANGE`/`XADD`. All of those verbs are
+issued from the shared base (`apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer`);
+the sacred `apps/worker/src/curie_worker/consumer.py::Consumer` subclass supplies the
+specs and handlers and issues only its own pre-claim `xpending_range`
+(`apps/worker/src/curie_worker/consumer.py::Consumer._pending_delivery_count`). A second, sibling stream
 `"curie:evals"` uses the same one-field `payload` convention
 (`apps/worker/src/curie_worker/eval/stream.py`), reinforcing the wire shape as the
 real contract.
@@ -101,16 +107,45 @@ The verbs return a bare `Awaitable`/value matching redis-py's own typing, so
 
 ## Known leakage
 
-- **Reclaim + composition root still touch redis directly.** `consumer.py`'s
-  `XAUTOCLAIM` call (sacred file, by rule) and the client construction in
-  `apps/worker/src/curie_worker/run.py` (the composition root, by design) reference
-  redis directly.
-- **The API writes the runs stream outside the broker port.** Correcting an earlier claim
-  that the API's redis only backs the kill-switch / eval-queue: the approval-resume path
-  enqueues resume turns directly onto the same `curie:runs` stream via `ResumeQueue`
-  (`apps/api/src/curie_api/resumequeue.py::ResumeQueue`) and the expiry sweeper, an `xadd`
-  that bypasses the dispatcher's `StreamPublisher` port entirely. A second broker must
-  account for this third producer (the API) that does not go through the port today.
+- **The composition root still touches redis directly.** The client construction in
+  `apps/worker/src/curie_worker/run.py` (by design) builds concrete
+  `redis.Redis` / `redis.asyncio.Redis` handles and passes them into the ports.
+  (The audit's companion claim that the sacred `consumer.py` calls `XAUTOCLAIM`
+  directly does not hold: `consumer.py` names `XAUTOCLAIM` only in a docstring and a
+  comment, and the actual call is the base's
+  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._reclaim_once`,
+  which goes through the port.)
+- **Set verbs sit beside the stream on the same connection, on neither port.** The
+  operator thread-reset feature (#713, #812) needs Valkey Set semantics, which
+  `StreamBroker` deliberately does not cover, so the sacred consumer keeps a second,
+  concretely-typed `redis.asyncio.Redis` handle onto the same connection
+  (`self._valkey`) and calls `SPOP`/`SADD`/`SREM` on it in
+  `apps/worker/src/curie_worker/consumer.py::Consumer._drain_thread_reset_requests`.
+  The API half is the same shape: `SADD`/`SISMEMBER` in
+  `apps/api/src/curie_api/threadreset.py::ThreadResetRequests`. A second broker that
+  implements only the two stream Protocols would leave this feature unbacked; it is a
+  Valkey dependency, not a stream-contract one, and no port names it today.
+- **The API both writes the runs stream and reads the graveyard outside the ports.**
+  Correcting an earlier claim that the API's redis only backs the kill-switch /
+  eval-queue: the approval-resume path enqueues resume turns directly onto the same
+  `curie:runs` stream via `ResumeQueue`
+  (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), driven both by the
+  approvals router and by the expiry sweeper
+  (`apps/api/src/curie_api/sweeper.py::sweep_expired_approvals`): an `xadd` that bypasses
+  the dispatcher's `StreamPublisher` port entirely. The API also *reads* the worker's
+  `<stream>:dead` graveyard directly, with `xrevrange`/`xrange` on its own raw client:
+  `apps/api/src/curie_api/graveyardwatcher.py::GraveyardWatcher` (`xrevrange` to seed the
+  cursor in `seed_cursor`, `xrange` to scan in `scan_once`) and
+  `apps/api/src/curie_api/resumequeue.py::ResumeQueue.read_dead_letter` (`xrevrange`),
+  whose rows the #532 backstop
+  (`apps/api/src/curie_api/resumereconciler.py::ResumeReconciler.reopen_dead_lettered_resumes`)
+  consumes. Both readers also depend on the worker's `dl_*` metadata field schema
+  (`dl_original_id`, `dl_delivery_count`, `dl_reason`, `dl_dead_lettered_at`, written by
+  `apps/worker/src/curie_worker/stream_consumer.py::StreamConsumer._dead_letter`), and
+  the API re-derives the graveyard name as `<stream>:dead` rather than reading the
+  worker's config. So a second broker must account for a third producer (the API) and for
+  two API-side graveyard readers, none of which go through a port today, plus an
+  undeclared cross-service field schema on the dead-letter stream.
 - **The redis-py exception surface leaks.** The ports type the verbs but not the error
   contract: `redis.exceptions` propagate through the callers unabstracted, so a non-redis
   broker must either raise redis-py-compatible exceptions or the call sites must learn its

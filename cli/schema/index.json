@@ -4,6 +4,12 @@
   "discovery": "These schema files are bundled into released `curie` CLI binaries and printed on demand: `curie schema-index` emits this index, `curie schema-index <name>` emits a named schema. In a source checkout they live at cli/schema/.",
   "results": [
     {
+      "result": "AllTargetsDeployOutput",
+      "kind": "CliOutput",
+      "schema": "deploy.schema.json",
+      "version": "1.1"
+    },
+    {
       "result": "ApplyOutput",
       "kind": "CliOutput",
       "schema": "apply.schema.json",
@@ -67,7 +73,7 @@
       "result": "DeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "DiffOutput",
@@ -230,6 +236,12 @@
       "kind": "CliOutput",
       "schema": "versions.schema.json",
       "version": "1.0"
+    },
+    {
+      "result": "all_targets_deploy_failure_json",
+      "kind": "builder",
+      "schema": "deploy.schema.json",
+      "version": "1.1"
     },
     {
       "result": "error_json",

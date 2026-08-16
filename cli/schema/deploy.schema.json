@@ -1,104 +1,226 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/deploy/v1.json",
+  "$id": "https://schemas.curietech.ai/cli/deploy/v1.1.json",
   "title": "curie <tier> deploy --json",
-  "description": "The agent-facing payload of `curie local deploy` / `curie cluster deploy`: the deployed agent, version, channel, bundle, and deployment summary.",
-  "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "plugin": {
-      "type": "string"
+  "description": "The agent facing payload of `curie local deploy` / `curie cluster deploy`: a single target result, ordered results for all targets, or reconciliation failures for all targets.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/deploy_result"
     },
-    "label": {
-      "type": "string"
+    {
+      "$ref": "#/$defs/aggregate_success"
     },
-    "environment": {
-      "type": "string"
+    {
+      "$ref": "#/$defs/deploy_failure"
     },
-    "agent": {
+    {
+      "$ref": "#/$defs/connector_failure"
+    }
+  ],
+  "$defs": {
+    "deploy_result": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "name": {
+        "plugin": {
           "type": "string"
         },
-        "id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "id"
-      ]
-    },
-    "version": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
         "label": {
-          "type": "string"
-        },
-        "id": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "label",
-        "id"
-      ]
-    },
-    "channel": {
-      "type": "string"
-    },
-    "bundle": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "ref": {
-          "type": "string"
-        },
-        "sha256": {
-          "type": "string"
-        },
-        "size_bytes": {
-          "type": "integer"
-        }
-      },
-      "required": [
-        "ref",
-        "sha256",
-        "size_bytes"
-      ]
-    },
-    "deployment": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "id": {
           "type": "string"
         },
         "environment": {
           "type": "string"
         },
-        "status": {
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "id"
+          ]
+        },
+        "version": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "label",
+            "id"
+          ]
+        },
+        "channel": {
           "type": "string"
+        },
+        "bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ref": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size_bytes": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "ref",
+            "sha256",
+            "size_bytes"
+          ]
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "environment": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "environment",
+            "status"
+          ]
         }
       },
       "required": [
-        "id",
+        "plugin",
+        "label",
         "environment",
-        "status"
+        "agent",
+        "version",
+        "channel",
+        "bundle",
+        "deployment"
+      ]
+    },
+    "target_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/deploy_result"
+        }
+      },
+      "required": [
+        "target",
+        "result"
+      ]
+    },
+    "aggregate_success": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/target_result"
+          }
+        }
+      },
+      "required": [
+        "results"
+      ]
+    },
+    "deploy_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "failed_target": {
+          "type": "string"
+        },
+        "stage": {
+          "const": "deploy"
+        },
+        "completed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/target_result"
+          }
+        },
+        "error": {
+          "type": "string"
+        },
+        "fix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "failed_target",
+        "stage",
+        "completed",
+        "error",
+        "fix"
+      ]
+    },
+    "connector_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "failed_target": {
+          "type": "string"
+        },
+        "stage": {
+          "const": "connector_sync"
+        },
+        "completed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/target_result"
+          }
+        },
+        "failed_result": {
+          "$ref": "#/$defs/deploy_result"
+        },
+        "error": {
+          "type": "string"
+        },
+        "fix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "failed_target",
+        "stage",
+        "completed",
+        "failed_result",
+        "error",
+        "fix"
       ]
     }
-  },
-  "required": [
-    "plugin",
-    "label",
-    "environment",
-    "agent",
-    "version",
-    "channel",
-    "bundle",
-    "deployment"
-  ]
+  }
 }

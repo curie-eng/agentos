@@ -152,7 +152,10 @@ When exposed as NodePort (`curie up` does this by default), Langfuse is reachabl
 The nodePort is pinned in values (langfuse.web.service.nodePort) so it survives a down/up cycle.
 {{- end }}
   # Dev project public key (headless-bootstrapped): {{ .Values.langfuse.init.projectPublicKey }}
-  # The project secret key is stored in the {{ include "curie.secretName" . }} Secret (key langfuseInitProjectSecretKey), not printed here.
+  # Retrieve the project secret key:
+  kubectl get secret {{ include "curie.secretName" . }} -n {{ .Release.Namespace }} -o jsonpath='{.data.langfuseInitProjectSecretKey}' | base64 -d; echo
+  # Retrieve the Langfuse admin password:
+  kubectl get secret {{ include "curie.secretName" . }} -n {{ .Release.Namespace }} -o jsonpath='{.data.langfuseInitUserPassword}' | base64 -d; echo
 
 App services send OTLP traces to the collector, NOT directly to Langfuse:
   {{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.grpcPort }} (gRPC) / :{{ .Values.otelCollector.service.httpPort }} (HTTP)
