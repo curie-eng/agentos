@@ -318,19 +318,41 @@ service:
      may never see and miss the header it actually gets. Composed via b64enc
      rather than pasted so it cannot drift from curie.otlpAuthHeader.
 
-     What is compared is the CREDENTIAL, not the whole header: the last
-     whitespace-separated field of the rendered header, with base64 padding
-     stripped. The auth scheme token is case-insensitive and is separated from
-     the credential by whitespace, so "basic <cred>", "BASIC <cred>" and
-     "Basic  <cred>" all present the same credential to Langfuse, as does the
-     unpadded spelling and a stray trailing space. Matching on the credential
-     token subsumes every one of those, where an exact-string match on the whole
-     header lets each through. An empty rendered header (the chart ships nothing,
-     the operator's Secret carries it) yields an empty token, which matches
-     nothing. b64dec is not usable here, since sprig returns an error string
-     rather than the plaintext for unpadded input. */}}
-{{- if eq (trimAll "=" (regexSplit "[[:space:]]+" (trim (include "curie.otlpAuthHeader" .)) -1 | last)) (trimAll "=" (b64enc "pk-lf-curie-dev:sk-lf-curie-dev")) -}}
-{{- fail "security.checkDefaultCredentials is on but the Authorization header the OTel Collector would send to Langfuse is still the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" (auth scheme spelling, surrounding whitespace and base64 padding aside). The collector would authenticate with the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
+     THREAT MODEL, so the next reader stops enumerating spellings: this guards
+     against an operator shipping this repository's published credential by
+     accident. It is not an adversarial control, and cannot be one: anyone who
+     can set otelCollector.otlpAuthHeader can equally set
+     security.checkDefaultCredentials=false. Normalising the scheme's case and
+     the credential's whitespace covers the spellings a copy/paste, a line wrap
+     or a templating tool actually produces; it deliberately does NOT chase
+     encodings only a deliberate bypass would produce.
+
+     The header is split ONCE into scheme and credential, on its first run of
+     whitespace, and each half is then normalised on its own terms. The scheme
+     token is case-insensitive (RFC 9110), so it is compared lowercased against
+     "basic". The credential is compared with ALL whitespace removed and base64
+     padding stripped, because the receiver strips whitespace before decoding:
+     interior whitespace from a wrapped paste decodes to the same credential,
+     and taking the last whitespace-separated field instead would compare only
+     its tail. The credential is NOT lowercased: base64 is case-significant, and
+     folding its case would widen the match to strings that are not this
+     credential. An empty rendered header (the chart ships nothing, the
+     operator's Secret carries it) yields an empty scheme, which is not "basic",
+     so it matches nothing. b64dec is not usable here, since sprig returns an
+     error string rather than the plaintext for unpadded input.
+
+     Deliberately independent of otelCollector.deploy: the chart writes this
+     credential into its Secret either way, so a release that does not run a
+     collector still ships the published dev key for one that later does. */}}
+{{- $header := trim (include "curie.otlpAuthHeader" .) -}}
+{{- $parts := regexSplit "[[:space:]]+" $header 2 -}}
+{{- $scheme := first $parts -}}
+{{- $credential := "" -}}
+{{- if gt (len $parts) 1 -}}
+{{- $credential = index $parts 1 -}}
+{{- end -}}
+{{- if and (eq (lower $scheme) "basic") (eq (trimAll "=" (regexReplaceAll "[[:space:]]+" $credential "")) (trimAll "=" (b64enc "pk-lf-curie-dev:sk-lf-curie-dev"))) -}}
+{{- fail "security.checkDefaultCredentials is on but the chart would ship the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" as the OTel Collector auth credential in its Secret (auth scheme spelling, whitespace and base64 padding aside), which the collector authenticates with when deployed. That is the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

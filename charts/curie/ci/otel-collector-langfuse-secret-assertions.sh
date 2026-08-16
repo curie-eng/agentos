@@ -257,4 +257,33 @@ grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-double-space.stderr" ||
 rc="$(gate_rc existing-secret-empty-header --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse')"
 [[ "$rc" == "0" ]] || fail "T12: security.checkDefaultCredentials=true with a foreign langfuse.existingSecret and no header override must still render. The chart ships no header at all on that path, so there is no default credential to refuse. stderr was: $(cat "$TMP/existing-secret-empty-header.stderr")"
 
+# T13: whitespace INSIDE the credential is the same copy/paste and line-wrap
+# artifact as whitespace around it. The receiver strips it before base64
+# decoding, so "cGst...bGYtY3Vy<TAB>aWUtZGV2..." presents exactly the published
+# dev credential. Taking the last whitespace-separated field would compare only
+# the tail and let both spellings through. langfuse.existingSecret is foreign
+# here for the same reason as in T4, so the failure can only come from the
+# otlpAuthHeader check.
+rc="$(gate_rc dev-header-interior-tab --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set-string "otelCollector.otlpAuthHeader=$(printf 'Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1\tcmllLWRldg==')")"
+[[ "$rc" != "0" ]] || fail "T13: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential with a tab inside the base64. Langfuse strips the whitespace and accepts pk-lf-curie-dev:sk-lf-curie-dev, so splitting the header on whitespace and comparing only the last field defeats the gate"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-interior-tab.stderr" || fail "T13: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-interior-tab.stderr")"
+
+rc="$(gate_rc dev-header-interior-space --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set-string 'otelCollector.otlpAuthHeader=Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1 cmllLWRldg==')"
+[[ "$rc" != "0" ]] || fail "T13: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential with a plain space inside the base64. The credential still decodes to pk-lf-curie-dev:sk-lf-curie-dev, so the gate must normalise whitespace across the whole credential rather than take its last field"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-interior-space.stderr" || fail "T13: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-interior-space.stderr")"
+
+# T14: the check is deliberately independent of otelCollector.deploy -- the
+# chart writes the published dev credential into its Secret either way. So the
+# refusal is correct here, but the message must not assert a collector that this
+# render does not produce: with deploy=false no collector manifest exists, and a
+# message claiming a header "the OTel Collector would send" describes something
+# the operator cannot find. Asserting on the wording is what stops a future edit
+# from silently reintroducing that false claim.
+rc="$(gate_rc dev-header-no-collector --set security.checkDefaultCredentials=true --set otelCollector.deploy=false --set langfuse.existingSecret='my-langfuse' --set-string 'otelCollector.otlpAuthHeader=Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==')"
+[[ "$rc" != "0" ]] || fail "T14: security.checkDefaultCredentials=true rendered successfully with otelCollector.deploy=false and the published dev header. The chart still writes that credential into its Secret whether or not this release runs a collector, so the gate must still refuse"
+grep -qF 'as the OTel Collector auth credential in its Secret' "$TMP/dev-header-no-collector.stderr" || fail "T14: the render failed but its message does not say the credential is what the chart ships in its Secret, which is the part that is true whether or not a collector is deployed. stderr was: $(cat "$TMP/dev-header-no-collector.stderr")"
+if grep -qF 'header the OTel Collector would send to Langfuse' "$TMP/dev-header-no-collector.stderr"; then
+  fail "T14: with otelCollector.deploy=false no collector manifest renders, but the message still describes the header as one the OTel Collector would send to Langfuse. It asserts a component this render does not contain. stderr was: $(cat "$TMP/dev-header-no-collector.stderr")"
+fi
+
 echo "Collector follows langfuse.existingSecret, the chart Secret ships no stale dev header, the override still wins, and the default-credential gate refuses the published dev header: OK"
