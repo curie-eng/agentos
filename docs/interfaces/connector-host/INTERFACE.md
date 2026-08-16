@@ -4,7 +4,7 @@ kind: CLEAN
 impls: 1 (Kubernetes) + in-memory fake
 grade: not separately graded
 epics:
-  - "#1118"
+  - "#1063"
   - "#1184"
 order: 20
 ---
@@ -179,6 +179,18 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
   that prunes another agent's connectors. None of that is expressible in the three
   method signatures, so a host without those semantics satisfies the `Protocol`
   and still behaves differently.
+- **There are two appliers, only one of them behind the port, and they
+  disagree.** The CLI applies the same rendered objects on the `cluster deploy`
+  path (`cli/src/connectors.rs`) with a plain client-side `kubectl apply`, prunes
+  in one bulk labelled delete, mints and deletes the owned Secret, and stamps no
+  drift hash; the reconciler server-side applies, prunes one object at a time,
+  never touches that Secret, and stamps a hash on every apply — so a
+  CLI-created object reads as drift and is adopted on the reconciler's first
+  pass. The ownership label that decides what gets deleted is also two
+  hand-maintained copies of one string, `OWNER_LABEL`
+  (`apps/worker/src/curie_worker/connector_reconcile.py::OWNER_LABEL`) and a Rust
+  constant in `cli/src/connectors.rs`, with no codegen or drift gate tying them
+  together the way the ACI contract is tied.
 - **The port's own docstring miscounts itself.** `ConnectorClient` is introduced
   as "deliberately four verbs" while declaring three; the cluster module states
   the true shape, four object kinds and three verbs. A second implementer reading
@@ -189,6 +201,6 @@ The port is a real `Protocol`, and the values crossing it are Kubernetes:
 - **Related seam:** [substrate](../substrate/INTERFACE.md) — `SandboxClient` is the other Kubernetes-behind-a-Protocol seam, and it is the discipline this one copies; it covers the runner runtime, not connector workloads.
 - **Related seam:** [bundle-format](../bundle-format/INTERFACE.md) — `connectors.yaml` is an additive, platform-facing declaration in the bundle; declaring intent is a bundle's job, being the platform's implementation is not.
 - **Related seam:** [sealed-credential](../sealed-credential/INTERFACE.md) — the third credential holder shape a connector spec can declare.
-- **Epic(s):** #1118 — hosted connectors declared by a bundle; #1184 — the in-cluster connector reconciler and its RBAC
+- **Epic(s):** #1063 — bundles declare connectors and the platform derives the objects; #1184 — the in-cluster connector reconciler and its RBAC
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — connector hosting is not one of the six swap-readiness Jobs; not separately graded
 - **ADR(s):** [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — bundles declare connectors, the platform hosts them; [ADR-0087](../../adr/0087-the-api-renders-connector-objects-the-cli-applies-them.md) — the API renders connector objects and never applies them; [ADR-0090](../../adr/0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) — a reconciler applies them, so agent repos need no CLI; [ADR-0009](../../adr/0009-per-agent-connector-auth.md) — per-agent secrets and connector credentials
