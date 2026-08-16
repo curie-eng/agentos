@@ -50,6 +50,10 @@ import yaml
 
 DEV_HEADER = "Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg=="
 OVERRIDE_HEADER = "Basic YXNzZXJ0OmFzc2VydA=="
+# The header the chart must derive on the selfnamed render, composed from the
+# langfuse.init keys in effect there (the values.yaml defaults) rather than
+# pasted, so it cannot drift from what curie.otlpAuthHeader composes.
+SELFNAMED_DERIVED = "Basic " + base64.b64encode(b"pk-lf-curie-dev:sk-lf-curie-dev").decode()
 
 
 def docs(path):
@@ -158,10 +162,11 @@ assert "otlpAuthHeader" in selfnamed_secret, (
     "emission condition disagree about which Secret carries the header, so the collector pod "
     "would enter CreateContainerConfigError"
 )
-assert selfnamed_secret["otlpAuthHeader"], (
+assert selfnamed_secret["otlpAuthHeader"] == SELFNAMED_DERIVED, (
     "T6: the chart-managed Secret is the one the collector reads, so its otlpAuthHeader must be "
-    "non-empty, but it is empty. The collector would start with an empty Authorization header "
-    "and 401 to Langfuse in silence"
+    "the header the chart derives from the langfuse.init keys in effect on this path "
+    f"({SELFNAMED_DERIVED!r}), got {selfnamed_secret['otlpAuthHeader']!r}. A non-empty but "
+    "unrelated value lets the collector start and 401 to Langfuse in silence"
 )
 PY
 
@@ -285,5 +290,74 @@ grep -qF 'as the OTel Collector auth credential in its Secret' "$TMP/dev-header-
 if grep -qF 'header the OTel Collector would send to Langfuse' "$TMP/dev-header-no-collector.stderr"; then
   fail "T14: with otelCollector.deploy=false no collector manifest renders, but the message still describes the header as one the OTel Collector would send to Langfuse. It asserts a component this render does not contain. stderr was: $(cat "$TMP/dev-header-no-collector.stderr")"
 fi
+
+# T15/T16: the success control for the gate. Every other gate assertion above
+# proves the gate REFUSES something, so a gate that refused every non-empty
+# header would satisfy all of them. These two renders are the shapes a real
+# hardened install takes -- an operator Secret plus an own-project header, and
+# the chart's own Secret with every langfuse.init credential overridden -- and
+# they must render with security.checkDefaultCredentials on. This is what stops
+# a further round of strictness from blocking legitimate installs.
+render_rc() {
+  local name="$1"
+  shift
+  local rc=0
+  helm template curie "$CHART" --output-dir "$TMP/$name" "$@" >/dev/null 2>"$TMP/$name.stderr" || rc=$?
+  printf '%s\n' "$rc"
+}
+
+LEGIT_FOREIGN_HEADER='Basic cGstbGYtb3duZWQ6c2stbGYtb3duZWQ='
+LEGIT_SELFNAMED_HEADER='Basic cGstbGYtbWluZTpzay1sZi1taW5l'
+
+rc="$(render_rc gate-legit-foreign --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set-string "otelCollector.otlpAuthHeader=$LEGIT_FOREIGN_HEADER")"
+[[ "$rc" == "0" ]] || fail "T15: security.checkDefaultCredentials=true with a foreign langfuse.existingSecret and an operator's own otelCollector.otlpAuthHeader must render. The gate exists to refuse this repository's published dev credential, not to refuse a legitimate header, and refusing one blocks exactly the hardened install the gate is meant to protect. stderr was: $(cat "$TMP/gate-legit-foreign.stderr")"
+
+rc="$(render_rc gate-legit-selfnamed --set security.checkDefaultCredentials=true --set langfuse.existingSecret='curie-secrets' --set langfuse.init.projectPublicKey='pk-lf-mine' --set langfuse.init.projectSecretKey='sk-lf-mine' --set langfuse.init.userPassword='not-the-dev-password' --set-string "otelCollector.otlpAuthHeader=$LEGIT_SELFNAMED_HEADER")"
+[[ "$rc" == "0" ]] || fail "T16: security.checkDefaultCredentials=true with langfuse.existingSecret naming the chart's own Secret, every langfuse.init credential overridden and an operator's own otelCollector.otlpAuthHeader must render. Nothing published is left on this path, so the gate must let it through. stderr was: $(cat "$TMP/gate-legit-selfnamed.stderr")"
+
+python3 - \
+  "$LEGIT_FOREIGN_HEADER" \
+  "$(manifest_for "$TMP/gate-legit-foreign" secrets.yaml)" \
+  "$LEGIT_SELFNAMED_HEADER" \
+  "$(manifest_for "$TMP/gate-legit-selfnamed" secrets.yaml)" <<'PY'
+import base64
+import sys
+
+import yaml
+
+
+def docs(path):
+    return [doc for doc in yaml.safe_load_all(open(path)) if doc]
+
+
+def secret_entries(path):
+    secret = next((doc for doc in docs(path) if doc.get("kind") == "Secret"), None)
+    assert secret is not None, f"{path}: no chart-managed Secret rendered"
+    entries = dict(secret.get("stringData") or {})
+    for key, value in (secret.get("data") or {}).items():
+        entries[key] = base64.b64decode(value).decode()
+    return entries
+
+
+legit_foreign_header = sys.argv[1]
+legit_foreign_secret = secret_entries(sys.argv[2])
+legit_selfnamed_header = sys.argv[3]
+legit_selfnamed_secret = secret_entries(sys.argv[4])
+
+# T15/T16: the render succeeding is not enough. The header the operator passed
+# must reach the chart-managed Secret the collector reads, verbatim, so a gate
+# that silently normalised or blanked the value on its way through is caught
+# here rather than at a 401 in production.
+assert legit_foreign_secret.get("otlpAuthHeader") == legit_foreign_header, (
+    "T15: with the gate on and a foreign langfuse.existingSecret, the chart-managed Secret must "
+    f"carry the operator's otelCollector.otlpAuthHeader verbatim ({legit_foreign_header!r}), got "
+    f"{legit_foreign_secret.get('otlpAuthHeader')!r}"
+)
+assert legit_selfnamed_secret.get("otlpAuthHeader") == legit_selfnamed_header, (
+    "T16: with the gate on and langfuse.existingSecret naming the chart's own Secret, that Secret "
+    f"must carry the operator's otelCollector.otlpAuthHeader verbatim ({legit_selfnamed_header!r}), "
+    f"got {legit_selfnamed_secret.get('otlpAuthHeader')!r}"
+)
+PY
 
 echo "Collector follows langfuse.existingSecret, the chart Secret ships no stale dev header, the override still wins, and the default-credential gate refuses the published dev header: OK"
