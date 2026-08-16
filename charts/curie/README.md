@@ -257,8 +257,10 @@ Guard against shipping those dev defaults to a shared/production cluster with
 while `langfuse.init.projectSecretKey` or `langfuse.init.userPassword` still
 carries its published dev default (a Langfuse admin-takeover risk on a reachable
 UI; the project key also feeds the OTel Collector auth header on the
-non-`existingSecret` path). Override those values or supply
-`langfuse.existingSecret` to clear those two checks. A third condition fails the
+non-`existingSecret` path). Override those values, or point
+`langfuse.existingSecret` at a Secret this chart does not manage, to clear those
+two checks. Naming the chart's own Secret does not clear them, because the chart
+still fills those keys from those very values. A third condition fails the
 render whenever the header the collector would actually send is the published dev
 header `Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==`, whether
 `otelCollector.otlpAuthHeader` is set to it directly or the chart composed it

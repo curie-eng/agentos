@@ -1384,9 +1384,12 @@ security:
   # file -- the published admin password is a Langfuse admin-takeover risk on a
   # reachable UI, and on the non-existingSecret path the project secret key also
   # feeds the OTel Collector auth header. Clear those two checks by overriding
-  # those values or supplying
-  # langfuse.existingSecret (the secretKeyRef escape, keys langfuseInitProjectSecretKey
-  # + langfuseInitUserPassword + otlpAuthHeader). A third check refuses the
+  # those values or by pointing
+  # langfuse.existingSecret at a Secret this chart does not manage (the secretKeyRef
+  # escape, keys langfuseInitProjectSecretKey
+  # + langfuseInitUserPassword + otlpAuthHeader). Naming the chart's own Secret does
+  # NOT clear them: the chart still fills those keys from these very values, so the
+  # published defaults would still reach Langfuse and the collector. A third check refuses the
   # published dev header on whatever the collector would actually send, whether
   # set directly via otelCollector.otlpAuthHeader or composed by the chart from
   # the langfuse.init keys, and is NOT cleared by langfuse.existingSecret, since

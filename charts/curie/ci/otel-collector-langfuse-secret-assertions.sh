@@ -208,10 +208,16 @@ grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-unpadded.stderr" || fai
 # Secret, so curie.otlpAuthHeaderSecretName resolves back to curie-secrets and
 # the header is derived from the langfuse.init keys (T6 renders this exact
 # configuration and asserts the dev header is present). A gate that only reads
-# the otelCollector.otlpAuthHeader input never sees it.
+# the otelCollector.otlpAuthHeader input never sees it. The chart composes that
+# header only out of both published dev init keys, so the projectSecretKey check
+# now covers this render too and, running first, is the message the operator
+# gets. Either check refusing the render satisfies what T9 exists to protect:
+# this configuration must never render. The rendered-header check itself stays
+# pinned by T4, T8, T10 and T12 on the foreign-Secret path, where it is the only
+# check that applies.
 rc="$(gate_rc selfnamed-dev-header --set security.checkDefaultCredentials=true --set langfuse.existingSecret='curie-secrets')"
 [[ "$rc" != "0" ]] || fail "T9: security.checkDefaultCredentials=true rendered successfully with langfuse.existingSecret=curie-secrets, where the chart composes the published dev header out of the langfuse.init keys and ships it to the collector in its own Secret. The gate must judge the header the collector would send, not just the otelCollector.otlpAuthHeader input"
-grep -qF 'langfuse.init.projectPublicKey' "$TMP/selfnamed-dev-header.stderr" || fail "T9: the render failed but its message never names langfuse.init.projectPublicKey, so the operator cannot tell the header was composed by the chart rather than set as an override. stderr was: $(cat "$TMP/selfnamed-dev-header.stderr")"
+grep -qE 'langfuse\.init\.(projectPublicKey|projectSecretKey)' "$TMP/selfnamed-dev-header.stderr" || fail "T9: the render failed but its message names neither langfuse.init.projectPublicKey nor langfuse.init.projectSecretKey, so the operator cannot tell the credential was composed by the chart out of its own values rather than set as an override. stderr was: $(cat "$TMP/selfnamed-dev-header.stderr")"
 
 # T10: a trailing space is a plausible copy/paste artifact, not only a
 # deliberate bypass. The receiver splits the Authorization header on a space and
@@ -220,5 +226,35 @@ grep -qF 'langfuse.init.projectPublicKey' "$TMP/selfnamed-dev-header.stderr" || 
 rc="$(gate_rc dev-header-trailing-space --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set otelCollector.otlpAuthHeader='Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg== ')"
 [[ "$rc" != "0" ]] || fail "T10: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev header with a trailing space. Langfuse ignores the surrounding whitespace and accepts pk-lf-curie-dev:sk-lf-curie-dev, so a stray space defeats the gate"
 grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-trailing-space.stderr" || fail "T10: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-trailing-space.stderr")"
+
+# T11: langfuse.existingSecret naming the chart's OWN Secret does not move the
+# Langfuse credentials anywhere else -- the chart still composes them from the
+# langfuse.init keys and ships them in that very Secret. So the two #198 checks
+# must run on that path. Overriding only the public half is what makes this
+# assertion pin check 1 rather than the rendered-header check: the composed
+# header is no longer the published dev header, so only the projectSecretKey
+# check can catch the published dev SECRET key still going to the collector.
+rc="$(gate_rc selfnamed-init-keys --set security.checkDefaultCredentials=true --set langfuse.existingSecret='curie-secrets' --set langfuse.init.projectPublicKey='pk-mine')"
+[[ "$rc" != "0" ]] || fail "T11: security.checkDefaultCredentials=true rendered successfully with langfuse.existingSecret=curie-secrets and only the public key overridden, so the chart ships Basic base64(pk-mine:sk-lf-curie-dev) to the collector with the published dev secret key sk-lf-curie-dev in it. langfuse.existingSecret naming the chart's own Secret must not exempt the langfuse.init checks, because that Secret is the one the chart fills from those very values"
+grep -qF 'langfuse.init.projectSecretKey' "$TMP/selfnamed-init-keys.stderr" || fail "T11: the render failed but its message never names langfuse.init.projectSecretKey. stderr was: $(cat "$TMP/selfnamed-init-keys.stderr")"
+
+# T12: the HTTP auth scheme token is case-insensitive and is separated from the
+# credential by whitespace, so "basic <cred>" and "Basic  <cred>" are the same
+# credential to the receiver. The gate must judge the credential token, not the
+# spelling of the scheme. langfuse.existingSecret is foreign here for the same
+# reason as in T4, so the failure can only come from the otlpAuthHeader check.
+rc="$(gate_rc dev-header-lowercase-scheme --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set-string otelCollector.otlpAuthHeader='basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==')"
+[[ "$rc" != "0" ]] || fail "T12: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential under a lowercase scheme token. RFC 9110 makes the auth scheme case-insensitive, so Langfuse accepts pk-lf-curie-dev:sk-lf-curie-dev exactly as it would from the canonical spelling"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-lowercase-scheme.stderr" || fail "T12: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-lowercase-scheme.stderr")"
+
+rc="$(gate_rc dev-header-double-space --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse' --set-string otelCollector.otlpAuthHeader='Basic  cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==')"
+[[ "$rc" != "0" ]] || fail "T12: security.checkDefaultCredentials=true rendered successfully while otelCollector.otlpAuthHeader carried the published dev credential separated from the scheme by two spaces. The receiver takes the last whitespace-separated field, so the extra space changes nothing about which credential is presented"
+grep -qF 'otelCollector.otlpAuthHeader' "$TMP/dev-header-double-space.stderr" || fail "T12: the render failed but its message never names otelCollector.otlpAuthHeader. stderr was: $(cat "$TMP/dev-header-double-space.stderr")"
+
+# T12: the empty rendered header is not a credential and must not be read as
+# one. With a foreign Secret and no override the chart ships nothing, and the
+# last-field comparison must not collapse that to a match.
+rc="$(gate_rc existing-secret-empty-header --set security.checkDefaultCredentials=true --set langfuse.existingSecret='my-langfuse')"
+[[ "$rc" == "0" ]] || fail "T12: security.checkDefaultCredentials=true with a foreign langfuse.existingSecret and no header override must still render. The chart ships no header at all on that path, so there is no default credential to refuse. stderr was: $(cat "$TMP/existing-secret-empty-header.stderr")"
 
 echo "Collector follows langfuse.existingSecret, the chart Secret ships no stale dev header, the override still wins, and the default-credential gate refuses the published dev header: OK"
