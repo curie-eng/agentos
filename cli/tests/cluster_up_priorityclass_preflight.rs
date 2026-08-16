@@ -59,6 +59,7 @@ if [ "$1" = "template" ]; then
     sandbox_name="curie-sandbox"
     platform_create="true"
     sandbox_create="true"
+    show_priorityclass="false"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --set|--set-string)
@@ -69,6 +70,15 @@ if [ "$1" = "template" ]; then
                     priorityClasses.platform.create=*) platform_create=${1#*=} ;;
                     priorityClasses.sandbox.create=*) sandbox_create=${1#*=} ;;
                 esac
+                ;;
+            --show-only)
+                shift
+                if [ "$1" = "templates/priorityclass.yaml" ]; then
+                    show_priorityclass="true"
+                fi
+                ;;
+            --show-only=templates/priorityclass.yaml)
+                show_priorityclass="true"
                 ;;
         esac
         shift
@@ -96,6 +106,11 @@ if [ "$1" = "template" ]; then
             "  name: $sandbox_name" \
             'value: 100000' \
             'globalDefault: false'
+        first="false"
+    fi
+    if [ "$first" = "true" ] && [ "$show_priorityclass" = "true" ]; then
+        printf '%s\n' 'Error: could not find template templates/priorityclass.yaml in chart' >&2
+        exit 1
     fi
     exit 0
 fi

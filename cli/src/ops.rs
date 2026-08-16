@@ -2321,6 +2321,10 @@ async fn rendered_priority_classes(
         )));
         let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
         if !ok {
+            if err.trim() == "Error: could not find template templates/priorityclass.yaml in chart"
+            {
+                continue;
+            }
             bail!(
                 "could not render the PriorityClass for role {}: {}",
                 role.key(),
