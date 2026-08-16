@@ -4,7 +4,10 @@ the real cluster path is the e2e in test_e2e_k8scratch.py)."""
 
 from __future__ import annotations
 
+import logging
 import time
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from aci_protocol import BootEnv
@@ -173,13 +176,241 @@ def test_reap_orphans_deletes_unrouted_claims(
     orphan = substrate.claim("T-orphan")
     # The orphan's route expires (simulated by guarded delete), its claim stays.
     affinity.delete_if_claim("T-orphan", orphan.claim_name)
+    # An idle thread's route expires long after its claim was created, so the
+    # orphan is aged well past the reaper's bind-window grace. Without this the
+    # claim is milliseconds old, which is indistinguishable from a claim still
+    # binding, and "no route" alone does not mean "litter".
+    fake_k8s.claims[orphan.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33.0)
+    # The survivor is aged past the grace too, so its survival can only be
+    # explained by its live route. Left milliseconds old it would be spared by
+    # AGE, and dropping the live-route exclusion entirely would still pass
+    # here while deleting a genuinely routed claim in production.
+    fake_k8s.claims[live.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33.0)
 
     reaped = substrate.reap_orphans()
     assert reaped == [orphan.claim_name]
     assert orphan.claim_name not in fake_k8s.claims
     assert live.claim_name in fake_k8s.claims
+    assert live.claim_name not in fake_k8s.deleted
     # Reap is idempotent.
     assert substrate.reap_orphans() == []
+
+
+@dataclass
+class _ReapDuringBindClient(FakeSandboxClient):
+    """A fake that runs one reaper tick from inside the bind window.
+
+    ``_await_bound`` issues its first ``get_claim`` poll immediately after
+    ``create_claim`` returns, which is precisely the window in which
+    ``_claim_fresh`` has not written the thread's route yet. Reaping from that
+    poll reproduces "the periodic maintenance tick landed mid-claim" -- the
+    production race -- synchronously: no threads, no sleeps, no wall clock.
+    """
+
+    substrate: SandboxSubstrate | None = None
+    reaped: bool = False
+    reap_results: list[list[str]] = field(default_factory=list)
+
+    def get_claim(self, name: str) -> ClaimView | None:
+        if self.substrate is not None and not self.reaped:
+            # Flagged before reaping: reap_orphans() calls list_claims(), which
+            # re-enters get_claim on this same fake.
+            self.reaped = True
+            self.reap_results.append(self.substrate.reap_orphans())
+            view = super().get_claim(name)  # the claim has not bound yet
+            claim = self.claims.get(name)
+            if claim is not None:
+                claim.ready = True  # the controller binds right after the tick
+            return view
+        return super().get_claim(name)
+
+
+def test_reap_orphans_spares_an_in_flight_claim(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # A claim that is still binding has no route yet, so "no live route names
+    # it" is ambiguous, not proof of litter. Reaping it deletes a live sandbox
+    # out from under the blocked creator, which then polls a claim that is gone
+    # until its deadline and reports a timeout blaming the node.
+    fake_k8s = _ReapDuringBindClient(bind_ready=False)
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    fake_k8s.substrate = substrate
+
+    handle = substrate.claim("T1")
+
+    assert fake_k8s.reap_results == [[]]  # the tick found nothing reapable
+    assert handle.claim_name in fake_k8s.claims  # the claim survived
+    # Never deleted at all, as opposed to deleted and re-created.
+    assert handle.claim_name not in fake_k8s.deleted
+
+
+@dataclass
+class _ReapAfterBindClient(FakeSandboxClient):
+    """A fake that runs one reaper tick AFTER the claim has bound, while the
+    substrate is still waiting for the sandbox's dial target.
+
+    ``_claim_fresh`` writes the thread's route only once both phases finish, so
+    between ``_await_bound`` returning and ``_await_service_fqdn`` succeeding
+    the claim is READY and routeless at the same time. This fake reaps from the
+    first ``get_sandbox`` poll and withholds the serviceFQDN on that same poll,
+    which is that window exactly: the claim reports ready, the sandbox exists,
+    and no route names it yet.
+    """
+
+    substrate: SandboxSubstrate | None = None
+    reaped: bool = False
+    reap_results: list[list[str]] = field(default_factory=list)
+    ready_at_reap: list[bool] = field(default_factory=list)
+
+    def get_sandbox(self, name: str) -> SandboxView | None:
+        view = super().get_sandbox(name)
+        if view is None or self.substrate is None or self.reaped:
+            return view
+        self.reaped = True
+        self.ready_at_reap = [claim.ready for claim in self.claims.values()]
+        self.reap_results.append(self.substrate.reap_orphans())
+        # The dial target arrives on a later poll, so this one hands back a
+        # bound sandbox with no address, keeping the claim routeless.
+        return SandboxView(
+            name=view.name,
+            ready=view.ready,
+            service_fqdn=None,
+            operating_mode=view.operating_mode,
+            port=view.port,
+        )
+
+
+def test_reap_orphans_spares_a_bound_claim_awaiting_its_route(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # The spare must not hinge on the claim being unbound. A claim that has
+    # already bound but is still waiting on its service address, or on the
+    # route write that follows it, is equally live and equally routeless;
+    # reaping it kills a running sandbox out from under its blocked creator.
+    fake_k8s = _ReapAfterBindClient()
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+    fake_k8s.substrate = substrate
+
+    handle = substrate.claim("T1")
+
+    # The tick really did run against a BOUND claim, not an unbound one.
+    assert fake_k8s.ready_at_reap == [True]
+    assert fake_k8s.reap_results == [[]]  # the tick found nothing reapable
+    assert handle.claim_name in fake_k8s.claims  # the claim survived
+    # Never deleted at all, as opposed to deleted and re-created.
+    assert handle.claim_name not in fake_k8s.deleted
+
+
+def test_reap_orphans_still_deletes_a_claim_older_than_the_grace(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = substrate.claim("T-old")
+    boundary = substrate.claim("T-boundary")
+    affinity.delete_if_claim("T-old", old.claim_name)
+    affinity.delete_if_claim("T-boundary", boundary.claim_name)
+
+    # The reaper's wall-clock reference is pinned so that "exactly at the
+    # grace" is a real boundary rather than a race against test execution time.
+    frozen = datetime.now(UTC)
+
+    class _FrozenClock:
+        @staticmethod
+        def now(tz: object = None) -> datetime:
+            return frozen
+
+    monkeypatch.setattr("curie_worker.sandbox.substrate.datetime", _FrozenClock)
+
+    # The grace is the config fixture's claim_timeout_seconds (2.0) plus the
+    # reaper's fixed margin (30.0), spelled as literals: importing the module
+    # under test's own constant would keep this green under any margin value,
+    # including 0, which is the defect itself.
+    fake_k8s.claims[old.claim_name].created_at = frozen - timedelta(seconds=33.0)
+    fake_k8s.claims[boundary.claim_name].created_at = frozen - timedelta(seconds=32.0)
+
+    assert substrate.reap_orphans() == [old.claim_name]
+    assert old.claim_name not in fake_k8s.claims
+    # Exactly at the grace is spared: ties go to the creator.
+    assert boundary.claim_name in fake_k8s.claims
+
+
+def test_reap_grace_scales_with_the_configured_claim_timeout(
+    affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    # The grace is claim_timeout_seconds PLUS a fixed margin, so raising the
+    # configured timeout must spare an older claim. Every other reaper test
+    # runs at the one fixture timeout, where a cutoff that hardcodes the
+    # resulting grace and ignores claim_timeout_seconds is indistinguishable
+    # from the real rule. Two substrates differing only in that value, against
+    # one age between their two graces, is what separates them: 2.0 gives a
+    # grace of 32.0 and 10.0 gives 40.0, and the claim is aged 35.0. Literals
+    # throughout, because importing the substrate's own margin constant would
+    # stay green under any value it is given, including one that drops the
+    # scaling.
+    patient_config = replace(config, claim_timeout_seconds=10.0)
+    age = timedelta(seconds=35.0)
+
+    strict_k8s = FakeSandboxClient()
+    strict = SandboxSubstrate(strict_k8s, affinity, config)
+    strict_claim = strict.claim("T-strict")
+    affinity.delete_if_claim("T-strict", strict_claim.claim_name)
+    strict_k8s.claims[strict_claim.claim_name].created_at = datetime.now(UTC) - age
+
+    patient_k8s = FakeSandboxClient()
+    patient = SandboxSubstrate(patient_k8s, affinity, patient_config)
+    patient_claim = patient.claim("T-patient")
+    affinity.delete_if_claim("T-patient", patient_claim.claim_name)
+    patient_k8s.claims[patient_claim.claim_name].created_at = datetime.now(UTC) - age
+
+    # Past the short config's grace of 32.0: litter, reaped.
+    assert strict.reap_orphans() == [strict_claim.claim_name]
+    assert strict_claim.claim_name not in strict_k8s.claims
+    # The very same age, inside the long config's grace of 40.0: a creator can
+    # still be waiting on it, so it is spared.
+    assert patient.reap_orphans() == []
+    assert patient_claim.claim_name in patient_k8s.claims
+    assert patient_claim.claim_name not in patient_k8s.deleted
+
+
+def test_reap_orphans_skips_and_warns_on_a_claim_of_unknown_age(
+    substrate: SandboxSubstrate,
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    orphan = substrate.claim("T-unknown")
+    affinity.delete_if_claim("T-unknown", orphan.claim_name)
+    # An adapter that cannot report a creation instant: a parse defect, a
+    # malformed cluster answer, a future third adapter.
+    fake_k8s.claims[orphan.claim_name].created_at = None
+
+    # A second orphan, plainly reapable, created AFTER the unknown-age one so
+    # the sweep reaches it only by continuing past that claim. One unreadable
+    # claim must cost exactly itself; skipping the rest of the sweep would let
+    # a single malformed answer stall reaping fleet-wide.
+    stale = substrate.claim("T-stale")
+    affinity.delete_if_claim("T-stale", stale.claim_name)
+    fake_k8s.claims[stale.claim_name].created_at = datetime.now(UTC) - timedelta(seconds=33.0)
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        assert substrate.reap_orphans() == [stale.claim_name]
+
+    # Unknown age is never reaped: an unreaped claim is recoverable litter, a
+    # wrongly reaped one is a killed live sandbox.
+    assert orphan.claim_name in fake_k8s.claims
+    assert stale.claim_name not in fake_k8s.claims
+    # And the skip is observable. Without a signal, one adapter bug turns
+    # orphan reaping off entirely and nothing anywhere reports it. Asserted on
+    # the claim name, not the sentence, so a reworded message still passes
+    # while a deleted or downgraded log line does not.
+    warned = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and orphan.claim_name in record.getMessage()
+    ]
+    assert warned, "an unknown-age skip must name the claim at WARNING"
 
 
 def test_claim_rebinds_when_sandbox_died_under_live_route(
@@ -259,6 +490,7 @@ class _SlowBindNoFqdnClient(FakeSandboxClient):
             name=claim.name,
             ready=ready,
             sandbox_name=claim.sandbox_name if ready else None,
+            created_at=claim.created_at,
         )
 
     def get_sandbox(self, name: str) -> SandboxView | None:

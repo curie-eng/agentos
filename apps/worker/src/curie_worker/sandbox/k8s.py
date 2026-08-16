@@ -11,6 +11,7 @@ the k8scratch e2e test.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from aci_protocol import BootEnv
@@ -75,6 +76,34 @@ def _conditions_ready(status: dict[str, Any]) -> bool:
     return False
 
 
+def _parse_timestamp(raw: object) -> datetime | None:
+    """A cluster creation instant as tz-aware UTC, or None when unreadable.
+
+    ``CustomObjectsApi`` hands back the raw deserialized JSON for a CRD rather
+    than a typed model, so ``metadata.creationTimestamp`` is always the RFC3339
+    string the API server emitted. Normalizing to aware UTC is not cosmetic:
+    the reaper compares this against ``datetime.now(UTC)``, and a naive value
+    on either side raises TypeError inside a maintenance tick whose caller
+    swallows exceptions, which would silently stop reaping for good.
+
+    An unreadable value returns None (unknown age, never reaped) rather than
+    raising, so one malformed object cannot take down the whole tick.
+    """
+
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    # Naive is read as UTC, never as host-local: the API server always sends
+    # an aware RFC3339 string, but if a naive value ever reached here,
+    # interpreting it as local time would shift it by the host's UTC offset,
+    # and the reaper compares this against datetime.now(UTC) to decide
+    # whether a claim is past the grace and safe to delete.
+    return parsed.astimezone(UTC) if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _claim_view(obj: dict[str, Any]) -> ClaimView:
     status = obj.get("status") or {}
     sandbox = (status.get("sandbox") or {}).get("name")
@@ -82,6 +111,7 @@ def _claim_view(obj: dict[str, Any]) -> ClaimView:
         name=obj["metadata"]["name"],
         ready=_conditions_ready(status),
         sandbox_name=sandbox,
+        created_at=_parse_timestamp(obj["metadata"].get("creationTimestamp")),
     )
 
 

@@ -21,6 +21,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -139,7 +140,13 @@ class _FakeK8s:
         claim = self.claims.get(name)
         if claim is None:
             return None
-        return ClaimView(name=claim.name, ready=True, sandbox_name=claim.sandbox_name)
+        # This suite never reaps; the claim is simply as new as it looks.
+        return ClaimView(
+            name=claim.name,
+            ready=True,
+            sandbox_name=claim.sandbox_name,
+            created_at=datetime.now(UTC),
+        )
 
     def delete_claim(self, name: str) -> None:
         self.claims.pop(name, None)
