@@ -28,7 +28,8 @@ the egress port the kernel writes replies through (`SlackSink`). Everything betw
 routing, concurrency, sandboxing — is opinionated core and channel-agnostic. Since #7 and
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract; the remaining vendor shape is on the
-egress semantics (edit-in-place) and on the Slack-typed binding surface. One implementation
+egress semantics (edit-in-place streaming, plus posting and settling platform-owned cards)
+and on the Slack-typed binding surface. One implementation
 today; the port is the wire + Protocol contract, extracted further only when a second
 channel demands it ("the second implementation teaches the interface").
 
@@ -42,17 +43,44 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   session per), `author`, `text`, `received_at`, and `reply_handle` — a `ReplyHandle`
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying `channel`,
   `placeholder` (the pre-posted reply the worker edits in place), and an optional per-turn
-  `endpoint`. The dispatcher serializes it to a single Stream field via `to_stream_fields`
+  `endpoint`. For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is
+  the thread ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel
+  plus the placeholder ts.
+  The dispatcher serializes the turn to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
-  `STREAM_PAYLOAD_FIELD = "payload"` (`apps/dispatcher/src/curie_dispatcher/queue.py::STREAM_PAYLOAD_FIELD`).
-  For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
-  ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel plus the
-  placeholder ts.
-- **Egress** — the `SlackSink` Protocol (`apps/worker/src/curie_worker/slack_sink.py::SlackSink`),
-  whose core method is `async def update(self, *, channel: str, ts: str, text: str)`
-  (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.update`) — an edit-in-place on Slack's `chat.update`, plus best-effort
-  `set_status`/`clear_status`. The mrkdwn dialect is confined behind the sink in
-  `to_mrkdwn` (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`).
+  `STREAM_PAYLOAD_FIELD = "payload"`. That key is not the dispatcher's: it is frozen-package
+  contract in
+  `packages/aci-protocol/src/aci_protocol/service_config.py::STREAM_PAYLOAD_FIELD`, imported
+  by every producer and consumer of the stream (the dispatcher, the API resume queue in
+  `apps/api/src/curie_api/resumequeue.py`, and the Rust CLI through the generated constant in
+  `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
+  the literal.
+- **Egress** — the `SlackSink` Protocol (`apps/worker/src/curie_worker/slack_sink.py::SlackSink`)
+  carries five methods, and a second channel implements all five:
+  - `update` (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.update`), the streamed
+    reply, is `async def update(self, *, channel: str, ts: str, text: str, nav: NavPack | None
+    = None, endpoint: str | None = None, best_effort_unreachable: bool = False) -> None`: an
+    edit-in-place of the ingress placeholder, carrying the agent's hub-button pack (`nav`),
+    the per-turn reply target (`endpoint`, #19), and the offline resume allowance
+    (`best_effort_unreachable`, #708).
+  - `post` (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.post`) posts a NEW
+    platform-owned message and returns its id, and `update_message`
+    (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.update_message`) edits an
+    already-posted one into its settled form. Both take a channel-neutral `OutboundMessage`
+    (`packages/channel-protocol/src/channel_protocol/models.py::OutboundMessage`, ADR-0020)
+    that the adapter renders below the seam, so no channel-native markup crosses here;
+    `update_message` also takes a `SettledCard`
+    (`apps/worker/src/curie_worker/slack_sink.py::SettledCard`) carrying the outcome
+    semantically (who asked, what was decided, by whom, with what note).
+  - `set_status`/`clear_status`
+    (`apps/worker/src/curie_worker/slack_sink.py::SlackSink.set_status`,
+    `apps/worker/src/curie_worker/slack_sink.py::SlackSink.clear_status`) are the
+    best-effort thread status caption, a no-op on a channel with no equivalent.
+
+  Slack dialect and widget shape stay below the seam: `to_mrkdwn`
+  (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
+  `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
+  (`apps/worker/src/curie_worker/blocks.py::approval_card`).
 - **Binding** — a channel resolves to a deployment by `agents.slack_channel`
   equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
 
@@ -77,9 +105,17 @@ Two ends were cleaned and one Slack surface is newly documented.
   one deployment. `WorkerConfig.slack_api_base_url` (`apps/worker/src/curie_worker/config.py::WorkerConfig`)
   is now only the default when a turn sets no `endpoint`, fed to `AsyncSlackSink`
   (`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.__init__`).
-- **Still leaks — egress semantics.** The reply model is edit-a-placeholder —
-  `update(channel, ts, text)` on `chat.update`, not post-a-message — so any channel without
-  in-place edit must emulate it.
+- **Still leaks — egress semantics.** The streamed reply is edit-a-placeholder: `update`
+  runs on Slack's `chat.update` against the message the ingress already posted
+  (`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.update`), so a channel with no
+  in-place edit must emulate it. That is no longer the whole egress model, though: the sink
+  also really posts, via `chat.postMessage` in
+  `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.post`, for platform-owned
+  messages such as the approval card, and settles that card in place afterwards in
+  `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.update_message` (expired in
+  #419, resolved in #1084). A second channel therefore has to support three shapes, not one:
+  repeatedly editing one streamed message, posting an interactive card and returning its id,
+  and editing that card into a settled, non-interactive form.
 - **Still leaks — the Slack-typed binding surface, undocumented until now.** The agents table
   carries a `slack_channel` column (`apps/api/src/curie_api/models.py::Agent`), and agent
   create/update validate it as a Slack channel id via `_validate_slack_channel_id`
