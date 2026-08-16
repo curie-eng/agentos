@@ -51,6 +51,7 @@ impl Fixture {
             "helm",
             r#"#!/bin/sh
 if [ "$1" = "get" ] && [ "$2" = "values" ]; then
+    printf '%s\n' 'Error: release: not found' >&2
     exit 1
 fi
 
