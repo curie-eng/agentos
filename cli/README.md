@@ -121,9 +121,11 @@ state on stdout --
 The five shapes are the `oneOf` in `cli/schema/message.schema.json`. Two
 exceptions still print human text instead of JSON on success (tracked in
 #485): `curie skill message`, and the operator verbs (`up`, `down`,
-`status`, `comms`, `deploy`). On failure under `--json`, the error is
-emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` instead of
-a prose message, so an agent can recover without parsing prose.
+`status`, `comms`, `deploy`). On generic failure under `--json`, the error is
+emitted to stdout as `{"error": "<message>", "fix": "<hint>"|null}` and follows
+`cli/schema/error.schema.json`, so an agent can recover without parsing prose.
+The exception is `curie cluster deploy --all-targets`, whose reconciliation
+failures follow `cli/schema/deploy.schema.json`.
 
 **Versioned result schemas.** Every agent-facing `--json` result maps to a
 committed JSON Schema under `cli/schema/`, with an explicit version in its
