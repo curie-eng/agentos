@@ -292,29 +292,54 @@ fn live_local_release_rung_grades_its_own_weather_cases_copy() {
 }
 
 #[test]
-fn live_cluster_rung_grades_weather_cases_with_the_message_listen_host() {
+fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
     let text = ladder();
-    let contract = r#"assert_finalized_reply "cluster" "$out"
-
-    if [[ "$LIVE" == "1" ]]; then
-        echo
-        echo "=== curie cluster eval ==="
-        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+    let contract = r#"local eval_args=(--json cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
         if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
             eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
-        fi
-        "$BIN" "${eval_args[@]}"
-    fi"#;
+        fi"#;
+    assert!(
+        text.contains(r#"assert_finalized_reply "cluster" "$out""#),
+        "the live cluster rung must keep its plumbing assertion; ladder \
+         contents:\n{text}"
+    );
     assert!(
         text.contains(contract),
-        "the live cluster rung must run cluster eval after its plumbing \
-         assertion against the deployed weather bundle cases and forward the \
-         message listen host; ladder contents:\n{text}"
+        "the live cluster rung must still RUN cluster eval against the deployed \
+         weather bundle cases and forward the message listen host -- report \
+         only (#1603) means the grade is non-fatal, never that the step was \
+         deleted; ladder contents:\n{text}"
     );
 }
 
+/// The cluster rung's eval must run in `--json` mode. The human table prints a
+/// reply only for a RED case, so a green would carry no evidence of HOW it was
+/// earned -- and the weather case is precisely the one that can go green
+/// dishonestly (#1602): its regex grades that a temperature figure is present,
+/// not that the agent fetched one. The json payload carries `output` for every
+/// case, pass included, which is what keeps the report-only grade auditable in
+/// the job log. Asserted for the cluster rung alone, since the sibling
+/// assertions above pin the other rungs to the plain table.
 #[test]
-fn live_cluster_rung_propagates_deployed_evaluator_failure() {
+fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
+    let text = ladder();
+    assert!(
+        text.contains(r#"local eval_args=(--json cluster eval --cases"#),
+        "the live cluster rung must run its eval with `--json` so a PASSING \
+         case's reply text lands in the job log; without it a dishonest green \
+         (a fabricated temperature) is indistinguishable from an honest one; \
+         ladder contents:\n{text}"
+    );
+}
+
+/// The inverse of the local/local-release assertions above, which pin those
+/// rungs to a bare `"$BIN" local eval ...` that `set -e` makes fatal. On the
+/// cluster rung the grade is REPORT ONLY (#1603): the eval still runs and still
+/// prints, but a red case must not fail the rung, because the weather case
+/// grades temperature PRESENCE and the cluster rung's provider-only egress makes
+/// presence a function of model phrasing rather than of a real fetch.
+#[test]
+fn live_cluster_rung_reports_but_does_not_propagate_evaluator_failure() {
     let harness = tempfile::tempdir().expect("create harness directory");
     let fake_curie = harness.path().join("curie");
     let eval_marker = harness.path().join("eval_called");
@@ -333,7 +358,7 @@ case "$*" in
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"live weather reply"}'
         ;;
-    "cluster eval --cases "*)
+    "--json cluster eval --cases "*)
         printf '%s\n' called > "$EVAL_MARKER"
         exit 42
         ;;
@@ -361,14 +386,26 @@ esac
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         eval_marker.exists(),
-        "the deployed evaluator must run after the cluster message plumbing \
-         succeeds; status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "the deployed evaluator must still run after the cluster message \
+         plumbing succeeds -- report only means non-fatal, not skipped; \
+         status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
     assert_eq!(
         output.status.code(),
-        Some(42),
-        "the ladder must preserve the deployed evaluator failure; \
+        Some(0),
+        "the cluster rung's eval grade is report only (#1603), so an evaluator \
+         failure must NOT fail the ladder; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("LADDER PASS"),
+        "the ladder must run to completion past a red cluster eval; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("report only (#1603)"),
+        "a red cluster eval must say IN THE LOG that it was tolerated, and cite \
+         the ticket, so a silent tolerance is never mistaken for a pass; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
