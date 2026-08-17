@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1202,62 +1203,34 @@ class TestLegitimateSkips:
             required_names=TEST_REQUIRED_NAMES,
         )
 
-    def test_every_conditional_required_ci_job_gates_only_on_the_ladder_output(self):
-        """A required ci.yaml job may carry no `if:` but the ladder gate.
-
-        Exactly two required jobs are conditional today -- `e2e-ladder`
-        (`E2E parity ladder (skill + local, fake model)`) and
-        `e2e-ladder-release` (`E2E parity ladder (local-release, fake model)`)
-        -- and both gate solely on `needs.changes.outputs.ladder == 'true'`,
-        which the `changes` job forces true on push (pinned behaviorally by the
-        test below). Any other expression reopens the hole: adding a
-        `github.event_name == 'pull_request'` conjunct, for instance, would
-        conclude those required checks `skipped` on every push and block every
-        release, while the `changes` job still faithfully wrote `ladder=true`.
-
-        Filtered on `REQUIRED_CHECK_NAMES` rather than over all jobs because
-        `e2e-ladder-cluster` and `commit-messages` also declare an `if:` but
-        their names are not required, so a skip there cannot reach the gate;
-        they are out of this assertion by construction. Asserted over every
-        matching job rather than the two known ids, so a newly-added
-        conditional required job is covered without editing this test.
-        """
+    def test_required_ci_job_conditions_match_tier_outputs(self):
+        """Required conditional jobs must select exactly their owned tiers."""
         doc = yaml.safe_load(CI_YAML.read_text())
-        offenders = {
+        actual = {
             job_id: str(job["if"]).strip()
             for job_id, job in doc["jobs"].items()
             if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
             and "if" in job
-            and str(job["if"]).strip() != "needs.changes.outputs.ladder == 'true'"
+        }
+        expected = {
+            "e2e-ladder": (
+                "${{ needs.changes.outputs.skill == 'true' || "
+                "needs.changes.outputs.local == 'true' }}"
+            ),
+            "e2e-ladder-release": (
+                "${{ needs.changes.outputs.local_release == 'true' }}"
+            ),
         }
 
-        assert not offenders, (
-            "ci.yaml required job(s) carry a job-level `if:` other than the "
-            "ladder gate, so their required check-run can conclude `skipped` on "
-            f"a release train push and block every release: {sorted(offenders.items())}"
+        assert actual == expected, (
+            "required ci.yaml jobs no longer gate on their exact tier outputs: "
+            f"expected {expected!r}, got {actual!r}"
         )
 
-    def test_the_changes_filter_step_emits_ladder_true_when_executed_as_a_push(
+    def test_the_changes_filter_step_emits_every_tier_when_executed_as_a_push(
         self, tmp_path
     ):
-        """The push short-circuit is what makes the conditional jobs safe.
-
-        The `changes` job's filter step emits `ladder=true` unconditionally on
-        a push to a release train branch, before ever consulting the
-        changed-file filter, so the required ladder jobs gated on that output
-        always run and never report `skipped` on a releasable push. Remove the
-        short-circuit and a docs-only push skips both required checks, and this
-        gate refuses every release.
-
-        Executed rather than grepped: a harmless shell rewrite of the same
-        behavior would fail a text scan, and a scan that finds the literal
-        `ladder=true` in a branch that no longer runs would pass while the
-        safety was gone. Interpolations are substituted first --
-        `github.event_name` becomes `push`, every other expression becomes
-        empty -- so without the short-circuit the script falls through to
-        `git fetch --quiet origin ""` under `set -euo pipefail` and exits
-        non-zero. It runs in `tmp_path` so it cannot touch this repo.
-        """
+        """A push selects every tier through the real selector runtime."""
         doc = yaml.safe_load(CI_YAML.read_text())
         filter_step = next(
             step
@@ -1271,6 +1244,14 @@ class TestLegitimateSkips:
         )
         script_path = tmp_path / "filter.sh"
         script_path.write_text(script)
+        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select.py"
+        selector_path.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO_ROOT / "tools" / "e2e-ci-selection" / "select.py", selector_path
+        )
+        registry_path = tmp_path / ".github" / "e2e-selection.yaml"
+        registry_path.parent.mkdir()
+        shutil.copy2(REPO_ROOT / ".github" / "e2e-selection.yaml", registry_path)
         github_output = tmp_path / "github_output"
         github_output.touch()
 
@@ -1283,14 +1264,18 @@ class TestLegitimateSkips:
         )
 
         assert result.returncode == 0, (
-            "ci.yaml's `changes` filter step no longer short-circuits on push -- "
-            "it fell through to the changed-file filter and failed: "
+            "ci.yaml's `changes` filter step no longer selects tiers on push: "
             f"{result.stderr}"
         )
-        assert "ladder=true" in github_output.read_text(), (
-            "ci.yaml's `changes` job no longer forces ladder=true on push, so the "
-            "`if: needs.changes.outputs.ladder == 'true'` required jobs can report "
-            f"`skipped` on a release train push: {github_output.read_text()!r}"
+        assert github_output.read_text().splitlines() == [
+            "skill=true",
+            "local=true",
+            "local_release=true",
+            "cluster=true",
+            "skill_local_tiers=skill,local",
+        ], (
+            "ci.yaml's push selection no longer emits the complete tier contract: "
+            f"{github_output.read_text()!r}"
         )
 
 

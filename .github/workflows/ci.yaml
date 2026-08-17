@@ -1165,51 +1165,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          check_boolean() {
-            [[ "$1" == "true" || "$1" == "false" ]]
-          }
-
-          check_group() {
-            if [[ "$1" == "true" ]]; then
-              [[ "$2" == "success" ]]
-            else
-              [[ "$2" == "skipped" ]]
-            fi
-          }
-
-          check_results() {
-            [[ "$1" == "success" ]] || return 1
-            check_boolean "$2" || return 1
-            check_boolean "$3" || return 1
-            check_boolean "$4" || return 1
-            check_boolean "$5" || return 1
-
-            skill_local_selected="false"
-            if [[ "$2" == "true" || "$3" == "true" ]]; then
-              skill_local_selected="true"
-            fi
-
-            check_group "$skill_local_selected" "$6" || return 1
-            check_group "$4" "$7" || return 1
-            check_group "$5" "$8" || return 1
-          }
-
-          if check_results success true false false false skipped skipped skipped; then
-            echo "Selected and skipped negative control failed" >&2
+          if [[ "$CHANGES_RESULT" != "success" ||
+                ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
+                ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
+                ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
+                ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ]]; then
+            echo "E2E required failed" >&2
             exit 1
           fi
-          echo "Selected and skipped negative control passed"
 
-          if ! check_results \
-            "$CHANGES_RESULT" \
-            "$SKILL_SELECTED" \
-            "$LOCAL_SELECTED" \
-            "$LOCAL_RELEASE_SELECTED" \
-            "$CLUSTER_SELECTED" \
-            "$SKILL_LOCAL_RESULT" \
-            "$LOCAL_RELEASE_RESULT" \
-            "$CLUSTER_RESULT"; then
+          skill_local_expected="skipped"
+          if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
+            skill_local_expected="success"
+          fi
+          local_release_expected="skipped"
+          if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
+            local_release_expected="success"
+          fi
+          cluster_expected="skipped"
+          if [[ "$CLUSTER_SELECTED" == "true" ]]; then
+            cluster_expected="success"
+          fi
+
+          if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
+                "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
             echo "E2E required failed" >&2
+            exit 1
+          fi
+
+          negative_skill_local_expected="skipped"
+          if [[ "true" == "true" || "false" == "true" ]]; then
+            negative_skill_local_expected="success"
+          fi
+          negative_local_release_expected="skipped"
+          negative_cluster_expected="skipped"
+          if [[ "success" != "success" ||
+                "skipped" == "$negative_skill_local_expected" ||
+                "skipped" == "$negative_local_release_expected" ||
+                "skipped" == "$negative_cluster_expected" ]]; then
+            echo "Selected and skipped negative control passed"
+          else
+            echo "Selected and skipped negative control failed" >&2
             exit 1
           fi
           echo "E2E required passed"
