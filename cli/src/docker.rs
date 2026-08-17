@@ -914,6 +914,46 @@ pub async fn container_facts(name: &str) -> Result<Option<ContainerFacts>> {
         }))
 }
 
+/// The host path bound at `destination` inside the container holding this name,
+/// as the DAEMON reports it. `None` when nothing is mounted there.
+///
+/// This is a read of a genuine second party, not an echo of what this process
+/// recorded: it is what proves a booted runner is executing the artifact this
+/// run packed rather than some other directory a stale container holds.
+pub async fn container_mount_source(name: &str, destination: &str) -> Result<Option<String>> {
+    let args: Vec<String> = vec![
+        "inspect".into(),
+        "--format".into(),
+        "{{range .Mounts}}{{.Destination}}\t{{.Source}}{{println}}{{end}}".into(),
+        name.to_string(),
+    ];
+    let out = docker(&args).await?;
+    Ok(out.lines().find_map(|line| {
+        let (dest, source) = line.split_once('\t')?;
+        (dest.trim() == destination).then(|| source.trim().to_string())
+    }))
+}
+
+/// The value of environment variable `key` in the container holding this name,
+/// as the daemon reports it. `None` when the container does not carry it.
+///
+/// The same read `message::probe_fake_model` performs for the local worker:
+/// what the running container was actually booted with, never a re-derivation
+/// of the flags this process passed.
+pub async fn container_env_value(name: &str, key: &str) -> Result<Option<String>> {
+    let args: Vec<String> = vec![
+        "inspect".into(),
+        "--format".into(),
+        "{{range .Config.Env}}{{println .}}{{end}}".into(),
+        name.to_string(),
+    ];
+    let out = docker(&args).await?;
+    let prefix = format!("{key}=");
+    Ok(out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(&prefix).map(str::to_string)))
+}
+
 /// Whether a container with exactly this name exists, running or stopped.
 pub async fn container_exists(name: &str) -> Result<bool> {
     Ok(container_facts(name).await?.is_some())
