@@ -556,11 +556,23 @@ probe_local_fake_model() {
         echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=curie plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
         return 1
     fi
+    # Captured into a variable and status-checked, never read through a process
+    # substitution: a process substitution discards `docker inspect`'s exit
+    # status, so a container that died since the `docker ps` above, or a daemon
+    # blip, would read as zero env lines and return an empty string with exit 0.
+    # An absent CURIE_FAKE_MODEL is legitimately live mode, and assert_model_mode
+    # accepts an empty value as live under CURIE_E2E_LIVE=1 -- so an unread probe
+    # would PASS the live-mode assertion having verified nothing at all.
+    local env_dump
+    if ! env_dump="$(docker inspect "${workers[0]}" --format '{{range .Config.Env}}{{println .}}{{end}}')"; then
+        echo "local mode probe: \`docker inspect ${workers[0]}\` failed, so the deployed worker's effective model mode is unknown. Refusing to treat an unread probe as live." >&2
+        return 1
+    fi
     while IFS= read -r line; do
         if [[ "$line" == CURIE_FAKE_MODEL=* ]]; then
             value="${line#CURIE_FAKE_MODEL=}"
         fi
-    done < <(docker inspect "${workers[0]}" --format '{{range .Config.Env}}{{println .}}{{end}}')
+    done <<< "$env_dump"
     printf '%s' "$value"
 }
 
