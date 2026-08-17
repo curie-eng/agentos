@@ -1420,8 +1420,19 @@ pub async fn prepare_start(opts: &StartOpts) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
     // Fail fast on a directory that is not a bundle; the runner would reject
-    // it at boot anyway (real-model mode), with a worse error surface.
-    read_manifest(&plugin_dir)?;
+    // it at boot anyway (real-model mode), with a worse error surface. A
+    // deterministic input error, so it carries the Usage class and the fix an
+    // agent consumer branches on rather than an untyped exit 1 (ADR-0021).
+    read_manifest(&plugin_dir).map_err(|err| {
+        crate::exit::CliError::usage(format!(
+            "{} is not a usable bundle: {err:#}",
+            plugin_dir.display()
+        ))
+        .with_fix(
+            "point this at a bundle directory holding a .claude-plugin/plugin.json with a string \
+             'name', or scaffold one with `curie init <name>`",
+        )
+    })?;
 
     if opts.local_model.is_some() && opts.fake_model {
         return Err(crate::exit::usage(
@@ -1443,10 +1454,17 @@ pub async fn prepare_start(opts: &StartOpts) -> Result<PathBuf> {
         opts.replace,
     );
     if recorded_plan == RecordedStatePlan::Refuse {
-        return Err(crate::exit::usage(format!(
-            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first",
-            plugin_dir.display()
-        )));
+        return Err(anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "a local runner is already recorded in {}/.curie/runner.json",
+                plugin_dir.display()
+            ))
+            .with_fix(format!(
+                "run 'curie skill down' in {} to tear that runner down first; its record is \
+                 cleared with it",
+                plugin_dir.display()
+            )),
+        ));
     }
 
     // Parse (not just forward) the budget so a typo fails here, not in-container.

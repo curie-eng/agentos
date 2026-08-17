@@ -6,9 +6,7 @@
 //! PATH and a doubled runner HTTP peer bound on `commands::DEFAULT_PORT`, the
 //! exact harness `cli/tests/scenario_runner.rs` and `cli/tests/scenario_manifest.rs`
 //! establish. Nothing here reaches a real daemon, a real network, or a
-//! credential, and no `curie::scenario::*` symbol is referenced, so this file
-//! compiles against today's crate and fails on the defect rather than on a
-//! missing item.
+//! credential.
 //!
 //! The runner double binds one fixed port for the whole test binary and is
 //! leased by one test at a time, for the same reason the runner-pipeline file
@@ -216,6 +214,9 @@ fn green_turns() -> Vec<Vec<String>> {
 /// - `CURIE_HARDEN_UNREADABLE_SNAPSHOT_ROOT`: teardown drops the execute bit on
 ///   the snapshot root, so a metadata read of the snapshot directory ERRORS
 ///   rather than reporting absence.
+/// - `CURIE_HARDEN_RENAME_ON_RM`: the removal frees the container NAME while the
+///   container the boot recorded keeps running under its own id, the shape a
+///   name-only postcondition reports as removed.
 ///
 /// The `/plugin` mount source it reports is parsed out of the REAL `docker run`
 /// argv the command issued, so agreement is never handed back by the test.
@@ -258,6 +259,14 @@ case "$1" in
       printf '%s\n' 'error during connect: Cannot connect to the Docker daemon' >&2
       exit 1
     fi
+    case "$all" in
+      *"--filter id="*)
+        if [ -f "$state/id_present" ]; then
+          printf '%s\n' 'c0ffeec0ffee'
+        fi
+        exit 0
+        ;;
+    esac
     if [ -n "$CURIE_HARDEN_NAME_TAKEN" ]; then
       printf '%s\t%s\t%s\n' "$runner_name" 'deadbeefdead' 'curie-cli'
       exit 0
@@ -280,6 +289,7 @@ case "$1" in
       prev="$arg"
     done
     : > "$state/container"
+    : > "$state/id_present"
     printf '%s\n' 'c0ffeec0ffee'
     exit 0
     ;;
@@ -288,12 +298,32 @@ case "$1" in
       chmod 0666 "$CURIE_HARDEN_SNAPSHOT_ROOT" 2>/dev/null
     fi
     rm -f "$state/container"
+    if [ -z "$CURIE_HARDEN_RENAME_ON_RM" ]; then
+      rm -f "$state/id_present"
+    fi
     : > "$state/removed"
     printf '%s\n' 'c0ffeec0ffee'
     exit 0
     ;;
 esac
 exit 0
+"#;
+
+/// A `git` that answers "not a git tree" (the honest answer for a bundle in a
+/// tempdir, which is what the REAL git already says here) and, under
+/// `CURIE_HARDEN_CORRUPT_STATE`, overwrites an already-written runner record
+/// with something that will not parse.
+///
+/// `commands::start` calls `git rev-parse` once, between `state::save` and the
+/// scenario's read-back of that record, so this is the seam that makes the boot
+/// leave a container behind AND a record that cannot be read. The
+/// already-exists guard is what keeps the earlier `source_commit` call (which
+/// runs before anything is recorded) from writing the file itself.
+const FAKE_GIT: &str = r#"#!/bin/sh
+if [ -n "$CURIE_HARDEN_CORRUPT_STATE" ] && [ -f "$CURIE_HARDEN_CORRUPT_STATE" ]; then
+  printf '%s' 'not a runner record' > "$CURIE_HARDEN_CORRUPT_STATE"
+fi
+exit 1
 "#;
 
 fn write_exec(dir: &Path, name: &str, body: &str) {
@@ -361,6 +391,7 @@ impl Rig {
                 .replace("__STATE__", &docker_state.display().to_string())
                 .replace("__RUNNER_NAME__", RUNNER_CONTAINER_LOCAL),
         );
+        write_exec(&fake_bin, "git", FAKE_GIT);
 
         Self {
             dir,
@@ -408,6 +439,19 @@ impl Rig {
 
     fn snapshot_root(&self) -> PathBuf {
         self.bundle.join(".curie").join("snapshots")
+    }
+
+    fn state_file(&self) -> PathBuf {
+        self.bundle.join(".curie").join("runner.json")
+    }
+
+    /// The bundle path as the command itself resolves it: every path the
+    /// scenario derives comes from a canonicalized plugin dir, so a test that
+    /// wants to touch one of them has to canonicalize too.
+    fn canonical_bundle(&self) -> PathBuf {
+        self.bundle
+            .canonicalize()
+            .expect("the scaffolded bundle resolves")
     }
 
     /// Every entry directly under the snapshot root, or an empty list when the
@@ -925,5 +969,205 @@ fn runtime_identity_is_read_from_one_immutable_container_id() {
         inspects.len() >= 2 && inspects.iter().all(|line| line.ends_with("c0ffeec0ffee")),
         "every identity read must name the immutable container id, never the name a \
          second container can take over: {inspects:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-review, blocking A -- the lifecycle lock is not crash safe
+// (cli/src/scenario.rs:743)
+// ---------------------------------------------------------------------------
+
+/// A lock whose exclusivity is "this file exists" is released only by a `Drop`
+/// that a SIGKILL never runs, so one killed run wedges the bundle permanently
+/// and the documented recovery (delete the file) races a genuinely live owner.
+/// A kernel-held lock is released however the process dies, so a lock FILE with
+/// no holder behind it must never refuse the next run.
+///
+/// *Deletion checks*: delete it and a crashed run leaves the bundle unusable
+/// with no gate noticing. Put the presence check back and the run is refused, so
+/// it fails. Rename internals and it survives -- it drives the binary against a
+/// file left on disk.
+#[test]
+fn a_lock_file_left_by_a_killed_run_never_blocks_the_next_run() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let state_dir = rig.bundle.join(".curie");
+    fs::create_dir_all(&state_dir).expect("create the bundle state directory");
+    fs::write(state_dir.join("scenario.lock"), b"").expect("leave a lock file behind");
+
+    let _run = lease(green_turns(), MODE_NORMAL);
+    let output = rig.run(&[]);
+
+    assert!(
+        output.status.success(),
+        "no process holds this lock, so the next run must be able to take it\n{}",
+        output_text(&output)
+    );
+}
+
+/// The other half, and the reason the lock exists at all: while a live holder
+/// has it, a second run must still be refused before it packs anything onto the
+/// snapshot the holder is using.
+///
+/// *Deletion checks*: delete it and "fix the stale lock" could be satisfied by
+/// deleting the lock entirely. Delete the exclusion and the second run proceeds,
+/// so it fails. Rename internals and it survives -- it holds the real lock
+/// through the crate and drives the binary by argv.
+#[test]
+fn a_lock_held_by_a_live_process_still_refuses_a_second_run() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let held = curie::scenario::LifecycleLock::acquire(&rig.canonical_bundle())
+        .expect("this process takes the bundle's lifecycle lock");
+
+    let output = rig.run(&[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a bundle whose lifecycle another run holds is a Usage refusal\n{}",
+        output_text(&output)
+    );
+    assert!(
+        !rig.docker_log_path().exists(),
+        "a refused run must never reach Docker: {:?}",
+        rig.docker_log()
+    );
+    drop(held);
+}
+
+// ---------------------------------------------------------------------------
+// Re-review, blocking B -- teardown proves only that the NAME is free
+// (cli/src/scenario.rs:1253)
+// ---------------------------------------------------------------------------
+
+/// The teardown postcondition is read with `docker ps --filter name=...`, which
+/// answers "nothing holds this name". A container renamed out of the way keeps
+/// running under the id the boot recorded while that probe reports it removed,
+/// so the one assertion that exists to catch a stranded runner greens on one.
+///
+/// *Deletion checks*: delete it and a surviving runner is reported torn down.
+/// Delete the id probe and the run goes green, so it fails. Rename internals and
+/// it survives -- it asserts the emitted postcondition against a container the
+/// daemon still lists by id.
+#[test]
+fn teardown_verifies_the_container_it_booted_by_id_not_only_by_name() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let _run = lease(green_turns(), MODE_NORMAL);
+    let output = rig.run(&[("CURIE_HARDEN_RENAME_ON_RM", "1")]);
+
+    let value = payload(&output);
+    let teardown = &value["tiers"][0]["teardown"];
+    assert_ne!(
+        teardown["container_removed"],
+        serde_json::json!(true),
+        "the container this run booted is still running under its own id: {value}"
+    );
+    assert!(
+        teardown["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("c0ffeec0ffee"),
+        "the diagnosis must name the container that survived: {value}"
+    );
+    assert!(
+        !output.status.success(),
+        "a stranded runner must never be reported as a clean run\n{}",
+        output_text(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-review, major C -- a failed record read discards the real teardown report
+// (cli/src/scenario.rs:946)
+// ---------------------------------------------------------------------------
+
+/// When the record the boot wrote cannot be read back, the run DOES tear down --
+/// and then throws that report away, emitting the never-attempted placeholder.
+/// A consumer reading `attempted: false` believes nothing was cleaned up and
+/// nothing was leaked, on the one path where both are actually in question.
+///
+/// *Deletion checks*: delete it and the report on that path is fiction. Discard
+/// the teardown report again and `attempted` is false, so it fails. Rename
+/// internals and it survives -- the emitted teardown block is the contract.
+#[test]
+fn a_boot_whose_record_cannot_be_read_still_reports_the_teardown_it_ran() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let corrupt = rig.state_file().display().to_string();
+    let _run = lease(green_turns(), MODE_NORMAL);
+    let output = rig.run(&[("CURIE_HARDEN_CORRUPT_STATE", &corrupt)]);
+
+    assert!(
+        !output.status.success(),
+        "a record that cannot be read is a failed run\n{}",
+        output_text(&output)
+    );
+    let value = payload(&output);
+    let teardown = &value["tiers"][0]["teardown"];
+    assert_eq!(
+        teardown["attempted"],
+        serde_json::json!(true),
+        "teardown ran, so the report must be the one it produced: {value}"
+    );
+    assert!(
+        !teardown["error"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the leftovers that teardown could not clear must surface: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Re-review, major D -- a deadline expiry is reported as exit 1
+// (cli/src/scenario.rs:893)
+// ---------------------------------------------------------------------------
+
+/// A runner that accepted the connection and never answered is retryable: the
+/// same argv may well succeed once it does. ADR-0021 reserves exit 3 for exactly
+/// that, and reporting it as exit 1 tells an agent the run failed for a reason
+/// re-running cannot change.
+///
+/// *Deletion checks*: delete it and a timeout is indistinguishable from a red
+/// probe. Delete the transient class and the exit code is 1, so it fails. Rename
+/// internals and it survives -- it asserts a process exit code.
+#[test]
+fn a_deadline_expiry_exits_transient_rather_than_failure() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let _run = lease(green_turns(), MODE_STALL);
+
+    let out_path = rig.dir.path().join("deadline.out");
+    let err_path = rig.dir.path().join("deadline.err");
+    let mut child = rig
+        .command(&[])
+        .stdout(Stdio::from(
+            fs::File::create(&out_path).expect("create stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(&err_path).expect("create stderr capture"),
+        ))
+        .spawn()
+        .expect("spawn curie scenario");
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let status = loop {
+        match child.try_wait().expect("poll the scenario process") {
+            Some(status) => break Some(status),
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => thread::sleep(Duration::from_millis(250)),
+        }
+    };
+
+    let captured = fs::read_to_string(&out_path).unwrap_or_default()
+        + &fs::read_to_string(&err_path).unwrap_or_default();
+    let status =
+        status.unwrap_or_else(|| panic!("the command must impose its own deadline\n{captured}"));
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "a deadline expiry is Transient (ADR-0021 exit 3), not a Failure\n{captured}"
     );
 }

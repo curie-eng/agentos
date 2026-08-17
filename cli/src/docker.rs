@@ -954,6 +954,29 @@ pub async fn container_env_value(name: &str, key: &str) -> Result<Option<String>
         .find_map(|line| line.trim().strip_prefix(&prefix).map(str::to_string)))
 }
 
+/// Whether the container with this ID exists, running or stopped.
+///
+/// Keyed by the immutable id `docker run` returned rather than by the name a
+/// container can be renamed out of: a free NAME proves only that nothing holds
+/// the name, never that the container this process started is gone. The daemon
+/// reports the short id, so a full recorded id is matched by prefix, exactly
+/// the way `--filter id=` itself matches.
+pub async fn container_id_present(id: &str) -> Result<bool> {
+    let args: Vec<String> = vec![
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        format!("id={id}"),
+        "--format".into(),
+        "{{.ID}}".into(),
+    ];
+    let out = docker(&args).await?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .any(|found| !found.is_empty() && id.starts_with(found)))
+}
+
 /// Whether a container with exactly this name exists, running or stopped.
 pub async fn container_exists(name: &str) -> Result<bool> {
     Ok(container_facts(name).await?.is_some())

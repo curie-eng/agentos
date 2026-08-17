@@ -3,8 +3,10 @@
 //!
 //! The five stages, each a real production code path:
 //!
-//! 1. **Package once.** [`crate::bundle::snapshot`] materializes the
-//!    content-addressed artifact, exactly one pack per run (#1087).
+//! 1. **Package once.** [`crate::bundle::snapshot_ephemeral`] materializes a
+//!    run-unique snapshot, exactly one pack per run (#1087). Run-unique rather
+//!    than the canonical content-addressed path so a concurrent `skill up` of
+//!    the same bundle cannot pack over the artifact this run booted on.
 //! 2. **Boot on that exact artifact.** [`crate::commands::start`], the function
 //!    `skill up` calls, taking the snapshot rather than packing its own.
 //! 3. **Verify runtime identity against the DAEMON.** The `/plugin` mount source
@@ -26,6 +28,7 @@
 //! contract; degrading to a probe-less run is not.
 
 use std::collections::BTreeSet;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -598,19 +601,26 @@ fn eval_case(probe: &Probe) -> EvalCase {
 /// The teardown's postconditions, read from the daemon and the filesystem rather
 /// than inferred from a `stop` that returned Ok.
 ///
-/// Both reads arrive as a `Result` because a read that FAILED observed nothing:
-/// a daemon that could not answer is not a container that is gone, and a
-/// directory whose presence could not be determined is not a released snapshot.
-/// An unverifiable postcondition is never a satisfied one.
+/// Every read arrives as a `Result` because a read that FAILED observed nothing:
+/// a daemon that could not answer is not a container that is gone, and a path
+/// whose presence could not be determined is not a released snapshot or a
+/// cleared record. An unverifiable postcondition is never a satisfied one.
+///
+/// The container takes TWO readings. `container` is the name probe, which proves
+/// only that nothing holds the runner name; `booted_container_present` is keyed
+/// by the id the boot recorded, and is what proves the container this run
+/// actually started is gone rather than merely renamed out of the way.
 pub fn teardown_postconditions(
     container: Result<Option<&docker::ContainerFacts>, &str>,
-    state_present: bool,
+    booted_container_present: Result<bool, &str>,
+    state_present: Result<bool, &str>,
     snapshot_present: Result<bool, &str>,
 ) -> TeardownReport {
     TeardownReport {
         attempted: true,
-        container_removed: matches!(container, Ok(None)),
-        state_cleared: !state_present,
+        container_removed: matches!(container, Ok(None))
+            && matches!(booted_container_present, Ok(false)),
+        state_cleared: matches!(state_present, Ok(false)),
         snapshot_released: matches!(snapshot_present, Ok(false)),
         error: None,
     }
@@ -717,54 +727,95 @@ pub struct RunOpts {
     pub dry_run: bool,
 }
 
-/// One tier's accumulated failure: the diagnosis and what to do about it.
+/// One tier's accumulated failure: the diagnosis, what to do about it, and
+/// whether it is retryable.
+///
+/// `transient` is what makes the run exit 3 rather than 1 (ADR-0021): a deadline
+/// that expired says the peer never answered in time, and the same argv may well
+/// succeed once it does. A red probe or a leaked container is not that.
 struct Diagnosis {
     error: String,
     fix: String,
+    transient: bool,
+}
+
+/// A boot that never reached a probe: the error, and the teardown that actually
+/// ran because of it.
+///
+/// The teardown report travels WITH the error because the arms differ: the ones
+/// that abort before a container exists tore nothing down, while the arm that
+/// cannot read back the record did tear down and its results are the only
+/// account of what was left behind.
+struct BootFailure {
+    error: anyhow::Error,
+    teardown: TeardownReport,
+}
+
+/// The teardown report for a failure that happened before anything was booted:
+/// nothing was attempted, so nothing is claimed either way.
+fn teardown_not_attempted() -> TeardownReport {
+    TeardownReport {
+        attempted: false,
+        container_removed: false,
+        state_cleared: false,
+        snapshot_released: false,
+        error: None,
+    }
 }
 
 /// The exclusive hold one scenario run takes on a bundle's lifecycle.
 ///
-/// The canonical snapshot path is content-addressed, so a second run of the same
-/// unchanged bundle resolves onto the very directory the first run's container
-/// has mounted read-only at `/plugin`, and packing REMOVES an existing
-/// destination. The name-conflict preflight refuses a second run before anything
-/// destructive happens; this lock is what makes that check hold for the whole
-/// lifecycle instead of only at the instant it ran.
-struct LifecycleLock {
-    path: PathBuf,
+/// A run boots on a snapshot under the bundle's own state dir and releases it at
+/// teardown, so two concurrent runs of the same bundle would pack, boot and tear
+/// down over each other. The name-conflict preflight refuses a second run before
+/// anything destructive happens; this lock is what makes that check hold for the
+/// whole lifecycle instead of only at the instant it ran.
+///
+/// The exclusion is a KERNEL-held `flock` on an open descriptor, never the
+/// presence of the file: the kernel drops it when the descriptor closes, which
+/// happens however the holder dies, SIGKILL included. So the lock FILE may
+/// outlive a run harmlessly and is never something a user has to delete -- the
+/// alternative (a `create_new` file unlinked on `Drop`) leaves a killed run's
+/// file behind permanently, and its only recovery is a manual delete that races
+/// a genuinely live owner. The file is deliberately not unlinked on release for
+/// the same reason: unlinking the path another process has already opened and
+/// locked would let a third process create a fresh file and lock that instead.
+pub struct LifecycleLock {
+    /// The lock lives on this open descriptor, so it is held for exactly as long
+    /// as the guard and released by the kernel when the guard (or the process)
+    /// goes away.
+    _file: std::fs::File,
 }
 
 impl LifecycleLock {
-    fn acquire(plugin_dir: &Path) -> Result<Self> {
+    pub fn acquire(plugin_dir: &Path) -> Result<Self> {
         let dir = plugin_dir.join(state::STATE_DIR);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(LOCK_FILE);
-        match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(&path)
-        {
-            Ok(_) => Ok(Self { path }),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(refusal(
+            .with_context(|| format!("opening the scenario lock {}", path.display()))?;
+        // SAFETY: `flock` only reads the descriptor, which `file` owns and keeps
+        // open for at least as long as the lock it is being asked to take.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Self { _file: file });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(refusal(
                 format!(
                     "another curie scenario run holds this bundle's lifecycle lock ({})",
                     path.display()
                 ),
-                format!(
-                    "wait for that run to finish; if no run is in flight, delete {} and re-run",
-                    path.display()
-                ),
-            )),
-            Err(err) => Err(anyhow::Error::new(err)
-                .context(format!("taking the scenario lock {}", path.display()))),
+                "wait for that run to finish; the lock is held by the kernel on an open file, \
+                 so it is released the moment that process exits however it exits, and there is \
+                 nothing to delete by hand",
+            ));
         }
-    }
-}
-
-impl Drop for LifecycleLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        Err(anyhow::Error::new(err).context(format!("taking the scenario lock {}", path.display())))
     }
 }
 
@@ -850,15 +901,16 @@ pub async fn run(opts: RunOpts) -> Result<()> {
     // onto, boots from, or releases this bundle's content-addressed snapshot.
     let _lock = LifecycleLock::acquire(&plugin_dir)?;
 
-    let (artifact_digest, tier, boot_error) =
+    let (artifact_digest, tier, transient, boot_error) =
         match boot_and_probe(&manifest, start_opts, &plugin_dir, &runner_url).await {
-            Ok((digest, tier)) => (digest, tier, None),
+            Ok((digest, tier, transient)) => (digest, tier, transient, None),
             // A boot that never reached a probe packed nothing that survives, so
             // there is no digest to report and none is invented.
-            Err(err) => (
+            Err(BootFailure { error, teardown }) => (
                 String::new(),
-                boot_failure_tier(&err, &runner_url),
-                Some(err),
+                boot_failure_tier(&error, teardown, &runner_url),
+                false,
+                Some(error),
             ),
         };
     let tiers = vec![tier];
@@ -890,10 +942,14 @@ pub async fn run(opts: RunOpts) -> Result<()> {
             .error
             .clone()
             .unwrap_or_else(|| "the scenario failed".to_string());
-        return Err(exit::with_json_payload(
-            anyhow::Error::from(CliError::failure(message)),
-            payload,
-        ));
+        // A deadline that expired is retryable and exits 3; everything else the
+        // tier can report is a genuine failure (ADR-0021).
+        let err = if transient {
+            CliError::transient(message)
+        } else {
+            CliError::failure(message)
+        };
+        return Err(exit::with_json_payload(anyhow::Error::from(err), payload));
     }
     crate::ui::ui().emit(&output);
     Ok(())
@@ -910,34 +966,66 @@ async fn boot_and_probe(
     start_opts: StartOpts,
     plugin_dir: &Path,
     runner_url: &str,
-) -> Result<(String, TierReport)> {
+) -> std::result::Result<(String, TierReport, bool), BootFailure> {
     let container_name = start_opts.name.clone();
     // Before ANYTHING destructive (#747, #1087). The pack below removes and
     // recreates the content-addressed destination, which on unchanged source is
     // the directory a runner already holding this name has mounted at /plugin,
     // so discovering the conflict after the pack means destroying a live run's
     // artifact to learn this run was never allowed to start.
-    docker::ensure_container_name_free(
+    if let Err(error) = docker::ensure_container_name_free(
         &container_name,
         Some(start_opts.port),
         start_opts.replace,
         docker::ConflictContext::SkillUp,
     )
-    .await?;
+    .await
+    {
+        return Err(BootFailure {
+            error,
+            teardown: teardown_not_attempted(),
+        });
+    }
 
-    // Stage 1: the ONE pack of the run. Everything below asserts against this
-    // exact artifact.
-    let snapshot = crate::bundle::snapshot(plugin_dir)
-        .context("packaging the bundle snapshot for the scenario runner")?;
+    // Stage 1: the ONE pack of the run, into a RUN-UNIQUE directory. Everything
+    // below asserts against this exact artifact. Deliberately not the canonical
+    // content-addressed `<digest>/` path: on unchanged source that path is the
+    // very directory a live `skill up` runner has mounted at `/plugin`, and
+    // packing removes an existing destination, so a scenario and an ordinary
+    // `skill up` of the same bundle would each destroy the other's artifact.
+    // `skill up` takes no lifecycle lock and never will, so the only way to keep
+    // out of its way is to not share the path.
+    let snapshot = match crate::bundle::snapshot_ephemeral(plugin_dir)
+        .context("packaging the bundle snapshot for the scenario runner")
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Err(BootFailure {
+                error,
+                teardown: teardown_not_attempted(),
+            })
+        }
+    };
     let artifact_digest = snapshot.digest.clone();
     let snapshot_dir = snapshot.dir.clone();
 
     // Stage 2: boot on exactly that artifact. Nothing records the snapshot until
     // this returns Ok, so no later teardown could ever find it: every failure
-    // between the pack and here releases it right here.
+    // between the pack and here releases it right here -- and a release that
+    // FAILED is a leaked artifact, so it rides out with the boot error rather
+    // than being dropped.
     if let Err(err) = crate::commands::start(start_opts, snapshot).await {
-        let _ = crate::bundle::remove_snapshot(&snapshot_dir, plugin_dir);
-        return Err(err);
+        let error = match crate::bundle::remove_snapshot(&snapshot_dir, plugin_dir) {
+            Ok(()) => err,
+            Err(release) => err.context(format!(
+                "the snapshot this run packed at {} could not be released either: {release:#}",
+                snapshot_dir.display()
+            )),
+        };
+        return Err(BootFailure {
+            error,
+            teardown: teardown_not_attempted(),
+        });
     }
 
     // The immutable id `docker run` returned, as the boot recorded it. Every
@@ -947,16 +1035,21 @@ async fn boot_and_probe(
         Ok(Some(recorded)) => recorded.container_id,
         other => {
             // The container exists whatever the record says, so it still owns a
-            // teardown.
-            let _ = tear_down(plugin_dir, &container_name, &snapshot_dir).await;
+            // teardown -- and that teardown's real results are the only account
+            // of what this run left behind, so they are reported rather than
+            // replaced by a never-attempted placeholder.
+            let teardown = tear_down(plugin_dir, &container_name, None, &snapshot_dir).await;
             let detail = match other {
                 Err(err) => format!("{err:#}"),
                 _ => "no runner record was written".to_string(),
             };
-            return Err(anyhow::anyhow!(
-                "the boot left no runner record to read the container id from ({detail}), so no \
-                 observation could be bound to the container this run started"
-            ));
+            return Err(BootFailure {
+                error: anyhow::anyhow!(
+                    "the boot left no runner record to read the container id from ({detail}), so \
+                     no observation could be bound to the container this run started"
+                ),
+                teardown,
+            });
         }
     };
 
@@ -965,7 +1058,13 @@ async fn boot_and_probe(
     let (probes, mut diagnosis, mounted_snapshot_dir, container_fake_model, identity_verified) =
         probe_tier(manifest, &container_id, &snapshot_dir, runner_url).await;
 
-    let mut teardown = tear_down(plugin_dir, &container_name, &snapshot_dir).await;
+    let mut teardown = tear_down(
+        plugin_dir,
+        &container_name,
+        Some(&container_id),
+        &snapshot_dir,
+    )
+    .await;
     let mut tier_verdict = roll_up(probes.iter().map(|probe| probe.outcome));
     if diagnosis.is_none() {
         if let Some(probe) = probes
@@ -989,10 +1088,12 @@ async fn boot_and_probe(
                 fix: "remove the leftovers by hand ('docker ps -a' and the bundle's .curie/ \
                       directory), then re-run the scenario"
                     .to_string(),
+                transient: false,
             });
         }
     }
     teardown.attempted = true;
+    let transient = diagnosis.as_ref().is_some_and(|d| d.transient);
 
     Ok((
         artifact_digest,
@@ -1008,15 +1109,21 @@ async fn boot_and_probe(
             error: diagnosis.as_ref().map(|d| d.error.clone()),
             fix: diagnosis.as_ref().map(|d| d.fix.clone()),
         },
+        transient,
     ))
 }
 
 /// The tier row for a boot that never reached a probe.
 ///
-/// Nothing was verified, so nothing is claimed: no probe ran, identity was never
-/// established, and the teardown postconditions stay unsatisfied rather than
-/// reporting a clean teardown of a container this run never booted.
-fn boot_failure_tier(err: &anyhow::Error, runner_url: &str) -> TierReport {
+/// Nothing was verified, so nothing is claimed: no probe ran and identity was
+/// never established. `teardown` is whatever the failing path actually did --
+/// the never-attempted placeholder for the arms that abort before a container
+/// exists, and the real postconditions for the one that tears down.
+fn boot_failure_tier(
+    err: &anyhow::Error,
+    teardown: TeardownReport,
+    runner_url: &str,
+) -> TierReport {
     TierReport {
         tier: TierName::Skill,
         verdict: Verdict::Failed,
@@ -1025,13 +1132,7 @@ fn boot_failure_tier(err: &anyhow::Error, runner_url: &str) -> TierReport {
         container_fake_model: None,
         runner_url: runner_url.to_string(),
         probes: Vec::new(),
-        teardown: TeardownReport {
-            attempted: false,
-            container_removed: false,
-            state_cleared: false,
-            snapshot_released: false,
-            error: None,
-        },
+        teardown,
         error: Some(format!("{err:#}")),
         fix: Some(exit::classify(err).1.unwrap_or_else(|| {
             "resolve the boot failure above, then re-run the scenario".to_string()
@@ -1069,6 +1170,7 @@ async fn probe_tier(
                     error: format!("reading the runner container's mounts: {err:#}"),
                     fix: "check that the Docker daemon is reachable, then re-run the scenario"
                         .to_string(),
+                    transient: false,
                 }),
                 None,
                 None,
@@ -1099,6 +1201,7 @@ async fn probe_tier(
                     "tear down whatever is holding the runner container name ('curie skill down') \
                       and re-run the scenario so it boots on its own snapshot"
                         .to_string(),
+                transient: false,
             }),
             mounted,
             fake_model,
@@ -1113,6 +1216,7 @@ async fn probe_tier(
                 fix: "set the manifest's model_mode to the model the runner actually boots on, or \
                       supply a real model credential so it boots live"
                     .to_string(),
+                transient: false,
             }),
             mounted,
             fake_model,
@@ -1131,6 +1235,7 @@ async fn probe_tier(
                 Some(Diagnosis {
                     error: format!("building the runner client for {runner_url}: {err:#}"),
                     fix: "re-run the scenario once the runner is reachable".to_string(),
+                    transient: false,
                 }),
                 mounted,
                 fake_model,
@@ -1147,13 +1252,22 @@ async fn probe_tier(
         // Deadlined, and the expiry is routed through the ordinary diagnosis
         // path: a peer that accepts the connection and never answers must end
         // the run with a report and a teardown, not wedge it.
-        let reset = match tokio::time::timeout(RESET_DEADLINE, client.reset()).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "no answer within {RESET_DEADLINE:?}; the runner accepted the connection and \
-                 never replied"
-            )),
-        };
+        //
+        // An expiry is TRANSIENT (ADR-0021 exit 3): it says the peer had not
+        // answered yet, which re-running may well change. A reset the runner
+        // actively refused is not that, so the two are told apart here rather
+        // than by matching on the message downstream.
+        let (reset, reset_expired) =
+            match tokio::time::timeout(RESET_DEADLINE, client.reset()).await {
+                Ok(result) => (result, false),
+                Err(_) => (
+                    Err(anyhow::anyhow!(
+                    "no answer within {RESET_DEADLINE:?}; the runner accepted the connection and \
+                     never replied"
+                )),
+                    true,
+                ),
+            };
         if let Err(err) = reset {
             return (
                 probes,
@@ -1162,6 +1276,7 @@ async fn probe_tier(
                     fix: "re-run the scenario; a runner that will not reset cannot give isolated \
                           probe results"
                         .to_string(),
+                    transient: reset_expired,
                 }),
                 mounted,
                 fake_model,
@@ -1171,16 +1286,19 @@ async fn probe_tier(
         // Deadlined for the same reason as the reset above, and generously: a
         // live model turn legitimately takes minutes, an unbounded one strands
         // the container, the record and the snapshot.
-        let sent = match tokio::time::timeout(
+        let (sent, probe_expired) = match tokio::time::timeout(
             PROBE_DEADLINE,
             client.send_event(EventType::Message, &probe.prompt, "curie-scenario", |_| {}),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "the turn produced no final frame within {PROBE_DEADLINE:?}"
-            )),
+            Ok(result) => (result, false),
+            Err(_) => (
+                Err(anyhow::anyhow!(
+                    "the turn produced no final frame within {PROBE_DEADLINE:?}"
+                )),
+                true,
+            ),
         };
         let events =
             match sent {
@@ -1191,6 +1309,7 @@ async fn probe_tier(
                         error: format!("probe {}: the turn did not complete: {err:#}", probe.id),
                         fix: "check the runner logs for the failed turn, then re-run the scenario"
                             .to_string(),
+                        transient: probe_expired,
                     }),
                     mounted,
                     fake_model,
@@ -1223,6 +1342,7 @@ fn probe_diagnosis(probe: &ProbeReport) -> Diagnosis {
             fix: "fix the agent until the probe's expectation holds, or correct the probe's \
                   expectation if it was wrong"
                 .to_string(),
+            transient: false,
         },
         ProbeKind::Negative => Diagnosis {
             error: format!(
@@ -1233,6 +1353,7 @@ fn probe_diagnosis(probe: &ProbeReport) -> Diagnosis {
             fix: "the control is meant to fail its grader: fix the agent, or choose a control \
                   expectation the agent genuinely does not satisfy"
                 .to_string(),
+            transient: false,
         },
     }
 }
@@ -1242,12 +1363,17 @@ fn probe_diagnosis(probe: &ProbeReport) -> Diagnosis {
 /// `skill down` is deliberately tolerant of a snapshot that will not delete
 /// (#323, its agent consumer needs teardown to succeed); a scenario does not
 /// inherit that tolerance, so it checks the outcome itself.
-async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path) -> TeardownReport {
+async fn tear_down(
+    plugin_dir: &Path,
+    container_name: &str,
+    container_id: Option<&str>,
+    snapshot_dir: &Path,
+) -> TeardownReport {
     let stop_error = crate::commands::stop(plugin_dir, None)
         .await
         .err()
         .map(|err| format!("tearing down the runner: {err:#}"));
-    // Both reads keep their error class. Collapsing a daemon failure into "no
+    // Every read keeps its error class. Collapsing a daemon failure into "no
     // container", or a metadata failure into "the path does not exist", reports
     // an observation that was never made -- and in the fail-OPEN direction.
     let container = docker::container_facts(container_name)
@@ -1255,10 +1381,30 @@ async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path)
         .map_err(|err| {
             format!("whether container '{container_name}' was removed could not be read: {err:#}")
         });
-    let state_present = plugin_dir
-        .join(state::STATE_DIR)
-        .join(state::STATE_FILE)
-        .exists();
+    // The name probe above says nothing about the container this run booted: a
+    // container renamed out of the way frees the name and keeps running. An id
+    // this run never got to record is an id whose removal nothing can verify,
+    // which is not the same as a removal.
+    let booted_present = match container_id {
+        Some(id) => docker::container_id_present(id).await.map_err(|err| {
+            format!(
+                "whether the container this run booted (id {id}) was removed could not be read: \
+                 {err:#}"
+            )
+        }),
+        None => Err(
+            "the boot recorded no container id, so nothing could verify that the container this \
+             run started was removed"
+                .to_string(),
+        ),
+    };
+    let state_path = plugin_dir.join(state::STATE_DIR).join(state::STATE_FILE);
+    let state_present = state_path.try_exists().map_err(|err| {
+        format!(
+            "whether the runner record at {} was cleared could not be read: {err}",
+            state_path.display()
+        )
+    });
     let snapshot_present = snapshot_dir.try_exists().map_err(|err| {
         format!(
             "whether the bundle snapshot at {} was released could not be read: {err}",
@@ -1270,7 +1416,8 @@ async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path)
             .as_ref()
             .map(Option::as_ref)
             .map_err(String::as_str),
-        state_present,
+        booted_present.as_ref().copied().map_err(String::as_str),
+        state_present.as_ref().copied().map_err(String::as_str),
         snapshot_present.as_ref().copied().map_err(String::as_str),
     );
 
@@ -1283,11 +1430,21 @@ async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path)
         Ok(None) => {}
         Err(err) => unmet.push(err.clone()),
     }
-    if !report.state_cleared {
-        unmet.push(format!(
+    match (&booted_present, container_id) {
+        (Ok(true), Some(id)) => unmet.push(format!(
+            "the container this run booted (id {id}) is still present after teardown, whatever \
+             holds its name now"
+        )),
+        (Err(err), _) => unmet.push(err.clone()),
+        _ => {}
+    }
+    match &state_present {
+        Ok(true) => unmet.push(format!(
             "the runner record is still in {}",
             plugin_dir.join(state::STATE_DIR).display()
-        ));
+        )),
+        Ok(false) => {}
+        Err(err) => unmet.push(err.clone()),
     }
     match &snapshot_present {
         Ok(true) => unmet.push(format!(
@@ -1425,19 +1582,44 @@ mod tests {
                 id: "c0ffee".into(),
                 cli_managed: true,
             })),
-            false,
+            Ok(false),
+            Ok(false),
             Ok(false),
         );
         assert!(!report.container_removed);
         assert!(report.state_cleared && report.snapshot_released);
     }
 
+    // A container renamed out of the way frees the NAME and keeps running under
+    // the id the boot recorded, so the name probe alone cannot report a removal.
+    #[test]
+    fn a_container_still_running_under_its_recorded_id_is_not_a_removed_container() {
+        let report = teardown_postconditions(Ok(None), Ok(true), Ok(false), Ok(false));
+        assert!(
+            !report.container_removed,
+            "a free name proves only that nothing holds the name"
+        );
+        assert!(
+            teardown_postconditions(Ok(None), Ok(false), Ok(false), Ok(false)).container_removed,
+            "both readings agreeing the container is gone is the only removal"
+        );
+    }
+
     #[test]
     fn a_postcondition_whose_read_failed_is_never_reported_satisfied() {
-        let report = teardown_postconditions(Err("the daemon refused"), false, Err("EACCES"));
+        let report = teardown_postconditions(
+            Err("the daemon refused"),
+            Err("the daemon refused"),
+            Err("EACCES"),
+            Err("EACCES"),
+        );
         assert!(
             !report.container_removed,
             "a daemon that could not answer observed no removal"
+        );
+        assert!(
+            !report.state_cleared,
+            "a record whose presence could not be read is not a cleared record"
         );
         assert!(
             !report.snapshot_released,
