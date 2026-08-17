@@ -27,6 +27,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use curie_aci_protocol::{EventType, OutboundEvent};
@@ -49,6 +50,20 @@ const FAKE_MODEL_ENV: &str = "CURIE_FAKE_MODEL";
 /// The reply recorded for a turn that produced no gradeable text, so a red probe
 /// is diagnosable without a re-run (#548).
 const NO_REPLY: &str = "<no reply text>";
+
+/// The bundle-scoped file that makes one scenario lifecycle exclusive.
+const LOCK_FILE: &str = "scenario.lock";
+
+/// How long a probe waits for `/v1/reset`, a runner control call answered
+/// immediately. A peer that accepts the connection and then never answers would
+/// otherwise wedge the run forever, and a run that hangs never tears down: the
+/// container, the record and the snapshot all outlive it.
+const RESET_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a probe waits for one complete graded turn. Generous, because a live
+/// model turn legitimately takes minutes, but bounded for the same reason the
+/// reset is.
+const PROBE_DEADLINE: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // The manifest contract
@@ -155,6 +170,12 @@ pub struct Teardown {
 /// The manifest schema version this build understands.
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
+/// A usage refusal (exit 2) whose recovery instruction rides in the `fix` FIELD
+/// rather than inside the diagnosis, the ADR-0021 shape an agent consumer reads.
+fn refusal(error: impl Into<String>, fix: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::from(CliError::usage(error).with_fix(fix))
+}
+
 /// Parse and validate a scenario manifest.
 ///
 /// Every rule here is also expressed in `cli/schema/scenario-manifest.schema.json`,
@@ -162,34 +183,46 @@ const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// rule is the one JSON Schema cannot express, so this is its only enforcement.
 pub fn parse_manifest(raw: &str, source: &Path) -> Result<ScenarioManifest> {
     let manifest: ScenarioManifest = serde_json::from_str(raw).map_err(|err| {
-        exit::usage(format!(
-            "{} is not a valid scenario manifest: {err}",
-            source.display()
-        ))
+        refusal(
+            format!(
+                "{} is not a valid scenario manifest: {err}",
+                source.display()
+            ),
+            "correct the manifest against cli/schema/scenario-manifest.schema.json, which \
+             declares every field and value this build reads",
+        )
     })?;
 
     if manifest.schema_version != SUPPORTED_SCHEMA_VERSION {
-        return Err(exit::usage(format!(
-            "scenario manifest schema_version {} is not supported; this build reads version {SUPPORTED_SCHEMA_VERSION}",
-            manifest.schema_version
-        )));
+        return Err(refusal(
+            format!(
+                "scenario manifest schema_version {} is not supported; this build reads version {SUPPORTED_SCHEMA_VERSION}",
+                manifest.schema_version
+            ),
+            format!(
+                "set \"schema_version\": {SUPPORTED_SCHEMA_VERSION}, or run a curie build that \
+                 reads the version this manifest declares"
+            ),
+        ));
     }
     if manifest.tiers.is_empty() {
-        return Err(exit::usage(
-            "the scenario selects no tier, so it would run nothing and report nothing; \
-             list at least one tier in `tiers`",
+        return Err(refusal(
+            "the scenario selects no tier, so it would run nothing and report nothing",
+            "list at least one tier in `tiers`, e.g. \"tiers\": [\"skill\"]",
         ));
     }
     if manifest.acceptance_criteria.is_empty() {
-        return Err(exit::usage(
+        return Err(refusal(
             "the scenario names no acceptance criteria, so nothing it reports is bound to \
-             the ticket; list them in `acceptance_criteria`",
+             the ticket",
+            "list the ticket's criteria in `acceptance_criteria`",
         ));
     }
     if !manifest.teardown.remove_runner {
-        return Err(exit::usage(
-            "teardown.remove_runner must be true: a scenario run always destroys the runner \
-             it booted, and there is no mode that keeps it",
+        return Err(refusal(
+            "teardown.remove_runner is false, but a scenario run always destroys the runner \
+             it booted and there is no mode that keeps it",
+            "set \"teardown\": { \"remove_runner\": true } in the manifest",
         ));
     }
     if !manifest
@@ -197,9 +230,10 @@ pub fn parse_manifest(raw: &str, source: &Path) -> Result<ScenarioManifest> {
         .iter()
         .any(|probe| probe.kind == ProbeKind::Positive)
     {
-        return Err(exit::usage(
+        return Err(refusal(
             "the scenario declares no positive probe, so nothing shows the required behavior \
-             is present; add a probe with \"kind\": \"positive\"",
+             is present",
+            "add a probe with \"kind\": \"positive\" whose grader matches the required behavior",
         ));
     }
     if !manifest
@@ -207,30 +241,65 @@ pub fn parse_manifest(raw: &str, source: &Path) -> Result<ScenarioManifest> {
         .iter()
         .any(|probe| probe.kind == ProbeKind::Negative)
     {
-        return Err(exit::usage(
-            "the scenario declares no negative probe, so it cannot be falsified: add a control \
-             with \"kind\": \"negative\" whose grader must NOT match",
+        return Err(refusal(
+            "the scenario declares no negative probe, so it cannot be falsified",
+            "add a control with \"kind\": \"negative\" whose grader must NOT match",
         ));
     }
     let mut seen = BTreeSet::new();
     for probe in &manifest.probes {
         if !seen.insert(probe.id.as_str()) {
-            return Err(exit::usage(format!(
-                "probe id {:?} appears twice; every probe id must be unique",
-                probe.id
-            )));
+            return Err(refusal(
+                format!("probe id {:?} appears twice", probe.id),
+                "give every probe a unique `id`; the id is what binds a graded row to the \
+                 probe that produced it",
+            ));
         }
     }
 
     let uncovered = uncovered_criteria(&manifest);
     if !uncovered.is_empty() {
-        return Err(exit::usage(format!(
-            "these acceptance criteria have no positive probe: {}. A criterion whose only \
-             evidence is that the pre-fix behavior is absent has no positive evidence that the \
-             required behavior is present",
-            uncovered.join(", ")
-        )));
+        return Err(refusal(
+            format!(
+                "these acceptance criteria have no positive probe: {}. A criterion whose only \
+                 evidence is that the pre-fix behavior is absent has no positive evidence that \
+                 the required behavior is present",
+                uncovered.join(", ")
+            ),
+            "add a positive probe naming each of those criteria in its `acceptance_criteria`",
+        ));
     }
+
+    // The graders, before ANY side effect: a manifest that reaches Docker and
+    // only then discovers an unsatisfiable expectation has already packed and
+    // booted. `minLength: 1` is a schema rule, and a hand-written manifest never
+    // passes through the schema, so this is its only enforcement.
+    for probe in &manifest.probes {
+        if probe.expect.value.trim().is_empty() {
+            return Err(refusal(
+                format!(
+                    "probe {:?} has an empty expect.value: a grader with no value matches every \
+                     completed reply, so a positive probe can never fail and a control can never \
+                     be satisfied",
+                    probe.id
+                ),
+                "give the probe a non-empty `expect.value` that the reply must (or, for a \
+                 control, must not) satisfy",
+            ));
+        }
+    }
+    // The frozen validation `skill eval` applies to a suite, applied to the
+    // probes verbatim: a probe is judged by that code, so it is validated by it
+    // too. An uncompilable regex grades false, and on a NEGATIVE probe that false
+    // is inverted into a pass, so a typo'd control could never fail.
+    let cases: Vec<EvalCase> = manifest.probes.iter().map(eval_case).collect();
+    evals::validate_suite(&manifest.ticket, &cases).map_err(|err| {
+        refusal(
+            format!("{err:#}"),
+            "correct that probe's `expect` in the manifest: every grader is compiled before \
+             anything is packed or booted",
+        )
+    })?;
 
     Ok(manifest)
 }
@@ -528,16 +597,21 @@ fn eval_case(probe: &Probe) -> EvalCase {
 
 /// The teardown's postconditions, read from the daemon and the filesystem rather
 /// than inferred from a `stop` that returned Ok.
+///
+/// Both reads arrive as a `Result` because a read that FAILED observed nothing:
+/// a daemon that could not answer is not a container that is gone, and a
+/// directory whose presence could not be determined is not a released snapshot.
+/// An unverifiable postcondition is never a satisfied one.
 pub fn teardown_postconditions(
-    container: Option<&docker::ContainerFacts>,
+    container: Result<Option<&docker::ContainerFacts>, &str>,
     state_present: bool,
-    snapshot_present: bool,
+    snapshot_present: Result<bool, &str>,
 ) -> TeardownReport {
     TeardownReport {
         attempted: true,
-        container_removed: container.is_none(),
+        container_removed: matches!(container, Ok(None)),
         state_cleared: !state_present,
-        snapshot_released: !snapshot_present,
+        snapshot_released: matches!(snapshot_present, Ok(false)),
         error: None,
     }
 }
@@ -588,17 +662,13 @@ pub fn dry_run_lines(
             manifest.acceptance_criteria.join(", ")
         ),
     ];
+    // Only the skill tier reaches a plan: an unsupported tier is refused (exit 4)
+    // before the bundle is even resolved, so it never becomes a line here.
     for tier in &manifest.tiers {
-        lines.push(match tier {
-            TierName::Skill => {
-                "tier skill: package, boot, verify identity, probe, tear down".into()
-            }
-            other => format!(
-                "tier {}: REFUSED (exit 4), the platform API can neither run a probe against a \
-                 CLI-created version nor end a deployment",
-                other.as_str()
-            ),
-        });
+        lines.push(format!(
+            "tier {}: package, boot, verify identity, probe, tear down",
+            tier.as_str()
+        ));
     }
     for probe in &manifest.probes {
         lines.push(format!(
@@ -653,14 +723,73 @@ struct Diagnosis {
     fix: String,
 }
 
+/// The exclusive hold one scenario run takes on a bundle's lifecycle.
+///
+/// The canonical snapshot path is content-addressed, so a second run of the same
+/// unchanged bundle resolves onto the very directory the first run's container
+/// has mounted read-only at `/plugin`, and packing REMOVES an existing
+/// destination. The name-conflict preflight refuses a second run before anything
+/// destructive happens; this lock is what makes that check hold for the whole
+/// lifecycle instead of only at the instant it ran.
+struct LifecycleLock {
+    path: PathBuf,
+}
+
+impl LifecycleLock {
+    fn acquire(plugin_dir: &Path) -> Result<Self> {
+        let dir = plugin_dir.join(state::STATE_DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(LOCK_FILE);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self { path }),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Err(refusal(
+                format!(
+                    "another curie scenario run holds this bundle's lifecycle lock ({})",
+                    path.display()
+                ),
+                format!(
+                    "wait for that run to finish; if no run is in flight, delete {} and re-run",
+                    path.display()
+                ),
+            )),
+            Err(err) => Err(anyhow::Error::new(err)
+                .context(format!("taking the scenario lock {}", path.display()))),
+        }
+    }
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub async fn run(opts: RunOpts) -> Result<()> {
     let raw = std::fs::read_to_string(&opts.manifest).map_err(|err| {
-        exit::usage(format!(
-            "reading the scenario manifest {}: {err}",
-            opts.manifest.display()
-        ))
+        refusal(
+            format!(
+                "reading the scenario manifest {}: {err}",
+                opts.manifest.display()
+            ),
+            "pass the path of a checked-in scenario manifest; `curie scenario <MANIFEST> \
+             --dry-run` prints what it would run",
+        )
     })?;
     let manifest = parse_manifest(&raw, &opts.manifest)?;
+
+    // Refused on the TIER ALONE, before the bundle is resolved: nothing about the
+    // bundle changes this answer, so a manifest that also has a bad bundle_path
+    // must still get the ADR-0041 contract an agent branches on, not an
+    // unrelated path failure.
+    for tier in &manifest.tiers {
+        if *tier != TierName::Skill {
+            return Err(tier_refusal(*tier));
+        }
+    }
 
     // Resolved against the MANIFEST's directory, so a checked-in scenario is
     // portable and a relative bundle path means what its author sees.
@@ -672,10 +801,14 @@ pub async fn run(opts: RunOpts) -> Result<()> {
     let bundle_dir = manifest_dir
         .join(&manifest.bundle_path)
         .canonicalize()
-        .with_context(|| {
-            format!(
-                "the scenario's bundle_path does not resolve to a directory: {}",
-                manifest_dir.join(&manifest.bundle_path).display()
+        .map_err(|err| {
+            refusal(
+                format!(
+                    "the scenario's bundle_path does not resolve to a directory: {} ({err})",
+                    manifest_dir.join(&manifest.bundle_path).display()
+                ),
+                "point `bundle_path` at the bundle directory, relative to the manifest's own \
+                 directory so the checked-in scenario stays portable",
             )
         })?;
     let source_commit = crate::commands::git_short_sha(&bundle_dir).await;
@@ -685,14 +818,6 @@ pub async fn run(opts: RunOpts) -> Result<()> {
             lines: dry_run_lines(&manifest, &bundle_dir, source_commit.as_deref()),
         });
         return Ok(());
-    }
-
-    // Refuse before anything is packed or booted: a tier this command cannot run
-    // is answered, never degraded to a probe-less pass (ADR-0041).
-    for tier in &manifest.tiers {
-        if *tier != TierName::Skill {
-            return Err(tier_refusal(*tier));
-        }
     }
 
     let start_opts = StartOpts {
@@ -719,25 +844,128 @@ pub async fn run(opts: RunOpts) -> Result<()> {
         // existing #747 refusal, not something a scenario silently replaces.
         replace: false,
     };
+    let runner_url = format!("http://localhost:{DEFAULT_PORT}");
     let plugin_dir = crate::commands::prepare_start(&start_opts).await?;
+    // Exclusive from here to the emitted payload: everything below either packs
+    // onto, boots from, or releases this bundle's content-addressed snapshot.
+    let _lock = LifecycleLock::acquire(&plugin_dir)?;
+
+    let (artifact_digest, tier, boot_error) =
+        match boot_and_probe(&manifest, start_opts, &plugin_dir, &runner_url).await {
+            Ok((digest, tier)) => (digest, tier, None),
+            // A boot that never reached a probe packed nothing that survives, so
+            // there is no digest to report and none is invented.
+            Err(err) => (
+                String::new(),
+                boot_failure_tier(&err, &runner_url),
+                Some(err),
+            ),
+        };
+    let tiers = vec![tier];
+    let output = ScenarioOutput {
+        ticket: manifest.ticket.clone(),
+        bundle_path: bundle_dir.display().to_string(),
+        source_commit,
+        artifact_digest,
+        model_mode: manifest.model_mode,
+        verdict: roll_up_tiers(&tiers),
+        error: tiers[0].error.clone(),
+        fix: tiers[0].fix.clone(),
+        tiers,
+    };
+
+    if let Some(err) = boot_error {
+        // A failed boot is a failed SCENARIO: the same payload every other red
+        // path emits, carrying the boot error's own exit class rather than a
+        // generic `{error, fix}` object an agent cannot branch on.
+        let payload = scenario_json(&output);
+        return Err(exit::with_json_payload(err, payload));
+    }
+    if output.verdict == Verdict::Failed {
+        // A red run must still emit the full payload AND exit non-zero, which
+        // `Ui::emit` cannot do: the per-probe evidence is the object an agent
+        // most needs to read.
+        let payload = scenario_json(&output);
+        let message = output
+            .error
+            .clone()
+            .unwrap_or_else(|| "the scenario failed".to_string());
+        return Err(exit::with_json_payload(
+            anyhow::Error::from(CliError::failure(message)),
+            payload,
+        ));
+    }
+    crate::ui::ui().emit(&output);
+    Ok(())
+}
+
+/// Stages 1 to 5 for the skill tier: preflight, pack, boot, verify, probe, tear
+/// down. Returns the packed artifact's digest and the tier row.
+///
+/// An `Err` here is a boot that never reached a probe, and every one of them
+/// leaves nothing behind: the only destructive step before a recorded state is
+/// the pack, and the single arm between it and a successful boot releases it.
+async fn boot_and_probe(
+    manifest: &ScenarioManifest,
+    start_opts: StartOpts,
+    plugin_dir: &Path,
+    runner_url: &str,
+) -> Result<(String, TierReport)> {
+    let container_name = start_opts.name.clone();
+    // Before ANYTHING destructive (#747, #1087). The pack below removes and
+    // recreates the content-addressed destination, which on unchanged source is
+    // the directory a runner already holding this name has mounted at /plugin,
+    // so discovering the conflict after the pack means destroying a live run's
+    // artifact to learn this run was never allowed to start.
+    docker::ensure_container_name_free(
+        &container_name,
+        Some(start_opts.port),
+        start_opts.replace,
+        docker::ConflictContext::SkillUp,
+    )
+    .await?;
+
     // Stage 1: the ONE pack of the run. Everything below asserts against this
     // exact artifact.
-    let snapshot = crate::bundle::snapshot(&plugin_dir)
+    let snapshot = crate::bundle::snapshot(plugin_dir)
         .context("packaging the bundle snapshot for the scenario runner")?;
     let artifact_digest = snapshot.digest.clone();
     let snapshot_dir = snapshot.dir.clone();
-    let container_name = start_opts.name.clone();
-    let runner_url = format!("http://localhost:{DEFAULT_PORT}");
 
-    // Stage 2: boot on exactly that artifact.
-    crate::commands::start(start_opts, snapshot).await?;
+    // Stage 2: boot on exactly that artifact. Nothing records the snapshot until
+    // this returns Ok, so no later teardown could ever find it: every failure
+    // between the pack and here releases it right here.
+    if let Err(err) = crate::commands::start(start_opts, snapshot).await {
+        let _ = crate::bundle::remove_snapshot(&snapshot_dir, plugin_dir);
+        return Err(err);
+    }
+
+    // The immutable id `docker run` returned, as the boot recorded it. Every
+    // identity observation below is keyed by it rather than by the container
+    // NAME, which a second container can take over between two reads (#747).
+    let container_id = match state::load(plugin_dir) {
+        Ok(Some(recorded)) => recorded.container_id,
+        other => {
+            // The container exists whatever the record says, so it still owns a
+            // teardown.
+            let _ = tear_down(plugin_dir, &container_name, &snapshot_dir).await;
+            let detail = match other {
+                Err(err) => format!("{err:#}"),
+                _ => "no runner record was written".to_string(),
+            };
+            return Err(anyhow::anyhow!(
+                "the boot left no runner record to read the container id from ({detail}), so no \
+                 observation could be bound to the container this run started"
+            ));
+        }
+    };
 
     // Stages 3 and 4, then stage 5 unconditionally: the tier owns a teardown
     // from the moment the container exists, whatever went wrong after it.
     let (probes, mut diagnosis, mounted_snapshot_dir, container_fake_model, identity_verified) =
-        probe_tier(&manifest, &container_name, &snapshot_dir, &runner_url).await;
+        probe_tier(manifest, &container_id, &snapshot_dir, runner_url).await;
 
-    let mut teardown = tear_down(&plugin_dir, &container_name, &snapshot_dir).await;
+    let mut teardown = tear_down(plugin_dir, &container_name, &snapshot_dir).await;
     let mut tier_verdict = roll_up(probes.iter().map(|probe| probe.outcome));
     if diagnosis.is_none() {
         if let Some(probe) = probes
@@ -766,47 +994,49 @@ pub async fn run(opts: RunOpts) -> Result<()> {
     }
     teardown.attempted = true;
 
-    let tier = TierReport {
-        tier: TierName::Skill,
-        verdict: tier_verdict,
-        identity_verified,
-        mounted_snapshot_dir,
-        container_fake_model,
-        runner_url,
-        probes,
-        teardown,
-        error: diagnosis.as_ref().map(|d| d.error.clone()),
-        fix: diagnosis.as_ref().map(|d| d.fix.clone()),
-    };
-    let tiers = vec![tier];
-    let output = ScenarioOutput {
-        ticket: manifest.ticket.clone(),
-        bundle_path: bundle_dir.display().to_string(),
-        source_commit,
+    Ok((
         artifact_digest,
-        model_mode: manifest.model_mode,
-        verdict: roll_up_tiers(&tiers),
-        error: tiers[0].error.clone(),
-        fix: tiers[0].fix.clone(),
-        tiers,
-    };
+        TierReport {
+            tier: TierName::Skill,
+            verdict: tier_verdict,
+            identity_verified,
+            mounted_snapshot_dir,
+            container_fake_model,
+            runner_url: runner_url.to_string(),
+            probes,
+            teardown,
+            error: diagnosis.as_ref().map(|d| d.error.clone()),
+            fix: diagnosis.as_ref().map(|d| d.fix.clone()),
+        },
+    ))
+}
 
-    if output.verdict == Verdict::Failed {
-        // A red run must still emit the full payload AND exit non-zero, which
-        // `Ui::emit` cannot do: the per-probe evidence is the object an agent
-        // most needs to read.
-        let payload = scenario_json(&output);
-        let message = output
-            .error
-            .clone()
-            .unwrap_or_else(|| "the scenario failed".to_string());
-        return Err(exit::with_json_payload(
-            anyhow::Error::from(CliError::failure(message)),
-            payload,
-        ));
+/// The tier row for a boot that never reached a probe.
+///
+/// Nothing was verified, so nothing is claimed: no probe ran, identity was never
+/// established, and the teardown postconditions stay unsatisfied rather than
+/// reporting a clean teardown of a container this run never booted.
+fn boot_failure_tier(err: &anyhow::Error, runner_url: &str) -> TierReport {
+    TierReport {
+        tier: TierName::Skill,
+        verdict: Verdict::Failed,
+        identity_verified: false,
+        mounted_snapshot_dir: None,
+        container_fake_model: None,
+        runner_url: runner_url.to_string(),
+        probes: Vec::new(),
+        teardown: TeardownReport {
+            attempted: false,
+            container_removed: false,
+            state_cleared: false,
+            snapshot_released: false,
+            error: None,
+        },
+        error: Some(format!("{err:#}")),
+        fix: Some(exit::classify(err).1.unwrap_or_else(|| {
+            "resolve the boot failure above, then re-run the scenario".to_string()
+        })),
     }
-    crate::ui::ui().emit(&output);
-    Ok(())
 }
 
 /// Verify runtime identity against the daemon, then run every probe.
@@ -814,9 +1044,13 @@ pub async fn run(opts: RunOpts) -> Result<()> {
 /// Returns the probe rows, the first diagnosis, and the two daemon readings.
 /// A tier whose identity does not check out runs NO probe: an unverified
 /// container's answers are evidence of nothing.
+///
+/// `container_id` is the immutable id the boot recorded, never the container
+/// name: both observations below must describe ONE container, and a name can be
+/// taken over by another container between two reads.
 async fn probe_tier(
     manifest: &ScenarioManifest,
-    container_name: &str,
+    container_id: &str,
     snapshot_dir: &Path,
     runner_url: &str,
 ) -> (
@@ -826,7 +1060,7 @@ async fn probe_tier(
     Option<bool>,
     bool,
 ) {
-    let mounted = match docker::container_mount_source(container_name, PLUGIN_MOUNT).await {
+    let mounted = match docker::container_mount_source(container_id, PLUGIN_MOUNT).await {
         Ok(found) => found,
         Err(err) => {
             return (
@@ -842,8 +1076,17 @@ async fn probe_tier(
             )
         }
     };
-    let fake_model = match docker::container_env_value(container_name, FAKE_MODEL_ENV).await {
-        Ok(value) => Some(matches!(value.as_deref(), Some(v) if !v.is_empty() && v != "0")),
+    // The RUNTIME's own reading of the value, not a third spelling of it: the
+    // runner accepts only `1`/`true`/`yes` (`runner/src/curie_runner/__main__.py`),
+    // so `CURIE_FAKE_MODEL=false` is a LIVE container. An ABSENT variable is live
+    // too, which is exactly how a live CLI boot leaves it -- it passes no such
+    // variable at all. Only a failed READ is unknown.
+    let fake_model = match docker::container_env_value(container_id, FAKE_MODEL_ENV).await {
+        Ok(value) => Some(
+            value
+                .as_deref()
+                .is_some_and(crate::local::fake_model_is_truthy),
+        ),
         Err(_) => None,
     };
 
@@ -873,7 +1116,10 @@ async fn probe_tier(
             }),
             mounted,
             fake_model,
-            true,
+            // The model mode is half of runtime identity: a container proved to
+            // be running the right artifact on the WRONG model is not the
+            // artifact under test, so identity stays unverified.
+            false,
         );
     }
 
@@ -897,7 +1143,18 @@ async fn probe_tier(
     for probe in &manifest.probes {
         // Per-probe isolation (#550): a probe must not answer from an earlier
         // probe's history instead of actually doing the work.
-        if let Err(err) = client.reset().await {
+        //
+        // Deadlined, and the expiry is routed through the ordinary diagnosis
+        // path: a peer that accepts the connection and never answers must end
+        // the run with a report and a teardown, not wedge it.
+        let reset = match tokio::time::timeout(RESET_DEADLINE, client.reset()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "no answer within {RESET_DEADLINE:?}; the runner accepted the connection and \
+                 never replied"
+            )),
+        };
+        if let Err(err) = reset {
             return (
                 probes,
                 Some(Diagnosis {
@@ -911,11 +1168,22 @@ async fn probe_tier(
                 true,
             );
         }
+        // Deadlined for the same reason as the reset above, and generously: a
+        // live model turn legitimately takes minutes, an unbounded one strands
+        // the container, the record and the snapshot.
+        let sent = match tokio::time::timeout(
+            PROBE_DEADLINE,
+            client.send_event(EventType::Message, &probe.prompt, "curie-scenario", |_| {}),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "the turn produced no final frame within {PROBE_DEADLINE:?}"
+            )),
+        };
         let events =
-            match client
-                .send_event(EventType::Message, &probe.prompt, "curie-scenario", |_| {})
-                .await
-            {
+            match sent {
                 Ok(events) => events,
                 Err(err) => return (
                     probes,
@@ -979,19 +1247,41 @@ async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path)
         .await
         .err()
         .map(|err| format!("tearing down the runner: {err:#}"));
-    let container = docker::container_facts(container_name).await.ok().flatten();
+    // Both reads keep their error class. Collapsing a daemon failure into "no
+    // container", or a metadata failure into "the path does not exist", reports
+    // an observation that was never made -- and in the fail-OPEN direction.
+    let container = docker::container_facts(container_name)
+        .await
+        .map_err(|err| {
+            format!("whether container '{container_name}' was removed could not be read: {err:#}")
+        });
     let state_present = plugin_dir
         .join(state::STATE_DIR)
         .join(state::STATE_FILE)
         .exists();
-    let mut report =
-        teardown_postconditions(container.as_ref(), state_present, snapshot_dir.exists());
+    let snapshot_present = snapshot_dir.try_exists().map_err(|err| {
+        format!(
+            "whether the bundle snapshot at {} was released could not be read: {err}",
+            snapshot_dir.display()
+        )
+    });
+    let mut report = teardown_postconditions(
+        container
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(String::as_str),
+        state_present,
+        snapshot_present.as_ref().copied().map_err(String::as_str),
+    );
 
     let mut unmet = Vec::new();
-    if !report.container_removed {
-        unmet.push(format!(
-            "container '{container_name}' is still present after teardown"
-        ));
+    match &container {
+        Ok(Some(facts)) => unmet.push(format!(
+            "container '{container_name}' (id {}) is still present after teardown",
+            facts.id
+        )),
+        Ok(None) => {}
+        Err(err) => unmet.push(err.clone()),
     }
     if !report.state_cleared {
         unmet.push(format!(
@@ -999,11 +1289,13 @@ async fn tear_down(plugin_dir: &Path, container_name: &str, snapshot_dir: &Path)
             plugin_dir.join(state::STATE_DIR).display()
         ));
     }
-    if !report.snapshot_released {
-        unmet.push(format!(
+    match &snapshot_present {
+        Ok(true) => unmet.push(format!(
             "the bundle snapshot is still on disk at {}",
             snapshot_dir.display()
-        ));
+        )),
+        Ok(false) => {}
+        Err(err) => unmet.push(err.clone()),
     }
     report.error = match (stop_error, unmet.is_empty()) {
         (Some(err), true) => Some(err),
@@ -1129,14 +1421,27 @@ mod tests {
     #[test]
     fn an_unmet_postcondition_is_reported_from_the_observation_not_the_call() {
         let report = teardown_postconditions(
-            Some(&docker::ContainerFacts {
+            Ok(Some(&docker::ContainerFacts {
                 id: "c0ffee".into(),
                 cli_managed: true,
-            }),
+            })),
             false,
-            false,
+            Ok(false),
         );
         assert!(!report.container_removed);
         assert!(report.state_cleared && report.snapshot_released);
+    }
+
+    #[test]
+    fn a_postcondition_whose_read_failed_is_never_reported_satisfied() {
+        let report = teardown_postconditions(Err("the daemon refused"), false, Err("EACCES"));
+        assert!(
+            !report.container_removed,
+            "a daemon that could not answer observed no removal"
+        );
+        assert!(
+            !report.snapshot_released,
+            "a presence that could not be read is not an absence"
+        );
     }
 }
