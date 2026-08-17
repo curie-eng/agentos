@@ -1117,6 +1117,38 @@ fn a_boot_whose_record_cannot_be_read_still_reports_the_teardown_it_ran() {
     );
 }
 
+/// Teardown releases the snapshot only through the runner record, so the one
+/// path where that record cannot be read is the path where the snapshot this
+/// run packed is never removed. The snapshot is RUN-UNIQUE, so no later run
+/// reuses that directory and every such failure strands one more of them under
+/// `.curie/snapshots/` forever.
+///
+/// *Deletion checks*: delete it and the leak is invisible -- the run already
+/// reports a teardown error for the container. Delete the record-independent
+/// release and a `sweep-*` directory survives, so it fails. Rename internals and
+/// it survives -- it asserts on the on-disk artifact, not on a call.
+#[test]
+fn a_boot_whose_record_cannot_be_read_still_releases_the_snapshot_it_packed() {
+    let rig = Rig::unchanged("skill-two-probes.json");
+    let corrupt = rig.state_file().display().to_string();
+    let _run = lease(green_turns(), MODE_NORMAL);
+    let output = rig.run(&[("CURIE_HARDEN_CORRUPT_STATE", &corrupt)]);
+
+    assert!(
+        !output.status.success(),
+        "a record that cannot be read is a failed run\n{}",
+        output_text(&output)
+    );
+    assert_eq!(
+        rig.snapshot_entries(),
+        Vec::<String>::new(),
+        "the run knows the directory it packed, so an unreadable record must not \
+         strand it: {:?}\n{}",
+        rig.snapshot_entries(),
+        output_text(&output)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Re-review, major D -- a deadline expiry is reported as exit 1
 // (cli/src/scenario.rs:893)

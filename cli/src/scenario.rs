@@ -1373,6 +1373,20 @@ async fn tear_down(
         .await
         .err()
         .map(|err| format!("tearing down the runner: {err:#}"));
+    // `stop` releases the snapshot only through the runner record, and every arm
+    // that cannot read that record (or that aborts before reaching the release)
+    // leaves it on disk. The snapshot is RUN-UNIQUE, so nothing later reuses that
+    // directory: it is stranded forever. This run packed it and holds the path in
+    // memory, so the release is repeated here, independently of the record. It is
+    // idempotent -- a directory already gone is not an error.
+    let release_error = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir)
+        .err()
+        .map(|err| {
+            format!(
+                "the snapshot this run packed at {} could not be released: {err:#}",
+                snapshot_dir.display()
+            )
+        });
     // Every read keeps its error class. Collapsing a daemon failure into "no
     // container", or a metadata failure into "the path does not exist", reports
     // an observation that was never made -- and in the fail-OPEN direction.
@@ -1422,6 +1436,9 @@ async fn tear_down(
     );
 
     let mut unmet = Vec::new();
+    if let Some(err) = release_error {
+        unmet.push(err);
+    }
     match &container {
         Ok(Some(facts)) => unmet.push(format!(
             "container '{container_name}' (id {}) is still present after teardown",
