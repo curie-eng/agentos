@@ -69,6 +69,32 @@ Keep a small state file inside the worktree at
   "stage": "setup | triage | plan | de risk | build | review | done check | finish",
   "status": "in progress | blocked | done",
   "open_findings": ["<review finding not yet fixed>"],
+  "e2e": {
+    "decision": {
+      "skill": { "status": "required | not applicable", "reason": "<surface reached, or the surface this change does not reach>" },
+      "local": { "status": "required | not applicable", "reason": "<...>" },
+      "local-release": { "status": "required | not applicable", "reason": "<...>" },
+      "cluster": { "status": "required | not applicable", "reason": "<...>" },
+      "live-provider": { "status": "required | not applicable", "reason": "<...>" },
+      "external-integration": { "status": "required | not applicable", "reason": "<...>" }
+    },
+    "evidence": [
+      {
+        "tier": "<tier key from decision>",
+        "criterion": "<the acceptance criterion this observation proves>",
+        "command": "<exact command as run>",
+        "commit": "<candidate commit the run observed>",
+        "artifact": "<image tag, chart release, bundle ref, or trace id, or null>",
+        "mode": "fake | live",
+        "outcome": "pass | fail | blocked",
+        "observed": "<the literal assertion, output line, or value observed, not a restatement of outcome>",
+        "negative": "<the falsifiable negative or second path, and what it observed>",
+        "teardown": "<what was torn down, or why it was left running>",
+        "blocker": "<what stopped this run, or null>",
+        "skip_reason": "<why this required tier produced no evidence, or null>"
+      }
+    ]
+  },
   "updated": "<ISO8601 UTC>"
 }
 ```
@@ -79,6 +105,19 @@ fills, a day passes. Without this file the next run either repeats finished stag
 or skips an unfinished one, and outstanding findings that lived only in a lost
 context are lost with it. A direct path change finishes with nothing to resume, so
 the file is optional there.
+
+Record the tier decision once, at triage, and an evidence entry per observation
+as it is made. Fill `command`, `commit`, `mode`, `outcome`, and `observed` from the run
+itself, never from intent, and set `artifact` whenever the run produced an
+identifiable image, release, bundle, or trace. `observed` carries the literal
+line the run printed, because an `outcome` of pass with nothing observed
+behind it is the self-report this record exists to replace. `teardown` is
+filled when the surface is released, naming what came down or why it was left
+running. A required tier that could not
+run records `outcome` blocked with its `blocker` and `skip_reason` rather than
+being dropped from the decision. A verification observed only in a context that
+is now gone cannot be re-checked, and a tier nobody recorded a decision for is
+indistinguishable from one that was skipped.
 
 When a blocker or an unresolvable ambiguity appears after triage, set `status` to
 blocked, record the open question, surface it, and stop. The resume check in Setup
@@ -92,7 +131,7 @@ Classify from the work, not from a requested process size.
 | --- | --- | --- |
 | Direct | Mechanical, non behavioral change | Focused validation and review of the diff |
 | Quick | Small, single stream behavior change with clear criteria | Failing test, implementation, focused suite, code and scope review |
-| Build | Multiple streams, architecture, security, deployment, or unclear interactions | Written plan, separate test and implementation contexts, reviews, and real surface verification when applicable |
+| Build | Multiple streams, architecture, security, deployment, or unclear interactions | Written plan, separate test and implementation contexts, reviews, and real surface verification, which is required by default |
 
 Promote a direct or quick change when its real scope exceeds the selected path. Do
 not add a planning artifact for a trivial mechanical change. If a quick change
@@ -100,6 +139,14 @@ turns up an assumption that qualifies for the de risk gate below, promote it to
 build before its first edit. If that assumption only appears after an edit, stop
 and either escalate or restart as a build path change; do not carry those edits
 forward.
+
+Classify the end-to-end tiers before the first edit, per the tier decision rule
+in AGENTS.md: every behavior changing path marks each of skill, local,
+local-release, cluster, live provider, and external integration required or not
+applicable, with a concrete reason. Any behavior-bearing path needs at least one
+required tier, and a change that bears no runtime behavior records that reason
+once instead. A direct path change makes no behavior change and classifies
+nothing.
 
 ## Build rules
 
@@ -214,7 +261,8 @@ then rerun the relevant checks.
 Those two reviews are not waivable. No instruction in a task prompt, no time
 pressure, and no session setting skips them on a change that alters behavior. If an
 instruction appears to waive one, run it anyway and record in the summary that the
-instruction was overridden and why. Everything else in this workflow is
+instruction was overridden and why. Verification of a required tier is not
+waivable either, on the same terms. Everything else in this workflow is
 proportional to the change and may legitimately not run.
 
 Each reviewer writes its full findings to
@@ -226,9 +274,12 @@ claim that it passed leaves nothing to check, and a skipped review looks exactly
 the same from the outside.
 
 Add a security review for authorization, secrets, payments, personally identifiable
-information, or tenant boundaries. Verify user facing, deployment, runtime, chart,
-or integration changes through the real affected surface. Static checks alone do not
-prove a runtime acceptance criterion.
+information, or tenant boundaries. Verify every required tier through its real
+surface, and record each observation in run state as it happens. Static checks
+alone never prove a runtime acceptance criterion, and neither does a fake-tier pass
+on a criterion about a real provider. Each meaningful acceptance criterion carries
+positive proof plus a falsifiable negative or a second independent path, per
+Evidence per acceptance criterion in AGENTS.md.
 
 Before completion, run the full affected test suite plus the relevant type check and
 lint. Check sibling paths when the change touches a known seam or guard. Demonstrate
@@ -267,15 +318,25 @@ an item nobody had to answer for is an item nobody checked.
       consumer path, by running it rather than by reading it
 - [ ] Security review passed, where the change touches that surface
 - [ ] The real affected surface was exercised, where the change reaches one
+- [ ] All six end-to-end tiers are classified required or not applicable in run
+      state, each with a concrete reason
+- [ ] Every required tier has an evidence record whose outcome is pass, naming
+      the exact command, the candidate commit, the mode, and the observed result
+- [ ] Every meaningful acceptance criterion carries positive proof plus a
+      falsifiable negative or a second independent path
 - [ ] The change does not undo an earlier deliberate decision, per Prior intent
 - [ ] Full affected test suite, type check, and lint pass on the final code
 
 A quick path change marks the failing tests, separate contexts, and prior intent
 items not applicable. A direct path change applies only the suite and lint items.
 The two review items are never not applicable on a change that alters behavior.
+On a quick or build path they are never not applicable, and a required tier whose
+evidence record is missing, failed, or blocked leaves its item open.
 
 Route a failed item back into the stage that owns it. Do not present the diff with
-an item still open.
+an item still open. An open end-to-end item is a blocker: report it, with the tier,
+the command attempted, and what stopped it, rather than presenting the diff or
+opening the pull request.
 
 ## Finish
 
