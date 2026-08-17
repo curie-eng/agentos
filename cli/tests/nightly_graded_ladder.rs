@@ -634,6 +634,15 @@ esac
 set -u
 case "$*" in
     "inspect "*)
+        # A failed env read, on its own knob: an inspect that dies (the worker
+        # exited since the `docker ps`, or a daemon blip) prints nothing, which
+        # is indistinguishable from a worker carrying no CURIE_FAKE_MODEL unless
+        # the probe checks the status. Under a live run that reads as "live", so
+        # the unread probe would certify the mode it never managed to read.
+        if [ "${STUB_DOCKER_INSPECT_EXIT:-0}" != "0" ]; then
+            echo "stub docker: no such object: the container is gone" >&2
+            exit "$STUB_DOCKER_INSPECT_EXIT"
+        fi
         if [ -n "${STUB_FAKE_MODEL:-}" ]; then
             echo "CURIE_FAKE_MODEL=$STUB_FAKE_MODEL"
         fi
@@ -1043,6 +1052,55 @@ fn parity_fails_when_the_deployed_model_mode_contradicts_the_run() {
         transcript.contains("cluster") && transcript.contains("CURIE_FAKE_MODEL"),
         "the failure must name the rung and the observed CURIE_FAKE_MODEL value \
          read off the running artifact; transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: a mode probe that could not read anything. The run asks for
+/// live and `docker inspect` on the compose worker exits non-zero.
+///
+/// The sibling of the control above, on the failure mode it cannot reach: there
+/// the probe read a contradiction, here it read NOTHING. An absent
+/// CURIE_FAKE_MODEL is legitimately live, so a probe that swallowed the failed
+/// read would hand assert_model_mode an empty string and the live rung would
+/// certify a mode nobody observed. LIVE is the only mode where this hides, since
+/// a sealed run already refuses an empty value.
+#[test]
+fn parity_fails_when_the_local_mode_probe_cannot_read_the_worker_env() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local"),
+            ("CURIE_E2E_LIVE", "1"),
+            ("CURIE_CREDENTIALS", "test-credential"),
+            ("CURIE_API_URL", &api_url),
+            // No fake model, which is what a live run wants to observe.
+            ("STUB_FAKE_MODEL", ""),
+            // The one knob moved: the env read itself fails.
+            ("STUB_DOCKER_INSPECT_EXIT", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a live run whose worker env read failed must fail the ladder rather \
+         than treat the unread probe as live; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass on a mode it never read; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("local mode probe") && transcript.contains("docker inspect"),
+        "the failure must say the worker env read is what failed, so an operator \
+         is not sent hunting a parity divergence; transcript:\n{transcript}"
     );
 }
 
