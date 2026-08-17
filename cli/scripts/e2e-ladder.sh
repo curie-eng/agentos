@@ -3,8 +3,24 @@
 #
 # This is an E2E test, not a gate: it drives the SAME bundle through each
 # deployment tier with the tier's own real verbs and asserts a turn actually
-# finalized. Rung 1 (skill) is the existing `cli/scripts/e2e.sh`, invoked as is
-# so the skill leg has exactly one implementation. Rung 2 (local) is
+# finalized.
+#
+# "The same bundle" is PROVEN, not asserted in prose. It cannot be proven by
+# packing once: no CLI surface accepts a pre-packed archive, so every tier packs
+# for itself -- skill packs and hashes client-side (cli/src/bundle.rs), while
+# local and cluster upload raw bytes the platform hashes server-side
+# (apps/api/src/curie_api/deploy.py). So the ladder packs ONCE PER RUNG from one
+# canonical source tree and asserts the independently computed sha256 values are
+# equal. That is a superset of pack-once: it additionally proves the skill
+# tier's client-side packer and the platform's server-side hasher agree on the
+# same source. The same reasoning applies to the case set -- the digest covers
+# `evals/cases.json`, so digest equality IS the case-id proof at the deployed
+# tiers, while each tier's own suite loader independently reports the suite name
+# and case count via `eval --dry-run`.
+#
+# Rung 1 (skill) is the existing `cli/scripts/e2e.sh`, invoked as is
+# so the skill leg has exactly one implementation, and handed THIS run's bundle
+# copy through CURIE_E2E_BUNDLE. Rung 2 (local) is
 # `local up --minimal` -> `local deploy` -> `local message` -> `local down`,
 # against `compose.dev.yaml`. The `local-release` mode is the same round trip
 # against `compose.release.yaml` instead -- the generated, checkout-free
@@ -31,9 +47,14 @@
 # every rung and requires a credential up front. Under fake, the local and
 # cluster rungs assert PLUMBING only -- that a turn finalized and a reply came
 # back -- never reply CONTENT (ADR-0055, #612): an assertion tuned to the
-# fake's canned reply manufactures a green. Rung 1 (skill) runs its own real
-# eval graders against whichever model it booted (cli/scripts/e2e.sh), fake or
-# live, since that leg is acceptance evidence for #325, not a plumbing probe.
+# fake's canned reply manufactures a green. Rung 1 (skill) invokes its own
+# tier's evaluator on whichever model it booted (cli/scripts/e2e.sh), but a FAKE
+# skill run is not a graded run: the skill evaluator refuses to consult a grader
+# on a fake turn (cli/src/evals.rs turn_outcome returns PlumbingOk), so every
+# case reports plumbing_ok and no grader ever reads a reply. A fake skill rung
+# therefore verifies PLUMBING and CASE IDENTITY only -- that the suite loaded,
+# that its cases are the ones the ladder packed, and that each turn completed.
+# GRADING, at every rung including skill, happens in LIVE mode only.
 #
 # Requirements: docker, a cargo toolchain (or $CURIE_BIN), and an
 # curie-runner image (`curie build`). Rung 3 additionally needs a reachable
@@ -81,6 +102,22 @@ FAKE_SENTINEL="all done"
 # brought a stack up owns tearing it down, so a stack that was already running
 # when the ladder started is reused and left alone.
 LOCAL_STACK_OWNED=0
+
+# Cross-rung artifact identity, pinned by the first rung to report a digest and
+# matched by every later one (see assert_bundle_identity). Empty until then.
+PARITY_DIGEST=""
+# What the run summary is allowed to claim: the rungs that ran, and the rungs
+# whose identity / suite / model mode were each actually asserted. Accumulated
+# by the assertions themselves, so the summary can never over-report.
+RAN_RUNGS=""
+PARITY_RUNGS=""
+SUITE_RUNGS=""
+MODE_RUNGS=""
+# Whether the cluster rung proved its turn could only bind to the deployment it
+# just created. Set only by the full active-set assertion, which is conditional
+# at that tier (see rung_cluster), so the summary reports upload identity and
+# runtime binding as the two separate claims they are.
+CLUSTER_BINDING_PROVEN=0
 
 # The label the sandbox substrate stamps on every runner container it spawns
 # (cli/src/docker.rs SANDBOX_LABEL, apps/worker sandbox/types.py). Container
@@ -182,7 +219,10 @@ apply_model_mode() {
         export CURIE_FAKE_MODEL=1
         echo "model mode: FAKE (sealed; CURIE_FAKE_MODEL=1 exported for the local rung)"
     fi
-    echo "note: the cluster rung's model is a property of the installed release (cluster up --fake-model), not of this run."
+    # Was a disclaimer that the cluster rung's mode is unverified. It is now
+    # verified: every deployed rung reads CURIE_FAKE_MODEL off the artifact that
+    # is actually running and fails on a contradiction (assert_model_mode).
+    echo "note: each deployed rung's effective mode is VERIFIED against this choice by reading CURIE_FAKE_MODEL off the running worker; a contradiction fails that rung."
 }
 
 # Accept ONLY the `reply` shape with finalized == true and a non-empty reply.
@@ -261,6 +301,299 @@ else:
     fi
 }
 
+# Cross-rung artifact identity. The digest identifies the ARCHIVE a tier
+# actually shipped, and the two sides compute it independently: skill hashes the
+# bytes it packed client-side (cli/src/bundle.rs), local and cluster get back the
+# platform's server-side hash of the bytes they uploaded
+# (apps/api/src/curie_api/deploy.py). The first rung to report pins the value;
+# every later rung must match it, so equality proves both hashers agree on one
+# source tree -- and, because `evals/cases.json` is inside that archive, that
+# every rung graded the same case ids.
+#
+# Deliberately called at the END of a rung rather than at its deploy step: the
+# rung's suite and mode evidence must reach the transcript BEFORE a cross-rung
+# divergence stops the run, because "the tier's own plan line matched and only
+# the digest moved" is exactly what distinguishes a case-ids-only divergence
+# from a suite divergence. Aborting at the deploy step would throw away the
+# evidence that makes the failure diagnosable.
+assert_bundle_identity() {
+    local label="$1" digest="$2"
+    if [[ -z "$digest" || "$digest" == "null" || "$digest" == "None" ]]; then
+        echo "$label: no bundle digest was reported, so this rung's artifact identity is unknown and cannot be compared." >&2
+        return 1
+    fi
+    if [[ -z "$PARITY_DIGEST" ]]; then
+        PARITY_DIGEST="$digest"
+        PARITY_RUNGS="$PARITY_RUNGS $label"
+        echo "$label: bundle identity pinned for this ladder run: $digest"
+        return 0
+    fi
+    if [[ "$digest" != "$PARITY_DIGEST" ]]; then
+        echo "$label: bundle identity DIVERGED -- this ladder pinned $PARITY_DIGEST, but the $label rung shipped $digest." >&2
+        echo "fix: the rungs are not running the same artifact. Check that nothing mutated the bundle copies between rungs, and that every copy's regular-file mtimes were normalized (pack_tar_gz embeds per-file mtime, so equal content is not enough)." >&2
+        return 1
+    fi
+    PARITY_RUNGS="$PARITY_RUNGS $label"
+    echo "$label: bundle identity matches the pinned digest: $digest"
+}
+
+# The suite the TIER's own frozen loader resolved, read off `eval --dry-run`.
+# Runs in fake mode as well as live: a dry run sends no turn, grades nothing and
+# needs no reachable stack (it returns before connecting), yet it still loads and
+# validates the cases file. The plan line carries a suite NAME and a case COUNT
+# and no ids at all, so this is a cross-check that the ladder handed the tier the
+# file it thinks it did -- never a case-id readback. The case-id claim at these
+# tiers rests on digest equality (assert_bundle_identity).
+assert_suite() {
+    local label="$1" payload="$2" line grade_line="" count="" suite=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^grade\ ([0-9]+)\ case\(s\)\ from\ suite\ \"(.*)\"\ against\ the\ .+\ tier$ ]]; then
+            grade_line="$line"
+            count="${BASH_REMATCH[1]}"
+            suite="${BASH_REMATCH[2]}"
+        fi
+    done < <(printf '%s' "$payload" | python3 -c '
+import json, sys
+try:
+    plan = json.loads(sys.stdin.read()).get("plan") or []
+except Exception:
+    plan = []
+for entry in plan:
+    print(entry)
+' || true)
+    if [[ -z "$grade_line" ]]; then
+        # Print the raw payload, not just a verdict: a corrupt .curie in the
+        # invoking cwd can red this check for reasons that have nothing to do
+        # with parity, and the raw output is what tells the two apart.
+        echo "$label: the tier's \`eval --dry-run\` plan carried no \"grade N case(s) from suite ... tier\" line, so the suite it resolved cannot be read." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    fi
+    # Re-match to repopulate BASH_REMATCH: the loop above may have run further
+    # iterations since the match that set grade_line.
+    [[ "$grade_line" =~ ^grade\ ([0-9]+)\ case\(s\)\ from\ suite\ \"(.*)\"\ against\ the\ .+\ tier$ ]]
+    local count="${BASH_REMATCH[1]}" suite="${BASH_REMATCH[2]}"
+    if [[ "$suite" != "$EXPECT_SUITE" || "$count" != "$EXPECT_CASE_COUNT" ]]; then
+        echo "$label: the tier resolved a different suite than the ladder packed. Expected suite \"$EXPECT_SUITE\" with $EXPECT_CASE_COUNT case(s); the tier's own loader reported: $grade_line" >&2
+        return 1
+    fi
+    SUITE_RUNGS="$SUITE_RUNGS $label"
+    echo "$label: suite parity asserted (name and count only, no ids) -- the tier's own loader reported: $grade_line"
+}
+
+# The effective model mode of the DEPLOYED artifact, compared against what this
+# run asked for. Truthiness rule mirrored from cli/src/local.rs
+# fake_model_is_truthy; an ABSENT value means live, because compose only
+# materializes a value through ${CURIE_FAKE_MODEL:-1} and the chart only sets it
+# on a sealed install.
+#
+# Bounded to FRESH claims, deliberately: mode reaches a run through the binding
+# (apps/worker/src/curie_worker/binding.py fake_model=...), read per claim, so
+# this describes the mode the NEXT turn gets. It says nothing about a sandbox
+# that was already running when the ladder started. Each rung deploys and then
+# messages, so that is exactly the turn it cares about -- but do not later read
+# this assertion as a claim about pre-existing sandboxes.
+assert_model_mode() {
+    local label="$1" observed="$2" truthy=0
+    case "${observed,,}" in
+        1|true|yes) truthy=1 ;;
+    esac
+    if [[ "$LIVE" == "1" ]]; then
+        if (( truthy )); then
+            echo "$label: this run asked for the LIVE model, but the deployed worker carries CURIE_FAKE_MODEL=$observed, so the rung would run sealed against the fake model and any grade it reported would be manufactured." >&2
+            echo "fix: for a compose rung run \`curie local down\` and re-run so the stack boots live; for the cluster rung reinstall the release without \`cluster up --fake-model\`." >&2
+            return 1
+        fi
+        MODE_RUNGS="$MODE_RUNGS $label"
+        echo "$label: deployed worker carries no truthy CURIE_FAKE_MODEL (observed: '$observed'), so the rung is live as asked"
+        return 0
+    fi
+    if (( ! truthy )); then
+        echo "$label: this run is sealed (fake model), but the deployed worker's CURIE_FAKE_MODEL is '$observed', which is not truthy, so the rung would call a real model." >&2
+        echo "fix: bring the deployment up sealed, or set CURIE_E2E_LIVE=1 to run the ladder live deliberately." >&2
+        return 1
+    fi
+    MODE_RUNGS="$MODE_RUNGS $label"
+    echo "$label: deployed worker carries CURIE_FAKE_MODEL=$observed (sealed, as asked)"
+}
+
+# A deploy receipt proves what was UPLOADED. It does NOT prove the following
+# `message` and `eval` turns ran that deployment: `deploy` defaults the
+# environment to dev (cli/src/commands.rs) while the worker's runtime binding
+# prefers prod over recency (apps/worker/src/curie_worker/binding.py's
+# `ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC`) over the ACTIVE
+# set only. So one stale active prod row for this agent serves the turn while the
+# ladder reports the digest of the dev bundle it just uploaded: a green ladder
+# proving the wrong artifact. Not hypothetical here -- `local down` is
+# deliberately non-destructive and the compose project name is pinned to
+# `curie`, so Postgres volumes and their deployment rows outlive every run and
+# are shared across worktrees.
+#
+# The invariant asserted, chosen over re-implementing that ORDER BY in shell:
+# exactly ONE active deployment exists for this agent, and it is this run's.
+# Why that is sufficient, each link checkable:
+#  1. A channel maps to exactly one agent, enforced in the database --
+#     apps/api/src/curie_api/models.py:44
+#     `slack_channel: Mapped[str] = mapped_column(unique=True)`, added by #38
+#     because without it the create succeeded and the second agent was silently
+#     shadowed by the worker's resolver at runtime.
+#  2. That agent has exactly one active deployment, which is what this
+#     assertion counts.
+#  3. The resolver selects over the ACTIVE set only --
+#     apps/worker/src/curie_worker/binding.py:172
+#     `JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'`,
+#     the same predicate counted here -- so no other status value can serve a
+#     row this assertion never saw.
+# Therefore the row the worker resolves for this channel can only be this run's,
+# whatever ordering it applies.
+#
+# Residual, named and deliberately not engineered around: the read happens before
+# the turn, so a deployment created in that window is not caught. That needs a
+# concurrent deployer against the same stack, which is why the ladder owns its
+# stack rather than fighting a foreign one.
+assert_sole_active_deployment() {
+    local label="$1" agent_id="$2" deployment_id="$3" api_base verdict listed
+    # The CLI's own public inputs, with the CLI's own defaults (cli/src/main.rs's
+    # --api-url/--api-key clap declarations, defaulting to the crate constants
+    # DEFAULT_LOCAL_API_URL and DEFAULT_API_KEY in cli/src/message.rs). Reading
+    # the same two variables means this queries whatever API the deploy above
+    # actually went to; it is not a ladder-local or test-only knob.
+    api_base="${CURIE_API_URL:-http://localhost:28000}"
+    # python3 + urllib, already a hard dependency of this script, so the read
+    # adds no new binary requirement.
+    verdict="$(python3 -c '
+import json, sys, urllib.request
+base, key, agent_id, deployment_id = sys.argv[1:5]
+url = base.rstrip("/") + "/deployments?agent_id=" + agent_id
+request = urllib.request.Request(url, headers={"X-API-Key": key})
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        rows = json.load(response)
+except Exception as exc:
+    print("unreachable")
+    print("%s: %s" % (type(exc).__name__, exc))
+    sys.exit(0)
+if not isinstance(rows, list):
+    print("unparseable")
+    print(repr(rows)[:400])
+    sys.exit(0)
+# Validate EVERY row before filtering, and fail on any that is not a
+# DeploymentOut (apps/api/src/curie_api/schemas.py). Skipping malformed rows
+# inside the filter instead would be fail-open on an unexpected shape: a
+# response carrying the expected active row PLUS a null or a truncated object
+# would be silently reduced to the one good row and pass as proof that exactly
+# one active deployment exists. An unexpected shape must surface as itself.
+required = ("id", "agent_id", "version_id", "environment", "status")
+malformed = [
+    r for r in rows
+    if not isinstance(r, dict) or any(field not in r for field in required)
+]
+if malformed:
+    print("malformed_row")
+    print(repr(malformed[:3])[:400])
+    sys.exit(0)
+active = [r for r in rows if r.get("status") == "active"]
+listed = ", ".join(
+    "%s (environment %s)" % (r.get("id"), r.get("environment")) for r in active
+) or "<none>"
+print("ok" if len(active) == 1 and active[0].get("id") == deployment_id else "shadowed")
+print(listed)
+' "$api_base" "${CURIE_API_KEY:-curie-dev-key}" "$agent_id" "$deployment_id" || echo "probe_failed")"
+    # Two-line protocol, split on the FIRST newline; `listed` first, because the
+    # second expansion overwrites the string both read.
+    listed="${verdict#*$'\n'}"
+    verdict="${verdict%%$'\n'*}"
+
+    case "$verdict" in
+        ok)
+            echo "$label: exactly one active deployment for this agent, and it is the one this rung just created ($deployment_id), so the turn below can only bind to it"
+            ;;
+        malformed_row)
+            echo "$label: the deployments read from $api_base/deployments?agent_id=$agent_id returned a row that is not a deployment object carrying id, agent_id, version_id, environment and status: $listed" >&2
+            echo "why: a malformed row is not filtered away here, deliberately. Discarding it would be fail-open -- the expected active row plus a null would then read as 'exactly one active deployment', certifying a binding this ladder never actually checked." >&2
+            echo "fix: this is an API or proxy problem, not a stale-state one; check what is answering GET /deployments at $api_base before trusting any rung's identity claim." >&2
+            return 1
+            ;;
+        shadowed)
+            echo "$label: the turn is NOT guaranteed to run the deployment this rung just created ($deployment_id). Active deployments for agent $agent_id: $listed" >&2
+            echo "why: the worker's runtime binding prefers an active prod deployment over recency, so a stale row can serve the turn while this rung reports the digest it just uploaded -- a green ladder proving the wrong artifact." >&2
+            echo "fix: curie local down --wipe --yes, then re-run the ladder." >&2
+            return 1
+            ;;
+        *)
+            echo "$label: could not read the active deployment set from $api_base/deployments?agent_id=$agent_id ($verdict): $listed" >&2
+            return 1
+            ;;
+    esac
+}
+
+# The two mode probes below are the SECOND deliberate use of this script's
+# documented raw-tool exception (see the header): no `curie` verb reports the
+# effective model mode of a deployed tier -- neither local-status.schema.json nor
+# cluster-status.schema.json carries a model field, and `local rebuild --json`'s
+# model_mode is a re-derivation from the invoking shell, not a read of the
+# running stack. So the ladder mirrors the CLI's own internal probe
+# (cli/src/message.rs probe_fake_model), which is deliberately a read of the
+# OUTPUT rather than a re-derivation of the input. A CLI verb that surfaced this
+# value is the named follow-up; adding one here is forbidden by scope.
+#
+# The project label on the `docker ps` below is deliberate EXTRA scoping, NOT a
+# mirror: the CLI selects on the service label alone, which is host-wide and
+# would match a concurrent worktree's worker. The compose project name is pinned
+# to `curie` by the CLI (cli/src/local.rs COMPOSE_PROJECT_NAME), so adding it
+# selects this ladder's stack and nothing else. Do not "fix" it back to an exact
+# mirror of the CLI's selector.
+probe_local_fake_model() {
+    local line value="" workers=()
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            workers+=("$line")
+        fi
+    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    # Exactly one, never "inspect the first": two matches mean the scoping
+    # assumption broke and the probe's answer would be meaningless.
+    if (( ${#workers[@]} != 1 )); then
+        echo "local mode probe: expected exactly one running container matching label=com.docker.compose.project=curie plus label=com.docker.compose.service=curie-worker, found ${#workers[@]} (${workers[*]:-none})." >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" == CURIE_FAKE_MODEL=* ]]; then
+            value="${line#CURIE_FAKE_MODEL=}"
+        fi
+    done < <(docker inspect "${workers[0]}" --format '{{range .Config.Env}}{{println .}}{{end}}')
+    printf '%s' "$value"
+}
+
+probe_cluster_fake_model() {
+    # Release and namespace both default to `curie` (cli/src/main.rs), which is
+    # what this rung runs against; the deployment name is built the same way the
+    # CLI builds it, as `deployment/<release>-worker`.
+    kubectl -n curie get deployment/curie-worker \
+        -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_FAKE_MODEL")].value}'
+}
+
+# One field out of a `deploy --json` receipt. deploy.schema.json is a oneOf over
+# deploy_result, aggregate_success, deploy_failure and connector_failure; the
+# ladder never passes --all-targets, so it gets deploy_result. The extractor
+# still fails with a named error and prints the payload rather than emitting an
+# empty string, so an unexpected shape surfaces as itself instead of pinning an
+# empty digest and making every later comparison vacuous.
+deploy_field() {
+    local label="$1" payload="$2" path="$3" value
+    value="$(printf '%s' "$payload" | python3 -c '
+import json, sys
+value = json.loads(sys.stdin.read())
+for key in sys.argv[1].split("."):
+    value = value[key]
+print(value)
+' "$path")" || {
+        echo "$label: the deploy --json receipt carried no $path; deploy.schema.json requires it on the deploy_result branch, so this is an unexpected payload shape." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    }
+    printf '%s' "$value"
+}
+
 # The local reply stub binds a fixed port. A second ladder, or any process
 # holding it, would otherwise hang until the 300s message timeout and look like
 # a product failure.
@@ -321,13 +654,52 @@ case_leftover_runner_container() {
     echo "skill down --name cleared the leftover with no recorded state"
 }
 
-# Rung 1: the existing skill-tier round trip, invoked as is. Never copied. The
-# #747 recovery case rides here because it drives skill-tier verbs and shares
-# rung 1's runner-image requirement.
+# Rung 1: the existing skill-tier round trip. Still exactly one implementation
+# and never copied -- but no longer unparameterized: it is handed THIS run's
+# bundle copy through CURIE_E2E_BUNDLE, so rung 1 boots and grades the same
+# artifact and the same case set as every later rung. That deliberately
+# supersedes #690's "keep the current skill-tier leg as is"; the `--from-spec`
+# deal-desk leg it refers to (#325's acceptance evidence) is preserved as the
+# behavior of a bare `bash cli/scripts/e2e.sh`, which is where that evidence now
+# lives.
+#
+# The #747 recovery case rides here because it drives skill-tier verbs and shares
+# rung 1's runner-image requirement. It is unaffected by the shared bundle: it
+# expects exit 2 from `skill up`'s name-conflict preflight and never reaches a
+# pack, so it neither reads nor perturbs artifact identity.
 rung_skill() {
     echo
     echo "########## rung 1/3: skill ##########"
-    bash "$REPO_ROOT/cli/scripts/e2e.sh"
+    RAN_RUNGS="$RAN_RUNGS skill"
+
+    local log="$WORKDIR/rung-skill.log"
+    # `tee`, not a command substitution: rung 1 runs for minutes and its progress
+    # must keep streaming. `set -o pipefail` is already on (set -euo pipefail
+    # above), so a failing e2e.sh still fails this rung through the pipe rather
+    # than being masked by tee's exit status -- never add `|| true` here. The log
+    # lives inside $WORKDIR, so the existing `rm -rf` in the trap covers it and
+    # this adds no new cleanup path.
+    CURIE_E2E_BUNDLE="$WORKDIR/bundle" bash "$REPO_ROOT/cli/scripts/e2e.sh" | tee "$log"
+
+    # e2e.sh already prints its client-side digest on a stable line, and exits 1
+    # on a null or empty one BEFORE reaching that line, so a present line always
+    # carries a real value. Parsing it keeps the env contract at one variable:
+    # e2e.sh gains no output contract of its own.
+    local line digest=""
+    while IFS= read -r line; do
+        if [[ "$line" == "initial bundle digest: "* ]]; then
+            digest="${line#initial bundle digest: }"
+        fi
+    done < "$log"
+    if [[ -z "$digest" ]]; then
+        echo "skill: cli/scripts/e2e.sh printed no \"initial bundle digest:\" line, so rung 1's artifact identity cannot be read." >&2
+        return 1
+    fi
+    # Rung 1 is the one rung that reads its case ids back DIRECTLY, inside
+    # e2e.sh's --json skill eval assertion, in fake mode as well as live.
+    SUITE_RUNGS="$SUITE_RUNGS skill"
+    assert_bundle_identity "skill" "$digest"
+
     case_leftover_runner_container
 }
 
@@ -335,6 +707,7 @@ rung_skill() {
 rung_local() {
     echo
     echo "########## rung 2/3: local (compose) ##########"
+    RAN_RUNGS="$RAN_RUNGS local"
 
     assert_stub_port_free
 
@@ -342,13 +715,11 @@ rung_local() {
         # Reuse it and do NOT tear it down: the thread that brought a stack up
         # owns tearing it down, in both directions.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
-        if [[ "$LIVE" == "1" ]]; then
-            # Model mode is fixed at `local up` time, so a reused stack may have
-            # been started sealed. Warn rather than refuse: the live-only fake
-            # sentinel control below catches it for real.
-            echo "warning: CURIE_E2E_LIVE=1, but the reused stack's model mode was fixed by whoever ran \`local up\` and is NOT verified here." >&2
-            echo "warning: if that stack was started with the fake model, this 'live' rung runs sealed; \`local down\` then re-run to be sure." >&2
-        fi
+        # Model mode is fixed at `local up` time, so a reused stack may have been
+        # started sealed. That used to be a warning; it is now VERIFIED by
+        # assert_model_mode below, off the reused stack's own running worker, and
+        # a contradiction is a hard failure with a fix line.
+        echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
         echo "=== curie local up --minimal ==="
@@ -366,11 +737,34 @@ rung_local() {
     fi
 
     echo
-    echo "=== curie local deploy ==="
+    echo "=== curie --json local deploy ==="
     # No --api-url: the default IS the cold-start path a real user hits, and
     # exercising the default is the point. First create binds C0LOCALDEV, so the
     # message below can resolve the sole deployed agent with no --channel.
-    "$BIN" local deploy --plugin-dir "$WORKDIR/bundle"
+    #
+    # --json for the receipt: `local status --json` carries no digest
+    # (cli/schema/local-status.schema.json is only `services`), so the deploy
+    # receipt's bundle.sha256 -- the platform's server-side hash of the bytes this
+    # rung uploaded -- is the ONLY surface that reports this tier's artifact
+    # identity. Read from stdout only; the human text is on stderr.
+    local deploy_json digest agent_id deployment_id
+    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle")"
+    printf '%s\n' "$deploy_json"
+    digest="$(deploy_field "local" "$deploy_json" bundle.sha256)"
+    agent_id="$(deploy_field "local" "$deploy_json" agent.id)"
+    deployment_id="$(deploy_field "local" "$deploy_json" deployment.id)"
+
+    echo
+    echo "=== assert the turn will bind to the deployment this rung created ==="
+    # BEFORE the turn, deliberately: a shadowed binding must stop the rung rather
+    # than produce a green turn against the wrong artifact.
+    assert_sole_active_deployment "local" "$agent_id" "$deployment_id"
+
+    echo
+    echo "=== assert the deployed worker's effective model mode ==="
+    local observed_mode
+    observed_mode="$(probe_local_fake_model)"
+    assert_model_mode "local" "$observed_mode"
 
     echo
     echo "=== curie local message --json ==="
@@ -383,6 +777,10 @@ rung_local() {
     out="$("$BIN" --json local message "$PROMPT" || true)"
     printf '%s\n' "$out"
     assert_finalized_reply "local" "$out"
+
+    echo
+    echo "=== curie local eval --dry-run (suite parity) ==="
+    assert_suite "local" "$("$BIN" --json local eval --cases "$WORKDIR/bundle/evals/cases.json" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -425,6 +823,11 @@ rung_local() {
         fi
         echo "no curie containers running"
     fi
+
+    # Last, not at the deploy step: see assert_bundle_identity's comment. The
+    # rung's suite and mode evidence is on the transcript by now, so a divergence
+    # here is diagnosable as an identity divergence specifically.
+    assert_bundle_identity "local" "$digest"
 }
 
 # local-release mode: the same local round trip as rung_local, but against the
@@ -437,6 +840,7 @@ rung_local() {
 rung_local_release() {
     echo
     echo "########## rung: local-release (compose, generated release artifact) ##########"
+    RAN_RUNGS="$RAN_RUNGS local-release"
 
     local release_compose="$WORKDIR/compose.release.yaml"
     echo
@@ -476,10 +880,10 @@ rung_local_release() {
         # Reuse it and do NOT tear it down, matching rung_local's rule: the
         # thread that brought a stack up owns tearing it down.
         echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
-        if [[ "$LIVE" == "1" ]]; then
-            echo "warning: CURIE_E2E_LIVE=1, but the reused stack's model mode was fixed by whoever ran \`local up\` and is NOT verified here." >&2
-            echo "warning: if that stack was started with the fake model, this 'live' rung runs sealed; \`local down\` then re-run to be sure." >&2
-        fi
+        # Same rule as rung_local, and changed together with it: the reused
+        # stack's mode is verified by assert_model_mode below rather than
+        # disclaimed in a warning.
+        echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
         echo "=== clear any stale volumes from a prior non-wiped teardown ==="
@@ -500,12 +904,33 @@ rung_local_release() {
     fi
 
     echo
-    echo "=== curie local deploy (release-compose stack) ==="
+    echo "=== curie --json local deploy (release-compose stack) ==="
     # A separate bundle copy from rung_local's, never the same directory: deploy
     # records state into the bundle dir, and reusing rung_local's copy here
     # would carry over its recorded agent/version ids instead of a fresh
-    # cold-start deploy.
-    "$BIN" local deploy --plugin-dir "$WORKDIR/bundle-release"
+    # cold-start deploy. The copies now pack to the same digest by construction
+    # (their regular-file mtimes are normalized where they are created), so a
+    # separate copy no longer means a separate identity.
+    local deploy_json digest agent_id deployment_id
+    deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle-release")"
+    printf '%s\n' "$deploy_json"
+    digest="$(deploy_field "local-release" "$deploy_json" bundle.sha256)"
+    agent_id="$(deploy_field "local-release" "$deploy_json" agent.id)"
+    deployment_id="$(deploy_field "local-release" "$deploy_json" deployment.id)"
+
+    echo
+    echo "=== assert the turn will bind to the deployment this rung created ==="
+    # Normally trivially satisfied here, because this rung's pre-`up`
+    # `local down --wipe` above clears the deployment rows before it deploys. It
+    # is still asserted, because that wipe is skipped entirely when the rung
+    # reuses a running stack -- which is exactly the case where a shadow exists.
+    assert_sole_active_deployment "local-release" "$agent_id" "$deployment_id"
+
+    echo
+    echo "=== assert the deployed worker's effective model mode ==="
+    local observed_mode
+    observed_mode="$(probe_local_fake_model)"
+    assert_model_mode "local-release" "$observed_mode"
 
     echo
     echo "=== curie local message --json (release-compose stack) ==="
@@ -514,6 +939,10 @@ rung_local_release() {
     out="$("$BIN" --json local message "$PROMPT" || true)"
     printf '%s\n' "$out"
     assert_finalized_reply "local-release" "$out"
+
+    echo
+    echo "=== curie local eval --dry-run (suite parity, release compose stack) ==="
+    assert_suite "local-release" "$("$BIN" --json local eval --cases "$WORKDIR/bundle-release/evals/cases.json" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -544,6 +973,8 @@ rung_local_release() {
         fi
         echo "no curie containers running"
     fi
+
+    assert_bundle_identity "local-release" "$digest"
 }
 
 # Rung 3: the deployed release. Requires one to already exist; it is never
@@ -551,6 +982,7 @@ rung_local_release() {
 rung_cluster() {
     echo
     echo "########## rung 3/3: cluster ##########"
+    RAN_RUNGS="$RAN_RUNGS cluster"
 
     echo
     echo "=== curie cluster status (gate) ==="
@@ -578,10 +1010,62 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     fi
 
     echo
-    echo "=== curie cluster deploy ==="
+    echo "=== curie --json cluster deploy ==="
     # No --api-url: deploy auto-discovers the release's UI /api proxy over
     # NodePort. No --secret: it is declined at this tier by design (#440).
-    "$BIN" cluster deploy --plugin-dir "$WORKDIR/bundle"
+    # --json for the receipt: `cluster status --json` carries no digest, so the
+    # deploy receipt's bundle.sha256 is the only artifact-identity surface here
+    # too.
+    local deploy_json digest agent_id deployment_id deployment_status deployment_environment
+    deploy_json="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle")"
+    printf '%s\n' "$deploy_json"
+    digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
+    agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
+    deployment_id="$(deploy_field "cluster" "$deploy_json" deployment.id)"
+    deployment_status="$(deploy_field "cluster" "$deploy_json" deployment.status)"
+    deployment_environment="$(deploy_field "cluster" "$deploy_json" deployment.environment)"
+
+    echo
+    echo "=== assert this rung's deployment is the terminal state a turn can bind to ==="
+    # The receipt's own terminal state first: it is readable at every tier, with
+    # no API credential at all.
+    if [[ "$deployment_status" != "active" ]]; then
+        echo "cluster: the deployment this rung created reports status '$deployment_status', not 'active', so no turn can bind to it." >&2
+        return 1
+    fi
+    if [[ "$deployment_environment" != "dev" ]]; then
+        echo "cluster: the deployment this rung created landed in environment '$deployment_environment'; this run asked for 'dev' (deploy's own default, and the ladder passes no --environment)." >&2
+        return 1
+    fi
+    echo "cluster: deploy receipt reports an active deployment in environment $deployment_environment"
+
+    # The full runtime-binding assertion is CONDITIONAL here, and only here,
+    # because the cluster API key has no default -- it is resolved from the
+    # installed release (cli/src/main.rs's --api-key value_parser) -- and CI's
+    # cluster ladder job supplies none, so requiring it would red a job this
+    # change cannot touch.
+    #
+    # So: when the operator's environment already carries CURIE_API_KEY, this
+    # rung performs exactly the same one-active-deployment assertion the local
+    # rungs perform, through the same helper, as a hard failure. When it does
+    # not, the rung does not fail and does not claim parity: the receipt above
+    # proves which artifact was UPLOADED, nothing proves the turn RAN it, and the
+    # summary reports the two as separate claims.
+    if [[ -n "${CURIE_API_KEY:-}" ]]; then
+        assert_sole_active_deployment "cluster" "$agent_id" "$deployment_id"
+        CLUSTER_BINDING_PROVEN=1
+    else
+        echo "cluster: runtime binding is NOT proven at this tier for this run. The deploy receipt proves which artifact was UPLOADED to the cluster; it does not prove the turn below ran that artifact, so a stale ACTIVE prod deployment shadowing the turn would go undetected here."
+        echo "cluster: to prove it, export CURIE_API_KEY (and CURIE_API_URL if the release's API is not on the default) and re-run; this rung then reads the active deployment set exactly as the local rungs do."
+    fi
+
+    echo
+    echo "=== assert the installed release's effective model mode ==="
+    # kubectl is only reached inside this rung, which already gated on a
+    # reachable release above, so a skill/local-only invocation never needs it.
+    local observed_mode
+    observed_mode="$(probe_cluster_fake_model)"
+    assert_model_mode "cluster" "$observed_mode"
 
     echo
     echo "=== curie cluster message --json ==="
@@ -614,17 +1098,29 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     printf '%s\n' "$out"
     assert_finalized_reply "cluster" "$out"
 
+    echo
+    echo "=== curie cluster eval --dry-run (suite parity) ==="
+    # ONE array feeding BOTH cluster eval calls (this dry-run plan and the live
+    # grade below), so `--listen-host` cannot reach one and be forgotten on the
+    # other. `--json` is deliberately NOT in the array: both call sites need it
+    # for DIFFERENT reasons -- a machine-readable `--dry-run` plan here, an
+    # auditable green on the live grade below -- and passing it once per call site
+    # is what keeps it from being passed twice at either.
+    local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+    if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
+        eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
+    fi
+    assert_suite "cluster" "$("$BIN" --json "${eval_args[@]}" --dry-run)"
+
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie cluster eval (REPORT ONLY, does not fail this rung: #1603) ==="
-        # --json here and nowhere else: the human table prints a reply only for a
-        # RED case, so a green carried no evidence of HOW it was earned. The json
-        # payload carries `output` for every case, pass included, which is what
-        # makes the weather case's greens auditable from the job log (#1602).
-        local eval_args=(--json cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
-        if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
-            eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
-        fi
+        # --json on this rung's live grade and no other rung's: the human table
+        # prints a reply only for a RED case, so a green carried no evidence of
+        # HOW it was earned. The json payload carries `output` for every case,
+        # pass included, which is what makes the weather case's greens auditable
+        # from the job log (#1602).
+        #
         # Report only on THIS rung alone (#1603). The graded weather case cannot
         # express what it is meant to assert here: it grades that a temperature
         # figure is PRESENT, and under the cluster rung's provider-only egress
@@ -639,10 +1135,12 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # turn finalizes with a reply, and under live mode that reply is not the
         # fake sentinel) still fail it, and they are what caught the sandbox
         # reaper race in #1601.
-        if ! "$BIN" "${eval_args[@]}"; then
+        if ! "$BIN" --json "${eval_args[@]}"; then
             echo "cluster: eval reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     fi
+
+    assert_bundle_identity "cluster" "$digest"
 }
 
 echo
@@ -683,6 +1181,46 @@ fi
 cp -r "$BUNDLE_SRC" "$WORKDIR/bundle"
 cp -r "$BUNDLE_SRC" "$WORKDIR/bundle-release"
 
+# Normalize every regular file's mtime across both copies. This is load-bearing,
+# not hygiene: the digest every rung asserts on identifies an ARCHIVE, not a
+# source tree, because pack_tar_gz embeds per-file mtime (cli/src/bundle.rs), and
+# `cp -r` does NOT preserve mtimes. Two copies of identical content would
+# therefore pack to different bytes and different digests, and every multi-rung
+# run would be red by construction. Only regular files become tar entries (the
+# packer recurses directories and appends only files), and uid/gid are constant
+# inside one ladder process, so pinning file mtimes to a fixed epoch is exactly
+# sufficient to make both copies pack byte-identically.
+find "$WORKDIR/bundle" "$WORKDIR/bundle-release" -type f -exec touch -t 200001010000 {} +
+
+# The one place the expected suite is derived, from the file the ladder itself
+# packed, so no rung can be compared against an externally pinned value. The
+# case ids are recorded for the summary; they are PROVEN at the deployed tiers by
+# digest equality (evals/cases.json is inside the packed archive), and read back
+# directly only at the skill rung and, under CURIE_E2E_LIVE=1, at every rung.
+CASES_FILE="$WORKDIR/bundle/evals/cases.json"
+if [[ ! -f "$CASES_FILE" ]]; then
+    echo "error: the ladder's bundle carries no evals/cases.json at $CASES_FILE, so there is no common suite to assert." >&2
+    echo "fix: point BUNDLE_SRC at a bundle that ships an eval suite." >&2
+    exit 1
+fi
+{
+    read -r EXPECT_SUITE
+    read -r EXPECT_CASE_COUNT
+    read -r EXPECT_CASE_IDS
+} < <(python3 -c '
+import json, sys
+suite = json.load(open(sys.argv[1]))
+ids = sorted(case["id"] for case in suite["cases"])
+print(suite["name"])
+print(len(ids))
+print(",".join(ids))
+' "$CASES_FILE")
+echo
+echo "=== common bundle and suite ==="
+echo "bundle source: $BUNDLE_SRC"
+echo "suite: \"$EXPECT_SUITE\" with $EXPECT_CASE_COUNT case(s)"
+echo "case ids: $EXPECT_CASE_IDS"
+
 # Rungs run strictly in order and never in parallel: they share host ports, and
 # rung 1 must release its runner container before rung 2 starts.
 if (( RUN_SKILL )); then
@@ -711,6 +1249,33 @@ else
     echo
     echo "SKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live"
     echo "release and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all."
+fi
+
+echo
+echo "=== parity summary (what this run actually proved) ==="
+echo "rungs run:$RAN_RUNGS"
+if [[ -z "$PARITY_DIGEST" ]]; then
+    echo "bundle identity: NOT reported by any rung that ran, so nothing about artifact identity was proven."
+else
+    echo "bundle identity: $PARITY_DIGEST, reported by rung(s):$PARITY_RUNGS"
+    if (( $(wc -w <<< "$PARITY_RUNGS") < 2 )); then
+        echo "note: only one rung reported a digest, so the CROSS-RUNG digest comparison was vacuous for this tier set -- only that rung's own identity was recorded. This is NOT a cross-rung parity claim."
+    fi
+fi
+echo "suite: \"$EXPECT_SUITE\" with $EXPECT_CASE_COUNT case(s), resolved by the tier's own loader at rung(s):$SUITE_RUNGS"
+echo "case ids: $EXPECT_CASE_IDS (proven at local/cluster by digest equality; read back directly at skill, and at every rung under CURIE_E2E_LIVE=1)"
+echo "model mode read off the deployed artifact at rung(s):${MODE_RUNGS:- none}"
+if [[ "$LIVE" == "1" ]]; then
+    echo "grading: GRADED rungs:$RAN_RUNGS -- each ran its tier's own evaluator against a real model."
+else
+    echo "grading: PLUMBING-ONLY rungs:$RAN_RUNGS -- sealed against the fake model, so no rung graded reply content and a green here must never be read as a graded pass (ADR-0055, #612)."
+fi
+if (( RUN_CLUSTER )); then
+    if (( CLUSTER_BINDING_PROVEN )); then
+        echo "cluster rung: upload identity AND runtime binding both proven -- exactly one active deployment existed for this agent before the turn, and it was the one this rung created, so the turn could only bind to the artifact whose digest is reported above."
+    else
+        echo "cluster rung: upload-identity-proven / runtime-binding-UNPROVEN. The digest above is the artifact this rung UPLOADED to the cluster; no read was performed to show the turn ran it, so a stale ACTIVE prod deployment shadowing the turn would have gone undetected. Read that digest as an upload record, never as a cluster parity claim, and see the cluster rung's own note above for how to prove it."
+    fi
 fi
 
 echo

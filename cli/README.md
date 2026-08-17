@@ -619,11 +619,13 @@ real model, failing fast if no model credential (`ANTHROPIC_API_KEY`,
 `CLAUDE_CODE_OAUTH_TOKEN`, or `CURIE_CREDENTIALS`) is present.
 
 The cold-start parity ladder (`curie dev e2e-ladder`, `cli/scripts/e2e-ladder.sh`)
-runs the same skill-tier script as rung 1, then adds a local rung (`local up
+runs rung 1 as the skill-tier script against the same bundle every other rung
+drives, then adds a local rung (`local up
 --minimal` -> `local deploy` -> `local message` with the reply asserted ->
 `local down`, against `compose.dev.yaml`) and a cluster rung (`cluster deploy`
 then `cluster message`, a real round trip with no manual port-forward) against
-a pre-installed release.
+a pre-installed release. It asserts one bundle identity, one eval suite, and
+one model mode across every rung and fails on divergence.
 
 A `local-release` rung repeats the local rung's exact round trip against the
 generated `compose.release.yaml` instead -- the artifact a release binary's
@@ -633,7 +635,7 @@ only coverage it gets. It needs the release-pinned
 `ghcr.io/curie-eng/curie-api` and `-worker-local` images already built and
 tagged locally (it preflights and fails with a fix hint otherwise).
 
-Two env knobs configure it:
+Three env knobs configure it:
 
 - `CURIE_E2E_TIERS` -- which rungs to run. Defaults to `skill,local`
   (credential-free, CI-safe); `all` runs `skill,local,cluster`. A tier named
@@ -653,6 +655,13 @@ Two env knobs configure it:
   host -- notably a kind/minikube cluster whose API server binds loopback, where
   the auto-detected `127.0.0.1` is unreachable from a pod. CI's kind cluster job
   sets it to the kind Docker network gateway.
+
+`CURIE_E2E_BUNDLE` is not a ladder knob: the ladder hardcodes `examples/weather`
+as its bundle source and sets the var itself when it invokes `cli/scripts/e2e.sh`
+for rung 1, so every rung drives the same bundle. It is a knob of `e2e.sh` --
+set it standalone to drive `e2e.sh` against a named bundle instead of
+scaffolding its own `deal-desk` one; leave it unset and `e2e.sh` keeps that
+scaffold. Exporting it before a ladder run has no effect on the ladder's rungs.
 
 The one-command pre-release gate:
 
