@@ -106,16 +106,19 @@ or skips an unfinished one, and outstanding findings that lived only in a lost
 context are lost with it. A direct path change finishes with nothing to resume, so
 the file is optional there.
 
-Record the tier decision once, at triage, and an evidence entry per observation
-as it is made. Fill `command`, `commit`, `mode`, `outcome`, and `observed` from the run
-itself, never from intent, and set `artifact` whenever the run produced an
-identifiable image, release, bundle, or trace. `observed` carries the literal
-line the run printed, because an `outcome` of pass with nothing observed
-behind it is the self-report this record exists to replace. `teardown` is
-filled when the surface is released, naming what came down or why it was left
-running. A required tier that could not
-run records `outcome` blocked with its `blocker` and `skip_reason` rather than
-being dropped from the decision. A verification observed only in a context that
+Record the tier decision once, at triage. Record one evidence entry per
+required tier and criterion, filled in as the run observes it, with the
+positive proof in `command`, `mode`, `outcome`, and `observed`, and its
+falsifiable negative or second path in `negative` on that same entry. Two
+observations make one record, not two. Fill `command`, `commit`, `mode`,
+`outcome`, and `observed` from the run itself, never from intent, and set
+`artifact` whenever the run produced an identifiable image, release, bundle, or
+trace. `observed` carries the literal line the run printed, because an `outcome`
+of pass with nothing observed behind it is the self-report this record exists to
+replace. `teardown` is filled when the surface is released, naming what came
+down or why it was left running. A required tier that could not run records
+`outcome` blocked with its `blocker` and `skip_reason` rather than being dropped
+from the decision. A verification observed only in a context that
 is now gone cannot be re-checked, and a tier nobody recorded a decision for is
 indistinguishable from one that was skipped.
 
