@@ -1,0 +1,22 @@
+version: 1
+fallback: [skill, local, local-release, cluster]
+rules:
+  exact:
+    compose.dev.yaml: [local]
+    pyproject.toml: [skill, local, local-release, cluster]
+    uv.lock: [skill, local, local-release, cluster]
+    .github/e2e-selection.yaml: [skill, local, local-release, cluster]
+    .github/workflows/ci.yaml: [skill, local, local-release, cluster]
+  prefixes:
+    charts: [cluster]
+    compose: [local-release]
+    apps/api: [local, local-release, cluster]
+    apps/worker: [local, local-release, cluster]
+    otel: [local, local-release]
+    runner: [skill, local, local-release, cluster]
+    cli: [skill, local, local-release, cluster]
+    packages: [skill, local, local-release, cluster]
+    examples: [skill, local, local-release, cluster]
+    tools/e2e-ci-selection: [skill, local, local-release, cluster]
+  ignored_prefixes:
+    docs: []
