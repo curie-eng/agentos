@@ -2,7 +2,7 @@
 
 Date: 2026-07-16
 
-Status: Draft
+Status: Accepted
 
 ## Context
 
@@ -48,13 +48,24 @@ fitness, and also a warning about how much of Grok's approach transfers.
 
 ## Decision
 
-**1. Adopt ACP as an edge projection, not as a replacement for TurnEvent.** Add a
-`TurnEvent -> acp::SessionUpdate` projector at the runner edge. TurnEvent stays the
-internal canonical type because it does a job ACP does not do: normalize across
-heterogeneous harnesses. Grok can make "ACP `SessionUpdate` is the one true type"
-work only because it is a single self-contained harness with nothing to normalize.
-Curie is not that, per ADR-0031, and collapsing the internal type into the wire
-type would put the cross-harness normalization back in every consumer.
+**1. Adopt ACP as an edge projection, not as the internal canonical type.** Add a
+projector at the runner edge mapping the runner's internal turn representation to
+`acp::SessionUpdate`. The internal type stays internal because it does a job ACP
+does not do: normalize across heterogeneous harnesses. Grok can make "ACP
+`SessionUpdate` is the one true type" work only because it is a single
+self-contained harness with nothing to normalize. Curie is not that, and
+collapsing the internal type into the wire type would put the cross-harness
+normalization back in every consumer.
+
+**Which internal type the projector reads is deliberately left open.** This
+decision originally named ADR-0031's runner-owned `TurnEvent` union. ADR-0031 is
+now Superseded by [ADR-0060](0060-the-harness-is-a-declared-package.md) and
+[ADR-0061](0061-out-of-process-harness-boundary.md), and under ADR-0061 the
+harness boundary is a process rather than a Protocol, with `TurnEvent` demoted to
+that ADR's recorded fallback if its spike fails. Naming a source type now would
+freeze a premise the spike has not answered. This decision binds the *shape* --
+edge projection, never replacement -- and the source type follows whatever the
+harness boundary settles on.
 
 **2. Ship an ACP server entry point (stdio first).** A dedicated `curie runner acp`
 subcommand speaks ACP over stdio and projects turns through decision 1. Remote
@@ -93,9 +104,9 @@ model is a loud error, not a fallback.
 
 ## Alternatives considered
 
-- **Replace TurnEvent with `acp::SessionUpdate` outright (Grok's approach).**
-  Rejected. It discards the cross-harness normalization that is ADR-0031's entire
-  reason for existing, and it couples the core's message model to an external crate's
+- **Replace the internal type with `acp::SessionUpdate` outright (Grok's approach).**
+  Rejected. It discards the cross-harness normalization the internal type exists
+  for, and it couples the core's message model to an external crate's
   enum evolution, so every upstream ACP release becomes a core refactor.
 - **Bespoke per-editor integrations.** Rejected: N integrations, no standard, and each
   one re-implements turn rendering and approval prompting, which is the cost this ADR
@@ -108,8 +119,8 @@ model is a loud error, not a fallback.
 
 - IDE embedding and an open standard for roughly the cost of one projector plus one
   entry point. Nothing in the worker, the API, or the approval plane moves.
-- The projector is a pure function of TurnEvent, which makes it cheap to test and
-  keeps ADR-0031's safety net intact: `run_conformance`
+- The projector is a pure function of the internal turn type, which makes it cheap
+  to test and keeps the conformance safety net intact: `run_conformance`
   (`packages/aci-protocol/src/aci_protocol/conformance.py`, exercised by
   `runner/tests/test_conformance.py`) must stay green for the Claude, fake, and
   OpenCode sessions with the projector in the tree.
@@ -125,6 +136,7 @@ model is a loud error, not a fallback.
   `request_permission` the way the spec naively reads. The client renders and relays;
   it does not decide. Clients whose UX assumes local authority over the answer will
   see a round trip and, sometimes, a denial.
-- TurnEvent itself is still ADR-0031's proposed decision and is not yet in the tree.
-  This ADR is a decision about where ACP sits relative to that seam, and the projector
-  cannot be built before the seam it projects from exists.
+- The internal turn type this projects from is not settled: ADR-0031 was superseded
+  by ADR-0060 and ADR-0061, and ADR-0061 is a Draft gated on a spike. This ADR is a
+  decision about where ACP sits relative to that seam, and the projector cannot be
+  built before the seam it projects from exists.

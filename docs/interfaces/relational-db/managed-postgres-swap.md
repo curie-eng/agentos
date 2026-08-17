@@ -15,9 +15,11 @@ and the one validation that proves it.
    dedicated `curie` schema (`config.db_schema`), so it can share a database with
    Langfuse without colliding with Langfuse's `public`-schema Prisma baseline.
 
-2. **Point `DATABASE_URL` at it.** The engine is built from this env var alone
-   (`apps/api/src/curie_api/config.py`, `apps/api/src/curie_api/db.py`). Use the
-   async `asyncpg` dialect:
+2. **Point `DATABASE_URL` at it.** Two services read it, each building its own
+   engine from it: the API (`apps/api/src/curie_api/config.py`,
+   `apps/api/src/curie_api/db.py`) and the worker, which reads the same database
+   read-only (`apps/worker/src/curie_worker/config.py::WorkerConfig`). Set it for
+   both. Use the async `asyncpg` dialect:
 
    ```
    DATABASE_URL=postgresql+asyncpg://<user>:<password>@<host>:5432/<database>
@@ -42,15 +44,26 @@ and the one validation that proves it.
 
 ## Why it just works (and where it would leak)
 
-Two Postgres-isms are the only things that make the "just change the DSN" story
-leak — and only for a *non*-Postgres store. Both are cheap within the Postgres
-family, so any managed Postgres is unaffected:
+The Postgres-isms below are the things that make the "just change the DSN" story
+leak, and only for a *non*-Postgres store. Every one of them is standard Postgres,
+so any managed Postgres is unaffected (the full, cited list lives in
+[INTERFACE.md](./INTERFACE.md#known-leakage); this is the swap-relevant summary):
 
 1. **`postgresql.UUID` column type** — every primary/foreign key. Native `uuid` on
    any Postgres.
 2. **Schema-qualified tables + a schema-scoped native enum** — the `environment`
    column is a native `CREATE TYPE ... environment` in the `curie` schema. Created
    from the same migration on any Postgres.
+3. **`JSONB` columns** — on the `agents`, `approval_audit_entries` and
+   `workflow_state_entries` tables (`apps/api/src/curie_api/models.py`), emitted by
+   the same migration chain. Native on any Postgres.
+4. **Raw `DISTINCT ON` SQL in application code** — the API's commit poller
+   (`apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL`) and the worker's
+   connector reconcile loop
+   (`apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`). The worker's
+   raw-SQL reads also decode JSONB with `json.loads`, because asyncpg hands back a
+   `str` for a raw-text `SELECT`. Postgres-only and asyncpg-specific, but unchanged
+   by which Postgres sits behind the DSN.
 
 Cross-database portability (MySQL, etc.) is explicitly a non-goal
 ([ADR-0007](../../adr/0007-adopt-not-build-boundaries.md)); if a non-Postgres store
@@ -61,10 +74,12 @@ is ever demanded, extract a repository port first.
 `apps/api/tests/test_managed_pg_swap.py` is the executable proof of this swap. The
 test suite's `migrated` fixture provisions a throwaway database reached **purely by
 overriding `DATABASE_URL`** and runs `alembic upgrade head` against it — the exact
-shape of pointing the app at a managed Postgres. The test then asserts the schema
-came up cleanly and that both Postgres-isms materialized as expected (native `uuid`
-columns; the `environment` enum type in the `curie` schema with the right labels;
-zero tables in `public`).
+shape of pointing the app at a managed Postgres. The test then asserts that items 1
+and 2 materialized as expected: native `uuid` id columns on `agents`,
+`agent_versions` and `deployments`; the `environment` enum type in the `curie`
+schema with the right labels; zero tables in `public`. Items 3 and 4 have no
+assertion here, so the JSONB columns and the raw `DISTINCT ON` queries are covered
+only by the ordinary API and worker suites.
 
 ```bash
 cd apps/api

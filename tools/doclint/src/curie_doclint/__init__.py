@@ -38,7 +38,7 @@ from .citation import (
     scan_raw_line_ban,
 )
 from .commands import check_agent_contract
-from .counts import check_counts
+from .counts import check_counts, check_name_sets
 from .finding import Finding
 from .frontmatter import SeamMeta, parse_and_validate
 from .generate import (
@@ -108,6 +108,10 @@ def _lint_and_count(repo_root: Path) -> tuple[list[Finding], int]:
     # region: the numbers sit mid-sentence, so they are asserted against source
     # rather than rewritten, and `--write` leaves them alone.
     findings.extend(check_counts(repo_root))
+    # The same prose, gated on WHICH modules rather than how many (#1028). A
+    # count and a name set drift independently: swapping one importing module
+    # for another holds the count and makes the list wrong.
+    findings.extend(check_name_sets(repo_root))
     # The published verification contract names commands an agent is told to
     # trust (#1041). Same class as check_counts: prose asserted against
     # machine-readable ground truth, never rewritten, so `--write` leaves it

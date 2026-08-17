@@ -20,8 +20,9 @@ order: 14
 ## The black line
 
 The durable workflow-state store is built. It shipped (#248, under epic #23) as the API
-state router: a scoped KV/document store on Postgres JSONB exposing exactly the five verbs
-this doc once said did not exist — get / put-with-CAS / list / delete / append. The swap
+state router: a scoped KV/document store on Postgres JSONB. The router exposes
+six state routes, covering the verbs this doc once said did not exist (get / put-with-CAS /
+list / delete / append) plus the namespace listing added by #250. The swap
 axis here is the state backend, and it is a SOFT seam: the store is reached over the HTTP
 state API, not a typed in-process port, so a second backend is a persistence change behind
 that API rather than a `Protocol` swap. A separate concrete route store, `AffinityStore`,
@@ -32,7 +33,7 @@ implementation teaches the interface."
 
 ## Current contract
 
-The state API is the store today. The five verbs live in
+The state API is the store today. Every route lives in
 `apps/api/src/curie_api/routers/state.py`:
 
 - `get_state` (`apps/api/src/curie_api/routers/state.py::get_state`)
@@ -40,6 +41,8 @@ The state API is the store today. The five verbs live in
 - `list_state` (`apps/api/src/curie_api/routers/state.py::list_state`)
 - `delete_state` (`apps/api/src/curie_api/routers/state.py::delete_state`)
 - `append_state` (`apps/api/src/curie_api/routers/state.py::append_state`)
+- `list_namespaces` — the namespaces an agent has stored, each with its key count and
+  last write time (#250) (`apps/api/src/curie_api/routers/state.py::list_namespaces`)
 
 Memory and Conversation history are the CLEAN loaders already built over this store
 (`StateApiMemoryStore`, `StateApiTranscriptStore`).
@@ -47,11 +50,27 @@ Memory and Conversation history are the CLEAN loaders already built over this st
 Bundle code reaches the store two ways (#249), without shipping its own server. The
 platform mounts an in-process `curie-state` MCP server into every sandbox
 (`runner/src/curie_runner/state.py::build_state_server`), carrying get / set /
-list / delete / append tools over the five router verbs; `memory` and `transcript`
-are reserved so a skill cannot corrupt the memory or history namespaces. A bundle
+append / list / delete tools over the per-key and per-namespace routes; the
+namespace listing is not exposed as a tool. `memory` and `transcript` are reserved
+so a skill cannot corrupt the memory or history namespaces. A bundle
 script that talks to the store directly reads the same URL and scoped token from
-`CURIE_STATE_URL` / `CURIE_STATE_TOKEN`. Both authenticate with the per-turn
-scoped `state` token (ADR-0033), never the platform key.
+`CURIE_STATE_URL` / `CURIE_STATE_TOKEN`.
+
+Neither path uses the platform key, and neither carries the same reach as the
+runner's own loaders: there are two scoped-token scopes (ADR-0033), minted
+side by side at `apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`.
+The broad `state` scope backs `CURIE_MEMORY_TOKEN` / `CURIE_HISTORY_TOKEN` and
+reaches every namespace, because the memory and history loaders must read and
+write the reserved ones to rehydrate the agent across a suspend/resume. The narrow
+`state.app` scope backs the bundle-facing `CURIE_STATE_TOKEN` and is refused on
+the reserved namespaces server-side by
+`apps/api/src/curie_api/routers/state.py::forbid_reserved_namespace`, so a skill
+cannot bypass the MCP tool's own client-side refusal by composing
+`CURIE_STATE_URL` itself. `list_namespaces` has no `namespace` path param and so
+cannot be gated that way; it filters the reserved namespaces out of the response
+for an app-scoped caller instead (#856). Which scope authenticated is carried
+through as `apps/api/src/curie_api/routers/state.py::StateCaller`, resolved by
+`apps/api/src/curie_api/routers/state.py::require_state_access`.
 
 The worker-side route store is separate. `AffinityStore` at
 `apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore` records the
@@ -84,6 +103,24 @@ the route store leans on Valkey TTL-expiry as garbage collection: an idle route 
 simply expires, and the reaper protocol depends on that automatic expiry. A durable
 (non-TTL) backend for a future workflow-state port would have to add its own sweeper to
 reclaim abandoned state, because it cannot inherit Valkey's expiry-as-GC for free.
+
+The store's own seam already leaks in-process on the API side. The HTTP state API is
+not the only reader and writer of `apps/api/src/curie_api/models.py::WorkflowStateEntry`:
+the memory router queries and mutates that table directly through the ORM in the same
+process, rather than calling its own state routes. `list_memory` and `edit_memory`
+(`apps/api/src/curie_api/routers/memory.py::list_memory`,
+`apps/api/src/curie_api/routers/memory.py::edit_memory`) and
+`apps/api/src/curie_api/routers/memory.py::delete_memory` all `select(WorkflowStateEntry)`
+against the `memory` namespace, and the router imports the state module's private
+`apps/api/src/curie_api/routers/state.py::_enforce_caps` to reuse the size caps rather
+than inheriting them from a route. That import is deliberate (the state module documents
+it as the reason `RESERVED_NAMESPACES` is a literal there and not an import back from
+`routers.memory`), but the consequence for this seam is concrete: a second state backend
+placed behind the HTTP state API would not cover these calls, and the memory surface would
+keep reading the Postgres table the first backend owned. Anything the API-side seam gains
+by being HTTP (auth scope, reserved-namespace guard, size caps at the boundary) is
+re-implemented or bypassed on this path. The memory seam's own file covers the same
+bypass from the memory side.
 
 ## Cross-links
 

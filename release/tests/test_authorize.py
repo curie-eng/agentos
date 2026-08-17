@@ -2,8 +2,8 @@
 
 The gate is the deterministic check behind issue #628: a `v*` tag must not be
 able to start the publish pipeline unless its commit is reachable from
-`origin/main` and that commit's required checks are all green. These tests
-drive both functions directly -- `commit_is_on_reviewed_main` against a real,
+`origin/main` or `origin/next` and that commit's required checks are all green. These tests
+drive both functions directly -- `commit_is_on_reviewed_branch` against a real,
 disposable git repo (no network needed for ancestry) and
 `missing_required_checks` against constructed
 check-run lists -- plus `authorize()`, which combines them and is what
@@ -11,8 +11,11 @@ check-run lists -- plus `authorize()`, which combines them and is what
 """
 
 import importlib.util
+import inspect
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -61,12 +64,32 @@ def git_repo(tmp_path) -> Path:
     return repo
 
 
+@pytest.fixture
+def reviewed_refs_repo(git_repo) -> tuple[Path, dict[str, str]]:
+    """A history with commits unique to main, next, and an unmerged feature."""
+    base = run_git(git_repo, "rev-parse", "HEAD")
+
+    run_git(git_repo, "checkout", "-q", "-b", "next")
+    next_commit = commit(git_repo, "next-only.txt")
+    run_git(git_repo, "update-ref", "refs/remotes/origin/next", next_commit)
+
+    run_git(git_repo, "checkout", "-q", "main")
+    main_commit = commit(git_repo, "main-only.txt")
+    run_git(git_repo, "update-ref", "refs/remotes/origin/main", main_commit)
+
+    run_git(git_repo, "checkout", "-q", "-b", "feature", base)
+    feature_commit = commit(git_repo, "feature-only.txt")
+
+    return git_repo, {"main": main_commit, "next": next_commit, "feature": feature_commit}
+
+
 # A required-name set distinct from the real, larger production
 # REQUIRED_CHECK_NAMES (issue #733). Most tests in this file exercise the
 # *logic* of required-check matching and should not need updating every time
 # a ci.yaml job is renamed or added; the production constant itself gets its
 # own coverage in TestRequiredCheckAllowlist below.
 TEST_REQUIRED_NAMES = frozenset({"CI", "CodeQL"})
+REVIEWED_REFS = ("origin/main", "origin/next")
 
 CHECK_RUNS_ALL_GREEN = [
     {"name": "CI", "conclusion": "success"},
@@ -103,30 +126,41 @@ GATE_OWN_IN_PROGRESS = check_run(
 )
 
 
-class TestCommitIsOnReviewedMain:
+class TestCommitIsOnReviewedBranch:
+    def test_reviewed_branch_ref_has_no_default(self):
+        parameters = inspect.signature(
+            authorize_module.commit_is_on_reviewed_branch
+        ).parameters
+
+        assert parameters["reviewed_ref"].default is inspect.Parameter.empty
+
     def test_head_of_main_is_reachable(self, git_repo):
         sha = run_git(git_repo, "rev-parse", "HEAD")
 
-        assert authorize_module.commit_is_on_reviewed_main(sha, "main", cwd=git_repo)
+        assert authorize_module.commit_is_on_reviewed_branch(sha, "main", cwd=git_repo)
 
     def test_ancestor_of_main_is_reachable(self, git_repo):
         first = run_git(git_repo, "rev-parse", "HEAD")
         commit(git_repo, "later-on-main.txt")
 
-        assert authorize_module.commit_is_on_reviewed_main(first, "main", cwd=git_repo)
+        assert authorize_module.commit_is_on_reviewed_branch(first, "main", cwd=git_repo)
 
     def test_commit_only_on_an_unmerged_branch_is_refused(self, git_repo):
         run_git(git_repo, "checkout", "-q", "-b", "feature")
         unmerged = commit(git_repo, "feature-only.txt")
 
-        assert not authorize_module.commit_is_on_reviewed_main(
+        assert not authorize_module.commit_is_on_reviewed_branch(
             unmerged, "main", cwd=git_repo
         )
 
-    def test_unknown_sha_is_refused_not_raised(self, git_repo):
-        assert not authorize_module.commit_is_on_reviewed_main(
-            "0" * 40, "main", cwd=git_repo
-        )
+    def test_unknown_sha_refuses_as_indeterminate_reachability(self, git_repo):
+        sha = "0" * 40
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.commit_is_on_reviewed_branch(sha, "main", cwd=git_repo)
+
+        assert sha in str(exc_info.value)
+        assert "main" in str(exc_info.value)
 
 
 class TestRequiredCheckSatisfaction:
@@ -205,22 +239,78 @@ class TestMissingRequiredChecks:
 
 
 class TestAuthorize:
-    def test_reviewed_and_green_commit_is_authorized(self, git_repo):
-        sha = run_git(git_repo, "rev-parse", "HEAD")
+    def test_reviewed_ref_collection_has_no_default(self):
+        parameters = inspect.signature(authorize_module.authorize).parameters
 
+        assert "main_ref" not in parameters
+        assert parameters["reviewed_refs"].default is inspect.Parameter.empty
+
+    def test_commit_reachable_only_from_next_is_authorized(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
         authorize_module.authorize(
-            sha, CHECK_RUNS_ALL_GREEN, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            commits["next"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
         )
 
-    def test_unreviewed_commit_is_refused_even_with_green_checks(self, git_repo):
-        run_git(git_repo, "checkout", "-q", "-b", "feature")
-        unmerged = commit(git_repo, "feature-only.txt")
+    def test_commit_reachable_only_from_main_is_authorized(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
 
-        with pytest.raises(authorize_module.AuthorizationError, match="not reachable"):
+        authorize_module.authorize(
+            commits["main"],
+            CHECK_RUNS_ALL_GREEN,
+            REVIEWED_REFS,
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+        )
+
+    def test_commit_reachable_from_neither_reviewed_ref_is_refused(
+        self, reviewed_refs_repo
+    ):
+        git_repo, commits = reviewed_refs_repo
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
             authorize_module.authorize(
-                unmerged,
+                commits["feature"],
                 CHECK_RUNS_ALL_GREEN,
-                "main",
+                REVIEWED_REFS,
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+            )
+
+        assert "origin/main" in str(exc_info.value)
+        assert "origin/next" in str(exc_info.value)
+
+    def test_matching_ref_does_not_hide_an_unresolvable_ref(self, reviewed_refs_repo):
+        git_repo, commits = reviewed_refs_repo
+        unresolvable_ref = "origin/not-a-ref"
+
+        with pytest.raises(authorize_module.AuthorizationError) as exc_info:
+            authorize_module.authorize(
+                commits["main"],
+                CHECK_RUNS_ALL_GREEN,
+                ("origin/main", unresolvable_ref),
+                cwd=git_repo,
+                required_names=TEST_REQUIRED_NAMES,
+            )
+
+        assert commits["main"] in str(exc_info.value)
+        assert unresolvable_ref in str(exc_info.value)
+
+    def test_empty_reviewed_ref_collection_is_refused(self, git_repo):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+
+        with pytest.raises(authorize_module.AuthorizationError, match="reviewed ref"):
+            authorize_module.authorize(
+                sha,
+                CHECK_RUNS_ALL_GREEN,
+                (),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
@@ -232,7 +322,7 @@ class TestAuthorize:
             authorize_module.authorize(
                 sha,
                 CHECK_RUNS_ONE_FAILED,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
@@ -268,7 +358,9 @@ class TestRequiredCheckAllowlist:
         with pytest.raises(
             authorize_module.AuthorizationError, match="required check-run"
         ):
-            authorize_module.authorize(sha, self.UNRELATED_BUT_GREEN, "main", cwd=git_repo)
+            authorize_module.authorize(
+                sha, self.UNRELATED_BUT_GREEN, ("main",), cwd=git_repo
+            )
 
     def test_every_required_check_present_and_green_authorizes(self, git_repo):
         sha = run_git(git_repo, "rev-parse", "HEAD")
@@ -277,7 +369,7 @@ class TestRequiredCheckAllowlist:
             for name in authorize_module.REQUIRED_CHECK_NAMES
         ]
 
-        authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+        authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
     def test_a_single_missing_required_check_among_an_otherwise_full_set_is_refused(
         self, git_repo
@@ -290,7 +382,25 @@ class TestRequiredCheckAllowlist:
         with pytest.raises(
             authorize_module.AuthorizationError, match=re.escape(dropped)
         ):
-            authorize_module.authorize(sha, runs, "main", cwd=git_repo)
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
+
+    def test_authorize_refuses_a_failed_chart_check_when_every_other_check_passes(
+        self, git_repo
+    ):
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        chart_check = "Chart (lint + template + kubeconform)"
+        runs = [
+            {
+                "name": name,
+                "conclusion": "failure" if name == chart_check else "success",
+            }
+            for name in authorize_module.REQUIRED_CHECK_NAMES
+        ]
+
+        with pytest.raises(
+            authorize_module.AuthorizationError, match=re.escape(chart_check)
+        ):
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
 
 
 class TestFetchCheckRuns:
@@ -410,7 +520,7 @@ class TestFetchCheckRunsPagination:
             )
 
         authorize_module.authorize(
-            sha, runs, "main", cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
         )
 
     def test_stops_when_a_page_reports_nothing_even_if_total_count_implied_more(
@@ -467,7 +577,7 @@ class TestAuthorizeExcludesCurrentRun:
         authorize_module.authorize(
             sha,
             runs,
-            "main",
+            ("main",),
             cwd=git_repo,
             exclude_run_id=CURRENT_RUN_ID,
             required_names=TEST_REQUIRED_NAMES,
@@ -489,7 +599,7 @@ class TestAuthorizeExcludesCurrentRun:
         authorize_module.authorize(
             sha,
             runs,
-            "main",
+            ("main",),
             cwd=git_repo,
             exclude_run_id=CURRENT_RUN_ID,
             required_names=TEST_REQUIRED_NAMES,
@@ -507,7 +617,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -525,7 +635,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -544,7 +654,7 @@ class TestAuthorizeExcludesCurrentRun:
             authorize_module.authorize(
                 sha,
                 runs,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 exclude_run_id=CURRENT_RUN_ID,
                 required_names=TEST_REQUIRED_NAMES,
@@ -603,7 +713,7 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 0
@@ -621,7 +731,7 @@ class TestMain:
         monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 0
@@ -642,7 +752,7 @@ class TestMain:
         monkeypatch.setenv("GITHUB_RUN_ID", OTHER_RUN_ID)
 
         exit_code = authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
         assert exit_code == 1
@@ -672,7 +782,7 @@ class TestMainLookupFailures:
         monkeypatch.chdir(git_repo)
         monkeypatch.setenv("GITHUB_RUN_ID", CURRENT_RUN_ID)
         return authorize_module.main(
-            [sha, "--repo", "curie-eng/curie", "--main-ref", "main"]
+            [sha, "--repo", "curie-eng/curie", "--reviewed-ref", "main"]
         )
 
     def test_gh_api_failure_refuses_with_a_message_naming_the_lookup(
@@ -739,6 +849,8 @@ class TestMainLookupFailures:
 
 
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+HELM_CI_YAML = REPO_ROOT / ".github" / "workflows" / "helm-ci.yaml"
+RELEASE_YAML = REPO_ROOT / ".github" / "workflows" / "release.yaml"
 
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
 
@@ -772,29 +884,152 @@ def ci_job_check_run_names() -> set[str]:
     return names
 
 
-class TestRequiredNamesMatchCiYaml:
-    """`REQUIRED_CHECK_NAMES` must not drift from ci.yaml's job names (#811).
+def helm_ci_job_check_run_names() -> set[str]:
+    doc = yaml.safe_load(HELM_CI_YAML.read_text())
+    return {job["name"] for job in doc["jobs"].values() if job.get("name")}
 
-    The gate is fail-closed: a required name that no ci.yaml job produces can
+
+class TestReleaseWorkflowContract:
+    def test_release_branch_sources_are_anchored_and_wired_to_authorization(self):
+        source = RELEASE_YAML.read_text()
+        workflow = yaml.load(source, Loader=yaml.BaseLoader)
+        trigger = workflow["on"]["push"]
+
+        assert trigger["branches"] == ["main", "next"]
+        assert trigger["tags"] == ["v*"]
+
+        trigger_source = re.search(
+            r"(?ms)^on:\n  push:\n(?P<body>.*?)(?=^permissions:)", source
+        )
+        assert trigger_source is not None
+        anchors = {}
+        for branch in ("main", "next"):
+            anchor = re.search(
+                rf"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s+['\"]?{branch}['\"]?",
+                trigger_source.group("body"),
+            )
+            assert anchor is not None
+            anchors[branch] = anchor.group("name")
+        assert len(set(anchors.values())) == 2
+
+        authorization_source = re.search(
+            r"(?ms)^  authorize-release:\n(?P<body>.*?)(?=^  build:)", source
+        )
+        assert authorization_source is not None
+        env_source = re.search(
+            r"(?ms)^    env:\n(?P<body>(?:^      [^\n]+\n)+)",
+            authorization_source.group("body"),
+        )
+        assert env_source is not None
+        aliases = dict(
+            re.findall(
+                r"^      (?P<name>[A-Za-z_][A-Za-z0-9_]*): \*(?P<anchor>[^\s]+)\s*$",
+                env_source.group("body"),
+                re.MULTILINE,
+            )
+        )
+        assert set(aliases.values()) == set(anchors.values())
+
+        authorization = workflow["jobs"]["authorize-release"]
+        authorization_env = authorization["env"]
+        assert set(authorization_env) == set(aliases)
+        assert {authorization_env[name] for name in aliases} == {"main", "next"}
+
+        command = next(
+            step["run"]
+            for step in authorization["steps"]
+            if "release/authorize.py" in step.get("run", "")
+        )
+        reviewed_ref_envs = re.findall(
+            r"--reviewed-ref\s+origin/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}",
+            command,
+        )
+        assert "--main-ref" not in command
+        assert set(reviewed_ref_envs) == set(authorization_env)
+        assert len(reviewed_ref_envs) == len(authorization_env) == 2
+        assert {authorization_env[name] for name in reviewed_ref_envs} == {"main", "next"}
+
+        overlay = re.search(
+            r"git checkout origin/\$\{\{\s*env\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}\s+-- release/",
+            authorization_source.group("body"),
+        )
+        assert overlay is not None
+        assert authorization_env[overlay.group(1)] == "main"
+
+    def test_continuous_metadata_and_worker_local_base_use_the_push_sha(self):
+        workflow = yaml.load(RELEASE_YAML.read_text(), Loader=yaml.BaseLoader)
+
+        for job_name in ("merge", "worker-local-merge"):
+            metadata = next(
+                step
+                for step in workflow["jobs"][job_name]["steps"]
+                if step.get("name") == "Image metadata"
+            )
+            tags = metadata["with"]["tags"]
+            assert "type=sha,format=long" in tags
+            assert "type=raw,value=latest,enable={{is_default_branch}}" in tags
+
+        base_tag_script = next(
+            step["run"]
+            for step in workflow["jobs"]["worker-local-build"]["steps"]
+            if step.get("name") == "Compute base tag"
+        )
+        assert 'echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"' in base_tag_script
+        assert 'echo "v=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"' in base_tag_script
+        assert 'echo "v=latest" >> "$GITHUB_OUTPUT"' not in base_tag_script
+
+
+class TestRequiredNamesMatchCiWorkflows:
+    """`REQUIRED_CHECK_NAMES` must not drift from CI workflow job names (#811).
+
+    The gate is fail-closed: a required name that no CI workflow job produces can
     never appear among a commit's real check-runs, so it is reported missing on
     every otherwise-legitimate commit and blocks the release. Conversely a
     stale name masks the loss of the check it was meant to assert. This pins the
-    constant as a subset of the concrete check-run names the current ci.yaml
-    actually emits, parsed live (never derived from the constant itself).
+    constant as a subset of the concrete check-run names the current CI workflows
+    actually emit, parsed live (never derived from the constant itself).
 
-    So renaming or splitting a required job in ci.yaml without updating
+    So renaming or splitting a required job in a CI workflow without updating
     `REQUIRED_CHECK_NAMES` fails here (with the drifted names listed), rather
     than silently dropping a release gate.
     """
 
-    def test_every_required_name_is_a_real_ci_yaml_check_run_name(self):
-        ci_names = ci_job_check_run_names()
+    def test_every_required_name_is_a_real_ci_workflow_check_run_name(self):
+        ci_names = ci_job_check_run_names() | helm_ci_job_check_run_names()
         stale = authorize_module.REQUIRED_CHECK_NAMES - ci_names
 
         assert authorize_module.REQUIRED_CHECK_NAMES <= ci_names, (
-            "REQUIRED_CHECK_NAMES has drifted from ci.yaml -- these required "
+            "REQUIRED_CHECK_NAMES has drifted from the CI workflows -- these required "
             f"names match no current job check-run: {sorted(stale)}"
         )
+
+
+class TestHelmCiWorkflowTriggers:
+    """Pin the deliberate push and pull request trigger asymmetry."""
+
+    def test_push_trigger_is_unfiltered_for_releasable_branches(self):
+        doc = yaml.safe_load(HELM_CI_YAML.read_text())
+        triggers = doc[True]
+
+        assert triggers["push"]["branches"] == ["main", "next"]
+        assert "paths" not in triggers["push"]
+        assert "paths-ignore" not in triggers["push"]
+        assert triggers["pull_request"]["branches"] == ["main", "next"]
+        # The Python paths are not strays to tidy up: the object-store
+        # web-identity gate executes those repository files against each
+        # rendered workload, so a PR touching only them (a revert of the
+        # credential fix) must still match this filter or the gate never runs.
+        assert triggers["pull_request"]["paths"] == [
+            "charts/curie/**",
+            ".github/workflows/helm-ci.yaml",
+            "packages/aci-protocol/src/aci_protocol/s3.py",
+            "apps/api/src/curie_api/config.py",
+            "apps/api/src/curie_api/storage.py",
+            "apps/worker/src/curie_worker/config.py",
+            "apps/worker/src/curie_worker/bundle_store.py",
+            "uv.lock",
+            "pyproject.toml",
+        ]
 
 
 class TestMixedPassFailRequiredCheck:
@@ -852,7 +1087,222 @@ class TestMixedPassFailRequiredCheck:
             authorize_module.authorize(
                 sha,
                 self.MIXED_CI,
-                "main",
+                ("main",),
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
+
+
+class TestSkippedRequiredCheck:
+    """A required check-run that concluded `skipped` is not a pass (#1470).
+
+    `skipped` used to sit in `PASSING_CONCLUSIONS` alongside `success` and
+    `neutral`, so a required check that never actually ran authorized a
+    release. Two routes produce it, and both are live risks here:
+
+      * a job-level `if:` added to the job. Adding one to helm-ci.yaml's
+        `helm` job would make GitHub record
+        `Chart (lint + template + kubeconform)` as `skipped` on every
+        releasable push, and the gate would then authorize a release whose
+        chart was never rendered, linted, or kubeconform-validated.
+      * a failed job in the job's `needs:`. ci.yaml's `rust-build` and
+        `changes` are not themselves required names, so a FAILED `rust-build`
+        skips the three ladder jobs -- which ARE required names -- into
+        `conclusion: skipped`, and that authorized a release too.
+
+    Measured live against the real `authorize()` before this change, with the
+    chart check varied and all 15 other required checks `success`:
+    `success` authorized, `failure` raised, `skipped` AUTHORIZED (the defect),
+    `cancelled` raised, `neutral` authorized, `None` raised, and an absent
+    entry raised. Only the `skipped` row changes here; a workflow whose
+    triggers never match produces NO check-run at all and is still correctly
+    refused as absent.
+    """
+
+    def test_a_required_name_whose_only_run_was_skipped_is_reported_missing(self):
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CodeQL", "conclusion": "skipped"},
+        ]
+
+        assert authorize_module.missing_required_checks(
+            runs, TEST_REQUIRED_NAMES
+        ) == {"CodeQL"}
+
+    def test_authorize_refuses_a_skipped_chart_check_when_every_other_check_passes(
+        self, git_repo
+    ):
+        # The exact scenario a job-level `if:` on helm-ci.yaml's `helm` job
+        # would produce, driven against the real production
+        # REQUIRED_CHECK_NAMES.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        chart_check = "Chart (lint + template + kubeconform)"
+        runs = [
+            {
+                "name": name,
+                "conclusion": "skipped" if name == chart_check else "success",
+            }
+            for name in authorize_module.REQUIRED_CHECK_NAMES
+        ]
+
+        with pytest.raises(
+            authorize_module.AuthorizationError, match="required check-run"
+        ):
+            authorize_module.authorize(sha, runs, ("main",), cwd=git_repo)
+
+    def test_a_required_name_with_both_a_success_and_a_skipped_run_is_refused(
+        self, git_repo
+    ):
+        # Fail-closed, consistent with the mixed pass/fail behavior above: one
+        # green run does not excuse a same-named run that never executed.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        runs = [
+            {"name": "CI", "conclusion": "success"},
+            {"name": "CI", "conclusion": "skipped"},
+            {"name": "CodeQL", "conclusion": "success"},
+        ]
+
+        assert "CI" in authorize_module.missing_required_checks(
+            runs, TEST_REQUIRED_NAMES
+        )
+        with pytest.raises(
+            authorize_module.AuthorizationError, match="required check-run"
+        ):
+            authorize_module.authorize(
+                sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+            )
+
+
+class TestLegitimateSkips:
+    """Why refusing skipped required checks does not over-reject (#1470).
+
+    There is exactly ONE legitimate `skipped` conclusion, enumerated below: a
+    check-run whose name is not in the required set, which the gate ignores
+    entirely. It needs no blanket allowance and does not put `skipped` back in
+    `PASSING_CONCLUSIONS`.
+
+    The two ci.yaml tests here are not a second legitimate skip. They pin the
+    only place a required job carries a job-level `if:` -- the conditional
+    ladder jobs -- so that it cannot conclude `skipped` on a releasable push,
+    which is what keeps the stricter gate from blocking every release.
+    """
+
+    def test_a_skipped_check_run_outside_the_required_set_does_not_block(
+        self, git_repo
+    ):
+        # CHECK_RUNS_ALL_GREEN carries `Secret Scan` at `skipped`, which is not
+        # a required name. Non-required entries are ignored entirely, so this
+        # still authorizes -- the only legitimate skip.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+
+        authorize_module.authorize(
+            sha,
+            CHECK_RUNS_ALL_GREEN,
+            ("main",),
+            cwd=git_repo,
+            required_names=TEST_REQUIRED_NAMES,
+        )
+
+    def test_required_ci_job_conditions_match_tier_outputs(self):
+        """Required conditional jobs must select exactly their owned tiers."""
+        doc = yaml.safe_load(CI_YAML.read_text())
+        actual = {
+            job_id: str(job["if"]).strip()
+            for job_id, job in doc["jobs"].items()
+            if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
+            and "if" in job
+        }
+        expected = {
+            "e2e-ladder": (
+                "${{ needs.changes.outputs.skill == 'true' || "
+                "needs.changes.outputs.local == 'true' }}"
+            ),
+            "e2e-ladder-release": (
+                "${{ needs.changes.outputs.local_release == 'true' }}"
+            ),
+        }
+
+        assert actual == expected, (
+            "required ci.yaml jobs no longer gate on their exact tier outputs: "
+            f"expected {expected!r}, got {actual!r}"
+        )
+
+    def test_the_changes_filter_step_emits_every_tier_when_executed_as_a_push(
+        self, tmp_path
+    ):
+        """A push selects every tier through the real selector runtime."""
+        doc = yaml.safe_load(CI_YAML.read_text())
+        filter_step = next(
+            step
+            for step in doc["jobs"]["changes"]["steps"]
+            if step.get("id") == "filter"
+        )
+        script = re.sub(
+            r"\$\{\{\s*(.*?)\s*\}\}",
+            lambda m: "push" if m.group(1) == "github.event_name" else "",
+            filter_step["run"],
+        )
+        script_path = tmp_path / "filter.sh"
+        script_path.write_text(script)
+        selector_path = tmp_path / "tools" / "e2e-ci-selection" / "select.py"
+        selector_path.parent.mkdir(parents=True)
+        shutil.copy2(
+            REPO_ROOT / "tools" / "e2e-ci-selection" / "select.py", selector_path
+        )
+        registry_path = tmp_path / ".github" / "e2e-selection.yaml"
+        registry_path.parent.mkdir()
+        shutil.copy2(REPO_ROOT / ".github" / "e2e-selection.yaml", registry_path)
+        github_output = tmp_path / "github_output"
+        github_output.touch()
+
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            cwd=tmp_path,
+            env={**os.environ, "GITHUB_OUTPUT": str(github_output)},
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0, (
+            "ci.yaml's `changes` filter step no longer selects tiers on push: "
+            f"{result.stderr}"
+        )
+        assert github_output.read_text().splitlines() == [
+            "skill=true",
+            "local=true",
+            "local_release=true",
+            "cluster=true",
+            "skill_local_tiers=skill,local",
+        ], (
+            "ci.yaml's push selection no longer emits the complete tier contract: "
+            f"{github_output.read_text()!r}"
+        )
+
+
+class TestHelmCiJobsCarryNoJobLevelIf:
+    """No helm-ci.yaml job may carry a job-level `if:` (#1470).
+
+    A job-level `if:` on the `helm` job makes GitHub record
+    `Chart (lint + template + kubeconform)` -- a required check name -- with
+    `conclusion: skipped` on every releasable push. The gate now refuses a
+    skipped required check, so every release would be blocked with the chart
+    never rendered; before that change it silently AUTHORIZED instead, which is
+    strictly worse. Either way the job must simply run on push.
+
+    `TestHelmCiWorkflowTriggers` pins the trigger-level route into the same
+    hole (a filtered `push:` trigger produces no check-run at all); this pins
+    the job-level route. Asserted over every job in the workflow, not just
+    `helm`, so a future job added there is covered without editing this test.
+    """
+
+    def test_no_helm_ci_job_declares_a_job_level_if(self):
+        doc = yaml.safe_load(HELM_CI_YAML.read_text())
+        conditional = sorted(
+            job_id for job_id, job in doc["jobs"].items() if "if" in job
+        )
+
+        assert not conditional, (
+            "helm-ci.yaml job(s) carry a job-level `if:`, which makes their "
+            "check-run `skipped` on releasable pushes and blocks every release "
+            f"with the chart never rendered: {conditional}"
+        )

@@ -51,6 +51,14 @@ const KUBECTL_UNREACHABLE: &str =
 /// non-connectivity failure shape the guard must still fail closed on.
 const KUBECTL_FORBIDDEN: &str = "Error from server (Forbidden): statefulsets.apps is forbidden: User \"system:serviceaccount:curie:deployer\" cannot list resource \"statefulsets\" in API group \"apps\" in the namespace \"curie\"";
 
+const HELM_UNREACHABLE: &str =
+    "Error: Kubernetes cluster unreachable: dial tcp 127.0.0.1:6443: connect: connection refused";
+const HELM_FORBIDDEN: &str = "Error: query: secrets is forbidden: User \"system:serviceaccount:curie:deployer\" cannot list resource \"secrets\" in API group \"\" in the namespace \"parity\"";
+const HELM_EXECUTABLE_NOT_FOUND: &str = "Error: exec: executable kubelogin file not found in PATH";
+const SENTINEL_SEALING_KEY: &str = "SENTINEL_SEALING_PRIVATE_KEY";
+const WARNING_PREFIXED_VALUES: &str = "WARNING: cached discovery information is stale\n{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}";
+const ARRAY_VALUES: &str = "[{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}]";
+
 /// One staged object, as `<size> <key>`, the shape both halves of the
 /// migration's verify compare: the staging pod's `find -printf` listing and the
 /// new store's `aws s3 ls` listing. Identical on both sides means nothing was
@@ -72,15 +80,24 @@ fn write_exec(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+#[derive(Clone)]
+enum HelmValuesResponse {
+    Object(Value),
+    Null,
+    Absent,
+    Failure(&'static str),
+    RawSuccess(&'static str),
+}
+
 struct HelmFixture {
     temp: tempfile::TempDir,
     file: PathBuf,
-    live_values: Option<String>,
+    values_response: HelmValuesResponse,
     log: PathBuf,
 }
 
 impl HelmFixture {
-    fn new(config: &str, live_values: Option<Value>) -> Self {
+    fn new(config: &str, values_response: HelmValuesResponse) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("curie.yaml");
         fs::write(&file, config).expect("write curie.yaml");
@@ -95,14 +112,97 @@ if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
     printf 'HELM_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 if [ "$1" = get ] && [ "$2" = values ]; then
-    if [ "${CURIE_TEST_HELM_ABSENT:-}" = 1 ]; then
-        printf '%s\n' 'release not found' >&2
-        exit 1
-    fi
-    printf '%s\n' "$CURIE_TEST_HELM_VALUES"
-    exit 0
+    case "${CURIE_TEST_HELM_VALUES_MODE:-}" in
+        absent)
+            printf '%s\n' 'Error: release: not found' >&2
+            exit 1
+            ;;
+        failure)
+            printf '%s\n' "$CURIE_TEST_HELM_VALUES" >&2
+            exit 1
+            ;;
+        success)
+            printf '%s\n' "$CURIE_TEST_HELM_VALUES"
+            exit 0
+            ;;
+        *)
+            printf '%s\n' 'missing values response mode' >&2
+            exit 64
+            ;;
+    esac
 fi
 if [ "$1" = template ]; then
+    case " $* " in
+        *" --show-only templates/priorityclass.yaml "*)
+            case " $* " in
+                *" --set priorityClasses.sandbox.create=false "*)
+                    cat <<'YAML'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: curie-platform
+value: 1000000
+globalDefault: false
+YAML
+                    ;;
+                *" --set priorityClasses.platform.create=false "*)
+                    cat <<'YAML'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: curie-sandbox
+value: 100000
+globalDefault: false
+YAML
+                    ;;
+                *)
+                    printf 'unexpected PriorityClass render: %s\n' "$*" >&2
+                    exit 64
+                    ;;
+            esac
+            exit 0
+            ;;
+    esac
+    if [ "${CURIE_TEST_HELM_MIXED_STATEFULSETS:-}" = 1 ]; then
+        cat <<'YAML'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-rustfs
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: rustfs
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-postgres
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-valkey
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: valkey
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: parity-curie-clickhouse
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: clickhouse
+YAML
+        exit 0
+    fi
     cat <<'YAML'
 apiVersion: apps/v1
 kind: StatefulSet
@@ -116,6 +216,17 @@ YAML
     exit 0
 fi
 if [ "$1" = upgrade ]; then
+    previous=''
+    sealing_key_present='no'
+    for argument in "$@"; do
+        if [ "$previous" = '-f' ] && grep -q '"sealing"' "$argument" && grep -q '"privateKey"' "$argument"; then
+            sealing_key_present='yes'
+        fi
+        previous="$argument"
+    done
+    if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
+        printf 'SEALING_KEY_PRESENT: %s\n' "$sealing_key_present" >> "$CURIE_TEST_CALL_LOG"
+    fi
     exit 0
 fi
 printf 'unexpected helm invocation: %s\n' "$*" >&2
@@ -160,6 +271,13 @@ unexpected() {{
     exit 64
 }}
 case "$verb $object" in
+'get priorityclass')
+    # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
+    :
+    ;;
+'get namespace')
+    exit 1
+    ;;
 'get statefulset')
     if [ "${{CURIE_TEST_KUBECTL_FAIL:-}}" = 1 ]; then
         printf '%s\n' '{KUBECTL_UNREACHABLE}' >&2
@@ -215,7 +333,7 @@ exit 0
         Self {
             temp,
             file,
-            live_values: live_values.map(|values| values.to_string()),
+            values_response,
             log,
         }
     }
@@ -245,20 +363,39 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_STS")
             .env_remove("CURIE_TEST_KUBECTL_FAIL")
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
+            .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
+            .env_remove("CURIE_CREDENTIALS")
+            .env_remove("CURIE_MODEL_CREDENTIALS")
+            .env_remove("CURIE_GITHUB_TOKEN")
             .env_remove("CURIE_MODEL")
             .env_remove("CURIE_TEST_PROVIDER_EGRESS_JSON")
             .env_remove("CURIE_APPLY_TEST_MODEL_KEY")
             .env_remove("CURIE_APPLY_TEST_GITHUB_TOKEN");
-        match &self.live_values {
-            Some(values) => {
+        match &self.values_response {
+            HelmValuesResponse::Object(values) => {
                 command
-                    .env_remove("CURIE_TEST_HELM_ABSENT")
+                    .env("CURIE_TEST_HELM_VALUES_MODE", "success")
+                    .env("CURIE_TEST_HELM_VALUES", values.to_string());
+            }
+            HelmValuesResponse::RawSuccess(values) => {
+                command
+                    .env("CURIE_TEST_HELM_VALUES_MODE", "success")
                     .env("CURIE_TEST_HELM_VALUES", values);
             }
-            None => {
+            HelmValuesResponse::Null => {
                 command
-                    .env("CURIE_TEST_HELM_ABSENT", "1")
+                    .env("CURIE_TEST_HELM_VALUES_MODE", "success")
+                    .env("CURIE_TEST_HELM_VALUES", "null");
+            }
+            HelmValuesResponse::Absent => {
+                command
+                    .env("CURIE_TEST_HELM_VALUES_MODE", "absent")
                     .env_remove("CURIE_TEST_HELM_VALUES");
+            }
+            HelmValuesResponse::Failure(reason) => {
+                command
+                    .env("CURIE_TEST_HELM_VALUES_MODE", "failure")
+                    .env("CURIE_TEST_HELM_VALUES", reason);
             }
         }
         for (key, value) in env {
@@ -291,6 +428,26 @@ exit 0
         self.run(
             &["diff", "--file", self.file.to_str().expect("UTF 8 path")],
             env,
+        )
+    }
+
+    fn cluster_up(&self) -> Output {
+        let chart = repo_root().join("charts/curie");
+        self.run(
+            &[
+                "cluster",
+                "up",
+                "--namespace",
+                "parity",
+                "--release",
+                "parity",
+                "--chart",
+                chart.to_str().expect("UTF 8 chart path"),
+                "--fake-model",
+                "--set",
+                "agentSandbox.controller.deploy=false",
+            ],
+            &[],
         )
     }
 }
@@ -468,9 +625,236 @@ fn installation_with_effective_values() -> &'static str {
     "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  dispatcher.deploy: \"false\"\n  worker.replicas: \"3\"\n"
 }
 
+#[derive(Clone, Copy)]
+enum ExistingValuesConsumer {
+    ClusterUp,
+    Apply,
+    Diff,
+}
+
+impl ExistingValuesConsumer {
+    const ALL: [Self; 3] = [Self::ClusterUp, Self::Apply, Self::Diff];
+    const MUTATING: [Self; 2] = [Self::ClusterUp, Self::Apply];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ClusterUp => "cluster up",
+            Self::Apply => "apply",
+            Self::Diff => "diff",
+        }
+    }
+
+    fn run(self, fixture: &HelmFixture) -> Output {
+        match self {
+            Self::ClusterUp => fixture.cluster_up(),
+            Self::Apply => fixture.apply(&[], &[]),
+            Self::Diff => fixture.diff(&[]),
+        }
+    }
+}
+
+fn assert_only_existing_values_read(fixture: &HelmFixture, consumer: ExistingValuesConsumer) {
+    let calls = fixture.calls();
+    assert_eq!(
+        calls.trim(),
+        "HELM_CALL: get values parity -n parity -o json",
+        "{} must stop after the existing values read:\n{calls}",
+        consumer.name()
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade") && !calls.contains("KUBECTL_CALL:"),
+        "{} reached a mutating or secondary cluster command:\n{calls}",
+        consumer.name()
+    );
+    assert!(
+        !calls.contains("SEALING_KEY_PRESENT: yes"),
+        "{} regenerated a sealing key after an unknown read:\n{calls}",
+        consumer.name()
+    );
+}
+
+#[test]
+fn existing_values_absent_is_fresh_for_all_consumers() {
+    for consumer in ExistingValuesConsumer::MUTATING {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            HelmValuesResponse::Absent,
+        );
+        let output = consumer.run(&fixture);
+        json_output(output, consumer.name());
+
+        let calls = fixture.calls();
+        assert!(
+            calls.contains("HELM_CALL: upgrade"),
+            "{} must reach Helm upgrade after exact release absence:\n{calls}",
+            consumer.name()
+        );
+        assert!(
+            calls.contains("SEALING_KEY_PRESENT: yes"),
+            "{} must generate the initial sealing key after exact release absence:\n{calls}",
+            consumer.name()
+        );
+    }
+
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let diff = json_output(fixture.diff(&[]), "diff");
+    assert_eq!(diff["release_exists"], false, "{diff}");
+    assert_eq!(
+        fixture.calls().trim(),
+        "HELM_CALL: get values parity -n parity -o json\nHELM_CALL: list -n parity -o json"
+    );
+}
+
+#[test]
+fn existing_values_nonzero_is_unknown_for_all_consumers() {
+    let failures = [
+        (HELM_UNREACHABLE, 3, "connection refused"),
+        (HELM_FORBIDDEN, 1, "forbidden"),
+        (HELM_EXECUTABLE_NOT_FOUND, 1, "executable"),
+    ];
+
+    for (reason, expected_exit, expected_message) in failures {
+        for consumer in ExistingValuesConsumer::ALL {
+            let fixture = HelmFixture::new(
+                installation_for_the_stateful_guard(),
+                HelmValuesResponse::Failure(reason),
+            );
+            let output = consumer.run(&fixture);
+            assert_eq!(
+                output.status.code(),
+                Some(expected_exit),
+                "{} classified an unknown values read incorrectly; stdout:\n{}\nstderr:\n{}",
+                consumer.name(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let error = json_error(output, consumer.name());
+            assert!(
+                error["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(expected_message)),
+                "{} did not preserve the Helm diagnosis: {error}",
+                consumer.name()
+            );
+            assert!(
+                error["fix"]
+                    .as_str()
+                    .is_some_and(|fix| fix.contains("helm status")),
+                "{} did not provide the safe release access check: {error}",
+                consumer.name()
+            );
+            assert!(
+                error.get("release_exists").is_none(),
+                "{} reported an unknown release as known: {error}",
+                consumer.name()
+            );
+            assert_only_existing_values_read(&fixture, consumer);
+        }
+    }
+}
+
+#[test]
+fn existing_values_malformed_is_unknown_for_all_consumers() {
+    for malformed in [WARNING_PREFIXED_VALUES, ARRAY_VALUES] {
+        for consumer in ExistingValuesConsumer::ALL {
+            let fixture = HelmFixture::new(
+                installation_for_the_stateful_guard(),
+                HelmValuesResponse::RawSuccess(malformed),
+            );
+            let output = consumer.run(&fixture);
+            let visible = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !visible.contains(SENTINEL_SEALING_KEY),
+                "{} exposed Helm values output:\n{visible}",
+                consumer.name()
+            );
+            assert!(
+                !visible.contains("generated strong per-release secrets"),
+                "{} reported sealing key generation after malformed values:\n{visible}",
+                consumer.name()
+            );
+            let error = json_error(output, consumer.name());
+            assert!(
+                error["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("malformed")),
+                "{} did not identify malformed Helm values: {error}",
+                consumer.name()
+            );
+            assert!(
+                error.get("release_exists").is_none(),
+                "{} reported a malformed release read as known: {error}",
+                consumer.name()
+            );
+            assert_only_existing_values_read(&fixture, consumer);
+            assert!(
+                !fixture.calls().contains(SENTINEL_SEALING_KEY),
+                "{} exposed the sentinel in the command log:\n{}",
+                consumer.name(),
+                fixture.calls()
+            );
+        }
+    }
+}
+
+#[test]
+fn existing_values_null_is_an_existing_release() {
+    for consumer in ExistingValuesConsumer::MUTATING {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            HelmValuesResponse::Null,
+        );
+        let output = consumer.run(&fixture);
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !visible.contains("generated strong per-release secrets"),
+            "{} mislabeled a valid null release as fresh:\n{visible}",
+            consumer.name()
+        );
+        json_output(output, consumer.name());
+
+        let calls = fixture.calls();
+        assert!(
+            calls.contains("HELM_CALL: upgrade"),
+            "{} must accept valid null values:\n{calls}",
+            consumer.name()
+        );
+        assert!(
+            calls.contains("SEALING_KEY_PRESENT: yes"),
+            "{} may add sealing to an existing release with no values:\n{calls}",
+            consumer.name()
+        );
+    }
+
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Null,
+    );
+    let diff = json_output(fixture.diff(&[]), "diff");
+    assert_eq!(diff["release_exists"], true, "{diff}");
+    assert!(
+        diff["entries"].is_array(),
+        "valid null values must produce a completed diff for the existing release: {diff}"
+    );
+}
+
 #[test]
 fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values() {
-    let fixture = HelmFixture::new(installation_with_effective_values(), None);
+    let fixture = HelmFixture::new(
+        installation_with_effective_values(),
+        HelmValuesResponse::Absent,
+    );
     let env = [
         ("CURIE_APPLY_TEST_MODEL_KEY", MODEL_VALUE),
         ("CURIE_APPLY_TEST_GITHUB_TOKEN", GITHUB_VALUE),
@@ -535,7 +919,7 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
 fn empty_github_token_clear_is_shared_by_apply_and_diff() {
     let fixture = HelmFixture::new(
         "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  api.githubToken: \"\"\n",
-        None,
+        HelmValuesResponse::Absent,
     );
 
     let apply = plan(fixture.apply_dry_run(&[]));
@@ -562,7 +946,7 @@ fn empty_github_token_clear_is_shared_by_apply_and_diff() {
 fn diff_marks_only_extra_live_egress_for_reset_and_preserves_live_github_token() {
     let fixture = HelmFixture::new(
         "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  egress:\n    - host: anthropic\n",
-        Some(json!({
+        HelmValuesResponse::Object(json!({
             "api": {"githubToken": "ghp-live-token"},
             "security": {"networkPolicy": {"allowedEgress": [
                 {"cidr": "1.1.1.1/32", "ports": [{"port": 443, "protocol": "TCP"}]},
@@ -608,7 +992,7 @@ fn diff_marks_only_extra_live_egress_for_reset_and_preserves_live_github_token()
 fn apply_and_diff_report_the_same_curie_model_conflict() {
     let fixture = HelmFixture::new(
         "version: 1\ninstall:\n  namespace: parity\n  release: parity\nset:\n  agentSandbox.runner.model: file-model\n",
-        None,
+        HelmValuesResponse::Absent,
     );
     let env = [("CURIE_MODEL", "shell-model")];
     let apply = fixture.apply_dry_run(&env);
@@ -637,7 +1021,10 @@ fn apply_with_both_flags_makes_no_cluster_call() {
     // intent, and apply resolved the contradiction by silently dropping the
     // migration and taking the data destroying path. The primary assertion is
     // the ABSENCE of the mutation, not the wording of the refusal.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(&["--migrate-store", "--allow-stateful-removal"], &[]);
 
@@ -671,7 +1058,10 @@ fn migrate_store_alone_still_migrates() {
     // AC2: the control run. A live minio store plus a chart that renders rustfs
     // is the rename the guard exists for, and --migrate-store alone must still
     // take the migration branch.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(
         &["--migrate-store"],
@@ -729,7 +1119,10 @@ fn migrate_store_does_not_read_a_failed_cluster_read_as_a_removal() {
     // find out" to "definitely at risk, start staging" -- and the run then died
     // inside the export with "nothing to migrate", a message about a decision
     // the operator never made, blaming the wrong thing.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(&["--migrate-store"], &[("CURIE_TEST_KUBECTL_FAIL", "1")]);
 
@@ -773,7 +1166,10 @@ fn migrate_store_does_not_read_a_failed_cluster_read_as_a_removal() {
 fn allow_stateful_removal_alone_still_proceeds() {
     // AC3: the override short circuits the guard entirely, so the same live
     // minio store that stops a plain apply proceeds straight to the upgrade.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(
         &["--allow-stateful-removal"],
@@ -802,7 +1198,10 @@ fn a_failed_kubectl_read_fails_the_apply() {
     // AC4, the core anti regression for #1351: a kubectl read that FAILED was
     // returned as an empty list, which told the guard "fresh install, nothing
     // to lose" while the upgrade went on to prune the StatefulSet.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(&[], &[("CURIE_TEST_KUBECTL_FAIL", "1")]);
 
@@ -840,7 +1239,10 @@ fn a_forbidden_kubectl_read_fails_the_apply_as_a_permanent_failure() {
     // green while restoring the exact vacuous-pass data-loss bug for a
     // Forbidden read: exit 0, no error, the guard reading "fresh install,
     // nothing to lose", and the upgrade pruning a live StatefulSet.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(&[], &[("CURIE_TEST_KUBECTL_FORBIDDEN", "1")]);
 
@@ -874,7 +1276,10 @@ fn a_namespace_with_no_statefulsets_still_passes_the_guard() {
     // AC5, the trap guard. An empty items array with exit 0 is what a real
     // namespaced LIST returns for a fresh install AND for a namespace that does
     // not exist, so it is a genuine "nothing to lose" and must still apply.
-    let fixture = HelmFixture::new(installation_for_the_stateful_guard(), None);
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
 
     let output = fixture.apply(&[], &[]);
 

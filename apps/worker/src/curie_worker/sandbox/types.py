@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
 
@@ -130,6 +131,18 @@ class ClaimView:
     name: str
     ready: bool
     sandbox_name: str | None
+    # The substrate-neutral instant the backing object was created, tz-aware
+    # UTC. Its one reader is SandboxSubstrate.reap_orphans(), which spares a
+    # claim still inside its bind window: such a claim has no route yet, so
+    # "no live route names it" is ambiguous rather than proof of litter.
+    #
+    # ``None`` means the adapter cannot report an age. The reaper treats
+    # unknown age as not-reapable (and warns), because wrongly reaping a live
+    # claim kills a running sandbox while sparing an orphan only leaves litter.
+    #
+    # Required, with no default: a default would let an adapter silently omit
+    # the field and silently disable the reaper's guard on that tier.
+    created_at: datetime | None
 
 
 @dataclass(frozen=True)

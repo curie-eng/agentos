@@ -412,6 +412,59 @@ just that unit tests pass.
   `scripts/chart-runtime-e2e.sh`) is the one-command way to install a trimmed
   slice, run the init containers, and exec-assert.
 
+### The tier decision rule
+
+Applicability is a recorded decision, not a matter of taste. Every
+behavior-bearing change classifies all six tiers below as **required** or
+**not applicable**, and a not-applicable row states a concrete reason naming
+the surface the change does not reach. "Unit tests cover it", "low risk", "CI
+is green", and "no time" are not reasons.
+
+A behavior-bearing change has at least one required tier, on the quick path as
+much as the build path. A classification that marks all six not applicable is
+a claim that the change alters no runtime behavior on any surface: either say
+that plainly and carry no tier, or the tier set is wrong for this change and
+the maintainer decides, but do not proceed on all six not applicable while
+still calling the change behavior-bearing. A change that genuinely bears no
+runtime behavior, which is the documentation, ADR, and strictly
+behavior-preserving refactor case, records that reason once and is exempt,
+including on the build path. Promoting a tier to required is always allowed;
+dropping a required tier is not.
+
+Classification is taken at triage and re-checked whenever the diff grows past
+the scope that was triaged. A tier that becomes reachable is promoted to
+required and proved, not carried on the original classification.
+
+| Tier | Required when the change reaches | Command |
+| --- | --- | --- |
+| skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
+| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
+| local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
+| cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
+| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
+| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape | drive the real integration; a replayed fixture or a fake does not close this tier |
+
+### Evidence per acceptance criterion
+
+Every meaningful acceptance criterion needs two observations, not one.
+
+- **Positive proof.** The exact command run against the required tier, the
+  candidate commit it ran against, and the observed outcome showing the
+  criterion met.
+- **A falsifiable negative, or a second independent path.** The same surface
+  observed refusing, failing, or reporting absent once the criterion's
+  precondition is removed: feed the guard a violating input, unset the
+  credential, drop the flag, omit the manifest entry. Where no negative is
+  constructible, assert the same outcome through a second independent path
+  instead. A positive alone cannot separate a working change from a check that
+  would have passed regardless.
+
+Record both against the run, per the run state contract in
+`.claude/skills/implement/SKILL.md`, and expose them in the pull request
+through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
+with no passing evidence record blocks completion; it is reported as a blocker,
+not carried as a note.
+
 ## Playwright: two modes
 
 - **The merge gate is the committed E2E suite** under `apps/ui` (Playwright,
@@ -459,24 +512,45 @@ Before accepting PRs against either branch, an administrator must protect both
 and must prohibit force pushes and branch deletion. Do not use an unprotected
 release train branch.
 
-After a fix merges to `main`, merge `main` forward into `next` promptly through
-a PR. Do not routinely cherry pick fixes between release lines. When v0.7 is
-ready, merge `next` into `main`, then run every parity ladder rung on the
-resulting `main` commit:
+Bug fixes, security fixes, and anything shared by both lines land on the stable
+`main` line first. v0.7 features land on `next`.
+
+To cut a v0.7.0 release candidate, merge `main` into `next` through a PR, tag
+the release candidate on `next`, and test that candidate extensively. The
+forward merge from `main` into `next` happens at release candidate prep, not
+after every individual fix. Do not routinely cherry pick fixes between release
+lines.
+
+When a release candidate is accepted, merge `next` into `main`, then run every
+parity ladder rung on the resulting `main` commit:
 
 ```bash
 CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag v0.7.0 from `main` only after both commands pass, then delete `next` or
-recreate it from `main` for the next approved feature train. Only an
-administrator may retire `next`, by temporarily removing protection after the
-tag while `main` remains protected. If `next` is recreated, restore its full
-protection before accepting PRs against it.
+Tag the final v0.7.0 release on `main` only after both commands pass. Only an
+administrator may retire `next`. Before deleting it, the administrator must
+merge one release workflow and contract test change that removes `next` from the
+workflow trigger branch list, removes the `RELEASE_NEXT_BRANCH` environment
+alias, removes the
+`--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
+`release/tests/test_authorize.py`. After that change lands, the administrator
+may temporarily remove protection and delete `next`, while keeping `main`
+protected. To recreate `next` for the next approved feature train, the
+administrator must first restore full protection for `next`, then create it
+from `main`. Only after those steps may the administrator merge one release
+workflow and contract test change that adds `next` to the workflow trigger
+branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
+`--reviewed-ref origin/$RELEASE_NEXT_BRANCH` argument, and updates
+`release/tests/test_authorize.py` before accepting PRs against it.
 
 - Commit message format: a short imperative summary line, then detail bullets.
-- Reference the relevant issue in the PR body (e.g. `Closes #123`).
+- Reference the relevant issue in the PR body (e.g. `Closes #123`). GitHub only
+  auto closes an issue when the PR merges into the default branch, so a closing
+  keyword in a PR that targets `next` never fires on its own. Issues referenced
+  by a `next` targeted PR are closed at the `next` into `main` merge, where the
+  magic words fire once on the default branch.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
   CI enforces this on every PR (issue #962); check before pushing with:

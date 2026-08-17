@@ -137,11 +137,13 @@ paths = [
   '''^\.gitleaks\.toml$''',
 ]
 
-# Pre-existing fixture ids. Every one is obviously invented -- it spells a
-# word (C0MANAGERS), repeats a character (C0FFFFFF6), or is mostly zeroes
-# (C000000A01). That is the bar for a new one: a reader must be able to tell
-# at a glance that it is not somebody's channel. Adding to this list should be
-# rare; prefer reusing C0EXAMPLE1.
+# Gitleaks stopwords are case insensitive substring matches, so an entry
+# suppresses any longer identifier containing it, including identifiers
+# prefixed by that entry. Every value is an
+# obviously invented fixture id: it spells a word (C0MANAGERS), repeats a
+# character (C0FFFFFF6), or is mostly zeroes (C000000A01). That is the bar for
+# a new one: a reader must be able to tell at a glance that it is not somebody's
+# channel. Adding to this list should be rare; prefer reusing C0EXAMPLE1.
 stopwords = [
   "C000000A01",
   "C000000A02",
@@ -212,6 +214,63 @@ stopwords = [
   "C0TRIAGE01",
   "C0WRONG01",
   "C9999ZZZZ",
+  # The channel-neutral agent_channels work (#1491) scrubbed these from the
+  # tree, but they survive in commits on an unmerged branch. A push scan no
+  # longer reaches them: #1592 scoped push-event runs to the pushed
+  # branch's own history. The weekly scheduled sweep still scans every ref,
+  # so these entries stay registered rather than being deleted. Every one
+  # clears the bar this list sets -- each spells a word, repeats a
+  # character, or is mostly zeroes.
+  "C0000ADD01",
+  "C0000DEL01",
+  "C0000DEL02",
+  "C0BOUNDAA",
+  "C0DOWNAA1",
+  "C0DOWNBB2",
+  "C0DUPEAA1",
+  "C0EARNED1",
+  "C0FINE001",
+  "C0FINE002",
+  "C0GENAAA1",
+  "C0GONE001",
+  "C0IMPLIC1",
+  "C0INGRES1",
+  "C0INGRES2",
+  "C0LEGACY1",
+  "C0LEGACY2",
+  "C0LEGACY3",
+  "C0LEGACY4",
+  "C0LEGACY5",
+  "C0LOCKED01",
+  "C0LOCKED02",
+  "C0MIG0001",
+  "C0MIGAAA1",
+  "C0MIGBBB2",
+  "C0MIGCCC3",
+  "C0MOVED01",
+  "C0NONSLK1",
+  "C0NOROUT1",
+  "C0NULLCH1",
+  "C0ORPHAN1",
+  "C0PLAIN01",
+  "C0PLURAL1",
+  "C0PLURAL2",
+  "C0PLURPT1",
+  "C0PLURPT2",
+  "C0READER1",
+  "C0ROUTE01",
+  "C0ROUTE02",
+  "C0ROUTE03",
+  "C0ROUTE04",
+  "C0ROUTE05",
+  "C0ROUTE06",
+  "C0SHARED01",
+  "C0SHARED1",
+  "C0SHARED2",
+  "C0SINGLE1",
+  "C0STALE001",
+  "C0STALE002",
+  "C0UNIQUE1",
 ]
 
 # Historical commits that carry an identifier scrubbed from HEAD. Allowlisted
@@ -236,4 +295,5 @@ commits = [
   # repository's existence and name as disclosed.
   "39b0bd3990b2e0ea816e4e0a99d1f4159efcefe5",  # ADR-0091 impl: the slug as a test fixture
   "cde1ac43c284b17eb2253af02b50345b808d6711",  # ADR-0090 Draft: the slug + its issue, cited as evidence
+  "33505bd401c915ed7254ab6172a4f337eeeb5f77",  # object store role examples, scrubbed from HEAD
 ]

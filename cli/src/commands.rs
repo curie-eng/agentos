@@ -5,7 +5,6 @@
 //! scaffold, state, evals, render).
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -618,88 +617,143 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Discover and run every executable shell assertion directly in the chart CI directory.
-pub async fn chart_check() -> Result<()> {
-    let ui = crate::ui::ui();
-    let root = find_repo_root().context(
-        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
-         from a curie source checkout because a release binary has no dev scripts.",
-    )?;
-    let assertions_dir = root.join("charts/curie/ci");
-    let entries = std::fs::read_dir(&assertions_dir).with_context(|| {
-        format!(
-            "failed to read chart assertion directory: {}",
-            assertions_dir.display()
-        )
-    })?;
-    let mut scripts = Vec::new();
+/// The chart assertion scripts live here, and helm-ci runs every one of them on
+/// any `charts/curie/**` change.
+pub const CHART_CI_DIR: &str = "charts/curie/ci";
+
+/// One chart assertion script and how it fared.
+pub struct ChartCheckOutcome {
+    /// The script's file name, e.g. `render-assertions.sh`.
+    pub name: String,
+    pub passed: bool,
+}
+
+/// Discover the assertion scripts `curie dev chart-check` runs: every executable
+/// `*.sh` in `dir`, sorted by name so the run order is stable.
+///
+/// Discovery is a directory listing rather than a hardcoded list, so a script
+/// added to `charts/curie/ci/` is picked up with no edit to `cli/` (#1481). That
+/// matters because helm-ci runs the whole directory and is release-blocking, so
+/// a verb that knows about only some of it reports a local green CI will refuse.
+pub fn discover_chart_check_scripts(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read chart assertion directory {}", dir.display()))?;
+    let mut scripts: Vec<PathBuf> = Vec::new();
     for entry in entries {
-        let entry = entry.with_context(|| {
-            format!(
-                "failed to read an entry in chart assertion directory: {}",
-                assertions_dir.display()
-            )
-        })?;
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to read file type for {}", entry.path().display()))?;
-        if !file_type.is_file() {
-            continue;
-        }
-        let permissions = entry
-            .metadata()
-            .with_context(|| format!("failed to read permissions for {}", entry.path().display()))?
-            .permissions();
-        if permissions.mode() & 0o111 != 0 {
-            scripts.push(entry.file_name());
+        let path = entry
+            .with_context(|| format!("failed to read an entry in {}", dir.display()))?
+            .path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "sh") && is_executable(&path)
+        {
+            scripts.push(path);
         }
     }
     scripts.sort();
+    Ok(scripts)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool {
+    true
+}
+
+/// Run every discovered script from `root`, streaming its output, and report how
+/// each one fared.
+///
+/// A failure does not stop the run: the point of the verb is that one invocation
+/// surfaces every problem, rather than making a contributor fix, re-run, and
+/// discover the next failure one at a time.
+pub async fn run_chart_check_scripts(
+    root: &Path,
+    scripts: &[PathBuf],
+) -> Result<Vec<ChartCheckOutcome>> {
+    let ui = crate::ui::ui();
+    let mut outcomes = Vec::with_capacity(scripts.len());
+    for (index, script) in scripts.iter().enumerate() {
+        let name = script
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let rel = script.strip_prefix(root).unwrap_or(script);
+        ui.note(&format!(
+            "=== [{}/{}] bash {} ===",
+            index + 1,
+            scripts.len(),
+            rel.display()
+        ));
+        let status = tokio::process::Command::new("bash")
+            .arg(script)
+            .current_dir(root)
+            .status()
+            .await
+            .with_context(|| format!("failed to invoke bash for {name}"))?;
+        outcomes.push(ChartCheckOutcome {
+            name,
+            passed: status.success(),
+        });
+    }
+    Ok(outcomes)
+}
+
+/// `curie dev chart-check`: run the chart assertion suite helm-ci runs.
+///
+/// helm-ci executes every script in `charts/curie/ci/` on any `charts/curie/**`
+/// change and is release-blocking (#1466), so this verb covers the same set. It
+/// reports per-script pass or fail, runs them all before deciding, and exits
+/// non-zero if any failed. A release binary has no checkout, so this errors
+/// clearly outside one, same as `dev_script`.
+pub async fn dev_chart_check() -> Result<()> {
+    let ui = crate::ui::ui();
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout -- a release binary has no dev scripts.",
+    )?;
+    let ci_dir = root.join(CHART_CI_DIR);
+    let scripts = discover_chart_check_scripts(&ci_dir)?;
     if scripts.is_empty() {
         bail!(
-            "no executable shell assertions found in {}",
-            assertions_dir.display()
+            "no executable *.sh assertion scripts found in {}",
+            ci_dir.display()
         );
     }
 
-    let mut failed = Vec::new();
-    for file_name in scripts {
-        let rel_path = Path::new("charts/curie/ci").join(&file_name);
-        let display_name = file_name.to_string_lossy();
-        ui.note(&format!(
-            "=== bash {} (in {}) ===",
-            rel_path.display(),
-            root.display()
-        ));
-        match tokio::process::Command::new("bash")
-            .arg(&rel_path)
-            .current_dir(&root)
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => {
-                ui.success(&format!("PASS {display_name}"));
-            }
-            Ok(status) => {
-                ui.failure(&format!("FAIL {display_name} ({status})"));
-                failed.push(display_name.into_owned());
-            }
-            Err(error) => {
-                ui.failure(&format!(
-                    "FAIL {display_name} because bash could not start: {error}"
-                ));
-                failed.push(display_name.into_owned());
-            }
-        }
+    ui.note(&format!(
+        "=== {} chart assertion scripts from {CHART_CI_DIR} (in {}) ===",
+        scripts.len(),
+        root.display()
+    ));
+    let outcomes = run_chart_check_scripts(&root, &scripts).await?;
+
+    ui.note("=== chart-check summary ===");
+    for outcome in &outcomes {
+        let mark = if outcome.passed { "PASS" } else { "FAIL" };
+        ui.note(&format!("{mark}  {}", outcome.name));
     }
 
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.passed)
+        .map(|o| o.name.as_str())
+        .collect();
     if !failed.is_empty() {
         bail!(
-            "{} chart assertion scripts failed: {}",
+            "{} of {} chart assertion scripts failed: {}",
             failed.len(),
+            outcomes.len(),
             failed.join(", ")
         );
     }
+    ui.success(&format!(
+        "all {} chart assertion scripts passed",
+        outcomes.len()
+    ));
     Ok(())
 }
 
@@ -3419,6 +3473,80 @@ pub struct DeployOutput {
     pub deployment_id: String,
     pub deployment_environment: String,
     pub deployment_status: String,
+}
+
+/// One completed entry in a deploy across every declared target, retaining the
+/// target name beside the full deploy result.
+#[derive(Debug)]
+pub struct AllTargetsDeployResult {
+    pub target: String,
+    pub result: DeployOutput,
+}
+
+impl AllTargetsDeployResult {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "target": self.target,
+            "result": <DeployOutput as crate::ui::CliOutput>::to_json(&self.result),
+        })
+    }
+}
+
+/// Ordered result of a cluster deploy across every declared target.
+#[derive(Debug)]
+pub struct AllTargetsDeployOutput {
+    pub results: Vec<AllTargetsDeployResult>,
+}
+
+impl crate::ui::CliOutput for AllTargetsDeployOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "results": self
+                .results
+                .iter()
+                .map(AllTargetsDeployResult::to_json)
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if let Some(last) = self.results.last() {
+            <DeployOutput as crate::ui::CliOutput>::render(&last.result, ui);
+        }
+    }
+}
+
+/// Build the reconciliation payload for a failed cluster deploy across every
+/// target. A connector failure includes the completed deploy result.
+pub fn all_targets_deploy_failure_json(
+    failed_target: &str,
+    completed: &[AllTargetsDeployResult],
+    failed_result: Option<&DeployOutput>,
+    err: &anyhow::Error,
+) -> serde_json::Value {
+    let completed = completed
+        .iter()
+        .map(AllTargetsDeployResult::to_json)
+        .collect::<Vec<_>>();
+    let fix = crate::exit::classify(err).1;
+
+    match failed_result {
+        Some(result) => serde_json::json!({
+            "failed_target": failed_target,
+            "stage": "connector_sync",
+            "completed": completed,
+            "failed_result": <DeployOutput as crate::ui::CliOutput>::to_json(result),
+            "error": format!("{err:#}"),
+            "fix": fix,
+        }),
+        None => serde_json::json!({
+            "failed_target": failed_target,
+            "stage": "deploy",
+            "completed": completed,
+            "error": format!("{err:#}"),
+            "fix": fix,
+        }),
+    }
 }
 
 impl crate::ui::CliOutput for DeployOutput {

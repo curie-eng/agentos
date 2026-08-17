@@ -16,6 +16,13 @@ metadata:
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
+  {{- with .Values.api.serviceAccount.annotations }}
+  # Where a key-free object store binds its identity (#1325): an IRSA install
+  # annotates this SA with `eks.amazonaws.com/role-arn`, and the pod-identity
+  # webhook injects the projected token and the two web-identity env vars.
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

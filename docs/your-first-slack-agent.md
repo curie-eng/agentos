@@ -117,12 +117,13 @@ connectors:
 `secrets` are **names only** — the value never enters your repository:
 
 ```bash
-curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN
+curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_SERVICE_ACCOUNT_TOKEN
 ```
 
-Each agent gets its **own** connector Deployment, Service, and Secret, labelled
-with its owner. Two agents in one namespace cannot reach each other's
-credentials.
+At cluster deploy time, Curie delivers both connector `secrets` and
+`secret_files` values into the agent's Kubernetes Secret. The host secret store
+is install global, so agents that use the same secret name share one stored
+value and can collide. Issue #440 tracks the future per agent delivery path.
 
 ---
 

@@ -1,8 +1,13 @@
 """Runtime configuration for the Curie API server.
 
 All values default to the compose dev stack (see compose.dev.yaml and
-.env.example) so a local run needs no .env. Override any field via the matching
-environment variable for shared or production deployments.
+.env.example) so a local run needs no .env, with one exception: the two S3
+credentials default to empty, because an empty credential is the signal that
+selects the AWS provider chain for the key-free BYO object store path (#1559).
+A local run against the compose RustFS therefore has to supply them, from .env
+or the environment; the dev values live in .env.example and compose.dev.yaml.
+Override any field via the matching environment variable for shared or
+production deployments.
 """
 
 from functools import lru_cache
@@ -54,9 +59,18 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = "sk-lf-curie-dev"
 
     # RustFS / S3 for immutable plugin bundles (compose stack RustFS on 29000).
+    # The credentials default to EMPTY on purpose (#1559): an empty credential
+    # selects the AWS provider chain, which is the key-free BYO path the chart
+    # README documents under "Key-free object store auth" (IRSA, an instance
+    # role, an ambient profile). The dev static credential now lives in
+    # `.env.example` and `compose.dev.yaml`, which set S3_ACCESS_KEY /
+    # S3_SECRET_KEY explicitly for the compose stack's RustFS. Never reintroduce
+    # a non-empty value as a default here: a baked-in key is precisely what made
+    # the key-free path inert, because it is handed to boto3 as an explicit
+    # credential and the provider chain is never consulted.
     s3_endpoint_url: str = "http://localhost:29000"
-    s3_access_key: str = "rustfs"
-    s3_secret_key: str = "rustfssecret"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
     # Bundle ingestion bounds (ADR-0059 decision 3). Three independent caps:

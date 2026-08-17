@@ -63,9 +63,11 @@ during migration but is not valid v1 authoring.
 ## Adapter requirements
 
 - Render `text` even when no optional capability is supported.
-- Advertise capabilities; never infer them from the channel name.
-- Render choices and confirmations using native affordances when
-  `interactive-actions` is present and as numbered text otherwise.
+- Advertise capabilities; never infer them from the channel name. (ADR-0020's
+  intent. `ChannelCapabilities` is modeled but has no producer or consumer today,
+  so both shipped adapters decide statically; see Known leakage.)
+- Render choices and confirmations using native affordances when the channel has
+  them and as numbered text otherwise.
 - Preserve action values exactly when converting a selection into inbound text.
 - Keep rendering and channel-native payloads inside the adapter.
 - Treat links as navigation, not conversation responses.
@@ -73,8 +75,9 @@ during migration but is not valid v1 authoring.
 
 ## TUI behavior
 
-The Curie TUI advertises `interactive-actions`, `live-steering`, `streaming`,
-and `threading`. It renders agent-authored actions first and appends `Type a
+The Curie TUI advertises nothing: no adapter emits `ChannelCapabilities`, so its
+support for interactive actions is expressed only by what it renders. It renders
+agent-authored actions first and appends `Type a
 message...` as the final selector option when free text is allowed. Selecting
 that option enters an explicit compose mode; it is a terminal affordance and is
 never added to the agent-authored contract. The selector expands to keep every
@@ -111,10 +114,14 @@ back into the contract:
    The approval card (ADR-0010) travels the same seam: the kernel emits a
    `confirm` intent and the adapter renders it below the line via
    `apps/worker/src/curie_worker/blocks.py::approval_card` inside
-   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit` (its
-   settled/expired form via
-   `apps/worker/src/curie_worker/blocks.py::expired_approval_card`), so no Block
-   Kit is built above the seam. `allow_free_text` on that intent is rendered here
+   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`, so no Block
+   Kit is built above the seam. Its settled forms are split by which outcome
+   arrived: nobody decided renders the expired form via
+   `apps/worker/src/curie_worker/blocks.py::expired_approval_card`, and a
+   decision renders the resolved form via
+   `apps/worker/src/curie_worker/blocks.py::resolved_approval_card`, both reached
+   through the same adapter on a settling `reply.update`.
+   `allow_free_text` on that intent is rendered here
    too: Slack expresses "this decision may carry free text" as a dialog opened by
    the click, so the card carries the note-collecting action ids and the
    dispatcher's `apps/dispatcher/src/curie_dispatcher/approval_actions.py::open_note_dialog`
@@ -123,17 +130,36 @@ back into the contract:
    default card is a thread reply and the channel timeline does not carry one
    (#1073); a card that cannot be read is left unstamped rather than rebuilt
    from nothing.
+
+   Block Kit for that card is built in **two** modules, not one. The dispatcher
+   owns the settled form:
+   `apps/dispatcher/src/curie_dispatcher/approval_actions.py::settled_approval_card`
+   assembles the header, summary, requested-by and verdict blocks, and
+   `apps/dispatcher/src/curie_dispatcher/approval_actions.py::_resolved_card_blocks`
+   strips the actions block off a clicked card and appends the verdict context
+   line. `resolved_approval_card` above is a thin adapter over the first of those,
+   not a second renderer. The direction is deliberate (#1084): the worker already
+   imports this module for the action ids, so the reverse import would be a cycle,
+   and one renderer shared by the click path and the resume path is what stops the
+   two producing different-looking cards for the same decision.
 2. **Terminal (TUI selector)** — `cli/src/channel.rs`. It parses the same fence
    (`REPLY_FENCE`) into a `TerminalMessage` of plain lines plus actions, which the
    TUI renders as a numbered selector per the TUI behavior above. It expresses
    `allow_free_text` as a typed reply alongside the numbered actions.
 
-Both renderers now honor `allow_free_text`; until #1053 the terminal one did and
-the Slack one silently dropped it, which is the sibling-path drift this catalog
-exists to make visible.
+The two renderers honor `allow_free_text` on different subsets. The terminal one
+carries it through for both intents
+(`cli/src/channel.rs`, consumed by `cli/src/interactive.rs`). The Slack one reads
+it on exactly one path, the kernel-emitted `confirm` that becomes the approval
+card (#1053, at
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`); the
+agent-authored envelope path drops it, since
+`apps/worker/src/curie_worker/blocks.py::_reply_from_message` never reads the
+field. See Known leakage for why that is not simply a bug.
 
-The split is the point: Block Kit lives only in `blocks.py`, the numbered selector
-only in `channel.rs`, and the agent authors neither.
+The split is the point: Block Kit lives only in the two Slack-side modules named
+above (`blocks.py` and `approval_actions.py`), the numbered selector only in
+`channel.rs`, and the agent authors none of them.
 
 ## Known leakage
 
@@ -148,6 +174,29 @@ only in `channel.rs`, and the agent authors neither.
   `deny_unknown_fields` means the mirror *rejects* the new field rather than
   ignoring it. This is the seam's real drift risk, and it is why "2 renderers" does
   not imply "2 generated adapters".
+- **Capability negotiation is modeled but unwired.**
+  `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapability`
+  and
+  `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapabilities`
+  exist and are exported to the committed JSON Schema, but a repo-wide sweep
+  (Python, Rust, TypeScript) finds no reference outside that package and its
+  schema export: nothing advertises capabilities and nothing reads them. Both
+  shipped adapters decide their affordances statically instead. So the "Advertise
+  capabilities" adapter requirement above states ADR-0020's intent, not a live
+  wire, and a third channel would find no negotiation to plug into. Documented
+  rather than built: what the capability set should contain is exactly what a real
+  third channel would teach, and inventing it ahead of one is the speculative
+  layer the architecture vision rules out.
+- **`allow_free_text` reaches the Slack renderer on one path only.** The terminal
+  renderer carries the field for both `choice` and `confirm`; the Slack renderer
+  reads it only for the kernel's approval-card `confirm`, because
+  `apps/worker/src/curie_worker/blocks.py::_reply_from_message` projects
+  `OutboundMessage` onto its internal `Reply` shape without it. Part of this is
+  inherent: a Slack channel is always typeable, so `allow_free_text: true` needs
+  no affordance and `false` cannot be enforced there at all, where the TUI can and
+  does hide its compose option. But the field is dropped at the projection rather
+  than deliberately declined, so the asymmetry is invisible in the code, and the
+  next Slack-side interaction that wants it will find nothing to read.
 - **The envelope is a text-channel workaround.** ACI has no native
   semantic-message event, so the message rides inside the runner's final text as a
   fenced block. Every adapter therefore carries fence-parsing and partial-envelope

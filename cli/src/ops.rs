@@ -1890,9 +1890,11 @@ data:
     }
 }
 
-/// The user-supplied values helm recorded for a release, or `None` when the
-/// release does not exist. The read-only half of [`fetch_existing_values`],
-/// exposed for `curie diff`.
+/// The user supplied values Helm recorded for a release. `None` means Helm
+/// positively reported that the release does not exist. Read failures and
+/// malformed values fail closed before callers can plan a mutation or diff.
+/// This is the read only half of [`fetch_existing_values`], exposed for
+/// `curie diff`.
 pub async fn fetch_release_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
     fetch_existing_values(o).await
 }
@@ -2045,19 +2047,56 @@ fn helm_get_values_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-/// The user-supplied values of an existing release, or `None` when the release
-/// does not exist yet (or helm cannot reach it -- treated as a fresh install;
-/// the subsequent `helm upgrade --install` surfaces any real connectivity
-/// error). `helm get values` prints `null` for a release with no user values,
-/// which parses to `Value::Null` and yields no reusable secrets.
+/// Whether Helm positively reported that the requested release does not exist.
+/// Other failures must remain errors because the release state is unknown.
+fn helm_release_is_absent(stderr: &str) -> bool {
+    failure_reason(stderr) == "Error: release: not found"
+}
+
+/// The user supplied values of an existing release, or `None` only when Helm
+/// positively reports that the release does not exist. A valid JSON object or
+/// `null` is returned as `Some`; failed reads, malformed JSON, and other JSON
+/// shapes fail closed. Helm prints `null` for an existing release with no user
+/// supplied values.
 async fn fetch_existing_values(o: &CommonOpts) -> Result<Option<serde_json::Value>> {
-    let (ok, out, _err) = run_capture(&helm_get_values_cmd(o)).await?;
+    let (ok, out, err) = run_capture(&helm_get_values_cmd(o)).await?;
+    let fix = format!(
+        "verify the release and cluster access with `helm status {} -n {}`, then retry",
+        o.release, o.namespace
+    );
     if !ok {
-        return Ok(None);
+        if helm_release_is_absent(&err) {
+            return Ok(None);
+        }
+        let reason = failure_reason(&err);
+        let message = format!(
+            "could not read Helm values for release {} in namespace {}: {reason}",
+            o.release, o.namespace
+        );
+        let error = if is_connectivity_failure(&err) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        };
+        return Err(error.with_fix(fix).into());
     }
-    Ok(Some(
-        serde_json::from_str(out.trim()).unwrap_or(serde_json::Value::Null),
-    ))
+
+    let values: serde_json::Value = serde_json::from_str(out.trim()).map_err(|error| {
+        crate::exit::CliError::failure(format!(
+            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON ({error})",
+            o.release, o.namespace
+        ))
+        .with_fix(fix.clone())
+    })?;
+    if !values.is_object() && !values.is_null() {
+        return Err(crate::exit::CliError::failure(format!(
+            "could not read Helm values for release {} in namespace {}: malformed Helm values JSON, expected an object or null",
+            o.release, o.namespace
+        ))
+        .with_fix(fix)
+        .into());
+    }
+    Ok(Some(values))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2212,6 +2251,282 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
         plan.set_expression(expression.clone());
     }
     plan
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorityClassRole {
+    Platform,
+    Sandbox,
+}
+
+impl PriorityClassRole {
+    const ALL: [Self; 2] = [Self::Platform, Self::Sandbox];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Platform => "platform",
+            Self::Sandbox => "sandbox",
+        }
+    }
+
+    fn sibling(self) -> Self {
+        match self {
+            Self::Platform => Self::Sandbox,
+            Self::Sandbox => Self::Platform,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PriorityClassOwner {
+    release: String,
+    namespace: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PriorityClassConflict {
+    role: PriorityClassRole,
+    name: String,
+    owner: PriorityClassOwner,
+}
+
+fn priority_class_name_from_render(
+    rendered: &str,
+    role: PriorityClassRole,
+) -> Result<Option<String>> {
+    let mut found = None;
+    for document in rendered.split("\n---") {
+        let document = document.trim();
+        if document.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_norway::from_str(document).with_context(|| {
+            format!(
+                "could not parse the rendered PriorityClass for role {}",
+                role.key()
+            )
+        })?;
+        if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) != Some("PriorityClass") {
+            bail!(
+                "the PriorityClass template rendered an unexpected object for role {}",
+                role.key()
+            );
+        }
+        let name = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.is_empty())
+            .with_context(|| {
+                format!(
+                    "the rendered PriorityClass for role {} has no name",
+                    role.key()
+                )
+            })?;
+        if found.replace(name.to_string()).is_some() {
+            bail!(
+                "the PriorityClass template rendered more than one object for role {}",
+                role.key()
+            );
+        }
+    }
+    Ok(found)
+}
+
+async fn rendered_priority_classes(
+    chart: &str,
+    common: &CommonOpts,
+    plan: &UpValuePlan,
+) -> Result<Vec<(PriorityClassRole, String)>> {
+    let mut rendered = Vec::new();
+    for role in PriorityClassRole::ALL {
+        let mut args = vec![
+            plain("template"),
+            plain(&common.release),
+            plain(chart),
+            plain("-n"),
+            plain(&common.namespace),
+        ];
+        plan.append_command_args(&mut args);
+        args.push(plain("--show-only"));
+        args.push(plain("templates/priorityclass.yaml"));
+        args.push(plain("--set"));
+        args.push(plain(format!(
+            "priorityClasses.{}.create=false",
+            role.sibling().key()
+        )));
+        let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
+        if !ok {
+            if err.trim() == "Error: could not find template templates/priorityclass.yaml in chart"
+            {
+                continue;
+            }
+            bail!(
+                "could not render the PriorityClass for role {}: {}",
+                role.key(),
+                failure_reason(&err)
+            );
+        }
+        if let Some(name) = priority_class_name_from_render(&out, role)? {
+            rendered.push((role, name));
+        }
+    }
+    Ok(rendered)
+}
+
+fn priority_class_read_error(
+    name: &str,
+    detail: impl std::fmt::Display,
+    transient: bool,
+) -> anyhow::Error {
+    let fix = format!(
+        "check cluster reachability and permission with `kubectl get priorityclass {name} -o json`"
+    );
+    let message = format!("could not inspect PriorityClass `{name}`: {detail}; {fix}");
+    let error = if transient {
+        crate::exit::CliError::transient(message)
+    } else {
+        crate::exit::CliError::failure(message)
+    };
+    error.with_fix(fix).into()
+}
+
+fn priority_class_metadata_map<'a>(
+    metadata: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    name: &str,
+) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+    match metadata.get(field) {
+        None => Ok(None),
+        Some(serde_json::Value::Object(values)) => Ok(Some(values)),
+        Some(_) => Err(priority_class_read_error(
+            name,
+            format!("kubectl returned invalid object JSON with nonobject metadata.{field}"),
+            false,
+        )),
+    }
+}
+
+fn priority_class_metadata_value<'a>(
+    values: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    name: &str,
+) -> Result<Option<&'a str>> {
+    match values.and_then(|values| values.get(key)) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(priority_class_read_error(
+            name,
+            format!("kubectl returned invalid object JSON at metadata key `{key}`"),
+            false,
+        )),
+    }
+}
+
+async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("priorityclass"),
+            plain(name),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        return Err(priority_class_read_error(
+            name,
+            failure_reason(&err),
+            is_connectivity_failure(&err),
+        ));
+    }
+    if out.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|_| priority_class_read_error(name, "kubectl returned invalid JSON", false))?;
+    let object = value.as_object().ok_or_else(|| {
+        priority_class_read_error(name, "kubectl returned invalid object JSON", false)
+    })?;
+    let metadata = object
+        .get("metadata")
+        .and_then(|metadata| metadata.as_object())
+        .ok_or_else(|| {
+            priority_class_read_error(
+                name,
+                "kubectl returned invalid object JSON without metadata",
+                false,
+            )
+        })?;
+    if metadata.get("name").and_then(|value| value.as_str()) != Some(name) {
+        return Err(priority_class_read_error(
+            name,
+            "kubectl returned invalid object JSON with another metadata.name",
+            false,
+        ));
+    }
+
+    let labels = priority_class_metadata_map(metadata, "labels", name)?;
+    if priority_class_metadata_value(labels, "app.kubernetes.io/managed-by", name)? != Some("Helm")
+    {
+        return Ok(None);
+    }
+    let annotations = priority_class_metadata_map(metadata, "annotations", name)?;
+    let Some(release) =
+        priority_class_metadata_value(annotations, "meta.helm.sh/release-name", name)?
+    else {
+        return Ok(None);
+    };
+    let Some(namespace) =
+        priority_class_metadata_value(annotations, "meta.helm.sh/release-namespace", name)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PriorityClassOwner {
+        release: release.to_string(),
+        namespace: namespace.to_string(),
+    }))
+}
+
+async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+    let rendered = rendered_priority_classes(&opts.chart, &opts.common, plan).await?;
+    let mut conflicts = Vec::new();
+    for (role, name) in rendered {
+        let Some(owner) = priority_class_owner(&name).await? else {
+            continue;
+        };
+        if owner.release != opts.common.release || owner.namespace != opts.common.namespace {
+            conflicts.push(PriorityClassConflict { role, name, owner });
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    let mut message = String::from("PriorityClass ownership conflicts block installation:");
+    for conflict in conflicts {
+        message.push_str(&format!(
+            "\nPriorityClass `{}` is owned by Helm release `{}` in namespace `{}`.",
+            conflict.name, conflict.owner.release, conflict.owner.namespace
+        ));
+        message.push_str(&format!(
+            "\nReuse it with `--set priorityClasses.{}.create=false --set priorityClasses.{}.name={}`.",
+            conflict.role.key(),
+            conflict.role.key(),
+            conflict.name
+        ));
+        message.push_str(&format!(
+            "\nKeep creation enabled with `--set priorityClasses.{}.name=<different-name>`.",
+            conflict.role.key()
+        ));
+    }
+    Err(crate::exit::CliError::failure(message).into())
 }
 
 fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
@@ -3060,6 +3375,7 @@ async fn run_prepared_up(
         }));
     }
     require_on_path("helm")?;
+    preflight_priority_class_ownership(&opts, &value_plan).await?;
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {

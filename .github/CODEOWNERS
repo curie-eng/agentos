@@ -1,0 +1,5 @@
+# Accepting an ADR is the merged approving review on it, and until now no
+# approver was defined. This file names one, so the owner is auto requested as a
+# reviewer on every ADR change. It auto requests only; it does not block a merge.
+
+docs/adr/ @TheConnMan

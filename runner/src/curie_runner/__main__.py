@@ -88,16 +88,20 @@ def _compose_system_prompt(
     base: str | None,
     memory_preamble: str | None,
     conversation_preamble: str | None = None,
+    *,
+    model: str | None,
 ) -> str | None:
-    """Prepend the loaded-memory and conversation preambles to the system prompt.
+    """Compose the system prompt with recovered context and model identity.
 
     State delivered from outside the sandbox becomes durable model context by
     leading the system prompt: durable memory (ADR-0025) first, then this thread's
-    recovered conversation (ADR-0029), then the bundle/env system prompt. Any part
+    recovered conversation (ADR-0029), then the bundle/env system prompt. The
+    configured model identity follows the bundle prompt when present. Any part
     may be absent.
     """
 
-    parts = [p for p in (memory_preamble, conversation_preamble, base) if p]
+    model_preamble = f"Configured model: {model}" if model else None
+    parts = [p for p in (memory_preamble, conversation_preamble, base, model_preamble) if p]
     return "\n\n".join(parts) if parts else None
 
 
@@ -138,8 +142,14 @@ def build_runner(
     system_prompt = compiled.system_prompt
     # Prior memory (#264) and this thread's recovered conversation (#20), both
     # loaded from outside the sandbox, lead the system prompt so the model sees
-    # learned lessons and the prior exchange as durable context.
-    system_prompt = _compose_system_prompt(system_prompt, memory_preamble, conversation_preamble)
+    # learned lessons and the prior exchange as durable context. The configured
+    # model identity is appended after the bundle prompt.
+    system_prompt = _compose_system_prompt(
+        system_prompt,
+        memory_preamble,
+        conversation_preamble,
+        model=config.model,
+    )
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
     bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
@@ -164,9 +174,14 @@ def build_runner(
             grant_tool=config.approval_grant_tool,
             grantable_by_route=resolution.grantable_by_route,
             # Bundle identity so an operator mcp__<server>__<tool> shorthand
-            # normalizes to its effective plugin-prefixed runtime name (#703).
+            # normalizes to its effective plugin-prefixed runtime name (#703),
+            # and the connectors.yaml servers so a gate on a connector tool --
+            # whose live name is the bare mcp__<connector>__<tool> the SDK gives
+            # a directly-mounted server -- verifies instead of failing closed
+            # (#1495).
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
         )
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths

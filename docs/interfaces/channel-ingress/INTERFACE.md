@@ -28,8 +28,8 @@ the egress port the kernel writes replies through (`ReplySink`). Everything betw
 routing, concurrency, sandboxing — is opinionated core and channel-agnostic. Since #7 and
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
-binding surface too; the remaining vendor shape is on the egress semantics
-(edit-in-place). One implementation
+binding surface too; the remaining vendor shape is on the egress semantics (edit-in-place
+streaming, plus posting and settling platform-owned cards). One implementation
 today; the port is the wire + Protocol contract, extracted further only when a second
 channel demands it ("the second implementation teaches the interface").
 
@@ -44,9 +44,15 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying `channel`,
   required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
-  dispatcher serializes it to a single Stream field via `to_stream_fields`
+  dispatcher serializes the turn to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
-  `STREAM_PAYLOAD_FIELD = "payload"` (`apps/dispatcher/src/curie_dispatcher/queue.py::STREAM_PAYLOAD_FIELD`).
+  `STREAM_PAYLOAD_FIELD = "payload"`. That key is not the dispatcher's: it is frozen-package
+  contract in
+  `packages/aci-protocol/src/aci_protocol/service_config.py::STREAM_PAYLOAD_FIELD`, imported
+  by every producer and consumer of the stream (the dispatcher, the API resume queue in
+  `apps/api/src/curie_api/resumequeue.py`, and the Rust CLI through the generated constant in
+  `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
+  the literal.
   For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
   ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel plus the
   placeholder ts.
@@ -54,9 +60,32 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
   events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) over a
-  worker-local `TargetRoute`. Slack's edit-in-place `chat.update`, its assistant-thread
-  status, and the mrkdwn dialect all sit BELOW that port, in `SlackReplyAdapter` and
-  `to_mrkdwn` (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`).
+  worker-local `TargetRoute`. One verb, but a second channel still supports three shapes,
+  not one:
+  - `reply.update` (`packages/channel-protocol/src/channel_protocol/reply.py::ReplyUpdate`)
+    carries either a streamed or final `text`, edited in place over the ingress placeholder,
+    or a `message` plus `settled` pair that turns an already-posted platform message into
+    its settled form (an approval card that expired or was resolved). It also carries the
+    agent's hub affordances (`nav`).
+  - `reply.post` (`packages/channel-protocol/src/channel_protocol/reply.py::ReplyPost`)
+    posts a NEW platform-owned message, such as the approval card, and is acked with its
+    ref. Both it and the settling form of `reply.update` carry a channel-neutral
+    `OutboundMessage`
+    (`packages/channel-protocol/src/channel_protocol/models.py::OutboundMessage`, ADR-0020)
+    plus, for the settled form, a `SettledOutcome`
+    (`packages/channel-protocol/src/channel_protocol/reply.py::SettledOutcome`) carrying the
+    outcome semantically (who asked, what was decided, by whom, with what note), so no
+    channel-native markup crosses the seam.
+  - `turn.status` (`packages/channel-protocol/src/channel_protocol/reply.py::TurnStatus`) is
+    the best-effort thread status caption, a no-op on a channel with no equivalent, and an
+    empty status is the clear.
+
+  Slack dialect and widget shape stay BELOW that port, in `SlackReplyAdapter`
+  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) — its edit-in-place
+  `chat.update`, its `chat.postMessage`, and its assistant-thread status — plus `to_mrkdwn`
+  (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
+  `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
+  (`apps/worker/src/curie_worker/blocks.py::approval_card`).
 - **Binding** — a channel resolves to a deployment by `agent_channels.address`
   equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a second
@@ -86,9 +115,14 @@ routing key that carries no kind.
   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.__init__`) — which
   also makes it the only TRUSTED Slack origin, so a per-turn endpoint elsewhere is
   refused rather than handed the platform bot token.
-- **Still leaks — egress semantics.** The reply model is edit-a-placeholder —
-  `update(channel, ts, text)` on `chat.update`, not post-a-message — so any channel without
-  in-place edit must emulate it.
+- **Still leaks — egress semantics.** The streamed reply is edit-a-placeholder: it runs on
+  Slack's `chat.update` against the message the ingress already posted, so a channel with no
+  in-place edit must emulate it. That is no longer the whole egress model, though: the
+  adapter also really posts, via `chat.postMessage`, for platform-owned messages such as the
+  approval card, and settles that card in place afterwards (expired in #419, resolved in
+  #1084). A second channel therefore has to support three shapes, not one: repeatedly
+  editing one streamed message, posting an interactive card and returning its id, and
+  editing that card into a settled, non-interactive form.
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent
   create/update validated it as a Slack channel id, so binding any other channel kind took a

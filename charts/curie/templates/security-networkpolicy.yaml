@@ -133,6 +133,35 @@ spec:
         - { protocol: TCP, port: {{ .Values.otelCollector.service.grpcPort }} }
         - { protocol: TCP, port: {{ .Values.otelCollector.service.httpPort }} }
 {{- end }}
+{{- if .Values.api.deploy }}
+---
+{{/* Allow the runner to reach THIS release's in chart API for memory and history calls;
+     without this carve out, rail 1 default deny blocks those calls. TCP 8000 is the API
+     container port, not the configurable Service port. An external or overridden API
+     destination remains governed by the operator's allowedEgress list. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-runner-allow-api
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 8000 }
+{{- end }}
 {{- if and .Values.rustfs.deploy .Values.agentSandbox.runner.bundleFetch.enabled }}
 ---
 {{/* Allow the runner's bundle-fetch init container to reach THIS release's

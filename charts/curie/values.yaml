@@ -71,14 +71,21 @@ langfuse:
   nextauthUrl: http://localhost:23000
   # Dev-only secret material. Override in prod or set `existingSecret` to a
   # Secret carrying keys: langfuseEncryptionKey, langfuseSalt,
-  # langfuseNextauthSecret, langfuseInitProjectSecretKey, langfuseInitUserPassword.
+  # langfuseNextauthSecret, langfuseInitProjectSecretKey, langfuseInitUserPassword,
+  # otlpAuthHeader. That last key is the full `Authorization` header value the
+  # OTel Collector sends to Langfuse, `Basic <base64(projectPublicKey:projectSecretKey)>`;
+  # on the existingSecret path the chart no longer derives it, so a Secret without
+  # it leaves the collector pod in CreateContainerConfigError (set
+  # otelCollector.otlpAuthHeader instead if you prefer to keep it in values).
   # ENCRYPTION_KEY must be 64 hex chars (openssl rand -hex 32).
   encryptionKey: "0000000000000000000000000000000000000000000000000000000000000000"
   salt: dev-salt-change-me
   nextauthSecret: dev-nextauth-secret-change-me
   existingSecret: ""
-  # Headless bootstrap: seeds a fixed org/project + keys on first boot so the
-  # OTel trace path authenticates with no manual key-minting. Dev values.
+  # Headless bootstrap seeds a fixed org/project on first boot. The project
+  # secret key and user password are first boot inputs. Fresh chart installs
+  # generate them unless development defaults are enabled; changing them during
+  # an upgrade does not rotate Langfuse records already initialized. Dev values.
   init:
     orgId: curie
     orgName: Curie
@@ -392,10 +399,30 @@ rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
   awsCliImage: amazon/aws-cli:2.32.6
+  # For the API, worker, and sandbox bundle fetch endpoints, an external RustFS on port 443 uses HTTPS. All other configurations use HTTP.
   host: ""
   port: 9000
   consolePort: 9001
   bucket: langfuse
+  # Static credentials, and the only mode the in-chart RustFS supports.
+  #
+  # Clearing `accessKey` selects the key-free path (#1325), valid only with
+  # `deploy: false` and an external store: every S3 credential env var is
+  # omitted from the api, the worker, and the sandbox bundle-fetch init
+  # container, so the AWS SDK falls through its provider chain to the
+  # web-identity provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`) fed
+  # by a projected ServiceAccount token. Bind the role with the
+  # `serviceAccount.annotations` blocks on `api`, `worker`, and
+  # `agentSandbox.runner`. Clearing it with `deploy: true` is refused at render.
+  #
+  # The instance role is NOT an option here, deliberately. Rail 1 denies
+  # 169.254.169.254 by construction and computes an `except` so a broad
+  # `allowedEgress` CIDR cannot re-permit it. NetworkPolicy selects pods rather
+  # than containers, so opening IMDS for the bundle-fetch init container also
+  # opens it for the runner -- a prompt-injectable agent -- which would hand it
+  # the node's IAM role. Web identity reads a mounted token instead, needs no
+  # metadata access, and so leaves Rail 1 intact. Chart README, "Key-free object
+  # store auth", has the full setup.
   auth:
     accessKey: rustfs
     secretKey: rustfssecret
@@ -454,8 +481,15 @@ inference:
 otelCollector:
   deploy: true
   image: otel/opentelemetry-collector-contrib:0.119.0
-  # base64("<publicKey>:<secretKey>"). Left empty, it is derived from
-  # langfuse.init keys at render time.
+  # Full `Authorization` header, `Basic <base64(publicKey:secretKey)>`, in three
+  # branches. Set here, it always wins and is stored in the chart-managed Secret.
+  # Left empty with chart managed init credentials, it is derived from the
+  # resolved project key at render time, so a sealed install ships the generated
+  # credential. Left empty with langfuse.existingSecret set, the collector reads
+  # an otlpAuthHeader key from that Secret and the chart emits none of its own --
+  # that Secret must carry the key or the collector pod fails with
+  # CreateContainerConfigError. Setting it to the published dev header trips
+  # security.checkDefaultCredentials.
   otlpAuthHeader: ""
   service:
     grpcPort: 4317
@@ -512,6 +546,14 @@ api:
     digest: ""
     pullPolicy: Always
   imagePullSecrets: []
+  # The API gets a ServiceAccount with a narrow read-only Role for the runner-log
+  # observability proxy (see templates/api-rbac.yaml). It is created with the
+  # API, so there is no `create` toggle here.
+  serviceAccount:
+    # Extra annotations on the API ServiceAccount. The key-free object store
+    # path (#1325) binds its IAM role here, e.g.
+    # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
+    annotations: {}
   # Deploy environment the API boots as (`dev` or `prod`), rendered as
   # ENVIRONMENT on the api container. `prod` arms the API production boot gate,
   # which refuses to start on the dev-default `apiKey`/`githubWebhookSecret`
@@ -732,6 +774,7 @@ dispatcher:
 worker:
   deploy: true
   replicas: 1
+  terminationGracePeriodSeconds: 1800
   image:
     repository: ghcr.io/curie-eng/curie-worker
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.
@@ -745,6 +788,10 @@ worker:
   # (see templates/worker.yaml). Its token IS mounted (unlike the runner SA).
   serviceAccount:
     create: true
+    # Extra annotations on the worker ServiceAccount. The key-free object store
+    # path (#1325) binds its IAM role here, e.g.
+    # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
+    annotations: {}
   # Declarative connector hosting (ADR-0090): the worker converges each agent's
   # connector Deployment/Service/Secret/NetworkPolicy toward what its in-force
   # bundle declares, so an agent repo needs no CLI near the cluster.
@@ -1250,6 +1297,16 @@ agentSandbox:
       create: true
       # The runner does not call the K8s API, so its token is not mounted.
       automountToken: false
+      # Extra annotations on the runner ServiceAccount. The key-free object
+      # store path (#1325) binds the bundle-fetch IAM role here, e.g.
+      # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`. The
+      # projected web-identity token is a separate volume from the SA's own API
+      # token, so this composes with `automountToken: false`.
+      #
+      # Scope that role to the bundle bucket, read-only: NetworkPolicy selects
+      # pods and not containers, so an identity the bundle-fetch init container
+      # can reach is also reachable by the runner, which is prompt-injectable.
+      annotations: {}
 
 # ---------------------------------------------------------------------------
 # Security rails. The four security-boundary rails shipped ON by default. They
@@ -1355,25 +1412,32 @@ security:
   # render if a Langfuse bootstrap identity (langfuse.init.projectSecretKey /
   # langfuse.init.userPassword) still carries the published dev default from this
   # file -- the published admin password is a Langfuse admin-takeover risk on a
-  # reachable UI, and the project secret key also feeds the OTel Collector auth
-  # header. Clear the gate by overriding those values or supplying
-  # langfuse.existingSecret (the secretKeyRef escape, keys langfuseInitProjectSecretKey
-  # + langfuseInitUserPassword). Off by default so the flagship zero-secret bare
+  # reachable UI, and on the non-existingSecret path the project secret key also
+  # feeds the OTel Collector auth header. These two checks compare chart inputs
+  # before managed secret resolution. Clear them by overriding those values or by
+  # pointing langfuse.existingSecret at a Secret this chart does not manage (the
+  # secretKeyRef escape, keys langfuseInitProjectSecretKey
+  # + langfuseInitUserPassword + otlpAuthHeader). Naming the chart's own Secret does
+  # NOT clear them: the chart still fills those keys from these very values, so the
+  # published defaults would still reach Langfuse and the collector. A third check
+  # refuses the published dev header on whatever the collector would actually send,
+  # whether set directly via otelCollector.otlpAuthHeader or composed by the chart
+  # from the langfuse.init keys, and is NOT cleared by langfuse.existingSecret,
+  # since that header reaches the collector on every path. Off by default so the flagship zero-secret bare
   # install stays green and the dev/e2e overlays render unchanged; flip it on for a
-  # shared/production cluster. (#57 will extend this same gate to the nine
-  # store/control-plane secrets once its design pass lands.)
+  # shared/production cluster. (#57 will extend this same gate to the remaining
+  # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` GENERATES a strong random per release for the nine
-  # chart-owned credentials (postgres, valkey, clickhouse, and RustFS secrets, the
-  # Langfuse salt/encryptionKey/nextauthSecret, and the api/webhook keys) instead
-  # of shipping the published dev defaults. Generated values are persisted via a
-  # `lookup` of the release Secret, so `helm upgrade` re-uses them and never
-  # rotates a live store credential. Set true (values-dev.yaml does) for a
-  # deterministic dev/CI render that keeps the published defaults byte-for-byte.
-  # A per-store `existingSecret` and explicit `--set` overrides still win in every
-  # mode -- an override that differs from the published default beats the persisted
-  # value on install AND upgrade, so rotation/recovery works.
+  # no-override `helm install` generates strong random values for the eleven
+  # chart owned credentials: the backing store passwords, Langfuse
+  # salt/encryptionKey/nextauthSecret, the two init credentials, and the
+  # api/webhook keys. Set true (values-dev.yaml does) for a deterministic dev/CI
+  # render that keeps the published defaults byte-for-byte. The nine non init
+  # credentials persist via `lookup`, so `helm upgrade` re-uses them. Their
+  # explicit `--set` overrides and per store `existingSecret` values support
+  # rotation and recovery. The two Langfuse init credentials are first boot
+  # inputs: changing them during an upgrade does not rotate initialized records.
   # Caveat: generation relies on Helm `lookup`, which is empty under client-side
   # rendering. Driving this chart via `helm template | kubectl apply` or ArgoCD's
   # client-side Helm (no live API lookup) regenerates these values on every sync

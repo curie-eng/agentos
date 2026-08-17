@@ -1,7 +1,8 @@
 name: Release images and binaries
 
 # Two triggers, one workflow, so a single ref carries both artifacts:
-#  - push to main            -> publish images tagged sha + latest (continuous).
+#  - push to main or next    -> publish images tagged sha (continuous); main
+#                               also publishes latest.
 #  - push a v* tag           -> publish images tagged with the version AND build,
 #                               strip, and attach the curie CLI binaries to a
 #                               GitHub Release with generated notes.
@@ -20,7 +21,7 @@ name: Release images and binaries
 
 on:
   push:
-    branches: [main]
+    branches: [&release_main main, &release_next next]
     tags: ["v*"]
 
 permissions:
@@ -30,7 +31,8 @@ permissions:
 jobs:
   # Gates the ENTIRE tag-triggered publish pipeline (issue #628). A `v*` tag push
   # proves nothing about the tagged commit on its own, so nothing below may run
-  # for one until this job says the commit is reviewed, on main, and green.
+  # for one until this job says the commit is reviewed, on an allowed release
+  # branch, and green.
   # See ADR-0058 for the ancestry/checks design and ADR-0065 for the trust
   # boundary this job actually sits behind: it stops an accidentally-tagged
   # commit, not a write actor willing to edit the gate itself, because both
@@ -40,8 +42,8 @@ jobs:
   # environment -- are admin-only settings, unconfigured, and tracked as
   # blocking work in ADR-0065, not as a hardening follow-up.
   #
-  # `if:` makes this a no-op (skipped) for ordinary pushes to `main`, so the
-  # continuous sha/latest image builds below are unaffected. `environment:` has
+  # `if:` makes this a no-op (skipped) for ordinary pushes to `main` or `next`,
+  # so the continuous image builds below are unaffected. `environment:` has
   # no effect until required reviewers are added to it; the day they are, every
   # tag push pauses for approval right here, before anything else runs.
   authorize-release:
@@ -49,17 +51,20 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-publish
+    env:
+      RELEASE_MAIN_BRANCH: *release_main
+      RELEASE_NEXT_BRANCH: *release_next
     permissions:
       contents: read
       checks: read
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history: an ancestor commit deep in main's log must stay
-          # reachable, which a shallow clone would hide. This materializes the
-          # TAGGED commit's tree (GitHub Actions checks out the triggering ref
-          # on a push trigger), origin/main included as a remote-tracking ref
-          # by the same fetch-depth: 0.
+          # Full history: an ancestor commit deep in either release branch's
+          # log must stay reachable, which a shallow clone would hide. This
+          # materializes the TAGGED commit's tree (GitHub Actions checks out
+          # the triggering ref on a push trigger), with both release branches
+          # included as remote-tracking refs by the same fetch-depth: 0.
           fetch-depth: 0
           persist-credentials: false
       - name: Resolve release/ from origin/main, not the tagged ref
@@ -76,11 +81,14 @@ jobs:
         # is unaffected by which copy of authorize.py exists, because their
         # tampered workflow never calls it. See ADR-0065 for the full trust
         # boundary this does and does not cover.
-        run: git checkout origin/main -- release/
-      - name: Tag's commit must be reviewed, on main, and fully checked
+        run: git checkout origin/${{ env.RELEASE_MAIN_BRANCH }} -- release/
+      - name: Tag's commit must be reviewed, on an allowed branch, and fully checked
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 release/authorize.py "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+        run: |
+          python3 release/authorize.py "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" \
+            --reviewed-ref origin/${{ env.RELEASE_MAIN_BRANCH }} \
+            --reviewed-ref origin/${{ env.RELEASE_NEXT_BRANCH }}
 
   build:
     name: Build ${{ matrix.name }} image (${{ matrix.platform }})
@@ -88,9 +96,10 @@ jobs:
     needs: [authorize-release]
     # `always()` overrides the default needs-propagation (which would skip this
     # job whenever authorize-release is merely skipped, i.e. on every ordinary
-    # main push): a `skipped` authorize-release means "not a tag push, nothing to
-    # authorize" and this job proceeds; a `failure` result means an unauthorized
-    # tag, and this job -- and everything downstream of it -- does not run.
+    # branch push): a `skipped` authorize-release means "not a tag push, nothing
+    # to authorize" and this job proceeds; a `failure` result means an
+    # unauthorized tag, and this job -- and everything downstream of it -- does
+    # not run.
     if: |
       always() &&
       (needs.authorize-release.result == 'success' || needs.authorize-release.result == 'skipped')
@@ -142,7 +151,7 @@ jobs:
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -154,7 +163,7 @@ jobs:
           sleep 15
       - name: Log in to GHCR (retry)
         if: steps.ghcr_login.outcome == 'failure'
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -193,9 +202,10 @@ jobs:
     name: Merge ${{ matrix.name }} manifest
     needs: [build]
     # A skip propagates through the WHOLE ancestor graph, not just the direct
-    # `needs:` edge: with authorize-release skipped on an ordinary main push,
-    # this job was skipped too even though `build` reported success, which froze
-    # the sha/latest manifests at the last tag push (#787). Naming a status
+    # `needs:` edge: with authorize-release skipped on an ordinary main or next
+    # push, this job was skipped too even though `build` reported success, which
+    # froze the SHA manifest and the main only latest manifest at the last tag
+    # push (#787). Naming a status
     # function opts the job out of that propagation, and the explicit result
     # check keeps it as strict as the implicit one: a `build` that failed or was
     # cancelled still stops the manifest, and on the tag path a refused
@@ -242,7 +252,7 @@ jobs:
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -254,7 +264,7 @@ jobs:
           sleep 15
       - name: Log in to GHCR (retry)
         if: steps.ghcr_login.outcome == 'failure'
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -307,7 +317,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "v=latest" >> "$GITHUB_OUTPUT"
+            echo "v=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
       - name: Set up Buildx
         id: setup_buildx
@@ -324,7 +334,7 @@ jobs:
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -336,7 +346,7 @@ jobs:
           sleep 15
       - name: Log in to GHCR (retry)
         if: steps.ghcr_login.outcome == 'failure'
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -416,7 +426,7 @@ jobs:
       - name: Log in to GHCR
         id: ghcr_login
         continue-on-error: true
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -428,7 +438,7 @@ jobs:
           sleep 15
       - name: Log in to GHCR (retry)
         if: steps.ghcr_login.outcome == 'failure'
-        uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -717,7 +727,7 @@ jobs:
       # asset carries SLSA provenance naming this repo, this workflow, and the
       # release commit. Runs after signing so the bundle is a subject too.
       - name: Attest build provenance for every asset
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
       # action-gh-release honors `draft:` only when it CREATES the release; if one

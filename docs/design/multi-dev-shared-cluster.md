@@ -25,13 +25,10 @@ time**.
 
 The single-operator assumptions that break at team scale, grounded in the code:
 
-- **`curie cluster message` self-plumbs cluster-wide.** It opens its own
-  `kubectl port-forward`s and, to wire a Slack stub, sets `worker.slackApiBaseUrl`
-  via a `helm upgrade --reuse-values` that is **release-wide** — it re-points *the*
-  worker's outbound Slack for everyone. It already guards against hijacking a live
-  workspace (refuses when a `<release>-dispatcher` exists unless `--force-wire`,
-  per `cli/src/message.rs` and `cli/CLAUDE.md`), but two devs stub-wiring at once
-  still contend for the one `slackApiBaseUrl` value.
+- **`curie cluster message` follows the release transport.** It opens its own
+  `kubectl port-forward`s. When a dispatcher is connected, it posts a placeholder
+  and routes replies to the agent's bound Slack channel. Without a dispatcher,
+  it uses a per turn terminal reply stub and prints the reply.
 - **Agent targeting is "the sole deployed agent."** `cluster message` resolves the
   target agent from the single deployed agent's `slack_channel`, and treats zero
   or multiple deployed agents as an error (`message.rs`). With N devs each
@@ -107,10 +104,8 @@ per-dev runtime namespaces for compute and a single shared ingress for exposure.
   of an existing seam, not a new trust model.
 - **RBAC (devs, not pods).** Devs get a scoped kubeconfig/role that permits
   `deploy`/`message` against the shared release and their own runtime namespace,
-  but **not** `helm upgrade` on the platform release (which is how `cluster
-  message`'s cluster-wide `slackApiBaseUrl` rewrite happens today — see Q3). This
-  makes "don't let one dev's stub-wiring clobber everyone" an RBAC guarantee, not
-  just a `--force-wire` prompt.
+  but **not** `helm upgrade` on the platform release. This prevents one dev's
+  message transport changes from affecting everyone else.
 - **NodePort/ingress collisions.** Stop exposing per-dev NodePorts. The shared
   release exposes **one ingress / LoadBalancer**; per-dev/per-agent surfaces are
   **path- or host-routed** (e.g. `…/agent/<owner>/<name>/` or
@@ -119,34 +114,14 @@ per-dev runtime namespaces for compute and a single shared ingress for exposure.
   move: managed clusters get a real LoadBalancer/ingress; local single-node
   (kind/k3s) keeps NodePort but for the **one** shared exposure, not per dev.
 
-### Q3. How does `cluster message` target a *specific* deployed agent without cluster-wide wiring that collides?
+### Q3. How does `cluster message` target a *specific* deployed agent?
 
-This is the sharpest question, because today's mechanism is cluster-wide by
-construction. Two changes:
+The remaining ambiguity is which deployed agent should receive the turn:
 
 1. **Explicit agent targeting.** Add `--agent <name>` (and/or `--owner`) to
    `cluster message`, replacing the "sole deployed agent" resolution. Ambiguity
    (multiple agents) becomes "pass `--agent`," not an error, and targeting is
    exact equality on `(owner, name)`.
-2. **Per-agent reply routing instead of one shared `worker.slackApiBaseUrl`.**
-   The collision is that stub-wiring rewrites *the* worker's outbound Slack base
-   URL for the whole release. Options, in order of preference:
-   - **(Preferred) Per-agent stub routing carried on the turn, not on the worker
-     Deployment.** The reply destination becomes an attribute of the enqueued turn
-     / the agent's deployment record (a per-agent `reply_base_url` the worker reads
-     per message), so dev A driving agent X and dev B driving agent Y never
-     contend for one release-wide value and neither needs `helm upgrade` rights.
-     This is the clean fix and dovetails with per-dev RBAC in Q2.
-   - **(Bridge) Keep the direct-enqueue path as the default multi-dev driver.**
-     `cluster message` already has a "no kubectl/helm/port-forwards — enqueue
-     straight onto the Kubernetes release" form (`message.rs`). For multi-dev, make
-     *that* the default: a dev enqueues a turn for their agent and reads the reply
-     back over their own short-lived port-forward, with **no** release-wide
-     mutation at all. The stub-wiring `helm upgrade` path becomes an
-     admin/`--force-wire` escape hatch, not the everyday loop.
-
-   Either way, the everyday multi-dev `message` must stop performing a
-   release-wide `helm upgrade`.
 
 ### Q4. The "run against a running cluster you did not install" experience.
 
@@ -174,8 +149,8 @@ and it is the natural home for "which cluster / which release / which owner."**
   ADR-0008: an `owner` in the context is a precursor to a `tenant_id` at ingress.
 - **Caveat:** ambient context is a footgun for destructive verbs (the `--local`
   lesson from #40 — a silent default targeting the wrong place). Mitigation: keep
-  destructive/admin verbs (`cluster up`/`down`, `--force-wire`) **explicit and
-  loud** (echo the resolved cluster/release, require `--yes`), and never let the
+  destructive/admin verbs (`cluster up`/`down`) **explicit and loud** (echo the
+  resolved cluster/release, require `--yes`), and never let the
   ambient context silently escalate a dev into an admin action.
 
 ### Q6. Managed-cluster reachability (EKS) vs local single-node (kind/k3s).
@@ -200,7 +175,7 @@ admin, not per dev.**
 | Platform install | Each dev installs a release | **One shared release**, admin/CI-owned |
 | Dev's loop | `cluster up` + deploy + message | **connect (context) → deploy → message**, no install |
 | Agent targeting | "the sole deployed agent" | **`--agent`/`--owner` exact match**, from context |
-| Reply routing | release-wide `worker.slackApiBaseUrl` via `helm upgrade` | **per-agent routing on the turn/deployment**; direct-enqueue default |
+| Reply routing | per turn terminal stub or bound Slack channel | **target the agent by owner and name** |
 | Compute isolation | one runtime namespace | **namespace-per-owner** (reuses ADR-0008/0023) |
 | Exposure | per-release NodePort | **one shared LoadBalancer/ingress**, host/path-routed |
 | "Which cluster/release" | flags per call | **`curie context use`** ambient selector |
@@ -219,22 +194,17 @@ dependency.
 2. **Explicit agent targeting on `cluster message`/`status`.** `--agent`/`--owner`
    exact-match resolution replacing "sole deployed agent"; multiple agents →
    "pass `--agent`", not an error. (Q3.)
-3. **Per-agent reply routing off the release-wide `slackApiBaseUrl`.** Carry the
-   reply destination on the enqueued turn / deployment record so the everyday
-   multi-dev `message` performs **no** release-wide `helm upgrade`; make
-   direct-enqueue the default driver and stub-wiring an admin `--force-wire`
-   escape hatch. (Q3 — the load-bearing one.)
-4. **`owner` scope on agents + namespace-per-owner runtime isolation.** Add an
+3. **`owner` scope on agents + namespace-per-owner runtime isolation.** Add an
    `owner` column, scope uniqueness to `(owner, name)`, and run each owner's
    sandboxes in `curie-run-<owner>`; extend controller RBAC (ADR-0023) to the
    per-owner namespaces. (Q2 — precursor to ADR-0008 `tenant_id`.)
-5. **Per-dev scoped RBAC role / kubeconfig.** A role that permits deploy/message
+4. **Per-dev scoped RBAC role / kubeconfig.** A role that permits deploy/message
    against the shared release and the dev's runtime namespace but **not** `helm
    upgrade` on the platform release. (Q2.)
-6. **Shared ingress / host-path per-agent routing; retire per-dev NodePorts.**
+5. **Shared ingress / host-path per-agent routing; retire per-dev NodePorts.**
    One LoadBalancer+ingress on managed clusters (NodePort only for the single
    shared exposure on kind/k3s), with per-agent host/path routes. (Q2/Q6.)
-7. **`cluster` runbook + connect-to-existing docs.** Document the admin-installs-
+6. **`cluster` runbook + connect-to-existing docs.** Document the admin-installs-
    once / devs-connect model, the context workflow, and the destructive-verb
    guards. (Q4 — depends on 1–3.)
 
@@ -242,10 +212,6 @@ dependency.
 
 - **Ambient-context footgun.** Verify the destructive-verb guards actually prevent
   a dev from admin-escalating via a stale context (the #40 `--local` lesson).
-- **Per-agent reply routing vs the frozen queue contract.** Issue 3 may touch the
-  `QueuedTurn` shape or the worker's Slack sink; if a new field is required it is a
-  frozen-contract change (raise it in an issue/PR first per the repo's
-  frozen-contract rule), not a side channel.
 - **Cooperative-not-adversarial assumption.** This design trusts teammates. If a
   shared *staging* cluster ever hosts semi-trusted users, the boundary must harden
   toward ADR-0008 (RLS, always-on tenant scoping) — the `owner` primitives here

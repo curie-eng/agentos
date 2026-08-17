@@ -41,8 +41,8 @@ another hardcoded handler. The three that exist:
   in the same `register_handlers`, gated to `channel_type == "im"`, shares the path.)
 - **GitHub push** — `apps/api/src/curie_api/routers/github.py::github_webhook`:
   `@router.post("/webhook")` verifies the HMAC signature, then branches on
-  `x_github_event`; a `"push"` event is handed to `process_push(...)`,
-  everything else is `"ignored"`.
+  `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
+  is answered `"pong"`, and every other event is `"ignored"`.
 
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:
   a timer in the API asks GitHub whether the deploy branches moved and hands any
@@ -56,9 +56,9 @@ GitHub HMAC auth, and an asyncio timer. The last two converge one step earlier t
 the others -- both call `process_push`, deliberately, so the two deploy ingresses
 cannot disagree about what a push means.
 
-**Two further wake paths the inventory omitted.** Beyond the three external triggers, two
-platform-internal paths also turn an event into a run on the same `curie:runs` stream,
-and a truthful inventory names them:
+**Three further wake paths the inventory omitted.** Beyond the external triggers above,
+two platform-internal paths and one operator-driven path also turn an event into a run on
+the same `curie:runs` stream, and a truthful inventory names them:
 
 - **Slack block-action (button click)** —
   `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` normalizes a Block
@@ -70,6 +70,12 @@ and a truthful inventory names them:
   `apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`, so a suspended session
   wakes down the identical consumer/kernel/claim path a Slack mention takes (see the
   [approval seam](../approval/INTERFACE.md)).
+- **CLI enqueue** — `curie local message` and `curie cluster message` (and the `local`/`cluster`
+  eval drivers that reuse them) do not call any ingress at all: `cli/src/message.rs` builds a
+  `QueuedTurn` with `synthetic_turn` and appends it to the runs stream with `xadd`, both from
+  `cli/src/queue.rs`. This is an operator-driven wake that skips the Slack listener, the GitHub
+  webhook and the commit poller alike, and it hand-mints its own dedupe id (`new_event_id` in the
+  same file), which is the leak recorded below.
 
 **Declaration vs. consumption (#273/#270).** The bundle manifest now carries deploy-time-validated
 `triggers` declarations (`cron` with a `schedule`, `webhook` with a `path`; `TriggerDeclaration` in
@@ -90,9 +96,12 @@ Three external triggers, all hardcoded, in two different processes:
    entirely unbuilt: this one is real, though it is a single hardcoded platform timer and
    not the per-agent declared `cron` the trigger DECLARATION surface anticipates.
 
-Plus two platform-internal wake paths that also enqueue a run: the Slack block-action
-handler (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`) and the
-approval-resume enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`).
+Plus three further wake paths that also enqueue a run without going through any of those
+three: the Slack block-action handler
+(`apps/dispatcher/src/curie_dispatcher/handlers.py::process_action`), the approval-resume
+enqueue (`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`), and the CLI's own
+enqueue (`cli/src/message.rs` via `synthetic_turn`/`xadd`/`new_event_id` in
+`cli/src/queue.rs`), which is operator-driven rather than platform-internal.
 
 ## Known leakage
 
@@ -103,6 +112,16 @@ authed by the Slack app token; the GitHub trigger is HMAC-signature-shaped and l
 if Epic #29 concludes one is warranted — must reconcile these two auth models and
 payload shapes into a common event contract, and would live alongside the ingress
 handlers rather than replacing the transport-specific receivers.
+
+A second, narrower leak the CLI path exposes: **the dedupe id is minted by whoever enqueues**,
+under a different rule per producer, with nothing enforcing that the rules stay disjoint.
+`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` passes Slack's own `event_id`
+through verbatim; `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` synthesizes
+`action-<interaction id>`; `apps/api/src/curie_api/resumequeue.py::resume_event_id` returns a
+deterministic `approval-<id>-resolved`; and the CLI generates a random uuid behind an `EvSIM-`
+prefix (`cli/src/queue.rs`), chosen expressly so it cannot collide with a real Slack `Ev...` id.
+Idempotency across producers therefore holds by convention, not by contract, and that is the
+first thing a real `Trigger` port would have to take ownership of.
 
 ## Cross-links
 
