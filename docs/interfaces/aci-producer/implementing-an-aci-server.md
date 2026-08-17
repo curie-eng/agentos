@@ -17,7 +17,7 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes three POST
+An ACI server is an **HTTP process** inside the sandbox that exposes four POST
 routes and streams NDJSON back:
 
 | Route | Purpose |
@@ -25,11 +25,22 @@ routes and streams NDJSON back:
 | `POST /v1/event` | Open a turn. Body is an inbound `event` frame; the response streams outbound NDJSON, ending in a `final` event. |
 | `POST /v1/steer` | Inject a follow-up `event` into the live turn; return `409` when no turn is active (the caller then falls back to a fresh `/v1/event`). |
 | `POST /v1/interrupt` | Hard-stop the live turn. Body is an `interrupt` frame; the open turn's `final` is reclassified to idle. |
+| `POST /v1/reset` | Discard the conversation and start a fresh model session, so the next turn cannot answer from earlier history; return `409` while a turn is active. No body, no wire frame (#550). |
 
 Plus two unauthenticated GETs the platform relies on: `GET /healthz` (liveness)
 and `GET /status` (session status + readiness). The chart's readiness probe hits
 `/healthz` with no auth header, so keep those two open even when the POST routes
 are token-gated.
+
+`/v1/reset` is the odd one out and is easy to skip: it carries no ACI frame, so
+it is a runner control route rather than part of the frozen wire union. It is
+still required. The worker's eval driver resets before every non-`shared_history`
+sample (`apps/worker/src/curie_worker/eval/runner.py::EvalRunner._isolate` over
+`apps/worker/src/curie_worker/runner_client.py::RunnerClient.reset`), and `curie`'s
+own eval path calls the same route (`cli/src/runner.rs`); a reset that fails is
+reported as a failed case, so a server without this route fails every eval case
+that has not opted into shared history. The reference implementation is
+`runner/src/curie_runner/server.py`.
 
 Session setup is **not** on the wire — it comes from the environment. Read it once
 at startup with `SessionConfig.from_env()` (the `CURIE_*` mapping: `plugin_dir`,
@@ -138,7 +149,7 @@ will fail here — that is the point. A concrete failing example: a producer tha
 emits only a `text_delta` and no `final` fails `producer_stream` with a detail
 naming the missing `final`.
 
-## Step 3 — wrap the producer in the three HTTP routes
+## Step 3 — wrap the producer in the HTTP routes
 
 Once the producer is conformant, the server is thin: parse the body with
 `parse_inbound`, reject the wrong frame type, and stream the producer's lines.
@@ -162,10 +173,13 @@ Route contract to honor:
   surfaces on the open `/v1/event` stream. Return **409** when no turn is active.
 - **`/v1/interrupt`**: body is an `interrupt` frame; hard-stop the live turn and
   let its `final` reclassify to `idle-awaiting-input`.
+- **`/v1/reset`**: no body. Tear down the conversation and start a fresh session,
+  keeping the process (and any per-process setup) alive. Return **409** while a
+  turn is active, rather than resetting under an open `/v1/event` stream.
 - **`/healthz`**, **`/status`**: always-open GETs; `/status` returns
   `{status, ready, turn_active}`.
 - **Auth (optional):** when a bearer token is configured, require
-  `Authorization: Bearer <token>` on the three POST routes only, compared with a
+  `Authorization: Bearer <token>` on the POST routes only, compared with a
   constant-time check; leave the GETs open for the probe.
 
 Map any decode/validation error on a POST body to a **400** so a malformed frame
@@ -217,6 +231,8 @@ You have a conformant ACI server when:
 - [ ] All outbound events are built from `aci_protocol` models (version gate free).
 - [ ] `POST /v1/event` streams `application/x-ndjson`; `/v1/steer` returns 409 with
       no live turn; `/v1/interrupt` reclassifies to idle.
+- [ ] `POST /v1/reset` discards the conversation between turns and returns 409
+      while a turn is active, so eval cases stay isolated.
 - [ ] `GET /healthz` and `GET /status` are open and unauthenticated.
 - [ ] `SessionConfig.from_env()` is honored and the `CURIE_PLUGIN_DIR` bundle is
       loaded.

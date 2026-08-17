@@ -79,6 +79,29 @@ _RUST_TEST_RE = re.compile(r"#\[test\]")
 # prose states ("32 committed schemas ... with an index") excludes it.
 _SCHEMA_INDEX_NAME = "index.json"
 
+# The ACI server's route table registers every route through `web.<method>(`,
+# one per line, so counting the POST registrations counts the POST surface a
+# second ACI server has to publish. The two GETs (`/healthz`, `/status`) are a
+# different claim and use a different verb, so they cannot inflate this one.
+_ACI_POST_ROUTE_RE = re.compile(r"web\.post\(")
+
+# A `CliOutput` implementation, anchored at column 0. Every one in the crate is
+# written at top level, so an anchored pattern cannot pick up a fixture impl
+# nested inside a test module or a doc example, and the crate spells the trait
+# both bare and path-qualified.
+_CLI_OUTPUT_IMPL_RE = re.compile(r"^impl (?:crate::ui::|ui::)?CliOutput for ", re.MULTILINE)
+
+# A JSONB-typed column declaration. The bare name `JSONB` also appears in the
+# module's import line and would inflate a looser pattern, so the mapping call
+# is what is matched.
+_JSONB_COLUMN_RE = re.compile(r"mapped_column\(JSONB")
+
+# FastAPI route decorators in a router module, anchored at column 0 so a
+# decorator quoted inside a docstring or a comment cannot inflate the count.
+# `state.py` holds one `APIRouter` and nothing but state routes, so every
+# decorator in it is part of the claim.
+_ROUTER_DECORATOR_RE = re.compile(r"^@router\.\w+\(", re.MULTILINE)
+
 # This module's own path *within* the repository, used as the marker that
 # identifies a linted tree as the catalog.
 #
@@ -127,11 +150,33 @@ def parse_count(token: str) -> int | None:
     return _NUMBER_WORDS.get(token.lower())
 
 
+def _sdk_importing_runner_module_names(repo_root: Path) -> set[str]:
+    """The runner modules that import ``claude_agent_sdk`` at import level.
+
+    This is the leakage the harness seam grades itself on: every module here is
+    one the SDK is not yet walled off from. The prose names them as bare file
+    names (``check.py``), so that is what this returns.
+
+    Args:
+        repo_root: The repository root to resolve ``runner/src`` against.
+
+    Returns:
+        The set of ``.py`` file names under ``runner/src`` carrying an SDK import.
+    """
+    src = repo_root / "runner" / "src"
+    return {
+        path.name
+        for path in sorted(src.rglob("*.py"))
+        if _SDK_IMPORT_RE.search(path.read_text(encoding="utf-8"))
+    }
+
+
 def _count_sdk_importing_runner_modules(repo_root: Path) -> int:
     """Count runner modules that import ``claude_agent_sdk`` at import level.
 
-    This is the leakage the harness seam grades itself on: every module here is
-    one the SDK is not yet walled off from.
+    Derived from [`_sdk_importing_runner_module_names`] rather than counted
+    separately, so the count claim and the name claim below cannot disagree with
+    each other about the same tree (#1019).
 
     Args:
         repo_root: The repository root to resolve ``runner/src`` against.
@@ -139,12 +184,7 @@ def _count_sdk_importing_runner_modules(repo_root: Path) -> int:
     Returns:
         The number of ``.py`` files under ``runner/src`` carrying an SDK import.
     """
-    src = repo_root / "runner" / "src"
-    return sum(
-        1
-        for path in sorted(src.rglob("*.py"))
-        if _SDK_IMPORT_RE.search(path.read_text(encoding="utf-8"))
-    )
+    return len(_sdk_importing_runner_module_names(repo_root))
 
 
 def _count_committed_cli_schemas(repo_root: Path) -> int:
@@ -175,6 +215,89 @@ def _count_json_contract_tests(repo_root: Path) -> int:
     if not path.is_file():
         return 0
     return len(_RUST_TEST_RE.findall(path.read_text(encoding="utf-8")))
+
+
+def _count_cli_output_impls(repo_root: Path) -> int:
+    """Count the ``CliOutput`` implementations in the CLI crate.
+
+    This is the seam's own inventory, and it is the count that rotted worst:
+    the doc said nine while the crate carried 38, because every new verb adds
+    one and nothing recomputed the prose. ``cli/src`` only, so the fixture
+    impls under ``cli/tests`` cannot inflate it.
+
+    Args:
+        repo_root: The repository root to resolve ``cli/src`` against.
+
+    Returns:
+        The number of top-level ``impl CliOutput for`` blocks under ``cli/src``.
+    """
+    src = repo_root / "cli" / "src"
+    return sum(
+        len(_CLI_OUTPUT_IMPL_RE.findall(path.read_text(encoding="utf-8")))
+        for path in sorted(src.rglob("*.rs"))
+    )
+
+
+def _count_jsonb_columns(repo_root: Path) -> int:
+    """Count the JSONB-typed columns in the API's ORM models.
+
+    The relational-DB seam grades itself on how much Postgres-specific surface
+    a non-Postgres target would have to rework, and JSONB is the part of that
+    inventory that is actually countable: what else qualifies as a
+    "Postgres-ism" is a taxonomy judgement, so the doc enumerates those rather
+    than totalling them, and this is the one number left in the section.
+
+    Args:
+        repo_root: The repository root to resolve the models module against.
+
+    Returns:
+        The number of ``mapped_column(JSONB`` declarations, or ``0`` when the
+        models module is absent.
+    """
+    path = repo_root / "apps" / "api" / "src" / "curie_api" / "models.py"
+    if not path.is_file():
+        return 0
+    return len(_JSONB_COLUMN_RE.findall(path.read_text(encoding="utf-8")))
+
+
+def _count_aci_post_routes(repo_root: Path) -> int:
+    """Count the POST routes the ACI server publishes.
+
+    The seam doc calls this the producer surface a second ACI server must
+    implement, and it drifted once already: the doc said three long after
+    ``/v1/reset`` landed and the worker's eval runner and the CLI both started
+    calling it.
+
+    Args:
+        repo_root: The repository root to resolve the server module against.
+
+    Returns:
+        The number of ``web.post(`` registrations in the ACI server's route
+        table, or ``0`` when that module is absent.
+    """
+    path = repo_root / "runner" / "src" / "curie_runner" / "server.py"
+    if not path.is_file():
+        return 0
+    return len(_ACI_POST_ROUTE_RE.findall(path.read_text(encoding="utf-8")))
+
+
+def _count_state_api_routes(repo_root: Path) -> int:
+    """Count the routes the workflow-state HTTP API exposes.
+
+    Same drift, same shape: the doc said "exactly the five verbs" after
+    ``list_namespaces`` made it six.
+
+    Args:
+        repo_root: The repository root to resolve the router module against.
+
+    Returns:
+        The number of ``@router.<method>(`` decorators in the state router, or
+        ``0`` when that module is absent.
+    """
+    path = repo_root / "apps" / "api" / "src" / "curie_api" / "routers" / "state.py"
+    if not path.is_file():
+        return 0
+    return len(_ROUTER_DECORATOR_RE.findall(path.read_text(encoding="utf-8")))
 
 
 @dataclass(frozen=True)
@@ -219,7 +342,165 @@ CLAIMS: tuple[CountClaim, ...] = (
         counter=_count_json_contract_tests,
         source="#[test] in cli/tests/json_contract.rs",
     ),
+    # The three below were found stale by the 2026-08-14 seam audit, which is
+    # the same class #938 exists for arriving by a slower route: a human read
+    # the code. Each one counts a surface a second implementation must publish
+    # or consume, so each grows whenever the product does.
+    CountClaim(
+        doc="docs/interfaces/cli-output/INTERFACE.md",
+        label="CliOutput implementations in the CLI crate",
+        pattern=re.compile(r"(\S+)\s+`CliOutput` implementations"),
+        counter=_count_cli_output_impls,
+        source="top-level `impl CliOutput for` in cli/src/**/*.rs",
+    ),
+    CountClaim(
+        doc="docs/interfaces/aci-producer/INTERFACE.md",
+        label="ACI POST endpoints",
+        pattern=re.compile(r"(\S+)\s+POST\s+endpoints"),
+        counter=_count_aci_post_routes,
+        source="web.post( in runner/src/curie_runner/server.py",
+    ),
+    CountClaim(
+        doc="docs/interfaces/aci-producer/implementing-an-aci-server.md",
+        label="ACI POST endpoints, in the implementer's guide",
+        # `exposes` again: the guide says "the POST routes" twice more, about
+        # auth rather than about how many there are.
+        pattern=re.compile(r"exposes\s+(\S+)\s+POST\s+routes"),
+        counter=_count_aci_post_routes,
+        source="web.post( in runner/src/curie_runner/server.py",
+    ),
+    CountClaim(
+        doc="docs/interfaces/relational-db/INTERFACE.md",
+        label="JSONB columns in the API models",
+        pattern=re.compile(r"used on \*\*(\S+)\*\* columns"),
+        counter=_count_jsonb_columns,
+        source="mapped_column(JSONB in apps/api/src/curie_api/models.py",
+    ),
+    CountClaim(
+        doc="docs/interfaces/workflow-state/INTERFACE.md",
+        label="workflow-state HTTP routes",
+        # `exposes` is load-bearing: the same doc later says the memory router
+        # reaches the store "rather than calling its own state routes", which a
+        # bare `(\S+) state routes` would read as a count of "own".
+        pattern=re.compile(r"exposes\s+(\S+)\s+state routes"),
+        counter=_count_state_api_routes,
+        source="@router.<method>( in apps/api/src/curie_api/routers/state.py",
+    ),
 )
+
+
+@dataclass(frozen=True)
+class NameSetClaim:
+    """One ENUMERATION a seam doc states in prose, tied to its source of truth.
+
+    A count claim above pins how many; this pins which. #952 gated the harness
+    doc's "nine runner modules" but not the nine names listed beside it, so two
+    edits kept the gate green while making the doc wrong: renaming one of the
+    modules, or moving the import from one module to another. The second is the
+    likely one, because confining these imports is #844 Phase 2's refactor and
+    moving imports between modules is precisely what it does (#1019).
+
+    ``pattern`` must capture the region holding the list in group 1; the names
+    are then read out of it as backticked tokens, so re-ordering or re-wrapping
+    the sentence does not matter but changing the membership does.
+    """
+
+    doc: str
+    label: str
+    pattern: re.Pattern[str]
+    lister: Callable[[Path], set[str]]
+    source: str
+
+
+# A backticked file name inside the enumerated region.
+_BACKTICKED_NAME_RE = re.compile(r"`([^`]+\.py)`")
+
+# Every enumeration claim the seam catalog makes.
+NAME_CLAIMS: tuple[NameSetClaim, ...] = (
+    NameSetClaim(
+        doc="docs/interfaces/harness-modelsession/INTERFACE.md",
+        label="the runner modules importing claude_agent_sdk, by name",
+        # The parenthesised run after the claim sentence. DOTALL because the
+        # list wraps across lines in the prose.
+        pattern=re.compile(r"claude_agent_sdk`\s+today\s+\(([^)]*)\)", re.DOTALL),
+        lister=_sdk_importing_runner_module_names,
+        source="`from`/`import claude_agent_sdk` in runner/src/**/*.py",
+    ),
+)
+
+
+def check_name_sets(
+    repo_root: Path, claims: tuple[NameSetClaim, ...] = NAME_CLAIMS
+) -> list[Finding]:
+    """Assert every prose ENUMERATION in the seam catalog against the tree (#1019).
+
+    The count-claim sibling above answers "how many"; this answers "which", so a
+    rename or a swap that preserves the count cannot leave the list wrong while
+    the gate stays green.
+
+    Args:
+        repo_root: The repository root the docs and sources are resolved under.
+        claims: The claims to check; defaults to the catalog's own [`NAME_CLAIMS`].
+
+    Returns:
+        One finding per claim whose listed names disagree with the tree, or whose
+        anchor phrase vanished, and an empty list when every list matches.
+    """
+    findings: list[Finding] = []
+    is_catalog = _is_catalog_root(repo_root)
+
+    for claim in claims:
+        doc = repo_root / claim.doc
+        if not doc.is_file():
+            if is_catalog:
+                findings.append(
+                    Finding(
+                        claim.doc,
+                        claim.label,
+                        f"the seam doc has moved, so this claim ({claim.source}) is "
+                        "no longer verified. Restore the doc at this path, or update "
+                        f"this claim's doc path in {_CATALOG_MARKER}.",
+                    )
+                )
+            continue
+
+        regions = claim.pattern.findall(doc.read_text(encoding="utf-8"))
+        if not regions:
+            # Same anti-vacuity rule the count claims use: a reworded sentence
+            # must fail loudly rather than quietly stop being checked.
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    "no sentence enumerates these any more, so the list is no longer "
+                    "verified. Restore the phrasing, or update this claim's pattern "
+                    f"in {_CATALOG_MARKER} "
+                    f"(source of truth: {claim.source}).",
+                )
+            )
+            continue
+
+        expected = claim.lister(repo_root)
+        for region in regions:
+            listed = set(_BACKTICKED_NAME_RE.findall(region))
+            missing = sorted(expected - listed)
+            extra = sorted(listed - expected)
+            if not missing and not extra:
+                continue
+            parts = []
+            if missing:
+                parts.append(f"the tree has {', '.join(missing)} but the prose omits them")
+            if extra:
+                parts.append(f"the prose lists {', '.join(extra)} but the tree does not")
+            findings.append(
+                Finding(
+                    claim.doc,
+                    claim.label,
+                    f"{'; '.join(parts)} ({claim.source}). Update the prose to match.",
+                )
+            )
+
+    return findings
 
 
 def check_counts(repo_root: Path, claims: tuple[CountClaim, ...] = CLAIMS) -> list[Finding]:

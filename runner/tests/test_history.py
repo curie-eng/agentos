@@ -287,10 +287,45 @@ def test_compose_system_prompt_orders_memory_then_conversation_then_base() -> No
     # conversation, then the bundle/env system prompt. Any part may be absent.
     from curie_runner.__main__ import _compose_system_prompt
 
-    assert _compose_system_prompt("BASE", "MEM", "CONV") == "MEM\n\nCONV\n\nBASE"
-    assert _compose_system_prompt("BASE", None, "CONV") == "CONV\n\nBASE"
-    assert _compose_system_prompt("BASE", "MEM", None) == "MEM\n\nBASE"
-    assert _compose_system_prompt(None, None, None) is None
+    assert _compose_system_prompt("BASE", "MEM", "CONV", model=None) == "MEM\n\nCONV\n\nBASE"
+    assert _compose_system_prompt("BASE", None, "CONV", model=None) == "CONV\n\nBASE"
+    assert _compose_system_prompt("BASE", "MEM", None, model=None) == "MEM\n\nBASE"
+    assert _compose_system_prompt(None, None, None, model=None) is None
+
+
+def test_compose_system_prompt_appends_configured_model() -> None:
+    from curie_runner.__main__ import _compose_system_prompt
+
+    assert (
+        _compose_system_prompt("BASE", "MEM", "CONV", model="z-ai/glm-5.2")
+        == "MEM\n\nCONV\n\nBASE\n\nConfigured model: z-ai/glm-5.2"
+    )
+
+
+def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> None:
+    from curie_runner import RunnerConfig
+    from curie_runner.__main__ import build_runner
+
+    plugin_dir = tmp_path / ".claude-plugin"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        '{"name": "modelwiring", "version": "0.1.0", "description": "test"}'
+    )
+    config = RunnerConfig.from_env(
+        {
+            "CURIE_PLUGIN_DIR": str(tmp_path),
+            "CURIE_SESSION_ID": "s-model",
+            "CURIE_SANDBOX_ID": "b-model",
+            "CURIE_BUDGET": (
+                '{"max_output_tokens_per_run": 1000, "max_usd_per_day": 1.0}'
+            ),
+            "CURIE_MODEL": "z-ai/glm-5.2",
+        }
+    )
+    runner = build_runner(config, fake_model=False)
+    options = runner._factory()._options
+
+    assert options.system_prompt == "Configured model: z-ai/glm-5.2"
 
 
 def test_record_turn_swallows_store_failure() -> None:

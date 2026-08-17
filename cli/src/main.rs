@@ -495,7 +495,10 @@ enum Command {
 enum DevAction {
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
-    /// Discover and run every executable shell assertion directly in charts/curie/ci.
+    /// Render-assert the Helm chart: discover and run every executable assertion
+    /// script in `charts/curie/ci/`, the same set helm-ci runs on a
+    /// `charts/curie/**` change (#1481). Reports per-script pass or fail and exits
+    /// non-zero if any failed, so one run surfaces every problem.
     ChartCheck,
     /// Prove a changed test fails when only the change's product hunks are reversed.
     VerifyFixPin {
@@ -1945,7 +1948,9 @@ async fn main() {
     if let Err(err) = run(cli.command).await {
         let (class, _fix) = curie::exit::classify(&err);
         if ui::ui().json() {
-            ui::ui().emit_json(&curie::exit::error_json(&err));
+            let payload = curie::exit::wrapped_json_payload(&err)
+                .unwrap_or_else(|| curie::exit::error_json(&err));
+            ui::ui().emit_json(&payload);
         } else {
             eprintln!("Error: {err:#}");
         }
@@ -1988,7 +1993,7 @@ async fn run(command: Option<Command>) -> Result<()> {
         },
         Some(Command::Dev { action }) => match action {
             DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
-            DevAction::ChartCheck => commands::chart_check().await,
+            DevAction::ChartCheck => commands::dev_chart_check().await,
             DevAction::VerifyFixPin { change, selector } => {
                 commands::dev_script(
                     "cli/scripts/verify-fix-pin.sh",
@@ -3052,12 +3057,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     vec![target]
                 };
 
-                // Emits the LAST deploy, so `--json` still yields one object
-                // (cli/CLAUDE.md: a verb emits exactly one). The per-target
-                // progress is on the note above.
+                // Single target deploy retains its existing output. All target
+                // deploy accumulates complete results in the API's declared order.
                 let mut last_deployed = None;
+                let mut completed = Vec::new();
                 for target in targets {
-                    let deployed = commands::deploy(DeployOpts {
+                    let target_name = target.clone();
+                    let deployed = match commands::deploy(DeployOpts {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
@@ -3077,7 +3083,23 @@ async fn run(command: Option<Command>) -> Result<()> {
                         secret_binding_supported: false,
                         connect_hint: connect_hint.clone(),
                     })
-                    .await?;
+                    .await
+                    {
+                        Ok(deployed) => deployed,
+                        Err(err) if all_targets => {
+                            let failed_target = target_name
+                                .as_deref()
+                                .expect("all target entries always have a target name");
+                            let payload = commands::all_targets_deploy_failure_json(
+                                failed_target,
+                                &completed,
+                                None,
+                                &err,
+                            );
+                            return Err(curie::exit::with_json_payload(err, payload));
+                        }
+                        Err(err) => return Err(err),
+                    };
 
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist
@@ -3085,7 +3107,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
                     // secret delivery #440 tracks.
-                    sync_connectors(
+                    if let Err(err) = sync_connectors(
                         &api_url,
                         &api_key,
                         &namespace,
@@ -3094,10 +3116,37 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_name,
                         &deployed.version_id,
                     )
-                    .await?;
-                    last_deployed = Some(deployed);
+                    .await
+                    {
+                        if all_targets {
+                            let failed_target = target_name
+                                .as_deref()
+                                .expect("all target entries always have a target name");
+                            let payload = commands::all_targets_deploy_failure_json(
+                                failed_target,
+                                &completed,
+                                Some(&deployed),
+                                &err,
+                            );
+                            return Err(curie::exit::with_json_payload(err, payload));
+                        }
+                        return Err(err);
+                    }
+                    if all_targets {
+                        completed.push(commands::AllTargetsDeployResult {
+                            target: target_name
+                                .expect("all target entries always have a target name"),
+                            result: deployed,
+                        });
+                    } else {
+                        last_deployed = Some(deployed);
+                    }
                 }
-                emit(last_deployed.expect("the target list is never empty"))
+                if all_targets {
+                    emit(commands::AllTargetsDeployOutput { results: completed })
+                } else {
+                    emit(last_deployed.expect("the target list is never empty"))
+                }
             }
             ClusterAction::Kill {
                 agent,

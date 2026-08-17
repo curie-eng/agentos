@@ -28,9 +28,12 @@
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::thread;
 
 /// Read a workflow file's raw text, or an empty string when it does not exist
 /// yet. Assertions on an empty string fail with their own readable messages
@@ -256,10 +259,38 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
     }
 }
 
+// --- Assertion group 5: the eval-block TEXT contracts ----------------------
+//
+// The four tests below are exact-substring assertions on the ladder script's
+// source text, and they are therefore WEAK BY CONSTRUCTION: a substring match
+// proves no behavior at all, and a reformat that preserves behavior breaks
+// them. They are kept, not deleted, because they encode a real CI contract --
+// that the graded nightly path still fires the LIVE tier eval at every rung --
+// and deleting them would remove the only guard on it. The real coverage for
+// parity lives in the EXECUTING controls at the bottom of this file (assertion
+// group 6), which run the script rather than read it.
+//
+// Each region now also carries the `--dry-run` suite-parity check, which runs
+// in fake mode as well as live (no turn, no grading, no stack: the dry-run plan
+// line is resolved by the tier's own frozen suite loader). At the cluster rung
+// the dry-run and the live eval share one `eval_args` array so `--listen-host`
+// is forwarded to BOTH, which is why the two calls sit adjacent. `--json` is the
+// one flag NOT in that array: both calls pass it themselves, for different
+// reasons (#1602's auditable green, and a machine-readable dry-run plan).
+//
+// The cluster rung's grade is REPORT ONLY (#1603), so its text contract here
+// asserts the eval still RUNS and still runs under `--json`; the non-fatal half
+// is proved by the executing control at the bottom of this file, which runs the
+// ladder against a stub evaluator that exits 42.
+
 #[test]
 fn live_local_rung_grades_the_deployed_weather_cases() {
     let text = ladder();
     let contract = r#"assert_finalized_reply "local" "$out"
+
+    echo
+    echo "=== curie local eval --dry-run (suite parity) ==="
+    assert_suite "local" "$("$BIN" --json local eval --cases "$WORKDIR/bundle/evals/cases.json" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -269,7 +300,8 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
     assert!(
         text.contains(contract),
         "the live local rung must run local eval after its plumbing assertion \
-         against the deployed weather bundle cases; ladder contents:\n{text}"
+         against the deployed weather bundle cases, with the suite-parity \
+         dry-run check in front of it; ladder contents:\n{text}"
     );
 }
 
@@ -277,6 +309,10 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
 fn live_local_release_rung_grades_its_own_weather_cases_copy() {
     let text = ladder();
     let contract = r#"assert_finalized_reply "local-release" "$out"
+
+    echo
+    echo "=== curie local eval --dry-run (suite parity, release compose stack) ==="
+    assert_suite "local-release" "$("$BIN" --json local eval --cases "$WORKDIR/bundle-release/evals/cases.json" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -286,56 +322,298 @@ fn live_local_release_rung_grades_its_own_weather_cases_copy() {
     assert!(
         text.contains(contract),
         "the live local release rung must run local eval after its plumbing \
-         assertion against its own deployed weather bundle cases copy; \
+         assertion against its own deployed weather bundle cases copy, with \
+         the suite-parity dry-run check in front of it; \
          ladder contents:\n{text}"
     );
 }
 
 #[test]
-fn live_cluster_rung_grades_weather_cases_with_the_message_listen_host() {
+fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
     let text = ladder();
-    let contract = r#"assert_finalized_reply "cluster" "$out"
-
-    if [[ "$LIVE" == "1" ]]; then
-        echo
-        echo "=== curie cluster eval ==="
-        local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
-        if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
-            eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
-        fi
-        "$BIN" "${eval_args[@]}"
-    fi"#;
+    // The shared `eval_args` array and the dry-run call it feeds. Scoped to the
+    // array plus that one call rather than the whole block, because the block
+    // carries the #1602/#1603 rationale comments and a reworded comment must not
+    // red this contract.
+    let contract = r#"local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+    if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
+        eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
+    fi
+    assert_suite "cluster" "$("$BIN" --json "${eval_args[@]}" --dry-run)""#;
+    assert!(
+        text.contains(r#"assert_finalized_reply "cluster" "$out""#),
+        "the live cluster rung must keep its plumbing assertion; ladder \
+         contents:\n{text}"
+    );
     assert!(
         text.contains(contract),
-        "the live cluster rung must run cluster eval after its plumbing \
-         assertion against the deployed weather bundle cases and forward the \
-         message listen host; ladder contents:\n{text}"
+        "the live cluster rung must resolve its suite through one shared \
+         eval_args array and forward the message listen host to the \
+         suite-parity dry-run; ladder contents:\n{text}"
+    );
+    assert!(
+        text.contains(r#"if ! "$BIN" --json "${eval_args[@]}"; then"#),
+        "the live cluster rung must still RUN cluster eval against the deployed \
+         weather bundle cases and forward the message listen host -- through the \
+         SAME array as the dry-run, so neither call can lose it -- and report \
+         only (#1603) means the grade is non-fatal, never that the step was \
+         deleted; ladder contents:\n{text}"
     );
 }
 
+/// The cluster rung's eval must run in `--json` mode. The human table prints a
+/// reply only for a RED case, so a green would carry no evidence of HOW it was
+/// earned -- and the weather case is precisely the one that can go green
+/// dishonestly (#1602): its regex grades that a temperature figure is present,
+/// not that the agent fetched one. The json payload carries `output` for every
+/// case, pass included, which is what keeps the report-only grade auditable in
+/// the job log. Asserted for the cluster rung alone, since the sibling
+/// assertions above pin the other rungs to the plain table.
+///
+/// The second half is the reconciliation of #1602 with the suite-parity dry-run
+/// that shares this rung's `eval_args`: BOTH calls need `--json` (auditability of
+/// a green here, a machine-readable plan there), so it is passed at each call
+/// site and must stay OUT of the shared array -- inside it, every invocation
+/// would carry `--json` twice.
 #[test]
-fn live_cluster_rung_propagates_deployed_evaluator_failure() {
-    let harness = tempfile::tempdir().expect("create harness directory");
-    let fake_curie = harness.path().join("curie");
-    let eval_marker = harness.path().join("eval_called");
+fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
+    let text = ladder();
+    assert!(
+        text.contains(r#"if ! "$BIN" --json "${eval_args[@]}"; then"#),
+        "the live cluster rung must run its eval with `--json` so a PASSING \
+         case's reply text lands in the job log; without it a dishonest green \
+         (a fabricated temperature) is indistinguishable from an honest one; \
+         ladder contents:\n{text}"
+    );
+    assert!(
+        !text.contains(r#"local eval_args=(--json cluster eval"#),
+        "`--json` must be passed at each cluster eval call site, never stored in \
+         the shared eval_args array: in the array both the dry-run and the live \
+         grade would pass it twice, and neither invocation would be the one the \
+         executing controls below drive; ladder contents:\n{text}"
+    );
+}
+
+// --- Assertion group 6: the EXECUTING parity controls -----------------------
+//
+// Everything below runs the real `cli/scripts/e2e-ladder.sh` against a stub
+// `curie`, `docker` and `kubectl`, so it exercises the ladder's own parity
+// helpers rather than reading its source. No Docker daemon, no cluster, no
+// credential (the one live-mode control supplies a dummy CURIE_CREDENTIALS,
+// which apply_model_mode only checks for presence).
+//
+// The design that makes each negative control attributable: ONE stub body,
+// configured entirely through STUB_* env vars, so every negative control is the
+// positive control's configuration with exactly ONE knob moved. A non-zero exit
+// therefore cannot come from an unrelated breakage -- the positive control
+// proves the un-moved configuration is green -- and each control additionally
+// requires the operator-facing message to name the divergence it injected.
+//
+// All of these assert on exit codes and operator-facing message text, never on
+// the ladder's internal shell identifiers, so renaming `PARITY_DIGEST` or
+// `assert_bundle_identity` leaves them passing.
+
+/// The ids the stub deploy receipt reports. They are also what the stubbed
+/// `GET /deployments` read must agree with, which is the whole point of the
+/// sole-active-deployment control.
+const AGENT_ID: &str = "6f3d1c2a-0000-4000-8000-000000000001";
+const VERSION_ID: &str = "6f3d1c2a-0000-4000-8000-000000000002";
+const DEPLOYMENT_ID: &str = "6f3d1c2a-0000-4000-8000-000000000003";
+/// The stale `prod` row the second-active-deployment control injects. `prod`
+/// because the worker's runtime binding prefers it over recency, so this is the
+/// exact row that would silently serve the turn while the ladder reported the
+/// digest of the `dev` bundle it just uploaded.
+const STALE_PROD_DEPLOYMENT_ID: &str = "6f3d1c2a-0000-4000-8000-000000000099";
+
+/// A digest value pinned by the digest-divergence control at the local rung.
+const PINNED_DIGEST: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+/// The divergent digest the cluster rung reports in the digest-divergence
+/// control.
+const DIVERGENT_DIGEST: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+
+/// The stub `curie`, `docker` and `kubectl` the executing controls drive the
+/// ladder with. One body for all of them: behavior comes from STUB_* env vars
+/// so the tests differ by configuration, not by a second stub.
+///
+/// Every arm matches only the argv shape the scripts actually issue. An
+/// invocation variant nobody issues falls through to `exit 97`, deliberately: an
+/// arm that tolerates a shape the script does not use is a compatibility path,
+/// and it would keep a control green while hiding the regression that started
+/// issuing that shape (the `--json`-less deploy is the exact case -- the stub
+/// answers with JSON either way, so tolerating it would hide a deploy that
+/// stopped asking for a receipt).
+fn write_ladder_stubs(dir: &Path) {
     write_executable(
-        &fake_curie,
+        &dir.join("curie"),
         r#"#!/bin/sh
+set -u
+
+# `--plugin-dir <dir>` is the last pair on every deploy the ladder makes, so the
+# final argument is the bundle directory that rung packed.
+bundle_dir=""
+for arg in "$@"; do bundle_dir="$arg"; done
+
+# The `--name <name>` value, read off argv: the #747 leftover-runner case asserts
+# that `skill up`'s refusal names the exact container an operator must clear.
+name=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--name" ]; then name="$arg"; fi
+    prev="$arg"
+done
+
+# A CONTENT-derived digest, not a canned one: the default makes two rungs that
+# packed the same tree agree by construction and two rungs that packed different
+# trees disagree by construction. That is what lets the case-ids-only control
+# prove the digest carries the case-id claim, and what lets the positive control
+# compare three independently derived digests instead of one canned constant.
+#
+# Hashes path plus bytes for every regular file, mtimes excluded (the ladder
+# normalizes those itself) and `.curie` excluded (the real packer excludes it,
+# cli/src/bundle.rs). The Rust side computes the same value for the pristine
+# weather bundle in weather_bundle_sha256(); the two must stay in step.
+sha_of_bundle() {
+    python3 -c 'import hashlib, os, sys
+root = sys.argv[1]
+digest = hashlib.sha256()
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = sorted(d for d in dirnames if d != ".curie")
+    for entry in sorted(filenames):
+        path = os.path.join(dirpath, entry)
+        digest.update(os.path.relpath(path, root).encode())
+        digest.update(open(path, "rb").read())
+print(digest.hexdigest())' "$1"
+}
+
+# The `deploy_result` branch of cli/schema/deploy.schema.json, with every field
+# the ladder reads: bundle.sha256, agent.id, version.id, and
+# deployment.{id,environment,status}.
+emit_deploy() {
+    printf '{"plugin":"weather","label":"e2e","environment":"dev","agent":{"name":"weather","id":"%s"},"version":{"label":"e2e","id":"%s"},"channel":"C0LOCALDEV","bundle":{"ref":"weather-e2e.tar.gz","sha256":"%s","size_bytes":2048},"deployment":{"id":"%s","environment":"dev","status":"active"}}\n' "$STUB_AGENT_ID" "$STUB_VERSION_ID" "$1" "$STUB_DEPLOYMENT_ID"
+}
+
+# The DryRunPlan shape (cli/src/ui.rs: {"dry_run":true,"plan":[lines]}) carrying
+# the one plan line the tier's suite loader emits.
+emit_plan() {
+    printf '{"dry_run":true,"plan":["grade %s case(s) from suite \\"%s\\" against the %s tier"]}\n' "$2" "$3" "$1"
+}
+
 case "$*" in
     "--version")
         echo "curie test harness"
         ;;
     "--json cluster status")
+        # The case-ids-only control's single injection point: after the local
+        # rung deployed and before the cluster rung does, rewrite ONLY the case
+        # ids in the bundle both rungs deploy. Suite name and case count are
+        # untouched, so every dry-run plan line still matches exactly and the
+        # digest is the only thing that moves.
+        if [ "${STUB_MUTATE_CASE_IDS:-0}" = "1" ] && [ -f "$STUB_STATE/last_plugin_dir" ]; then
+            python3 -c 'import json,sys
+p = sys.argv[1]
+d = json.load(open(p))
+for i, c in enumerate(d["cases"]):
+    c["id"] = "drifted-case-%d" % i
+json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.json"
+        fi
         printf '%s\n' '{"release_found":true}'
         ;;
-    "cluster deploy --plugin-dir "*)
+    "skill up --plugin-dir . --image curie-runner --port 7245 --name curie-e2e-runner --fake-model")
+        # The skill rung's identity surface. `skill up` packs an IMMUTABLE
+        # snapshot of the source as it stands now and the runner keeps it for its
+        # whole lifetime, so the digest is recorded here and replayed by
+        # `skill status --json` below. That is what makes e2e.sh's two #1087 legs
+        # resolve the way the real CLI resolves them: a host edit after boot is
+        # invisible to the running runner, and a re-up on the edited source packs
+        # a NEW digest.
+        printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        echo "stub: runner up"
+        # e2e.sh asserts the boot panel NAMES the model path it resolved, and
+        # that it does not cry wolf about a missing credential. This arm is the
+        # sealed argv, so the sealed row is the honest answer to it.
+        echo "  Model    fake (offline, no credential)"
+        ;;
+    "skill up --fake-model --plugin-dir "*" --name "*)
+        # The #747 leftover-runner case: a taken container name must be a usage
+        # refusal (exit 2) carrying the operator's own remedy, never docker's raw
+        # "name is already in use" text.
+        echo "error: container name conflict: a container named '$name' already exists." >&2
+        echo "fix: curie skill down --name $name, then re-run." >&2
+        exit 2
+        ;;
+    "skill status")
+        echo "stub: runner running"
+        ;;
+    "skill status --json")
+        printf '{"bundle_digest":"%s"}\n' "$(cat "$STUB_STATE/skill_digest")"
+        ;;
+    "skill message "*)
+        echo "stub skill weather reply"
+        ;;
+    "--json skill eval")
+        # The bundle's OWN suite, read off the bundle e2e.sh cd'd into, because
+        # the skill rung is the one rung that reads its case ids back directly.
+        # Sealed shape only (ADR-0055: a fake turn is reported as the non-graded
+        # plumbing_ok and nothing is graded), which is what the one control that
+        # drives this rung runs as; a live skill run would fall on e2e.sh's own
+        # live-posture assertion rather than be silently accepted here.
+        python3 -c 'import json, sys
+suite = json.load(open(sys.argv[1]))
+ids = [case["id"] for case in suite["cases"]]
+print(json.dumps({
+    "suite": suite["name"],
+    "total": len(ids),
+    "passed": 0,
+    "failed": 0,
+    "plumbing_ok": len(ids),
+    "cases": [{"id": case_id, "status": "plumbing_ok"} for case_id in ids],
+}))' "$PWD/evals/cases.json"
+        ;;
+    "skill down")
+        echo "stub: runner down"
+        ;;
+    "skill down --name "*)
+        echo "stub: removed the leftover runner named '$name'"
+        ;;
+    "local up --minimal")
+        echo "stub: compose stack up"
+        ;;
+    "--json local deploy --plugin-dir "*)
+        printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
+        emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
+        ;;
+    "--json cluster deploy --plugin-dir "*)
+        printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
+        emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
+        ;;
+    "--json local message "*)
+        printf '%s\n' '{"finalized":true,"reply":"stub local weather reply"}'
         ;;
     "--json cluster message "*)
-        printf '%s\n' '{"finalized":true,"reply":"live weather reply"}'
+        printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
-    "cluster eval --cases "*)
-        printf '%s\n' called > "$EVAL_MARKER"
-        exit 42
+    "--json local eval --cases "*--dry-run*)
+        emit_plan local 1 weather
+        ;;
+    "--json cluster eval --cases "*--dry-run*)
+        # Only the cluster count is an override: it is the knob the suite
+        # divergence control moves. Everything else is the constant the weather
+        # bundle declares.
+        emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
+        ;;
+    # The two LIVE grades, and they are deliberately asymmetric: the local rung
+    # runs the plain human table, the cluster rung runs `--json` so a passing
+    # case's reply is auditable in the job log (#1602). The dry-run arms above
+    # must stay above this one, since `--json cluster eval --cases *` matches a
+    # dry-run argv too and the first matching arm wins.
+    "local eval --cases "*|"--json cluster eval --cases "*)
+        if [ -n "${STUB_EVAL_MARKER:-}" ]; then
+            printf '%s\n' called > "$STUB_EVAL_MARKER"
+        fi
+        exit "${STUB_EVAL_EXIT:-0}"
+        ;;
+    "local down")
+        echo "stub: compose stack down"
         ;;
     *)
         echo "unexpected curie invocation: $*" >&2
@@ -345,30 +623,609 @@ esac
 "#,
     );
 
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
-    let output = Command::new("bash")
-        .arg(script)
-        .env("CURIE_BIN", &fake_curie)
-        .env("CURIE_E2E_TIERS", "cluster")
-        .env("CURIE_E2E_LIVE", "1")
-        .env("CURIE_CREDENTIALS", "test-credential")
-        .env("EVAL_MARKER", &eval_marker)
-        .env_remove("CURIE_E2E_LISTEN_HOST")
-        .output()
-        .expect("run the real ladder script");
+    // The ladder's raw-docker uses are all either "is a stack already running"
+    // or "assert nothing survived", so an unrecognized invocation returning
+    // nothing is the honest default here; the two reads that carry a real
+    // answer (the compose-worker selection and its env inspect) get explicit
+    // arms above it.
+    write_executable(
+        &dir.join("docker"),
+        r#"#!/bin/sh
+set -u
+case "$*" in
+    "inspect "*)
+        if [ -n "${STUB_FAKE_MODEL:-}" ]; then
+            echo "CURIE_FAKE_MODEL=$STUB_FAKE_MODEL"
+        fi
+        echo "PATH=/usr/local/bin:/usr/bin:/bin"
+        ;;
+    *"com.docker.compose.service=curie-worker"*)
+        # Exactly one worker: the probe must refuse to guess when the scoping
+        # assumption breaks, so returning one id is the only shape that lets the
+        # mode assertion be reached at all.
+        echo "stub-curie-worker"
+        ;;
+    *)
+        ;;
+esac
+"#,
+    );
 
+    write_executable(
+        &dir.join("kubectl"),
+        r#"#!/bin/sh
+set -u
+case "$*" in
+    *"CURIE_FAKE_MODEL"*)
+        printf '%s' "${STUB_FAKE_MODEL:-}"
+        ;;
+    *)
+        ;;
+esac
+"#,
+    );
+}
+
+/// Serve one canned JSON body to every request on an ephemeral loopback port,
+/// and return its base URL for `CURIE_API_URL`.
+///
+/// `CURIE_API_URL` is not a test-only knob: it is the documented env fallback of
+/// every local verb's `--api-url` (`cli/src/main.rs:1193`), with the same
+/// default the CLI itself applies, so pointing the ladder's deployments read at
+/// a different API is production behavior that happens to also be the seam this
+/// control needs.
+fn spawn_deployments_stub(body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the deployments stub");
+    let address = listener.local_addr().expect("read the stub address");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // The ladder only GETs, so the request is one small buffer and its
+            // content is irrelevant; it is drained only so the client sees a
+            // complete exchange before the response.
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://{address}")
+}
+
+/// The `DeploymentOut` list shape (`apps/api/src/curie_api/schemas.py:654-660`)
+/// for the healthy case: exactly one active row, and it is this run's.
+fn one_active_deployment() -> String {
+    format!(
+        "[{{\"id\":\"{DEPLOYMENT_ID}\",\"agent_id\":\"{AGENT_ID}\",\
+         \"version_id\":\"{VERSION_ID}\",\"environment\":\"dev\",\
+         \"commit_sha\":null,\"status\":\"active\",\
+         \"deployed_at\":\"2026-08-17T00:00:00Z\"}}]"
+    )
+}
+
+/// This run's `dev` row plus a stale active `prod` row for the same agent: the
+/// wrong-artifact-green shape.
+fn two_active_deployments() -> String {
+    format!(
+        "[{{\"id\":\"{DEPLOYMENT_ID}\",\"agent_id\":\"{AGENT_ID}\",\
+         \"version_id\":\"{VERSION_ID}\",\"environment\":\"dev\",\
+         \"commit_sha\":null,\"status\":\"active\",\
+         \"deployed_at\":\"2026-08-17T00:00:00Z\"}},\
+         {{\"id\":\"{STALE_PROD_DEPLOYMENT_ID}\",\"agent_id\":\"{AGENT_ID}\",\
+         \"version_id\":\"{VERSION_ID}\",\"environment\":\"prod\",\
+         \"commit_sha\":null,\"status\":\"active\",\
+         \"deployed_at\":\"2026-01-01T00:00:00Z\"}}]"
+    )
+}
+
+/// Refuse to run a control that drives the local rung while something holds the
+/// local reply stub's port.
+///
+/// `assert_stub_port_free` (`cli/scripts/e2e-ladder.sh`) is a real connect
+/// probe against a HOST-GLOBAL port that the ladder deliberately does not let a
+/// caller override, so no stub can satisfy it. On a box with several checkouts,
+/// a concurrent `local message` or `local eval` holds it and reds every
+/// local-rung control for a reason that has nothing to do with parity. Failing
+/// here, with the ladder's own fix line, keeps that red diagnosable instead of
+/// arriving as a confusing parity failure.
+fn require_local_stub_port_free() {
+    let address = "127.0.0.1:8155"
+        .parse()
+        .expect("parse the stub port address");
+    if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(250)).is_ok()
+    {
+        panic!(
+            "port 8155 is already in use, so the ladder's local rung cannot \
+             start and this control cannot run. This is a host collision, not \
+             a parity failure. fix: stop the process holding it (another ladder \
+             run, or a stale local message/eval), then re-run."
+        );
+    }
+}
+
+/// Run the real ladder script against the stubs in `harness`, with `envs`
+/// carrying the tier selection and the STUB_* knobs this control moves.
+///
+/// Every variable the ladder or `e2e.sh` reads is REMOVED before `envs` is
+/// applied, so the child environment is fixed by the control rather than by
+/// whatever the developer happens to have exported. Two classes, both of which
+/// have already bitten:
+/// - `CURIE_API_KEY` / `CURIE_API_URL`: the cluster rung's runtime-binding read
+///   arms itself only when a key is present, so an exported key made a
+///   cluster-only control reach the default `localhost:28000` and fail
+///   unreachable -- green in CI, red on one box.
+/// - `CURIE_E2E_IMAGE` / `_PORT` / `_NETWORK` / `_OTEL`: these change the argv
+///   `e2e.sh` builds for `skill up`, which the stub matches exactly, so an
+///   exported value turns the skill rung into an `exit 97`.
+fn run_ladder(harness: &Path, envs: &[(&str, &str)]) -> Output {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    let path = format!(
+        "{}:{}",
+        harness.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("bash");
+    command
+        .arg(script)
+        .env("CURIE_BIN", harness.join("curie"))
+        .env("PATH", path)
+        .env("STUB_STATE", harness)
+        .env("STUB_AGENT_ID", AGENT_ID)
+        .env("STUB_VERSION_ID", VERSION_ID)
+        .env("STUB_DEPLOYMENT_ID", DEPLOYMENT_ID)
+        .env_remove("CURIE_E2E_TIERS")
+        .env_remove("CURIE_E2E_LIVE")
+        .env_remove("CURIE_E2E_LISTEN_HOST")
+        .env_remove("CURIE_E2E_BUNDLE")
+        .env_remove("CURIE_E2E_IMAGE")
+        .env_remove("CURIE_E2E_PORT")
+        .env_remove("CURIE_E2E_NETWORK")
+        .env_remove("CURIE_E2E_OTEL")
+        .env_remove("CURIE_FAKE_MODEL")
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_API_URL");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run the real ladder script")
+}
+
+/// Whether some ONE line of the transcript carries every one of `needles`.
+///
+/// Line-scoped rather than whole-transcript, and that is the load-bearing part:
+/// the stub's raw `deploy --json` receipt already echoes a digest into the
+/// transcript, so a whole-transcript `contains` check for that digest passes
+/// with no parity logic in the ladder at all. Requiring the digest to share a
+/// line with a rung label, or two digests to share a line with each other,
+/// demands an actual operator-facing report instead.
+fn has_line_with(transcript: &str, needles: &[&str]) -> bool {
+    transcript
+        .lines()
+        .any(|line| needles.iter().all(|needle| line.contains(needle)))
+}
+
+/// Both streams together, because a control asserts on the operator-facing
+/// message without caring which stream carried it.
+fn transcript(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The content digest of the weather bundle as it sits in the tree, which is the
+/// digest the content-derived stub reports for every rung before anything
+/// mutates the copy. Computed with the same path-plus-bytes walk the stub's
+/// `sha_of_bundle` runs, so the two agree by construction.
+fn weather_bundle_sha256() -> String {
+    let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/weather");
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import hashlib, os, sys\n\
+             root = sys.argv[1]\n\
+             digest = hashlib.sha256()\n\
+             for dirpath, dirnames, filenames in os.walk(root):\n\
+             \x20   dirnames[:] = sorted(d for d in dirnames if d != '.curie')\n\
+             \x20   for entry in sorted(filenames):\n\
+             \x20       path = os.path.join(dirpath, entry)\n\
+             \x20       digest.update(os.path.relpath(path, root).encode())\n\
+             \x20       digest.update(open(path, 'rb').read())\n\
+             print(digest.hexdigest())",
+        )
+        .arg(bundle)
+        .output()
+        .expect("hash the weather bundle tree");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// POSITIVE CONTROL. Every rung -- skill, local and cluster -- reports the same
+/// bundle digest, a matching dry-run plan line, and a model mode consistent with
+/// the run, so the ladder must pass and must NAME that one digest against each of
+/// the three rungs.
+///
+/// Why it exists: without it, the five negative controls below are unanchored --
+/// a ladder that failed unconditionally would satisfy all of them. This is the
+/// test that makes "one knob moved" mean something, and it is also the only test
+/// that catches a parity assertion so strict it can never pass.
+///
+/// The skill rung is in the tier list deliberately, and it is the only executing
+/// coverage of that leg: it runs `cli/scripts/e2e.sh` as a child, so it is what
+/// fails if the `CURIE_E2E_BUNDLE` handoff breaks, if the `tee`d
+/// `initial bundle digest:` line stops being parsed, or if the skill rung stops
+/// comparing its identity with the deployed rungs. With local and cluster alone,
+/// every one of those regressions stayed green.
+///
+/// No digest is pinned through a STUB_* override here: all three rungs report the
+/// content-derived digest of the tree they actually packed, so their agreement is
+/// three independent derivations landing on one value rather than one canned
+/// constant echoed three times.
+#[test]
+fn parity_passes_when_every_rung_reports_the_same_identity() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+    let digest = weather_bundle_sha256();
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "skill,local,cluster"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_FAKE_MODEL", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a ladder run whose rungs all report the same digest, the same suite \
+         and a mode matching the run must pass; transcript:\n{transcript}"
+    );
+    for rung in ["skill", "local", "cluster"] {
+        assert!(
+            has_line_with(&transcript, &[&digest, rung]),
+            "the ladder must report the common bundle digest against the {rung} \
+             rung by name, since the transcript IS the parity evidence an \
+             operator reads; transcript:\n{transcript}"
+        );
+    }
+    assert!(
+        transcript.contains("reports-a-temperature"),
+        "the ladder must name the common suite's case ids, so a reader can see \
+         WHICH case set every rung shared rather than taking `parity` on \
+         trust; transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: bundle identity. The cluster rung's deploy receipt reports
+/// a different `bundle.sha256` than the local rung's.
+///
+/// Prevents shipping silently: two tiers running two different artifacts while
+/// the ladder reports a green "same bundle at every tier", which is the false
+/// claim in the script header this whole change repairs.
+#[test]
+fn parity_fails_when_a_rung_reports_a_different_bundle_digest() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local,cluster"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_LOCAL_SHA256", PINNED_DIGEST),
+            // The one knob moved off the positive control.
+            ("STUB_CLUSTER_SHA256", DIVERGENT_DIGEST),
+            ("STUB_FAKE_MODEL", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a rung reporting a different bundle digest must fail the ladder; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass on a digest divergence; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        has_line_with(&transcript, &[PINNED_DIGEST, DIVERGENT_DIGEST]),
+        "the failure must put the pinned digest and the divergent one on one \
+         line, so an operator sees the mismatch itself rather than two \
+         unrelated receipts; transcript:\n{transcript}"
+    );
+    assert!(
+        has_line_with(&transcript, &[DIVERGENT_DIGEST, "cluster"]),
+        "the failure must name WHICH rung shipped the different artifact; \
+         transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: suite and case count. The cluster tier's own suite loader
+/// reports two cases from the weather suite when the bundle the ladder packed
+/// carries one.
+///
+/// Prevents shipping silently: a tier grading a different suite than the one the
+/// ladder deployed -- the second half of the divergence this change repairs
+/// (skill graded `introduces-itself`, local and cluster graded
+/// `reports-a-temperature`, and nothing compared them).
+#[test]
+fn parity_fails_when_a_rung_resolves_a_different_case_set() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local,cluster"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_LOCAL_SHA256", PINNED_DIGEST),
+            ("STUB_CLUSTER_SHA256", PINNED_DIGEST),
+            ("STUB_FAKE_MODEL", "1"),
+            // The one knob moved off the positive control.
+            ("STUB_CLUSTER_PLAN_COUNT", "2"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a tier whose suite loader resolves a different case count must fail \
+         the ladder; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass on a suite divergence; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("cluster")
+            && transcript
+                .contains(r#"grade 2 case(s) from suite "weather" against the cluster tier"#),
+        "the failure must name the rung and print the raw plan line the tier \
+         reported, so a harness red is distinguishable from a parity red; \
+         transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: fake-versus-live mode. The run asks for live, and the
+/// deployed cluster worker reports `CURIE_FAKE_MODEL=1`.
+///
+/// Prevents shipping silently: a "graded" nightly rung actually running sealed
+/// against the fake model. The cluster rung is the target on purpose -- it is
+/// the rung whose mode the script used to DISCLAIM rather than verify.
+#[test]
+fn parity_fails_when_the_deployed_model_mode_contradicts_the_run() {
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "cluster"),
+            ("CURIE_E2E_LIVE", "1"),
+            ("CURIE_CREDENTIALS", "test-credential"),
+            // The one knob moved: a live run against a sealed deployment.
+            ("STUB_FAKE_MODEL", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a live run against a deployment whose worker reports the fake model \
+         must fail the ladder, not warn; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass on a mode contradiction; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("cluster") && transcript.contains("CURIE_FAKE_MODEL"),
+        "the failure must name the rung and the observed CURIE_FAKE_MODEL value \
+         read off the running artifact; transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: case ids only. Between the local rung's deploy and the
+/// cluster rung's, the bundle's suite file has every case id rewritten while its
+/// suite NAME and case COUNT stay identical. Both rungs' dry-run plan lines
+/// therefore match the expectation exactly, and the digest is the only signal
+/// that moved.
+///
+/// This is the control that proves the digest, not the dry-run plan line, is
+/// what carries the case-id claim: the plan line carries a name and a count and
+/// no ids at all, so if the ladder's case-set evidence rested on it, this run
+/// would go green while the two tiers graded different cases. Deleting this test
+/// makes that transitive argument unfalsifiable and lets a decorative case-id
+/// claim ship.
+#[test]
+fn parity_fails_when_only_the_case_ids_differ() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+    let unmutated_digest = weather_bundle_sha256();
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local,cluster"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_FAKE_MODEL", "1"),
+            // The one knob moved off the positive control. No SHA overrides
+            // here: the stub reports a content-derived digest, so the
+            // divergence is CAUSED by the id rewrite rather than asserted.
+            ("STUB_MUTATE_CASE_IDS", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a case-id-only divergence must still fail the ladder, through bundle \
+         identity; transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass when two rungs graded different \
+         case ids; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains(r#"grade 1 case(s) from suite "weather" against the cluster tier"#),
+        "the cluster tier's plan line must still have matched the expected \
+         suite and count -- that is what makes this a case-ids-only \
+         divergence rather than a suite divergence; transcript:\n{transcript}"
+    );
+    assert!(
+        has_line_with(&transcript, &[&unmutated_digest, "cluster"]),
+        "the failure must be an identity failure naming the cluster rung and \
+         the pinned digest of the tree the ladder packed, not a suite failure; \
+         transcript:\n{transcript}"
+    );
+}
+
+/// NEGATIVE CONTROL: runtime binding. A stale active `prod` deployment exists
+/// for the same agent alongside the `dev` row this run just created.
+///
+/// Prevents shipping silently the worst failure in this area: a deploy receipt
+/// proves what was UPLOADED, not what the following turn RAN. The worker's
+/// binding prefers `prod` over recency over the active set, so a leftover active
+/// prod row serves the turn while the ladder reports the dev bundle's digest --
+/// a green ladder proving the wrong artifact. Deleting this test makes the
+/// sole-active-deployment assertion unfalsifiable.
+#[test]
+fn parity_fails_when_a_second_active_deployment_exists() {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    // The one knob moved off the positive control: the deployments read.
+    let api_url = spawn_deployments_stub(&two_active_deployments());
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local,cluster"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_LOCAL_SHA256", PINNED_DIGEST),
+            ("STUB_CLUSTER_SHA256", PINNED_DIGEST),
+            ("STUB_FAKE_MODEL", "1"),
+        ],
+    );
+
+    let transcript = transcript(&output);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a second active deployment for the same agent must stop the ladder \
+         before the turn, since the turn may bind to the wrong artifact; \
+         transcript:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("LADDER PASS"),
+        "the ladder must not announce a pass while a stale active deployment \
+         could have served the turn; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains(DEPLOYMENT_ID) && transcript.contains(STALE_PROD_DEPLOYMENT_ID),
+        "the failure must name every active deployment row, so the operator \
+         can see which one is the shadow; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("local down --wipe --yes"),
+        "the failure must carry the actionable fix line, matching the ladder's \
+         other preflight-style hard failures; transcript:\n{transcript}"
+    );
+}
+
+/// The inverse of the local/local-release assertions above, which pin those
+/// rungs to a bare `"$BIN" local eval ...` that `set -e` makes fatal. On the
+/// cluster rung the grade is REPORT ONLY (#1603): the eval still runs and still
+/// prints, but a red case must not fail the rung, because the weather case
+/// grades temperature PRESENCE and the cluster rung's provider-only egress makes
+/// presence a function of model phrasing rather than of a real fetch.
+///
+/// This is the successor of the #872 coverage (commit 1d266a73's third bullet),
+/// which asserted the ladder EXITED 42 on a red deployed evaluator. #1603
+/// deliberately reversed that half for this one rung, so what survives from #872
+/// is the other half, and it is the half that mattered: the evaluator must
+/// actually have been REACHED. Report only means non-fatal, never skipped.
+///
+/// Driven through the shared stub so the cluster rung's deploy-receipt, suite and
+/// mode reads resolve deterministically instead of falling through to `exit 97`
+/// or reaching the host's real `kubectl`. `STUB_EVAL_EXIT=42` keeps the injected
+/// failure the same one #872 used, so the only thing that changed is what the
+/// ladder is allowed to do with it.
+#[test]
+fn live_cluster_rung_reports_but_does_not_propagate_evaluator_failure() {
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let eval_marker = harness.path().join("eval_called");
+
+    let output = run_ladder(
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "cluster"),
+            ("CURIE_E2E_LIVE", "1"),
+            ("CURIE_CREDENTIALS", "test-credential"),
+            // A live run needs the deployed worker to report NO fake model, or
+            // the mode assertion would red the run before the evaluator ran.
+            ("STUB_FAKE_MODEL", ""),
+            (
+                "STUB_EVAL_MARKER",
+                eval_marker.to_str().expect("marker path"),
+            ),
+            ("STUB_EVAL_EXIT", "42"),
+        ],
+    );
+
+    // Stream-scoped, not the merged transcript: the tolerated-grade notice is a
+    // stderr diagnostic while LADDER PASS is the stdout verdict, and a control
+    // that accepted either on either stream would pass with the two swapped.
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         eval_marker.exists(),
-        "the deployed evaluator must run after the cluster message plumbing \
-         succeeds; status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "the deployed evaluator must still run after the cluster message \
+         plumbing succeeds -- report only means non-fatal, not skipped; \
+         status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
     assert_eq!(
         output.status.code(),
-        Some(42),
-        "the ladder must preserve the deployed evaluator failure; \
+        Some(0),
+        "the cluster rung's eval grade is report only (#1603), so an evaluator \
+         failure must NOT fail the ladder; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("LADDER PASS"),
+        "the ladder must run to completion past a red cluster eval; \
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("report only (#1603)"),
+        "a red cluster eval must say IN THE LOG that it was tolerated, and cite \
+         the ticket, so a silent tolerance is never mistaken for a pass; \
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }

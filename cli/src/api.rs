@@ -119,6 +119,11 @@ pub struct Agent {
 /// separates.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalRouteBinding {
+    // The deployed API can return a route binding with no `channel` after a
+    // live rebind, which previously hard-failed every verb that lists agents.
+    // Defaulting to empty is deliberate tolerance, not the fix: the
+    // underlying API/CLI schema mismatch (#1533) is still owed.
+    #[serde(default)]
     pub channel: String,
     /// Absent means the card channel's members are the approvers, the zero-setup
     /// default. Skipped on serialize so a channel-only write sends no `approvers`

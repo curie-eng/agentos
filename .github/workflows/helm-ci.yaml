@@ -5,16 +5,28 @@ name: Helm CI
 # job gives the chart the CI it otherwise lacks -- lint, render every shipped
 # values overlay, and schema-validate the rendered manifests.
 on:
+  # Push runs for every releasable commit because release authorization
+  # requires this check. Pull requests remain filtered to chart changes.
   push:
     branches: [main, next]
-    paths:
-      - "charts/curie/**"
-      - ".github/workflows/helm-ci.yaml"
   pull_request:
     branches: [main, next]
     paths:
       - "charts/curie/**"
       - ".github/workflows/helm-ci.yaml"
+      # The object-store web-identity gate below EXECUTES these repository
+      # files, so a change to one of them can break the gate without touching
+      # any charts/ path. Without them in this filter, a PR that reverts the
+      # credential fix matches nothing here, the whole helm job is skipped, and
+      # the gate that exists to catch exactly that revert never runs. That is
+      # the difference between a gate and a gate-shaped thing.
+      - "packages/aci-protocol/src/aci_protocol/s3.py"
+      - "apps/api/src/curie_api/config.py"
+      - "apps/api/src/curie_api/storage.py"
+      - "apps/worker/src/curie_worker/config.py"
+      - "apps/worker/src/curie_worker/bundle_store.py"
+      - "uv.lock"
+      - "pyproject.toml"
 
 permissions:
   contents: read
@@ -122,6 +134,21 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/sandbox-quota-scope-assertions.sh
+
+      - name: helm render assertions (otel collector checksum)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-checksum-assertions.sh
+
+      # Prove the collector's Langfuse credential and the Secret that carries it
+      # stay the same decision (issue #1563): under `langfuse.existingSecret` the
+      # collector follows the operator's Secret, the chart-managed Secret ships no
+      # stale dev-derived header for it to read, and the default-credential gate
+      # refuses the published dev header on that path instead of going green.
+      - name: helm render assertions (collector langfuse secret wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
 
       # Prove the Langfuse web+worker containers carry a numeric runAsUser
       # alongside runAsNonRoot (issue #351) so the kubelet can verify non-root
@@ -274,6 +301,34 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/worker-eval-wiring-assertions.sh
+
+      # This otherwise Python-free chart job needs the workspace because the
+      # web-identity gate below does not stop at the rendered YAML: it builds
+      # the real API and worker BundleStore objects under each rendered
+      # workload's env and asks the constructed boto3 client which credential
+      # provider won. Reading the manifests alone cannot tell an omitted
+      # credential apart from one the SDK signs as an empty identity.
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+
+      # Prove the key-free object store path (#1325). Pointing the bundle store
+      # at a real cloud object store used to REQUIRE static access keys: all
+      # three consumers supplied explicit credentials unconditionally, so an
+      # ambient role was never consulted. Clearing rustfs.auth.accessKey now
+      # omits every credential env and shell export, which only works if the
+      # omission is COMPLETE -- an empty AWS_ACCESS_KEY_ID is still a credential
+      # to the SDK, so it stops the provider chain and the web-identity provider
+      # is never reached. Also asserts the instance-role shortcut stays shut:
+      # NetworkPolicy selects pods and not containers, so opening IMDS for
+      # bundle-fetch would hand the node's IAM role to the runner as well.
+      - name: helm render assertions (object store web identity)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/object-store-web-identity-assertions.sh
 
       - name: helm template + kubeconform (values-dev overlay)
         run: |

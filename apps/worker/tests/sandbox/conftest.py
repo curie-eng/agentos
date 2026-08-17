@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 import redis
@@ -97,6 +98,11 @@ class FakeClaim:
     labels: dict[str, str]
     sandbox_name: str
     ready: bool = True
+    # The claim's creation instant, tz-aware UTC, as the cluster would stamp it.
+    # A test ages a claim by assigning a past instant here, which is how the
+    # reaper's bind-window grace is driven with no sleeps and no wall-clock
+    # dependence; None models an adapter that cannot report an age at all.
+    created_at: datetime | None = None
 
 
 @dataclass
@@ -139,6 +145,7 @@ class FakeSandboxClient:
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             sandbox_name=sandbox_name,
             ready=self.bind_ready,
+            created_at=datetime.now(UTC),
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
@@ -150,10 +157,13 @@ class FakeSandboxClient:
         claim = self.claims.get(name)
         if claim is None:
             return None
+        # The age every reaper test drives is read back through this view: a
+        # test ages ``FakeClaim.created_at``, and the substrate sees it here.
         return ClaimView(
             name=claim.name,
             ready=claim.ready,
             sandbox_name=claim.sandbox_name if claim.ready else None,
+            created_at=claim.created_at,
         )
 
     def delete_claim(self, name: str) -> None:

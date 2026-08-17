@@ -2010,6 +2010,7 @@ def test_operator_shorthand_gate_denies_the_effective_runtime_name() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert gate is not None
         callback = build_can_use_tool(gate)
@@ -2062,6 +2063,7 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert builtin is not None
         assert isinstance(
@@ -2077,6 +2079,7 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+            connector_servers=set(),
         )
         assert effective is not None
         assert isinstance(
@@ -2274,4 +2277,259 @@ def test_already_prefixed_operator_gate_naming_wrong_bundle_fails_closed() -> No
             policy_routes={},
             bundle_name="b",
             mcp_servers={"github"},
+        )
+
+
+# --- connectors.yaml tools are gateable end to end (#1495) ----------------------
+#
+# A connector rides ClaudeAgentOptions.mcp_servers (curie_runner.connectors), so
+# the SDK hands can_use_tool the bare mcp__<connector>__<tool>. The gate must arm
+# that exact literal: rewriting it to the plugin form would arm a name the SDK
+# never produces and the call would run unapproved.
+
+_K8S_TOOL = "mcp__kubernetes-admin__resources_create_or_update"
+
+
+def _connector_bundle(tmp_path, manifest: str, connectors: str) -> str:
+    plugin = tmp_path / ".claude-plugin"
+    plugin.mkdir(exist_ok=True)
+    (plugin / "plugin.json").write_text(manifest, encoding="utf-8")
+    (tmp_path / "connectors.yaml").write_text(connectors, encoding="utf-8")
+    return str(tmp_path)
+
+
+_K8S_CONNECTORS = "connectors:\n  kubernetes-admin:\n    image: ghcr.io/example/k8s-mcp:1.0.0\n"
+
+
+def test_resolution_carries_connector_server_names(tmp_path) -> None:
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+    resolution = resolve_approval_policy(root)
+    assert resolution.connector_servers == {"kubernetes-admin"}
+
+
+def test_manifest_gate_on_a_connector_tool_denies_the_live_call(tmp_path) -> None:
+    """The end-to-end property: a manifest gate naming a connector tool blocks it.
+
+    Driven through the public can_use_tool callback with the exact name the SDK
+    emits for a directly-mounted server, not a set-membership peek.
+    """
+
+    root = _connector_bundle(
+        tmp_path,
+        json.dumps(
+            {
+                "name": "sre-bot",
+                "approvalPolicy": {"gates": [{"gate": _K8S_TOOL, "route": "sre-oncall"}]},
+            }
+        ),
+        _K8S_CONNECTORS,
+    )
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=None,
+            policy_routes=resolution.route_by_tool,
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+        # And the blocked call carries the manifest route to the approving audience.
+        assert gate.route_by_tool[_K8S_TOOL] == "sre-oncall"
+
+    anyio.run(go)
+
+
+def test_operator_gate_on_a_connector_tool_arms_the_bare_name(tmp_path) -> None:
+    """The operator env-knob half: armed VERBATIM, never plugin-prefixed.
+
+    Before #1495 this raised ApprovalPolicyError (the connector is not a declared
+    MCP server), so an operator could not gate a connector tool at all. Rewriting
+    it to mcp__plugin_<bundle>_<connector>__<tool> would be worse: the gate would
+    arm green and the live call would sail through.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=[_K8S_TOOL],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({_K8S_TOOL})
+        result = await build_can_use_tool(gate)(
+            _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_operator_gate_naming_an_undeclared_connector_still_fails_closed(tmp_path) -> None:
+    root = _connector_bundle(tmp_path, json.dumps({"name": "sre-bot"}), _K8S_CONNECTORS)
+    resolution = resolve_approval_policy(root)
+    with pytest.raises(ApprovalPolicyError):
+        build_approval_gate(
+            operator_tools=["mcp__ghost__do_it"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+
+
+# --- a connector must not shadow a plugin server it prefixes (#1564) -------------
+#
+# A connectors.yaml connector and a plugin-loaded MCP server produce the SAME
+# mcp__<server>__ prefix shape, so one operator gate name can match both -- but
+# only one of the two live tool names is real. build_can_use_tool compares by
+# exact string equality, so arming the wrong one is a total fail-open: the SDK
+# hands over the live name, it is not in gate.required, and the call is ALLOWED
+# with no block recorded and nothing logged.
+
+_GIT_CONNECTORS = "connectors:\n  git:\n    image: ghcr.io/example/git-mcp:1.0.0\n"
+
+
+def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None:
+    """Connector `git` + plugin MCP server `git__hub`, gate mcp__git__hub__create_pr.
+
+    Both declared servers match the one gate name and nothing says which hosts the
+    tool, so BOTH live forms are armed and either real call is denied. Arming only
+    the connector's bare form arms a literal the SDK never emits when the tool
+    lives on the plugin server.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git__hub": {"command": "gh-server"}}}), encoding="utf-8"
+    )
+    live = "mcp__plugin_acme-bot_git__hub__create_pr"
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=["mcp__git__hub__create_pr"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({live, "mcp__git__hub__create_pr"})
+        result = await build_can_use_tool(gate)(live, {"title": "..."}, ToolPermissionContext())
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_connector_tool_with_double_underscore_is_denied_alongside_its_plugin_twin(
+    tmp_path,
+) -> None:
+    """The fail-open a length tiebreak leaves behind, driven end to end.
+
+    Connector `deploy` exposes a tool named `prod__apply`, so
+    mcp__deploy__prod__apply is ALREADY the live name -- and MCP server
+    `deploy__prod` is merely the LONGER matched name. Preferring the longer match
+    rewrote the gate into mcp__plugin_acme-bot_deploy__prod__apply, which the SDK
+    never emits for the connector, and build_can_use_tool's exact-string match let
+    the real connector call run unapproved with nothing logged. Neither name's
+    length says which server hosts the tool, so both live forms must be armed and
+    both calls must be denied.
+    """
+
+    root = _connector_bundle(
+        tmp_path,
+        json.dumps({"name": "acme-bot"}),
+        "connectors:\n  deploy:\n    image: ghcr.io/example/deploy-mcp:1.0.0\n",
+    )
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"deploy__prod": {"command": "deploy-server"}}}),
+        encoding="utf-8",
+    )
+    connector_live = "mcp__deploy__prod__apply"
+    plugin_live = "mcp__plugin_acme-bot_deploy__prod__apply"
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=[connector_live],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        callback = build_can_use_tool(gate)
+        for live in (connector_live, plugin_live):
+            result = await callback(live, {"env": "prod"}, ToolPermissionContext())
+            assert isinstance(result, PermissionResultDeny), live
+
+    anyio.run(go)
+
+
+def test_connector_gate_on_a_connector_tool_still_denies_alongside_a_prefixed_server(
+    tmp_path,
+) -> None:
+    """The #1495 property survives in the very bundle that triggers the contest.
+
+    Gate mcp__git__status names a genuine connector tool: no declared MCP server
+    matches it, so it stays the bare live name and the real call is denied.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git__hub": {"command": "gh-server"}}}), encoding="utf-8"
+    )
+
+    async def go() -> None:
+        resolution = resolve_approval_policy(root)
+        gate = build_approval_gate(
+            operator_tools=["mcp__git__status"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
+        )
+        assert gate is not None
+        assert gate.required == frozenset({"mcp__git__status"})
+        result = await build_can_use_tool(gate)(
+            "mcp__git__status", {"manifest": "..."}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+
+    anyio.run(go)
+
+
+def test_ambiguous_connector_and_server_gate_refuses_to_boot(tmp_path) -> None:
+    """Connector `git` and MCP server `git` both match mcp__git__create_pr.
+
+    The two live forms differ and neither is more specific, so there is no
+    principled winner. validate_bundle rejects this bundle at deploy, but the
+    operator env knob is never deploy-validated -- the runtime must refuse on its
+    own, loudly and with a message that names the ambiguity rather than claiming
+    the gate resolved to nothing.
+    """
+
+    root = _connector_bundle(tmp_path, json.dumps({"name": "acme-bot"}), _GIT_CONNECTORS)
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"git": {"command": "git-server"}}}), encoding="utf-8"
+    )
+    resolution = resolve_approval_policy(root)
+    with pytest.raises(ApprovalPolicyError, match="ambiguous"):
+        build_approval_gate(
+            operator_tools=["mcp__git__create_pr"],
+            policy_routes={},
+            bundle_name=resolution.bundle_name,
+            mcp_servers=resolution.mcp_servers,
+            connector_servers=resolution.connector_servers,
         )

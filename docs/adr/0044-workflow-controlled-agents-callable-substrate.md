@@ -2,11 +2,22 @@
 
 Date: 2026-07-16
 
-Status: Draft
+Status: Accepted
 
 This is a **decision, not code**: it settles whether, and how deeply, Curie
 supports *workflow-controlled* agents — developer-authored orchestration
 frameworks such as LangGraph and CrewAI — and what we would build to do it.
+
+**Read every ADR-0031 reference below as ADR-0060 plus ADR-0061.** This ADR was
+drafted while [ADR-0031](0031-harness-neutral-runner-seams.md) was Proposed; it
+is now Superseded by [ADR-0060](0060-the-harness-is-a-declared-package.md) (a
+harness is a declared package) and
+[ADR-0061](0061-out-of-process-harness-boundary.md) (the boundary is a process,
+not a Protocol). The decision here is unaffected, because it never depended on
+which shape the harness seam took — only on that seam existing before B is
+built. So phase 2's first gate condition now reads "0060 and 0061 have landed"
+rather than "ADR-0031 has landed", and it is if anything further out: 0061 is
+itself still a Draft gated on a spike.
 
 ## Context
 
@@ -83,7 +94,7 @@ Prior decisions frame this:
 - **ADR-0028** (substrate is resilience, not a product swap axis): the same
   discipline applied to the sandbox seam — keep a clean port, but do not market it
   as a bring-your-own axis ahead of funded demand.
-- **ADR-0031** (harness-neutral runner seams, *Proposed*): the runner is still
+- **ADR-0031** (harness-neutral runner seams, *Superseded by 0060/0061*): the runner is still
   Claude-shaped at four seams (`translate.py` isinstance-matches SDK types, the
   side-effect allowlist hardcodes Claude tool names, plugin ingestion hands the
   bundle to the SDK). B depends on this refactor landing first.
@@ -146,7 +157,8 @@ ADR-0031 and demand.
 B is not "write an adapter" — it is a second runtime path through the runner:
 
 1. **ADR-0031 lands first** (the `TurnEvent` union + `BundleInstaller` port +
-   harness-declared tool identity). Biggest hidden cost; currently *Proposed*.
+   harness-declared tool identity). Biggest hidden cost; superseded by 0060 and
+   0061, of which 0061 is a Draft gated on a spike.
 2. **A non-turn-based runner seam** distinct from `ModelSession` — "run this whole
    program, stream ACI events" — since a flow is not a turn.
 3. **Per-framework in-pod translators**: `stream_events(v3)` → ACI for LangGraph,

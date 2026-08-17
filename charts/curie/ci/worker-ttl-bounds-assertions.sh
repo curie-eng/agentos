@@ -57,7 +57,7 @@
 # JSON-Schema validator, whose wording changed between the CI-pinned helm and
 # current helm while the pass/fail outcomes stayed identical:
 #
-#   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:41):
+#   helm 3.16.4 (the CI pin, .github/workflows/helm-ci.yaml:40):
 #     - worker.routeTtlSeconds: Must be greater than 0
 #     - worker.routeTtlSeconds: Invalid type. Expected: integer, given: string
 #   helm 3.20.0:
@@ -113,6 +113,26 @@ for pair in want:
 PY
 )"
 
+WORKER_TERMINATION_GRACE_PY="$(
+  cat <<'PY'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+deploys = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and (d["metadata"].get("labels") or {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(deploys) != 1:
+    raise SystemExit(f"expected exactly one worker Deployment, rendered {len(deploys)}")
+got = deploys[0]["spec"]["template"]["spec"].get("terminationGracePeriodSeconds")
+if type(got) is not int or got != 1800:
+    raise SystemExit(
+        "worker terminationGracePeriodSeconds rendered "
+        f"{got!r}, expected integer 1800"
+    )
+PY
+)"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -156,8 +176,13 @@ assert_refused() {
 #     ci/api-ingress-assertions.sh:31-34 documents having fallen into. The
 #     negatives below render the WHOLE chart (via `render()`, no `-s`), so the
 #     guard must cover that same render shape, not just the worker template.
-helm template curie "$CHART" >/dev/null 2>&1 \
-  || fail a "the full-chart default render FAILED; every negative below would pass for the wrong reason"
+DEFAULT_RENDER="$TMP/default.yaml"
+if ! helm template curie "$CHART" >"$DEFAULT_RENDER" 2>&1; then
+  fail a "the full-chart default render FAILED; every negative below would pass for the wrong reason"
+fi
+if ! msg="$(python3 -c "$WORKER_TERMINATION_GRACE_PY" "$DEFAULT_RENDER" 2>&1)"; then
+  fail a "$msg"
+fi
 assert_env a -- \
   CURIE_CLAIM_TIMEOUT_SECONDS=90 \
   CURIE_ROUTE_TTL_SECONDS=3600 \

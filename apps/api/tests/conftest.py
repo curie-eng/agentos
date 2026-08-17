@@ -28,6 +28,17 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.sql import text
 
+# The object-store credential the suite talks to compose's RustFS with. The code
+# default in `curie_api.config` is deliberately empty so that omitting these
+# variables selects the AWS provider chain instead (the key-free BYO object-store
+# path, #1559), which means the test environment has to name the dev credential
+# itself rather than leaning on a production default. Declaring it here also makes
+# the suite independent of whatever ambient AWS credentials the developer's machine
+# happens to carry, which previously decided the result. `setdefault`, so a
+# contributor pointing the suite at another store by exporting their own value wins.
+os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
+os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_DIR = API_DIR / "alembic"
 DB_PREFIX = "curie_test_"
@@ -133,7 +144,8 @@ async def _truncate() -> None:
             await conn.execute(
                 text(
                     "TRUNCATE curie.approvals, curie.deployments, "
-                    "curie.agent_versions, curie.agents CASCADE"
+                    "curie.agent_versions, curie.agents, "
+                    "curie.console_sessions CASCADE"
                 )
             )
     finally:

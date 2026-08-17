@@ -1,275 +1,277 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+//! `curie dev chart-check` covers what helm-ci covers (#1481).
+//!
+//! helm-ci runs every script in `charts/curie/ci/` on any `charts/curie/**`
+//! change, and #1466 made that job release-blocking. The verb used to shell one
+//! script, so a contributor could run the documented local chart gate, see
+//! green, push, and be refused by CI on any of the other sixteen.
+//!
+//! The gap was structural, not a missing entry in a list: the verb named its one
+//! script literally, so every script added since was invisible to it. These
+//! tests pin the two properties that close it -- discovery from the directory,
+//! and a run that reports every failure rather than the first -- plus the
+//! divergence gate that keeps the verb and helm-ci describing the same set.
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
-const DELIBERATE_FAILURE: &str = "000-deliberate-failure";
+use curie::commands::{discover_chart_check_scripts, run_chart_check_scripts, CHART_CI_DIR};
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_curie")
+fn repo_root() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
 }
 
-fn source_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli has a repository parent")
-        .to_path_buf()
-}
-
-fn copy_file(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination.parent().expect("file has a parent"))
-        .expect("create destination parent");
-    fs::copy(source, destination).expect("copy fixture file");
-    fs::set_permissions(
-        destination,
-        fs::metadata(source)
-            .expect("read source permissions")
-            .permissions(),
-    )
-    .expect("preserve fixture permissions");
-}
-
-fn copy_directory(source: &Path, destination: &Path) {
-    fs::create_dir_all(destination).expect("create destination directory");
-    for entry in fs::read_dir(source).expect("read fixture directory") {
-        let entry = entry.expect("read fixture entry");
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type().expect("read fixture entry type");
-        if file_type.is_dir() {
-            copy_directory(&source_path, &destination_path);
-        } else if file_type.is_file() {
-            copy_file(&source_path, &destination_path);
-        } else {
-            panic!(
-                "fixture entry is not a regular file: {}",
-                source_path.display()
-            );
-        }
+/// Write `body` to `dir/name` and mark it executable, the shape the discovery
+/// walk selects on.
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("write scratch script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod scratch script");
     }
-    fs::set_permissions(
-        destination,
-        fs::metadata(source)
-            .expect("read source directory permissions")
-            .permissions(),
-    )
-    .expect("preserve fixture directory permissions");
+    path
 }
 
-fn scratch_checkout() -> tempfile::TempDir {
-    let source = source_root();
-    let scratch = tempfile::tempdir().expect("create scratch checkout");
-    copy_directory(
-        &source.join("charts/curie"),
-        &scratch.path().join("charts/curie"),
+/// AC3: a script added to `charts/curie/ci/` is picked up with no edit to `cli/`.
+///
+/// The scratch copy stands in for the real directory so the assertion is about
+/// discovery rather than about any particular chart assertion. A deliberately
+/// failing script is the load-bearing half: it proves the new file was actually
+/// executed, not merely listed.
+#[tokio::test]
+async fn a_newly_added_script_is_discovered_and_run_with_no_cli_edit() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    write_script(
+        scratch.path(),
+        "aaa-existing-assertions.sh",
+        "#!/bin/bash\nexit 0\n",
     );
-    for relative in ["runner/Dockerfile"] {
-        copy_file(&source.join(relative), &scratch.path().join(relative));
+
+    let before = discover_chart_check_scripts(scratch.path()).expect("discover");
+    assert_eq!(
+        before.len(),
+        1,
+        "expected the one seeded script, got {before:?}"
+    );
+
+    // The edit a contributor makes: drop a new script in the directory, touch
+    // nothing in cli/.
+    write_script(
+        scratch.path(),
+        "zzz-newly-added-assertions.sh",
+        "#!/bin/bash\nexit 1\n",
+    );
+
+    let after = discover_chart_check_scripts(scratch.path()).expect("discover");
+    assert_eq!(
+        after
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec![
+            "aaa-existing-assertions.sh".to_string(),
+            "zzz-newly-added-assertions.sh".to_string(),
+        ],
+        "the new script must be discovered, in sorted order"
+    );
+
+    let outcomes = run_chart_check_scripts(scratch.path(), &after)
+        .await
+        .expect("run the discovered scripts");
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.passed)
+        .map(|o| o.name.as_str())
+        .collect();
+    assert_eq!(
+        failed,
+        vec!["zzz-newly-added-assertions.sh"],
+        "the newly added failing script must be run and reported as failed"
+    );
+}
+
+/// AC2: one run surfaces every problem, so a failure does not stop the run.
+///
+/// Ordered fail / pass / fail on purpose: stopping at the first failure would
+/// report one failure and never reach the third script, which is the behavior
+/// that makes a contributor fix-and-rerun once per broken assertion.
+#[tokio::test]
+async fn a_failing_script_does_not_stop_the_run() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    write_script(
+        scratch.path(),
+        "1-fails-assertions.sh",
+        "#!/bin/bash\nexit 1\n",
+    );
+    write_script(
+        scratch.path(),
+        "2-passes-assertions.sh",
+        "#!/bin/bash\nexit 0\n",
+    );
+    write_script(
+        scratch.path(),
+        "3-also-fails-assertions.sh",
+        "#!/bin/bash\nexit 3\n",
+    );
+
+    let scripts = discover_chart_check_scripts(scratch.path()).expect("discover");
+    let outcomes = run_chart_check_scripts(scratch.path(), &scripts)
+        .await
+        .expect("run the discovered scripts");
+
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "every script must run, not just up to the first failure"
+    );
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|o| !o.passed)
+        .map(|o| o.name.as_str())
+        .collect();
+    assert_eq!(
+        failed,
+        vec!["1-fails-assertions.sh", "3-also-fails-assertions.sh"],
+        "both failures must be reported from a single run"
+    );
+}
+
+/// Discovery selects executable `*.sh` only: a README or a non-executable
+/// fragment sitting in the directory is not an assertion script, and running one
+/// would fail the whole verb for a file that never was a check.
+#[tokio::test]
+async fn discovery_skips_non_scripts_and_non_executable_files() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    write_script(
+        scratch.path(),
+        "real-assertions.sh",
+        "#!/bin/bash\nexit 0\n",
+    );
+    std::fs::write(scratch.path().join("README.md"), "not a script\n").expect("write readme");
+    std::fs::write(scratch.path().join("fragment.sh"), "#!/bin/bash\nexit 1\n")
+        .expect("write non-executable fragment");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            scratch.path().join("fragment.sh"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod fragment non-executable");
     }
-    scratch
+
+    let scripts = discover_chart_check_scripts(scratch.path()).expect("discover");
+    assert_eq!(
+        scripts
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["real-assertions.sh".to_string()],
+        "only executable *.sh files are assertion scripts"
+    );
 }
 
-fn executable_script_names(directory: &Path) -> Vec<String> {
-    let mut names = fs::read_dir(directory)
-        .expect("read chart assertion directory")
-        .map(|entry| entry.expect("read chart assertion entry"))
-        .filter(|entry| {
-            entry
-                .file_type()
-                .expect("read chart assertion file type")
-                .is_file()
-                && entry
-                    .metadata()
-                    .expect("read chart assertion metadata")
-                    .permissions()
-                    .mode()
-                    & 0o111
-                    != 0
-        })
-        .map(|entry| {
-            entry
-                .file_name()
-                .into_string()
-                .expect("chart assertion name is utf8")
-        })
-        .collect::<Vec<_>>();
-    names.sort();
-    names
+/// The set of scripts helm-ci names, recovered from the workflow rather than
+/// from a second hardcoded list.
+fn helm_ci_referenced_scripts() -> Vec<String> {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/helm-ci.yaml"))
+        .expect(".github/workflows/helm-ci.yaml is committed");
+    let needle = format!("{CHART_CI_DIR}/");
+    let mut found: Vec<String> = Vec::new();
+    for line in workflow.lines() {
+        let Some(start) = line.find(&needle) else {
+            continue;
+        };
+        let rest = &line[start + needle.len()..];
+        let end = rest.find(".sh").expect("a referenced script ends in .sh");
+        found.push(rest[..end + 3].to_string());
+    }
+    found
 }
 
-fn run_chart_check(checkout: &Path) -> Output {
-    let fake_bin = checkout.join("fake-bin");
-    fs::create_dir_all(&fake_bin).expect("create fake bash directory");
-    let fake_bash = fake_bin.join("bash");
-    fs::write(
-        &fake_bash,
-        format!(
-            "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  exit 1\nfi\nif [ \"${{1##*/}}\" = \"{DELIBERATE_FAILURE}\" ]; then\n  exec /bin/sh \"$@\"\nfi\nexit 0\n"
-        ),
-    )
-    .expect("write fake bash");
-    fs::set_permissions(&fake_bash, fs::Permissions::from_mode(0o755))
-        .expect("make fake bash executable");
-    let mut path = fake_bin.into_os_string();
-    path.push(":");
-    path.push(std::env::var_os("PATH").expect("PATH is set"));
-    Command::new(bin())
-        .args(["--color=never", "dev", "chart-check"])
-        .current_dir(checkout)
-        .env("PATH", path)
-        .output()
-        .expect("run curie dev chart-check")
-}
-
-fn output_text(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
-}
-
-#[derive(Clone, Copy)]
-enum ResultKind {
-    Pass,
-    Fail,
-}
-
-fn result_line_position(text: &str, script: &str, expected: ResultKind) -> Option<usize> {
-    let result = match expected {
-        ResultKind::Pass => format!("PASS {script}"),
-        ResultKind::Fail => format!("FAIL {script} ("),
-    };
-    text.lines()
-        .enumerate()
-        .find_map(|(position, line)| line.contains(&result).then_some(position))
-}
-
+/// AC5: the verb and helm-ci cannot silently diverge.
+///
+/// The verb discovers the directory and helm-ci names each script in its own
+/// step, so the two agree only by construction if something asserts it. Without
+/// this, a script added to the directory is run locally and never in CI (a check
+/// that blocks no release), or a helm-ci step outlives the script it names (a
+/// step that fails for a missing file). Exact 1:1 is assertable because this
+/// change also removed the duplicated `worker-object-store-assertions.sh` step
+/// that #1473 filed.
 #[test]
-fn chart_check_passes_unmodified_scratch_chart() {
-    let checkout = scratch_checkout();
-    let scripts = executable_script_names(&checkout.path().join("charts/curie/ci"));
+fn helm_ci_and_the_chart_ci_directory_cannot_diverge() {
+    let ci_dir = repo_root().join(CHART_CI_DIR);
+    let mut on_disk: Vec<String> = discover_chart_check_scripts(&ci_dir)
+        .expect("the committed chart assertion directory is readable")
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+
+    let referenced = helm_ci_referenced_scripts();
+    let mut unique = referenced.clone();
+    unique.sort();
+    unique.dedup();
+
+    assert_eq!(
+        referenced.len(),
+        unique.len(),
+        "helm-ci names a script more than once; a duplicated step costs CI time and \
+         hides which assertion actually covers the change"
+    );
+    assert_eq!(
+        unique, on_disk,
+        "helm-ci and {CHART_CI_DIR} disagree. Every script in the directory needs a \
+         helm-ci step, and every helm-ci step needs a script that exists."
+    );
+}
+
+/// AC4: the verb passes on the unmodified chart.
+///
+/// This runs the real assertion suite, so it needs BOTH `helm` and `uv` on PATH
+/// and takes single-digit seconds. `uv` joined `helm` with #1559: the object
+/// store assertions no longer only read the rendered manifest, they drive the
+/// real Python API and worker `BundleStore` clients through `uv run` to prove
+/// which botocore credential provider actually resolves, which reading YAML
+/// cannot show.
+///
+/// It skips rather than fails where either tool is absent, the same posture as
+/// the Valkey-backed tests: a missing local tool is not a regression in the
+/// chart. helm-ci itself is the environment where the suite is guaranteed to
+/// run, and `.github/workflows/helm-ci.yaml` installs uv and runs `uv sync`
+/// before that step, so the executing assertion runs for real on every chart
+/// change and on every push to main and next. Skipping here narrows where the
+/// suite runs locally, never where it gates.
+#[tokio::test]
+async fn chart_check_passes_on_the_unmodified_chart() {
+    if Command::new("helm").arg("version").output().is_err() {
+        eprintln!("skipping: helm is not on PATH");
+        return;
+    }
+    if Command::new("uv").arg("--version").output().is_err() {
+        eprintln!("skipping: uv is not on PATH");
+        return;
+    }
+
+    let root = repo_root();
+    let scripts = discover_chart_check_scripts(&root.join(CHART_CI_DIR)).expect("discover");
     assert!(
         !scripts.is_empty(),
-        "scratch chart has no executable assertions"
+        "the chart assertion directory must not be empty"
     );
 
-    let output = run_chart_check(checkout.path());
-    let text = output_text(&output);
-    assert!(
-        output.status.success(),
-        "unmodified chart check failed\n{text}"
-    );
-    let mut result_positions = BTreeSet::new();
-    for script in &scripts {
-        let position = result_line_position(&text, script, ResultKind::Pass)
-            .unwrap_or_else(|| panic!("missing explicit pass result for {script}\n{text}"));
-        assert!(
-            result_positions.insert(position),
-            "multiple assertions shared one pass result line\n{text}"
-        );
-    }
-    let pass_result_count = text.lines().filter(|line| line.contains("PASS ")).count();
-    assert_eq!(
-        pass_result_count,
-        scripts.len(),
-        "chart check reported an unexpected number of pass results\n{text}"
-    );
-}
-
-#[test]
-fn chart_check_discovers_deliberate_executable_failure() {
-    let checkout = scratch_checkout();
-    let assertions = checkout.path().join("charts/curie/ci");
-    let committed = executable_script_names(&assertions);
-    let later_script = committed
-        .last()
-        .expect("scratch chart has an executable assertion")
-        .clone();
-    assert!(later_script.as_str() > DELIBERATE_FAILURE);
-
-    let failure = assertions.join(DELIBERATE_FAILURE);
-    fs::write(
-        &failure,
-        "#!/bin/sh\nprintf 'deliberate failure ran\\n'\nexit 17\n",
-    )
-    .expect("write deliberate failure");
-    fs::set_permissions(&failure, fs::Permissions::from_mode(0o755))
-        .expect("make deliberate failure executable");
-
-    let output = run_chart_check(checkout.path());
-    let text = output_text(&output);
-    assert!(
-        !output.status.success(),
-        "discovered failing assertion must fail chart check\n{text}"
-    );
-    let failure_position = result_line_position(&text, DELIBERATE_FAILURE, ResultKind::Fail)
-        .unwrap_or_else(|| panic!("missing explicit fail result for {DELIBERATE_FAILURE}\n{text}"));
-    let later_position = result_line_position(&text, &later_script, ResultKind::Pass)
-        .unwrap_or_else(|| panic!("missing later pass result for {later_script}\n{text}"));
-    assert!(
-        later_position > failure_position,
-        "chart check stopped before the later assertion\n{text}"
-    );
-}
-
-fn helm_workflow_script_names(workflow: &str) -> Vec<String> {
-    workflow
-        .lines()
-        .flat_map(|line| {
-            let line = line.split_once('#').map_or(line, |(before, _)| before);
-            let tokens = line.split_whitespace().collect::<Vec<_>>();
-            tokens
-                .windows(2)
-                .filter(|pair| pair[0] == "bash")
-                .filter_map(|pair| {
-                    pair[1]
-                        .trim_matches(&['\'', '"'][..])
-                        .strip_prefix("charts/curie/ci/")
-                })
-                .filter(|name| !name.is_empty() && !name.contains('/'))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-#[test]
-fn chart_assertion_scripts_match_helm_ci_steps() {
-    let root = source_root();
-    let scripts = executable_script_names(&root.join("charts/curie/ci"))
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    assert!(!scripts.is_empty(), "chart assertion inventory is empty");
-
-    let workflow = fs::read_to_string(root.join(".github/workflows/helm-ci.yaml"))
-        .expect("read helm workflow");
-    let workflow_names = helm_workflow_script_names(&workflow);
-    let mut counts = BTreeMap::new();
-    for name in &workflow_names {
-        *counts.entry(name.clone()).or_insert(0usize) += 1;
-    }
-    let duplicates = counts
+    let outcomes = run_chart_check_scripts(&root, &scripts)
+        .await
+        .expect("run the committed chart assertion scripts");
+    let failed: Vec<&str> = outcomes
         .iter()
-        .filter(|(_, count)| **count > 1)
-        .map(|(name, count)| format!("{name} ({count} references)"))
-        .collect::<Vec<_>>();
+        .filter(|o| !o.passed)
+        .map(|o| o.name.as_str())
+        .collect();
     assert!(
-        duplicates.is_empty(),
-        "duplicate helm workflow assertion references: {}",
-        duplicates.join(", ")
-    );
-
-    let workflow_scripts = workflow_names.into_iter().collect::<BTreeSet<_>>();
-    let missing_from_workflow = scripts
-        .difference(&workflow_scripts)
-        .cloned()
-        .collect::<Vec<_>>();
-    let missing_from_directory = workflow_scripts
-        .difference(&scripts)
-        .cloned()
-        .collect::<Vec<_>>();
-    assert!(
-        missing_from_workflow.is_empty() && missing_from_directory.is_empty(),
-        "chart assertion parity mismatch\nmissing from workflow: {}\nmissing from directory: {}",
-        missing_from_workflow.join(", "),
-        missing_from_directory.join(", ")
+        failed.is_empty(),
+        "chart-check must pass on the unmodified chart; failed: {failed:?}"
     );
 }

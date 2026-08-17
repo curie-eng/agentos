@@ -1,7 +1,7 @@
 # 88. Per user delegated OAuth for MCP
 
 Date: 2026-07-30
-Status: Draft
+Status: Accepted
 
 Extends: [ADR 0009](0009-per-agent-connector-auth.md) by adding a user owned
 credential mode alongside per agent credentials.

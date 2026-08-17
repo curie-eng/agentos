@@ -93,6 +93,55 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.clickhouse.loggingConfig" -}}
+<clickhouse>
+  <logger>
+    <level>{{ .Values.clickhouse.logLevel }}</level>
+    <!-- Also to stdout, so `kubectl logs` works. The image logs only to
+         files under /var/log/clickhouse-server/, which in Kubernetes means
+         the diagnostics live inside the container and die with the pod,
+         exactly when you most want them. Cheap at `warning`. -->
+    <console>1</console>
+  </logger>
+  <!-- text_log is KEPT, and level-filtered rather than removed.
+       The image ships <text_log><level>trace</level></text_log>, and that
+       `level` is the whole problem: an hour of it produced 253,727 Debug
+       and 58,186 Trace rows against 15 Information. Filtering to
+       `{{ .Values.clickhouse.logLevel }}` drops the volume by ~4 orders of
+       magnitude while keeping the table queryable, and a queryable
+       text_log is precisely what diagnosed the incident this fixes. It also
+       outlives the pod, which the log file does not. -->
+  <text_log>
+    <level>{{ .Values.clickhouse.logLevel }}</level>
+    <ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl>
+  </text_log>
+{{- if .Values.clickhouse.systemLogs.enabled }}
+  <!-- Profiling and per-second resource sampling, on but TTL-bounded. -->
+  <trace_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></trace_log>
+  <metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></metric_log>
+  <asynchronous_metric_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></asynchronous_metric_log>
+{{- else }}
+  <!-- Removed. Unlike text_log these have no level filter; they sample on
+       a timer regardless of whether anything is happening, so the only
+       lever is on/off. metric_log was the table whose merge wedged and
+       started the spiral. Prometheus and node metrics already cover what
+       they measure, from outside the process that is failing. -->
+  <trace_log remove="1"/>
+  <metric_log remove="1"/>
+  <asynchronous_metric_log remove="1"/>
+{{- end }}
+  <!-- Kept regardless: low volume, useful when ClickHouse itself
+       misbehaves. TTL'd so none can become the next text_log.
+       processors_profile_log is here because a live boot showed the image
+       creates it too. It is easy to miss precisely because it is small
+       today, which is what text_log also was once. -->
+  <query_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></query_log>
+  <part_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></part_log>
+  <error_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></error_log>
+  <processors_profile_log><ttl>event_date + INTERVAL {{ .Values.clickhouse.systemLogs.retentionDays }} DAY DELETE</ttl></processors_profile_log>
+</clickhouse>
+{{- end }}
+
 {{- define "curie.rustfs.host" -}}
 {{- if .Values.rustfs.deploy -}}
 {{- printf "%s-rustfs" (include "curie.fullname" .) -}}
@@ -101,31 +150,159 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- end -}}
 {{- end -}}
 
+{{- define "curie.rustfs.scheme" -}}
+{{- if and (not .Values.rustfs.deploy) (eq (printf "%v" .Values.rustfs.port) "443") -}}
+https
+{{- else -}}
+http
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.rustfs.endpoint" -}}
+{{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
+{{- end -}}
+
+{{/* Whether the object-store clients (api, worker, and the sandbox
+     bundle-fetch init container) present static credentials.
+
+     Non-empty when `rustfs.auth.accessKey` is set, which is the default and the
+     only mode the in-chart RustFS supports. Empty when the operator cleared it,
+     which is the BYO key-free path (#1325): every credential env var is omitted
+     so the AWS SDK falls through its provider chain to the web-identity
+     provider (`AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`), fed by a
+     projected ServiceAccount token.
+
+     Web identity is the ONLY key-free path this chart supports, deliberately.
+     The instinct on AWS is to drop the keys and let the node's instance role
+     answer, and that must not be made to work here: Rail 1 denies
+     169.254.169.254 by construction, and `security-networkpolicy.yaml` computes
+     an `except` so a broad operator `allowedEgress` CIDR cannot re-permit the
+     metadata address. NetworkPolicy selects pods, not containers, so opening
+     IMDS for the bundle-fetch init container would also open it for the runner
+     -- a prompt-injectable agent -- handing it the node's IAM role. Web
+     identity reads a mounted token instead of a network endpoint, so it needs
+     no metadata access and leaves Rail 1 intact. */}}
+{{- define "curie.rustfs.staticCredentials" -}}
+{{- if .Values.rustfs.auth.accessKey -}}
+true
+{{- else if .Values.rustfs.deploy -}}
+{{- fail "rustfs.auth.accessKey is empty but rustfs.deploy is true. The in-chart RustFS is configured with those static credentials and has no web-identity path, so clearing the key would leave every bundle read and write unauthenticated against it. Either set rustfs.auth.accessKey, or set rustfs.deploy=false and point rustfs.host at an external store that accepts the ServiceAccount's projected token (see the chart README, 'Key-free object store auth')." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.langfuse.webHost" -}}
 {{- printf "%s-langfuse-web" (include "curie.fullname" .) -}}
 {{- end -}}
 
-{{/* base64("<publicKey>:<secretKey>") for the OTel Collector's Authorization
-     header. Uses the operator override when set, otherwise derives it from the
-     Langfuse init keys so the trace path authenticates with no manual step. */}}
+{{/* base64("<publicKey>:<secretKey>") for the OTel Collector config checksum,
+     and the operand the default-credential gate judges. The header this chart
+     actually emits is resolved in secrets.yaml, from the managed-secret value
+     of the Langfuse init project secret key; this helper composes from the raw
+     .Values inputs instead, so a generated per-release credential does not
+     churn the checksum.
+
+     Three branches (issue #1563):
+       1. the operator override wins whenever it is set;
+       2. when the collector reads a Secret this chart does not manage, this
+          renders EMPTY. The header lives in the operator's Secret, which a
+          .Values composition cannot read, so the helper must report only what
+          this chart actually ships and never a dev-key-derived value the chart
+          puts nowhere. Deciding that off curie.otlpAuthHeaderSecretName is also
+          what keeps this helper and the secrets.yaml emission condition the
+          same decision;
+       3. otherwise the chart-managed Secret is the one the collector reads, so
+          the header derives from the Langfuse init keys. */}}
 {{- define "curie.otlpAuthHeader" -}}
 {{- if .Values.otelCollector.otlpAuthHeader -}}
 {{- .Values.otelCollector.otlpAuthHeader -}}
+{{- else if ne (include "curie.otlpAuthHeaderSecretName" .) (include "curie.secretName" .) -}}
 {{- else -}}
 {{- printf "Basic %s" (printf "%s:%s" .Values.langfuse.init.projectPublicKey .Values.langfuse.init.projectSecretKey | b64enc) -}}
 {{- end -}}
 {{- end -}}
 
+{{/* Secret the OTel Collector reads its otlpAuthHeader key from. An explicit
+     otelCollector.otlpAuthHeader materialises into the chart-managed Secret, so
+     that override reads from the chart's own Secret; otherwise the collector
+     follows the same BYO idiom as every other Langfuse consumer (#169).
+     This MUST agree with the otlpAuthHeader emission condition in secrets.yaml:
+     they are the same decision written twice, and disagreement is the desync
+     issue #1563 closes. */}}
+{{- define "curie.otlpAuthHeaderSecretName" -}}
+{{- if .Values.otelCollector.otlpAuthHeader -}}
+{{- include "curie.secretName" . -}}
+{{- else -}}
+{{- .Values.langfuse.existingSecret | default (include "curie.secretName" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.otelCollector.config" -}}
+# Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
+# forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
+# silently unsupported), so the collector is the adapter. Langfuse appends
+# /v1/traces to the otlphttp base path itself.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  batch: {}
+exporters:
+  otlphttp/langfuse:
+    endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
+    headers:
+      Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+  debug:
+    verbosity: normal
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/langfuse, debug]
+{{- end }}
+
 {{/* ---- Default-credential gate (issue #198) ----
      When security.checkDefaultCredentials is on, refuse to render if a Langfuse
-     bootstrap identity still carries the published dev default from values.yaml.
-     Unlike the nine store/control-plane secrets, these init identities seed the
-     org/project on first boot (a different lifecycle), so #57 deliberately
-     excludes them from its render-time gate; this closes that gap. The published
-     admin password is a Langfuse admin-takeover risk on a reachable UI, and the
-     project secret key also feeds the OTel Collector auth header. The operator
-     clears the gate by overriding the value or supplying langfuse.existingSecret
-     (the #169 secretKeyRef escape carries both keys).
+     chart input for a bootstrap identity still carries the published dev default
+     from values.yaml. The first two checks compare INPUTS, before managed secret
+     resolution: with security.allowDevDefaults on, that input is what ships, and
+     an operator who leaves the published value in a values file has said what
+     they intend regardless of what the sealed path would have generated. These
+     init identities seed the org/project on first boot (a different lifecycle
+     from the nine store/control-plane secrets), so #57 deliberately excludes them
+     from its render-time gate; this closes that gap. The published admin password
+     is a Langfuse admin-takeover risk on a reachable UI, and on the path where
+     the chart-managed Secret is the one the collector reads, the project secret
+     key also feeds the OTel Collector auth header. The operator clears these two
+     checks by overriding the value or pointing langfuse.existingSecret at a
+     Secret this chart does not manage (the #169 secretKeyRef escape carries both
+     keys, and on that path the operator's Secret supplies otlpAuthHeader
+     directly).
+
+     The guard is "does the chart-managed Secret still supply these credentials",
+     written with the same existingSecret-defaults-to-our-own-Secret idiom every
+     other consumer uses, NOT "is existingSecret non-empty". Naming the chart's
+     own Secret changes nothing about where the credentials come from: the chart
+     still fills those keys from the langfuse.init values, so the checks have to
+     run there. Guarding on non-emptiness disabled the check on a path that ships
+     a default credential.
+
+     The third check, on the rendered collector header (issue #1563), is
+     unconditional: langfuse.existingSecret does NOT clear it, because that
+     header ships to the collector whatever the Langfuse credential source is,
+     whether it came from an otelCollector.otlpAuthHeader override or the chart
+     composed it from the langfuse.init keys.
 
      Off by default so the flagship zero-secret bare install stays green and the
      dev/e2e overlays render unchanged; flip it on for a shared/production
@@ -133,13 +310,65 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
      (hence the general name) once its design pass lands. */}}
 {{- define "curie.checkDefaultCredentials" -}}
 {{- if .Values.security.checkDefaultCredentials -}}
-{{- if not .Values.langfuse.existingSecret -}}
+{{- if eq (.Values.langfuse.existingSecret | default (include "curie.secretName" .)) (include "curie.secretName" .) -}}
 {{- if eq .Values.langfuse.init.projectSecretKey "sk-lf-curie-dev" -}}
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.projectSecretKey is still the published dev default \"sk-lf-curie-dev\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- this key also feeds the OTel Collector auth header." -}}
 {{- end -}}
 {{- if eq .Values.langfuse.init.userPassword "curie-dev-password" -}}
 {{- fail "security.checkDefaultCredentials is on but langfuse.init.userPassword is still the published dev default \"curie-dev-password\". Override it (or set langfuse.existingSecret) before installing on a shared/production cluster -- the published admin password allows Langfuse admin takeover on a reachable UI." -}}
 {{- end -}}
+{{- end -}}
+{{/* Outside the existingSecret guard on purpose (issue #1563): the header
+     reaches the collector on every path, so a BYO Langfuse Secret does not make
+     the published header safe. That is the case this check exists for: with a
+     foreign langfuse.existingSecret the two checks above are skipped entirely,
+     and an otelCollector.otlpAuthHeader carrying the published dev credential
+     would otherwise render unchallenged.
+
+     The operand is the RENDERED header (curie.otlpAuthHeader), not the
+     otelCollector.otlpAuthHeader input, so the same expression covers the
+     override and the composed-from-langfuse.init spellings without enumerating
+     them. The composed spelling is in practice preempted by the projectSecretKey
+     check above, which fires first on exactly the inputs that would compose it;
+     reading the rendered header keeps the two in agreement rather than relying
+     on that ordering. Composed via b64enc rather than pasted so it cannot drift
+     from curie.otlpAuthHeader.
+
+     THREAT MODEL, so the next reader stops enumerating spellings: this guards
+     against an operator shipping this repository's published credential by
+     accident. It is not an adversarial control, and cannot be one: anyone who
+     can set otelCollector.otlpAuthHeader can equally set
+     security.checkDefaultCredentials=false. Normalising the scheme's case and
+     the credential's whitespace covers the spellings a copy/paste, a line wrap
+     or a templating tool actually produces; it deliberately does NOT chase
+     encodings only a deliberate bypass would produce.
+
+     The header is split ONCE into scheme and credential, on its first run of
+     whitespace, and each half is then normalised on its own terms. The scheme
+     token is case-insensitive (RFC 9110), so it is compared lowercased against
+     "basic". The credential is compared with ALL whitespace removed and base64
+     padding stripped, because the receiver strips whitespace before decoding:
+     interior whitespace from a wrapped paste decodes to the same credential,
+     and taking the last whitespace-separated field instead would compare only
+     its tail. The credential is NOT lowercased: base64 is case-significant, and
+     folding its case would widen the match to strings that are not this
+     credential. An empty rendered header (the chart ships nothing, the
+     operator's Secret carries it) yields an empty scheme, which is not "basic",
+     so it matches nothing. b64dec is not usable here, since sprig returns an
+     error string rather than the plaintext for unpadded input.
+
+     Deliberately independent of otelCollector.deploy: the chart writes this
+     credential into its Secret either way, so a release that does not run a
+     collector still ships the published dev key for one that later does. */}}
+{{- $header := trim (include "curie.otlpAuthHeader" .) -}}
+{{- $parts := regexSplit "[[:space:]]+" $header 2 -}}
+{{- $scheme := first $parts -}}
+{{- $credential := "" -}}
+{{- if gt (len $parts) 1 -}}
+{{- $credential = index $parts 1 -}}
+{{- end -}}
+{{- if and (eq (lower $scheme) "basic") (eq (trimAll "=" (regexReplaceAll "[[:space:]]+" $credential "")) (trimAll "=" (b64enc "pk-lf-curie-dev:sk-lf-curie-dev"))) -}}
+{{- fail "security.checkDefaultCredentials is on but the chart would ship the published dev header \"Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==\" as the OTel Collector auth credential in its Secret (auth scheme spelling, whitespace and base64 padding aside), which the collector authenticates with when deployed. That is the dev project key pk-lf-curie-dev:sk-lf-curie-dev, which anyone reading this repository holds. That header arrives either from otelCollector.otlpAuthHeader set to it directly, or from the chart composing it out of langfuse.init.projectPublicKey and langfuse.init.projectSecretKey when the chart-managed Secret is the one the collector reads. Set otelCollector.otlpAuthHeader from your own project keys, override those two langfuse.init values, or point langfuse.existingSecret at your own Secret and supply otlpAuthHeader there." -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
@@ -166,12 +395,12 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
           quoted `--set security.allowDevDefaults="false"` would otherwise read as
           truthy and ship the published default -- a fail-OPEN regression.
        2. Explicit override: if the operator/CLI supplied a value that differs from
-          the published default (`ne value default`), it WINS -- even on `helm
-          upgrade`. This is operator intent (a rotation, a recovery, a `--set`, or
-          an `existingSecret`-equivalent value), so it must beat the persisted
-          value; matches Bitnami's `providedPasswordValue`-first precedence. It
-          MUST sit ahead of the persist branch or an explicit rotation on
-          upgrade would be silently ignored.
+          the published default (`ne value default`), it wins even on `helm
+          upgrade`. For the nine non init credentials, this supports rotation or
+          recovery. The Langfuse init credentials are first boot inputs, so an
+          upgrade only changes the Secret; it does not rotate Langfuse records.
+          The override must sit ahead of the persist branch or an explicit value
+          on upgrade would be silently ignored.
        3. Persist existing: no override, so if a prior install already GENERATED
           this key, re-use it. `helm upgrade` must NEVER rotate a live store
           credential (Postgres would reject the new password against its persisted
@@ -236,13 +465,16 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
       key: valkeyPassword
 {{- end -}}
 
-{{/* Platform-API connection env for the first-party services that CALL the API
-     (today the dispatcher; the chart worker's identical gap is a tracked
-     follow-up). Exists as a helper for the same reason curie.env.postgres and
-     curie.env.valkey do: the API URL env has now been forgotten three
-     times on new callers, while the store envs never recurred, because those had
-     a helper to include and this did not. Wire a new API caller by including
-     this rather than re-deriving the URL inline.
+{{/* Platform API connection env for first party services that call the API.
+     Keep the URL and key as separate helpers so callers can include only the
+     credentials they need. The composed helper preserves the existing
+     dispatcher contract.
+
+     The API URL env has been forgotten three times on new callers because
+     those callers had a shared helper to include and the worker did not.
+     New API callers should include the granular URL helper rather than derive
+     the URL inline. This follows the same shared helper pattern as
+     `curie.env.postgres` and `curie.env.valkey`.
 
      The BYO override is .Values.dispatcher.apiBaseUrl. Note the deliberate
      absence of a `required` call for the api.deploy=false case that the sibling
@@ -250,7 +482,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
      CrashLoopBackOff by design (documented in NOTES.txt and the README), not a
      render-time failure. Include with `nindent 12` to land at a container's env
      column. */}}
-{{- define "curie.env.api" -}}
+{{- define "curie.env.apiUrl" -}}
 # Where the platform API lives. The dispatcher POSTs an approval
 # resolve here when someone clicks Approve in Slack, so an unwired
 # value means the click dead-ends: the code default
@@ -261,6 +493,9 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 # api.service.port so the two sides cannot drift.
 - name: CURIE_API_URL
   value: {{ .Values.dispatcher.apiBaseUrl | default (printf "http://%s-api:%v" (include "curie.fullname" .) .Values.api.service.port) | quote }}
+{{- end -}}
+
+{{- define "curie.env.apiKey" -}}
 # The same chart Secret key api.yaml consumes as API_KEY, so the
 # caller and the API cannot drift apart. By reference only: an inline
 # value would put the shared platform key into `helm get manifest`
@@ -270,6 +505,11 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
     secretKeyRef:
       name: {{ include "curie.secretName" . }}
       key: apiKey
+{{- end -}}
+
+{{- define "curie.env.api" -}}
+{{- include "curie.env.apiUrl" . }}
+{{ include "curie.env.apiKey" . }}
 {{- end -}}
 
 {{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP

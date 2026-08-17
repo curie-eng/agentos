@@ -36,9 +36,11 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   typed `CliOutput` whose `to_json` delegates to its unchanged pure builder, so the
   committed schemas stay byte-for-byte identical while the json-vs-human decision
   lives only in `Ui::emit`. The one intentional non-`CliOutput` emit is the
-  centralized error path in `main.rs` (`error_json` under `--json`): errors are not
-  success-path values, so they stay on the error-emit mirror rather than the
-  success-path `CliOutput` contract.
+  centralized error path in `main.rs` (`error_json` under `--json`): generic
+  errors use `error.schema.json`, while `cluster deploy --all-targets`
+  reconciliation failures use `deploy.schema.json`. Errors are not success-path
+  values, so they stay on the error-emit mirror rather than the success-path
+  `CliOutput` contract.
 - **The command manifest is a committed artifact; regenerate it in the same
   change as any command-surface edit (console/CLI parity, epic #145).** Any
   change to a clap `Command`/subcommand or an `*Action` enum — a renamed verb,
@@ -154,12 +156,11 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
   `secret_env` compose process env channel, and never prints an unmasked token
   in live or dry run output. `--disconnect` clears the real Slack wiring,
   stops the dispatcher, and restores the local stub for `local message`.
-- **`cluster message` self-plumbs and guards against hijacking real Slack.** It manages
-  its own kubectl port-forwards (children killed on exit) and, when wiring the
-  deployed worker to its local stub, refuses if a `<release>-dispatcher`
-  Deployment exists (a real workspace is connected) unless `--force-wire`. Do
-  not drop that guard: the stub wiring is cluster-wide and would divert a live
-  workspace's replies.
+- **`cluster message` follows the deployed transport.** It manages its own
+  kubectl port-forwards (children killed on exit). With a connected dispatcher,
+  it posts a placeholder and routes the reply to the agent's bound Slack
+  channel. Without a dispatcher, it uses the terminal reply stub and waits for
+  the reply.
 - **A new `Deserialize` struct in `cli/src/api.rs` must be declared in
   `cli/api-mirrors.json`** (as a `mirrors` entry with its allowlisted field
   omissions, or a `non_mirrors` entry with a one-line reason). `curie dev
@@ -214,10 +215,14 @@ the environment.
 Cold-start parity ladder (issue #690, `curie dev e2e-ladder` ->
 `cli/scripts/e2e-ladder.sh`) -- an E2E test, same as the scripted E2E above, not
 the falsifiability gate below it. It chains three rungs: rung 1 delegates to
-`e2e.sh` unchanged; rung 2 drives `local up --minimal` -> `local deploy` ->
-`local message` (reply asserted) -> `local down`, against `compose.dev.yaml`;
-rung 3 drives `cluster deploy` -> `cluster message` against a pre-installed
-release, a real round trip with no manual port-forward. A fourth,
+`e2e.sh`, passing it the common `examples/weather` bundle via
+`CURIE_E2E_BUNDLE` (a standalone `e2e.sh` run keeps its own `--from-spec`
+scaffold when the var is unset); rung 2 drives `local up --minimal` ->
+`local deploy` -> `local message` (reply asserted) -> `local down`, against
+`compose.dev.yaml`; rung 3 drives `cluster deploy` -> `cluster message`
+against a pre-installed release, a real round trip with no manual
+port-forward. The ladder asserts one bundle identity, one eval suite, and one
+model mode across every rung and fails on divergence. A fourth,
 separately-named `local-release` rung (issue #695) repeats rung 2's exact round
 trip against `compose.release.yaml` instead -- the file
 `compose/generate_release_compose.py` derives from `compose.dev.yaml` and the

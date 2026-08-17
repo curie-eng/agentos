@@ -1,7 +1,12 @@
 # 87. The API renders connector objects; the CLI applies them
 
 Date: 2026-07-30
-Status: Draft
+Status: Accepted
+
+Realized by `read_version_connectors` in `apps/api/src/curie_api/routers/agents.py`,
+which renders the objects and applies none of them, and by `version_connectors` in
+`cli/src/api.rs` with the apply and prune in `cli/src/connectors.rs`, which are
+what reach the cluster.
 
 ## Context
 

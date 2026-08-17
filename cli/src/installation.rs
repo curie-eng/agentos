@@ -2381,11 +2381,12 @@ mod apply_tests {
     #[tokio::test]
     async fn a_declared_but_unresolved_model_credential_is_not_a_reset() {
         let cfg = cfg_with_all_names();
-        let (local, missing) = plan_installation_lenient(cfg).expect("lenient plan");
+        let (mut local, missing) = plan_installation_lenient(cfg).expect("lenient plan");
         assert!(
             missing.contains(&"MODEL_KEY".to_string()),
             "fixture must leave the model credential unresolved: {missing:?}"
         );
+        local.up.common.dry_run = true;
         let plan = complete_installation_plan(local)
             .await
             .expect("dry-run plan needs no cluster");

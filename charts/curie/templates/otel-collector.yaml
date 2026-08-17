@@ -7,39 +7,7 @@ metadata:
     {{- include "curie.labels" . | nindent 4 }}
 data:
   collector-config.yaml: |
-    # Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
-    # forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
-    # silently unsupported), so the collector is the adapter. Langfuse appends
-    # /v1/traces to the otlphttp base path itself.
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: 0.0.0.0:4317
-          http:
-            endpoint: 0.0.0.0:4318
-    processors:
-      batch: {}
-    exporters:
-      otlphttp/langfuse:
-        endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
-        headers:
-          Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
-      debug:
-        verbosity: normal
-    extensions:
-      health_check:
-        endpoint: 0.0.0.0:13133
-    service:
-      extensions: [health_check]
-      telemetry:
-        metrics:
-          level: none
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [otlphttp/langfuse, debug]
+{{ include "curie.otelCollector.config" . | indent 4 }}
 ---
 apiVersion: v1
 kind: Service
@@ -72,7 +40,7 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/config: {{ printf "%s|%s" (include "curie.langfuse.webHost" .) (include "curie.otlpAuthHeader" .) | sha256sum }}
+        checksum/config: {{ printf "%s|%s" (include "curie.otelCollector.config" .) (include "curie.otlpAuthHeader" .) | sha256sum }}
       labels:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "otel-collector") | nindent 8 }}
@@ -94,7 +62,7 @@ spec:
             - name: LANGFUSE_OTLP_AUTH_HEADER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
+                  name: {{ include "curie.otlpAuthHeaderSecretName" . }}
                   key: otlpAuthHeader
           ports:
             - name: otlp-grpc

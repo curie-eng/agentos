@@ -6,17 +6,25 @@ just a ref; pushing one proves nothing about the commit it points at. This
 script is the gate `authorize-release` runs before any other job in that
 pipeline, and it fails closed on either of two questions:
 
-  ancestry  Is the tagged commit reachable from `origin/main`? A tag on a
-            feature branch, a rebased-away commit, or anything that bypassed a
-            merged PR is refused here, before any image builds.
+  ancestry  Is the tagged commit reachable from an explicitly supplied
+            reviewed branch? A tag on a feature branch, a rebased commit, or
+            anything that bypassed a merged PR is refused here, before any
+            image builds.
 
   checks    Does that commit's check-runs list show every REQUIRED_CHECK_NAMES
-            entry successful (or neutral/skipped)? An explicit allowlist,
+            entry successful (or neutral)? An explicit allowlist,
             not "some checks, all green" (issue #733): a commit with only an
             unrelated passing check-run and no sign its real CI ever ran
-            must be refused, the same as one that is on main but was never
-            checked, or was checked and failed. Zero check-runs is also a
-            failure -- absence of checks is not evidence they passed. The
+            must be refused, the same as one that is on a reviewed branch but
+            was never checked, or was checked and failed. Zero check-runs is
+            also a failure -- absence of checks is not evidence they passed. A
+            required check-run that concluded `skipped` is refused too
+            (issue #1470): a job-level `if:` on the job, or a failed job in
+            its `needs:`, both make GitHub record that required check as
+            `skipped`, and a chart that was never rendered, linted, or
+            kubeconform-validated must not authorize a release. A skipped
+            check-run whose name is NOT required is still ignored, like any
+            other non-required check. The
             gate's own workflow run is excluded from that list (issue #732):
             it is itself an in-progress check-run on the tagged SHA and
             would otherwise wait on itself forever.
@@ -35,14 +43,15 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
-PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
+PASSING_CONCLUSIONS = {"success", "neutral"}
 
 # The check-run names that must be present and green before a tag may
 # publish (issue #733). These are the job `name:` fields from
-# `.github/workflows/ci.yaml` -- the workflow that gates every PR/push to
-# `main` -- restricted to the jobs that speak to release confidence: the
+# `.github/workflows/ci.yaml`, the workflow that gates every PR and push to
+# a reviewed branch, restricted to jobs that speak to release confidence: the
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
 # (including the worker-local overlay and the dispatcher's own import
@@ -52,11 +61,13 @@ PASSING_CONCLUSIONS = {"success", "neutral", "skipped"}
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
 # excluded -- they matter, but are not what this gate is asserting about
 # *this* commit's CI.
+# The chart check is included despite living in another workflow because it
+# validates the release chart itself.
 #
-# This list is a plain constant, not derived from ci.yaml at runtime -- the
-# simpler of the two options ADR-0058 left open (issue #733). A renamed or
-# removed ci.yaml job needs a matching edit here; there is no drift check
-# tying the two together yet.
+# This list is a plain constant, not derived from ci.yaml or helm-ci.yaml at
+# runtime. It is the simpler of the two options ADR-0058 left open (issue
+# #733). Tests pin its required names to jobs in both workflows, so a job
+# rename or removal requires a matching edit here.
 REQUIRED_CHECK_NAMES = frozenset(
     {
         "Python (ruff + mypy + pytest)",
@@ -74,6 +85,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",
+        "Chart (lint + template + kubeconform)",
     }
 )
 
@@ -82,21 +94,39 @@ class AuthorizationError(Exception):
     """A tagged commit is not authorized to publish a release."""
 
 
-def commit_is_on_reviewed_main(
-    sha: str, main_ref: str = "origin/main", *, cwd: Path | None = None
+def commit_is_on_reviewed_branch(
+    sha: str, reviewed_ref: str, *, cwd: Path | None = None
 ) -> bool:
-    """Is `sha` reachable from `main_ref` in the checked-out repo at `cwd`?
+    """Is `sha` reachable from `reviewed_ref` in the repo at `cwd`?
 
     Requires full history (`fetch-depth: 0` in the workflow checkout); a
     shallow clone would make an ancestor commit unreachable and read as absent.
     """
-    result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", sha, main_ref],
-        cwd=cwd,
-        capture_output=True,
-        check=False,
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, reviewed_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise AuthorizationError(
+            f"could not determine whether commit {sha} is reachable from "
+            f"{reviewed_ref}: {exc}"
+        ) from exc
+
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+
+    detail = result.stderr.strip()
+    suffix = f": {detail}" if detail else ""
+    raise AuthorizationError(
+        f"could not determine whether commit {sha} is reachable from "
+        f"{reviewed_ref}; git merge-base returned {result.returncode}{suffix}"
     )
-    return result.returncode == 0
 
 
 def missing_required_checks(
@@ -106,8 +136,13 @@ def missing_required_checks(
     """Which `required_names` have no passing check-run for this commit?
 
     A name only counts as satisfied if some check-run with that exact `name`
-    concluded `success`/`neutral`/`skipped` AND no check-run with that name is
-    still running, failed, or otherwise non-passing. A required name with two
+    concluded `success`/`neutral` AND no check-run with that name is
+    still running, failed, skipped, or otherwise non-passing. `skipped` is not
+    a pass for a required name (issue #1470): GitHub records that conclusion
+    both when a job-level `if:` excludes the job and when a job in its
+    `needs:` failed, so treating it as passing authorized releases whose chart
+    was never rendered, linted, or kubeconform-validated, and whose ladder
+    jobs never ran because their upstream build failed. A required name with two
     check-runs -- one success and one failure (a re-run with mixed states) --
     is left in the returned set: for a fail-closed release gate any non-passing
     run of a required name masks nothing and blocks the tag. A same-named entry
@@ -115,7 +150,9 @@ def missing_required_checks(
     the returned set. Names outside `required_names` are ignored entirely -- an
     unrelated check-run, passing or not, has no bearing on this gate (issue
     #733): the point is asserting the checks that matter actually ran and
-    passed, not that everything present happened to be green.
+    passed, not that everything present happened to be green. That still holds
+    for a `skipped` NON-required check-run, which is ignored like any other
+    non-required entry; only a skipped *required* name blocks.
 
     `required_names` defaults to the module-level `REQUIRED_CHECK_NAMES`,
     looked up here rather than bound as the parameter's default value so that
@@ -165,18 +202,27 @@ def exclude_current_workflow_run(
 def authorize(
     sha: str,
     check_runs: list[dict[str, object]],
-    main_ref: str = "origin/main",
+    reviewed_refs: Sequence[str],
     *,
     cwd: Path | None = None,
     exclude_run_id: str | None = None,
     required_names: frozenset[str] | None = None,
 ) -> None:
     """Raise AuthorizationError unless `sha` may publish a release."""
-    if not commit_is_on_reviewed_main(sha, main_ref, cwd=cwd):
+    if not reviewed_refs:
         raise AuthorizationError(
-            f"commit {sha} is not reachable from {main_ref}. A release can only "
-            "publish from a commit that reached main through a reviewed, merged "
-            "PR; refusing to authorize this tag."
+            "at least one reviewed ref is required; refusing to authorize this tag"
+        )
+
+    reachability = [
+        commit_is_on_reviewed_branch(sha, reviewed_ref, cwd=cwd)
+        for reviewed_ref in reviewed_refs
+    ]
+    if not any(reachability):
+        checked_refs = ", ".join(reviewed_refs)
+        raise AuthorizationError(
+            f"commit {sha} is not reachable from any reviewed ref "
+            f"({checked_refs}); refusing to authorize this tag"
         )
     other_runs = exclude_current_workflow_run(check_runs, exclude_run_id)
     missing = missing_required_checks(other_runs, required_names)
@@ -253,7 +299,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("sha", help="the tagged commit to authorize")
     parser.add_argument("--repo", required=True, help="owner/name, e.g. curie-eng/curie")
-    parser.add_argument("--main-ref", default="origin/main", help="the reviewed-main ref")
+    parser.add_argument(
+        "--reviewed-ref",
+        action="append",
+        required=True,
+        help="a reviewed branch ref; repeat for every allowed branch",
+    )
     parser.add_argument(
         "--run-id",
         default=os.environ.get("GITHUB_RUN_ID"),
@@ -263,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         check_runs = fetch_check_runs(args.sha, args.repo)
-        authorize(args.sha, check_runs, args.main_ref, exclude_run_id=args.run_id)
+        authorize(args.sha, check_runs, args.reviewed_ref, exclude_run_id=args.run_id)
     except AuthorizationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -281,7 +332,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"OK: {args.sha} is reviewed, on {args.main_ref}, and checked -- authorized")
+    checked_refs = ", ".join(args.reviewed_ref)
+    print(
+        f"OK: {args.sha} is reachable from a reviewed ref "
+        f"({checked_refs}) and checked; authorized"
+    )
     return 0
 
 

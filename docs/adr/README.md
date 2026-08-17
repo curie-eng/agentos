@@ -69,11 +69,11 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0037 | [Opt-in binding hook and Pareto model routing](0037-opt-in-binding-hook-and-pareto-model-routing.md) | Accepted |
 | 0038 | [An observability CLI helper for the agent-dev loop](0038-observability-cli-helper-for-the-agent-dev-loop.md) | Accepted |
 | 0039 | [Bounded delivery: a delivery cap and a dead-letter graveyard](0039-bounded-delivery-and-a-dead-letter-graveyard.md) | Accepted |
-| 0040 | [Adopt the Agent Client Protocol as an edge projection](0040-adopt-acp-as-an-edge-projection.md) | Draft |
+| 0040 | [Adopt the Agent Client Protocol as an edge projection](0040-adopt-acp-as-an-edge-projection.md) | Accepted |
 | 0041 | [Every verb is answered at every tier](0041-every-verb-is-answered-at-every-tier.md) | Accepted |
 | 0042 | [Adopt LLM-as-a-Verifier: a continuous-score semantic grader and a live progress signal](0042-llm-as-a-verifier-grader-and-progress-signal.md) | Accepted |
 | 0043 | [The interface catalog is generated from declared front-matter and gated in CI](0043-generated-interface-catalog-and-doc-lint-gate.md) | Accepted |
-| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Draft |
+| 0044 | [Workflow-controlled agents run on Curie as a callable substrate first, a unified plane only on demand](0044-workflow-controlled-agents-callable-substrate.md) | Accepted |
 | 0045 | [The status line is the mutable part of an immutable ADR](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) | Accepted |
 | 0046 | [Converged approval gates: durable provenance, loud route resolution, and observe-only resume reconciliation](0046-converged-approval-gates-and-durable-provenance.md) | Accepted |
 | 0047 | [ADR-0047: Canonical env-var names for the API base URL and model credential](0047-canonical-env-var-names.md) | Accepted |
@@ -91,7 +91,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0059 | [The sandbox is a bounded resource envelope; capacity is a tenant boundary](0059-sandbox-is-a-bounded-resource-envelope.md) | Accepted |
 | 0060 | [The harness is a declared package, not a class](0060-the-harness-is-a-declared-package.md) | Accepted |
 | 0061 | [The harness boundary is an out-of-process adapter, wire-compatible with Omnigent](0061-out-of-process-harness-boundary.md) | Draft |
-| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Draft |
+| 0062 | [Harness conformance has teeth](0062-harness-conformance-has-teeth.md) | Accepted |
 | 0063 | [Message-driven approval reply surface](0063-message-driven-approval-reply-surface.md) | Accepted |
 | 0064 | [Fail-forward cluster teardown](0064-fail-forward-cluster-teardown.md) | Accepted |
 | 0065 | [Tag protection, not the workflow gate, binds a write actor](0065-tag-protection-not-the-workflow-gate-binds-a-write-actor.md) | Accepted |
@@ -112,19 +112,25 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0080 | [Rename the project to Curie](0080-rename-to-curie.md) | Accepted |
 | 0081 | [A nightly graded parity ladder verifies the real-model promise CI cannot](0081-nightly-graded-parity-ladder.md) | Accepted |
 | 0082 | [Connected-transport approval cards ride a real CLI-posted placeholder](0082-connected-transport-approval-cards-via-a-real-placeholder.md) | Accepted |
+| 0083 | [Console sessions and CLI-minted login codes](0083-console-sessions-and-cli-minted-login-codes.md) | Accepted |
 | 0084 | [Publish a verification contract for agents driving Curie](0084-publish-a-verification-contract-for-agents-driving-curie.md) | Accepted |
 | 0085 | [Acceptance, not implementation, authorizes an ADR](0085-acceptance-not-implementation-authorizes-an-adr.md) | Accepted |
 | 0086 | [Bundles declare connectors; the platform hosts them](0086-bundles-declare-connectors-the-platform-hosts-them.md) | Accepted |
-| 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Draft |
-| 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Draft |
+| 0087 | [The API renders connector objects; the CLI applies them](0087-the-api-renders-connector-objects-the-cli-applies-them.md) | Accepted |
+| 0088 | [Per user delegated OAuth for MCP](0088-per-user-delegated-oauth-for-mcp.md) | Accepted |
 | 0089 | [Bundles declare their deploy targets](0089-bundles-declare-their-deploy-targets.md) | Accepted |
 | 0090 | [A reconciler applies connectors, so agent repos need no CLI](0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md) | Accepted |
 | 0091 | [Git-flow resolves deploy targets, so one repo serves many agents](0091-git-flow-resolves-deploy-targets-so-one-repo-serves-many-agents.md) | Accepted |
 | 0092 | [A GitHub App gives the platform its own repository identity](0092-a-github-app-gives-the-platform-its-own-repository-identity.md) | Accepted |
-| 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Draft |
+| 0093 | [Local-model assets are pre-provisioned, never implicitly downloaded](0093-local-model-assets-are-pre-provisioned-never-implicitly-downloaded.md) | Accepted |
 | 0094 | [A bundle carries its own sealed connector keys](0094-a-bundle-carries-its-own-sealed-connector-keys.md) | Accepted |
 | 0095 | [One tiered memory lifecycle for agent and channel memory](0095-tiered-memory-lifecycle.md) | Draft |
+| 0096 | [A third-party port adapter is a deployed service, not a loaded plugin](0096-port-adapters-are-deployed-services.md) | Accepted |
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
+| 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Draft |
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
+| 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
+| 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
+| 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -4,6 +4,12 @@ Date: 2026-07-29
 
 Status: Accepted
 
+**Amended by [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md)**
+(back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+the third Decision clause is overtaken. An ADR may be Accepted alongside its
+implementation only with explicit maintainer approval and a named code path
+that realizes the decision. The remaining acceptance and history rules stand.
+
 **Amends [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md).**
 This ADR replaces only these two clauses in ADR 0045:
 

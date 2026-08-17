@@ -41,14 +41,28 @@ HOSTED = (
 )
 
 
-def _render(root: Path, agent: str = "acme-bot") -> list[dict]:
+# These four are forwarded into `connector_render.render` as four bare strings,
+# so they MUST stay distinct from one another. Held equal, the forward is pinned
+# by nothing: swapping any two of them leaves every test in this file green
+# while the rendered NetworkPolicies select no pod at all. A real install
+# already drives at least one apart -- `curie cluster up --namespace my-agent
+# --release my-agent` against a chart whose `nameOverride` is empty leaves
+# app_name `curie` while release and namespace are both `my-agent`.
+RELEASE = "acme-rel"
+AGENT = "acme-bot"
+NAMESPACE = "acme-ns"
+APP_NAME = "curie"
+SECRET_NAME = f"{RELEASE}-{AGENT}-connectors"
+
+
+def _render(root: Path, agent: str = AGENT) -> list[dict]:
     return bundles.render_connector_manifests(
         bundles.read_connectors(root),
-        release="acme-bot",
+        release=RELEASE,
         agent=agent,
-        namespace="acme-bot",
-        app_name="acme-bot",
-        secret_name=f"acme-bot-{agent}-connectors",
+        namespace=NAMESPACE,
+        app_name=APP_NAME,
+        secret_name=f"{RELEASE}-{agent}-connectors",
     )
 
 
@@ -93,7 +107,7 @@ def test_secret_is_referenced_not_inlined(tmp_path: Path) -> None:
     dep = next(o for o in _render(_bundle(tmp_path, HOSTED)) if o["kind"] == "Deployment")
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
     token = next(e for e in env if e["name"] == "GRAFANA_TOKEN")
-    assert token["valueFrom"]["secretKeyRef"]["name"] == "acme-bot-acme-bot-connectors"
+    assert token["valueFrom"]["secretKeyRef"]["name"] == SECRET_NAME
     assert "value" not in token
 
 
@@ -116,26 +130,87 @@ def test_ingress_policy_admits_only_the_sandbox(tmp_path: Path) -> None:
     # Same ClusterIP trap on the way in, and the same reason it matters: this is
     # the path a real deploy takes, so a rule that parses but never matches
     # would leave the connector open while looking closed.
-    np = _policy(_render(_bundle(tmp_path, HOSTED)), "Ingress")
+    connectors = HOSTED.replace(
+        "    args: [-t, streamable-http]\n",
+        "    args: [-t, streamable-http]\n    port: 9876\n",
+    )
+    root = _bundle(tmp_path, connectors)
+    objs = _render(root)
+    np = _policy(objs, "Ingress")
     src = np["spec"]["ingress"][0]["from"]
     assert len(src) == 1
     assert "podSelector" in src[0] and "ipBlock" not in src[0]
+    svc = next(o for o in objs if o["kind"] == "Service")
+    assert (
+        svc["spec"]["ports"][0]["port"]
+        == np["spec"]["ingress"][0]["ports"][0]["port"]
+        == 9876
+    )
 
 
 def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
     root = _bundle(tmp_path, HOSTED)
     svc = next(o for o in _render(root) if o["kind"] == "Service")
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="acme-bot", agent="acme-bot", namespace="acme-bot"
+        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert svc["metadata"]["name"] in entries["grafana"]["url"]
+
+
+IDENTITY = (
+    "connectors:\n"
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    env: {SELF_URL: '${CURIE_CONNECTOR_URL}'}\n"
+)
+
+
+def test_each_of_the_four_names_lands_where_it_belongs(tmp_path: Path) -> None:
+    # `render_connector_manifests` hands release, agent, namespace and app_name
+    # to the renderer as four interchangeable-looking strings. Swapping any two
+    # produces manifests that parse, apply, and are wrong: release for app_name
+    # makes the sandbox selector read `app.kubernetes.io/name: acme-rel` instead
+    # of `curie`, both NetworkPolicies then select no pod, and every connector
+    # tool call dies as a bare connection timeout with no policy error anywhere.
+    # Each of the four is asserted at the place only IT can reach, against whole
+    # values rather than substrings, so no swap survives.
+    root = _bundle(tmp_path, IDENTITY)
+    objs = _render(root)
+    name = f"{RELEASE}-{AGENT}-mcp-grafana"
+    dns = f"{name}.{NAMESPACE}.svc.cluster.local"
+    sandbox = {
+        "app.kubernetes.io/name": APP_NAME,
+        "app.kubernetes.io/instance": RELEASE,
+        "app.kubernetes.io/component": "runner-sandbox",
+    }
+
+    # app_name and release: the sandbox selector, on both policies.
+    assert _policy(objs, "Egress")["spec"]["podSelector"]["matchLabels"] == sandbox
+    ingress_from = _policy(objs, "Ingress")["spec"]["ingress"][0]["from"][0]
+    assert ingress_from["podSelector"]["matchLabels"] == sandbox
+
+    # release and agent: the object name, in that order, plus part-of.
+    dep = next(o for o in objs if o["kind"] == "Deployment")
+    assert {o["metadata"]["name"] for o in objs} == {name, f"{name}-allow", f"{name}-allow-ingress"}
+    assert dep["metadata"]["labels"] == {
+        "app.kubernetes.io/name": name,
+        "app.kubernetes.io/part-of": RELEASE,
+    }
+
+    # namespace: the only place it shows up is the Service DNS Curie derives.
+    env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert {"name": "SELF_URL", "value": f"http://{dns}:8000"} in env
+    entries = bundles.connector_mcp_entries(
+        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+    )
+    assert entries["grafana"] == {"type": "http", "url": f"http://{dns}:8000/mcp"}
 
 
 def test_remote_connector_contributes_an_entry_but_no_objects(tmp_path: Path) -> None:
     root = _bundle(tmp_path, "connectors:\n  x:\n    url: https://mcp.internal/mcp\n")
     assert _render(root) == []
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release="acme-bot", agent="acme-bot", namespace="acme-bot"
+        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert entries["x"]["url"] == "https://mcp.internal/mcp"
 
