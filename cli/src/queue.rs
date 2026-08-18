@@ -14,7 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use curie_aci_protocol::{
-    QueuedTurn, ReplyHandle, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT,
+    QueuedTurn, ReplyHandle, TurnSource, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD,
+    WORKER_GROUP_DEFAULT,
 };
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamInfoGroupsReply, StreamPendingCountReply, StreamPendingReply};
@@ -67,6 +68,11 @@ pub fn synthetic_turn(
             adapter: None,
         },
         received_at: now_rfc3339(),
+        // The CLI drives a turn on a person's behalf, so it is a message and not
+        // a job: `local message` and `cluster message` are someone typing. Named
+        // rather than left to serde's default for the same reason `kind` is --
+        // the operator lane should say what it produces.
+        source: TurnSource::Slack,
     }
 }
 
