@@ -221,17 +221,48 @@ class SlackReplyAdapter:
             return ReplyAck(ref=None)
         if isinstance(event, ReplyUpdate):
             if event.message is not None:
+                # Settling an ALREADY-POSTED platform message (an approval card).
+                # Its ref is the card's own ts, minted by the earlier reply.post,
+                # so a null here is a caller bug rather than a placeholder-less
+                # turn -- there is no message to settle. Say so instead of sending
+                # chat.update with an empty ts, which Slack rejects with an error
+                # naming neither the card nor the turn.
+                if target.reply_ref is None:
+                    raise ValueError(
+                        "reply.update carrying a message needs the posted message's "
+                        "reply_ref to settle; got none"
+                    )
                 await self._update_message(
                     channel=target.address,
-                    ts=target.reply_ref or "",
+                    ts=target.reply_ref,
                     message=event.message,
                     endpoint=endpoint,
                     settled=event.settled,
                 )
                 return ReplyAck(ref=target.reply_ref)
+            if target.reply_ref is None:
+                # No preposted message to edit (ADR-0079): a triggered turn has no
+                # ingress placeholder, so the reply has to create its own message.
+                # The minted ts goes back on the ack and the kernel adopts it, so
+                # only the FIRST event of the turn posts and the rest edit.
+                #
+                # This branch used to be unreachable because the kernel refused a
+                # null placeholder outright. It is reached now, and it must not be
+                # reduced to ``ts=target.reply_ref or ""``: chat.update with an
+                # empty ts is rejected by Slack, so the old coercion turned a
+                # placeholder-less turn into a silent delivery failure.
+                ref = await self._post_text(
+                    channel=target.address,
+                    thread_ts=target.conversation_id,
+                    text=event.text or "",
+                    nav=event.nav,
+                    endpoint=endpoint,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+                return ReplyAck(ref=ref)
             await self._update(
                 channel=target.address,
-                ts=target.reply_ref or "",
+                ts=target.reply_ref,
                 text=event.text or "",
                 nav=event.nav,
                 endpoint=endpoint,
@@ -429,6 +460,78 @@ class SlackReplyAdapter:
             describe="chat_update",
             best_effort_unreachable=best_effort_unreachable,
         )
+
+    async def _post_text(
+        self,
+        *,
+        channel: str,
+        thread_ts: str | None,
+        text: str,
+        nav: NavAffordance | None = None,
+        endpoint: str | None = None,
+        best_effort_unreachable: bool = False,
+    ) -> str | None:
+        """Post this turn's reply as a NEW message and return its ts.
+
+        The placeholder-less counterpart of :meth:`_update` (ADR-0079). A turn
+        whose ingress preposted nothing has no message to edit, so the first
+        reply has to create one; the ts handed back becomes the ``reply_ref``
+        every later event in the same turn edits, which is what keeps a streamed
+        job from posting one message per delta.
+
+        Rendering is deliberately identical to ``_update`` -- same ``render``,
+        same nav pack, same blocks-rejected text fallback -- so a job's reply and
+        a mention's reply are the same message to a reader. Only the Slack verb
+        differs.
+
+        Args:
+            channel: The Slack channel id.
+            thread_ts: The thread to post into, or None for a channel-level post.
+            text: The reply text, in the Markdown the runner emits.
+            nav: The agent's hub-button pack, or None for no hub button.
+            endpoint: Per-turn Slack API base URL override, or None for the default.
+            best_effort_unreachable: Swallow an unreachable transport instead of raising.
+
+        Returns:
+            The ts of the posted message, or None when nothing was delivered.
+        """
+        rendered_text, blocks = render(text, _nav_pack(nav))
+
+        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
+            try:
+                if blocks is not None:
+                    return await client.chat_postMessage(
+                        channel=channel,
+                        text=rendered_text,
+                        blocks=blocks,
+                        thread_ts=thread_ts,
+                    )
+                return await client.chat_postMessage(
+                    channel=channel, text=rendered_text, thread_ts=thread_ts
+                )
+            except SlackApiError:
+                if blocks is None:
+                    raise
+                logger.warning("chat_postMessage with blocks rejected; retrying text-only")
+                return await client.chat_postMessage(
+                    channel=channel, text=rendered_text, thread_ts=thread_ts
+                )
+
+        response = await self._with_transport_fallback(
+            endpoint,
+            op,
+            describe="chat_postMessage",
+            best_effort_unreachable=best_effort_unreachable,
+        )
+        # The best-effort swallow returns None instead of a response when the
+        # transport was unreachable and the caller opted into swallowing it. There
+        # is no ts to adopt then, which is correct: nothing was delivered, so the
+        # next event in this turn should post rather than edit a message that does
+        # not exist.
+        if response is None:
+            return None
+        ts = response.get("ts")
+        return str(ts) if ts else None
 
     async def _post(
         self,
