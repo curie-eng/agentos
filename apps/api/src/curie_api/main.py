@@ -38,6 +38,7 @@ from .routers import (
     deployments,
     evals,
     github,
+    hooks,
     memory,
     observability,
     runs,
@@ -273,6 +274,7 @@ def create_app() -> FastAPI:
     app.include_router(memory.router)
     app.include_router(approvals.router)
     app.include_router(channels.router)
+    app.include_router(hooks.router)
     return app
 
 

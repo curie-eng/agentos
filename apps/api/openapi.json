@@ -1862,6 +1862,37 @@
         "title": "HelpPackConfig",
         "type": "object"
       },
+      "HookAccepted": {
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "stream_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Id"
+          }
+        },
+        "required": [
+          "event_id",
+          "stream_id",
+          "duplicate"
+        ],
+        "title": "HookAccepted",
+        "type": "object"
+      },
       "KillState": {
         "description": "Whether an agent is currently killed (kill switch, L1).",
         "properties": {
@@ -6185,6 +6216,91 @@
         "summary": "Health",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/hooks/{agent_id}/{hook}": {
+      "post": {
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the raw body;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. routability, then the claim, quota and enqueue.",
+        "operationId": "ingest_hook_hooks__agent_id___hook__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-signature-256",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Signature-256"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-delivery-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Delivery-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ingest Hook",
+        "tags": [
+          "hooks"
         ]
       }
     },
