@@ -240,9 +240,20 @@ def test_a_slack_turns_record_carries_slack_and_no_adapter(make_harness) -> None
     asyncio.run(go())
 
 
-def test_null_placeholder_rejects_before_sink_runner_or_approval_persistence(
+def test_null_placeholder_turn_reaches_an_approval_and_persists_its_own_ref(
     make_harness,
 ) -> None:
+    """A placeholder-less turn can pause for approval like any other (ADR-0079).
+
+    The reverse of what this test asserted before the placeholder-less path
+    landed: the kernel used to refuse the turn outright, so a channel that
+    preposts nothing could not reach an approval gate at all.
+
+    The record must carry the ref the turn DELIVERED on, not the null the wire
+    carried. Those differ here, and persisting the null would send the approval's
+    outcome to a second message beside the request it answers.
+    """
+
     async def go() -> None:
         approvals = RecordingApprovals()
         async with make_harness(approvals=approvals) as h:
@@ -255,12 +266,17 @@ def test_null_placeholder_rejects_before_sink_runner_or_approval_persistence(
                 adapter="agentmail",
             )
 
-            with pytest.raises(ValueError, match=r"reply_handle\.placeholder"):
-                await h.kernel.process_event(event)
+            await h.kernel.process_event(event)
 
-            assert h.runner.opened == []
-            assert h.sink.events == []
-            assert approvals.create_calls == 0
+            assert h.runner.opened == ["please discount"]
+            assert approvals.create_calls == 1
+            req = approvals.requests[0]
+            # The routing pair and egress selector still come off the wire...
+            assert req.reply_kind == "email"
+            assert req.reply_adapter == "agentmail"
+            # ...but the reply ref is the one this turn minted by delivering.
+            assert req.reply_placeholder is not None
+            assert req.reply_placeholder == h.sink.text_posts[0][1]
 
     asyncio.run(go())
 

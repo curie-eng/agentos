@@ -67,7 +67,15 @@ def test_the_worker_build_rejects_historical_and_previous_deployed_minors() -> N
     # range genuinely excludes both the previous deployed minor and the older
     # historical version. If either reads True again, the bump was classed wrong
     # and the cutover ordering rests on nothing.
-    assert PROTOCOL_VERSION == "0.4.0"
+    #
+    # The MINOR is pinned, not the exact version. Compatibility under 0.x is
+    # decided by major.minor, so a patch bump (a new optional field, which is the
+    # only compatible change class) cannot move either exclusion below; pinning
+    # the patch digit made this test fail for a change it does not measure, and a
+    # test that has to be edited for reasons unrelated to its subject teaches
+    # people to edit it without reading it. A minor bump still lands here, which
+    # is exactly when someone should look.
+    assert PROTOCOL_VERSION.startswith("0.4."), PROTOCOL_VERSION
     assert is_compatible("0.3.0", PROTOCOL_VERSION) is False
     assert is_compatible("0.2.9", PROTOCOL_VERSION) is False
 

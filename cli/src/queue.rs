@@ -412,9 +412,14 @@ mod tests {
                 "event_id",
                 "received_at",
                 "reply_handle",
+                // ADR-0079: what STARTED this turn, as distinct from where its
+                // reply goes (reply_handle.kind). The CLI produces a person's
+                // message, so it is always "slack" on this lane.
+                "source",
                 "text",
             ]
         );
+        assert_eq!(object["source"], "slack");
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -497,6 +502,7 @@ mod tests {
                 adapter: None,
             },
             received_at: "2026-07-21T00:00:00Z".into(),
+            source: TurnSource::Slack,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

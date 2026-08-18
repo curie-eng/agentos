@@ -1784,7 +1784,13 @@ class Kernel:
                     # persisted values are facts about the original turn.
                     reply_kind=qevent.reply_handle.kind,
                     reply_channel=qevent.reply_handle.channel,
-                    reply_placeholder=qevent.reply_handle.placeholder,
+                    # The ref this turn actually DELIVERED on, not the one the wire
+                    # carried. On a placeholder-less turn (ADR-0079) the two differ:
+                    # the wire says null and the turn has since posted its own
+                    # message. Persisting the null would leave the resume with
+                    # nothing to edit, so the approval's outcome would land on a
+                    # second message beside the request it answers.
+                    reply_placeholder=self._target_for(qevent).reply_ref,
                     reply_endpoint=qevent.reply_handle.endpoint,
                     reply_adapter=qevent.reply_handle.adapter,
                     dedupe_key=qevent.event_id,
