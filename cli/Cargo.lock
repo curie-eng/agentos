@@ -768,7 +768,6 @@ dependencies = [
  "indicatif",
  "jsonschema",
  "keyring",
- "libc",
  "proc-macro2",
  "quote",
  "ratatui",

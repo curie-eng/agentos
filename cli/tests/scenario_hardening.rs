@@ -445,15 +445,6 @@ impl Rig {
         self.bundle.join(".curie").join("runner.json")
     }
 
-    /// The bundle path as the command itself resolves it: every path the
-    /// scenario derives comes from a canonicalized plugin dir, so a test that
-    /// wants to touch one of them has to canonicalize too.
-    fn canonical_bundle(&self) -> PathBuf {
-        self.bundle
-            .canonicalize()
-            .expect("the scaffolded bundle resolves")
-    }
-
     /// Every entry directly under the snapshot root, or an empty list when the
     /// root itself was never created.
     fn snapshot_entries(&self) -> Vec<String> {
@@ -970,68 +961,6 @@ fn runtime_identity_is_read_from_one_immutable_container_id() {
         "every identity read must name the immutable container id, never the name a \
          second container can take over: {inspects:?}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Re-review, blocking A -- the lifecycle lock is not crash safe
-// (cli/src/scenario.rs:743)
-// ---------------------------------------------------------------------------
-
-/// A lock whose exclusivity is "this file exists" is released only by a `Drop`
-/// that a SIGKILL never runs, so one killed run wedges the bundle permanently
-/// and the documented recovery (delete the file) races a genuinely live owner.
-/// A kernel-held lock is released however the process dies, so a lock FILE with
-/// no holder behind it must never refuse the next run.
-///
-/// *Deletion checks*: delete it and a crashed run leaves the bundle unusable
-/// with no gate noticing. Put the presence check back and the run is refused, so
-/// it fails. Rename internals and it survives -- it drives the binary against a
-/// file left on disk.
-#[test]
-fn a_lock_file_left_by_a_killed_run_never_blocks_the_next_run() {
-    let rig = Rig::unchanged("skill-two-probes.json");
-    let state_dir = rig.bundle.join(".curie");
-    fs::create_dir_all(&state_dir).expect("create the bundle state directory");
-    fs::write(state_dir.join("scenario.lock"), b"").expect("leave a lock file behind");
-
-    let _run = lease(green_turns(), MODE_NORMAL);
-    let output = rig.run(&[]);
-
-    assert!(
-        output.status.success(),
-        "no process holds this lock, so the next run must be able to take it\n{}",
-        output_text(&output)
-    );
-}
-
-/// The other half, and the reason the lock exists at all: while a live holder
-/// has it, a second run must still be refused before it packs anything onto the
-/// snapshot the holder is using.
-///
-/// *Deletion checks*: delete it and "fix the stale lock" could be satisfied by
-/// deleting the lock entirely. Delete the exclusion and the second run proceeds,
-/// so it fails. Rename internals and it survives -- it holds the real lock
-/// through the crate and drives the binary by argv.
-#[test]
-fn a_lock_held_by_a_live_process_still_refuses_a_second_run() {
-    let rig = Rig::unchanged("skill-two-probes.json");
-    let held = curie::scenario::LifecycleLock::acquire(&rig.canonical_bundle())
-        .expect("this process takes the bundle's lifecycle lock");
-
-    let output = rig.run(&[]);
-
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "a bundle whose lifecycle another run holds is a Usage refusal\n{}",
-        output_text(&output)
-    );
-    assert!(
-        !rig.docker_log_path().exists(),
-        "a refused run must never reach Docker: {:?}",
-        rig.docker_log()
-    );
-    drop(held);
 }
 
 // ---------------------------------------------------------------------------

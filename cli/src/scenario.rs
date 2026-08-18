@@ -28,7 +28,6 @@
 //! contract; degrading to a probe-less run is not.
 
 use std::collections::BTreeSet;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -42,7 +41,7 @@ use crate::evals::{self, CaseOutcome, EvalCase, ExpectedStatus, Grader, GraderKi
 use crate::exit::{self, CliError};
 use crate::runner::RunnerClient;
 use crate::state;
-use crate::ui::{CliOutput, DryRunPlan, Ui};
+use crate::ui::{CliOutput, Ui};
 
 /// The mount destination inside the runner container that holds the bundle.
 const PLUGIN_MOUNT: &str = "/plugin";
@@ -53,9 +52,6 @@ const FAKE_MODEL_ENV: &str = "CURIE_FAKE_MODEL";
 /// The reply recorded for a turn that produced no gradeable text, so a red probe
 /// is diagnosable without a re-run (#548).
 const NO_REPLY: &str = "<no reply text>";
-
-/// The bundle-scoped file that makes one scenario lifecycle exclusive.
-const LOCK_FILE: &str = "scenario.lock";
 
 /// How long a probe waits for `/v1/reset`, a runner control call answered
 /// immediately. A peer that accepts the connection and then never answers would
@@ -653,70 +649,6 @@ fn roll_up_tiers(tiers: &[TierReport]) -> Verdict {
     verdict
 }
 
-/// The `--dry-run` plan: everything resolvable with no Docker and no network.
-///
-/// The artifact digest is deliberately absent: computing it means packing the
-/// bundle, which materializes a snapshot directory a dry run would leave behind.
-pub fn dry_run_lines(
-    manifest: &ScenarioManifest,
-    bundle_dir: &Path,
-    source_commit: Option<&str>,
-) -> Vec<String> {
-    let mut lines = vec![
-        format!("ticket: {}", manifest.ticket),
-        format!("bundle: {}", bundle_dir.display()),
-        format!("source commit: {}", source_commit.unwrap_or("unknown")),
-        format!("model mode: {}", model_mode_str(manifest.model_mode)),
-        format!(
-            "acceptance criteria: {}",
-            manifest.acceptance_criteria.join(", ")
-        ),
-    ];
-    // Only the skill tier reaches a plan: an unsupported tier is refused (exit 4)
-    // before the bundle is even resolved, so it never becomes a line here.
-    for tier in &manifest.tiers {
-        lines.push(format!(
-            "tier {}: package, boot, verify identity, probe, tear down",
-            tier.as_str()
-        ));
-    }
-    for probe in &manifest.probes {
-        lines.push(format!(
-            "probe {} ({}): {} {:?} for {}",
-            probe.id,
-            match probe.kind {
-                ProbeKind::Positive => "positive",
-                ProbeKind::Negative => "negative",
-            },
-            grader_str(probe.expect.grader),
-            probe.expect.value,
-            probe.acceptance_criteria.join(",")
-        ));
-    }
-    lines.push(
-        "teardown: asserts the container is gone, the runner record is cleared, and the snapshot \
-         is released"
-            .into(),
-    );
-    lines
-}
-
-fn model_mode_str(mode: ModelMode) -> &'static str {
-    match mode {
-        ModelMode::Fake => "fake",
-        ModelMode::Live => "live",
-    }
-}
-
-fn grader_str(kind: GraderKind) -> &'static str {
-    match kind {
-        GraderKind::Exact => "exact",
-        GraderKind::Contains => "contains",
-        GraderKind::Regex => "regex",
-        GraderKind::ToolCalled => "tool_called",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The pipeline
 // ---------------------------------------------------------------------------
@@ -724,7 +656,6 @@ fn grader_str(kind: GraderKind) -> &'static str {
 /// Options for `curie scenario`, mirroring its clap flags.
 pub struct RunOpts {
     pub manifest: PathBuf,
-    pub dry_run: bool,
 }
 
 /// One tier's accumulated failure: the diagnosis, what to do about it, and
@@ -763,62 +694,6 @@ fn teardown_not_attempted() -> TeardownReport {
     }
 }
 
-/// The exclusive hold one scenario run takes on a bundle's lifecycle.
-///
-/// A run boots on a snapshot under the bundle's own state dir and releases it at
-/// teardown, so two concurrent runs of the same bundle would pack, boot and tear
-/// down over each other. The name-conflict preflight refuses a second run before
-/// anything destructive happens; this lock is what makes that check hold for the
-/// whole lifecycle instead of only at the instant it ran.
-///
-/// The exclusion is a KERNEL-held `flock` on an open descriptor, never the
-/// presence of the file: the kernel drops it when the descriptor closes, which
-/// happens however the holder dies, SIGKILL included. So the lock FILE may
-/// outlive a run harmlessly and is never something a user has to delete -- the
-/// alternative (a `create_new` file unlinked on `Drop`) leaves a killed run's
-/// file behind permanently, and its only recovery is a manual delete that races
-/// a genuinely live owner. The file is deliberately not unlinked on release for
-/// the same reason: unlinking the path another process has already opened and
-/// locked would let a third process create a fresh file and lock that instead.
-pub struct LifecycleLock {
-    /// The lock lives on this open descriptor, so it is held for exactly as long
-    /// as the guard and released by the kernel when the guard (or the process)
-    /// goes away.
-    _file: std::fs::File,
-}
-
-impl LifecycleLock {
-    pub fn acquire(plugin_dir: &Path) -> Result<Self> {
-        let dir = plugin_dir.join(state::STATE_DIR);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let path = dir.join(LOCK_FILE);
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening the scenario lock {}", path.display()))?;
-        // SAFETY: `flock` only reads the descriptor, which `file` owns and keeps
-        // open for at least as long as the lock it is being asked to take.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Self { _file: file });
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(refusal(
-                format!(
-                    "another curie scenario run holds this bundle's lifecycle lock ({})",
-                    path.display()
-                ),
-                "wait for that run to finish; the lock is held by the kernel on an open file, \
-                 so it is released the moment that process exits however it exits, and there is \
-                 nothing to delete by hand",
-            ));
-        }
-        Err(anyhow::Error::new(err).context(format!("taking the scenario lock {}", path.display())))
-    }
-}
-
 pub async fn run(opts: RunOpts) -> Result<()> {
     let raw = std::fs::read_to_string(&opts.manifest).map_err(|err| {
         refusal(
@@ -826,8 +701,7 @@ pub async fn run(opts: RunOpts) -> Result<()> {
                 "reading the scenario manifest {}: {err}",
                 opts.manifest.display()
             ),
-            "pass the path of a checked-in scenario manifest; `curie scenario <MANIFEST> \
-             --dry-run` prints what it would run",
+            "pass the path of a checked-in scenario manifest",
         )
     })?;
     let manifest = parse_manifest(&raw, &opts.manifest)?;
@@ -864,13 +738,6 @@ pub async fn run(opts: RunOpts) -> Result<()> {
         })?;
     let source_commit = crate::commands::git_short_sha(&bundle_dir).await;
 
-    if opts.dry_run {
-        crate::ui::ui().emit(&DryRunPlan {
-            lines: dry_run_lines(&manifest, &bundle_dir, source_commit.as_deref()),
-        });
-        return Ok(());
-    }
-
     let start_opts = StartOpts {
         plugin_dir: bundle_dir.clone(),
         image: crate::artifacts::resolve_image(
@@ -897,9 +764,6 @@ pub async fn run(opts: RunOpts) -> Result<()> {
     };
     let runner_url = format!("http://localhost:{DEFAULT_PORT}");
     let plugin_dir = crate::commands::prepare_start(&start_opts).await?;
-    // Exclusive from here to the emitted payload: everything below either packs
-    // onto, boots from, or releases this bundle's content-addressed snapshot.
-    let _lock = LifecycleLock::acquire(&plugin_dir)?;
 
     let (artifact_digest, tier, transient, boot_error) =
         match boot_and_probe(&manifest, start_opts, &plugin_dir, &runner_url).await {

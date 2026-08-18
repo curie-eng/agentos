@@ -548,7 +548,6 @@ the runner down and asserts the teardown's postconditions.
 
 ```bash
 curie scenario scenarios/ticket-1234.json --json
-curie scenario scenarios/ticket-1234.json --dry-run
 ```
 
 The manifest is validated against

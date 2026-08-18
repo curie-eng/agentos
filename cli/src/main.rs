@@ -408,9 +408,6 @@ enum Command {
     Scenario {
         /// Path to the scenario manifest JSON.
         manifest: PathBuf,
-        /// Print the plan and exit without booting a runner or sending a turn.
-        #[arg(long)]
-        dry_run: bool,
     },
 
     /// Converge a cluster to a `curie.yaml` installation file (ADR-0097).
@@ -3421,8 +3418,8 @@ async fn run(command: Option<Command>) -> Result<()> {
             Ok(())
         }
         Some(Command::Guide) => curie::guide::run(),
-        Some(Command::Scenario { manifest, dry_run }) => {
-            curie::scenario::run(curie::scenario::RunOpts { manifest, dry_run }).await
+        Some(Command::Scenario { manifest }) => {
+            curie::scenario::run(curie::scenario::RunOpts { manifest }).await
         }
         Some(Command::Apply {
             file,

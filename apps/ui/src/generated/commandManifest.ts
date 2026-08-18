@@ -4048,18 +4048,6 @@ export const commandManifest = {
           "id": "manifest",
           "positional": true,
           "required": true
-        },
-        {
-          "global": false,
-          "help": "Print the plan and exit without booting a runner or sending a turn",
-          "id": "dry_run",
-          "long": "dry-run",
-          "positional": false,
-          "possible_values": [
-            "true",
-            "false"
-          ],
-          "required": false
         }
       ],
       "hidden": false,
