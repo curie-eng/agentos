@@ -55,9 +55,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 DISPATCHER_QUEUE = (
     REPO_ROOT / "apps/dispatcher/src/curie_dispatcher/queue.py"
 )
-CHANNELS_ROUTER = (
-    REPO_ROOT / "apps/api/src/curie_api/routers/channels.py"
-)
+# The claim primitive moved to `curie_api.delivery` when the hook ingress became
+# its second caller (#269); this scan follows it, because what it corroborates is
+# where the primitive LIVES, not which router happens to call it.
+CHANNELS_ROUTER = REPO_ROOT / "apps/api/src/curie_api/delivery.py"
 
 
 # --- fixtures -----------------------------------------------------------------
@@ -259,7 +260,7 @@ def test_a_rival_arriving_mid_claim_never_enqueues_a_second_entry(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     rival: dict[str, Any] = {}
     fired = False
 
@@ -273,7 +274,7 @@ def test_a_rival_arriving_mid_claim_never_enqueues_a_second_entry(
             )
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_let_the_rival_run)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_let_the_rival_run)
 
     winner = _post(channels_client, binding, body)
     loser = rival["response"]
@@ -433,7 +434,7 @@ def test_the_pending_lease_expires_but_the_receipt_never_does(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     pending: dict[str, Any] = {}
 
     async def claim_then_inspect(*args: Any, **kwargs: Any) -> Any:
@@ -443,7 +444,7 @@ def test_the_pending_lease_expires_but_the_receipt_never_does(
         pending["ttl"] = valkey.ttl(key)
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_inspect)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_inspect)
 
     first = _post(channels_client, binding, body)
     assert first.status_code == 200, first.text
@@ -495,7 +496,7 @@ def test_a_resumed_owner_with_an_expired_uncontested_lease_still_enqueues(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     expired: dict[str, str] = {}
 
     async def claim_then_expire_the_lease(*args: Any, **kwargs: Any) -> Any:
@@ -507,7 +508,7 @@ def test_a_resumed_owner_with_an_expired_uncontested_lease_still_enqueues(
         valkey.delete(key)
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_expire_the_lease)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_expire_the_lease)
 
     resumed = _post(channels_client, binding, body)
     assert resumed.status_code == 200, resumed.text
@@ -554,7 +555,7 @@ def test_a_slow_winner_whose_lease_was_re_claimed_does_not_enqueue(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     rival: dict[str, Any] = {}
     fired = False
 
@@ -571,7 +572,7 @@ def test_a_slow_winner_whose_lease_was_re_claimed_does_not_enqueue(
             )
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_lose_the_lease)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_lose_the_lease)
 
     slow = _post(channels_client, binding, body)
     retry = rival["response"]
@@ -603,7 +604,7 @@ def test_a_slow_winner_whose_lease_was_re_claimed_by_an_in_flight_retry_is_202(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     fired = False
 
     async def claim_then_hand_the_lease_over(*args: Any, **kwargs: Any) -> Any:
@@ -615,7 +616,7 @@ def test_a_slow_winner_whose_lease_was_re_claimed_by_an_in_flight_retry_is_202(
             valkey.set(key, f"pending:{uuid.uuid4().hex}", ex=300)
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_hand_the_lease_over)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_hand_the_lease_over)
 
     slow = _post(channels_client, binding, body)
     assert slow.status_code == 202, slow.text
@@ -718,7 +719,7 @@ def test_the_ingress_claim_matches_the_dispatchers_set_nx_ex_primitive(
     """
 
     body = _turn(binding, f"msg-{uuid.uuid4().hex}")
-    real_claim = channels_router._claim_delivery
+    real_claim = channels_router.claim_delivery
     pending: dict[str, Any] = {}
 
     async def claim_then_inspect(*args: Any, **kwargs: Any) -> Any:
@@ -733,7 +734,7 @@ def test_the_ingress_claim_matches_the_dispatchers_set_nx_ex_primitive(
         )
         return result
 
-    monkeypatch.setattr(channels_router, "_claim_delivery", claim_then_inspect)
+    monkeypatch.setattr(channels_router, "claim_delivery", claim_then_inspect)
 
     assert _post(channels_client, binding, body).status_code == 200
     # The LEASE is what carries the expiry; the receipt it becomes does not
