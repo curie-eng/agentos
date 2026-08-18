@@ -98,6 +98,16 @@ class Agent(Base):
     # consumes them. NULL means no connector secrets. (The cluster tier delivers
     # values via a per-agent K8s Secret instead; only the names live here there.)
     secrets: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # Rotation counter for this agent's inbound hook secret (ADR-0079, #269).
+    #
+    # NOT a secret, which is the point. The secret an upstream signs with is
+    # DERIVED from the platform key, this agent's id and this number
+    # (`hook_secret.derive`), so nothing a reader of this table finds lets them
+    # forge a delivery. Bumping the counter rotates exactly one agent's hook
+    # secret; storing the secret itself would have meant a third-party credential
+    # sitting in plaintext in the control plane, and rotating it any other way
+    # means rotating the platform key for every agent at once.
+    hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list["AgentVersion"]] = relationship(
