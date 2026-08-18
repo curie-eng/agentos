@@ -1,0 +1,309 @@
+# What this bot needs running. Curie derives the Deployment, Service, container
+# hardening, host allowlist, sandbox-to-connector NetworkPolicy, secret wiring,
+# and the URL the agent dials (ADR-0086).
+#
+# This replaces roughly 180 lines of hand-written Kubernetes per connector. None
+# of it was this bot's business, and every copy of it was independently right or
+# wrong.
+#
+# ---------------------------------------------------------------------------
+# WHAT SHIPS ON, AND WHAT SHIPS OFF
+# ---------------------------------------------------------------------------
+#
+#   kubernetes    ON.  Read-only cluster access. The only connector you need to
+#                      make this bot useful, and the only one with no external
+#                      dependency beyond the cluster itself.
+#   k8s-write     OFF. One gated write verb. Needs an image you build, a second
+#                      credential, and an approval route. See README.md,
+#                      "Level up: the gated write path".
+#   grafana       OFF. Logs, metrics, alerts, profiles. Needs a Grafana and a
+#                      Viewer service-account token.
+#   tempo         OFF. Distributed traces. Needs Grafana plus an image you build.
+#
+# Turning one on is uncommenting its block and supplying its secret. Turning one
+# off is commenting it back out -- the connector disappears and so do its tools,
+# which is the fastest honest way to remove a capability.
+connectors:
+  # Read-only Kubernetes: the questions metrics cannot answer. What the
+  # scheduler actually said, what a crashed container logged, what a manifest
+  # currently declares.
+  #
+  # Tool surface verified against this image with these exact flags: 13 tools,
+  # and `tools/list` reports readOnlyHint=true on every one. It was 14 until
+  # `--toolsets core` dropped `configuration_view`; see below. `--read-only`
+  # FILTERS the surface rather than merely advising, and `--disable-destructive`
+  # sits under it.
+  #
+  #   events_list      the scheduler's reason string -- FailedScheduling,
+  #                    FailedMount, BackOff, Evicted. A metric says a pod is
+  #                    Pending; only this says why.
+  #   pods_log         container logs for ANY namespace, including the platform
+  #                    namespaces a log shipper is often not configured to
+  #                    collect. Takes `previous`, so a crashed container's last
+  #                    output is reachable.
+  #   resources_get    describe-equivalent: the live manifest of any kind.
+  #   nodes_log        kubelet logs, for when the node is the problem.
+  #   *_top            live usage, no scrape delay.
+  #
+  # RETENTION IS THE LIMIT AND THIS DOES NOT CHANGE IT. Events expire from etcd
+  # after about an hour and a pod's logs die with the pod, so this is live
+  # introspection, not history. "Why was that pod Pending at 03:00?" asked at
+  # 09:00 is still unanswerable, and SKILL.md tells the agent to say so rather
+  # than report the silence as calm. Closing that gap means shipping Events into
+  # a log store, which lives in your monitoring stack, not in this bundle.
+  kubernetes:
+    # PINNED, never `latest`. `latest` drifted between the flag check and the
+    # cluster's pull: the tag that had `--bind-address` when the args below were
+    # written no longer did by deploy time, so the container printed its usage
+    # and exited into CrashLoopBackOff. A mutable tag turns "verified the flags"
+    # into a statement about a moment rather than about the image.
+    #
+    # v0.0.66 verified directly: carries --port/--bind-address/--read-only/
+    # --disable-destructive/--disable-multi-cluster/--stateless/--kubeconfig,
+    # and publishes both amd64 and arm64.
+    image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
+    args:
+      - --port
+      - "8000"
+      - --bind-address
+      - 0.0.0.0
+      # Load-bearing. The RBAC on the mounted kubeconfig is the real boundary --
+      # a write is refused server-side -- but the agent is prompt-injectable and
+      # cannot be talked into calling a tool it cannot see. Tool filtering is
+      # defense in depth, not the fence.
+      - --read-only
+      # `--read-only` is NOT sufficient on its own, and the reason is worth
+      # keeping: `configuration_view` returns the kubeconfig as YAML --
+      # including the bearer token in cleartext -- and it is annotated
+      # readOnlyHint=true, because reading a credential IS a read. So the
+      # read-only filter keeps it, and "all 14 tools are readOnlyHint" was
+      # verified and still missed it.
+      #
+      # That tool alone defeats the property this whole shape exists for: the
+      # sandbox is supposed to learn a URL and never hold a credential, so that
+      # a successful prompt injection can only call read tools the connector
+      # already allows -- not walk away with the token and post it into Slack.
+      #
+      # Default toolsets are `core,config`; `configuration_view` is the config
+      # toolset's entire contribution here. Dropping to `core` removes exactly
+      # that one tool, 14 -> 13, and keeps every tool SKILL.md uses:
+      # events_list, pods_log, pods_get, pods_list, pods_list_in_namespace,
+      # resources_get, resources_list, nodes_log, pods_top, nodes_top,
+      # nodes_stats_summary, namespaces_list, projects_list.
+      # Verified by diffing tools/list with and without the flag.
+      - --toolsets
+      - core
+      - --disable-destructive
+      # One cluster, one context -- otherwise the multi-cluster tools appear and
+      # invite reasoning about clusters this bot has no business in.
+      - --disable-multi-cluster
+      - --stateless
+      - --kubeconfig
+      - /secrets/kubeconfig
+    # Where to reach this on a tier that cannot host it (#1160). The `skill`
+    # tier hosts nothing and `local` does not host connectors yet (#1159), so a
+    # laptop run supplies its own copy's URL with `--secret K8S_MCP_URL`.
+    #
+    # On the cluster this is ignored -- the URL is derived from the Service
+    # Curie creates, so a laptop's copy can never displace the real one.
+    unhosted_url: ${K8S_MCP_URL}
+    # A FILE, not an env var. This server authenticates only from a kubeconfig
+    # on disk, which `connectors.yaml` could not express until #1403 -- the
+    # first attempt at this connector declared `secrets:` and sat in
+    # CreateContainerConfigError, because a secretKeyRef cannot become a file.
+    #
+    # A STATIC kubeconfig holding a ServiceAccount token, not a cloud-provider
+    # `get-token` exec credential: an exec credential mints short-lived tokens
+    # and would need cloud credentials sitting next to the connector purely to
+    # refresh them. A ServiceAccount token keeps the whole blast radius inside
+    # Kubernetes RBAC, where manifests/read-access.yaml bounds it -- verified it
+    # cannot read Secrets or delete anything.
+    secret_files:
+      K8S_READONLY_KUBECONFIG: /secrets/kubeconfig
+
+# ---------------------------------------------------------------------------
+# THE GATED WRITE CONNECTOR -- SHIPS OFF. Uncomment to enable.
+#
+# What it is: a purpose-built server exposing exactly ONE tool,
+# `restart_deployment`, behind a Curie approval gate. Calling it pauses the
+# turn, posts an approval card, and a human decides. The agent never does.
+#
+# PURPOSE-BUILT, not kubernetes-mcp-server without `--read-only`. Dropping that
+# flag would expose create/update/delete across every kind, so the bot would
+# hold general write gated only by what `approvalPolicy` remembers to name --
+# and a tool nobody thought to gate has nothing in front of it. This server
+# exposes one tool, so there is no second thing for a gate to miss. Source and
+# full reasoning: connectors/k8s-write/server.py.
+#
+# ENABLING IT IS NOT JUST UNCOMMENTING. You must:
+#
+#   1. Build the image from `connectors/k8s-write/` and push it to a registry
+#      your cluster can pull from. There is no public image for this on purpose
+#      -- the allowlist and the credential are yours, and so is the artifact.
+#      Build it multi-arch; the Dockerfile says why.
+#   2. Apply `manifests/write-role.yaml` (after editing its namespace and
+#      `resourceNames`) and store the resulting kubeconfig as
+#      K8S_WRITE_KUBECONFIG.
+#   3. Set `image:` below to what you pushed, and `K8S_WRITE_ALLOWLIST` to the
+#      one `namespace/deployment` this bot may roll.
+#   4. Add the approval gate to `.claude-plugin/plugin.json`. It is NOT shipped:
+#      bundle validation rejects a gate that names an undeclared connector, so a
+#      gate for a commented-out connector would fail the build for everyone who
+#      never enables this. README.md carries the exact JSON.
+#
+# Full walkthrough: README.md, "Level up: the gated write path".
+#
+# THE TOOL NAME BELOW IS NOT WHAT CURIE'S ERROR MESSAGE TELLS YOU. Tools here
+# are `mcp__k8s-write__<tool>`, NOT `mcp__plugin_sre-bot_k8s-write__<tool>`.
+# Curie connectors are platform-supplied servers on
+# ClaudeAgentOptions.mcp_servers, so they are named like
+# `mcp__curie__request_approval`, with no plugin infix. The deploy error advises
+# the prefixed form; following it yields a gate that validates, deploys, and
+# never fires.
+#
+#   k8s-write:
+#     # Whatever you built and pushed in step 1. Pinned by digest or an
+#     # immutable tag, never `:latest` -- see the pinning note on `kubernetes`
+#     # above, which is not theoretical.
+#     #
+#     # PACKAGE VISIBILITY, if you push to a registry that has the concept: a
+#     # newly published package is often PRIVATE by default, and an anonymous
+#     # node pull then gets a 403 that surfaces as ImagePullBackOff rather than
+#     # as a permissions error. Verify with an anonymous manifest fetch before
+#     # blaming the cluster.
+#     image: <your-registry>/sre-bot-k8s-write-mcp:v1
+#     unhosted_url: ${K8S_WRITE_MCP_URL}
+#     env:
+#       # Defence in depth alongside the Role's `resourceNames`. A ceiling
+#       # stated in one place only is a ceiling that moves when someone edits
+#       # the other place. Format is `namespace/deployment`, comma-separated.
+#       # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
+#       # permitted -- a missing config fails closed.
+#       K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+#     # A SEPARATE kubeconfig from the read-only one, bound to the
+#     # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
+#     # exactly the named Deployments. Never the read-only connector's
+#     # credential -- that one is deliberately unable to write, and reusing it
+#     # here would mean widening it.
+#     secret_files:
+#       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# GRAFANA -- SHIPS OFF. Uncomment if you have a Grafana.
+#
+# Adds logs (Loki), metrics (Prometheus), alerts, on-call schedules, profiles,
+# and the ability to run the query behind a dashboard panel. That is a large
+# capability jump and it costs exactly one credential: a service-account token
+# with the **Viewer** role.
+#
+# THE VIEWER ROLE IS THE REAL READ-ONLY ENFORCEMENT. The `-disable-*` flags
+# below are defense in depth: a write returns 403 server-side regardless. But
+# the agent is prompt-injectable, so write-shaped tools should never reach its
+# context at all -- it cannot be talked into calling a tool it cannot see.
+#
+# Store the token before deploying:
+#
+#     curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN
+#
+#   grafana:
+#     image: docker.io/grafana/mcp-grafana:1.0.0
+#     args:
+#       - -t
+#       - streamable-http
+#       - -address
+#       - 0.0.0.0:8000
+#       # Curie names the Service, so Curie supplies every name the sandbox may
+#       # dial. Hardcoding these was wrong the moment one bundle served both a
+#       # dev and a prod agent: the names are agent-scoped and differ per agent.
+#       - -allowed-hosts
+#       - ${CURIE_ALLOWED_HOSTS}
+#       # `-enabled-tools` REPLACES the default category list rather than
+#       # extending it, so the default list is repeated VERBATIM here and the
+#       # additions are appended. Naming only the categories you want silently
+#       # drops the rest -- that is how `suggest_loki_alloy_label_config`
+#       # vanished in a first attempt.
+#       #
+#       # `cloudwatch` is OFF in the upstream default list, so it has to be
+#       # named explicitly. Before enabling it, check what identity your
+#       # CloudWatch datasource authenticates as and confirm that identity is
+#       # strictly read-only: the Viewer role does NOT constrain what a
+#       # datasource query can do, because querying datasources is exactly what
+#       # Viewer is for.
+#       #
+#       # `runpanelquery` is the useful addition: it executes the query BEHIND a
+#       # dashboard panel, so "what does the API latency panel actually say
+#       # right now" stops requiring the agent to reconstruct a query it can
+#       # already see. `examples` returns Grafana's own sample queries. Both are
+#       # reads.
+#       - -enabled-tools
+#       - search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples
+#       # The load-bearing one: removes create/update/delete across every group
+#       # in a single flag.
+#       - -disable-write
+#       # grafana_api_request is a generic passthrough to ANY Grafana API
+#       # endpoint. It defeats per-group tool scoping by construction, so it
+#       # goes even though the token would still reject a mutation.
+#       - -disable-api
+#       - -disable-plugin
+#       - -disable-provisioning
+#       - -disable-snapshot
+#       - -disable-admin
+#       - -disable-incident
+#       - -disable-proxied
+#       - -disable-rendering
+#     unhosted_url: ${GRAFANA_MCP_URL}
+#     env:
+#       # ***** THE ONE LINE TO EDIT PER INSTALL. *****
+#       #
+#       # This cannot be a placeholder today. Curie substitutes exactly four
+#       # names in `args`/`env` -- ${CURIE_ALLOWED_HOSTS}, ${CURIE_CONNECTOR_HOST},
+#       # ${CURIE_CONNECTOR_PORT}, ${CURIE_CONNECTOR_URL} -- all derived from the
+#       # Service Curie itself creates, and any other ${...} is rejected at
+#       # validation as `connectors.unknown_placeholder`. None of them carries
+#       # per-environment configuration, and `deploy.yaml` targets bind an agent
+#       # and a channel, not connector env.
+#       #
+#       # So the identical-bundle promise ("only the binding differs") does not
+#       # hold for this value: a second environment must edit this line. Fixing
+#       # it properly needs a platform-side per-target override (ADR-0089
+#       # shape); until that exists, treat this as the one line to change.
+#       GRAFANA_URL: https://grafana.example.com
+#     # NAME only. The value is resolved at deploy time and written to a
+#     # per-agent Kubernetes Secret; it never appears in this repository.
+#     secrets:
+#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF, and needs `grafana` on as well.
+#
+# `mcp-grafana` has no tool that speaks Tempo, so without this the bot can see
+# the datasource in `list_datasources` and never read a span. Three off-the-shelf
+# routes were measured and rejected first -- `proxied`, Sift, and
+# `run_panel_query`, the last of which refuses tempo outright. See
+# connectors/tempo/server.py for what each one actually returned.
+#
+# It holds the SAME Grafana token as the grafana connector and talks to the same
+# Grafana, just to an endpoint mcp-grafana has no tool for: the datasource
+# proxy. So this adds a capability without adding a credential.
+#
+# NO PUBLIC IMAGE. Build it from `connectors/tempo/` and push it to a registry
+# your cluster pulls from, then set `image:` to what you pushed. Pin it by
+# digest or an immutable tag -- a floating `:latest` already cost this connector
+# a CrashLoopBackOff once, when the flags verified at check time were not the
+# flags present at pull time.
+#
+#   tempo:
+#     image: <your-registry>/sre-bot-tempo-mcp:v1
+#     unhosted_url: ${TEMPO_MCP_URL}
+#     env:
+#       # Same install-specific line as the grafana block above, same reason.
+#       GRAFANA_URL: https://grafana.example.com
+#       # The Tempo datasource's uid. `__Tempo__` is the server's default and is
+#       # what a provisioned datasource commonly carries; confirm yours with the
+#       # grafana connector's `list_datasources` rather than assuming.
+#       TEMPO_DATASOURCE_UID: __Tempo__
+#     secrets:
+#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+# ---------------------------------------------------------------------------

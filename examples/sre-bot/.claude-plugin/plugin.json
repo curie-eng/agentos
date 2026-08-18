@@ -1,0 +1,32 @@
+{
+  "name": "sre-bot",
+  "version": "0.1.0",
+  "description": "Read-only SRE triage assistant. Answers plain-English questions about production health and Kubernetes cluster state in Slack. Reads the Kubernetes API directly (Events, describe, previous-container logs, live top) and, when the optional connectors are enabled, Grafana (Loki logs, Prometheus metrics, alerts, dashboard panel queries) and distributed traces through Tempo. Read-only by construction: every shipped tool is readOnlyHint and the cluster credential cannot read Secrets. One optional write verb -- rolling a single named Deployment -- ships disabled, behind a human approval gate.",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "CurieTech"
+  },
+  "keywords": [
+    "sre",
+    "observability",
+    "grafana",
+    "loki",
+    "prometheus",
+    "pyroscope",
+    "kubernetes",
+    "k8s",
+    "cluster",
+    "triage",
+    "read-only"
+  ],
+  "starterPrompts": [
+    "Is anything broken right now?",
+    "Is any pod crashlooping or restarting?",
+    "Are all the nodes healthy?",
+    "Did anything get OOMKilled today?",
+    "Are there any alerts firing?",
+    "Which services are logging the most errors today?",
+    "Is the API slow right now?",
+    "Show me slow traces from the last hour"
+  ]
+}
