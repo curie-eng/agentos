@@ -43,6 +43,7 @@ from aci_protocol import (
     SideEffectFlag,
     TextDelta,
     ToolNote,
+    TurnSource,
 )
 from channel_protocol import (
     MESSAGE_VERSION,
@@ -244,6 +245,25 @@ class TurnOutcome:
     approval_granted_tool: str | None = None
 
 
+class ThreadBusyError(RuntimeError):
+    """A job arrived at a thread whose session is live, so it was not started.
+
+    Raised INSTEAD of steering or blocking (ADR-0079: jobs are outputs, not
+    steering inputs). Deliberately not one of the classes ``_attempt`` converts
+    into a retryable outcome: this is not a failed turn to back off and retry
+    within the attempt budget, it is a turn that has not begun. Letting it escape
+    leaves the stream entry PENDING, so the existing reclaim redelivers it and the
+    job runs on a later pass once the conversation has finished.
+
+    The redelivery interval is therefore ``reclaim_min_idle_ms`` and the give-up
+    point is ``max_delivery``, which is a coarse instrument borrowed from crash
+    recovery rather than a scheduling policy: a job behind a conversation longer
+    than that budget dead-letters instead of running late. That is a visible,
+    bounded outcome rather than a silent one, and issue #268 owns replacing it
+    with a real idle-aware policy when cron schedules land.
+    """
+
+
 @dataclass
 class _RouteResult:
     steered: bool
@@ -296,9 +316,14 @@ class _ThrottledReply:
         nav: NavAffordance | None = None,
         no_edit: bool = False,
         best_effort: bool = False,
+        on_ref: Callable[[str], None] | None = None,
     ) -> None:
         self._sink = sink
         self._target = target
+        # Told when this turn mints a reply ref (ADR-0079), so the kernel's other
+        # delivery paths edit the same message this streamer created. Only fires
+        # on a placeholder-less turn, where the first emit posts rather than edits.
+        self._on_ref = on_ref
         self._min_interval_s = min_interval_s
         self._no_edit = no_edit
         self._last = 0.0
@@ -338,7 +363,7 @@ class _ThrottledReply:
         await self._emit(text or "(no response)")
 
     async def _emit(self, text: str) -> None:
-        await self._sink.emit(
+        ack = await self._sink.emit(
             ReplyUpdate(
                 version=REPLY_WIRE_VERSION,
                 event="reply.update",
@@ -349,6 +374,13 @@ class _ThrottledReply:
             route=self._route,
             best_effort_unreachable=self._best_effort,
         )
+        # A placeholder-less turn's first emit CREATES its message; adopt the ref
+        # so every later delta edits that message instead of posting another one.
+        # Without this a streamed job would post one message per throttle window.
+        if self._target.reply_ref is None and ack.ref:
+            self._target = self._target.model_copy(update={"reply_ref": ack.ref})
+            if self._on_ref is not None:
+                self._on_ref(ack.ref)
 
 
 class Kernel:
@@ -403,18 +435,98 @@ class Kernel:
         # deterministic ordering within a process without blocking steering,
         # because it is released before the stream is consumed.
         self._order_locks: dict[str, _LockEntry] = {}
+        # Reply refs MINTED during a placeholder-less turn, keyed by event id
+        # (ADR-0079). A triggered turn arrives with ``reply_handle.placeholder``
+        # null because no ingress preposted anything, so its first delivery
+        # creates the message and the adapter hands back its ref. Every later
+        # event in the SAME turn has to edit that message instead of posting
+        # another one, and the paths that need it -- the booting state, the
+        # stream, the final flush, an escalation -- are four different methods
+        # that each rebuild the target from the queued turn. Holding the minted
+        # ref here is what makes those rebuilds agree.
+        #
+        # Bounded by construction: an entry is written only for a turn that had
+        # no placeholder, and ``process_event`` drops it in a finally. It is
+        # deliberately NOT a cache across turns -- a later turn on the same
+        # thread gets its own message, exactly as a Slack mention does.
+        self._minted_refs: dict[str, str] = {}
+
+    def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
+        """This turn's reply target, including any ref minted during the turn.
+
+        Args:
+            qevent: The queued turn.
+
+        Returns:
+            The target from the wire handle, with ``reply_ref`` replaced by the
+            minted ref when this turn posted its own message.
+        """
+        target = _target_for(qevent)
+        if target.reply_ref is not None:
+            return target
+        minted = self._minted_refs.get(qevent.event_id)
+        return target if minted is None else target.model_copy(update={"reply_ref": minted})
+
+    def _adopt_ref(self, qevent: QueuedTurn, ack: ReplyAck) -> None:
+        """Remember a ref an adapter minted for a placeholder-less turn.
+
+        First writer wins: the message that was actually created first is the one
+        the rest of the turn edits, so a racing second delivery cannot redirect
+        the turn onto a message posted later.
+
+        Args:
+            qevent: The queued turn the delivery belonged to.
+            ack: The adapter's acknowledgement.
+        """
+        if ack.ref and qevent.reply_handle.placeholder is None:
+            self._minted_refs.setdefault(qevent.event_id, ack.ref)
+
+    async def _reply_for(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        text: str,
+        *,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        """Deliver platform-authored text for this turn, adopting any minted ref.
+
+        The single-shot counterpart of ``_ThrottledReply``: both exist so that no
+        caller has to remember the adoption step.
+
+        Args:
+            qevent: The queued turn.
+            route: This turn's egress route.
+            text: The platform-authored text.
+            best_effort_unreachable: Swallow an unreachable transport rather than raising.
+
+        Returns:
+            The adapter's acknowledgement.
+        """
+        ack = await self._reply(
+            self._target_for(qevent),
+            route,
+            text,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+        self._adopt_ref(qevent, ack)
+        return ack
 
     async def process_event(self, qevent: QueuedTurn) -> None:
-        """Handle one queued Slack event to a terminal state (success or escalate).
+        """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
         acks it. Raising leaves the entry pending for crash-recovery reclaim.
-        """
-        self._required_placeholder(qevent)
 
+        A null ``reply_handle.placeholder`` is ACCEPTED here (ADR-0079). This
+        method used to reject one outright, which left the contract and the
+        runtime disagreeing: the schema had already been widened to
+        ``placeholder: str | None`` for the channel port, so every triggered turn
+        the wire permitted died on the first line of the kernel. The reply path
+        now posts a message when there is none to edit and edits it thereafter.
+        """
         event_id = qevent.event_id
         thread = qevent.conversation_id
-        target = _target_for(qevent)
         # The turn's route starts as the one the server minted onto the wire and
         # is REPLACED by the binding row's once this turn resolves (EB-B2's two
         # sanctioned sources, in precedence order). Everything before resolution
@@ -669,7 +781,16 @@ class Kernel:
             # here would tell the adapter to deliver a turn that is about to run
             # again. An EMPTY status IS the clear on the neutral wire.
             if self._config.shimmer:
-                await self._emit_status(target, route, "")
+                # Rebuilt rather than reusing the ``target`` captured at entry, so
+                # a placeholder-less turn clears the status against the message it
+                # actually posted. Slack's status call does not read the ref, but a
+                # buffered adapter's does, and handing it a stale null would strand
+                # the caption on a channel nobody is watching.
+                await self._emit_status(self._target_for(qevent), route, "")
+            # Drop this turn's minted ref last, after every delivery above has had
+            # its chance to read it. Popping earlier would make the shimmer clear
+            # address a message the rest of the turn had already adopted.
+            self._minted_refs.pop(event_id, None)
 
     def _acquire_order_entry(self, thread: str) -> _LockEntry:
         entry = self._order_locks.get(thread)
@@ -873,7 +994,7 @@ class Kernel:
     ) -> None:
         """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
-        await self._reply(_target_for(qevent), route, message)
+        await self._reply_for(qevent, route, message)
         await self._complete(qevent, route, "dropped")
 
     async def _reply(
@@ -927,7 +1048,7 @@ class Kernel:
             event=TurnCompleted(
                 version=REPLY_WIRE_VERSION,
                 event="turn.completed",
-                target=_target_for(qevent),
+                target=self._target_for(qevent),
                 event_id=event_id,
                 outcome=cast("Any", outcome),
             ),
@@ -1133,7 +1254,7 @@ class Kernel:
             # An operator who blanks status_text wants no caption at all; setting
             # an empty status would read as a clear, not as a shimmer.
             return
-        await self._emit_status(_target_for(qevent), route, caption)
+        await self._emit_status(self._target_for(qevent), route, caption)
 
     async def _emit_status(
         self, target: ReplyTarget, route: TargetRoute, status: str
@@ -1174,7 +1295,6 @@ class Kernel:
         packs: BehaviorPacks | None = None,
     ) -> TurnOutcome:
         thread = qevent.conversation_id
-        target = _target_for(qevent)
 
         # Surface a booting state on the placeholder so the (up to claim_timeout)
         # cold-boot wait is not silent. Best-effort and outside the per-thread lock:
@@ -1184,7 +1304,12 @@ class Kernel:
         # chat.update (the final edit), so it opts out of the pre-boot edit too.
         if not self._config.slack_no_edit_streaming:
             try:
-                await self._reply(target, route, self._config.booting_text)
+                # Through the adopting helper, not a bare ``_reply``: on a
+                # placeholder-less turn this booting notice is the delivery that
+                # CREATES the message, and the stream that follows has to edit it.
+                # A bare reply here would post the notice, leave no ref behind, and
+                # the first delta would post a second message beside it.
+                await self._reply_for(qevent, route, self._config.booting_text)
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -1197,7 +1322,9 @@ class Kernel:
         # streaming so a follow-up can steer.
         try:
             async with self._lock.hold(self._config.lock_key(thread)):
-                routed = await self._route_and_start(thread, event, boot_env, packs)
+                routed = await self._route_and_start(
+                    thread, event, boot_env, packs, source=qevent.source
+                )
         except (RunnerError, aiohttp.ClientError, TimeoutError, SandboxError) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable
@@ -1214,7 +1341,7 @@ class Kernel:
             # the route lock (ADR-0018). Deliver the canned reply onto the
             # placeholder and return terminal-ok so process_event marks the event
             # done. No run was registered, no sandbox claimed, no turn started.
-            await self._reply(target, route, routed.canned_reply)
+            await self._reply_for(qevent, route, routed.canned_reply)
             return TurnOutcome(terminal_ok=True)
 
         if routed.steered:
@@ -1228,7 +1355,7 @@ class Kernel:
             # steer folded into a since-failed turn is not itself replayed. This is
             # the accepted MVP semantic; durable per-steer replay is a deliberate
             # follow-up, flagged to the orchestrator rather than silently assumed.
-            await self._reply(target, route, "Folded into the in-progress reply above.")
+            await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
@@ -1255,6 +1382,8 @@ class Kernel:
         event: Event,
         boot_env: dict[str, str] | None,
         packs: BehaviorPacks | None = None,
+        *,
+        source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
@@ -1287,10 +1416,63 @@ class Kernel:
         handle = await self._claim_or_resume(thread, boot_env)
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread, claim_ms)
-        if await self._runner.steer(handle.base_url, event, token=handle.token or None):
+        if source.is_job:
+            # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
+            # a webhook must never fold itself into whatever a person is currently
+            # saying, so this path does not attempt a steer at all.
+            #
+            # It also must not simply open a turn and block. The runner serializes
+            # turns on a semaphore, so ``start_turn`` against a busy session waits
+            # for the live turn to end -- and this call runs while the kernel holds
+            # the per-thread lock, so that wait would freeze the very conversation
+            # the job is supposed to stay out of. Waiting there would invert the
+            # rule rather than implement it.
+            #
+            # So ask, and defer if the answer is busy. ``turn_active`` is a plain
+            # read that neither steers nor queues. There is no TOCTOU gap worth
+            # guarding: the per-thread lock held across this critical section is
+            # what stops another turn on this thread from opening between the read
+            # and the start.
+            if await self._turn_active(handle):
+                raise ThreadBusyError(
+                    f"thread {thread} has a live session; deferring the {source} turn"
+                )
+        elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
             return _RouteResult(steered=True)
         turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
         return _RouteResult(steered=False, handle=handle, turn=turn)
+
+    async def _turn_active(self, handle: SandboxHandle) -> bool:
+        """Is a turn live in this sandbox right now?
+
+        The read a job uses to decide whether to run or defer. It is a plain GET
+        that neither steers nor queues, which is the whole reason it exists: the
+        two calls that could otherwise answer the question both have side effects
+        (``steer`` folds the job into the live conversation, ``start_turn`` blocks
+        on the runner's turn semaphore while holding the kernel's thread lock).
+
+        Fails CLOSED. An unreachable runner or an answer without a usable
+        ``turn_active`` reports busy, so an unreadable session defers the job
+        rather than opening a turn beside one that may already be running. A
+        deferred job is redelivered; two live turns on one thread would break the
+        kernel's first invariant.
+
+        Args:
+            handle: The claimed sandbox for this thread.
+
+        Returns:
+            True when a turn is live, or when liveness could not be determined.
+        """
+        try:
+            status = await self._runner.status(handle.base_url)
+        except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
+            logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
+            return True
+        active = status.get("turn_active")
+        if not isinstance(active, bool):
+            logger.warning("runner status carried no usable turn_active: %r", status)
+            return True
+        return active
 
     async def _claim_or_resume(self, thread: str, boot_env: dict[str, str] | None) -> SandboxHandle:
         try:
@@ -1602,7 +1784,13 @@ class Kernel:
                     # persisted values are facts about the original turn.
                     reply_kind=qevent.reply_handle.kind,
                     reply_channel=qevent.reply_handle.channel,
-                    reply_placeholder=qevent.reply_handle.placeholder,
+                    # The ref this turn actually DELIVERED on, not the one the wire
+                    # carried. On a placeholder-less turn (ADR-0079) the two differ:
+                    # the wire says null and the turn has since posted its own
+                    # message. Persisting the null would leave the resume with
+                    # nothing to edit, so the approval's outcome would land on a
+                    # second message beside the request it answers.
+                    reply_placeholder=self._target_for(qevent).reply_ref,
                     reply_endpoint=qevent.reply_handle.endpoint,
                     reply_adapter=qevent.reply_handle.adapter,
                     dedupe_key=qevent.event_id,
@@ -1655,8 +1843,8 @@ class Kernel:
             "The session is paused and will resume once an authorized member "
             "resolves this request."
         )
-        await self._reply(
-            _target_for(qevent), route, f"{base}\n\n{notice}" if base else notice
+        await self._reply_for(
+            qevent, route, f"{base}\n\n{notice}" if base else notice
         )
 
         # The card's destination -- kind AND route -- is selected from the
@@ -1807,7 +1995,7 @@ class Kernel:
         acc = _StreamAccumulator()
         reply = _ThrottledReply(
             self._sink,
-            target=_target_for(qevent),
+            target=self._target_for(qevent),
             route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
@@ -1824,6 +2012,7 @@ class Kernel:
             # _is_approval_resume. That shared coverage is deliberate and
             # plan-ratified, not an oversight.
             best_effort=self._is_approval_resume(qevent.event_id),
+            on_ref=lambda ref: self._adopt_ref(qevent, ReplyAck(ref=ref)),
         )
         try:
             # ``async with`` releases the aiohttp response on every exit path
@@ -1911,18 +2100,11 @@ class Kernel:
         message: str,
     ) -> None:
         logger.warning("escalating event %s: %s", qevent.event_id, message)
-        await self._reply(_target_for(qevent), route, message)
+        await self._reply_for(qevent, route, message)
 
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))
         return min(self._config.retry_backoff_max_s, raw)
-
-    @staticmethod
-    def _required_placeholder(qevent: QueuedTurn) -> str:
-        placeholder = qevent.reply_handle.placeholder
-        if placeholder is None:
-            raise ValueError("reply_handle.placeholder must not be null")
-        return placeholder
 
     @staticmethod
     def _to_event(qevent: QueuedTurn) -> Event:

@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 import redis.asyncio as redis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
 from fastapi import (
     APIRouter,
     Depends,
@@ -414,6 +414,11 @@ def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
         conversation_id=body.conversation_id,
         author=body.author,
         text=body.text,
+        # A channel-port turn is a PERSON writing on some transport (an email they
+        # sent, a message they typed). The transport is `reply_handle.kind`; this
+        # field is about who caused the turn, and the answer here is a human.
+        # ADR-0079's hook ingress is a separate route and will say `WEBHOOK`.
+        source=TurnSource.SLACK,
         reply_handle=ReplyHandle(
             kind=row.kind,
             channel=row.address,

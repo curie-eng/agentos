@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 
 import pytest
-from aci_protocol import QueuedTurn, ReplyHandle, parse_queued_turn
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource, parse_queued_turn
 from aci_protocol.events import _READER_CONTEXT_KEY
 from pydantic import ValidationError
 
@@ -138,6 +138,58 @@ def test_the_committed_golden_fixture_carries_slack_as_its_kind() -> None:
     assert turn.reply_handle.kind == "slack"
     assert turn.reply_handle.channel == "C0GOLDENAAA"
     assert turn.reply_handle.placeholder == "1720000000.000200"
+
+
+def test_a_payload_written_before_source_existed_decodes_as_a_message() -> None:
+    """The claim that makes this a PATCH rather than a breaking minor.
+
+    Adding `source` was classed as a new optional field, which means a producer
+    from the previous image must keep decoding on a consumer from this one. That
+    is exactly what happens across a rolling deploy, and it is the whole reason
+    the version gate stays quiet, so it is asserted rather than assumed.
+
+    The default also has to be the NON-JOB value. If an unset source read as a
+    job, a mid-deploy dispatcher would silently start minting turns the kernel
+    refuses to steer, and every follow-up in a live thread would defer instead of
+    joining the conversation.
+    """
+
+    pre_upgrade = json.loads(_GOLDEN.read_text())
+    del pre_upgrade["source"]
+
+    turn = QueuedTurn.model_validate(pre_upgrade, context={_READER_CONTEXT_KEY: True})
+
+    assert turn.source is TurnSource.SLACK
+    assert turn.source.is_job is False
+
+
+def test_source_round_trips_and_a_job_is_distinguishable() -> None:
+    """A job survives the wire and answers the one question the kernel asks."""
+
+    payload = json.loads(_GOLDEN.read_text())
+    payload["source"] = "cron"
+
+    turn = QueuedTurn.model_validate(payload, context={_READER_CONTEXT_KEY: True})
+
+    assert turn.source is TurnSource.CRON
+    assert turn.source.is_job is True
+    assert TurnSource.WEBHOOK.is_job is True
+    assert json.loads(turn.model_dump_json())["source"] == "cron"
+
+
+def test_an_unknown_source_is_refused_never_degraded() -> None:
+    """`source` is control-bearing, so an unrecognized value is rejected.
+
+    Same rule as `SessionStatus` (ADR-0036). Degrading an unknown value to the
+    default would silently reclassify a future job kind as a person's message and
+    let it steer a live session, which is the one thing this field exists to stop.
+    """
+
+    payload = json.loads(_GOLDEN.read_text())
+    payload["source"] = "carrier-pigeon"
+
+    with pytest.raises(ValidationError):
+        QueuedTurn.model_validate(payload, context={_READER_CONTEXT_KEY: True})
 
 
 def test_adapter_is_optional_and_round_trips_when_a_producer_sets_it() -> None:

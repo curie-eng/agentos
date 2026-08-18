@@ -136,6 +136,11 @@ class FakeSink:
         # window the completion outbox exists to survive (T-B12(a), T-B8).
         self.fail_events: set[str] = set()
         self.updates: list[tuple[str, str, str]] = []
+        # Deliveries that CREATED a message because the turn carried no reply ref
+        # (ADR-0079), as (address, minted_ref, text). Kept apart from ``updates``
+        # so a test can assert the difference between posting and editing, which
+        # is the whole behavior the placeholder-less path adds.
+        self.text_posts: list[tuple[str, str, str]] = []
         # The navigation affordance (if any) carried by each reply.update,
         # parallel to ``updates``. The WIRE form (finding 16): ``NavPack`` is
         # worker-local and cannot cross into channel_protocol, so the kernel's
@@ -245,7 +250,18 @@ class FakeSink:
                     )
                 )
                 return ReplyAck(ref=target.reply_ref)
-            self.updates.append((target.address, target.reply_ref or "", event.text or ""))
+            if target.reply_ref is None:
+                # Mirror SlackReplyAdapter: with nothing to edit, the delivery posts
+                # a NEW message and hands back its ref. A fake that returned None
+                # here would let the kernel's adoption step regress to a no-op with
+                # every assertion still green, because nothing else observes it.
+                minted = f"minted-{len(self.text_posts) + 1}"
+                self.text_posts.append((target.address, minted, event.text or ""))
+                self.updates.append((target.address, minted, event.text or ""))
+                self.update_navs.append(event.nav)
+                self.update_endpoints.append(endpoint)
+                return ReplyAck(ref=minted)
+            self.updates.append((target.address, target.reply_ref, event.text or ""))
             self.update_navs.append(event.nav)
             self.update_endpoints.append(endpoint)
             return ReplyAck(ref=target.reply_ref)
@@ -389,6 +405,11 @@ class FakeRunner:
             ]
         )
         self.turn_active = False
+        # When set, /status answers 500 so a test can drive the fail-closed
+        # liveness read (an unreadable session must count as busy).
+        self.status_fails = False
+        # When set, /status answers 200 with no ``turn_active`` field.
+        self.status_malformed = False
         self.turn_scripts: list[list[OutboundEvent]] = []
         self.default_script: list[OutboundEvent] = [Final(text="ok", status=SessionStatus.DONE)]
         self.opened: list[str] = []
@@ -407,6 +428,12 @@ class FakeRunner:
 
     async def _status(self, request: web.Request) -> web.Response:
         self.status_headers.append(dict(request.headers))
+        if self.status_fails:
+            return web.json_response({"error": "boom"}, status=500)
+        if self.status_malformed:
+            # 200, but without the field the liveness read needs. A newer or
+            # third-party runner could answer exactly this.
+            return web.json_response({"status": "idle-awaiting-input"})
         return web.json_response({"status": "idle-awaiting-input", "turn_active": self.turn_active})
 
     async def _event(self, request: web.Request) -> web.StreamResponse:

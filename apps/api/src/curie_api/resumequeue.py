@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import redis.asyncio as redis
-from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
 
 from .config import get_settings
 from .models import Approval, ApprovalStatus
@@ -59,6 +59,11 @@ def _build_turn(approval: Approval, *, author: str, text: str) -> QueuedTurn:
         conversation_id=approval.conversation_id,
         author=author,
         text=text,
+        # A resume continues the turn a PERSON started and a person approved, so it
+        # keeps that turn's category. It is not a job: reclassifying it would make
+        # every resumed approval defer behind a live session instead of finishing
+        # the work the approval just authorized.
+        source=TurnSource.SLACK,
         reply_handle=ReplyHandle(
             # The persisted routing pair and egress selector, replayed verbatim
             # (ADR-0096 phase 2). NEVER a lookup against `agent_channels`: an

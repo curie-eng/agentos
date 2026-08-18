@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use curie::chat::{await_reply, await_resume, parse_approval_id, Outcome, SlackStub};
 use curie::queue::{synthetic_turn, xadd, WORKER_GROUP};
-use curie_aci_protocol::{QueuedTurn, ReplyHandle};
+use curie_aci_protocol::{QueuedTurn, ReplyHandle, TurnSource};
 
 mod support;
 use support::{unique_stream, valkey_or_skip};
@@ -39,6 +39,9 @@ fn resume_turn(resume_event_id: &str, endpoint: &str) -> QueuedTurn {
             adapter: None,
         },
         received_at: "2026-07-21T00:00:00Z".into(),
+        // A resume continues the turn a person started, matching what
+        // `resumequeue._build_turn` mints on the Python side.
+        source: TurnSource::Slack,
     }
 }
 

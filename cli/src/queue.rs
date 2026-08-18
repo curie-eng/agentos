@@ -14,7 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use curie_aci_protocol::{
-    QueuedTurn, ReplyHandle, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT,
+    QueuedTurn, ReplyHandle, TurnSource, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD,
+    WORKER_GROUP_DEFAULT,
 };
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamInfoGroupsReply, StreamPendingCountReply, StreamPendingReply};
@@ -67,6 +68,11 @@ pub fn synthetic_turn(
             adapter: None,
         },
         received_at: now_rfc3339(),
+        // The CLI drives a turn on a person's behalf, so it is a message and not
+        // a job: `local message` and `cluster message` are someone typing. Named
+        // rather than left to serde's default for the same reason `kind` is --
+        // the operator lane should say what it produces.
+        source: TurnSource::Slack,
     }
 }
 
@@ -406,9 +412,14 @@ mod tests {
                 "event_id",
                 "received_at",
                 "reply_handle",
+                // ADR-0079: what STARTED this turn, as distinct from where its
+                // reply goes (reply_handle.kind). The CLI produces a person's
+                // message, so it is always "slack" on this lane.
+                "source",
                 "text",
             ]
         );
+        assert_eq!(object["source"], "slack");
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -491,6 +502,7 @@ mod tests {
                 adapter: None,
             },
             received_at: "2026-07-21T00:00:00Z".into(),
+            source: TurnSource::Slack,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

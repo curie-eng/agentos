@@ -22,7 +22,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from aci_protocol import QueuedTurn, ReplyHandle
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
 from slack_bolt import App
 from slack_sdk.web import WebClient
 
@@ -117,6 +117,10 @@ def process_event(
         conversation_id=thread_ts,
         author=event.get("user", ""),
         text=event.get("text", ""),
+        # A person spoke, so this turn MAY steer a live one. Stated rather than
+        # left to the model default for the same reason `kind` is: a producer
+        # that does not say what it is produces turns nobody can audit.
+        source=TurnSource.SLACK,
         # The literal "slack" is this dispatcher stating what it is; it never
         # comes from config, because a Slack Socket Mode dispatcher that could
         # claim another kind is a misrouting vector. `adapter=None` is explicit
@@ -208,6 +212,8 @@ def process_action(
         conversation_id=thread_ts,
         author=user,
         text=command,
+        # A person clicked a button. Still a person, still steerable.
+        source=TurnSource.SLACK,
         # Same literal, same reason, on the sibling lane (ADR-0096 D4.4).
         reply_handle=ReplyHandle(
             kind="slack", channel=channel, placeholder=placeholder["ts"], adapter=None

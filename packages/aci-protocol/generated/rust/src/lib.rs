@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.4.1";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -100,6 +100,17 @@ pub enum GateKind {
     Permission,
     #[serde(rename = "policy")]
     Policy,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub enum TurnSource {
+    #[serde(rename = "slack")]
+    #[default]
+    Slack,
+    #[serde(rename = "webhook")]
+    Webhook,
+    #[serde(rename = "cron")]
+    Cron,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -249,6 +260,8 @@ pub struct QueuedTurn {
     pub text: String,
     pub reply_handle: ReplyHandle,
     pub received_at: String,
+    #[serde(default)]
+    pub source: TurnSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -461,13 +474,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.4.1","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.4.2","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.4.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.4.1","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

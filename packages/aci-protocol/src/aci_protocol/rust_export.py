@@ -36,7 +36,7 @@ from .service_config import (
     WORKER_GROUP_DEFAULT,
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
-from .turn import QueuedTurn, ReplyHandle
+from .turn import QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -441,6 +441,15 @@ def render_rust() -> str:
         # No default variant: GateKind is only referenced as Option<GateKind>,
         # which is Default regardless of the enum's own derives.
         _string_enum("GateKind", tuple(m.value for m in GateKind)),
+        # QueuedTurn.source carries a serde(default), so this enum needs a Default
+        # variant for that attribute to compile. SLACK is the right one: it is the
+        # same non-job value the Python model defaults to, so a pre-upgrade payload
+        # decodes identically in both lanes.
+        _string_enum(
+            "TurnSource",
+            tuple(m.value for m in TurnSource),
+            default=TurnSource.SLACK.value,
+        ),
         _struct(Budget),
         _struct(OtelConfig),
         _struct(SessionConfig),

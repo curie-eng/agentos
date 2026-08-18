@@ -22,10 +22,12 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    TurnSource,
 )
-from channel_protocol.reply import ReplyAck, ReplyEvent
+from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 
@@ -41,6 +43,7 @@ def _qevent(
     event_id: str | None = None,
     placeholder: str | None = "p-1",
     endpoint: str | None = None,
+    source: TurnSource = TurnSource.SLACK,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id or uuid.uuid4().hex,
@@ -51,6 +54,7 @@ def _qevent(
             kind="slack", channel="C1", placeholder=placeholder, endpoint=endpoint
         ),
         received_at="2026-07-05T00:00:00+00:00",
+        source=source,
     )
 
 
@@ -81,18 +85,190 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_null_placeholder_is_rejected_before_any_sink_or_runner_call(
-    make_harness,
-) -> None:
+def test_null_placeholder_turn_runs_and_posts_its_own_reply(make_harness) -> None:
+    """ADR-0079: a turn with nothing to edit creates its own message.
+
+    This asserts the reverse of what the kernel used to do. Until this change it
+    raised on a null placeholder before touching the runner or the sink, which
+    left the frozen contract (``placeholder: str | None``) and the runtime
+    disagreeing about what the wire permitted.
+    """
+
     async def go() -> None:
         async with make_harness() as h:
-            event = _qevent("hi", placeholder=None)
+            h.runner.default_script = [Final(text="digest ready", status=DONE)]
+            event = _qevent("run the digest", placeholder=None)
 
-            with pytest.raises(ValueError, match=r"reply_handle\.placeholder"):
-                await h.kernel.process_event(event)
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == ["run the digest"]
+            # It POSTED rather than edited: the delivery minted a ref of its own.
+            assert [text for _, _, text in h.sink.text_posts]
+            assert h.sink.last_text == "digest ready"
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_placeholder_less_turn_posts_once_then_edits_that_message(make_harness) -> None:
+    """The minted ref is adopted, so a streamed job does not spam the channel.
+
+    Without adoption every throttled delta would create another message, which is
+    the failure a null placeholder would otherwise produce on a chatty turn.
+    """
+
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=0.0) as h:
+            h.runner.default_script = [
+                TextDelta(text="one "),
+                TextDelta(text="two "),
+                TextDelta(text="three"),
+                Final(text="one two three", status=DONE),
+            ]
+
+            await h.kernel.process_event(_qevent("go", placeholder=None))
+
+            # Exactly one message was created for the whole turn...
+            assert len(h.sink.text_posts) == 1, h.sink.text_posts
+            minted = h.sink.text_posts[0][1]
+            # ...and every later delivery addressed that same message.
+            refs = {ref for _, ref, _ in h.sink.updates}
+            assert refs == {minted}, refs
+            assert len(h.sink.updates) > 1, "the turn only delivered once; nothing was edited"
+
+    asyncio.run(go())
+
+
+def test_a_job_never_steers_a_live_session(make_harness) -> None:
+    """ADR-0079: jobs are outputs, not steering inputs.
+
+    A person's follow-up on a busy thread steers. A job on the same thread must
+    not, because folding a scheduled digest into someone's conversation changes
+    what that person's turn says.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_active = True
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent("nightly digest", placeholder=None, source=TurnSource.CRON)
+                )
+
+            assert h.runner.steers == [], "a job steered a live session"
+            assert h.runner.opened == [], "a job opened a turn beside a live one"
+
+    asyncio.run(go())
+
+
+def test_a_job_runs_normally_when_the_thread_is_idle(make_harness) -> None:
+    """The deferral is conditional. An idle thread runs the job immediately."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_active = False
+            h.runner.default_script = [Final(text="digest", status=DONE)]
+
+            await h.kernel.process_event(
+                _qevent("nightly digest", placeholder=None, source=TurnSource.CRON)
+            )
+
+            assert h.runner.opened == ["nightly digest"]
+            assert h.runner.steers == []
+
+    asyncio.run(go())
+
+
+def test_an_unreadable_session_defers_the_job(make_harness) -> None:
+    """The liveness read fails CLOSED.
+
+    A runner that cannot answer is not evidence of an idle thread. Reading the
+    failure as idle would open a turn beside one that may already be running,
+    which breaks the kernel's one-live-turn-per-thread invariant -- so the job
+    defers instead. Added because a mutation flipping this to fail-open left the
+    suite green.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_active = False
+            h.runner.status_fails = True
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent("digest", placeholder=None, source=TurnSource.CRON)
+                )
+
+            assert h.runner.opened == [], "an unreadable session let a job open a turn"
+
+    asyncio.run(go())
+
+
+def test_a_status_without_turn_active_defers_the_job(make_harness) -> None:
+    """A 200 that omits the field is as unreadable as a 500.
+
+    Separate from the 500 case on purpose: a runner answering successfully with a
+    shape we cannot interpret is the likelier real-world drift, and reading a
+    missing field as False would silently treat every such runner as idle.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_active = False
+            h.runner.status_malformed = True
+
+            with pytest.raises(ThreadBusyError):
+                await h.kernel.process_event(
+                    _qevent("digest", placeholder=None, source=TurnSource.CRON)
+                )
 
             assert h.runner.opened == []
-            assert h.sink.events == []
+
+    asyncio.run(go())
+
+
+def test_streamer_adopts_its_own_minted_ref(make_harness) -> None:
+    """A streamer that posts its first delta edits that message thereafter.
+
+    Driven directly rather than through ``process_event`` because the booting
+    notice normally mints the ref first, which hides this path: it is reached
+    when that delivery failed, and a mutation removing the adoption left the
+    end-to-end test green. One message, then edits, is the property.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            reply = kernel_module._ThrottledReply(
+                h.sink,
+                target=ReplyTarget(
+                    kind="slack", address="C1", conversation_id="th-1", reply_ref=None
+                ),
+                route=TargetRoute(),
+                min_interval_s=0.0,
+            )
+            await reply.stream("one")
+            await reply.stream("one two")
+            await reply.finalize("one two three")
+
+            assert len(h.sink.text_posts) == 1, h.sink.text_posts
+            minted = h.sink.text_posts[0][1]
+            assert {ref for _, ref, _ in h.sink.updates} == {minted}
+            assert len(h.sink.updates) == 3
+
+    asyncio.run(go())
+
+
+def test_a_person_still_steers_a_live_session(make_harness) -> None:
+    """The guard is scoped to jobs and leaves the conversational path alone."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_active = True
+
+            await h.kernel.process_event(_qevent("actually, make it shorter"))
+
+            assert h.runner.steers == ["actually, make it shorter"]
 
     asyncio.run(go())
 
