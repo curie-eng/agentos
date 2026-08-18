@@ -60,6 +60,16 @@ arrives some runs later as an assertion nobody made. The review named it
 plainly — *"you're going to hallucinate the bejesus out of it, because you're
 compacting compactions; it's just a game of telephone at that point."*
 
+**The property that follows is self-correction, and it is worth more than the
+absence of compounding.** Because a run derives the whole document from source
+material it re-reads, an error a run introduces does not survive the next one:
+the document is re-derived, not repaired. Ground truth stays the transcripts, and
+the document is only ever the current derivation of them. Any design whose source
+of truth becomes the document itself has no path back — an error introduced there
+is permanent, and every later write builds on it. That is the deeper reading of
+the review's objection, and it is the one that decides between the alternatives
+below.
+
 The cost of this clause is the reason for clause 3.
 
 ### 2. The source is the platform's transcripts, not the surface.
@@ -126,13 +136,18 @@ next run** — a fact stated in one place is not available to the same agent
 answering in another, which is exactly the position an agent bound to both a chat
 channel and a mailbox is in.
 
-Where that is not acceptable, **the first thing to reach for is targeted editing,
-not an in-turn write path.** Targeted editing cuts the latency to minutes without
-violating clause 1, because it never re-summarises the document. An in-turn write
-path cuts it to zero by moving the judgement into the model and opening a third
-write channel into memory, which is the more expensive trade of the two. Both are
-separate decisions, they are not the same decision, and the alternatives below say
-why this one is the default rather than the only option.
+Where that is not acceptable, the ways out are both worse than they look, and the
+alternatives below state why. Targeted editing cuts the latency to minutes but
+makes the document its own source of truth, which forfeits clause 1's
+self-correction. An in-turn write path cuts it to zero but moves the judgement
+into the model and opens a third write channel into memory.
+
+**A shorter period is the cheapest way out and the only one that keeps clause 1.**
+A run is a full rewrite whatever schedules it, so firing more often trades money
+for freshness and nothing else. ADR-0099's trigger vocabulary is open and already
+names message-count thresholds as a candidate: that fires where traffic is and
+stays quiet where there is none, which is the shape a cron interval cannot express.
+Anything beyond that is a separate decision and is not a patch to this one.
 
 ### 8. Extension points
 
@@ -169,22 +184,34 @@ second write channel that changes nothing about the output.
 **Targeted editing of the document, fact by fact.** The Mem0 shape ADR-0095's
 prior art names: extract candidate facts from new traffic, then a second pass
 decides add, update or delete against what the document already says. Stated as
-its own alternative because clause 1 does **not** rule it out, and the
-note-folding rejection above does not cover it — it neither re-summarises the
-document nor re-reads the whole source, so every line is either original text or
-text a decision explicitly replaced. There is no game of telephone.
+its own alternative because the note-folding rejection above does not describe it:
+it does not re-summarise the whole document on a schedule.
 
-Rejected as the default on a different ground: **it cannot reorganise.** Five
-true lines that are really one rule stay five lines, because no new fact
-contradicts any of them. Near-duplicate accumulation is the failure Mem0's own
-second pass exists to fight, which is the honest signal that it is the failure
-mode of the shape. Only a full rewrite can read five lines and write one.
+**It does not escape clause 1, and an earlier draft of this ADR wrongly said it
+did.** Two things break that claim. An update is a generation, not a swap: to
+change what a line says without discarding what it already carried, the pass has
+to read the existing line and write a merged one, which is a paraphrase of a
+paraphrase at line granularity rather than document granularity. And because the
+pass runs per turn rather than per period, there are orders of magnitude more such
+generations against the same text.
 
-That failure also arrives on the wrong timescale for this decision. Staleness
-shows up on the first day, self-heals on the next run, and is explainable to
-whoever noticed. Structural drift shows up over months, compounds, and does not
-self-heal. **Between two designs, ship first the one whose failure is visible
-inside the period we can measure.**
+The decisive objection is the one clause 1 states positively. **Targeted editing
+makes the document its own source of truth.** Nothing re-reads the transcripts, so
+nothing can notice that a line drifted; a line that went subtly wrong on one turn
+is wrong permanently, and every later edit against it inherits the error. A full
+rewrite is self-correcting for exactly the reason it is expensive — it goes back
+to the source every time, so yesterday's mistake is not repaired but replaced.
+
+A second, smaller objection: **it cannot reorganise.** Five true lines that are
+really one rule stay five lines, because no new fact contradicts any of them.
+Near-duplicate accumulation is the failure Mem0's own second pass exists to fight,
+which is the honest signal that it is the failure mode of the shape.
+
+Both failures also arrive on the wrong timescale. Staleness shows up on the first
+day, self-heals on the next run, and is explainable to whoever noticed. Silent
+drift in a document nothing re-derives shows up over months, compounds, and does
+not self-heal. **Between two designs, ship first the one whose failure is visible
+inside the period you can measure.**
 
 It is nonetheless the right next increment, and in this order: a document a full
 rewrite has already organised is the document targeted editing performs well
