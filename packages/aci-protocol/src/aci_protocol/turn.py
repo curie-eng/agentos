@@ -15,6 +15,8 @@ can produce and route the same payload:
     conversation_id the conversation/thread key routing keeps one live session per
     author          who authored the message
     text            the message text
+    source          what started this turn: a person's message, or a job (see
+                    ``TurnSource``)
     reply_handle    the routing pair plus where the reply is delivered (see
                     ``ReplyHandle``)
     received_at     ISO-8601 UTC timestamp of when the adapter received it
@@ -26,7 +28,49 @@ single ``payload`` field holding this model's JSON) is a transport detail and
 stays outside this package, in the dispatcher's queue module.
 """
 
+from enum import StrEnum
+
 from .events import _AciModel
+
+
+class TurnSource(StrEnum):
+    """What started this turn: a person speaking, or the system doing a job.
+
+    ADR-0079's new event kind. The values are the three the ADR names, and the
+    distinction the kernel actually acts on is binary: ``SLACK`` is a person's
+    message and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a
+    job is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept
+    here rather than re-derived at each call site so a fourth value cannot be
+    added without deciding which side of the line it falls on.
+
+    **This is a different axis from ``ReplyHandle.kind`` and the two do not
+    collapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``
+    answers *what caused the turn*. A nightly digest posted into a Slack channel
+    is ``kind="slack"`` with ``source=CRON``: same transport as a mention, and it
+    must not steer whatever conversation is live in that thread. Reading either
+    field off the other is the silent misroute both exist to close.
+
+    ``SLACK`` is the ADR's spelling for "a person's chat message", which was the
+    only such ingress when ADR-0079 was accepted. A channel port turn from a
+    human on another transport (an email that a person actually sent) is that
+    same category on a different ``kind``, and giving it its own value is a NEW
+    ENUM VALUE -- breaking under this package's rules, so it is a deliberate,
+    separately-decided bump rather than something this change assumes.
+    """
+
+    SLACK = "slack"
+    WEBHOOK = "webhook"
+    CRON = "cron"
+
+    @property
+    def is_job(self) -> bool:
+        """Is this turn a system-generated job rather than a person's message?
+
+        Returns:
+            True when the turn must never steer a live session (ADR-0079's
+            "jobs are outputs, not steering inputs").
+        """
+        return self is not TurnSource.SLACK
 
 
 class ReplyHandle(_AciModel):
@@ -80,6 +124,14 @@ class QueuedTurn(_AciModel):
     The Valkey Stream carries this model as a single ``payload`` JSON field; the
     stream-encoding helpers live with the producer (the dispatcher), not on this
     frozen model, so the contract stays transport-agnostic.
+
+    ``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set
+    it still decodes, which is what makes this addition a PATCH under this
+    package's change-class table rather than a breaking minor. The default is a
+    compatibility affordance and not a licence to omit it: every first-party mint
+    site sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting
+    to the non-job value is also the safe direction -- an unset ``source`` reads
+    as a person's message, so a job can never be created by omission.
     """
 
     event_id: str
@@ -88,3 +140,4 @@ class QueuedTurn(_AciModel):
     text: str
     reply_handle: ReplyHandle
     received_at: str
+    source: TurnSource = TurnSource.SLACK
