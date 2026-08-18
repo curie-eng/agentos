@@ -321,6 +321,16 @@ class Settings(BaseSettings):
     # exceeded requests are refused 429 rather than queued. It bounds the rate of
     # NEW work, not the depth of unconsumed work: the API cannot observe what the
     # worker has consumed without infrastructure phase 2 does not build.
+    # Inbound hook ingress (ADR-0079, #269). Body bound sized like the GitHub
+    # webhook's rather than the channel turn's: a hook payload is a machine
+    # document, not a person's message, and the whole document becomes the turn
+    # text today.
+    hook_max_body_bytes: int = 1024 * 1024
+    # Metered per AGENT: the thing worth bounding is how much work one agent's
+    # upstreams can create, and a per-hook counter would let a source multiply
+    # its own allowance by inventing hook names.
+    hook_backlog_limit: int = 64
+    hook_backlog_window_s: int = 60
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = 60
 

@@ -27,7 +27,6 @@ URL, which is credential capture rather than merely SSRF.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import secrets
 import time
@@ -54,6 +53,14 @@ from .. import channel_token
 from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
+from ..delivery import (
+    claim_delivery,
+    duplicate_stream_id,
+    enqueue_owned,
+    release_claim,
+    sha16,
+    take_backlog_slot,
+)
 from ..deps import SessionDep
 
 # The API's Valkey client is built without `decode_responses`, so values come
@@ -85,66 +92,6 @@ _AUTH_DETAIL = "missing or invalid credential"
 # sharing an upstream id space -- two AgentMail inboxes, two webhook sources --
 # cannot swallow each other's turns (E16).
 _CLAIM_PREFIX = "curie:channel"
-
-# The owner-checked enqueue, as ONE script so the ownership check and the XADD
-# are a single atomic step (Valkey runs a script single-threaded, which is
-# exactly the guarantee needed here). Three exhaustive outcomes:
-#
-#   (a) we still own the lease        -> XADD, and the claim becomes the receipt
-#   (b) the lease lapsed, NO successor -> re-claim and XADD in-script
-#   (c) a foreign token or a stream id -> no XADD; name the current owner
-#
-# (b) is not a nicety: without it a winner that resumed after its lease expired
-# but BEFORE any successor claimed would find an empty key, take the lease-lost
-# arm, and report a duplicate for a delivery that was NEVER enqueued -- and the
-# adapter retries only transport failures, so that delivery is silently dropped.
-# (c)'s TOKEN comparison is what makes the lease OWNED: a merely SLOW winner
-# whose lease was re-claimed must not XADD on top of the retry's entry.
-#
-# The claim key has TWO phases with OPPOSITE expiry contracts, and BOTH enqueue
-# arms below write the second one: `pending:<token>` carries the lease TTL (what
-# makes a dead winner's delivery recoverable), while the stream id that replaces
-# it is a RECEIPT and is written with NO expiry at all. An expiry there lets the
-# same `delivery_id` win a fresh `SET NX` once it lapses, enqueue a second time,
-# and answer the correspondent twice -- silently, and only for the deliveries an
-# adapter happens to retry after the window.
-_ENQUEUE_SCRIPT = """
-local cur = redis.call('GET', KEYS[1])
-if cur == ARGV[1] then
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
-  redis.call('SET', KEYS[1], id)
-  return {1, id}
-elseif not cur then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
-  redis.call('SET', KEYS[1], id)
-  return {1, id}
-else
-  return {0, cur}
-end
-"""
-
-# One binding's slot counter for the current window, taken atomically: INCR and
-# the window's EXPIRE cannot be two round trips, or a process that dies between
-# them leaves a counter that never expires and 429s that binding forever.
-_QUOTA_SCRIPT = """
-local n = redis.call('INCR', KEYS[1])
-if n == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return n
-"""
-
-# Give a claim back, and ONLY our own: used when the quota refuses a delivery we
-# have already claimed, so the refusal does not leave the `delivery_id` locked
-# for a lease's duration. The compare is what keeps a slow caller from deleting
-# a successor's claim.
-_RELEASE_SCRIPT = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  redis.call('DEL', KEYS[1])
-end
-return 1
-"""
 
 
 # --- request/response models --------------------------------------------------
@@ -329,10 +276,6 @@ async def mint_channel_token(
 # --- POST /channels/turns -----------------------------------------------------
 
 
-def _sha16(delivery_id: str) -> str:
-    return hashlib.sha256(delivery_id.encode()).hexdigest()[:16]
-
-
 # Both names below are built from the SAME digest of the same `delivery_id`, so
 # the handler hashes once and hands the digest to each: they name one delivery,
 # and re-deriving it per name is work paid on every ingress request.
@@ -430,92 +373,16 @@ def _mint_turn(row: AgentChannel, body: TurnIn, event_id: str) -> QueuedTurn:
     )
 
 
-async def _claim_delivery(
-    client: redis.Redis, key: str, owner: str, lease_s: int
-) -> bool:
-    """Claim one delivery for THIS request: `SET NX EX`, first writer wins.
-
-    The structural sibling of the dispatcher's `already_enqueued` guard
-    (`apps/dispatcher/src/curie_dispatcher/queue.py`'s `claim_event`), with two
-    deliberate differences: the dispatcher DROPS a retry silently while ingress
-    ANSWERS it (an HTTP caller needs a response), and the value here is an owner
-    TOKEN that later becomes the stream id rather than a bare `1`, which is what
-    makes that answer possible.
-
-    `SET NX` is the only atomic step available: a read-then-write guard (the
-    kernel's `is_done` check, read long before `mark_done` is written) admits two
-    winners, which is why idempotency is settled here, at ingress.
-    """
-
-    return bool(await client.set(key, owner, nx=True, ex=lease_s))
-
-
-async def _enqueue_owned(
-    client: redis.Redis,
-    *,
-    key: str,
-    stream: str,
-    owner: str,
-    payload: str,
-    lease_s: int,
-) -> tuple[bool, str]:
-    """Run the owner-checked enqueue script; True with the stream id when THIS
-    request enqueued, False with the current owner's value when it did not.
-
-    No receipt TTL is passed because the receipt has none: the claim key survives
-    as the stream id for good (see `_ENQUEUE_SCRIPT`)."""
-
-    result: Any = await client.eval(
-        _ENQUEUE_SCRIPT,
-        2,
-        key,
-        stream,
-        owner,
-        payload,
-        STREAM_PAYLOAD_FIELD,
-        str(lease_s),
-    )
-    enqueued, current = result
-    return bool(enqueued), _text(current)
-
-
-async def _take_backlog_slot(
-    client: redis.Redis, *, channel_id: uuid.UUID, limit: int, window_s: int
-) -> bool:
-    """Count ONE new delivery against this binding's window, atomically.
-
-    Called only once a claim is won, so a duplicate an adapter is retrying costs
-    nothing -- the cap is on NEW work per binding, which is the thing a
-    compromised adapter can make unbounded.
-    """
-
-    window = int(time.time()) // window_s
-    key = f"{_CLAIM_PREFIX}:backlog:{channel_id}:{window}"
-    count: Any = await client.eval(_QUOTA_SCRIPT, 1, key, str(window_s))
-    return int(count) <= limit
-
-
-async def _release_claim(client: redis.Redis, key: str, owner: str) -> None:
-    """Give back a claim this request took but will not enqueue."""
-
-    await client.eval(_RELEASE_SCRIPT, 1, key, owner)
-
-
-def _duplicate(
-    event_id: str, current: str, response: Response
-) -> TurnAccepted:
+def _duplicate(event_id: str, current: str, response: Response) -> TurnAccepted:
     """Answer a delivery someone else owns, from what the claim key holds.
 
-    A `pending:` value means another request is mid-flight and there is no stream
-    id yet, so the answer is 202 ("come back"); anything else IS the stream id of
-    the entry that request enqueued, so the answer is 200 with that id. Either
-    way this request issues no XADD.
+    The status and the None-vs-id decision live in `delivery.duplicate_stream_id`
+    so the hook ingress cannot drift from them; only this route's receipt SHAPE
+    is built here.
     """
 
-    if current.startswith("pending:"):
-        response.status_code = status.HTTP_202_ACCEPTED
-        return TurnAccepted(event_id=event_id, stream_id=None, duplicate=True)
-    return TurnAccepted(event_id=event_id, stream_id=current, duplicate=True)
+    stream_id = duplicate_stream_id(current, response)
+    return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
 
 
 @router.post("/turns", response_model=TurnAccepted)
@@ -566,7 +433,7 @@ async def ingest_turn(
         raise _unroutable(body.kind, body.address)
 
     # One hash of the `delivery_id`, shared by the two names derived from it.
-    digest = _sha16(body.delivery_id)
+    digest = sha16(body.delivery_id)
     event_id = _event_id(row.id, digest)
     client: redis.Redis = request.app.state.valkey
     key = _claim_key(row.id, digest)
@@ -592,12 +459,12 @@ async def ingest_turn(
     # have named its owner. If that repeats, the honest answer is "someone is
     # mid-flight" -- never a second XADD.
     for _attempt in range(2):
-        if await _claim_delivery(
+        if await claim_delivery(
             client, key, owner, settings.channel_delivery_lease_s
         ):
-            if not await _take_backlog_slot(
+            if not await take_backlog_slot(
                 client,
-                channel_id=row.id,
+                key_prefix=f"{_CLAIM_PREFIX}:backlog:{row.id}",
                 limit=settings.channel_binding_backlog_limit,
                 window_s=settings.channel_binding_backlog_window_s,
             ):
@@ -605,7 +472,7 @@ async def ingest_turn(
                 # is not locked out for a lease, and tell the adapter to retry.
                 # Metered per binding, so one compromised or runaway adapter
                 # cannot fill the shared stream for every other tenant.
-                await _release_claim(client, key, owner)
+                await release_claim(client, key, owner)
                 logger.warning(
                     "channel ingress refused event_id=%s kind=%s: binding backlog "
                     "quota of %d per %ds exceeded",
@@ -627,12 +494,13 @@ async def ingest_turn(
             # those requests answers from `event_id` alone and would have thrown
             # the payload away.
             turn = _mint_turn(row, body, event_id)
-            enqueued, current = await _enqueue_owned(
+            enqueued, current = await enqueue_owned(
                 client,
                 key=key,
                 stream=settings.runs_stream,
                 owner=owner,
                 payload=turn.model_dump_json(),
+                payload_field=STREAM_PAYLOAD_FIELD,
                 lease_s=settings.channel_delivery_lease_s,
             )
             if enqueued:
