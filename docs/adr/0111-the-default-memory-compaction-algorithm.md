@@ -149,7 +149,36 @@ names message-count thresholds as a candidate: that fires where traffic is and
 stays quiet where there is none, which is the shape a cron interval cannot express.
 Anything beyond that is a separate decision and is not a patch to this one.
 
-### 8. Extension points
+### 8. A run must be able to show what it changed.
+
+A run replaces the document whole, so only that run knows what it removed. If the
+previous document is not retained, **nothing can tell that last night's run lost a
+fact.** The state store's `version` is a compare-and-set counter, not a value
+history: the row is overwritten and the prior text is gone.
+
+This matters more under clause 1 than it would under a design that appends,
+because the Consequences below already rule out the obvious remedy — editing the
+document does not stick, since the next run overwrites the edit. **Inspection is
+therefore the only remedy this design leaves.** A wrong fact is fixed at its
+source, and finding it starts with reading what the document says and what
+changed.
+
+It is also the property this ADR should borrow from the assistants that write
+memory in-turn on the model's own judgement, rather than only noting that it does
+not need to. Their looser write path is safe for a reason that is not timing:
+**the artifact is a version-controlled file, so a wrong write appears in a diff
+and a person sees it.** A document held in one mutable row has no equivalent, and
+a compaction run's judgement is not obviously better than a model's mid-turn — it
+is only less frequent.
+
+Two concrete things are required and neither exists today: a way to read the
+current document from outside the sandbox, and a retained previous version so a
+run's effect is expressible as a diff. Neither needs a new datastore. Until both
+exist, **a run that quietly dropped a fact is indistinguishable from one that
+correctly decided the fact no longer held** — and clause 6's "leave the old
+document standing" is the only visible failure mode the design has.
+
+### 9. Extension points
 
 - **Replace** the prompt a run uses.
 - **Replace** the whole algorithm with a bundle-declared hook of the builder's
@@ -172,6 +201,14 @@ Anything beyond that is a separate decision and is not a patch to this one.
 - Because the algorithm is a scheduled turn, everything ADR-0099 says about
   silent turns, run records, and per-scope serialisation applies unchanged. This
   ADR adds no new machinery.
+- **Clause 8 is the one thing here that does need machinery, and it is absent.**
+  The record-shaped memory of ADR-0025 has an inspect/edit surface (#267); the
+  document does not, and no version of it is retained. Both are separate work
+  from this algorithm and both gate how much this algorithm can be trusted, so
+  they belong in an issue rather than in this ADR's scope. Enabling the algorithm
+  before they exist is a deliberate choice to run something whose output nobody
+  can audit, which is defensible only while the tier it writes is the scope tier
+  and the blast radius is one place.
 
 ## Alternatives considered
 
