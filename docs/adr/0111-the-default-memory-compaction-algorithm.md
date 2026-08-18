@@ -117,9 +117,22 @@ the document.
 ### 7. Latency is a property of the design, not an accident.
 
 A fact stated today is remembered from the next scheduled run, not from the next
-turn. For work on a quarterly or weekly cadence this is invisible. For an agent
-that must recall something said minutes ago, this algorithm is the wrong choice
-and an in-turn write path is a separate decision, not a patch to this one.
+turn. For work on a quarterly or weekly cadence this is invisible.
+
+Two cases make it visible, and they are not the same case. Within one thread
+nothing is lost: that thread's transcript is injected alongside the document, so a
+fact stated an hour ago is still in context. **Across scopes it is lost until the
+next run** — a fact stated in one place is not available to the same agent
+answering in another, which is exactly the position an agent bound to both a chat
+channel and a mailbox is in.
+
+Where that is not acceptable, **the first thing to reach for is targeted editing,
+not an in-turn write path.** Targeted editing cuts the latency to minutes without
+violating clause 1, because it never re-summarises the document. An in-turn write
+path cuts it to zero by moving the judgement into the model and opening a third
+write channel into memory, which is the more expensive trade of the two. Both are
+separate decisions, they are not the same decision, and the alternatives below say
+why this one is the default rather than the only option.
 
 ### 8. Extension points
 
@@ -152,6 +165,31 @@ originally carried: in-turn writes append notes, a scheduled pass folds them in.
 Rejected because the fold is either a compaction of a compaction, which clause 1
 refuses, or it re-reads the source anyway — at which point the notes are a
 second write channel that changes nothing about the output.
+
+**Targeted editing of the document, fact by fact.** The Mem0 shape ADR-0095's
+prior art names: extract candidate facts from new traffic, then a second pass
+decides add, update or delete against what the document already says. Stated as
+its own alternative because clause 1 does **not** rule it out, and the
+note-folding rejection above does not cover it — it neither re-summarises the
+document nor re-reads the whole source, so every line is either original text or
+text a decision explicitly replaced. There is no game of telephone.
+
+Rejected as the default on a different ground: **it cannot reorganise.** Five
+true lines that are really one rule stay five lines, because no new fact
+contradicts any of them. Near-duplicate accumulation is the failure Mem0's own
+second pass exists to fight, which is the honest signal that it is the failure
+mode of the shape. Only a full rewrite can read five lines and write one.
+
+That failure also arrives on the wrong timescale for this decision. Staleness
+shows up on the first day, self-heals on the next run, and is explainable to
+whoever noticed. Structural drift shows up over months, compounds, and does not
+self-heal. **Between two designs, ship first the one whose failure is visible
+inside the period we can measure.**
+
+It is nonetheless the right next increment, and in this order: a document a full
+rewrite has already organised is the document targeted editing performs well
+against, where a document targeted editing built from empty has no structure for
+it to preserve.
 
 **An in-turn `remember` tool as the primary write path.** Rejected as
 unnecessary rather than wrong: the utterance a tool would capture is already in
