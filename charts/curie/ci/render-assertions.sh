@@ -759,15 +759,20 @@ if check_github_token_empty "$GHT_MUTANT_RENDER" "mutant (githubToken via curie.
 fi
 echo "  ok: a generated githubToken is rejected (the assert can fail)"
 
-echo "=== Assertion 12c: worker API URL wiring (#1529) ==="
-WORKER_API_CHECK="$TMP/check_worker_api_url.py"
+echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
+WORKER_API_CHECK="$TMP/check_worker_api.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'
 import sys
 
 import yaml
 
-manifest, expected = sys.argv[1:]
-docs = [doc for doc in yaml.safe_load_all(open(manifest)) if doc]
+manifest, secret_manifest, expected_url, key_source, *key_ref = sys.argv[1:]
+docs = [
+    doc
+    for path in (manifest, secret_manifest)
+    for doc in yaml.safe_load_all(open(path))
+    if doc
+]
 workers = [
     doc
     for doc in docs
@@ -781,36 +786,83 @@ containers = workers[0]["spec"]["template"]["spec"].get("containers", [])
 if len(containers) != 1 or containers[0].get("name") != "worker":
     raise SystemExit("expected one worker container")
 
-entries = [
-    entry
-    for entry in containers[0].get("env", [])
-    if entry.get("name") == "CURIE_API_URL"
-]
-if len(entries) != 1:
-    raise SystemExit(f"CURIE_API_URL appears {len(entries)} times")
-if entries[0].get("value") != expected:
+def only_entry(name):
+    entries = [entry for entry in containers[0].get("env", []) if entry.get("name") == name]
+    if len(entries) != 1:
+        raise SystemExit(f"{name} appears {len(entries)} times")
+    return entries[0]
+
+url_entry = only_entry("CURIE_API_URL")
+if url_entry.get("value") != expected_url:
     raise SystemExit(
-        f"CURIE_API_URL is {entries[0].get('value')!r}, expected {expected!r}"
+        f"CURIE_API_URL is {url_entry.get('value')!r}, expected {expected_url!r}"
+    )
+
+key_entry = only_entry("CURIE_API_KEY")
+
+if key_source == "chart":
+    chart_secrets = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Secret"
+        and "apiKey" in (doc.get("stringData") or {})
+    ]
+    if len(chart_secrets) != 1:
+        raise SystemExit(
+            f"expected one chart Secret containing apiKey, found {len(chart_secrets)}"
+        )
+    expected_key_entry = {
+        "name": "CURIE_API_KEY",
+        "valueFrom": {
+            "secretKeyRef": {
+                "name": chart_secrets[0].get("metadata", {}).get("name"),
+                "key": "apiKey",
+            }
+        },
+    }
+elif key_source == "operator":
+    if len(key_ref) != 2:
+        raise SystemExit("operator key assertion requires a Secret name and key")
+    expected_key_entry = {
+        "name": "CURIE_API_KEY",
+        "valueFrom": {
+            "secretKeyRef": {"name": key_ref[0], "key": key_ref[1]}
+        },
+    }
+else:
+    raise SystemExit(f"unknown key source {key_source!r}")
+
+if key_entry != expected_key_entry:
+    raise SystemExit(
+        "CURIE_API_KEY does not match its expected Secret reference"
     )
 PYEOF
 
-assert_worker_api_url() {
-  local name="$1" release="$2" expected="$3"
-  shift 3
+assert_worker_api() {
+  local name="$1" release="$2" expected_url="$3" key_source="$4"
+  shift 4
+  local key_args=()
+  if [[ "$key_source" == "operator" ]]; then
+    key_args=("$1" "$2")
+    shift 2
+  fi
   local out="$TMP/worker_api_url_$name"
   mkdir -p "$out"
   helm template "$release" "$CHART" --output-dir "$out" "$@" >/dev/null
   local manifest="$out/curie/templates/worker.yaml"
+  local secret_manifest="$out/curie/templates/secrets.yaml"
   [[ -f "$manifest" ]] || fail "$name: worker.yaml did not render"
+  [[ -f "$secret_manifest" ]] || fail "$name: secrets.yaml did not render"
   local error
-  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$expected" 2>&1)"; then
+  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" "${key_args[@]}" 2>&1)"; then
     fail "$name: $error"
   fi
 }
 
-assert_worker_api_url default curie http://curie-api:8000
-assert_worker_api_url release other http://other-curie-api:8000
-assert_worker_api_url port curie http://curie-api:9999 --set api.service.port=9999
+assert_worker_api default curie http://curie-api:8000 chart
+assert_worker_api enabled curie http://curie-api:8000 chart --set worker.connectorReconciler.enabled=true
+assert_worker_api release other http://other-curie-api:8000 chart
+assert_worker_api port curie http://curie-api:9999 chart --set api.service.port=9999
 
 WORKER_API_BYO="$TMP/worker_api_byo.yaml"
 cat > "$WORKER_API_BYO" <<'EOF'
@@ -819,7 +871,7 @@ api:
 dispatcher:
   apiBaseUrl: https://byo-api.example
 EOF
-assert_worker_api_url byo curie https://byo-api.example -f "$WORKER_API_BYO"
+assert_worker_api byo curie https://byo-api.example chart -f "$WORKER_API_BYO"
 
 WORKER_API_OVERRIDE="$TMP/worker_api_override.yaml"
 cat > "$WORKER_API_OVERRIDE" <<'EOF'
@@ -832,8 +884,20 @@ worker:
     - name: CURIE_API_URL
       value: http://operator.example:9000
 EOF
-assert_worker_api_url override curie http://operator.example:9000 -f "$WORKER_API_OVERRIDE"
-echo "  ok: default, release name, configured port, BYO API, and operator override render one worker API URL"
+assert_worker_api override curie http://operator.example:9000 chart -f "$WORKER_API_OVERRIDE"
+
+WORKER_API_KEY_OVERRIDE="$TMP/worker_api_key_override.yaml"
+cat > "$WORKER_API_KEY_OVERRIDE" <<'EOF'
+worker:
+  extraEnv:
+    - name: CURIE_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: operatorapisecret
+          key: apiKey
+EOF
+assert_worker_api key_override curie http://curie-api:8000 operator operatorapisecret apiKey -f "$WORKER_API_KEY_OVERRIDE"
+echo "  ok: default and connector enabled renders use one chart API key reference; operator key override renders once without a chart duplicate"
 
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; and the worker renders exactly one API URL in the default, release name, configured port, BYO API, and operator override cases."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; and the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases."
