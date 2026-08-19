@@ -67,7 +67,7 @@ def has_usable_source(entry):
     return bool(entry.get("value")) or bool(entry.get("valueFrom"))
 
 
-def env_of(docs, kind, component, container_name, init=False):
+def container_env(docs, kind, component, container_name, init=False):
     """Select by the component LABEL and the container NAME.
 
     `endswith("-worker")` also matches `<release>-curie-langfuse-worker`, which
@@ -91,8 +91,13 @@ def env_of(docs, kind, component, container_name, init=False):
             f"{kind} {component} must render exactly one container named "
             f"{container_name}, got {len(matches)}"
         )
-        return {e["name"]: e for e in matches[0].get("env", [])}
+        return matches[0].get("env", [])
     return None
+
+
+def env_of(docs, kind, component, container_name, init=False):
+    env = container_env(docs, kind, component, container_name, init)
+    return None if env is None else {entry["name"]: entry for entry in env}
 
 
 def object_store_keys(env):
@@ -256,21 +261,6 @@ def assert_contract(docs, label, expected_endpoint):
     print(f"ok: {label}: S3_SECRET_KEY is a ref -> {ref['name']}/{ref['key']}")
 
 
-def probe_env(docs, kind, component, container_name, init=False):
-    for d in docs:
-        if d.get("kind") != kind:
-            continue
-        if d["metadata"].get("labels", {}).get("app.kubernetes.io/component") != component:
-            continue
-        pod_template = "template" if kind == "Deployment" else "podTemplate"
-        pod_spec = d["spec"][pod_template]["spec"]
-        containers = pod_spec.get("initContainers" if init else "containers", [])
-        matches = [c for c in containers if c.get("name") == container_name]
-        assert len(matches) == 1
-        return matches[0].get("env", [])
-    raise AssertionError(f"{kind} {component} was not rendered")
-
-
 def expect_failure(docs, messages):
     captured = io.StringIO()
     try:
@@ -292,7 +282,8 @@ default_docs = render()
 assert_contract(default_docs, "default", "http://curie-rustfs:9000")
 
 missing_api_key = copy.deepcopy(default_docs)
-api_env = probe_env(missing_api_key, "Deployment", "api", "api")
+api_env = container_env(missing_api_key, "Deployment", "api", "api")
+assert api_env is not None, "api Deployment was not rendered"
 api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
 expect_failure(
     missing_api_key,
@@ -303,15 +294,18 @@ expect_failure(
 )
 
 three_divergences = copy.deepcopy(default_docs)
-api_env = probe_env(three_divergences, "Deployment", "api", "api")
-worker_env = probe_env(three_divergences, "Deployment", "worker", "worker")
-bundle_env = probe_env(
+api_env = container_env(three_divergences, "Deployment", "api", "api")
+assert api_env is not None, "api Deployment was not rendered"
+worker_env = container_env(three_divergences, "Deployment", "worker", "worker")
+assert worker_env is not None, "worker Deployment was not rendered"
+bundle_env = container_env(
     three_divergences,
     "SandboxTemplate",
     "agent-sandbox",
     "bundle-fetch",
     init=True,
 )
+assert bundle_env is not None, "SandboxTemplate bundle-fetch was not rendered"
 api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
 worker_endpoint = next(
     entry for entry in worker_env if entry.get("name") == "S3_ENDPOINT_URL"
@@ -334,7 +328,8 @@ expect_failure(
 )
 
 unsupported_diagnostic = copy.deepcopy(default_docs)
-worker_env = probe_env(unsupported_diagnostic, "Deployment", "worker", "worker")
+worker_env = container_env(unsupported_diagnostic, "Deployment", "worker", "worker")
+assert worker_env is not None, "worker Deployment was not rendered"
 worker_env[:] = [
     entry for entry in worker_env if entry.get("name") != "S3_ACCESS_KEY"
 ]
