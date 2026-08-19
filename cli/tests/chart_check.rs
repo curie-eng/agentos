@@ -68,7 +68,10 @@ fn chart_check_json_keeps_child_chatter_off_stdout() {
              {error}; stdout: {stdout:?}"
         )
     });
-    assert!(payload.is_object(), "--json result must be an object: {payload}");
+    assert!(
+        payload.is_object(),
+        "--json result must be an object: {payload}"
+    );
     assert_eq!(payload["passed"], 1, "{payload}");
     assert_eq!(payload["total"], 1, "{payload}");
     assert_eq!(
