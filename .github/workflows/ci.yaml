@@ -1164,19 +1164,6 @@ jobs:
           set -euo pipefail
 
           validate_selected_outcomes() {
-            local skill_local_expected="skipped"
-            if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
-              skill_local_expected="success"
-            fi
-            local local_release_expected="skipped"
-            if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
-              local_release_expected="success"
-            fi
-            local cluster_expected="skipped"
-            if [[ "$CLUSTER_SELECTED" == "true" ]]; then
-              cluster_expected="success"
-            fi
-
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
@@ -1194,27 +1181,34 @@ jobs:
             exit 1
           fi
 
+          skill_local_expected="skipped"
+          if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
+            skill_local_expected="success"
+          fi
+          local_release_expected="skipped"
+          if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
+            local_release_expected="success"
+          fi
+          cluster_expected="skipped"
+          if [[ "$CLUSTER_SELECTED" == "true" ]]; then
+            cluster_expected="success"
+          fi
+
           if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
             exit 1
           fi
 
-          negative_skill_local_result="$SKILL_LOCAL_RESULT"
-          negative_local_release_result="$LOCAL_RELEASE_RESULT"
-          negative_cluster_result="$CLUSTER_RESULT"
-          if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
+          negative_skill_local_result="$skill_local_expected"
+          negative_local_release_result="$local_release_expected"
+          negative_cluster_result="$cluster_expected"
+          if [[ "$skill_local_expected" == "success" ]]; then
             negative_skill_local_result="skipped"
-          fi
-          if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
+          elif [[ "$local_release_expected" == "success" ]]; then
             negative_local_release_result="skipped"
-          fi
-          if [[ "$CLUSTER_SELECTED" == "true" ]]; then
+          elif [[ "$cluster_expected" == "success" ]]; then
             negative_cluster_result="skipped"
-          fi
-          if [[ "$SKILL_SELECTED" != "true" &&
-                "$LOCAL_SELECTED" != "true" &&
-                "$LOCAL_RELEASE_SELECTED" != "true" &&
-                "$CLUSTER_SELECTED" != "true" ]]; then
+          else
             negative_skill_local_result="success"
           fi
 
