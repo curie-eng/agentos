@@ -1057,27 +1057,37 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         return Ok(ApplyOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
 
-    // Load the staged objects into whatever the upgrade created, and verify per
-    // object. `run_import` retains the staging pod when anything is missing, so
-    // a partial load stays recoverable.
+    // Load the staged objects into the planned target. Import returns only once
+    // the persisted source inventory is present there at the same sizes.
     if migrating {
         let common = crate::ops::CommonOpts {
             namespace: cfg.install.namespace.clone(),
             release: cfg.install.release.clone(),
             dry_run: false,
         };
-        let imported = crate::migrate_store::run_import(&common, BUNDLE_BUCKET, false).await?;
-        if let crate::migrate_store::MigrateStoreOutput::Imported { missing, .. } = &imported {
-            if !missing.is_empty() {
-                bail!(
-                    "the upgrade applied, but {} staged object(s) did not reach the new \
-                     store. The staging pod has been kept -- it holds the only other \
-                     copy. Re-run `curie cluster migrate-store --phase import` before \
-                     deleting it.",
-                    missing.len()
-                );
-            }
-        }
+        let recovery_command = format!(
+            "`curie cluster migrate-store --phase import --namespace {} --release {}`",
+            common.namespace, common.release
+        );
+        let target = crate::migrate_store::read_planned_target(&common)
+            .await
+            .with_context(|| {
+                format!(
+                    "the upgrade applied, but the planned migration target could not be verified; the staging pod remains available. Retry with {recovery_command}"
+                )
+            })?;
+        crate::migrate_store::run_import_to_planned_target(
+            &common,
+            target,
+            BUNDLE_BUCKET,
+            false,
+        )
+            .await
+            .with_context(|| {
+                format!(
+                    "the upgrade applied, but store import verification did not complete; the staging pod remains available. Retry with {recovery_command}"
+                )
+            })?;
     }
 
     Ok(ApplyOutput::Applied {

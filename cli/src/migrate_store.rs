@@ -58,6 +58,14 @@ impl StoreKind {
             StoreKind::Rustfs => "rustfsSecretKey",
         }
     }
+
+    fn from_suffix(value: &str) -> Option<Self> {
+        match value {
+            "minio" => Some(StoreKind::Minio),
+            "rustfs" => Some(StoreKind::Rustfs),
+            _ => None,
+        }
+    }
 }
 
 /// Identify the store among a release's StatefulSet COMPONENTS.
@@ -134,11 +142,13 @@ pub fn create_staging_pod_cmd(o: &CommonOpts, image: &str, secret_name: &str) ->
                 "command": ["sleep", "86400"],
                 "volumeMounts": [
                     {"name": "stage", "mountPath": "/stage"},
+                    {"name": "migration", "mountPath": "/migration"},
                     {"name": "release-secret", "mountPath": "/secret", "readOnly": true}
                 ]
             }],
             "volumes": [
                 {"name": "stage", "emptyDir": {}},
+                {"name": "migration", "emptyDir": {}},
                 {"name": "release-secret", "secret": {"secretName": secret_name}}
             ]
         }
@@ -212,6 +222,10 @@ fn sync_script(store: StoreKind, endpoint: &str, from: &str, to: &str) -> String
 /// verb failed: `array index out of bounds: index 0, length 0`. Filtering on
 /// `spec.selector` is what actually finds it.
 pub fn store_service_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
+    store_service_for_component_cmd(o, store.suffix())
+}
+
+fn store_service_for_component_cmd(o: &CommonOpts, component: &str) -> OpsCommand {
     OpsCommand::new(
         "kubectl",
         vec![
@@ -222,7 +236,7 @@ pub fn store_service_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
             plain("-o"),
             plain(format!(
                 r#"jsonpath={{.items[?(@.spec.selector.app\.kubernetes\.io/component=="{}")].metadata.name}}"#,
-                store.suffix()
+                component
             )),
         ],
     )
@@ -246,6 +260,16 @@ pub fn export_cmd(o: &CommonOpts, from: StoreKind, bucket: &str, endpoint: &str)
 /// `mb` on an existing bucket is a no-op error, so it is tolerated: a re-run
 /// after a partial import must not fail on the bucket already being there.
 pub fn import_cmd(o: &CommonOpts, to: StoreKind, bucket: &str, endpoint: &str) -> OpsCommand {
+    import_for_store_cmd(o, to.access_key(), to.secret_key(), bucket, endpoint)
+}
+
+fn import_for_store_cmd(
+    o: &CommonOpts,
+    access_key: &str,
+    secret_key: &str,
+    bucket: &str,
+    endpoint: &str,
+) -> OpsCommand {
     let script = format!(
         "set -e; {wait}\
          export AWS_DEFAULT_REGION=us-east-1; \
@@ -255,16 +279,11 @@ pub fn import_cmd(o: &CommonOpts, to: StoreKind, bucket: &str, endpoint: &str) -
          aws s3 mb s3://{bucket} --endpoint-url {endpoint} || true; \
          aws s3 sync /stage s3://{bucket} --endpoint-url {endpoint} --only-show-errors; \
          echo synced",
-        wait = await_secret_key(to.secret_key()),
-        access = to.access_key(),
-        secret = to.secret_key(),
+        wait = await_secret_key(secret_key),
+        access = access_key,
+        secret = secret_key,
     );
     exec_cmd(o, &script)
-}
-
-/// Count staged objects, for the before/after comparison.
-pub fn staged_count_cmd(o: &CommonOpts) -> OpsCommand {
-    exec_cmd(o, "find /stage -type f | wc -l")
 }
 
 /// List `<size> <key>` for every object in a store, for a per-object diff.
@@ -278,16 +297,29 @@ pub fn store_listing_cmd(
     bucket: &str,
     endpoint: &str,
 ) -> OpsCommand {
+    store_listing_for_store_cmd(o, store.access_key(), store.secret_key(), bucket, endpoint)
+}
+
+fn store_listing_for_store_cmd(
+    o: &CommonOpts,
+    access_key: &str,
+    secret_key: &str,
+    bucket: &str,
+    endpoint: &str,
+) -> OpsCommand {
     let script = format!(
-        "{wait}export AWS_DEFAULT_REGION=us-east-1; \
+        "set -e; {wait}export AWS_DEFAULT_REGION=us-east-1; \
          aws configure set default.s3.addressing_style path; \
          export AWS_ACCESS_KEY_ID={access}; \
          export AWS_SECRET_ACCESS_KEY=$(cat /secret/{secret}); \
+         listing_raw=$(mktemp /tmp/curie-store-listing.XXXXXX); \
+         trap 'rm -f \"$listing_raw\"' EXIT; \
          aws s3 ls s3://{bucket} --recursive --endpoint-url {endpoint} \
-         | awk '{{print $3, $4}}' | sort",
-        wait = await_secret_key(store.secret_key()),
-        access = store.access_key(),
-        secret = store.secret_key(),
+         > \"$listing_raw\"; \
+         awk '{{print $3, $4}}' \"$listing_raw\" | sort",
+        wait = await_secret_key(secret_key),
+        access = access_key,
+        secret = secret_key,
     );
     exec_cmd(o, &script)
 }
@@ -295,6 +327,49 @@ pub fn store_listing_cmd(
 /// The staged files as `<size> <key>`, comparable with a store listing.
 pub fn staged_listing_cmd(o: &CommonOpts) -> OpsCommand {
     exec_cmd(o, "cd /stage && find . -type f -printf '%s %P\\n' | sort")
+}
+
+/// Capture the final source inventory and the target selected before upgrade.
+pub fn persist_migration_evidence_cmd(
+    o: &CommonOpts,
+    from: StoreKind,
+    to: StoreKind,
+    bucket: &str,
+    endpoint: &str,
+) -> OpsCommand {
+    let script = format!(
+        "set -e; {wait}export AWS_DEFAULT_REGION=us-east-1; \
+         aws configure set default.s3.addressing_style path; \
+         export AWS_ACCESS_KEY_ID={access}; \
+         export AWS_SECRET_ACCESS_KEY=$(cat /secret/{secret}); \
+         source_raw=/migration/source.raw.$$; \
+         source_tmp=/migration/source.list.tmp.$$; \
+         target_tmp=/migration/target.tmp.$$; \
+         trap 'rm -f \"$source_raw\" \"$source_tmp\" \"$target_tmp\"' EXIT; \
+         aws s3 ls s3://{bucket} --recursive --endpoint-url {endpoint} \
+         > \"$source_raw\"; \
+         awk '{{print $3, $4}}' \"$source_raw\" | sort > \"$source_tmp\"; \
+         [ -s \"$source_tmp\" ] || {{ echo 'the final source inventory is empty' >&2; exit 1; }}; \
+         printf '%s\\n' '{target}' > \"$target_tmp\"; \
+         mv \"$target_tmp\" /migration/target; \
+         mv \"$source_tmp\" /migration/source.list; \
+         cat /migration/source.list",
+        wait = await_secret_key(from.secret_key()),
+        access = from.access_key(),
+        secret = from.secret_key(),
+        target = to.suffix(),
+    );
+    exec_cmd(o, &script)
+}
+
+/// Read the target persisted by the export phase.
+pub fn planned_target_cmd(o: &CommonOpts) -> OpsCommand {
+    exec_cmd(o, "set -e; cat /migration/target")
+}
+
+/// Read the final source inventory persisted by the export phase.
+pub fn persisted_source_listing_cmd(o: &CommonOpts) -> OpsCommand {
+    exec_cmd(o, "set -e; cat /migration/source.list")
 }
 
 pub fn delete_staging_pod_cmd(o: &CommonOpts) -> OpsCommand {
@@ -468,11 +543,25 @@ mod tests {
             export_cmd(&o, StoreKind::Minio, "curie-bundles", "http://s:9000"),
             import_cmd(&o, StoreKind::Rustfs, "curie-bundles", "http://s:9000"),
             store_listing_cmd(&o, StoreKind::Minio, "curie-bundles", "http://s:9000"),
+            persist_migration_evidence_cmd(
+                &o,
+                StoreKind::Minio,
+                StoreKind::Rustfs,
+                "curie-bundles",
+                "http://s:9000",
+            ),
         ] {
             let joined = format!("{:?}", cmd.args);
             assert!(
                 joined.contains("/secret/"),
                 "the password must be read from the mounted Secret: {joined}"
+            );
+            assert!(
+                joined
+                    .split("AWS_SECRET_ACCESS_KEY=")
+                    .skip(1)
+                    .all(|assignment| assignment.starts_with("$(cat /secret/")),
+                "every password assignment must read from the mounted Secret: {joined}"
             );
             for leaked in [
                 "minioRootPassword=",
@@ -671,7 +760,7 @@ impl crate::ui::CliOutput for MigrateStoreOutput {
                     ));
                 }
                 if missing.is_empty() {
-                    ui.payload_plain("verified: every staged object is present at the same size");
+                    ui.payload_plain("verified: every source object is present at the same size");
                 } else {
                     ui.payload_plain(&format!("MISSING {} object(s):", missing.len()));
                     for k in missing {
@@ -684,6 +773,117 @@ impl crate::ui::CliOutput for MigrateStoreOutput {
             }
         }
     }
+}
+
+/// Load and validate the destination selected before the destructive upgrade.
+pub async fn read_planned_target(o: &CommonOpts) -> Result<StoreKind> {
+    let (ok, target, err) = crate::ops::run_capture(&planned_target_cmd(o)).await?;
+    if !ok {
+        bail!("could not read the planned migration target from the staging pod: {err}");
+    }
+    let target = target.trim();
+    StoreKind::from_suffix(target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the planned migration target in the staging pod is {}. Expected `minio` or `rustfs`; staging has been kept.",
+            if target.is_empty() {
+                "empty".to_string()
+            } else {
+                format!("unknown: `{target}`")
+            }
+        )
+    })
+}
+
+async fn read_persisted_source_listing(o: &CommonOpts) -> Result<String> {
+    let (ok, source, err) = crate::ops::run_capture(&persisted_source_listing_cmd(o)).await?;
+    if !ok {
+        bail!(
+            "could not read the final source inventory from the staging pod; staging has been kept: {err}"
+        );
+    }
+    if source.trim().is_empty() {
+        bail!(
+            "the final source inventory in the staging pod is empty; migration safety cannot be verified, so staging has been kept"
+        );
+    }
+    Ok(source)
+}
+
+fn observed_live_store(components: &[String]) -> Result<StoreKind> {
+    let stores: Vec<StoreKind> = [StoreKind::Minio, StoreKind::Rustfs]
+        .into_iter()
+        .filter(|kind| {
+            components
+                .iter()
+                .any(|component| component == kind.suffix())
+        })
+        .collect();
+    match stores.as_slice() {
+        [store] => Ok(*store),
+        [] => bail!(
+            "no object store StatefulSet in the release. Run the upgrade before `--phase import`; staging has been kept."
+        ),
+        _ => bail!(
+            "the live release reports both minio and rustfs object stores, so the migration target is ambiguous; staging has been kept"
+        ),
+    }
+}
+
+fn live_statefulsets_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("statefulset"),
+            plain("-n"),
+            plain(&o.namespace),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn standalone_import_dry_run_plan(
+    o: &CommonOpts,
+    bucket: &str,
+    keep_staging: bool,
+) -> MigrateStoreOutput {
+    let endpoint = endpoint_for("<planned-store-service>", &o.namespace);
+    let mut lines = vec![
+        planned_target_cmd(o).display(),
+        live_statefulsets_cmd(o).display(),
+        "verify the live release has exactly one object store and it matches the persisted planned target".to_string(),
+        persisted_source_listing_cmd(o).display(),
+        staged_listing_cmd(o).display(),
+        "verify every persisted source object is present in staging at the same size".to_string(),
+        store_service_for_component_cmd(o, "<planned-target>").display(),
+        import_for_store_cmd(
+            o,
+            "<planned-target-access-key>",
+            "<planned-target-secret-key>",
+            bucket,
+            &endpoint,
+        )
+        .display(),
+        store_listing_for_store_cmd(
+            o,
+            "<planned-target-access-key>",
+            "<planned-target-secret-key>",
+            bucket,
+            &endpoint,
+        )
+        .display(),
+        "verify every persisted source object is present in the planned target at the same size"
+            .to_string(),
+    ];
+    if !keep_staging {
+        lines.push(
+            "delete staging only after source versus planned target verification succeeds"
+                .to_string(),
+        );
+        lines.push(delete_staging_pod_cmd(o).display());
+    }
+    MigrateStoreOutput::DryRun(crate::ui::DryRunPlan { lines })
 }
 
 /// Phase one: stage every object while the old store is still up.
@@ -703,6 +903,15 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
             .collect();
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
+    run_export_with_plan(o, from, to, bucket).await
+}
+
+async fn run_export_with_plan(
+    o: &CommonOpts,
+    from: StoreKind,
+    to: StoreKind,
+    bucket: &str,
+) -> Result<MigrateStoreOutput> {
     let image = "amazon/aws-cli:2.32.6";
     // Discovered, not computed. `<release>-secrets` is only the chart Secret's
     // name when the release name contains the chart name; a default install
@@ -717,7 +926,8 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
             delete_staging_pod_cmd(o),
             create_staging_pod_cmd(o, image, &secret),
             export_cmd(o, from, bucket, &endpoint),
-            staged_count_cmd(o),
+            staged_listing_cmd(o),
+            persist_migration_evidence_cmd(o, from, to, bucket, &endpoint),
         ];
         return Ok(MigrateStoreOutput::DryRun(crate::ui::DryRunPlan {
             lines: cmds.iter().map(|c| c.display()).collect(),
@@ -749,9 +959,13 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
     if !ok {
         bail!("the export copy failed; the old store is untouched: {err}");
     }
-    let (_, count, _) = crate::ops::run_capture(&staged_count_cmd(o)).await?;
-    let objects: usize = count.trim().parse().unwrap_or(0);
-    if objects == 0 {
+    let (ok, staged, err) = crate::ops::run_capture(&staged_listing_cmd(o)).await?;
+    if !ok {
+        bail!(
+            "could not inventory the staged copy; the old store and staging pod remain available: {err}"
+        );
+    }
+    if staged.trim().is_empty() {
         bail!(
             "staged 0 objects from {}. Refusing to call that a successful export -- \
              upgrading now would leave the new store empty. Check --bucket (currently \
@@ -759,6 +973,31 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
             from.suffix()
         );
     }
+    let (ok, source, err) = crate::ops::run_capture(&persist_migration_evidence_cmd(
+        o, from, to, bucket, &endpoint,
+    ))
+    .await?;
+    if !ok {
+        bail!(
+            "could not capture the final source inventory; the old store and staging pod remain available: {err}"
+        );
+    }
+    if source.trim().is_empty() {
+        bail!(
+            "the final source inventory is empty; refusing to upgrade because migration safety cannot be verified"
+        );
+    }
+    let unstaged = missing_after(&source, &staged);
+    if !unstaged.is_empty() {
+        bail!(
+            "the source changed after the export and these objects are absent or resized in staging: {}. Refusing to upgrade; the source and staging pod remain available for a safe retry.",
+            unstaged.join(", ")
+        );
+    }
+    let objects = staged
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     Ok(MigrateStoreOutput::Exported {
         from: from.suffix().to_string(),
         to: to.suffix().to_string(),
@@ -781,9 +1020,24 @@ pub fn wait_ready_cmd(o: &CommonOpts) -> OpsCommand {
     )
 }
 
-/// Phase two: load the staged objects into the new store and verify per object.
+/// Standalone phase two: read the persisted target, load staging, and verify it.
 pub async fn run_import(
     o: &CommonOpts,
+    bucket: &str,
+    keep_staging: bool,
+) -> Result<MigrateStoreOutput> {
+    if o.dry_run {
+        return Ok(standalone_import_dry_run_plan(o, bucket, keep_staging));
+    }
+
+    let to = read_planned_target(o).await?;
+    run_import_to_planned_target(o, to, bucket, keep_staging).await
+}
+
+/// Load staging into the exact target selected before the destructive upgrade.
+pub async fn run_import_to_planned_target(
+    o: &CommonOpts,
+    to: StoreKind,
     bucket: &str,
     keep_staging: bool,
 ) -> Result<MigrateStoreOutput> {
@@ -792,26 +1046,16 @@ pub async fn run_import(
         .into_iter()
         .map(|(component, _)| component)
         .collect();
-    let to = detect_store(&live).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no object store StatefulSet in the release. Run the upgrade before \
-             `--phase import`."
-        )
-    })?;
-
-    if o.dry_run {
-        let endpoint = endpoint_for("<store-service>", &o.namespace);
-        let cmds = [
-            store_service_cmd(o, to),
-            staged_listing_cmd(o),
-            import_cmd(o, to, bucket, &endpoint),
-            store_listing_cmd(o, to, bucket, &endpoint),
-            delete_staging_pod_cmd(o),
-        ];
-        return Ok(MigrateStoreOutput::DryRun(crate::ui::DryRunPlan {
-            lines: cmds.iter().map(|c| c.display()).collect(),
-        }));
+    let observed = observed_live_store(&live)?;
+    if observed != to {
+        bail!(
+            "the live release runs {}, but the migration planned {}. Refusing to import into a different store; staging has been kept.",
+            observed.suffix(),
+            to.suffix()
+        );
     }
+
+    let source = read_persisted_source_listing(o).await?;
 
     let (ok, service, err) = crate::ops::run_capture(&store_service_cmd(o, to)).await?;
     let service = service.trim().to_string();
@@ -833,22 +1077,39 @@ pub async fn run_import(
     if staged.trim().is_empty() {
         bail!("the staging pod holds no objects; nothing to import");
     }
+    let unstaged = missing_after(&source, &staged);
+    if !unstaged.is_empty() {
+        bail!(
+            "the staged copy is missing or has resized source objects: {}. Refusing to import; staging has been kept.",
+            unstaged.join(", ")
+        );
+    }
     let (ok, _, err) = crate::ops::run_capture(&import_cmd(o, to, bucket, &endpoint)).await?;
     if !ok {
         bail!("the import copy failed; the staged copy is intact, so retry is safe: {err}");
     }
-    let (_, listing, _) =
+    let (ok, listing, err) =
         crate::ops::run_capture(&store_listing_cmd(o, to, bucket, &endpoint)).await?;
+    if !ok {
+        bail!(
+            "could not list the planned {} target after import; staging has been kept: {err}",
+            to.suffix()
+        );
+    }
 
-    let missing = missing_after(&staged, &listing);
-    let added = added_after(&staged, &listing);
+    let missing = missing_after(&source, &listing);
+    let added = added_after(&source, &listing);
     let objects = listing.lines().filter(|l| !l.trim().is_empty()).count();
 
-    // Keep the staging pod whenever anything is missing: it holds the only
-    // remaining copy, and deleting it would turn a recoverable partial import
-    // into permanent loss.
-    let kept = keep_staging || !missing.is_empty();
-    if !kept {
+    if !missing.is_empty() {
+        bail!(
+            "the planned {} target is missing or has resized source objects: {}. Migration is unverified and staging has been kept.",
+            to.suffix(),
+            missing.join(", ")
+        );
+    }
+
+    if !keep_staging {
         crate::ops::run_capture(&delete_staging_pod_cmd(o))
             .await
             .ok();
@@ -856,9 +1117,9 @@ pub async fn run_import(
     Ok(MigrateStoreOutput::Imported {
         store: to.suffix().to_string(),
         objects,
-        missing,
+        missing: vec![],
         added,
-        staging_kept: kept,
+        staging_kept: keep_staging,
     })
 }
 
@@ -973,9 +1234,12 @@ pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Migra
             store_service_cmd(o, from),
             create_staging_pod_cmd(o, image, &secret),
             export_cmd(o, from, bucket, &ep),
+            staged_listing_cmd(o),
+            persist_migration_evidence_cmd(o, from, to, bucket, &ep),
             get_values_cmd(o),
             upgrade_cmd(o, chart, "<captured values>"),
             store_service_cmd(o, to),
+            persisted_source_listing_cmd(o),
             import_cmd(o, to, bucket, &ep),
             store_listing_cmd(o, to, bucket, &ep),
             delete_staging_pod_cmd(o),
@@ -988,7 +1252,7 @@ pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Migra
     let ui = crate::ui::ui();
 
     // 1. Stage, before anything is destroyed.
-    let exported = run_export(o, chart, bucket).await?;
+    let exported = run_export_with_plan(o, from, to, bucket).await?;
     let staged = match &exported {
         MigrateStoreOutput::Exported { objects, .. } => *objects,
         _ => 0,
@@ -1020,7 +1284,7 @@ pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Migra
 
     // 3. Load the staged objects into whatever the upgrade created, and verify.
     ui.note(&format!("importing into {}", to.suffix()));
-    run_import(o, bucket, false).await
+    run_import_to_planned_target(o, to, bucket, false).await
 }
 
 #[cfg(test)]
