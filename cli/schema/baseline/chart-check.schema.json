@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/chart-check/v1.json",
+  "title": "curie dev chart-check --json",
+  "description": "The agent-facing result of `curie dev chart-check`: the number of passing scripts, the total discovered scripts, and the ordered result of every assertion script.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "passed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "scripts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "passed"
+        ]
+      }
+    }
+  },
+  "required": [
+    "passed",
+    "total",
+    "scripts"
+  ]
+}

@@ -621,10 +621,32 @@ pub async fn dev_script(rel_path: &str) -> Result<()> {
 pub const CHART_CI_DIR: &str = "charts/curie/ci";
 
 /// One chart assertion script and how it fared.
+#[derive(Serialize)]
 pub struct ChartCheckOutcome {
     /// The script's file name, e.g. `render-assertions.sh`.
     pub name: String,
     pub passed: bool,
+}
+
+/// The result of a successful `curie dev chart-check` run.
+#[derive(Serialize)]
+pub struct ChartCheckOutput {
+    pub passed: usize,
+    pub total: usize,
+    pub scripts: Vec<ChartCheckOutcome>,
+}
+
+impl crate::ui::CliOutput for ChartCheckOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.success(&format!(
+            "all {} chart assertion scripts passed",
+            self.total
+        ));
+    }
 }
 
 /// Discover the assertion scripts `curie dev chart-check` runs: every executable
@@ -662,8 +684,8 @@ fn is_executable(_path: &Path) -> bool {
     true
 }
 
-/// Run every discovered script from `root`, streaming its output, and report how
-/// each one fared.
+/// Run every discovered script from `root`, streaming its stdout and stderr to
+/// this process's stderr, and report how each one fared.
 ///
 /// A failure does not stop the run: the point of the verb is that one invocation
 /// surfaces every problem, rather than making a contributor fix, re-run, and
@@ -690,6 +712,8 @@ pub async fn run_chart_check_scripts(
         let status = tokio::process::Command::new("bash")
             .arg(script)
             .current_dir(root)
+            .stdout(std::io::stderr())
+            .stderr(std::process::Stdio::inherit())
             .status()
             .await
             .with_context(|| format!("failed to invoke bash for {name}"))?;
@@ -749,10 +773,13 @@ pub async fn dev_chart_check() -> Result<()> {
             failed.join(", ")
         );
     }
-    ui.success(&format!(
-        "all {} chart assertion scripts passed",
-        outcomes.len()
-    ));
+    let passed = outcomes.iter().filter(|outcome| outcome.passed).count();
+    let total = outcomes.len();
+    ui.emit(&ChartCheckOutput {
+        passed,
+        total,
+        scripts: outcomes,
+    });
     Ok(())
 }
 

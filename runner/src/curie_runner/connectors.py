@@ -41,12 +41,10 @@ from typing import Any
 
 import yaml
 from plugin_format.connector_render import mcp_entry, unhosted_mcp_entry
-from plugin_format.connectors import ConnectorsFile, validate_connectors
+from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.yaml_loader import safe_load_unique
 
 logger = logging.getLogger(__name__)
-
-CONNECTORS_FILE = "connectors.yaml"
 
 
 def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
@@ -55,7 +53,7 @@ def _read(plugin_dir: str | Path) -> ConnectorsFile | None:
         return None
     try:
         data = safe_load_unique(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         # Deploy already validated this file, so reaching here means the bundle
         # changed underneath us. Log and mount nothing rather than fail the
         # turn: the agent loses the connector's tools, which is visible, where a

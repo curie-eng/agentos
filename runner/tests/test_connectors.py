@@ -96,6 +96,12 @@ def test_unreadable_connectors_file_mounts_nothing_rather_than_crashing(tmp_path
     assert servers == {}
 
 
+def test_non_utf8_connectors_file_mounts_nothing_rather_than_crashing(tmp_path: Path) -> None:
+    root = _bundle(tmp_path)
+    (root / "connectors.yaml").write_bytes(b"\x80")
+    assert derive_mcp_servers(root, **SCOPE) == {}
+
+
 def test_explicit_mapping_tag_on_a_scalar_mounts_nothing(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, "connectors: !!map foo\n"), **SCOPE
