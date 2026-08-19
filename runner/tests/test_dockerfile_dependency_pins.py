@@ -445,6 +445,57 @@ source = { registry = "https://pypi.org/simple" }
     ]
 
 
+def test_dependency_exporter_pins_a_shared_transitive_reached_both_ways() -> None:
+    """A package reached under a marker and again unconditionally pins unconditionally.
+
+    The unconditional path has to widen the recorded reachability of a package
+    already recorded as conditional. The exporter runs inside the runner image
+    build, so failing that widening takes the whole image build down rather than
+    emitting a wrong pin.
+    """
+    lock_text = """\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "curie-runner"
+version = "0.0.0"
+source = { editable = "runner" }
+dependencies = [
+    { name = "windows-only", marker = "sys_platform == 'win32'" },
+    { name = "everywhere" },
+]
+
+[[package]]
+name = "windows-only"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "shared" },
+]
+
+[[package]]
+name = "everywhere"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "shared" },
+]
+
+[[package]]
+name = "shared"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+"""
+
+    assert _export_runner_dependencies(lock_text) == [
+        "everywhere==1.0.0",
+        "shared==2.0.0",
+        "windows-only==1.0.0 ; sys_platform == 'win32'",
+    ]
+
+
 @pytest.mark.parametrize(
     "marker_literal",
     [

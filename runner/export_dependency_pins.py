@@ -60,7 +60,7 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
         known_conditions = reachable_conditions.setdefault(name, set())
         if not any(known <= path_conditions for known in known_conditions):
             known_conditions.difference_update(
-                known for known in known_conditions if path_conditions <= known
+                {known for known in known_conditions if path_conditions <= known}
             )
             known_conditions.add(path_conditions)
 
@@ -71,10 +71,11 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
         ):
             return
         known_states.difference_update(
-            (known_conditions, known_extras)
-            for known_conditions, known_extras in known_states
-            if path_conditions <= known_conditions
-            and requested_extras >= known_extras
+            {
+                (known_path, known_extras)
+                for known_path, known_extras in known_states
+                if path_conditions <= known_path and requested_extras >= known_extras
+            }
         )
         known_states.add((path_conditions, requested_extras))
 
