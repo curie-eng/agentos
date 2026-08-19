@@ -4265,8 +4265,6 @@ pub struct ApprovalCmd {
 /// re-checks all of these; these exist only so a typo is answered locally with a
 /// fix hint instead of a round trip (the same split the API's own
 /// `_validate_slack_channel_id` docstring describes).
-static SLACK_CHANNEL_ID: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^[CDG][A-Z0-9]{7,}$").expect("channel id re"));
 static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
@@ -4467,7 +4465,7 @@ fn build_route_bindings(
 
 /// Channel-shape check for one route binding, with the route named in the error.
 fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
-    if !SLACK_CHANNEL_ID.is_match(channel) {
+    if !crate::credcheck::looks_like_slack_channel_id(channel) {
         return Err(crate::exit::CliError::usage(format!(
             "route {route:?}: {channel:?} is not a Slack channel ID. Real Slack events \
              carry the ID and the worker routes on it, so a #name binding never \
@@ -4568,9 +4566,8 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
         "summary": r.summary,
         "expires_at": r.expires_at,
         "resolved_by": r.resolved_by,
-        // #1078: the one field --resolve cannot be driven without. Null when
-        // the record names no route, which means the requesting channel is the
-        // approver set rather than a bound one.
+        // #1078: the one field --resolve cannot be driven without. Null only
+        // for an older row or a direct API write that omitted this field.
         "card_channel": r.card_channel,
     })
 }

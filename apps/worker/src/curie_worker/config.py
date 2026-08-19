@@ -51,8 +51,7 @@ def _parse_bool(value: object) -> bool:
 
     A real bool passes through (so kwarg construction in tests is unchanged); any
     other string is truthy only when it is one of the accepted tokens, matching
-    the previous hand-rolled ``_b`` (note: the worker does not treat "on" as
-    truthy, unlike the dispatcher).
+    the previous hand rolled ``_b``.
     """
     if isinstance(value, bool):
         return value

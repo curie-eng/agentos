@@ -276,7 +276,7 @@ pub(crate) fn recipes() -> Vec<Recipe> {
             }],
             notes: &[
                 "Each record reports its id and `card_channel`, the channel its route bound the card to; pass that as `--actor-channel` when resolving: `--resolve <id> --as <user> --actor-channel <card_channel>`.",
-                "A null `card_channel` means the record names no route, so the REQUESTING channel is the approver set; pass that one instead.",
+                "A null `card_channel` is from an older row or a direct API write that omitted the field; pass the requesting channel instead.",
                 "The server blocks self-approval, so the resolving actor must not be the person whose turn raised the request.",
             ],
         },

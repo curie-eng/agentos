@@ -804,17 +804,15 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
     let repo_root = find_repo_root(cwd.clone())
         .context("could not find Curie repo root; run this workflow from the source checkout")?;
 
-    let Some(channel) = prompt_checked(
+    let channel = prompt_checked(
         terminal,
         app,
         "Deploy to Slack",
-        "Slack channel ID (C0...)",
+        "Slack channel ID (C0..., D0..., or G0...)",
+        "A Slack channel ID is required to deploy to Slack",
         false,
         crate::credcheck::check_channel_id,
-    )?
-    else {
-        return Ok(());
-    };
+    )?;
     let plugin_dir = prompt_bundle_dir(terminal, app, "Deploy to Slack", &repo_root)?
         .filter(|dir| !dir.trim().is_empty())
         .unwrap_or_else(|| ".".to_string());
@@ -1153,16 +1151,17 @@ fn prompt_checked(
     app: &App,
     title: &str,
     label: &str,
+    cancel_recovery: &str,
     secret: bool,
     check: impl Fn(&str) -> crate::credcheck::CheckResult,
-) -> Result<Option<String>> {
+) -> Result<String> {
     let mut shown = label.to_string();
     loop {
         let Some(value) = prompt_text(terminal, app, title, &shown, None, secret, false)? else {
-            return Ok(None);
+            anyhow::bail!("{cancel_recovery}");
         };
         match check(&value) {
-            Ok(()) => return Ok(Some(value)),
+            Ok(()) => return Ok(value),
             Err(reason) => shown = format!("{label} -- {reason}"),
         }
     }
@@ -1278,6 +1277,10 @@ fn ensure_secret_available(
     app: &App,
     name: &str,
 ) -> Result<()> {
+    let recovery = format!(
+        "{name} is required for this workflow. Save it with `curie secrets set {name}` \
+         or `export {name}=...`, then retry"
+    );
     if std::env::var_os(name).is_some() {
         return Ok(());
     }
@@ -1306,17 +1309,14 @@ fn ensure_secret_available(
         ],
     )?
     else {
-        anyhow::bail!("{name} is required for this workflow");
+        anyhow::bail!("{recovery}");
     };
     if !save {
-        anyhow::bail!("{name} is required for this workflow");
+        anyhow::bail!("{recovery}");
     }
-    let Some(value) = prompt_checked(terminal, app, "Save Secret", name, true, |v| {
+    let value = prompt_checked(terminal, app, "Save Secret", name, &recovery, true, |v| {
         crate::credcheck::check_secret(name, v)
-    })?
-    else {
-        anyhow::bail!("{name} is required for this workflow");
-    };
+    })?;
     crate::secrets::save_value(name, &value)
 }
 
@@ -1324,6 +1324,9 @@ fn ensure_model_credential_available(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &App,
 ) -> Result<()> {
+    const RECOVERY: &str =
+        "A model credential is required. `CURIE_MODEL_BASE_URL` selects the endpoint. Use \
+        `curie secrets set <NAME>` or `export <NAME>=...`, then retry";
     const NAMES: &[&str] = &[
         "CURIE_CREDENTIALS",
         "ANTHROPIC_API_KEY",
@@ -1370,14 +1373,17 @@ fn ensure_model_credential_available(
         choices,
     )?
     else {
-        anyhow::bail!("a supported model credential is required");
+        anyhow::bail!(RECOVERY);
     };
-    let Some(value) = prompt_checked(terminal, app, "Save Model Credential", &name, true, |v| {
-        crate::credcheck::check_model_credential(v)
-    })?
-    else {
-        anyhow::bail!("a supported model credential is required");
-    };
+    let value = prompt_checked(
+        terminal,
+        app,
+        "Save Model Credential",
+        &name,
+        RECOVERY,
+        true,
+        crate::credcheck::check_model_credential,
+    )?;
     crate::secrets::save_value(&name, &value)
 }
 
