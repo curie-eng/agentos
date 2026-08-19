@@ -69,7 +69,7 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
     assert_eq!(entry_id, &stream_id, "read-back id matches the XADD id");
 
     // The single-`payload`-field encoding is the frozen seam.
-    assert_eq!(fields.len(), 2, "exactly one field on the entry");
+    assert_eq!(fields.len(), 1, "exactly one field on the entry");
     assert_eq!(fields[0].0, "payload", "the field is named payload");
 
     // The payload JSON round-trips into the same event with the exact
