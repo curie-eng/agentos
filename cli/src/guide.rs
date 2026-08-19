@@ -286,7 +286,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "A group route with no bot token on the API refuses every click",
-                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED: every resolution reports `could not verify approver group membership`. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
+                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED: every resolution reports `could not verify approver group membership`; the refusal does not name the missing token. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
             },
             Landmine {
                 title: "Silence after a request usually means an unbound route",
@@ -349,6 +349,14 @@ pub fn primer() -> Primer {
             Recovery {
                 symptom: "a resolve is refused with \"you are not an approver\"",
                 fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"could not verify approvers\"",
+                fix: "The declared approvers block is malformed, so the platform cannot determine who may resolve. Correct its `users` or `group` value, then replace the complete route map.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"could not verify approver group membership\"",
+                fix: "Slack group membership could not be verified, so the platform fails CLOSED. The refusal does not name the missing token. Check the API's SLACK_BOT_TOKEN, its `usergroups:read` scope and reinstallation, and Slack availability.",
             },
             Recovery {
                 symptom: "a command \"does not exist\"",

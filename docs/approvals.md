@@ -245,7 +245,8 @@ or `approvers.group` ignores the channel entirely, so passing it there is harmle
 |---|---|
 | `403 self-approval is blocked` | You are the author of the turn that raised it. Resolve as a different actor. |
 | `403 you are not an approver` | The route's set does not admit that actor from that channel. Pass the record's `card_channel` as `--actor-channel` (`--list --json` reports it since #1078), or check the `approvers` block. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel. |
-| `403 could not verify approver group membership` | A group lookup failed or the approvers block does not parse. Check `SLACK_BOT_TOKEN` and the `usergroups:read` scope; this never falls back to channel membership. |
+| `403 could not verify approvers` | The declared `approvers` block is malformed and cannot be evaluated. Correct its `users` or `group` value, then replace the complete route map. |
+| `403 could not verify approver group membership` | Slack group membership could not be verified. This fails closed and does not name its cause. Check the API `SLACK_BOT_TOKEN`, its `usergroups:read` scope and reinstallation, and Slack availability. It never falls back to channel membership. |
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
 | Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Add the binding. |
