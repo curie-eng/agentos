@@ -1,4 +1,4 @@
-"""Export the runner's direct registry dependencies from a uv lockfile."""
+"""Export the runner's recursive registry dependency closure from uv.lock."""
 
 from __future__ import annotations
 
@@ -34,18 +34,6 @@ def _package_name(package: dict[str, Any], context: str) -> str:
 
 def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
     packages = _require_package_records(lock)
-    runners = [
-        package
-        for package in packages
-        if _package_name(package, "uv.lock package record") == "curie-runner"
-    ]
-    if len(runners) != 1:
-        raise InvalidLock("uv.lock must contain exactly one curie-runner record")
-
-    dependencies = runners[0].get("dependencies")
-    if not isinstance(dependencies, list):
-        raise InvalidLock("curie-runner must declare dependency records")
-
     package_by_name: dict[str, dict[str, Any]] = {}
     for package in packages:
         name = _package_name(package, "uv.lock package record")
@@ -53,31 +41,159 @@ def _runner_dependency_pins(lock: dict[str, Any]) -> list[str]:
             raise InvalidLock(f"uv.lock resolves {name} more than once")
         package_by_name[name] = package
 
-    dependency_names: set[str] = set()
-    pins: dict[str, str] = {}
-    for dependency in dependencies:
-        if not isinstance(dependency, dict):
-            raise InvalidLock("each curie-runner dependency must be a package record")
-        name = _package_name(dependency, "each curie-runner dependency")
-        if name in dependency_names:
-            raise InvalidLock(f"curie-runner dependency {name} is duplicated")
-        dependency_names.add(name)
+    runner = package_by_name.get("curie-runner")
+    if runner is None:
+        raise InvalidLock("uv.lock must contain exactly one curie-runner record")
 
-        resolved = package_by_name.get(name)
-        if resolved is None:
-            raise InvalidLock(f"uv.lock does not resolve curie-runner dependency {name}")
-        source = resolved.get("source")
+    pins: dict[str, str] = {}
+    reachable_conditions: dict[str, set[frozenset[str]]] = {}
+    traversed_states: dict[
+        str, set[tuple[frozenset[str], frozenset[str]]]
+    ] = {}
+
+    def visit(
+        package: dict[str, Any],
+        path_conditions: frozenset[str],
+        requested_extras: frozenset[str],
+    ) -> None:
+        name = _package_name(package, "reachable uv.lock package record")
+        known_conditions = reachable_conditions.setdefault(name, set())
+        if not any(known <= path_conditions for known in known_conditions):
+            known_conditions.difference_update(
+                known for known in known_conditions if path_conditions <= known
+            )
+            known_conditions.add(path_conditions)
+
+        known_states = traversed_states.setdefault(name, set())
+        if any(
+            known_conditions <= path_conditions and known_extras >= requested_extras
+            for known_conditions, known_extras in known_states
+        ):
+            return
+        known_states.difference_update(
+            (known_conditions, known_extras)
+            for known_conditions, known_extras in known_states
+            if path_conditions <= known_conditions
+            and requested_extras >= known_extras
+        )
+        known_states.add((path_conditions, requested_extras))
+
+        source = package.get("source")
         if not isinstance(source, dict):
             raise InvalidLock(f"uv.lock package {name} must declare its source")
-        if "registry" not in source:
+
+        if "registry" in source:
+            version = package.get("version")
+            if not isinstance(version, str) or not version:
+                raise InvalidLock(
+                    f"uv.lock registry package {name} must declare a version"
+                )
+            pins[name] = version
+
+        def visit_dependencies(
+            dependencies: Any, dependency_context: str
+        ) -> None:
+            if not isinstance(dependencies, list):
+                raise InvalidLock(f"{dependency_context} must contain records")
+
+            dependency_names: set[str] = set()
+            for dependency in dependencies:
+                if not isinstance(dependency, dict):
+                    raise InvalidLock(
+                        f"each {dependency_context} entry must be a record"
+                    )
+                dependency_name = _package_name(
+                    dependency, f"each {dependency_context} entry"
+                )
+                if dependency_name in dependency_names:
+                    raise InvalidLock(
+                        f"{dependency_context} dependency {dependency_name} "
+                        "is duplicated"
+                    )
+                dependency_names.add(dependency_name)
+
+                marker = dependency.get("marker")
+                if marker is not None and (
+                    not isinstance(marker, str)
+                    or not marker.strip()
+                    or any(character in marker for character in "\r\n;")
+                ):
+                    raise InvalidLock(
+                        f"{dependency_context} dependency {dependency_name} "
+                        "must declare a valid marker"
+                    )
+
+                extras = dependency.get("extra", [])
+                if not isinstance(extras, list) or not all(
+                    isinstance(extra, str) and extra for extra in extras
+                ):
+                    raise InvalidLock(
+                        f"{dependency_context} dependency {dependency_name} "
+                        "extras must be names"
+                    )
+
+                resolved = package_by_name.get(dependency_name)
+                if resolved is None:
+                    raise InvalidLock(
+                        f"uv.lock does not resolve {name} dependency "
+                        f"{dependency_name}"
+                    )
+                dependency_conditions = path_conditions
+                if marker is not None:
+                    dependency_conditions = path_conditions | {marker}
+                visit(resolved, dependency_conditions, frozenset(extras))
+
+        visit_dependencies(
+            package.get("dependencies", []), f"uv.lock package {name} dependencies"
+        )
+
+        if requested_extras:
+            optional_dependencies = package.get("optional-dependencies", {})
+            if not isinstance(optional_dependencies, dict):
+                raise InvalidLock(
+                    f"uv.lock package {name} optional dependencies must be tables"
+                )
+            for extra in sorted(requested_extras):
+                extra_dependencies = optional_dependencies.get(extra)
+                if extra_dependencies is None:
+                    raise InvalidLock(
+                        f"uv.lock package {name} does not declare selected extra {extra}"
+                    )
+                visit_dependencies(
+                    extra_dependencies,
+                    f"uv.lock package {name} extra {extra} dependencies",
+                )
+
+    runner_dependencies = runner.get("dependencies")
+    if not isinstance(runner_dependencies, list):
+        raise InvalidLock("curie-runner must declare dependency records")
+    visit(runner, frozenset(), frozenset())
+    pins.pop("curie-runner", None)
+
+    requirements: list[str] = []
+    for name, version in sorted(pins.items()):
+        conditions = reachable_conditions[name]
+        if frozenset() in conditions:
+            requirements.append(f"{name}=={version}")
             continue
 
-        version = resolved.get("version")
-        if not isinstance(version, str) or not version:
-            raise InvalidLock(f"uv.lock registry package {name} must declare a version")
-        pins[name] = version
+        path_markers: list[str] = []
+        for condition in sorted(conditions, key=lambda item: tuple(sorted(item))):
+            markers = sorted(condition)
+            if len(markers) == 1:
+                path_markers.append(markers[0])
+            else:
+                path_markers.append(
+                    " and ".join(f"({marker})" for marker in markers)
+                )
+        combined_marker = path_markers[0]
+        if len(path_markers) > 1:
+            combined_marker = " or ".join(
+                f"({path_marker})" for path_marker in path_markers
+            )
+        requirements.append(f"{name}=={version} ; {combined_marker}")
 
-    return [f"{name}=={version}" for name, version in sorted(pins.items())]
+    return requirements
 
 
 def main() -> int:

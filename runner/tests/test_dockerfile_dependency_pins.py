@@ -21,6 +21,52 @@ _EXACT_NPM_VERSION = re.compile(
 _NPM_PACKAGE = re.compile(r"(?:@[0-9A-Za-z._-]+/)?[0-9A-Za-z._-]+")
 _PIP_EXECUTABLE = re.compile(r"pip(?:\d+(?:\.\d+)?)?$")
 _NPM_INSTALL_ALIASES = {"install", "i", "add"}
+_SYNTHETIC_RECURSIVE_LOCK = """\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "registry-second-level"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "registry-root" },
+]
+
+[[package]]
+name = "curie-runner"
+version = "0.0.0"
+source = { editable = "runner" }
+dependencies = [
+    { name = "local-bridge" },
+    { name = "registry-root" },
+]
+
+[[package]]
+name = "registry-middle"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "registry-second-level" },
+]
+
+[[package]]
+name = "local-bridge"
+version = "0.0.0"
+source = { editable = "packages/local-bridge" }
+dependencies = [
+    { name = "registry-middle" },
+]
+
+[[package]]
+name = "registry-root"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "registry-middle" },
+]
+"""
 
 
 @dataclass(frozen=True)
@@ -181,6 +227,35 @@ def _installs_generated_runner_requirements(instructions: list[str]) -> bool:
     return False
 
 
+def _generated_runner_requirements_install_command(
+    instructions: list[str],
+) -> list[str]:
+    controls = {"&&", "||", ";"}
+    matches: list[list[str]] = []
+    for instruction in instructions:
+        tokens = _shell_tokens(instruction)
+        if not tokens or tokens[0].upper() != "RUN":
+            continue
+        for index, token in enumerate(tokens[:-1]):
+            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
+                tokens[index + 1] != "install"
+            ):
+                continue
+            command: list[str] = []
+            for operand in tokens[index + 2 :]:
+                if operand in controls:
+                    break
+                command.append(operand)
+            if any(
+                option in {"-r", "--requirement"}
+                and requirement == _REQUIREMENTS_PATH
+                for option, requirement in zip(command, command[1:], strict=False)
+            ):
+                matches.append(command)
+    assert len(matches) == 1, "Dockerfile must install runner requirements once"
+    return matches[0]
+
+
 def _split_npm_operand(operand: str) -> tuple[str, str | None]:
     version_at = operand.rfind("@")
     if version_at <= 0:
@@ -302,24 +377,6 @@ def _export_runner_dependencies(lock_text: str) -> list[str]:
     return result.stdout.splitlines()
 
 
-def _effective_runner_python_operands(lock_text: str) -> dict[str, str]:
-    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
-    instructions = _logical_instructions(dockerfile)
-    assert any(
-        "python3 runner/export_dependency_pins.py < uv.lock "
-        f"> {_REQUIREMENTS_PATH}" in instruction
-        and f"pip install --no-cache-dir -r {_REQUIREMENTS_PATH}" in instruction
-        for instruction in instructions
-    )
-    operands: dict[str, str] = {}
-    for operand in _export_runner_dependencies(lock_text):
-        package, _ = operand.split("==", 1)
-        normalized = _normalize_python_name(package)
-        assert normalized not in operands, f"runner requirements must pin {normalized} once"
-        operands[normalized] = operand
-    return operands
-
-
 def _replace_locked_package_version(
     lock_text: str, package: str, replacement: str
 ) -> str:
@@ -339,13 +396,158 @@ def _dockerfile_with_python_pins(pins: dict[str, str]) -> str:
     return f"RUN pip install --no-cache-dir \\\n    {operands}\n"
 
 
-def test_dependency_exporter_emits_sorted_direct_registry_pins() -> None:
-    lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    expected = _locked_runner_dependencies(lock_text)
+def test_dependency_exporter_emits_sorted_complete_registry_closure() -> None:
+    assert _export_runner_dependencies(_SYNTHETIC_RECURSIVE_LOCK) == [
+        "registry-middle==2.0.0",
+        "registry-root==1.0.0",
+        "registry-second-level==3.0.0",
+    ]
+
+
+def test_dependency_exporter_propagates_markers_through_transitives() -> None:
+    lock_text = """\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "curie-runner"
+version = "0.0.0"
+source = { editable = "runner" }
+dependencies = [
+    { name = "always" },
+    { name = "windows-only", marker = "sys_platform == 'win32'" },
+]
+
+[[package]]
+name = "always"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "windows-only"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "windows-child" },
+]
+
+[[package]]
+name = "windows-child"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+"""
 
     assert _export_runner_dependencies(lock_text) == [
-        f"{package}=={version}" for package, version in sorted(expected.items())
+        "always==1.0.0",
+        "windows-child==3.0.0 ; sys_platform == 'win32'",
+        "windows-only==2.0.0 ; sys_platform == 'win32'",
     ]
+
+
+@pytest.mark.parametrize(
+    "marker_literal",
+    [
+        '""',
+        r'"\r"',
+        r'"\n"',
+        '"sys_platform == \'win32\'; python_version > \'3.13\'"',
+    ],
+)
+def test_dependency_exporter_rejects_malformed_markers(
+    marker_literal: str,
+) -> None:
+    lock_text = f"""\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "curie-runner"
+version = "0.0.0"
+source = {{ editable = "runner" }}
+dependencies = [
+    {{ name = "conditional", marker = {marker_literal} }},
+]
+
+[[package]]
+name = "conditional"
+version = "1.0.0"
+source = {{ registry = "https://pypi.org/simple" }}
+"""
+
+    result = _run_dependency_exporter(lock_text)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "invalid uv.lock" in result.stderr
+
+
+def test_dependency_exporter_follows_selected_extra_dependency_closure() -> None:
+    lock_text = """\
+version = 1
+revision = 3
+requires-python = ">=3.13"
+
+[[package]]
+name = "curie-runner"
+version = "0.0.0"
+source = { editable = "runner" }
+dependencies = [
+    { name = "provider", extra = ["crypto", "crypto"] },
+]
+
+[[package]]
+name = "provider"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+
+[package.optional-dependencies]
+crypto = [
+    { name = "extra-child" },
+]
+
+[[package]]
+name = "extra-child"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "extra-leaf" },
+]
+
+[[package]]
+name = "extra-leaf"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+optional-dependencies = "unused malformed table"
+"""
+
+    assert _export_runner_dependencies(lock_text) == [
+        "extra-child==2.0.0",
+        "extra-leaf==3.0.0",
+        "provider==1.0.0",
+    ]
+
+
+def test_dependency_exporter_rejects_a_missing_referenced_transitive() -> None:
+    second_level_record = """\
+[[package]]
+name = "registry-second-level"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "registry-root" },
+]
+
+"""
+    assert second_level_record in _SYNTHETIC_RECURSIVE_LOCK
+    incomplete_lock = _SYNTHETIC_RECURSIVE_LOCK.replace(second_level_record, "")
+
+    result = _run_dependency_exporter(incomplete_lock)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "invalid uv.lock" in result.stderr
 
 
 def test_dependency_exporter_reflects_a_lock_version_bump() -> None:
@@ -378,9 +580,9 @@ def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> No
     assert any(
         "python3 runner/export_dependency_pins.py < uv.lock "
         f"> {_REQUIREMENTS_PATH}" in instruction
-        and f"pip install --no-cache-dir -r {_REQUIREMENTS_PATH}" in instruction
         for instruction in instructions
     )
+    assert "--no-deps" in _generated_runner_requirements_install_command(instructions)
     assert _dockerfile_python_pins(instructions) == {}
 
 
@@ -455,20 +657,31 @@ def test_python_pin_revert_is_rejected() -> None:
     ) in violations
 
 
-def test_npm_version_removal_is_rejected() -> None:
+def test_runner_image_uses_bundled_claude_cli_and_keeps_pinned_github_mcp() -> None:
     dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
     npm_operands = _dockerfile_global_npm_operands(dockerfile)
-    assert len(npm_operands) >= 2
-    for current in npm_operands:
-        package, version = _split_npm_operand(current)
-        assert version and _EXACT_NPM_VERSION.fullmatch(version)
-        assert dockerfile.count(current) == 1
-        mutated = dockerfile.replace(current, package)
+    assert all(
+        _split_npm_operand(operand)[0] != "@anthropic-ai/claude-code"
+        for operand in npm_operands
+    )
+    github_operands = [
+        operand
+        for operand in npm_operands
+        if _split_npm_operand(operand)[0]
+        == "@modelcontextprotocol/server-github"
+    ]
+    assert len(github_operands) == 1
+    current = github_operands[0]
+    package, version = _split_npm_operand(current)
+    assert package == "@modelcontextprotocol/server-github"
+    assert version and _EXACT_NPM_VERSION.fullmatch(version)
+    assert dockerfile.count(current) == 1
+    mutated = dockerfile.replace(current, package)
 
-        violations = _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
-        assert Violation(
-            package, "global npm install is missing an exact version"
-        ) in violations
+    violations = _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
+    assert Violation(
+        package, "global npm install is missing an exact version"
+    ) in violations
 
 
 @pytest.mark.parametrize("command", sorted(_NPM_INSTALL_ALIASES))
@@ -485,7 +698,10 @@ def test_npm_global_install_aliases_require_exact_versions(command: str) -> None
 @pytest.mark.parametrize("executable", ["pip", "pip3"])
 def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    operands = _effective_runner_python_operands(lock_text)
+    operands = {
+        package: f"{package}=={version}"
+        for package, version in _locked_runner_dependencies(lock_text).items()
+    }
     synthetic = "RUN " + executable + " install " + " ".join(
         f'"{operand}"' for operand in operands.values()
     )
@@ -496,8 +712,9 @@ def test_pip_executable_forms_are_compared_with_the_lock(executable: str) -> Non
 def test_python_pin_set_must_match_all_direct_registry_dependencies() -> None:
     lock_text = _UV_LOCK.read_text(encoding="utf-8")
     expected = _locked_runner_dependencies(lock_text)
-    operands = _effective_runner_python_operands(lock_text)
-    assert operands.keys() == expected.keys()
+    operands = {
+        package: f"{package}=={version}" for package, version in expected.items()
+    }
     baseline = "RUN pip install " + " ".join(
         f'"{operand}"' for operand in operands.values()
     )

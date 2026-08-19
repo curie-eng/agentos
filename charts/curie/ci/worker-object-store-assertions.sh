@@ -60,6 +60,38 @@ def render(*values):
     return [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
 
 
+def assert_external_store_requires_hostname():
+    command = [
+        "helm",
+        "template",
+        "curie",
+        CHART,
+        "--namespace",
+        "dev",
+        "--set",
+        "rustfs.deploy=false",
+    ]
+    rendered = subprocess.run(command, capture_output=True, text=True)
+    if rendered.returncode == 0:
+        print(
+            "FAIL: rustfs.deploy=false without rustfs.host must fail Helm rendering",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    diagnostic = rendered.stderr + rendered.stdout
+    if "hostname" not in diagnostic.lower():
+        print(
+            "FAIL: the missing rustfs.host error must say that a hostname is required",
+            file=sys.stderr,
+        )
+        if diagnostic:
+            print(diagnostic, file=sys.stderr, end="")
+        raise SystemExit(1)
+
+    print("ok: an external object store without rustfs.host is rejected as missing a hostname")
+
+
 def value_source(entry):
     return {key: entry[key] for key in ("value", "valueFrom") if key in entry}
 
@@ -279,6 +311,7 @@ def expect_failure(docs, messages):
         assert unsupported not in output, f"unsupported diagnostic {unsupported!r} in:\n{output}"
 
 
+assert_external_store_requires_hostname()
 default_docs = render()
 assert_contract(default_docs, "default", "http://curie-rustfs:9000")
 

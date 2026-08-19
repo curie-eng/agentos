@@ -146,7 +146,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- if .Values.rustfs.deploy -}}
 {{- printf "%s-rustfs" (include "curie.fullname" .) -}}
 {{- else -}}
-{{- required "rustfs.deploy is false: set rustfs.host to your external S3-compatible endpoint" .Values.rustfs.host -}}
+{{- required "rustfs.deploy is false: set rustfs.host to your external S3-compatible hostname" .Values.rustfs.host -}}
 {{- end -}}
 {{- end -}}
 
