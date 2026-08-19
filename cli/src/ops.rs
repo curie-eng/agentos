@@ -530,16 +530,12 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 /// The canonical model providers `--allow-egress-host` accepts, each paired with
 /// the API hostname(s) its runner must reach, in the order shown in help and
 /// error text. The single source of truth for both the accepted-provider set and
-/// their egress hosts, so adding a provider is a one-line edit here.
+/// their egress hosts.
 ///
 /// This set is deliberately limited to the providers the runner can drive
-/// end-to-end today (`anthropic` via `sk-ant-` keys, `openrouter` via `sk-or-`
-/// keys). Opening egress to a host the runner cannot actually talk to gives
-/// false confidence, so a provider is only listed once the runner has runtime
-/// support for it. When the runner gains that support for additional providers
-/// (e.g. the `PROVIDER_BASE_URLS` base-URL providers zhipu/moonshot/deepseek, or
-/// native OpenAI/Gemini), layer them in here at the same time so the egress
-/// convenience list never advertises a provider the harness cannot use.
+/// end to end today. Opening egress to a host the runner cannot actually talk to
+/// gives false confidence, so a provider is only listed once the runner has
+/// runtime support for it. Native OpenAI and Gemini remain unsupported here.
 ///
 /// HOSTNAMES, never CIDRs: provider IPs rotate, so they are resolved to narrow
 /// host routes at install time (see [`resolve_provider_egress_cidrs`]) instead of
@@ -548,6 +544,9 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 const EGRESS_PROVIDERS: &[(&str, &[&str])] = &[
     ("anthropic", &["api.anthropic.com"]),
     ("openrouter", &["openrouter.ai"]),
+    ("zhipu", &["api.z.ai"]),
+    ("moonshot", &["api.moonshot.ai"]),
+    ("deepseek", &["api.deepseek.com"]),
 ];
 
 /// The API hostname(s) a named model provider's runner must reach, or `None`
@@ -779,7 +778,8 @@ pub fn sealed_credential_warning(
     if credentials_present && !any_egress_opened {
         Some(
             "a real model credential is set but the sandbox is sealed -- no egress opened, so the \
-             model is unreachable. Pass --allow-egress-host <anthropic|openrouter> \
+             model is unreachable. Pass --allow-egress-host \
+             <anthropic|openrouter|zhipu|moonshot|deepseek> \
              (or --allow-web-egress <CIDR>) and re-run."
                 .to_string(),
         )
@@ -837,7 +837,7 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            "Replies will be canned. Set CURIE_CREDENTIALS (an Anthropic API key) and re-run `curie cluster up` to enable the real model.".into(),
+            "Replies will be canned. Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential and configure matching egress before re-running `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.".into(),
         ));
     }
     lines
@@ -7173,15 +7173,19 @@ mod tests {
 
     #[test]
     fn provider_egress_hosts_maps_known_providers_and_rejects_unknown() {
-        // The two runner-drivable providers map to their canonical API host(s).
-        assert_eq!(
-            provider_egress_hosts("anthropic").unwrap().to_vec(),
-            vec!["api.anthropic.com"]
-        );
-        assert_eq!(
-            provider_egress_hosts("openrouter").unwrap().to_vec(),
-            vec!["openrouter.ai"]
-        );
+        for (provider, hosts) in [
+            ("anthropic", vec!["api.anthropic.com"]),
+            ("openrouter", vec!["openrouter.ai"]),
+            ("zhipu", vec!["api.z.ai"]),
+            ("moonshot", vec!["api.moonshot.ai"]),
+            ("deepseek", vec!["api.deepseek.com"]),
+        ] {
+            assert_eq!(
+                provider_egress_hosts(provider).unwrap(),
+                hosts,
+                "{provider}"
+            );
+        }
 
         // `openai` and `gemini` are not runner-drivable today, so they are NOT
         // known providers: they fall through to `None` rather than minting an
@@ -7204,7 +7208,7 @@ mod tests {
     #[test]
     fn parse_egress_provider_accepts_known_and_errs_usage_on_unknown() {
         // Each runner-drivable provider parses to its own canonical name.
-        for p in ["anthropic", "openrouter"] {
+        for p in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
             assert_eq!(parse_egress_provider(p).unwrap(), p);
         }
 
@@ -7228,7 +7232,7 @@ mod tests {
         );
         // The message enumerates the accepted providers so the operator can fix
         // the flag without reading source.
-        for p in ["anthropic", "openrouter"] {
+        for p in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
             assert!(
                 err.message.contains(p),
                 "message should list `{p}`: {}",
@@ -7267,9 +7271,9 @@ mod tests {
     fn resolve_provider_egress_cidrs_dedups_sorts_and_covers_all_hosts() {
         use std::net::IpAddr;
         // Injected resolver so the test never touches real DNS. Anthropic and
-        // OpenRouter share 1.1.1.1 to prove deduplication; Anthropic also
+        // OpenRouter share 1.1.1.1 to prove deduplication. Anthropic also
         // yields an IPv6 address to prove the v4/v6 mix. All addresses are
-        // globally routable so they survive the split-horizon guard.
+        // globally routable so they survive the split horizon guard.
         let resolve = |host: &str| -> std::io::Result<Vec<IpAddr>> {
             Ok(match host {
                 "api.anthropic.com" => {
@@ -7281,15 +7285,27 @@ mod tests {
                 "openrouter.ai" => {
                     vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()]
                 }
+                "api.z.ai" => vec!["8.8.8.8".parse().unwrap()],
+                "api.moonshot.ai" => vec!["8.8.4.4".parse().unwrap()],
+                "api.deepseek.com" => vec!["9.9.9.9".parse().unwrap()],
                 other => panic!("unexpected host {other}"),
             })
         };
-        let providers = vec!["anthropic".to_string(), "openrouter".to_string()];
+        let providers = ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"]
+            .map(str::to_string)
+            .to_vec();
         let cidrs = resolve_provider_egress_cidrs(&providers, resolve).unwrap();
-        // Deduplicated (one 1.1.1.1/32) and sorted for a stable install argv.
+        // Deduplicated to one 1.1.1.1/32 and sorted for a stable install argv.
         assert_eq!(
             cidrs,
-            vec!["1.0.0.1/32", "1.1.1.1/32", "2606:4700::1111/128"]
+            vec![
+                "1.0.0.1/32",
+                "1.1.1.1/32",
+                "2606:4700::1111/128",
+                "8.8.4.4/32",
+                "8.8.8.8/32",
+                "9.9.9.9/32"
+            ]
         );
     }
 
@@ -7474,6 +7490,12 @@ mod tests {
         assert!(warn.contains("unreachable"), "{warn}");
         assert!(warn.contains("--allow-egress-host"), "{warn}");
         assert!(warn.contains("--allow-web-egress"), "{warn}");
+        for provider in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
+            assert!(
+                warn.contains(provider),
+                "warning should name {provider}: {warn}"
+            );
+        }
 
         // Every other combination stays silent.
         assert!(sealed_credential_warning(true, true).is_none());
@@ -7540,6 +7562,22 @@ mod tests {
             msgs.iter().any(|m| m.contains("Replies will be canned")),
             "{msgs:?}"
         );
+    }
+
+    #[test]
+    fn model_egress_status_lines_canned_guidance_requires_native_base_urls() {
+        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let canned = lines
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .find(|message| message.contains("Replies will be canned"))
+            .expect("canned reply guidance");
+
+        for provider in ["Zhipu", "Moonshot", "DeepSeek"] {
+            assert!(canned.contains(provider), "{canned}");
+        }
+        assert!(canned.contains("worker runtime base URL"), "{canned}");
+        assert!(canned.contains("matching egress"), "{canned}");
     }
 
     #[test]

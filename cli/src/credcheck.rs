@@ -94,20 +94,34 @@ pub fn check_secret(name: &str, value: &str) -> CheckResult {
     }
 }
 
+/// Whether a value has the documented nonempty `id.secret` credential shape.
+fn looks_like_zhipu_credential(value: &str) -> bool {
+    let mut parts = value.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(id), Some(secret), None) if !id.is_empty() && !secret.is_empty()
+    )
+}
+
 /// A model credential, whichever of the accepted names it arrives under.
 pub fn check_model_credential(value: &str) -> CheckResult {
     check_paste_hygiene(value)?;
-    const OK: &[&str] = &["sk-ant-", "sk-or-"];
-    if OK.iter().any(|p| value.starts_with(p)) {
+    if value.starts_with("sk-") {
         return Ok(());
     }
     match describe(value) {
         Some(actual) => Err(format!(
-            "that looks like {actual}, not a model credential. An Anthropic key starts \
-             with `sk-ant-`"
+            "that looks like {actual}, not a model credential. Supported shapes are \
+             `sk-ant-` (Anthropic), `sk-or-` (OpenRouter), dotted `id.secret`, and \
+             bare `sk-`; bare `sk-` and dotted `id.secret` shapes alone do not \
+             identify the provider"
         )),
+        None if looks_like_zhipu_credential(value) => Ok(()),
         None => Err(
-            "a model credential starts with `sk-ant-` (Anthropic) or `sk-or-` (OpenRouter)"
+            "supported model credential shapes are `sk-ant-` (Anthropic), \
+             `sk-or-` (OpenRouter), dotted `id.secret`, and bare `sk-`; \
+             bare `sk-` and dotted `id.secret` shapes alone do not identify the \
+             provider"
                 .to_string(),
         ),
     }
@@ -204,17 +218,41 @@ mod tests {
     }
 
     #[test]
-    fn a_model_credential_accepts_both_providers() {
-        check_model_credential("sk-ant-api03-abc").expect("anthropic");
-        check_model_credential("sk-or-v1-abc").expect("openrouter");
-        check_model_credential("sk-ant-oat01-abc").expect("oauth token is sk-ant- too");
+    fn a_model_credential_accepts_every_supported_shape() {
+        for (provider, credential) in [
+            ("anthropic", "sk-ant-api03-abc"),
+            ("anthropic oauth", "sk-ant-oat01-abc"),
+            ("openrouter", "sk-or-v1-abc"),
+            ("zhipu", "zhipu-id.secret"),
+            ("moonshot", "sk-MOONSHOT-abc"),
+            ("deepseek", "sk-DEEPSEEK-abc"),
+        ] {
+            check_model_credential(credential)
+                .unwrap_or_else(|err| panic!("{provider} credential shape was rejected: {err}"));
+        }
+    }
+
+    #[test]
+    fn malformed_zhipu_credentials_are_rejected() {
+        for credential in [".secret", "id.", "id.secret.extra"] {
+            assert!(
+                check_model_credential(credential).is_err(),
+                "accepted malformed Zhipu credential {credential:?}"
+            );
+        }
     }
 
     #[test]
     fn a_slack_token_pasted_as_a_model_credential_is_named() {
         let err = check_model_credential("xoxb-EXAMPLE-not-a-real-token").expect_err("must reject");
         assert!(err.contains("Slack bot user token"), "{err}");
-        assert!(err.contains("sk-ant-"), "{err}");
+        for shape in ["sk-ant-", "sk-or-", "id.secret", "bare `sk-`"] {
+            assert!(err.contains(shape), "error should name {shape}: {err}");
+        }
+        assert!(
+            err.contains("shapes alone do not identify the provider"),
+            "{err}"
+        );
     }
 
     /// The mistake the runbook warns about twice: it binds to a channel that

@@ -21,12 +21,13 @@ order: 6
 
 ## The black line
 
-The model provider is swapped through config, not code: a base-URL override plus a
-credential whose prefix routes it onto the right SDK auth env, targeting any
-Anthropic-compatible endpoint. There is no provider interface to implement — a
-config author fills in a base URL, a credential, and a model id, and the runner maps
-them onto the variables the bundled Claude CLI authenticates from. What stays core is
-the Anthropic wire format (kept even for OpenRouter, so prompt caching survives).
+The model provider is swapped through config, not code: a base URL override plus a
+credential routes onto the right SDK auth env. The runner can target an
+Anthropic compatible endpoint, but named cluster egress is limited to the documented
+providers below. There is no provider interface to implement: a config author fills
+in a base URL, a credential, and a model id, and the runner maps them onto the
+variables the bundled Claude CLI authenticates from. What stays core is the Anthropic
+wire format (kept even for OpenRouter, so prompt caching survives).
 
 ## Current contract
 
@@ -51,11 +52,18 @@ four things:
   (`runner/src/curie_runner/sdk_auth.py::MODEL_ENV_KEY_ENV`) — a bare name or a JSON
   array of them, walked in order, first set and non-empty key winning
   (`runner/src/curie_runner/sdk_auth.py::resolve_credential`); a present-but-empty key
-  is skipped. `resolve_model_credential` (`runner/src/curie_runner/sdk_auth.py::resolve_model_credential`) routes it by
-  prefix: `sk-ant-oat...` → `CLAUDE_CODE_OAUTH_TOKEN`; other `sk-ant-...`
-  → `ANTHROPIC_API_KEY`; `sk-or-...` (OpenRouter) → base-URL override; a bare `sk-...`
-  raises `UnsupportedCredentialError` (`runner/src/curie_runner/sdk_auth.py::UnsupportedCredentialError`). An SDK credential
-  already in the env wins.
+  is skipped. Without a base URL override, `resolve_model_credential`
+  (`runner/src/curie_runner/sdk_auth.py::resolve_model_credential`) routes it by
+  prefix: `sk-ant-oat...` to `CLAUDE_CODE_OAUTH_TOKEN`; other `sk-ant-...`
+  to `ANTHROPIC_API_KEY`; `sk-or-...` (OpenRouter) to its base URL override; a
+  bare `sk-...` raises `UnsupportedCredentialError`
+  (`runner/src/curie_runner/sdk_auth.py::UnsupportedCredentialError`). With a
+  base URL override, a non OAuth provider credential is forwarded as the endpoint's
+  `x-api-key`. An SDK credential already in the env wins. The interactive CLI
+  paste check accepts the documented credential shape classes for Anthropic,
+  OpenRouter, Zhipu, Moonshot, and DeepSeek. A bare `sk-...` or dotted
+  `id.secret` value is intentionally ambiguous, so the check cannot identify a
+  provider or prove a key is live.
 - **Base URL**, `ANTHROPIC_BASE_URL`, or its `CURIE_`-namespaced alias
   `CURIE_MODEL_BASE_URL` (the raw var wins when both are set).
   `resolve_base_url_override` (`runner/src/curie_runner/sdk_auth.py::resolve_base_url_override`) builds the override env when either is set, and
@@ -98,7 +106,7 @@ gateway. A minimal config: `CURIE_MODEL_BASE_URL=https://api.deepseek.com/anthro
 
 ## Known leakage
 
-The gotcha the seam encodes rather than a bleed-through: base-URL override mode must
+The gotcha the seam encodes rather than a bleed-through: base URL override mode must
 carry a **non-empty** placeholder key, `NO_OP_API_KEY = "not-needed"`
 (`runner/src/curie_runner/sdk_auth.py::NO_OP_API_KEY`). The bundled Claude CLI treats an empty `ANTHROPIC_API_KEY` as
 "not logged in" and refuses to dial the overridden endpoint (empirically verified
@@ -106,28 +114,17 @@ carry a **non-empty** placeholder key, `NO_OP_API_KEY = "not-needed"`
 non-`sk-` placeholder passes the auth gate without being mistakable for a credential.
 The credential value is never logged.
 
-The real bleed-through is above the seam: three separate copies of provider knowledge
-live outside the runner, and each can drift from it.
+The runner, credential check, and named egress allowlist have distinct duties. The
+committed shared vector in `tests/vectors/model-provider-registry.json` pins their
+contract by projecting runner base URLs into CLI credential shapes and exact egress
+hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
 
-- **A second, lagging provider registry in the CLI.** `--allow-egress-host` accepts
-  only `anthropic` and `openrouter` (the `EGRESS_PROVIDERS` table behind
-  `parse_egress_provider` in `cli/src/ops.rs`), while the runner ships `zhipu`,
-  `moonshot`, `deepseek`, and `openrouter`
-  (`runner/src/curie_runner/sdk_auth.py::PROVIDER_BASE_URLS`). The three
-  provider-native endpoints in the table above therefore have no provider name to
-  pass, so a cluster agent on Zhipu, Moonshot, or DeepSeek has to open its sandbox
-  egress with a raw `--allow-web-egress` CIDR instead. The doc comment on that table
-  still describes those three as runtime support the runner has yet to gain, which it
-  has since shipped.
-- **The CLI paste gate knows only the two prefix-routed shapes.**
-  `check_model_credential` (`cli/src/credcheck.rs`) accepts a pasted value only when
-  it starts with `sk-ant-` or `sk-or-`, so the interactive "Save Model Credential"
-  prompt (`cli/src/interactive.rs`) refuses every provider-native key the table above
-  documents: Zhipu's non-`sk-` `id.secret`, and Moonshot's and DeepSeek's bare `sk-`
-  keys. The runner accepts all three under a base-URL override, so this is a
-  paste-time check disagreeing with the resolver, not a real restriction; supplying
-  the credential through the environment or a saved secret short-circuits the prompt
-  before the check runs.
+- **Credential validation is not egress authorization.** A recognized credential
+  shape can be saved without selecting a provider or opening a route. The sandbox
+  remains sealed until `--allow-egress-host` names one of the five lowercase exact
+  providers, or the operator explicitly supplies `--allow-web-egress`. Unknown,
+  mixed case, URL, and host literal provider names remain usage errors. Local Ollama
+  has no named remote egress entry.
 - **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
   for the `sk-ant-oat` prefix
   (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`), and it is already

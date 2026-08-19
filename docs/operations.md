@@ -86,29 +86,35 @@ curie cluster up
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
-| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. Present -> installs live (forwarded through masked `--set` machinery, so `--dry-run` never prints it). Absent -> installs sealed (canned replies). |
+| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. It checks only shape, not provider identity or liveness. Present -> installs live (forwarded through masked `--set` machinery, so `--dry-run` never prints it). Absent -> installs sealed (canned replies). |
 | `--fake-model` | Force a sealed install even when a credential is present (a dev/CI escape hatch). |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
-| `--allow-egress-host <provider>` (repeatable) | Open runner egress on TCP 443 to a named model provider (`anthropic` or `openrouter`). |
+| `--allow-egress-host <provider>` (repeatable) | Open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact; any other provider name is rejected. |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
 
 A downloaded release binary needs no repo checkout; the chart resolves from
 the version-pinned release asset by default.
+
+**Provider-native runtime configuration.** Zhipu, Moonshot, and DeepSeek need
+their matching documented `CURIE_MODEL_BASE_URL` in worker runtime configuration,
+as well as a credential and their named egress entry. Their credential shapes do
+not identify the provider: the base URL selects it.
 
 **Egress is sealed by default.** A model credential alone opens no egress:
 the sandbox stays fail-closed until you open its provider egress with one of
 the two flags above. Neither flag bakes provider IPs into the binary --
 only hostnames are resolved (to narrow `/32`+`/128` host routes) at install
 time, because provider/CDN IPs rotate; re-run `up` to re-resolve if calls
-start failing. `--allow-web-egress` is for agents whose skills need to
-reach the open web -- a search tool, a weather lookup, anything beyond the
-named model providers above: `curie cluster up --allow-web-egress
-0.0.0.0/0` opens the open internet (still minus the `169.254.169.254`
-metadata endpoint), or narrow the CIDR to a specific destination for a
-tighter posture. A default-route value (`0.0.0.0/0`, `::/0`, any `/0`
-prefix) prints a distinct rail-removal warning, since it removes the
-default-deny rail for a prompt-injectable sandbox.
+start failing. Credential shape validation does not select a provider or open a
+route. The named provider allowlist admits only the five documented lowercase
+names above; unknown names stay denied. `--allow-web-egress` is for agents whose
+skills need open web access, such as search or weather lookup, beyond the named
+model providers. `curie cluster up --allow-web-egress 0.0.0.0/0` opens the
+internet except `169.254.169.254`; narrow the CIDR to a specific destination for
+a tighter posture. A default route value (`0.0.0.0/0`, `::/0`, or any `/0`
+prefix) prints a distinct rail removal warning, since it removes the default
+deny rail for a prompt injectable sandbox.
 
 You don't need to worry about ordering when using the CLI flags together --
 `cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
