@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -355,8 +356,14 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
     return step["run"], bindings
 
 
-def _run_aggregate(**overrides: str) -> subprocess.CompletedProcess[str]:
+def _run_aggregate(
+    *,
+    script_transform: Callable[[str], str] | None = None,
+    **overrides: str,
+) -> subprocess.CompletedProcess[str]:
     script, bindings = _aggregate_contract()
+    if script_transform is not None:
+        script = script_transform(script)
     state = {
         "changes_result": "success",
         "skill_selected": "false",
@@ -429,3 +436,26 @@ def test_aggregate_negative_control_runs_before_real_results() -> None:
     assert negative_control in output
     assert real_result in output
     assert output.index(negative_control) < output.index(real_result)
+
+
+def test_negative_control_rejects_selected_skipped_outcome_when_validator_mutates() -> None:
+    unmutated = _run_aggregate(
+        skill_selected="true",
+        skill_local_result="success",
+    )
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+
+    skill_result_check = '"$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||'
+
+    def accept_selected_skipped(script: str) -> str:
+        assert script.count(skill_result_check) == 1
+        return script.replace(skill_result_check, "", 1)
+
+    completed = _run_aggregate(
+        script_transform=accept_selected_skipped,
+        skill_selected="true",
+        skill_local_result="skipped",
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "Selected and skipped negative control failed" in output
