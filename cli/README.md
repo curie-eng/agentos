@@ -408,15 +408,15 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | Delete an agent via the platform API (`DELETE /agents/{id}`). Destructive and irreversible: refuses without `--yes`. |
 
-The six lifecycle verbs (`kill`, `resume`, `budget`, `overrides`, `reset-thread`,
-`delete`)
-act on a deployed release's agents through the same platform API, defaulting
-`--api-url` to `http://localhost:8000` (auth via `--api-key` or
-`CURIE_API_KEY`). Unlike `cluster deploy`, which self-plumbs a port-forward
-and auto-discovers the release key (ADR-0057), the lifecycle verbs do neither
--- pass `--api-url` or port-forward the API yourself. They resolve `<agent>`
-(a name or id) to its API id with the same lookup `deploy` uses. Each takes
-`--dry-run` (prints the plan, makes no request); the destructive
+All authenticated cluster API verbs (`versions`, `memory`, `approvals`, `kill`,
+`resume`, `budget`, `overrides`, `reset-thread`, and `delete`) act on a deployed
+release through the same platform API. When `--api-url` is omitted, they
+self plumb a loopback tunnel to the release API service and discover the
+release key. An explicit nonloopback `http://` `--api-url` refuses a
+discovered key. Pass `--api-key` explicitly as the opt in, use HTTPS, or
+omit `--api-url` to use the loopback tunnel. The agent target verbs resolve
+`<agent>` (a name or id) to its API id with the same lookup `deploy` uses. Each
+takes `--dry-run` (prints the plan, makes no request); the destructive
 `kill`/`reset-thread`/`delete` also require `--yes`.
 
 ##### `curie cluster message`: drive the deployed cluster

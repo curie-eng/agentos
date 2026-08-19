@@ -460,28 +460,28 @@ pub struct DeployOutcome {
 /// (#705): the same classifier that drives [`warn_if_insecure`] gates the refusal,
 /// so warn and refuse can never disagree.
 pub fn is_insecure_endpoint(base_url: &str) -> bool {
-    let lower = base_url.trim().to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        return false;
-    }
-    let authority = lower
-        .strip_prefix("http://")
-        .unwrap_or(&lower)
-        .split('/')
-        .next()
-        .unwrap_or("");
-    // Strip the port, handling both `host:port` and `[::1]:port` IPv6 forms.
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
+    let Ok(endpoint) = reqwest::Url::parse(base_url.trim()) else {
+        return true;
     };
-    let is_loopback = host == "localhost"
-        || host.ends_with(".localhost")
-        || host.starts_with("127.")
-        || host == "::1"
-        || host == "0.0.0.0";
-    !is_loopback
+    match endpoint.scheme() {
+        "https" => !endpoint.has_host(),
+        "http" => !has_local_host(&endpoint),
+        _ => true,
+    }
+}
+
+fn has_local_host(endpoint: &reqwest::Url) -> bool {
+    let Some(host) = endpoint.host_str() else {
+        return false;
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(address) => address.is_loopback() || address.is_unspecified(),
+        Err(_) => host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost"),
+    }
 }
 
 /// Warn (to stderr) when the endpoint would leak the API key over cleartext
@@ -567,10 +567,15 @@ impl ApiClient {
 
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
         warn_if_insecure(base_url);
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .context("building HTTP client")?;
+        let endpoint = reqwest::Url::parse(base_url.trim()).ok();
+        let mut builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5));
+        if endpoint.as_ref().is_some_and(|endpoint| {
+            matches!(endpoint.scheme(), "http" | "https") && has_local_host(endpoint)
+        }) {
+            builder = builder.no_proxy();
+        }
+        let http = builder.build().context("building HTTP client")?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
