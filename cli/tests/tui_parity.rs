@@ -20,14 +20,21 @@
 //! The guided prompt check also drives cancellation through a real terminal
 //! and requires the recovery message before the action list accepts input.
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::thread;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use curie::recipes::command_recipe_argvs;
 
+#[cfg(target_os = "linux")]
 const CAPTURE_ROWS: usize = 40;
+#[cfg(target_os = "linux")]
 const CAPTURE_COLUMNS: usize = 240;
 
 fn bin() -> &'static str {
@@ -46,6 +53,7 @@ fn output_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }
 
+#[cfg(target_os = "linux")]
 fn replay_terminal(text: &str) -> String {
     let mut screen = vec![vec![' '; CAPTURE_COLUMNS]; CAPTURE_ROWS];
     let mut row = 0usize;
@@ -186,22 +194,37 @@ fn a_bogus_verb_fails_the_gate() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn guided_prompt_cancellation_names_visible_recovery() {
+fn cancel_next_local_deploy_prompt(environment: &[(&str, &str)], cancellation: &str) -> String {
     let config = tempfile::tempdir().expect("create isolated config directory");
-    let command = format!(
+    let shell_command = format!(
         "stty rows {CAPTURE_ROWS} cols {CAPTURE_COLUMNS}; exec {} interactive",
         bin()
     );
-    let mut child = Command::new("script")
-        .args(["--quiet", "--return", "--command", &command, "/dev/null"])
+    let mut process = Command::new("script");
+    process
+        .args([
+            "--quiet",
+            "--return",
+            "--command",
+            &shell_command,
+            "/dev/null",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("TERM", "xterm-256color")
         .env("NO_COLOR", "1")
-        .env("CURIE_CONFIG_DIR", config.path())
-        .env("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential")
-        .env("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token")
-        .env("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token")
+        .env("CURIE_CONFIG_DIR", config.path());
+    for name in [
+        "CURIE_CREDENTIALS",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CURIE_MODEL_BASE_URL",
+        "SLACK_APP_TOKEN",
+        "SLACK_BOT_TOKEN",
+    ] {
+        process.env_remove(name);
+    }
+    process.envs(environment.iter().copied());
+    let mut child = process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -229,7 +252,7 @@ fn guided_prompt_cancellation_names_visible_recovery() {
             child.kill().expect("stop stuck interactive CLI");
             let output = child.wait_with_output().expect("collect terminal output");
             panic!(
-                "channel cancellation did not return to the action list:\n{}",
+                "{cancellation} cancellation did not return to the action list:\n{}",
                 output_text(&output)
             );
         }
@@ -240,8 +263,65 @@ fn guided_prompt_cancellation_names_visible_recovery() {
     let output = child.wait_with_output().expect("collect terminal output");
     let text = replay_terminal(&output_text(&output));
     assert!(output.status.success(), "interactive CLI failed:\n{text}");
+    text
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guided_prompt_cancellation_names_visible_recovery() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
+            ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        "channel",
+    );
     assert!(
         text.contains("Action failed: A Slack channel ID is required to deploy to Slack"),
         "channel cancellation must show the recovery requirement:\n{text}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn model_credential_cancellation_names_every_recovery_path() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        "model credential",
+    );
+    for recovery in [
+        "CURIE_MODEL_BASE_URL",
+        "curie secrets set <NAME>",
+        "export <NAME>=",
+    ] {
+        assert!(
+            text.contains(recovery),
+            "model credential cancellation must show {recovery:?}:\n{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slack_app_token_cancellation_names_every_recovery_path() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        "Slack app token",
+    );
+    for recovery in [
+        "curie secrets set SLACK_APP_TOKEN",
+        "export SLACK_APP_TOKEN=",
+    ] {
+        assert!(
+            text.contains(recovery),
+            "Slack app token cancellation must show {recovery:?}:\n{text}"
+        );
+    }
 }
