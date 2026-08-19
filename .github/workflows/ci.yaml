@@ -238,11 +238,6 @@ jobs:
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
           cargo install cargo-zigbuild --locked --version 0.23.0
-      # x86_64 only. The floor is a property of the toolchain, not the
-      # architecture, so building both would double the cost to re-prove the
-      # same thing -- and the arm64 artifact cannot be EXECUTED here without
-      # dragging in qemu. The static assertion below covers arm64 at release
-      # time; this job's job is to prove the floor is real, not merely declared.
       # Both Linux targets, the same way a tag builds them. arm64 is here as
       # much for the artifact as for the check: it is the target that cannot be
       # obtained any other way between releases, and the one a Graviton cluster
