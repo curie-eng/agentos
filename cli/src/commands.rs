@@ -1565,25 +1565,33 @@ fn short_digest(digest: &str) -> String {
 }
 
 /// Release everything a boot that has already packed its snapshot leaves behind
-/// when it aborts: the ollama sidecar, the network `start` owns, and the
-/// snapshot itself.
+/// when it aborts: the ollama sidecar, the hosted connectors, the network
+/// `start` owns, and the snapshot itself.
 ///
 /// One definition for all three abort arms between the pack and a recorded
 /// state, because nothing else will ever collect these: no state was saved, so
 /// no `skill down` can find them (#1087). A fourth abort path added later gets
 /// the whole sequence by calling this rather than by remembering three lines.
 ///
+/// Order is load bearing: the connectors are attached to the owned network, and
+/// `docker network rm` fails while any container is still on it, so every
+/// connector goes before the network does (ADR 0113).
+///
 /// Every release is best effort and deliberately swallows its error: these run
 /// while a command is already failing for its own reason, and must not change
 /// the error it reports or the code it exits with.
 async fn release_boot_scaffolding(
     ollama_container: Option<&String>,
+    connector_containers: &[String],
     owned_network: Option<&String>,
     snapshot_dir: &Path,
     plugin_dir: &Path,
 ) {
     if let Some(ollama) = ollama_container {
         let _ = docker::remove_container(ollama).await;
+    }
+    for connector in connector_containers {
+        let _ = docker::remove_container(connector).await;
     }
     if let Some(net) = owned_network {
         let _ = docker::remove_network(net).await;
@@ -1810,12 +1818,79 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         (model_cred_names, passthrough)
     };
 
+    // Hosted-connector preflights (ADR 0113) run BEFORE the snapshot is packed:
+    // the runner validates the packed snapshot, so a lock rewritten after
+    // packing would leave the runner refusing the stale copy it was handed
+    // while the source directory holds the fresh one.
+    let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    let declares_hosted_connectors = connector_decl
+        .connectors
+        .values()
+        .any(|spec| spec.url.is_none() && spec.unhosted_url.is_none());
+    if declares_hosted_connectors {
+        // Fail closed on a missing credential BEFORE anything is created. It
+        // runs ahead of the rebuild below because there is no point spending
+        // minutes building images for a bring-up that will refuse, and ahead of
+        // the network and every container because a partial bring-up that then
+        // aborts leaks work this checks for up front instead.
+        if let Err(err) = refuse_missing_connector_secrets(&connector_decl) {
+            if let Some(ollama) = &ollama_container {
+                let _ = docker::remove_container(ollama).await;
+            }
+            if let Some(net) = &owned_network {
+                let _ = docker::remove_network(net).await;
+            }
+            return Err(err);
+        }
+        // ADR 0113's Decision 3, and its deliberate asymmetry: at the skill tier
+        // a missing or stale `connectors.lock.yaml` is REBUILT here, where the
+        // source and a Docker daemon are both within reach; at the cluster tier
+        // `lock_preflight` refuses instead. Without this, an edit to a connector's
+        // source silently brings up the previously locked image. A fresh lock
+        // computes no rebuild and issues no `docker build`, so the offline
+        // guarantee `cli/CLAUDE.md` makes for `skill up` still holds. It runs
+        // before the snapshot pack so the runner's copy carries the lock this
+        // writes, and before `start_skill_connectors`, which re-reads the lock
+        // from disk and so picks up whatever this wrote.
+        let stale = connectors_needing_rebuild(
+            &connector_decl,
+            crate::connector_build::load_lock(&plugin_dir)?.as_ref(),
+            &recompute_source_digests(&plugin_dir, &connector_decl)?,
+        );
+        if !stale.is_empty() {
+            // Not forced: a lock resolved to a pushed registry image is the
+            // operator's, and `write_lock` refuses to quietly downgrade it to a
+            // local-daemon one behind a `skill up`.
+            if let Err(err) = build_connectors(ConnectorBuildOpts {
+                plugin_dir: plugin_dir.clone(),
+                registry: None,
+                force: false,
+            })
+            .await
+            {
+                // A build is minutes long and fails for ordinary reasons (a bad
+                // Dockerfile, no daemon), so it releases what boot has created so
+                // far rather than leaving an ollama sidecar to collide with the
+                // operator's next attempt. No snapshot or connector container
+                // exists yet.
+                if let Some(ollama) = &ollama_container {
+                    let _ = docker::remove_container(ollama).await;
+                }
+                if let Some(net) = &owned_network {
+                    let _ = docker::remove_network(net).await;
+                }
+                return Err(err.context("rebuilding the bundle's connectors"));
+            }
+        }
+    }
+
     // #1087: the skill tier executes an immutable, content-addressed snapshot,
     // not the editable source -- matching what local and cluster already do. The
     // packer is the deploy path's packer, so the digest is the same one the API
     // records for this source. Placed AFTER the --replace teardown above so a
     // re-up of unchanged source (same digest, same directory) cannot have the
-    // snapshot it just created torn down again.
+    // snapshot it just created torn down again, and after the connector
+    // rebuild above so the packed bundle carries the lock the runner validates.
     let snapshot = match crate::bundle::snapshot(&plugin_dir) {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -1835,14 +1910,9 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // existing hermetic path untouched; one that declares some gets a private
     // network the runner and the connectors share, and the connector scope in
     // the runner's boot env so `derive_mcp_servers` takes its normal path.
-    let connector_decl = crate::connector_build::load(&plugin_dir)?;
     let mut connector_containers: Vec<String> = Vec::new();
     let mut connector_network: Option<String> = None;
-    if connector_decl
-        .connectors
-        .values()
-        .any(|spec| spec.url.is_none() && spec.unhosted_url.is_none())
-    {
+    if declares_hosted_connectors {
         let net = match &network {
             Some(net) => net.clone(),
             None => {
@@ -1911,9 +1981,11 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         Ok(id) => id,
         Err(err) => {
             // Nothing recorded the snapshot, so no teardown will ever find it
-            // (#1087); release it here alongside the sidecar and the network.
+            // (#1087); release it here alongside the sidecar, the connectors,
+            // and the network.
             release_boot_scaffolding(
                 ollama_container.as_ref(),
+                &connector_containers,
                 owned_network.as_ref(),
                 &snapshot.dir,
                 &plugin_dir,
@@ -1944,6 +2016,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // chance to release it (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -1984,6 +2057,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // nothing behind (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -3599,6 +3673,12 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
                 &recomputed,
                 opts.tier,
             )?;
+            // What the REGISTRY answers for the locked digest, not what the lock
+            // claims about it, is what a node has to pull (see
+            // `registry_preflight`). Cluster only: no local deploy pulls this.
+            if opts.tier == DeployTier::Cluster {
+                run_registry_preflight(&decl, lock.as_ref()).await?;
+            }
         }
     }
 
@@ -8995,6 +9075,55 @@ pub fn registry_preflight(
     ))
 }
 
+/// The lock entries a cluster deploy has to ask the registry about: the entries
+/// of the `build:` connectors whose lock delivers through a registry.
+///
+/// Everything else is out of scope by construction -- an `image:` connector
+/// pulls a reference nobody here built, and a `local-daemon` build has already
+/// been refused by [`lock_preflight`] at this tier. An empty result is the
+/// common bundle, and it queries nothing.
+pub fn registry_preflight_targets<'a>(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&'a crate::connector_build::ConnectorLockFileDecl>,
+) -> Vec<&'a crate::connector_build::ConnectorLockEntryDecl> {
+    decl.connectors
+        .iter()
+        .filter(|(_, spec)| spec.build.is_some())
+        .filter_map(|(connector, _)| lock.and_then(|lock| lock.connectors.get(connector)))
+        .filter(|entry| entry.delivery == crate::connector_build::Delivery::Registry)
+        .collect()
+}
+
+/// The impure half of [`registry_preflight`]: query the registry and the
+/// cluster, then hand both answers to the decision.
+///
+/// The node architectures are read ONCE and shared across every connector --
+/// they are a property of the cluster, not of the image, so one `kubectl get
+/// nodes` covers a bundle building any number of connectors.
+async fn run_registry_preflight(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+) -> Result<()> {
+    let targets = registry_preflight_targets(decl, lock);
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let (ok, out, err) = crate::ops::run_capture(&node_architectures_argv()).await?;
+    if !ok {
+        return Err(anyhow::anyhow!("{}", err.trim()))
+            .context("read the architectures this cluster's nodes report");
+    }
+    let node_archs = node_architectures(&out);
+
+    for entry in targets {
+        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
+        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+    }
+    Ok(())
+}
+
 /// The recomputed `source_digest` of every `build:` connector in a bundle, for
 /// the preflight to compare the lock against.
 pub fn recompute_source_digests(
@@ -9013,6 +9142,42 @@ pub fn recompute_source_digests(
         );
     }
     Ok(digests)
+}
+
+/// The hosted `build:` connectors whose locked image no longer stands for this
+/// source: either the lock records nothing for them, or it records a different
+/// `source_digest` than the tree hashes to now.
+///
+/// The staleness test is `lock_preflight`'s, verbatim -- a missing lock entry
+/// and a digest mismatch are the two failures it refuses a deploy on, and a
+/// connector the recompute could not weigh in on is left alone by both. What
+/// differs is only what the caller does with the answer: the skill tier rebuilds
+/// (ADR 0113's Decision 3), the cluster tier refuses.
+///
+/// An `image:`-hosted connector has no source to be stale against, and one
+/// pointed at an already-running process with `unhosted_url` is not started
+/// here, so neither can put this bundle into a build.
+pub fn connectors_needing_rebuild(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+    recomputed: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.build.is_none() || spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        let Some(entry) = lock.and_then(|lock| lock.connectors.get(connector)) else {
+            stale.push(connector.clone());
+            continue;
+        };
+        if let Some(fresh) = recomputed.get(connector) {
+            if &entry.source_digest != fresh {
+                stale.push(connector.clone());
+            }
+        }
+    }
+    stale
 }
 
 // ---------------------------------------------------------------------------
@@ -9079,6 +9244,40 @@ pub async fn bring_up_local(
         bail!("starting the bundle's connectors failed: {}", err.trim());
     }
     Ok(())
+}
+
+/// Refuse the WHOLE bundle when a hosted connector declares a secret that has
+/// no value on this box -- before a network, a build, or a container exists.
+///
+/// Bring-up used to skip an unresolved secret silently: `skill up` reported
+/// success, the connector container exited 1 on its own missing-credential
+/// check, and the runner was left holding an MCP URL that connection-refused
+/// mid-turn. Between a silent connection-refused mid-turn and an actionable
+/// refusal at bring-up, the refusal is the correct behavior. Every gap across
+/// every hosted connector is collected first so one run names them all, and the
+/// check is resolve-only -- nothing is staged and no value is retained.
+fn refuse_missing_connector_secrets(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+) -> Result<()> {
+    // First, so a `from_secret` reference keeps its own, more specific refusal
+    // (`refuse_out_of_band_secrets` names all three ways forward) instead of
+    // being reported as an ordinary unset name by the sweep below.
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        crate::connector_build::refuse_out_of_band_secrets(connector, spec)?;
+    }
+    let mut missing = Vec::new();
+    for name in crate::connector_build::hosted_secret_names(decl) {
+        if resolve_connector_secret(&name)?.is_none() {
+            missing.push(name);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(crate::connector_build::missing_secrets_error(&missing))
 }
 
 /// One connector credential, from the environment first and the host vault

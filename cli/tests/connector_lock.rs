@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 
 use curie::commands::{
     lock_preflight, manifest_platforms, node_architectures, node_architectures_argv,
-    registry_manifest_argv, registry_preflight, DeployOpts, DeployTier,
+    registry_manifest_argv, registry_preflight, registry_preflight_targets, DeployOpts, DeployTier,
 };
 use curie::connector_build::{
     ConnectorBuildDecl, ConnectorLockEntryDecl, ConnectorLockFileDecl, ConnectorSpecDecl,
@@ -558,6 +558,49 @@ fn coverage_is_against_the_node_set_not_equality_with_the_declaration() {
         &["linux/amd64".to_string(), "linux/arm64".to_string()],
     )
     .expect("an amd64 image on an amd64-only cluster is fine");
+}
+
+/// Which connectors the cluster deploy actually asks the registry about.
+///
+/// The selection decides whether a deploy contacts a registry at all, so it is
+/// the seam that keeps every existing bundle untouched: an `image:` connector
+/// builds nothing, and a `local-daemon` build is not in any registry to be
+/// found (`lock_preflight` has already refused that one at this tier).
+#[test]
+fn only_registry_delivered_build_connectors_are_queried() {
+    assert!(
+        registry_preflight_targets(&declaring_a_build("tempo"), None).is_empty(),
+        "with no lock there is nothing to ask about; lock_preflight already refused this"
+    );
+    assert!(
+        registry_preflight_targets(
+            &declaring_an_image("kubernetes"),
+            Some(&lock_for("kubernetes", PUSHED, Delivery::Registry, FRESH)),
+        )
+        .is_empty(),
+        "an image: connector builds nothing, so no lock entry of its own is checked"
+    );
+    assert!(
+        registry_preflight_targets(
+            &declaring_a_build("tempo"),
+            Some(&lock_for("tempo", LOCAL_ID, Delivery::LocalDaemon, FRESH)),
+        )
+        .is_empty(),
+        "a local-daemon build is never in a registry to be found"
+    );
+
+    let pushed_lock = lock_for("tempo", PUSHED, Delivery::Registry, FRESH);
+    let targets = registry_preflight_targets(&declaring_a_build("tempo"), Some(&pushed_lock));
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert_eq!(
+        targets[0].image, PUSHED,
+        "the digest-pinned reference is what gets queried"
+    );
+    assert_eq!(
+        targets[0].platforms,
+        vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+        "the declared platforms ride along for the refusal to name"
+    );
 }
 
 // ─── The preflight runs before the upload ────────────────────────────────────

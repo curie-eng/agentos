@@ -68,11 +68,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use curie::commands::{ConnectorBuildOutput, ConnectorBuildRecord};
+use curie::commands::{connectors_needing_rebuild, ConnectorBuildOutput, ConnectorBuildRecord};
 use curie::connector_build::{
     self, build_argv, build_plan, digest_from_metadata, digest_pinned_ref, host_platform,
-    image_inspect_argv, lock_overwrite_refusal, registry_image_ref, write_lock, ConnectorBuildDecl,
-    ConnectorLockEntryDecl, ConnectorLockFileDecl, ConnectorSpecDecl, Delivery,
+    hosted_secret_names, image_inspect_argv, lock_overwrite_refusal, missing_secrets_error,
+    registry_image_ref, write_lock, ConnectorBuildDecl, ConnectorLockEntryDecl,
+    ConnectorLockFileDecl, ConnectorSpecDecl, Delivery, SecretDecl,
 };
 use curie::ui::CliOutput;
 use tempfile::TempDir;
@@ -791,4 +792,219 @@ fn a_bundle_with_nothing_to_build_still_emits_an_object() {
         Some(0),
         "an empty list, not a missing key: {json}"
     );
+}
+
+// ─── The skill tier's rebuild decision (ADR 0113, Decision 3) ────────────────
+
+/// A hosted connector built from source, with no `url`/`unhosted_url`.
+fn built_spec() -> ConnectorSpecDecl {
+    spec_for("tempo", &["linux/amd64"])
+}
+
+fn declaration(entries: &[(&str, ConnectorSpecDecl)]) -> connector_build::ConnectorsFileDecl {
+    connector_build::ConnectorsFileDecl {
+        connectors: entries
+            .iter()
+            .map(|(name, spec)| ((*name).to_string(), spec.clone()))
+            .collect(),
+    }
+}
+
+fn digests(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+    entries
+        .iter()
+        .map(|(name, digest)| ((*name).to_string(), (*digest).to_string()))
+        .collect()
+}
+
+const FRESH: &str = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+const CHANGED: &str = "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+
+/// No lock at all: `skill up` has to build before it can start anything.
+#[test]
+fn an_absent_lock_names_every_built_connector() {
+    let decl = declaration(&[("tempo", built_spec())]);
+    assert_eq!(
+        connectors_needing_rebuild(&decl, None, &digests(&[("tempo", FRESH)])),
+        vec!["tempo".to_string()],
+        "a bundle with no lock has no image to start"
+    );
+}
+
+/// The driver-verified defect: the source moved on, the lock did not, and the
+/// old digest's container used to start with no warning.
+#[test]
+fn a_stale_digest_names_the_connector_that_moved() {
+    let decl = declaration(&[("tempo", built_spec())]);
+    let lock = lock_with(
+        "curie-connector-sre-bot-tempo:build",
+        Delivery::LocalDaemon,
+        FRESH,
+    );
+    assert_eq!(
+        connectors_needing_rebuild(&decl, Some(&lock), &digests(&[("tempo", CHANGED)])),
+        vec!["tempo".to_string()],
+        "the locked image no longer stands for this source"
+    );
+}
+
+/// The offline guarantee: a lock that still matches the tree triggers no build,
+/// so `skill up` stays runnable with no daemon build and no network.
+#[test]
+fn a_fresh_lock_asks_for_no_build() {
+    let decl = declaration(&[("tempo", built_spec())]);
+    let lock = lock_with(
+        "curie-connector-sre-bot-tempo:build",
+        Delivery::LocalDaemon,
+        FRESH,
+    );
+    assert!(
+        connectors_needing_rebuild(&decl, Some(&lock), &digests(&[("tempo", FRESH)])).is_empty(),
+        "an unchanged bundle must not invoke docker build"
+    );
+}
+
+/// Nothing to build: an `image:`-hosted connector carries no source, and a
+/// `build:` connector overridden to an already-running process is not started
+/// here. Neither may drag the bundle into a build.
+#[test]
+fn connectors_with_no_source_to_build_ask_for_no_build() {
+    let mut overridden = built_spec();
+    overridden.unhosted_url = Some("http://localhost:9000/mcp".to_string());
+    let decl = declaration(&[
+        (
+            "pinned",
+            ConnectorSpecDecl {
+                image: Some("ghcr.io/acme-corp/pinned:v1".to_string()),
+                ..Default::default()
+            },
+        ),
+        ("dev-override", overridden),
+    ]);
+    assert!(
+        connectors_needing_rebuild(&decl, None, &BTreeMap::new()).is_empty(),
+        "a bundle with no buildable hosted connector never reaches the build machinery"
+    );
+}
+
+// ─── The bring-up secret preflight (fail closed) ─────────────────────────────
+//
+// The driver-verified defect: `skill up` on a bundle whose hosted connector
+// declared a secret with no value here reported SUCCESS and started the
+// container anyway; the container exited 1 on its own missing-credential check
+// and the runner was left dialing an MCP URL that connection-refused mid-turn.
+// `hosted_secret_names` is the seam the refusal is computed from -- which NAMES
+// a bring-up must be able to resolve before it creates anything.
+
+/// A connector started locally, declaring one plain `secrets:` entry.
+fn hosted_with_secret(name: &str) -> ConnectorSpecDecl {
+    ConnectorSpecDecl {
+        image: Some("ghcr.io/acme-corp/grafana-mcp:v1".to_string()),
+        secrets: vec![SecretDecl::Name(name.to_string())],
+        ..Default::default()
+    }
+}
+
+/// THE RED. Without the preflight there is nothing to compute the refusal from,
+/// and bring-up proceeds to start a container that cannot serve a single call.
+#[test]
+fn a_hosted_connectors_declared_secret_is_demanded_at_bring_up() {
+    let decl = declaration(&[(
+        "grafana",
+        hosted_with_secret("GRAFANA_SERVICE_ACCOUNT_TOKEN"),
+    )]);
+    assert_eq!(
+        hosted_secret_names(&decl),
+        vec!["GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string()],
+        "the name the container's own startup check would have died on"
+    );
+}
+
+/// The over-refusal guard. A connector pointed at something already running is
+/// not started here at all: its secrets belong to the remote's client config and
+/// are expanded by the MCP client, so demanding them would refuse a bundle that
+/// works perfectly.
+#[test]
+fn a_connector_that_is_not_hosted_here_has_its_secrets_left_alone() {
+    let mut remote = hosted_with_secret("REMOTE_API_KEY");
+    remote.image = None;
+    remote.url = Some("https://mcp.acme-corp.example/mcp".to_string());
+    let mut overridden = hosted_with_secret("DEV_OVERRIDE_TOKEN");
+    overridden.unhosted_url = Some("http://localhost:9000/mcp".to_string());
+    let decl = declaration(&[("remote", remote), ("dev-override", overridden)]);
+    assert!(
+        hosted_secret_names(&decl).is_empty(),
+        "neither connector is started by this bring-up, so neither credential is its prerequisite"
+    );
+}
+
+/// The second channel a hosted connector resolves: a credential written to a
+/// file the container mounts. An unstaged `secret_files` mount is the same
+/// broken container, so its KEY is a prerequisite too.
+#[test]
+fn a_credential_file_key_is_a_prerequisite_as_well() {
+    let mut spec = hosted_with_secret("GRAFANA_SERVICE_ACCOUNT_TOKEN");
+    spec.secret_files = BTreeMap::from([(
+        "K8S_READONLY_KUBECONFIG".to_string(),
+        "/secrets/kubeconfig".to_string(),
+    )]);
+    let decl = declaration(&[("grafana", spec)]);
+    assert_eq!(
+        hosted_secret_names(&decl),
+        vec![
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "K8S_READONLY_KUBECONFIG".to_string(),
+        ],
+        "both resolution channels feed the one refusal"
+    );
+}
+
+/// Every hosted connector in the bundle is weighed before anything starts, so
+/// one run names every gap instead of one refusal per attempt.
+#[test]
+fn every_hosted_connector_in_the_bundle_is_weighed_at_once() {
+    let decl = declaration(&[
+        (
+            "grafana",
+            hosted_with_secret("GRAFANA_SERVICE_ACCOUNT_TOKEN"),
+        ),
+        ("kubernetes", hosted_with_secret("K8S_READONLY_KUBECONFIG")),
+    ]);
+    assert_eq!(
+        hosted_secret_names(&decl),
+        vec![
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "K8S_READONLY_KUBECONFIG".to_string(),
+        ],
+        "a bring-up that refused one at a time would cost an operator a run per gap"
+    );
+}
+
+/// The refusal itself: one shared message for the skill tier and the cluster
+/// deploy path, classified as a usage error (exit 2), carrying the fix line and
+/// nothing but NAMES.
+#[test]
+fn the_refusal_is_a_usage_error_naming_every_gap_and_the_fix() {
+    let err = missing_secrets_error(&[
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+        "K8S_READONLY_KUBECONFIG".to_string(),
+    ]);
+    let (class, _fix) = curie::exit::classify(&err);
+    assert_eq!(
+        class,
+        curie::exit::ExitClass::Usage,
+        "an operator prerequisite is a usage error, not a runtime failure"
+    );
+    let message = err.to_string();
+    for needle in [
+        "declares secret(s) with no value available",
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+        "K8S_READONLY_KUBECONFIG",
+        "curie secrets set <NAME>",
+    ] {
+        assert!(
+            message.contains(needle),
+            "the refusal must carry `{needle}`: {message}"
+        );
+    }
 }

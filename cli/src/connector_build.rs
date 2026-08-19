@@ -1420,6 +1420,38 @@ pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
         .collect()
 }
 
+/// Every secret NAME this bundle's HOSTED connectors need before bring-up.
+///
+/// A connector carrying `url:` or `unhosted_url:` is not started here -- its
+/// secrets belong to the remote's client config and are expanded by the MCP
+/// client, so demanding them would refuse a bundle that works. Both channels a
+/// hosted connector resolves are covered: the `secrets:` list and the
+/// `secret_files:` keys. Names only; no value ever travels through this seam.
+pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for spec in decl.connectors.values() {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        names.extend(declared_secret_names(spec));
+        names.extend(spec.secret_files.keys().cloned());
+    }
+    names.into_iter().collect()
+}
+
+/// The one refusal both tiers issue when declared secrets have no value here.
+///
+/// Shared so the skill tier and the cluster deploy path cannot drift into two
+/// near-identical strings. It names every gap at once rather than one per run,
+/// and it names only NAMES -- a value must never reach an error, a log, or argv.
+pub fn missing_secrets_error(missing: &[String]) -> anyhow::Error {
+    crate::exit::usage(format!(
+        "connectors.yaml declares secret(s) with no value available: {}. Export each in the \
+         environment, or store it once with `curie secrets set <NAME>`.",
+        missing.join(", ")
+    ))
+}
+
 /// A `from_secret` reference points at a Secret someone else provisioned, and
 /// nothing on a laptop corresponds to it. Starting without the credential would
 /// give a server that 401s on every call, which reads as a broken connector
