@@ -6,7 +6,7 @@ them can know on its own -- which objects are this agent's to manage, and when
 reconciling would do more harm than leaving it alone.
 
 **The credential hazard, which is the reason this module is not three lines.**
-The API's render emits a Service, a Deployment and a NetworkPolicy per
+The API's render emits a Service, a Deployment and two NetworkPolicies per
 connector. It never emits the Secret. For a connector using the owned form
 (`secrets: [NAME]`) that Secret is minted by `curie cluster deploy`, from values
 only the operator's environment holds -- the cluster deliberately does not have
