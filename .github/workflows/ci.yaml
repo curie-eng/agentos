@@ -139,6 +139,19 @@ jobs:
   rust:
     name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
+    env:
+      CI_REQUIRE_VALKEY_TESTS: "1"
+      TEST_VALKEY_URL: redis://localhost:26379
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 26379:6379
+        options: >-
+          --health-cmd "valkey-cli ping | grep -q PONG"
+          --health-interval 3s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: cli

@@ -1,9 +1,11 @@
 //! Integration: the chat enqueue seam against real Valkey, and the embedded
 //! Slack stub exercised over real HTTP.
 //!
-//! The redis client is NOT mocked: the XADD runs against the compose dev Valkey
-//! (host port 26379, password `valkeypass`) on a unique test-scoped stream that
-//! the test deletes afterward. It never touches the real `curie:runs` stream.
+//! The redis client is NOT mocked: the XADD runs against the Valkey selected by
+//! `TEST_VALKEY_URL`, which is the compose dev Valkey locally (host port 26379,
+//! password `valkeypass`) and a passwordless Valkey in CI. It uses a unique
+//! test-scoped stream that the test deletes afterward and never touches the real
+//! `curie:runs` stream.
 //! The Slack stub is the real one; only its client (reqwest) stands in for the
 //! worker.
 
@@ -368,8 +370,10 @@ async fn stub_captures_json_body_and_never_404s_other_methods() {
 /// drives the real client over real HTTP against the recording HTTP stub and pins
 /// both branches from the request bodies that actually went out.
 ///
-/// Valkey-free by design: it is the only CI-executing coverage of this seam, and
-/// the Valkey-backed tests in this file skip where no compose stack runs.
+/// Valkey-free by design, this path uses only the recording HTTP stub. CI also
+/// starts Valkey and executes the Valkey-backed tests in this file. Contributors
+/// need a reachable Valkey, such as the compose Valkey, for equivalent local
+/// coverage.
 #[tokio::test]
 async fn post_placeholder_threads_the_outbound_post_only_when_a_thread_is_named() {
     let _slack_base = SLACK_BASE_URL_LOCK.lock().await;

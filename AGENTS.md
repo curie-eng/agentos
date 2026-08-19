@@ -106,6 +106,9 @@ cargo fmt --check
 cargo clippy -- -D warnings
 cargo test
 ```
+The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
+tests execute in CI. Contributors need a reachable Valkey, such as the compose
+Valkey, for equivalent local coverage.
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
