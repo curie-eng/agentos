@@ -3547,10 +3547,10 @@ async fn run_prepared_up(
 
     // Count named provider intent on both live and dry runs, plus egress
     // implied by allow_egress_host resolution. Preserve explicit web egress
-    // and nonempty allowedEgress overrides supplied through set.
+    // and nonempty allowedEgress overrides supplied through either value lane.
     let any_egress = !opts.allow_egress_host.is_empty()
         || !opts.allow_web_egress.is_empty()
-        || operator_set_entries(&opts.set)
+        || operator_set_entries(&opts.operator_sets())
             .into_iter()
             .any(|(key, value)| {
                 key_is_or_descends_from(key.trim(), ALLOWED_EGRESS_KEY)

@@ -1437,6 +1437,55 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
 }
 
 #[test]
+fn apply_string_egress_does_not_warn_that_model_credential_is_sealed() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\nset:\n  security.networkPolicy.allowedEgress[0].cidr: \"198.51.100.20/32\"\n",
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulset = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-rustfs"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+        }]
+    })
+    .to_string();
+
+    let output = fixture.apply(
+        &[],
+        &[
+            ("CURIE_APPLY_TEST_MODEL_KEY", MODEL_VALUE),
+            ("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str()),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains("the sandbox is sealed"),
+        "an allowed egress string override must suppress the sealed credential warning: {visible}"
+    );
+    assert!(
+        !visible.contains(MODEL_VALUE),
+        "the model credential leaked during apply: {visible}"
+    );
+    json_output(output, "apply with string egress override");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(&format!("--set-string {OVERRIDE_EGRESS_SET}")),
+        "the string egress override must reach Helm through its original value lane: {calls}"
+    );
+    assert!(
+        !calls.contains(MODEL_VALUE),
+        "the model credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
 fn numeric_looking_declared_set_values_use_helm_string_semantics() {
     let fixture = HelmFixture::new(
         "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  example.label: plain\n  example.leadingZero: \"00123\"\n  ui.deploy: disabled\n  worker.replicas: \"3\"\n",
