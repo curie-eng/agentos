@@ -321,7 +321,7 @@ spec:
             - name: BUNDLE_BUCKET
               value: {{ $bf.bucket | quote }}
             - name: AWS_DEFAULT_REGION
-              value: us-east-1
+              value: {{ .Values.rustfs.region | quote }}
             - name: AWS_CONFIG_FILE
               value: /aws-config/config
             - name: AWS_SHARED_CREDENTIALS_FILE

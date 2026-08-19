@@ -5,6 +5,7 @@
 //! scaffold, state, evals, render).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -621,10 +622,32 @@ pub async fn dev_script(rel_path: &str) -> Result<()> {
 pub const CHART_CI_DIR: &str = "charts/curie/ci";
 
 /// One chart assertion script and how it fared.
+#[derive(Serialize)]
 pub struct ChartCheckOutcome {
     /// The script's file name, e.g. `render-assertions.sh`.
     pub name: String,
     pub passed: bool,
+}
+
+/// The result of a successful `curie dev chart-check` run.
+#[derive(Serialize)]
+pub struct ChartCheckOutput {
+    pub passed: usize,
+    pub total: usize,
+    pub scripts: Vec<ChartCheckOutcome>,
+}
+
+impl crate::ui::CliOutput for ChartCheckOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.success(&format!(
+            "all {} chart assertion scripts passed",
+            self.total
+        ));
+    }
 }
 
 /// Discover the assertion scripts `curie dev chart-check` runs: every executable
@@ -687,15 +710,20 @@ pub async fn run_chart_check_scripts(
             scripts.len(),
             rel.display()
         ));
-        let status = tokio::process::Command::new("bash")
+        let output = tokio::process::Command::new("bash")
             .arg(script)
             .current_dir(root)
-            .status()
+            .output()
             .await
             .with_context(|| format!("failed to invoke bash for {name}"))?;
+        {
+            let mut stderr = std::io::stderr().lock();
+            let _ = stderr.write_all(&output.stdout);
+            let _ = stderr.write_all(&output.stderr);
+        }
         outcomes.push(ChartCheckOutcome {
             name,
-            passed: status.success(),
+            passed: output.status.success(),
         });
     }
     Ok(outcomes)
@@ -749,10 +777,13 @@ pub async fn dev_chart_check() -> Result<()> {
             failed.join(", ")
         );
     }
-    ui.success(&format!(
-        "all {} chart assertion scripts passed",
-        outcomes.len()
-    ));
+    let passed = outcomes.iter().filter(|outcome| outcome.passed).count();
+    let total = outcomes.len();
+    ui.emit(&ChartCheckOutput {
+        passed,
+        total,
+        scripts: outcomes,
+    });
     Ok(())
 }
 
