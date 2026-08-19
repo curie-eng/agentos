@@ -571,7 +571,7 @@ def test_async_test_body_gate_rejects_a_shallow_corpus(
         repo_root / "apps/worker/tests/binding/test_no_unrun_async_test_bodies.py",
     )
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
-    gate = getattr(module, "test_no_test_defines_a_coroutine_it_never_runs")
+    gate = module.test_no_test_defines_a_coroutine_it_never_runs
     assert callable(gate)
 
     with pytest.raises(AssertionError) as exc_info:
@@ -592,7 +592,7 @@ def test_recorder_health_precondition_fails_when_service_is_unavailable(
     )
     unavailable_host = "http://127.0.0.1:1"
     monkeypatch.setattr(module, "_LF_HOST", unavailable_host)
-    recorder_test = getattr(module, "test_records_per_case_results_and_reads_them_back")
+    recorder_test = module.test_records_per_case_results_and_reads_them_back
     assert callable(recorder_test)
 
     try:

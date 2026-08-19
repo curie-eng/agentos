@@ -1314,15 +1314,9 @@ fn ensure_secret_available(
     if !save {
         anyhow::bail!("{recovery}");
     }
-    let value = prompt_checked(
-        terminal,
-        app,
-        "Save Secret",
-        name,
-        &recovery,
-        true,
-        |v| crate::credcheck::check_secret(name, v),
-    )?;
+    let value = prompt_checked(terminal, app, "Save Secret", name, &recovery, true, |v| {
+        crate::credcheck::check_secret(name, v)
+    })?;
     crate::secrets::save_value(name, &value)
 }
 

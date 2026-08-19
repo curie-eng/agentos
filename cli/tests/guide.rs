@@ -269,10 +269,19 @@ fn approval_card_channel_null_explanations_preserve_compatibility_meaning() {
     // write that omitted the field. It does not describe a routeless request.
     // These are four independent public consumers of that fact.
     for (surface, text) in [
-        ("approval schema", include_str!("../schema/approvals.schema.json")),
+        (
+            "approval schema",
+            include_str!("../schema/approvals.schema.json"),
+        ),
         ("approval recipe", include_str!("../src/recipes.rs")),
-        ("approval JSON projection", include_str!("../src/commands.rs")),
-        ("approval documentation", include_str!("../../docs/approvals.md")),
+        (
+            "approval JSON projection",
+            include_str!("../src/commands.rs"),
+        ),
+        (
+            "approval documentation",
+            include_str!("../../docs/approvals.md"),
+        ),
     ] {
         for fact in ["older row", "direct API write", "omitted"] {
             assert!(
