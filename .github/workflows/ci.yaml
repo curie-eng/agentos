@@ -742,8 +742,8 @@ jobs:
   # it, taking the release round trip off the ladder's critical path
   # (~30-50s wall-clock). A fresh runner shares no Docker daemon with e2e-ladder
   # so it must rebuild the images; the shared GHA layer cache defuses that --
-  # these builds hit the same ladder-{runner,api,worker} scopes e2e-ladder
-  # populates, so on a warm cache they cost the --load export, not a full
+  # these builds reuse the same cache scopes as the other ladder jobs, so on a
+  # warm cache they cost the --load export, not a full
   # rebuild. Uses the same use:false / build-push-action mechanism.
   e2e-ladder-release:
     name: E2E parity ladder (local-release, fake model)
@@ -805,6 +805,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-ui:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Tag the api image for the generated release compose (ghcr.io/curie-eng/curie-api:latest, no registry auth)
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
@@ -1048,47 +1059,13 @@ jobs:
           for img in curie-api:local curie-worker:local curie-ui:local curie-runner:latest; do
             kind load docker-image "$img" --name curie-e2e
           done
-      # Helm-install the platform through the operator wrapper. --dev pins the
-      # chart's deterministic published secrets (so `cluster message` can read
-      # them back); --fake-model seals the install credential-free. The --set
-      # overrides repoint every first-party image at the just-loaded local tags
-      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
-      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
-      # presence would trip the `cluster message` reply-hijack guard).
-      - name: Install the platform (curie cluster up)
-        env:
-          CURIE_BIN: cli/target/release/curie
-        run: |
-          set -euo pipefail
-          "$CURIE_BIN" cluster up \
-            --chart charts/curie \
-            --dev \
-            --fake-model \
-            --set security.gvisor.mode=off \
-            --set dispatcher.deploy=false \
-            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
-            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
-            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
-            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
-            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
-      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
-      # wait for the rollouts the round trip depends on before driving it. The
-      # controller-ready preflight already gated the agent-sandbox controller
-      # during install; these cover the app tier and the prewarm cache. Langfuse
-      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
-      # not need traces to have flushed, and they are the slowest pods to settle.
-      - name: Wait for the platform to become ready
-        run: |
-          set -euo pipefail
-          kubectl rollout status deploy/curie-api -n curie --timeout=300s
-          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
-          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
-          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The pod-reachable host for the reply stub: the kind Docker network
       # gateway. Every node container sits on this bridge, so a pod egressing
       # through its node reaches the host here; the stub binds 0.0.0.0 and answers
       # on it. See this job's header for why auto-detection (loopback API server)
-      # cannot produce this value on kind.
+      # cannot produce this value on kind. Resolved before the install now that
+      # the install trusts the stub origin, and it only needs the kind node
+      # container, which is already running by here.
       - name: Resolve the pod-reachable host for the reply stub
         run: |
           set -euo pipefail
@@ -1117,6 +1094,46 @@ jobs:
           fi
           echo "kind network gateway (worker->stub reply host): $gw"
           echo "CURIE_E2E_LISTEN_HOST=$gw" >> "$GITHUB_ENV"
+      # Helm-install the platform through the operator wrapper. --dev pins the
+      # chart's deterministic published secrets (so `cluster message` can read
+      # them back); --fake-model seals the install credential-free. The --set
+      # overrides repoint every first-party image at the just-loaded local tags
+      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
+      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
+      # presence would trip the `cluster message` reply-hijack guard).
+      # worker.slackTrustedOrigins is a CI-only widening that lets the worker
+      # answer the host-side reply stub (port = STUB_PORT in
+      # cli/scripts/e2e-ladder.sh); the chart default stays empty and fail-closed.
+      - name: Install the platform (curie cluster up)
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --fake-model \
+            --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
+      # wait for the rollouts the round trip depends on before driving it. The
+      # controller-ready preflight already gated the agent-sandbox controller
+      # during install; these cover the app tier and the prewarm cache. Langfuse
+      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
+      # not need traces to have flushed, and they are the slowest pods to settle.
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
       # The cluster rung only: `cluster status` gate -> `cluster deploy` ->
       # `cluster message` (reply asserted). Fake model, credential-free.
       - name: Parity ladder (cluster rung, fake model, credential-free)

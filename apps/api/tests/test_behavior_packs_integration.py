@@ -10,7 +10,7 @@ from typing import Any
 def _create_agent(client: Any, auth_headers: dict[str, str], **body: Any) -> dict[str, Any]:
     resp = client.post(
         "/agents",
-        json={"name": "packs-bot", "slack_channel": "C000PACKS1", **body},
+        json={"name": "packs-bot", "channel": {"kind": "slack", "address": "C000PACKS1"}, **body},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text

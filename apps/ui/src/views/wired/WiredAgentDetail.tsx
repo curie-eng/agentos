@@ -16,6 +16,7 @@ import {
   updateAgent,
   BundleValidationError,
   ApiError,
+  SLACK_ADDRESS_RE,
   type BundleFile,
   type BundleIssue,
 } from "../../api/client";
@@ -66,11 +67,6 @@ function FileView({ path, content }: { path: string; content: string }) {
   );
 }
 
-// The worker resolves agents.slack_channel against the Slack channel ID, not the
-// name. Soft check (mirrors NewAgentModal): a non-ID value warns but still saves;
-// only an empty value blocks. Copied CLI-synthetic channels are arbitrary strings.
-const CHANNEL_ID_RE = /^[CDG][A-Z0-9]+$/;
-
 // The wired agent-detail surface (FX2 headline). Opens from the Agents list:
 // loads the agent's active version, shows its bundle's skills, lets you edit each
 // skills/*/SKILL.md in the same editor as the create modal, and ships a new
@@ -108,12 +104,18 @@ export function WiredAgentDetail() {
   const [modelError, setModelError] = useState<string | null>(null);
   const channelValue = channel.trim();
   const channelBlank = channelValue === "";
-  const channelLooksOff = channelValue !== "" && !CHANNEL_ID_RE.test(channelValue);
+  // The worker resolves an agent's binding against the Slack channel ID, not the
+  // name. Soft check (mirrors NewAgentModal): a non-ID value warns but still saves;
+  // only an empty value blocks. Copied CLI-synthetic channels are arbitrary strings.
+  // The Slack shape check only applies to slack-kind bindings; other kinds
+  // (webhook, ms-teams, ...) are governed by the API's generic rule instead.
+  const channelLooksOff =
+    agent?.channel.kind === "slack" && channelValue !== "" && !SLACK_ADDRESS_RE.test(channelValue);
 
   useEffect(() => {
-    setChannel(agent?.slack_channel ?? "");
+    setChannel(agent?.channel.address ?? "");
     setChannelError(null);
-  }, [agent?.id, agent?.slack_channel]);
+  }, [agent?.id, agent?.channel.address]);
 
   useEffect(() => {
     setModel(agent?.model ?? "");
@@ -155,7 +157,10 @@ export function WiredAgentDetail() {
     setSavingChannel(true);
     setChannelError(null);
     try {
-      await updateAgent(agent.id, { slack_channel: channelValue });
+      // The console has no kind selector (E4/EB-20: "slack" is the only kind it
+      // can create), so a channel-move PATCH preserves the binding's existing
+      // kind and only replaces the address.
+      await updateAgent(agent.id, { channel: { kind: agent.channel.kind, address: channelValue } });
       refetch(); // refresh the wired agent data so the displayed channel updates
       dispatch({ type: "toast", message: `Channel set to ${channelValue}` });
     } catch (e) {

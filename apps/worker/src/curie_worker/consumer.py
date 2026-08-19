@@ -158,9 +158,30 @@ class Consumer(StreamConsumer):
 
     async def run(self) -> None:
         await self.ensure_group()
-        await asyncio.gather(self._read_loop(), self._maintenance_loop())
+        # The startup sweep covers the case redelivery can NEVER reach: a turn
+        # whose stream entry was already acked owes no redelivery, so a
+        # completion left owed by the crash that stopped the last process would
+        # otherwise sit in the outbox forever.
+        #
+        # It runs CONCURRENTLY with consumption, never ahead of it. The backlog
+        # it drains is exactly the one an outage left behind, and each record is
+        # an HTTP attempt against an adapter that may still be down -- awaiting
+        # it here made a healthy worker's ability to read turns at all wait on
+        # the recovery of the thing that broke. Owed completions are recovered on
+        # their own timeline; live traffic does not queue behind them.
+        await asyncio.gather(
+            self._startup_completion_sweep(),
+            self._read_loop(),
+            self._maintenance_loop(),
+        )
         if self._inflight:
             await asyncio.gather(*self._inflight, return_exceptions=True)
+
+    async def _startup_completion_sweep(self) -> None:
+        try:
+            await self._kernel.sweep_pending_completions()
+        except Exception:
+            logger.exception("startup completion sweep failed")
 
     # -- read loop ------------------------------------------------------------
 
@@ -246,6 +267,7 @@ class Consumer(StreamConsumer):
             try:
                 await self._reclaim_once()
                 await self._kernel.reap_orphans()
+                await self._kernel.sweep_pending_completions()
                 await self._drain_thread_reset_requests()
             except Exception:
                 logger.exception("maintenance tick failed")

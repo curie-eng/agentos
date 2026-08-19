@@ -13,7 +13,7 @@ def _create_agent(
 ) -> dict[str, Any]:
     resp = client.post(
         "/agents",
-        json={"name": "model-bot", "slack_channel": "CMODEL001", **body},
+        json={"name": "model-bot", "channel": {"kind": "slack", "address": "CMODEL001"}, **body},
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text
@@ -59,15 +59,15 @@ def test_patch_without_model_leaves_it_unchanged(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     agent = _create_agent(client, auth_headers, model="deepseek-v4")
-    # A PATCH touching only slack_channel must not clear the model.
+    # A PATCH touching only channel must not clear the model.
     resp = client.patch(
         f"/agents/{agent['id']}",
-        json={"slack_channel": "CMOVED001"},
+        json={"channel": {"kind": "slack", "address": "CMOVED001"}},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["slack_channel"] == "CMOVED001"
+    assert body["channel"] == {"kind": "slack", "address": "CMOVED001"}
     assert body["model"] == "deepseek-v4"
 
 
@@ -95,7 +95,11 @@ def test_an_empty_model_is_refused_and_the_error_points_at_null(
     # Create is refused identically -- same field, same nonsense, same answer.
     resp = client.post(
         "/agents",
-        json={"name": "empty-model", "slack_channel": "CMODEL011", "model": ""},
+        json={
+            "name": "empty-model",
+            "channel": {"kind": "slack", "address": "CMODEL011"},
+            "model": "",
+        },
         headers=auth_headers,
     )
     assert resp.status_code == 422, resp.text
@@ -109,7 +113,11 @@ def test_a_whitespace_only_model_is_refused_on_both_paths(
     # The same predicate that catches "" has to catch it.
     resp = client.post(
         "/agents",
-        json={"name": "ws-model", "slack_channel": "CMODEL012", "model": "   "},
+        json={
+            "name": "ws-model",
+            "channel": {"kind": "slack", "address": "CMODEL012"},
+            "model": "   ",
+        },
         headers=auth_headers,
     )
     assert resp.status_code == 422, resp.text
@@ -178,7 +186,11 @@ def test_trimming_does_not_soften_the_blank_refusal(
     for blank in ("", "   ", "\t\n"):
         resp = client.post(
             "/agents",
-            json={"name": f"blank-{len(blank)}x", "slack_channel": "CBLANK001", "model": blank},
+            json={
+                "name": f"blank-{len(blank)}x",
+                "channel": {"kind": "slack", "address": "CBLANK001"},
+                "model": blank,
+            },
             headers=auth_headers,
         )
         assert resp.status_code == 422, f"{blank!r} must still be refused: {resp.text}"

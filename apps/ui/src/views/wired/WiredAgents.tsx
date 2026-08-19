@@ -89,7 +89,7 @@ export function WiredAgents() {
               >
                 {a.name}
               </button>
-              <span style={{ marginLeft: "auto", fontSize: 12, color: C.muted, fontFamily: C.mono }}>{a.slack_channel}</span>
+              <span style={{ marginLeft: "auto", fontSize: 12, color: C.muted, fontFamily: C.mono }}>{a.channel.address}</span>
             </div>
             <div
               style={{
@@ -103,7 +103,7 @@ export function WiredAgents() {
             >
               <div>
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>channel</div>
-                <div style={{ fontFamily: C.mono, fontSize: 13 }}>{a.slack_channel}</div>
+                <div style={{ fontFamily: C.mono, fontSize: 13 }}>{a.channel.address}</div>
               </div>
               <div>
                 <div style={{ fontSize: 11, color: C.muted, marginBottom: 3 }}>created</div>

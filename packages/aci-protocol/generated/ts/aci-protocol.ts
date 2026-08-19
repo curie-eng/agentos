@@ -20,14 +20,16 @@ export type ExpiresInSeconds = number | null;
  * authority-bearing per #544/ADR-0046, so the value domain is a named, exported
  * part of the contract rather than an inline annotation.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "GateKind".
  */
 export type GateKind = "permission" | "policy";
 export type GrantedTool = string | null;
+export type ReplyAdapter = string | null;
 export type ReplyChannel = string;
 export type ReplyEndpoint = string | null;
-export type ReplyPlaceholder = string;
+export type ReplyKind = string;
+export type ReplyPlaceholder = string | null;
 export type Route = string | null;
 export type Summary = string;
 export type ApiBackend = string | null;
@@ -105,14 +107,14 @@ export type Text1 = string;
 export type Type2 = "final";
 export type Version1 = string;
 /**
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "InboundMessage".
  */
 export type InboundMessage = Event | Interrupt;
 export type Kind1 = "interrupt";
 export type Reason = string;
 /**
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "OutboundEvent".
  */
 export type OutboundEvent = TextDelta | ToolNote | Final | ErrorEvent | SideEffectFlag;
@@ -131,9 +133,36 @@ export type Author1 = string;
 export type ConversationId1 = string;
 export type EventId = string;
 export type ReceivedAt = string;
+export type Adapter = string | null;
 export type Channel = string;
 export type Endpoint1 = string | null;
-export type Placeholder = string;
+export type Kind2 = string;
+export type Placeholder = string | null;
+/**
+ * What started this turn: a person speaking, or the system doing a job.
+ *
+ * ADR-0079's new event kind. The values are the three the ADR names, and the
+ * distinction the kernel actually acts on is binary: ``SLACK`` is a person's
+ * message and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a
+ * job is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept
+ * here rather than re-derived at each call site so a fourth value cannot be
+ * added without deciding which side of the line it falls on.
+ *
+ * **This is a different axis from ``ReplyHandle.kind`` and the two do not
+ * collapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``
+ * answers *what caused the turn*. A nightly digest posted into a Slack channel
+ * is ``kind="slack"`` with ``source=CRON``: same transport as a mention, and it
+ * must not steer whatever conversation is live in that thread. Reading either
+ * field off the other is the silent misroute both exist to close.
+ *
+ * ``SLACK`` is the ADR's spelling for "a person's chat message", which was the
+ * only such ingress when ADR-0079 was accepted. A channel port turn from a
+ * human on another transport (an email that a person actually sent) is that
+ * same category on a different ``kind``, and giving it its own value is a NEW
+ * ENUM VALUE -- breaking under this package's rules, so it is a deliberate,
+ * separately-decided bump rather than something this change assumes.
+ */
+export type TurnSource = "slack" | "webhook" | "cron";
 export type Text4 = string;
 /**
  * Terminal or awaiting status of a session, from the output contract.
@@ -141,12 +170,40 @@ export type Text4 = string;
  * Wire tokens follow the section 0 spelling; ``classified failure`` in prose
  * becomes the token ``classified-failure`` on the wire.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "SessionStatus".
  */
 export type SessionStatus1 = "done" | "idle-awaiting-input" | "classified-failure" | "awaiting-approval";
+/**
+ * What started this turn: a person speaking, or the system doing a job.
+ *
+ * ADR-0079's new event kind. The values are the three the ADR names, and the
+ * distinction the kernel actually acts on is binary: ``SLACK`` is a person's
+ * message and may steer a live turn; ``WEBHOOK`` and ``CRON`` are jobs, and a
+ * job is an OUTPUT, never a steering input. ``is_job`` is that predicate, kept
+ * here rather than re-derived at each call site so a fourth value cannot be
+ * added without deciding which side of the line it falls on.
+ *
+ * **This is a different axis from ``ReplyHandle.kind`` and the two do not
+ * collapse.** ``kind`` answers *where the reply goes* (slack, email); ``source``
+ * answers *what caused the turn*. A nightly digest posted into a Slack channel
+ * is ``kind="slack"`` with ``source=CRON``: same transport as a mention, and it
+ * must not steer whatever conversation is live in that thread. Reading either
+ * field off the other is the silent misroute both exist to close.
+ *
+ * ``SLACK`` is the ADR's spelling for "a person's chat message", which was the
+ * only such ingress when ADR-0079 was accepted. A channel port turn from a
+ * human on another transport (an email that a person actually sent) is that
+ * same category on a different ``kind``, and giving it its own value is a NEW
+ * ENUM VALUE -- breaking under this package's rules, so it is a deliberate,
+ * separately-decided bump rather than something this change assumes.
+ *
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
+ * via the `definition` "TurnSource".
+ */
+export type TurnSource1 = "slack" | "webhook" | "cron";
 
-export interface ACIProtocolV029 {
+export interface ACIProtocolV041 {
   [k: string]: unknown;
 }
 /**
@@ -161,7 +218,16 @@ export interface ACIProtocolV029 {
  * provenance (#544, Decision C) written by the runner; both stay optional for
  * the rolling-deploy window.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * ``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s
+ * routing pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress
+ * selector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:
+ * an absent kind puts the silent misroute back on the resume path, where it is
+ * least observable, and ADR-0096 phase 2 buys the right to reject it with a
+ * quiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is
+ * nullable because ``slack`` legitimately has no adapter -- its route is the
+ * worker's configured Slack origin.
+ *
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "ApprovalRequest".
  */
 export interface ApprovalRequest {
@@ -173,8 +239,10 @@ export interface ApprovalRequest {
   expires_in_seconds?: ExpiresInSeconds;
   gate_kind?: GateKind | null;
   granted_tool?: GrantedTool;
+  reply_adapter?: ReplyAdapter;
   reply_channel: ReplyChannel;
   reply_endpoint?: ReplyEndpoint;
+  reply_kind: ReplyKind;
   reply_placeholder: ReplyPlaceholder;
   route?: Route;
   summary: Summary;
@@ -206,7 +274,7 @@ export interface ApprovalRequest {
  * baked template default, the worker's value is per-agent model routing. Do not
  * collapse either producer list to a single value.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "BootEnv".
  */
 export interface BootEnv {
@@ -245,7 +313,7 @@ export interface BootEnv {
  * section 0 describes these as per-tool secrets via K8s Secret refs, so the
  * contract carries the reference, not the secret material itself.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "SessionConfig".
  */
 export interface SessionConfig {
@@ -264,7 +332,7 @@ export interface SessionConfig {
  * ``task_budget_hint`` is the optional hint passed through to the model so it
  * self paces (section 6b); it is not a hard ceiling.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "Budget".
  */
 export interface Budget {
@@ -280,7 +348,7 @@ export interface Budget {
  * fields the prototype used (endpoint, headers, protocol); any others pass
  * through as raw env vars untouched and are out of scope for this typed view.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "OtelConfig".
  */
 export interface OtelConfig {
@@ -292,7 +360,7 @@ export interface OtelConfig {
 /**
  * A classified failure surfaced to the platform.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "ErrorEvent".
  */
 export interface ErrorEvent {
@@ -309,7 +377,7 @@ export interface ErrorEvent {
  * worker consumes off it (formerly the API's ``EvalJobRequest`` and the
  * worker's ``EvalWorkItem``, which had drifted on ``bundle_ref``).
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "EvalJob".
  */
 export interface EvalJob {
@@ -329,7 +397,7 @@ export interface EvalJob {
  * Byte-identical across both lanes before this promotion, so it carries no
  * semantic decisions.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "EvalReport".
  */
 export interface EvalReport {
@@ -343,7 +411,7 @@ export interface EvalReport {
 /**
  * An inbound event delivered into a live session (initial or follow-up).
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "Event".
  */
 export interface Event {
@@ -388,7 +456,7 @@ export interface Event {
  * scalars: a tolerant consumer decoding an older producer's ``final`` simply
  * sees them absent.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "Final".
  */
 export interface Final {
@@ -407,7 +475,7 @@ export interface Final {
 /**
  * A hard stop delivered on the control channel, distinct from a steer.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "Interrupt".
  */
 export interface Interrupt {
@@ -418,7 +486,7 @@ export interface Interrupt {
 /**
  * A streamed chunk of assistant text.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "TextDelta".
  */
 export interface TextDelta {
@@ -430,7 +498,7 @@ export interface TextDelta {
 /**
  * A human readable note about a tool call the harness is making.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "ToolNote".
  */
 export interface ToolNote {
@@ -446,7 +514,7 @@ export interface ToolNote {
  * Its presence gates the no-retry-after-side-effects rule (section 2b): a
  * failed run carrying this flag escalates to a human instead of retrying.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "SideEffectFlag".
  */
 export interface SideEffectFlag {
@@ -464,7 +532,15 @@ export interface SideEffectFlag {
  * stream-encoding helpers live with the producer (the dispatcher), not on this
  * frozen model, so the contract stays transport-agnostic.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * ``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set
+ * it still decodes, which is what makes this addition a PATCH under this
+ * package's change-class table rather than a breaking minor. The default is a
+ * compatibility affordance and not a licence to omit it: every first-party mint
+ * site sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting
+ * to the non-job value is also the safe direction -- an unset ``source`` reads
+ * as a person's message, so a job can never be created by omission.
+ *
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "QueuedTurn".
  */
 export interface QueuedTurn {
@@ -473,17 +549,28 @@ export interface QueuedTurn {
   event_id: EventId;
   received_at: ReceivedAt;
   reply_handle: ReplyHandle;
+  source?: TurnSource;
   text: Text4;
   [k: string]: unknown;
 }
 /**
  * Channel-neutral coordinates for where a turn's reply is delivered.
  *
- * The reply model is edit-in-place: the ingress adapter pre-posts a placeholder
- * message and the worker edits it as the answer streams. For the Slack adapter
- * today, ``channel`` is the Slack channel id (also the key the deployment
- * binding matches an agent on) and ``placeholder`` is the ts of the pre-posted
- * placeholder message.
+ * ``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind
+ * (``slack``, ``email``, ...) plus the address within that kind. Both halves are
+ * needed to resolve the binding, because one address can legitimately exist under
+ * two kinds. ``kind`` is REQUIRED and deliberately has no default: an optional
+ * kind forces the resolver to invent one, and every honest answer there is an
+ * address-only fallback or a ``"slack"`` guess -- the silent misroute this field
+ * exists to close.
+ *
+ * The reply model supports editing an existing reply or carrying no existing
+ * reply reference. ``placeholder`` is a required, nullable, opaque correlation
+ * handle minted by the adapter. The worker never parses it and only ever hands
+ * it back to the adapter that minted it. For the Slack adapter it happens to be
+ * the ts of the preposted placeholder message. For another kind it is whatever
+ * that adapter needs to find the same message again. ``None`` means this turn
+ * has no existing reply to edit.
  *
  * ``endpoint`` is the per-turn reply target: the base URL of the channel API the
  * worker delivers this turn's reply through. It routes the reply back to the
@@ -493,12 +580,23 @@ export interface QueuedTurn {
  * (its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set
  * it keeps the pre-#19 behavior.
  *
- * This interface was referenced by `ACIProtocolV029`'s JSON-Schema
+ * ``adapter`` names the egress adapter identity whose credential authenticates
+ * the reply, so a sink call made *before* binding resolution can still select the
+ * right credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both
+ * **platform-set from the binding row** (never accepted from an ingress request
+ * body); ``slack`` legitimately carries neither, because its route is the
+ * worker's configured Slack origin. ``adapter`` is optional at the schema so a
+ * third-party or pre-upgrade producer is not rejected outright, but every
+ * first-party mint site sets it explicitly.
+ *
+ * This interface was referenced by `ACIProtocolV041`'s JSON-Schema
  * via the `definition` "ReplyHandle".
  */
 export interface ReplyHandle {
+  adapter?: Adapter;
   channel: Channel;
   endpoint?: Endpoint1;
+  kind: Kind2;
   placeholder: Placeholder;
   [k: string]: unknown;
 }

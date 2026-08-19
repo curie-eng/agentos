@@ -32,6 +32,7 @@ def _resolved(
     resolved_by: str | None = "U_MANAGER",
     note: str | None = None,
     summary: str = "Give ACME a 20% discount",
+    reply_placeholder: str | None = "p-1",
 ) -> Approval:
     """A detached, resolved ``Approval``: only the fields the builder reads."""
 
@@ -41,9 +42,13 @@ def _resolved(
         conversation_id="C1-thread-0",
         author="U_AE",
         summary=summary,
+        # The durable routing half (ADR-0096 phase 2): NOT NULL with no default,
+        # so every construction site has to state which channel raised the turn.
+        reply_kind="slack",
         reply_channel="C1",
-        reply_placeholder="p-1",
+        reply_placeholder=reply_placeholder,
         reply_endpoint=None,
+        reply_adapter=None,
         dedupe_key="ev-1",
         status=status,
         resolved_by=resolved_by,
@@ -65,6 +70,13 @@ def test_a_noted_resolution_carries_the_note_into_the_resume_turn() -> None:
     assert turn.text.startswith("[approval resolved]")
     assert '"Give ACME a 20% discount"' in turn.text
     assert "was approved by U_MANAGER" in turn.text
+
+
+def test_resume_turn_preserves_reply_placeholder_values() -> None:
+    for expected in (None, "reply placeholder"):
+        turn = build_resume_turn(_resolved(reply_placeholder=expected))
+
+        assert turn.reply_handle.placeholder == expected
 
 
 def test_a_bare_resolution_omits_the_note_clause_entirely() -> None:

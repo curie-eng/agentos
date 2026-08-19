@@ -114,13 +114,13 @@ back into the contract:
    The approval card (ADR-0010) travels the same seam: the kernel emits a
    `confirm` intent and the adapter renders it below the line via
    `apps/worker/src/curie_worker/blocks.py::approval_card` inside
-   `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.post`, so no Block
+   `apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`, so no Block
    Kit is built above the seam. Its settled forms are split by which outcome
    arrived: nobody decided renders the expired form via
    `apps/worker/src/curie_worker/blocks.py::expired_approval_card`, and a
    decision renders the resolved form via
-   `apps/worker/src/curie_worker/blocks.py::resolved_approval_card`, both from
-   `apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.update_message`.
+   `apps/worker/src/curie_worker/blocks.py::resolved_approval_card`, both reached
+   through the same adapter on a settling `reply.update`.
    `allow_free_text` on that intent is rendered here
    too: Slack expresses "this decision may carry free text" as a dialog opened by
    the click, so the card carries the note-collecting action ids and the
@@ -152,7 +152,7 @@ carries it through for both intents
 (`cli/src/channel.rs`, consumed by `cli/src/interactive.rs`). The Slack one reads
 it on exactly one path, the kernel-emitted `confirm` that becomes the approval
 card (#1053, at
-`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink.post`); the
+`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter.emit`); the
 agent-authored envelope path drops it, since
 `apps/worker/src/curie_worker/blocks.py::_reply_from_message` never reads the
 field. See Known leakage for why that is not simply a bug.

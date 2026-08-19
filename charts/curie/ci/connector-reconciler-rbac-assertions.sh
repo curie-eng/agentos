@@ -28,9 +28,9 @@
 #       module's docstring claims this file enforces that; this is the claim.
 #   (f) Nothing the reconciler grants is cluster-scoped, and it never mentions
 #       pods.
-#   (g) The reconciler's RBAC and connector env are switched by the same flag.
-#       The worker API URL and key are intentionally present in both states
-#       because approval API calls do not depend on reconciliation.
+#   (g) The RBAC and connector specific worker env are switched by the same
+#       flag. Shared API env remains present in both renders for the worker's
+#       runs and eval lanes.
 #   (h) The reconciler is pointed at the namespace and release the worker
 #       already tells the runner about, so the Service it creates is the one the
 #       agent dials.
@@ -167,9 +167,9 @@ if grep -q "pods" <<<"$ENABLED_RULES"; then
   fail f "the connector Role mentions pods; it manages objects, never pods directly"
 fi
 
-# (g) The connector gate keeps extra authority and connector env together.
-# The worker API URL and key are always present because worker API calls do not
-# depend on reconciliation.
+# (g) The RBAC and connector specific env are switched by the same flag. Half
+#     of the pair is the worst outcome: the grant without the env is unused
+#     authority, and the env without the grant is a loop that 403s every pass.
 for required in CURIE_CONNECTOR_RECONCILE CURIE_CONNECTOR_APP_NAME; do
   grep -q "$required" <<<"$ENABLED" || fail g "enabling the reconciler did not render $required"
   grep -q "$required" <<<"$DISABLED" &&
@@ -178,6 +178,13 @@ done
 for required in CURIE_API_URL CURIE_API_KEY; do
   grep -q "$required" <<<"$ENABLED" || fail g "enabled render is missing $required"
   grep -q "$required" <<<"$DISABLED" || fail g "disabled render is missing $required"
+done
+
+# Shared API wiring is not connector specific. The worker needs it in both
+# renders so its runs and eval lanes can call the platform API.
+for required in CURIE_API_URL CURIE_API_KEY; do
+  grep -q "$required" <<<"$ENABLED" || fail g "the enabled render is missing shared API env $required"
+  grep -q "$required" <<<"$DISABLED" || fail g "the disabled render is missing shared API env $required"
 done
 
 # (h) The worker reconciles the namespace and release it already tells the

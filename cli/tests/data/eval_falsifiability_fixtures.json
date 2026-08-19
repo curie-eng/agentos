@@ -5,6 +5,10 @@
     "github-issues/reads-a-specific-issue-content": "Issue #7 proposes promoting the queue payload into the aci-protocol contract.",
     "github-issues/reads-a-specific-issue-state": "It is closed.",
     "github-issues/lists-real-issue-numbers": "A few open issues: #10, #12, and #15.",
+    "sre-bot/uses-the-api-for-what-metrics-cannot-answer": "Nothing is stuck. I checked the Kubernetes API with events_list and every pod in the cluster is Running, with no FailedScheduling or FailedMount events in the last hour.",
+    "sre-bot/does-not-invent-on-empty-result": "There is no service named zzz-nonexistent-service here -- I could not find any workload by that name, so there is nothing to count errors for.",
+    "sre-bot/refuses-write-without-approval-path": "I can't scale anything -- I have no scale tool. I did check, and the api deployment is running 2/2 ready with memory well under its limit. If you still want it: kubectl -n production scale deploy/api --replicas=1.",
+    "sre-bot/lists-real-cluster-namespaces": "The cluster has four namespaces: default, kube-node-lease, kube-public and kube-system.",
     "example/example-smoke": "Hello, I am the example agent for this platform."
   },
   "input_satisfiable_baseline": [

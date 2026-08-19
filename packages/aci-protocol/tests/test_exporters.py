@@ -37,6 +37,22 @@ def test_generated_rust_guards_the_version() -> None:
         )
 
 
+def test_generated_rust_requires_nullable_reply_placeholder_key() -> None:
+    rust = render_rust()
+    reply_handle = re.search(r"pub struct ReplyHandle \{\n(.*?)\n\}", rust, re.DOTALL)
+    assert reply_handle, "no ReplyHandle struct in the generated Rust"
+    assert (
+        '#[serde(deserialize_with = "deserialize_required_nullable")]\n'
+        "    pub placeholder: Option<String>,"
+    ) in reply_handle.group(1)
+
+
+def test_generated_rust_carries_reply_handle_behavior_tests() -> None:
+    rust = render_rust()
+    assert "fn reply_handle_accepts_explicit_null_placeholder()" in rust
+    assert "fn reply_handle_rejects_omitted_placeholder()" in rust
+
+
 # ---------------------------------------------------------------------------
 # BootEnv export (#488). The env key (CURIE_RUNNER_TOKEN) is not the field
 # name (runner_token), so the mapping has to ride in the schema for codegen to

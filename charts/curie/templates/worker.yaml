@@ -100,6 +100,17 @@ spec:
       {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
   template:
     metadata:
+      annotations:
+        # Roll the workers when the per-adapter egress credentials change
+        # (ADR-0096 D4.2). They arrive as env from the chart Secret, and env is
+        # read once at boot, so a `helm upgrade` that rotates a compromised
+        # adapter secret would otherwise leave every running worker presenting
+        # the OLD one -- the operator has to choose between an outage and a
+        # credential they believe they revoked. Same sha256sum-of-the-rendered-
+        # value idiom as otel-collector.yaml and clickhouse.yaml. Scoped to this
+        # value on purpose: annotating the whole Secret would restart the workers
+        # on any unrelated credential change in it.
+        checksum/adapter-credentials: {{ .Values.worker.adapterCredentials | toJson | sha256sum }}
       labels:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
@@ -187,6 +198,15 @@ spec:
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
 {{- end }}
+            - name: LANGFUSE_HOST
+              value: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
+            - name: LANGFUSE_PUBLIC_KEY
+              value: {{ .Values.langfuse.init.projectPublicKey | quote }}
+            - name: LANGFUSE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.langfuse.existingSecret | default (include "curie.secretName" .) }}
+                  key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
             - name: CURIE_RUNNER_PORT
@@ -229,6 +249,18 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: agentCredentials
             {{- end }}
+            # Per-adapter egress credentials (ADR-0096 D4.2). From the chart
+            # Secret, never inlined into the Deployment: these authenticate the
+            # PLATFORM to a channel adapter, so a leaked manifest is a leaked
+            # ability to impersonate Curie to every bound channel. Rendered
+            # unconditionally (unlike agentCredentials) because the worker's
+            # own parser treats empty as "no adapters configured" and fails
+            # closed on the first non-Slack turn, which is the honest signal.
+            - name: CURIE_ADAPTER_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: adapterCredentials
             # No-Slack egress routing: when set, the worker's Slack sink posts its
             # placeholder edits at this base URL (the `curie cluster message` CLI stub)
             # instead of real Slack. Empty (the default) leaves the sink on real
@@ -236,6 +268,14 @@ spec:
             {{- if .Values.worker.slackApiBaseUrl }}
             - name: SLACK_API_BASE_URL
               value: {{ .Values.worker.slackApiBaseUrl | quote }}
+            {{- end }}
+            # Extra trusted Slack origins (ADR-0096 D4.4), a DEV-ONLY widening of
+            # where the bot token may be sent. Empty (the default) renders
+            # nothing, leaving the configured Slack origin as the only trusted
+            # one and every cross-origin per-turn endpoint refused.
+            {{- if .Values.worker.slackTrustedOrigins }}
+            - name: CURIE_SLACK_TRUSTED_ORIGINS
+              value: {{ .Values.worker.slackTrustedOrigins | quote }}
             {{- end }}
             # Object store, for fetching immutable plugin bundles.
             #

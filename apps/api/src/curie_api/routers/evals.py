@@ -42,7 +42,7 @@ async def trigger_eval(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "version not found for this agent"
             )
-        sha = version.commit_sha
+        sha = version.commit_sha or version.bundle_sha256
     else:
         deployment = await crud.get_active_deployment(
             session, agent.id, Environment.dev
@@ -57,15 +57,14 @@ async def trigger_eval(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "deployed version not found"
             )
-        sha = version.commit_sha or deployment.commit_sha
+        sha = version.commit_sha or deployment.commit_sha or version.bundle_sha256
 
     if sha is None:
-        # A version with no commit sha cannot be keyed in eval traces; this is a
-        # caller/data problem, surfaced as a clean 4xx rather than a 500 on the
-        # required-string EvalJob.sha field.
+        # Git versions use their commit sha. A local deployment has no commit,
+        # so its immutable bundle digest keys the same eval trace dimension.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "resolved version has no commit sha; cannot run eval",
+            "resolved version has neither a commit sha nor a bundle digest; cannot run eval",
         )
 
     if version.bundle_ref is None:
@@ -103,12 +102,21 @@ async def trigger_eval(
 
 @router.get("/matrix", response_model=EvalMatrix)
 async def eval_matrix(
-    lf: LangfuseDep, suite: str, versions: int = 5
+    lf: LangfuseDep,
+    suite: str,
+    versions: int = 5,
+    stream_id: str | None = None,
 ) -> EvalMatrix:
     # Filtered by SUITE, the real dimension on eval traces. There is
     # deliberately no agent filter: eval traces are tagged by suite + version,
     # not agent, so an agent param would be dead. Do not re-add one.
     traces = await lf.list_traces_by_tags(["eval", f"suite:{suite}"])
+    if stream_id is not None:
+        traces = [
+            trace
+            for trace in traces
+            if (trace.get("metadata") or {}).get("stream_id") == stream_id
+        ]
     return build_matrix(traces, suite, versions)
 
 

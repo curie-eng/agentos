@@ -39,12 +39,12 @@ vi.mock("../../api/client", async (importOriginal) => {
   };
 });
 
-// The mocked agent carries a Slack channel ID (the channel-edit test pre-fills the
-// input with it; the promote/bundle tests only need the detail to render).
+// The mocked agent carries a Slack channel binding (the channel-edit test pre-fills
+// the input with its address; the promote/bundle tests only need the detail to render).
 const AGENT: AgentOut = {
   id: "a1",
   name: "deal-desk",
-  slack_channel: "C0123ABCD",
+  channel: { kind: "slack", address: "C0123ABCD" },
   model: null,
   created_at: "2026-07-01T00:00:00Z",
 };
@@ -94,7 +94,7 @@ beforeEach(() => {
   vi.mocked(listVersions).mockResolvedValue(VERSIONS);
   vi.mocked(listDeployments).mockResolvedValue(DEPLOYMENTS);
   vi.mocked(getVersionFiles).mockResolvedValue(FILES);
-  vi.mocked(updateAgent).mockResolvedValue({ ...AGENT, slack_channel: "C9999ZZZZ" });
+  vi.mocked(updateAgent).mockResolvedValue({ ...AGENT, channel: { kind: "slack", address: "C9999ZZZZ" } });
   vi.mocked(createDeployment).mockResolvedValue(deployment("v2", "prod", "2026-07-08T00:00:00Z"));
 });
 
@@ -144,7 +144,7 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
 
     // Exactly one PATCH, with the right args.
     await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(1));
-    expect(updateAgent).toHaveBeenCalledWith("a1", { slack_channel: "C9999ZZZZ" });
+    expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "C9999ZZZZ" } });
 
     // Save triggers a refetch of the wired agent data (getAgents runs a 2nd time).
     await waitFor(() => expect(getAgents).toHaveBeenCalledTimes(2));
@@ -176,7 +176,52 @@ describe("WiredAgentDetail — channel edit (item 5)", () => {
 
     // …but the value still saves.
     await user.click(screen.getByTestId("channel-save"));
-    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith("a1", { slack_channel: "revenue-ops" }));
+    await waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "slack", address: "revenue-ops" } }),
+    );
+  });
+
+  it("does not show the Slack-shape warning for a non-slack kind", async () => {
+    // ADR-0096 (#1459): the "does not look like a channel ID (C…)" hint is a
+    // SLACK fact. A webhook binding's address is an arbitrary string by design,
+    // so a kind-blind check warns on every correct value an adapter will ever
+    // use. A permanent warning on a correct value is worse than no warning: the
+    // operator learns to ignore this line, and the hint stops working for the
+    // Slack binding it was written for (#143's guidance is the deliverable).
+    const user = userEvent.setup();
+    vi.mocked(getAgents).mockResolvedValue([
+      { ...AGENT, channel: { kind: "webhook", address: "acme-room-7" } },
+    ]);
+    renderDetail();
+
+    const input = await screen.findByTestId("channel-input");
+    expect(input).toHaveValue("acme-room-7");
+    expect(screen.queryByTestId("channel-warn")).not.toBeInTheDocument();
+
+    // A different non-Slack-shaped address is still not warned on, so this
+    // cannot be satisfied by the seeded value happening to pass some rule.
+    await user.clear(input);
+    await user.type(input, "room/42");
+    expect(screen.queryByTestId("channel-warn")).not.toBeInTheDocument();
+
+    // The kind rides along on the save, unchanged.
+    await user.click(screen.getByTestId("channel-save"));
+    await waitFor(() =>
+      expect(updateAgent).toHaveBeenCalledWith("a1", { channel: { kind: "webhook", address: "room/42" } }),
+    );
+  });
+
+  it("still warns on a non-Slack-ID address when the kind IS slack", async () => {
+    // The negative control for the test above. Dispatching on kind is only
+    // correct if the slack arm keeps firing; a fix that disabled the check
+    // outright would pass the webhook test and silently re-open #143.
+    const user = userEvent.setup();
+    renderDetail();
+
+    const input = await screen.findByTestId("channel-input");
+    await user.clear(input);
+    await user.type(input, "revenue-ops");
+    expect(screen.getByTestId("channel-warn")).toBeInTheDocument();
   });
 });
 

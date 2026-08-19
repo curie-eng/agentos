@@ -34,9 +34,11 @@ class RecordingApprovals:
 
     def __init__(self, *, fail: bool = False) -> None:
         self.requests: list[ApprovalRequest] = []
+        self.create_calls = 0
         self.fail = fail
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        self.create_calls += 1
         if self.fail:
             raise ApprovalBackendError("approval API unavailable")
         self.requests.append(request)
@@ -80,8 +82,10 @@ def _qevent(
     *,
     thread: str = "th-appr",
     event_id: str | None = None,
-    placeholder: str = "p-1",
+    placeholder: str | None = "p-1",
     endpoint: str | None = None,
+    kind: str = "slack",
+    adapter: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
         event_id=event_id or uuid.uuid4().hex,
@@ -89,7 +93,11 @@ def _qevent(
         author="U1",
         text=text,
         reply_handle=ReplyHandle(
-            channel="C1", placeholder=placeholder, endpoint=endpoint
+            kind=kind,
+            channel="C1",
+            placeholder=placeholder,
+            endpoint=endpoint,
+            adapter=adapter,
         ),
         received_at="2026-07-14T00:00:00+00:00",
     )
@@ -165,6 +173,110 @@ def test_awaiting_approval_creates_record_and_suspends(make_harness) -> None:
             assert "Awaiting approval (appr-1)" in h.sink.last_text
             assert "Give ACME a 20% discount" in h.sink.last_text
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_the_created_record_carries_the_turns_kind_and_adapter(make_harness) -> None:
+    """T-A12, worker half / AC2 (plan EB-A17, finding 2).
+
+    The durable record is what the RESUME is rebuilt from, days later, possibly
+    after the binding moved (T-A8). So the kind and the egress-credential
+    selector have to be copied off THIS turn's reply handle at creation time --
+    the one moment both facts are known and true.
+
+    Mutation this catches: leave `kernel.py`'s `ApprovalRequest(...)` producer
+    unchanged. Everything still compiles, the approval is still created, the
+    Slack lane is unaffected, and only a resumed EMAIL turn -- the rarest path in
+    the system -- reveals the loss.
+
+    Both fields are asserted on the same request rather than in two tests,
+    because dropping either one alone produces the same silent shape.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Send the quote to ACME")
+            ev = _qevent(
+                "send it",
+                event_id="ev-appr-kind",
+                kind="email",
+                adapter="agentmail-sandbox",
+            )
+            await h.kernel.process_event(ev)
+
+            assert len(approvals.requests) == 1
+            req = approvals.requests[0]
+            assert req.reply_kind == "email"
+            assert req.reply_adapter == "agentmail-sandbox"
+            # The pre-existing reply-handle fields are still copied, so a
+            # producer that replaced the block rather than extending it fails.
+            assert req.reply_channel == "C1"
+            assert req.reply_placeholder == "p-1"
+
+    asyncio.run(go())
+
+
+def test_a_slack_turns_record_carries_slack_and_no_adapter(make_harness) -> None:
+    """T-A12, the sibling lane. Slack legitimately has no adapter (its route is
+    the worker's configured origin, D4.4), so its record must persist NULL rather
+    than borrow the email lane's slug or a placeholder string -- a fabricated
+    adapter would send the platform's egress credential for somebody else's
+    adapter on resume.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            await h.kernel.process_event(_qevent("discount?", event_id="ev-appr-slack"))
+
+            assert len(approvals.requests) == 1
+            req = approvals.requests[0]
+            assert req.reply_kind == "slack"
+            assert req.reply_adapter is None
+
+    asyncio.run(go())
+
+
+def test_null_placeholder_turn_reaches_an_approval_and_persists_its_own_ref(
+    make_harness,
+) -> None:
+    """A placeholder-less turn can pause for approval like any other (ADR-0079).
+
+    The reverse of what this test asserted before the placeholder-less path
+    landed: the kernel used to refuse the turn outright, so a channel that
+    preposts nothing could not reach an approval gate at all.
+
+    The record must carry the ref the turn DELIVERED on, not the null the wire
+    carried. Those differ here, and persisting the null would send the approval's
+    outcome to a second message beside the request it answers.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            event = _qevent(
+                "please discount",
+                placeholder=None,
+                endpoint="http://adapter.example.test/",
+                kind="email",
+                adapter="agentmail",
+            )
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == ["please discount"]
+            assert approvals.create_calls == 1
+            req = approvals.requests[0]
+            # The routing pair and egress selector still come off the wire...
+            assert req.reply_kind == "email"
+            assert req.reply_adapter == "agentmail"
+            # ...but the reply ref is the one this turn minted by delivering.
+            assert req.reply_placeholder is not None
+            assert req.reply_placeholder == h.sink.text_posts[0][1]
 
     asyncio.run(go())
 
@@ -303,7 +415,7 @@ class GrantBinding:
         self.grant_tool = grant_tool
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -566,7 +678,7 @@ class RoutedBinding:
         self.routes = routes
         self.agent_id = uuid.uuid4()
 
-    async def resolve(self, channel: str):  # noqa: ANN201
+    async def resolve(self, kind: str, channel: str):  # noqa: ANN201
         from curie_worker.binding import ResolvedDeployment
 
         return ResolvedDeployment(
@@ -740,7 +852,7 @@ def _resume_turn(
         conversation_id=thread,
         author=author,
         text=text,
-        reply_handle=ReplyHandle(channel="C1", placeholder="p-1", endpoint=None),
+        reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="p-1", endpoint=None),
         received_at="2026-07-14T00:00:00+00:00",
     )
 
@@ -1690,7 +1802,7 @@ def test_resume_reply_best_effort_completes_offline_when_endpoint_is_dead(
                 author="U9",
                 text="[approval resolved] approved by U9",
                 reply_handle=ReplyHandle(
-                    channel="C1", placeholder="p-1", endpoint=_CLI_STUB
+                    kind="slack", channel="C1", placeholder="p-1", endpoint=_CLI_STUB
                 ),
                 received_at="2026-07-14T00:00:00+00:00",
             )

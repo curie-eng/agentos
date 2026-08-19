@@ -1,17 +1,34 @@
-"""Reader-context propagation into nested models on the queued-turn payload.
+"""Reader-context propagation into nested models on the queued-turn payload,
+and ``ReplyHandle``'s routing half (ADR-0096 phase 2, D1/D2).
 
 ``QueuedTurn`` crosses the Valkey Stream boundary between the dispatcher and the
 worker, carrying a nested ``ReplyHandle``. The tolerant-read policy must reach
 that nested model, not just the top-level one -- pydantic propagates validation
 context into nested models, but decision 1 says assert it, do not assume it.
+
+``ReplyHandle.kind`` is REQUIRED (plan section 1, D1): an optional kind forces
+the resolver to answer "what do I do when kind is None?", and every honest answer
+is an address-only fallback or a ``"slack"`` default -- #38's silent misroute
+re-opened at the exact point the field that prevents it finally exists.
+``ReplyHandle.adapter`` is optional at the schema (a third-party producer is not
+rejected outright) but every first-party mint site sets it explicitly; the mint
+sites are asserted by T-A17 (dispatcher), T-A18 (resume) and T-C2 (ingress).
 """
 
 import json
+from pathlib import Path
 
 import pytest
-from aci_protocol import QueuedTurn, ReplyHandle, parse_queued_turn
+from aci_protocol import QueuedTurn, ReplyHandle, TurnSource, parse_queued_turn
 from aci_protocol.events import _READER_CONTEXT_KEY
 from pydantic import ValidationError
+
+# The committed cross-language golden the Rust CLI re-serializes byte-identically
+# (`cli/src/queue.rs::queued_turn_matches_cross_language_golden`, T-A3). Read from
+# disk rather than inlined, so this test and that one cannot drift apart.
+_GOLDEN = (
+    Path(__file__).resolve().parents[1] / "schema" / "queued-turn.fixture.json"
+)
 
 
 def _turn_payload_with_unknown_fields() -> dict[str, object]:
@@ -23,6 +40,7 @@ def _turn_payload_with_unknown_fields() -> dict[str, object]:
         "received_at": "2026-01-01T00:00:00Z",
         "future_top": 1,
         "reply_handle": {
+            "kind": "slack",
             "channel": "C1",
             "placeholder": "1.0",
             "future_nested": 2,
@@ -67,7 +85,151 @@ def test_constructing_queued_turn_with_unknown_field_is_strict() -> None:
             conversation_id="c1",
             author="u1",
             text="hi",
-            reply_handle=ReplyHandle(channel="C1", placeholder="1.0"),
+            reply_handle=ReplyHandle(kind="slack", channel="C1", placeholder="1.0"),
             received_at="2026-01-01T00:00:00Z",
             bogus=1,
         )
+
+
+# --- T-A1: the routing half of the pair is required ---------------------------
+
+
+def test_reply_handle_without_kind_is_rejected_on_construction() -> None:
+    """T-A1 / AC1. A producer that omits `kind` is refused at the source.
+
+    This is the assertion that forecloses the compatibility path: with `kind`
+    optional, `ReplyHandle(channel=..., placeholder=...)` would construct fine
+    and the resolver would have to invent a kind for it.
+    """
+
+    with pytest.raises(ValidationError):
+        ReplyHandle(channel="C1", placeholder="1.0")
+
+
+def test_a_kindless_payload_is_rejected_even_by_a_tolerant_consumer() -> None:
+    """T-A1, the consumer half. Tolerance is about UNKNOWN fields, never about
+    MISSING required ones: an old (0.2.x) producer's turn arriving at a 0.3.0
+    worker must dead-letter loudly (plan section 6.4, E1), not decode with a
+    fabricated kind. Without this, `extra="ignore"` plus a defaulted `kind`
+    would let the pre-cutover shape through silently.
+    """
+
+    payload = _turn_payload_with_unknown_fields()
+    handle = dict(payload["reply_handle"])  # type: ignore[arg-type]
+    handle.pop("kind")
+    payload["reply_handle"] = handle
+
+    with pytest.raises(ValidationError):
+        QueuedTurn.model_validate(payload, context={_READER_CONTEXT_KEY: True})
+
+
+def test_the_committed_golden_fixture_carries_slack_as_its_kind() -> None:
+    """T-A1, the golden half / AC1 and AC6.
+
+    `schema/queued-turn.fixture.json` is the cross-language golden: the Rust CLI
+    asserts byte-identical re-serialization of this exact file (T-A3), so it is
+    regenerated with the model, never hand-edited. Reading it back through the
+    sanctioned consumer decode proves the regeneration happened AND that the new
+    field landed with the only honest value for a Slack-shaped fixture.
+    """
+
+    turn = parse_queued_turn(_GOLDEN.read_text())
+
+    assert turn.reply_handle.kind == "slack"
+    assert turn.reply_handle.channel == "C0GOLDENAAA"
+    assert turn.reply_handle.placeholder == "1720000000.000200"
+
+
+def test_a_payload_written_before_source_existed_decodes_as_a_message() -> None:
+    """The claim that makes this a PATCH rather than a breaking minor.
+
+    Adding `source` was classed as a new optional field, which means a producer
+    from the previous image must keep decoding on a consumer from this one. That
+    is exactly what happens across a rolling deploy, and it is the whole reason
+    the version gate stays quiet, so it is asserted rather than assumed.
+
+    The default also has to be the NON-JOB value. If an unset source read as a
+    job, a mid-deploy dispatcher would silently start minting turns the kernel
+    refuses to steer, and every follow-up in a live thread would defer instead of
+    joining the conversation.
+    """
+
+    pre_upgrade = json.loads(_GOLDEN.read_text())
+    del pre_upgrade["source"]
+
+    turn = QueuedTurn.model_validate(pre_upgrade, context={_READER_CONTEXT_KEY: True})
+
+    assert turn.source is TurnSource.SLACK
+    assert turn.source.is_job is False
+
+
+def test_source_round_trips_and_a_job_is_distinguishable() -> None:
+    """A job survives the wire and answers the one question the kernel asks."""
+
+    payload = json.loads(_GOLDEN.read_text())
+    payload["source"] = "cron"
+
+    turn = QueuedTurn.model_validate(payload, context={_READER_CONTEXT_KEY: True})
+
+    assert turn.source is TurnSource.CRON
+    assert turn.source.is_job is True
+    assert TurnSource.WEBHOOK.is_job is True
+    assert json.loads(turn.model_dump_json())["source"] == "cron"
+
+
+def test_an_unknown_source_is_refused_never_degraded() -> None:
+    """`source` is control-bearing, so an unrecognized value is rejected.
+
+    Same rule as `SessionStatus` (ADR-0036). Degrading an unknown value to the
+    default would silently reclassify a future job kind as a person's message and
+    let it steer a live session, which is the one thing this field exists to stop.
+    """
+
+    payload = json.loads(_GOLDEN.read_text())
+    payload["source"] = "carrier-pigeon"
+
+    with pytest.raises(ValidationError):
+        QueuedTurn.model_validate(payload, context={_READER_CONTEXT_KEY: True})
+
+
+def test_adapter_is_optional_and_round_trips_when_a_producer_sets_it() -> None:
+    """T-A1, the `adapter` half (plan EB-A1, revision 4).
+
+    `adapter` is the egress-credential selector a pre-resolution sink call needs
+    (EB-B1's trust argument), so it must survive the wire, and it must be
+    OPTIONAL at the schema so a third-party producer is not rejected outright.
+    Both directions are asserted here: absent means None, present round-trips.
+    """
+
+    default = ReplyHandle(kind="slack", channel="C1", placeholder="1.0")
+    assert default.adapter is None
+    assert default.endpoint is None
+
+    routed = ReplyHandle(
+        kind="email",
+        channel="agent@example.test",
+        placeholder="msg_abc123",
+        endpoint="http://curie-mail-adapter:8080/",
+        adapter="agentmail-sandbox",
+    )
+    restored = ReplyHandle.model_validate_json(routed.model_dump_json())
+    assert restored == routed
+    assert restored.adapter == "agentmail-sandbox"
+    assert restored.endpoint == "http://curie-mail-adapter:8080/"
+
+
+def test_reply_handle_without_placeholder_raises() -> None:
+    with pytest.raises(ValidationError):
+        ReplyHandle.model_validate({"kind": "slack", "channel": "C1"})
+
+
+def test_reply_handle_with_null_placeholder_succeeds() -> None:
+    handle = ReplyHandle.model_validate(
+        {"kind": "slack", "channel": "C1", "placeholder": None}
+    )
+    assert handle.placeholder is None
+
+
+def test_reply_handle_with_empty_placeholder_succeeds() -> None:
+    handle = ReplyHandle(kind="slack", channel="C1", placeholder="")
+    assert handle.placeholder == ""

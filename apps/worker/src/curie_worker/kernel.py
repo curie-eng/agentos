@@ -43,12 +43,24 @@ from aci_protocol import (
     SideEffectFlag,
     TextDelta,
     ToolNote,
+    TurnSource,
 )
 from channel_protocol import (
     MESSAGE_VERSION,
     Action,
     ConfirmIntent,
     OutboundMessage,
+)
+from channel_protocol.reply import (
+    REPLY_WIRE_VERSION,
+    NavAffordance,
+    ReplyAck,
+    ReplyPost,
+    ReplyTarget,
+    ReplyUpdate,
+    SettledOutcome,
+    TurnCompleted,
+    TurnStatus,
 )
 from pydantic import ValidationError
 
@@ -70,7 +82,8 @@ from .behaviorpacks import (
 from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingResolver
 from .config import WorkerConfig
 from .killswitch import KillSwitch
-from .markers import Markers
+from .markers import CompletionRecord, MalformedCompletionError, Markers
+from .reply_sink import ReplySink, TargetRoute
 from .runner_client import RunnerClient, RunnerError, TurnStream
 from .sandbox import SandboxSubstrate
 from .sandbox.types import (
@@ -79,10 +92,51 @@ from .sandbox.types import (
     SandboxHandle,
     SuspendedThreadError,
 )
-from .slack_sink import SettledCard, SlackSink
 from .threadlock import ThreadLock
 
 logger = logging.getLogger(__name__)
+
+
+def _target_for(qevent: QueuedTurn) -> ReplyTarget:
+    """This turn's reply address, in the channel's own (opaque) terms.
+
+    Pure and derived wholly from the turn, so every path that holds a
+    ``QueuedTurn`` calls it rather than being handed the answer. The two targets
+    that are NOT this turn's -- the policy-routed approval card and the settled
+    card, both addressed to a channel the turn may never have come from -- build
+    their own ``ReplyTarget`` inline and deliberately do not come through here.
+    """
+    handle = qevent.reply_handle
+    return ReplyTarget(
+        kind=handle.kind,
+        address=handle.channel,
+        conversation_id=qevent.conversation_id,
+        reply_ref=handle.placeholder,
+    )
+
+
+def _route_from_handle(qevent: QueuedTurn) -> TargetRoute:
+    """The route the SERVER minted onto this turn.
+
+    The second of ``TargetRoute``'s two sanctioned sources (EB-B2), and the only
+    one the pre-resolution paths can reach. It is trustworthy because no adapter
+    writes to the stream at all after ADR-0096 phase 2: the ingress API mints the
+    handle from the binding row, and the dispatcher and CLI are first-party.
+    """
+    handle = qevent.reply_handle
+    return TargetRoute(endpoint=handle.endpoint, adapter=handle.adapter)
+
+
+def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
+    """The agent's hub button as the wire carries it, or nothing at all.
+
+    A disabled (or command-less) pack maps to None rather than to an affordance
+    with a false flag: absence is the disabled form on the wire, so no adapter
+    can render a dead hub button from it.
+    """
+    if nav is None or not nav.enabled or not nav.hub_command:
+        return None
+    return NavAffordance(label=nav.hub_label, command=nav.hub_command)
 
 # Failure classifications that are worth retrying (transient). Everything else
 # (budget-exceeded, model/server errors) escalates rather than looping.
@@ -98,6 +152,16 @@ RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
 # get its resolved card wrongly stamped expired. The marker is a stable
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
+
+# The channel kind a POLICY-ROUTED approval card posts to (#247). The one place
+# the kernel names a kind, and it is a fact about the route binding rather than a
+# branch on the turn: ``ApprovalRouteBinding.channel`` is validated as a Slack
+# channel id (``apps/api/src/curie_api/schemas.py``), the channel-membership
+# authorizer proves approver membership through Slack, and widening that binding
+# to other kinds is explicitly out of scope for ADR-0096 phase 2. Its route is
+# empty on both halves, which means the worker's DEFAULT Slack transport (#451):
+# the card is policy, so its transport is policy too, never the trigger's.
+POLICY_CARD_KIND = "slack"
 
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
@@ -186,6 +250,25 @@ class TurnOutcome:
     approval_granted_tool: str | None = None
 
 
+class ThreadBusyError(RuntimeError):
+    """A job arrived at a thread whose session is live, so it was not started.
+
+    Raised INSTEAD of steering or blocking (ADR-0079: jobs are outputs, not
+    steering inputs). Deliberately not one of the classes ``_attempt`` converts
+    into a retryable outcome: this is not a failed turn to back off and retry
+    within the attempt budget, it is a turn that has not begun. Letting it escape
+    leaves the stream entry PENDING, so the existing reclaim redelivers it and the
+    job runs on a later pass once the conversation has finished.
+
+    The redelivery interval is therefore ``reclaim_min_idle_ms`` and the give-up
+    point is ``max_delivery``, which is a coarse instrument borrowed from crash
+    recovery rather than a scheduling policy: a job behind a conversation longer
+    than that budget dead-letters instead of running late. That is a visible,
+    bounded outcome rather than a silent one, and issue #268 owns replacing it
+    with a real idle-aware policy when cron schedules land.
+    """
+
+
 @dataclass
 class _RouteResult:
     steered: bool
@@ -230,19 +313,22 @@ class _ThrottledReply:
 
     def __init__(
         self,
-        sink: SlackSink,
+        sink: ReplySink,
         *,
-        channel: str,
-        ts: str,
+        target: ReplyTarget,
+        route: TargetRoute,
         min_interval_s: float,
-        nav: NavPack | None = None,
+        nav: NavAffordance | None = None,
         no_edit: bool = False,
-        endpoint: str | None = None,
         best_effort: bool = False,
+        on_ref: Callable[[str], None] | None = None,
     ) -> None:
         self._sink = sink
-        self._channel = channel
-        self._ts = ts
+        self._target = target
+        # Told when this turn mints a reply ref (ADR-0079), so the kernel's other
+        # delivery paths edit the same message this streamer created. Only fires
+        # on a placeholder-less turn, where the first emit posts rather than edits.
+        self._on_ref = on_ref
         self._min_interval_s = min_interval_s
         self._no_edit = no_edit
         self._last = 0.0
@@ -258,9 +344,10 @@ class _ThrottledReply:
         # practice the final flush, which is the update that carries one). None
         # when unbound/disabled.
         self._nav = nav
-        # This turn's reply endpoint (issue #19): routes the edit back to the
-        # ingress that enqueued the turn. None uses the sink's worker default.
-        self._endpoint = endpoint
+        # This turn's reply route (issue #19, ADR-0096 D4): which adapter
+        # endpoint the edit is delivered to, and under whose credential. A kwarg
+        # on ``emit``, never a wire field.
+        self._route = route
 
     async def stream(self, text: str) -> None:
         if self._no_edit:
@@ -272,27 +359,33 @@ class _ThrottledReply:
             return
         self._last = now
         self._last_text = text
-        await self._sink.update(
-            channel=self._channel,
-            ts=self._ts,
-            text=text,
-            nav=self._nav,
-            endpoint=self._endpoint,
-            best_effort_unreachable=self._best_effort,
-        )
+        await self._emit(text)
 
     async def finalize(self, text: str) -> None:
         if text == self._last_text:
             return
         self._last_text = text
-        await self._sink.update(
-            channel=self._channel,
-            ts=self._ts,
-            text=text or "(no response)",
-            nav=self._nav,
-            endpoint=self._endpoint,
+        await self._emit(text or "(no response)")
+
+    async def _emit(self, text: str) -> None:
+        ack = await self._sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=self._target,
+                text=text,
+                nav=self._nav,
+            ),
+            route=self._route,
             best_effort_unreachable=self._best_effort,
         )
+        # A placeholder-less turn's first emit CREATES its message; adopt the ref
+        # so every later delta edits that message instead of posting another one.
+        # Without this a streamed job would post one message per throttle window.
+        if self._target.reply_ref is None and ack.ref:
+            self._target = self._target.model_copy(update={"reply_ref": ack.ref})
+            if self._on_ref is not None:
+                self._on_ref(ack.ref)
 
 
 class Kernel:
@@ -303,7 +396,7 @@ class Kernel:
         *,
         substrate: SandboxSubstrate,
         runner: RunnerClient,
-        sink: SlackSink,
+        sink: ReplySink,
         lock: ThreadLock,
         markers: Markers,
         config: WorkerConfig,
@@ -347,15 +440,104 @@ class Kernel:
         # deterministic ordering within a process without blocking steering,
         # because it is released before the stream is consumed.
         self._order_locks: dict[str, _LockEntry] = {}
+        # Reply refs MINTED during a placeholder-less turn, keyed by event id
+        # (ADR-0079). A triggered turn arrives with ``reply_handle.placeholder``
+        # null because no ingress preposted anything, so its first delivery
+        # creates the message and the adapter hands back its ref. Every later
+        # event in the SAME turn has to edit that message instead of posting
+        # another one, and the paths that need it -- the booting state, the
+        # stream, the final flush, an escalation -- are four different methods
+        # that each rebuild the target from the queued turn. Holding the minted
+        # ref here is what makes those rebuilds agree.
+        #
+        # Bounded by construction: an entry is written only for a turn that had
+        # no placeholder, and ``process_event`` drops it in a finally. It is
+        # deliberately NOT a cache across turns -- a later turn on the same
+        # thread gets its own message, exactly as a Slack mention does.
+        self._minted_refs: dict[str, str] = {}
+
+    def _target_for(self, qevent: QueuedTurn) -> ReplyTarget:
+        """This turn's reply target, including any ref minted during the turn.
+
+        Args:
+            qevent: The queued turn.
+
+        Returns:
+            The target from the wire handle, with ``reply_ref`` replaced by the
+            minted ref when this turn posted its own message.
+        """
+        target = _target_for(qevent)
+        if target.reply_ref is not None:
+            return target
+        minted = self._minted_refs.get(qevent.event_id)
+        return target if minted is None else target.model_copy(update={"reply_ref": minted})
+
+    def _adopt_ref(self, qevent: QueuedTurn, ack: ReplyAck) -> None:
+        """Remember a ref an adapter minted for a placeholder-less turn.
+
+        First writer wins: the message that was actually created first is the one
+        the rest of the turn edits, so a racing second delivery cannot redirect
+        the turn onto a message posted later.
+
+        Args:
+            qevent: The queued turn the delivery belonged to.
+            ack: The adapter's acknowledgement.
+        """
+        if ack.ref and qevent.reply_handle.placeholder is None:
+            self._minted_refs.setdefault(qevent.event_id, ack.ref)
+
+    async def _reply_for(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        text: str,
+        *,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        """Deliver platform-authored text for this turn, adopting any minted ref.
+
+        The single-shot counterpart of ``_ThrottledReply``: both exist so that no
+        caller has to remember the adoption step.
+
+        Args:
+            qevent: The queued turn.
+            route: This turn's egress route.
+            text: The platform-authored text.
+            best_effort_unreachable: Swallow an unreachable transport rather than raising.
+
+        Returns:
+            The adapter's acknowledgement.
+        """
+        ack = await self._reply(
+            self._target_for(qevent),
+            route,
+            text,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+        self._adopt_ref(qevent, ack)
+        return ack
 
     async def process_event(self, qevent: QueuedTurn) -> None:
-        """Handle one queued Slack event to a terminal state (success or escalate).
+        """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
         acks it. Raising leaves the entry pending for crash-recovery reclaim.
+
+        A null ``reply_handle.placeholder`` is ACCEPTED here (ADR-0079). This
+        method used to reject one outright, which left the contract and the
+        runtime disagreeing: the schema had already been widened to
+        ``placeholder: str | None`` for the channel port, so every triggered turn
+        the wire permitted died on the first line of the kernel. The reply path
+        now posts a message when there is none to edit and edits it thereafter.
         """
         event_id = qevent.event_id
         thread = qevent.conversation_id
+        # The turn's route starts as the one the server minted onto the wire and
+        # is REPLACED by the binding row's once this turn resolves (EB-B2's two
+        # sanctioned sources, in precedence order). Everything before resolution
+        # -- the prior-side-effect escalation, the unmapped-address drop -- can
+        # only reach the handle's, which is the point of it being carried.
+        route = _route_from_handle(qevent)
 
         # Acquire the per-thread order lock BEFORE any await, so concurrent
         # same-thread events queue in task-arrival order (asyncio.Lock is FIFO and
@@ -374,24 +556,55 @@ class Kernel:
                 self._release_order_entry(thread, entry)
 
         try:
-            if await self._markers.is_done(event_id):
+            if await self._markers.is_terminal(event_id):
+                # ``is_terminal``, not ``is_done``: a DONE outbox record proves
+                # this turn finished just as well as the marker does, and it
+                # outlives the marker by the retention window. Reading the marker
+                # alone reran a completed turn after a >24h outage -- the startup
+                # sweep emitted the record and cleared it, and the entry that was
+                # never acked was then reclaimed with nothing left to refuse it.
+                # Completion emit stays at-least-once; turn side effects stay
+                # at-most-once for the whole outbox retention period.
                 logger.info("event %s already done; skipping", event_id)
+                # The skip holds no resolved route of its own and must not
+                # invent one, so it makes no sink call -- except to hand off a
+                # completion an earlier delivery durably owed and never
+                # confirmed, which it re-emits from the STORED record.
+                await self._reemit_pending_completion(event_id)
                 return
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
             # and gated on the resume event id so an ordinary turn pays nothing.
-            await self._finalize_settled_card(qevent)
+            await self._finalize_settled_card(qevent, route)
 
             # Crash-safety: a prior attempt executed a side effect but never
             # reached done (worker died mid-run). Do not auto-retry the action.
             if await self._markers.saw_side_effect(event_id):
+                # This path is NOT silent: it is the one message a human most
+                # needs to see. It runs before binding resolution, so it emits
+                # over the server-minted handle's route, verbatim -- never a
+                # lookup it cannot reach and never a default standing in for a
+                # missing adapter.
+                #
+                # And it is a DURABLE TERMINAL OUTCOME, so it completes through
+                # the same ordering every other terminal path uses (driver
+                # adjudication, superseding the earlier "suppress the completion
+                # here" wording). Marking done without a completion is only
+                # survivable on an edit-in-place channel: a BUFFERED adapter
+                # accumulates the reply and flushes on ``turn.completed``, so a
+                # suppressed completion writes the escalation, marks the turn
+                # done, and never delivers it -- silently, on exactly the channel
+                # with nobody watching a thread. The handle-derived route is what
+                # the record stores, so a sweeper re-emits over the same
+                # transport the escalation text went to.
                 await self._escalate(
                     qevent,
+                    route,
                     "A prior attempt started an action before the worker restarted; "
                     "not retrying automatically. Flagging for a human.",
                 )
-                await self._markers.mark_done(event_id)
+                await self._complete(qevent, route, "escalated")
                 return
 
             # Deployment-to-runtime binding: resolve which agent/version this
@@ -399,21 +612,45 @@ class Kernel:
             # polite drop, not a crash.
             boot_env: dict[str, str] | None = None
             agent_id: uuid.UUID | None = None
-            nav: NavPack | None = None
+            nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
             if self._binding is not None:
-                resolved = await self._binding.resolve(qevent.reply_handle.channel)
+                # The routing key is the PAIR (ADR-0096 phase 2): the queue wire
+                # carries a required `kind`, and both halves bind into the
+                # resolver's predicate. Never the address alone -- one address
+                # can be bound under two kinds, and dropping the kind here would
+                # answer an unbound kind with the other agent.
+                resolved = await self._binding.resolve(
+                    qevent.reply_handle.kind, qevent.reply_handle.channel
+                )
                 if resolved is None:
+                    # Name BOTH halves: since the kind routes, a kind typo is a
+                    # newly reachable drop, and a message naming only the address
+                    # sends an operator hunting a binding that is right there.
                     await self._drop_with_message(
-                        qevent, "No agent is configured for this channel yet."
+                        qevent,
+                        route,
+                        "No agent is configured for this "
+                        f"{qevent.reply_handle.kind} address "
+                        f"{qevent.reply_handle.channel} yet.",
                     )
                     return
+                # The FIRST sanctioned route source, and the normal path: once a
+                # turn has resolved, its egress target is the binding row's,
+                # because endpoints are server-controlled (D4.1). A row that
+                # names none leaves the server-minted handle standing -- the
+                # dispatcher and CLI bind no endpoint of their own.
+                route = TargetRoute(
+                    endpoint=resolved.endpoint or qevent.reply_handle.endpoint,
+                    adapter=resolved.adapter or qevent.reply_handle.adapter,
+                )
                 if self._killswitch is not None and await self._killswitch.is_killed(
                     resolved.agent_id
                 ):
                     await self._drop_with_message(
                         qevent,
+                        route,
                         "This agent is paused by an operator. Try again once it resumes.",
                     )
                     return
@@ -472,7 +709,11 @@ class Kernel:
                 # getattr: binding doubles (tests, alternate resolvers) may not
                 # carry the routes attribute; absent means unbound (#247).
                 approval_routes = getattr(resolved, "approval_routes", None)
-                nav = packs.nav
+                # Mapped HERE, at the worker boundary: ``NavPack`` is
+                # worker-local and cannot cross into ``channel_protocol``
+                # (finding 16), so the wire carries a ``NavAffordance`` and a
+                # disabled pack carries nothing at all.
+                nav = _nav_affordance(packs.nav)
                 # Raise the shimmer (#1312). Deliberately placed HERE, after the
                 # binding resolved and before ``_attempt`` claims a sandbox: a
                 # channel we are about to refuse never gets a caption that would
@@ -481,42 +722,48 @@ class Kernel:
                 # in silence. Best-effort and outside the concurrency-critical
                 # section, like the clear below.
                 if self._config.shimmer:
-                    await self._set_shimmer(qevent, packs)
+                    await self._set_shimmer(qevent, route, packs)
 
             attempt = 0
             while True:
                 attempt += 1
-                outcome = await self._attempt(qevent, release_order, boot_env, agent_id, nav, packs)
+                outcome = await self._attempt(
+                    qevent, route, release_order, boot_env, agent_id, nav, packs
+                )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
                     # A gate fired (ADR-0010): persist the durable record, then
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
-                    await self._pause_for_approval(qevent, outcome, agent_id, approval_routes)
-                    await self._markers.mark_done(event_id)
+                    await self._pause_for_approval(
+                        qevent, route, outcome, agent_id, approval_routes
+                    )
+                    await self._complete(qevent, route, "awaiting-approval")
                     return
 
                 if outcome.terminal_ok:
-                    await self._markers.mark_done(event_id)
+                    await self._complete(qevent, route, "delivered")
                     return
 
                 if outcome.saw_side_effect:
                     await self._escalate(
                         qevent,
+                        route,
                         f"The run hit an error ({outcome.classification or 'unknown'}) after "
                         "starting an action; not retrying automatically. Flagging for a human.",
                     )
-                    await self._markers.mark_done(event_id)
+                    await self._complete(qevent, route, "escalated")
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
                     await self._escalate(
                         qevent,
+                        route,
                         f"The run failed ({outcome.classification or 'unknown'}) after "
                         f"{attempt} attempt(s). Flagging for a human.",
                     )
-                    await self._markers.mark_done(event_id)
+                    await self._complete(qevent, route, "escalated")
                     return
 
                 await asyncio.sleep(self._backoff(attempt))
@@ -532,12 +779,23 @@ class Kernel:
             # a status that was never set is a no-op on Slack's side, and the
             # alternative is tracking "did we set it" across every early return in
             # this function, which is more state on the sacred path for no gain.
+            #
+            # ONLY the shimmer clear lives here (EB-B6(a)). ``turn.completed``
+            # deliberately does not: this ``finally`` runs for every exception,
+            # while a failed entry stays PENDING for reclaim -- so completing
+            # here would tell the adapter to deliver a turn that is about to run
+            # again. An EMPTY status IS the clear on the neutral wire.
             if self._config.shimmer:
-                await self._sink.clear_status(
-                    channel=qevent.reply_handle.channel,
-                    thread_ts=qevent.conversation_id,
-                    endpoint=qevent.reply_handle.endpoint,
-                )
+                # Rebuilt rather than reusing the ``target`` captured at entry, so
+                # a placeholder-less turn clears the status against the message it
+                # actually posted. Slack's status call does not read the ref, but a
+                # buffered adapter's does, and handing it a stale null would strand
+                # the caption on a channel nobody is watching.
+                await self._emit_status(self._target_for(qevent), route, "")
+            # Drop this turn's minted ref last, after every delivery above has had
+            # its chance to read it. Popping earlier would make the shimmer clear
+            # address a message the rest of the turn had already adopted.
+            self._minted_refs.pop(event_id, None)
 
     def _acquire_order_entry(self, thread: str) -> _LockEntry:
         entry = self._order_locks.get(thread)
@@ -733,18 +991,245 @@ class Kernel:
             if not threads:
                 del self._active_by_agent[agent_id]
 
-    async def _drop_with_message(self, qevent: QueuedTurn, message: str) -> None:
-        """Edit the placeholder with a reason and mark the event done (a polite
+    async def _drop_with_message(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        message: str,
+    ) -> None:
+        """Edit the placeholder with a reason and complete the turn (a polite
         drop for an unmapped channel or a paused agent, never a crash)."""
-        await self._sink.update(
-            channel=qevent.reply_handle.channel,
-            ts=qevent.reply_handle.placeholder,
-            text=message,
-            endpoint=qevent.reply_handle.endpoint,
-        )
-        await self._markers.mark_done(qevent.event_id)
+        await self._reply_for(qevent, route, message)
+        await self._complete(qevent, route, "dropped")
 
-    async def _set_shimmer(self, qevent: QueuedTurn, packs: BehaviorPacks) -> None:
+    async def _reply(
+        self,
+        target: ReplyTarget,
+        route: TargetRoute,
+        text: str,
+        *,
+        best_effort_unreachable: bool = False,
+    ) -> ReplyAck:
+        """One ``reply.update`` carrying platform-authored text."""
+        return await self._sink.emit(
+            ReplyUpdate(
+                version=REPLY_WIRE_VERSION,
+                event="reply.update",
+                target=target,
+                text=text,
+            ),
+            route=route,
+            best_effort_unreachable=best_effort_unreachable,
+        )
+
+    async def _complete(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        outcome: str,
+    ) -> None:
+        """The terminal ordering, at every durable ``mark_done`` call site.
+
+        1. write the outbox record       -- durable, BEFORE the done marker
+        2. mark done + flag the record   -- ONE MULTI, so they cannot diverge
+        3. emit ``turn.completed``       -- may fail
+        4. clear the record              -- ONLY on a confirmed emit
+
+        Step 3 failing is caught and logged, never raised: the turn is already
+        durably done, and re-running it is the harm. The record survives so a
+        sweeper (or the next redelivery) delivers the completion the adapter is
+        still owed.
+
+        The ONLY ``mark_done`` call site: every durable terminal outcome
+        completes here, including the pre-resolution prior-side-effect
+        escalation, whose route is the server-minted ``reply_handle``'s (EB-B2's
+        second sanctioned source -- no adapter can write to the stream, so the
+        handle is trustworthy). A terminal path that marked done without a record
+        would be a completion nothing could ever recover.
+        """
+        event_id = qevent.event_id
+        record = CompletionRecord(
+            event_id=event_id,
+            event=TurnCompleted(
+                version=REPLY_WIRE_VERSION,
+                event="turn.completed",
+                target=self._target_for(qevent),
+                event_id=event_id,
+                outcome=cast("Any", outcome),
+            ),
+            route=route,
+            created_at=time.time(),
+            done=False,
+        )
+        generation = await self._markers.mark_completion_pending(event_id, record)
+        await self._markers.mark_done(event_id)
+        await self._deliver_completion(record, generation=generation)
+
+    async def _deliver_completion(
+        self, record: CompletionRecord, *, generation: str
+    ) -> bool:
+        """Emit a stored completion and clear it, or leave it owed. True on send.
+
+        The clear is compare-and-checked against ``generation`` -- the identity of
+        the record this caller actually read -- so a pass holding a stale record
+        can never delete the fresh one a concurrent retry wrote for the same
+        event id.
+        """
+        try:
+            await self._sink.emit(record.event, route=record.route)
+        except Exception as exc:  # noqa: BLE001 - the turn is already durably done
+            logger.warning(
+                "turn.completed delivery failed for %s (%s); the outbox record stands",
+                record.event_id,
+                exc,
+            )
+            return False
+        await self._markers.clear_completion(record.event_id, generation=generation)
+        return True
+
+    async def _reemit_pending_completion(self, event_id: str) -> None:
+        """Re-deliver a completion this event durably owed, if one is pending.
+
+        The already-done skip's only job on the completion plane. It reads a
+        STORED record rather than building one, because it never resolved a
+        route of its own and must not invent one.
+        """
+        try:
+            stored = await self._markers.read_completion(event_id)
+        except MalformedCompletionError as exc:
+            await self._quarantine_completion(event_id, exc)
+            return
+        if stored is None:
+            return
+        await self._deliver_completion(stored.record, generation=stored.generation)
+
+    async def _quarantine_completion(
+        self, event_id: str, exc: MalformedCompletionError
+    ) -> None:
+        """Refuse a malformed outbox record, loudly, and stop re-reading it.
+
+        The outbox is new in this train, so every record in it was written by a
+        writer that sets both the done flag and the generation. A record missing
+        either is corrupt, and there is no safe reading of it: treating it as
+        done would emit a completion for a turn that may still rerun, and
+        treating it as clearable would delete a record this pass cannot prove it
+        owns. The payload is therefore LEFT IN PLACE for an operator, and only
+        its index entry goes, so the sweeper does not spend a delivery attempt
+        on it every pass.
+        """
+        logger.warning(
+            "quarantining a malformed completion outbox record: event_id=%s (%s); "
+            "the payload is left in place and will never be emitted",
+            event_id,
+            exc,
+        )
+        await self._markers.drop_pending_member(event_id)
+
+    async def sweep_pending_completions(self) -> None:
+        """Drain the completion outbox, logging what it recovered.
+
+        A pass that delivers anything is by definition recovering a completion an
+        earlier turn owed and never confirmed, so it says so at INFO rather than
+        answering with a count both callers threw away. A quiet pass -- the
+        normal case -- stays silent.
+
+        Called from the consumer's maintenance loop and once at startup, which
+        is the case redelivery can NEVER reach: once a stream entry is acked
+        there is nothing left to redeliver, so a redelivery-only sweep would
+        strand the record forever.
+
+        A member may be emitted only when BOTH hold:
+
+        1. **the record is flagged done.** ``Markers.mark_done`` sets that flag
+           in the same MULTI as the done marker, so a false flag means the
+           kernel is mid-flight or crashed before durability -- the sweeper stays
+           silent and stream redelivery reruns the turn, correctly. The flag is
+           the WHOLE guard, with no marker fallback behind it: ``done_key``
+           expires at ``idempotency_ttl_s`` while the record is retained for a
+           week, so a guard resting on the marker could never pass after day
+           one, and consulting it for a record whose flag says "not yet" lets a
+           CONCURRENT retry's done marker authorize this pass to emit and clear
+           a record that retry is still mid-flight on. A record with NO flag is
+           malformed rather than legacy (the outbox is new in this train) and is
+           quarantined, never guessed at.
+        2. **the record is older than the grace period**, which keeps the
+           sweeper out of the kernel's own emit window so the normal path is not
+           racing it on every turn.
+
+        The pass is BOUNDED, in members and in wall time (``completion_sweep_batch``
+        / ``completion_sweep_budget_s``). Every delivery attempt is an HTTP call
+        with the sink's own timeout, so an unbounded pass over an unreachable
+        adapter is measured in hours -- and this same coroutine runs at startup,
+        against exactly the backlog an outage left behind. The remainder is
+        drained by the next maintenance tick.
+        """
+        sent = 0
+        now = time.time()
+        deadline = now + self._config.completion_sweep_budget_s
+        batch = await self._markers.pending_completions(
+            self._config.completion_sweep_batch
+        )
+        # ONE pipeline for the whole batch's records: the reads are independent
+        # of each other and of every delivery decision below, so paying a round
+        # trip per member (up to completion_sweep_batch of them, on the same
+        # Valkey the kernel's locks live on) bought nothing. The wall-time budget
+        # still bounds the part that is actually slow -- the delivery attempts.
+        stored_batch = await self._markers.read_completions(sorted(batch))
+        for seen, (event_id, stored) in enumerate(stored_batch.items()):
+            if time.time() >= deadline:
+                logger.info(
+                    "completion sweep budget (%.0fs) reached after %d record(s); "
+                    "the rest are left for the next pass",
+                    self._config.completion_sweep_budget_s,
+                    seen,
+                )
+                break
+            if isinstance(stored, MalformedCompletionError):
+                await self._quarantine_completion(event_id, stored)
+                continue
+            if stored is None:
+                # A member whose payload is gone: some emitter confirmed
+                # delivery and cleared it between our read of the set and our
+                # read of the key. Re-emitting would be a duplicate with no
+                # record to guide it, and no route to reconstruct one from.
+                # Only the stale index entry goes: deleting the KEY here would
+                # destroy a record a concurrent retry may have just written.
+                await self._markers.drop_pending_member(event_id)
+                continue
+            record = stored.record
+            age = now - record.created_at
+            if age > self._config.completion_max_retention_s:
+                # Never a silent expiry, and never a set member without its
+                # payload: both go together, and an operator hears about it.
+                logger.warning(
+                    "discarding an undelivered turn.completed after %.0fs: event_id=%s "
+                    "adapter=%s address=%s",
+                    age,
+                    event_id,
+                    record.route.adapter,
+                    record.event.target.address,
+                )
+                await self._markers.clear_completion(
+                    event_id, generation=stored.generation
+                )
+                continue
+            if not stored.done_flag:
+                continue
+            if age < self._config.completion_sweep_grace_s:
+                continue
+            if await self._deliver_completion(record, generation=stored.generation):
+                sent += 1
+        if sent:
+            logger.info(
+                "completion sweep delivered %d owed turn.completed event(s)", sent
+            )
+
+    async def _set_shimmer(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        packs: BehaviorPacks,
+    ) -> None:
         """Raise the shimmer for this turn, and own the only side that lowers it.
 
         The caption is this agent's sampled load line (+ tip), seeded by the thread
@@ -774,22 +1259,44 @@ class Kernel:
             # An operator who blanks status_text wants no caption at all; setting
             # an empty status would read as a clear, not as a shimmer.
             return
-        await self._sink.set_status(
-            channel=qevent.reply_handle.channel,
-            thread_ts=qevent.conversation_id,
-            status=caption,
-            endpoint=qevent.reply_handle.endpoint,
-        )
+        await self._emit_status(self._target_for(qevent), route, caption)
+
+    async def _emit_status(
+        self, target: ReplyTarget, route: TargetRoute, status: str
+    ) -> None:
+        """Raise or lower the channel's liveness caption. Never fails a turn.
+
+        Best-effort is a property of the SHIMMER, not of Slack, so the swallow
+        lives here rather than inside one adapter: a channel with no caption
+        affordance, an adapter that is down, or a workspace without the
+        assistant feature must all cost one debug line and nothing else. An
+        EMPTY status is the clear.
+        """
+        try:
+            await self._sink.emit(
+                TurnStatus(
+                    version=REPLY_WIRE_VERSION,
+                    event="turn.status",
+                    target=target,
+                    status=status,
+                ),
+                route=route,
+            )
+        except Exception as exc:  # noqa: BLE001 -- the caption never gates a turn
+            logger.debug(
+                "turn.status %r skipped for %s: %s", status, target.conversation_id, exc
+            )
 
     # -- internals ------------------------------------------------------------
 
     async def _attempt(
         self,
         qevent: QueuedTurn,
+        route: TargetRoute,
         release_order: Callable[[], None],
         boot_env: dict[str, str] | None = None,
         agent_id: uuid.UUID | None = None,
-        nav: NavPack | None = None,
+        nav: NavAffordance | None = None,
         packs: BehaviorPacks | None = None,
     ) -> TurnOutcome:
         thread = qevent.conversation_id
@@ -802,12 +1309,12 @@ class Kernel:
         # chat.update (the final edit), so it opts out of the pre-boot edit too.
         if not self._config.slack_no_edit_streaming:
             try:
-                await self._sink.update(
-                    channel=qevent.reply_handle.channel,
-                    ts=qevent.reply_handle.placeholder,
-                    text=self._config.booting_text,
-                    endpoint=qevent.reply_handle.endpoint,
-                )
+                # Through the adopting helper, not a bare ``_reply``: on a
+                # placeholder-less turn this booting notice is the delivery that
+                # CREATES the message, and the stream that follows has to edit it.
+                # A bare reply here would post the notice, leave no ref behind, and
+                # the first delta would post a second message beside it.
+                await self._reply_for(qevent, route, self._config.booting_text)
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
 
@@ -820,7 +1327,9 @@ class Kernel:
         # streaming so a follow-up can steer.
         try:
             async with self._lock.hold(self._config.lock_key(thread)):
-                route = await self._route_and_start(thread, event, boot_env, packs)
+                routed = await self._route_and_start(
+                    thread, event, boot_env, packs, source=qevent.source
+                )
         except CapacityExhaustedError as exc:
             release_order()
             rejection = exc.rejection
@@ -836,17 +1345,16 @@ class Kernel:
             )
             if self._is_approval_resume(qevent.event_id):
                 return TurnOutcome(terminal_ok=False, classification="runner-error")
-            await self._sink.update(
-                channel=qevent.reply_handle.channel,
-                ts=qevent.reply_handle.placeholder,
-                text=(
+            await self._reply_for(
+                qevent,
+                route,
+                (
                     "This agent is at sandbox capacity. ResourceQuota "
                     f"{rejection.quota_name} rejected {rejection.resource}: "
                     f"requested {rejection.requested}, observed usage "
                     f"{rejection.used}, hard limit {rejection.hard}. Try again "
                     "after another conversation releases its sandbox."
                 ),
-                endpoint=qevent.reply_handle.endpoint,
             )
             return TurnOutcome(terminal_ok=True)
         except (RunnerError, aiohttp.ClientError, TimeoutError, SandboxError) as exc:
@@ -860,20 +1368,15 @@ class Kernel:
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         release_order()
 
-        if route.canned_reply is not None:
+        if routed.canned_reply is not None:
             # An enabled greeting/help pack matched a provably-fresh thread under
             # the route lock (ADR-0018). Deliver the canned reply onto the
             # placeholder and return terminal-ok so process_event marks the event
             # done. No run was registered, no sandbox claimed, no turn started.
-            await self._sink.update(
-                channel=qevent.reply_handle.channel,
-                ts=qevent.reply_handle.placeholder,
-                text=route.canned_reply,
-                endpoint=qevent.reply_handle.endpoint,
-            )
+            await self._reply_for(qevent, route, routed.canned_reply)
             return TurnOutcome(terminal_ok=True)
 
-        if route.steered:
+        if routed.steered:
             # Delivered into the thread's live turn; that turn streams the output
             # onto its own placeholder. Retire this follow-up's placeholder so it
             # does not sit stuck on "working" in the thread.
@@ -884,15 +1387,10 @@ class Kernel:
             # steer folded into a since-failed turn is not itself replayed. This is
             # the accepted MVP semantic; durable per-steer replay is a deliberate
             # follow-up, flagged to the orchestrator rather than silently assumed.
-            await self._sink.update(
-                channel=qevent.reply_handle.channel,
-                ts=qevent.reply_handle.placeholder,
-                text="Folded into the in-progress reply above.",
-                endpoint=qevent.reply_handle.endpoint,
-            )
+            await self._reply_for(qevent, route, "Folded into the in-progress reply above.")
             return TurnOutcome(terminal_ok=True, steered=True)
 
-        assert route.handle is not None and route.turn is not None
+        assert routed.handle is not None and routed.turn is not None
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
         self._register_run(agent_id, thread)
@@ -906,7 +1404,7 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
-            return await self._consume(qevent, route.turn, nav)
+            return await self._consume(qevent, route, routed.turn, nav)
         finally:
             self._unregister_run(agent_id, thread)
 
@@ -916,6 +1414,8 @@ class Kernel:
         event: Event,
         boot_env: dict[str, str] | None,
         packs: BehaviorPacks | None = None,
+        *,
+        source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
@@ -948,10 +1448,63 @@ class Kernel:
         handle = await self._claim_or_resume(thread, boot_env)
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread, claim_ms)
-        if await self._runner.steer(handle.base_url, event, token=handle.token or None):
+        if source.is_job:
+            # ADR-0079: a job is an OUTPUT, not a steering input. A cron digest or
+            # a webhook must never fold itself into whatever a person is currently
+            # saying, so this path does not attempt a steer at all.
+            #
+            # It also must not simply open a turn and block. The runner serializes
+            # turns on a semaphore, so ``start_turn`` against a busy session waits
+            # for the live turn to end -- and this call runs while the kernel holds
+            # the per-thread lock, so that wait would freeze the very conversation
+            # the job is supposed to stay out of. Waiting there would invert the
+            # rule rather than implement it.
+            #
+            # So ask, and defer if the answer is busy. ``turn_active`` is a plain
+            # read that neither steers nor queues. There is no TOCTOU gap worth
+            # guarding: the per-thread lock held across this critical section is
+            # what stops another turn on this thread from opening between the read
+            # and the start.
+            if await self._turn_active(handle):
+                raise ThreadBusyError(
+                    f"thread {thread} has a live session; deferring the {source} turn"
+                )
+        elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
             return _RouteResult(steered=True)
         turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
         return _RouteResult(steered=False, handle=handle, turn=turn)
+
+    async def _turn_active(self, handle: SandboxHandle) -> bool:
+        """Is a turn live in this sandbox right now?
+
+        The read a job uses to decide whether to run or defer. It is a plain GET
+        that neither steers nor queues, which is the whole reason it exists: the
+        two calls that could otherwise answer the question both have side effects
+        (``steer`` folds the job into the live conversation, ``start_turn`` blocks
+        on the runner's turn semaphore while holding the kernel's thread lock).
+
+        Fails CLOSED. An unreachable runner or an answer without a usable
+        ``turn_active`` reports busy, so an unreadable session defers the job
+        rather than opening a turn beside one that may already be running. A
+        deferred job is redelivered; two live turns on one thread would break the
+        kernel's first invariant.
+
+        Args:
+            handle: The claimed sandbox for this thread.
+
+        Returns:
+            True when a turn is live, or when liveness could not be determined.
+        """
+        try:
+            status = await self._runner.status(handle.base_url)
+        except Exception as exc:  # noqa: BLE001 -- any unreadable answer means "assume busy"
+            logger.warning("could not read turn liveness at %s: %r", handle.base_url, exc)
+            return True
+        active = status.get("turn_active")
+        if not isinstance(active, bool):
+            logger.warning("runner status carried no usable turn_active: %r", status)
+            return True
+        return active
 
     async def _claim_or_resume(self, thread: str, boot_env: dict[str, str] | None) -> SandboxHandle:
         try:
@@ -971,7 +1524,7 @@ class Kernel:
         # matching it here does not couple to a mutable string.
         return event_id.startswith("approval-") and event_id.endswith("-resolved")
 
-    async def _finalize_settled_card(self, qevent: QueuedTurn) -> None:
+    async def _finalize_settled_card(self, qevent: QueuedTurn, route: TargetRoute) -> None:
         """Settle the approval card when its approval resumes (#419, #1084).
 
         Every terminal transition ends here, because the card outlives the
@@ -1050,7 +1603,7 @@ class Kernel:
             # inside the branch: the pop, the pairing check and its put-back
             # below are written once and apply to both, because a check present
             # on one path only is a wrong-card stamp on the other.
-            outcome: SettledCard | None = None
+            outcome: SettledOutcome | None = None
             if not is_expiry:
                 # Read first, pop second (#1199). The read is the step that can
                 # come back empty for a reason that later passes could recover
@@ -1095,11 +1648,11 @@ class Kernel:
             if is_expiry:
                 # The branch above left the outcome unread, on purpose: an expiry
                 # says only that nobody decided.
-                settled = SettledCard(requested_by=ref.requested_by)
+                settled = SettledOutcome(requested_by=ref.requested_by)
             else:
                 # The resolve branch returned above unless it read an outcome.
                 assert outcome is not None
-                settled = SettledCard(
+                settled = SettledOutcome(
                     requested_by=ref.requested_by,
                     decision=outcome.decision,
                     resolver=outcome.resolver,
@@ -1108,12 +1661,32 @@ class Kernel:
             # Emit the channel-neutral summary (ADR-0020) plus the semantic
             # outcome; the adapter renders the buttonless settled card below the
             # seam.
-            await self._sink.update_message(
-                channel=ref.channel,
-                ts=ref.ts,
-                message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
-                endpoint=ref.endpoint,
-                settled=settled,
+            # The card's own address and ref, over the transport it was posted
+            # through. ``settled`` carries the whole difference between an
+            # expired card and a resolved one; the adapter renders the form.
+            await self._sink.emit(
+                ReplyUpdate(
+                    version=REPLY_WIRE_VERSION,
+                    event="reply.update",
+                    target=ReplyTarget(
+                        # The card's OWN destination, remembered at post time. A
+                        # policy-routed card lives in a channel this resume turn
+                        # may not share a kind or a transport with, so rebuilding
+                        # either from the turn addresses the wrong place; ``kind``
+                        # empty is the pre-upgrade entry, which falls back to the
+                        # turn exactly as it did before.
+                        kind=ref.kind or qevent.reply_handle.kind,
+                        address=ref.channel,
+                        conversation_id=qevent.conversation_id,
+                        reply_ref=ref.ts,
+                    ),
+                    message=OutboundMessage(version=MESSAGE_VERSION, text=ref.summary),
+                    settled=settled,
+                ),
+                route=TargetRoute(
+                    endpoint=ref.endpoint,
+                    adapter=ref.adapter if ref.kind else route.adapter,
+                ),
             )
             logger.info("settled approval card for thread %s", qevent.conversation_id)
         except Exception as exc:  # noqa: BLE001 - card teardown is best-effort
@@ -1123,7 +1696,7 @@ class Kernel:
                 exc,
             )
 
-    async def _settled_from_record(self, qevent: QueuedTurn) -> SettledCard | None:
+    async def _settled_from_record(self, qevent: QueuedTurn) -> SettledOutcome | None:
         """The resolved outcome to stamp, read from the durable record.
 
         Read, not parsed. The resume turn does state the decision, the resolver
@@ -1147,7 +1720,7 @@ class Kernel:
         record = await self._approval_reader.get(approval_id)
         if record is None or record.status not in ("approved", "rejected"):
             return None
-        return SettledCard(
+        return SettledOutcome(
             requested_by="",
             decision=record.status,
             resolver=record.resolved_by,
@@ -1157,6 +1730,7 @@ class Kernel:
     async def _pause_for_approval(
         self,
         qevent: QueuedTurn,
+        route: TargetRoute,
         outcome: TurnOutcome,
         agent_id: uuid.UUID | None,
         approval_routes: dict[str, Any] | None = None,
@@ -1182,25 +1756,38 @@ class Kernel:
         thread = qevent.conversation_id
         summary = outcome.approval_summary or outcome.text or "Approval requested"
 
-        # Resolve the manifest route (#247) to its workspace channel. A named
+        # Resolve the manifest route NAME (#247) to its workspace channel. A named
         # route that resolves to no binding escalates instead of widening (#544).
-        route = outcome.approval_route
+        # Named ``route_name``, not ``route``: this is the approval manifest's
+        # route identifier, a different concept from the turn's ``TargetRoute``
+        # above, and one word for the two is what forced the old ``route_``.
+        route_name = outcome.approval_route
+        # The card's destination is a (kind, address) PAIR, never an address on
+        # its own: the schema permits the same address string under two kinds,
+        # so an address-only comparison misreads an email turn whose address
+        # happens to equal a Slack policy channel as "the requesting channel".
+        card_kind = qevent.reply_handle.kind
         card_channel = qevent.reply_handle.channel
-        if route:
-            binding = (approval_routes or {}).get(route)
+        if route_name:
+            binding = (approval_routes or {}).get(route_name)
             bound = binding.get("channel") if isinstance(binding, dict) else None
             if bound:
+                # A policy channel is a Slack channel id by construction
+                # (POLICY_CARD_KIND), so the routed card's pair is that kind
+                # with that address -- whatever kind the requesting turn had.
+                card_kind = POLICY_CARD_KIND
                 card_channel = str(bound)
             else:
                 logger.warning(
                     "approval route %r is not bound for agent %s; escalating "
                     "rather than routing the card to the requesting channel",
-                    route,
+                    route_name,
                     agent_id,
                 )
                 await self._escalate(
                     qevent,
-                    f"The run requested approval via route {route!r}, but that "
+                    route,
+                    f"The run requested approval via route {route_name!r}, but that "
                     "route is not bound to a channel for this agent; flagging for "
                     "a human instead of widening the request to this channel.",
                 )
@@ -1209,6 +1796,7 @@ class Kernel:
         if self._approvals is None:
             await self._escalate(
                 qevent,
+                route,
                 "The run requested an approval, but no approval backend is "
                 "configured on this worker; flagging for a human instead of pausing.",
             )
@@ -1221,11 +1809,24 @@ class Kernel:
                     conversation_id=thread,
                     author=qevent.author,
                     summary=summary,
+                    # The durable twin of this turn's routing pair and egress
+                    # selector (ADR-0096 phase 2). Copied off THIS turn at
+                    # creation time, never looked up at resume: an operator may
+                    # re-bind the address between suspension and resume, and the
+                    # persisted values are facts about the original turn.
+                    reply_kind=qevent.reply_handle.kind,
                     reply_channel=qevent.reply_handle.channel,
-                    reply_placeholder=qevent.reply_handle.placeholder,
+                    # The ref this turn actually DELIVERED on, not the one the wire
+                    # carried. On a placeholder-less turn (ADR-0079) the two differ:
+                    # the wire says null and the turn has since posted its own
+                    # message. Persisting the null would leave the resume with
+                    # nothing to edit, so the approval's outcome would land on a
+                    # second message beside the request it answers.
+                    reply_placeholder=self._target_for(qevent).reply_ref,
                     reply_endpoint=qevent.reply_handle.endpoint,
+                    reply_adapter=qevent.reply_handle.adapter,
                     dedupe_key=qevent.event_id,
-                    route=route,
+                    route=route_name,
                     card_channel=card_channel,
                     # The ACI ``final`` frame types this as a bare ``str``, so an
                     # unrecognized value only fails when the shared model
@@ -1246,6 +1847,7 @@ class Kernel:
             logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
             await self._escalate(
                 qevent,
+                route,
                 "The run requested an approval, but the approval record could "
                 "not be created; flagging for a human instead of pausing.",
             )
@@ -1273,19 +1875,35 @@ class Kernel:
             "The session is paused and will resume once an authorized member "
             "resolves this request."
         )
-        await self._sink.update(
-            channel=qevent.reply_handle.channel,
-            ts=qevent.reply_handle.placeholder,
-            text=f"{base}\n\n{notice}" if base else notice,
-            endpoint=qevent.reply_handle.endpoint,
+        await self._reply_for(
+            qevent, route, f"{base}\n\n{notice}" if base else notice
         )
 
-        # In the requesting channel the card joins the thread and rides the
-        # trigger's transport; a route-bound channel has no such thread and is
-        # policy, not a per-turn reply, so it posts top-level over the worker's
-        # default Slack transport.
-        in_requesting_channel = card_channel == qevent.reply_handle.channel
+        # The card's destination -- kind AND route -- is selected from the
+        # channel it POSTS TO, never from the turn that requested it. In the
+        # requesting channel the card joins the thread and rides the trigger's
+        # own transport. A route-bound channel has no such thread and is policy,
+        # not a per-turn reply: it posts top-level over the worker's default
+        # Slack transport, because an ``ApprovalRouteBinding`` is a Slack channel
+        # id by construction (``schemas.py`` validates it as one, and #247's
+        # binding shape is explicitly out of scope for ADR-0096 phase 2), and the
+        # authorizer proves membership of that channel through Slack.
+        #
+        # Keeping the requesting turn's kind and adapter here was a fail-closed
+        # bug: an email-originated approval routed to a Slack policy channel kept
+        # ``kind=email`` with an email adapter and NO endpoint, so the egress
+        # raised and the channel the policy exists to notify never saw the card.
+        #
+        # The comparison is the full PAIR, because an address is only unique
+        # within its kind: two bindings may carry the same address string under
+        # different kinds, and comparing addresses alone would hand a non-Slack
+        # turn's transport to a Slack policy card that merely shares its address.
+        in_requesting_channel = (card_kind, card_channel) == (
+            qevent.reply_handle.kind,
+            qevent.reply_handle.channel,
+        )
         card_endpoint = qevent.reply_handle.endpoint if in_requesting_channel else None
+        card_adapter = route.adapter if in_requesting_channel else None
         # The approval interaction (#246, ADR-0010/0020): a channel-neutral
         # Confirm intent (Approve/Reject) emitted WITHOUT any Block Kit -- the
         # Slack adapter renders it into the approval card's buttons below the
@@ -1340,13 +1958,25 @@ class Kernel:
                     allow_free_text=True,
                 ),
             )
-            card_ts = await self._sink.post(
-                channel=card_channel,
-                message=card_message,
-                requested_by=qevent.author,
-                thread_ts=thread if in_requesting_channel else None,
-                endpoint=card_endpoint,
+            # The card's own target: a policy-routed card belongs to no
+            # conversation (it posts top-level in a channel that never asked),
+            # and it mints its own ref, so it carries neither.
+            card_ack = await self._sink.emit(
+                ReplyPost(
+                    version=REPLY_WIRE_VERSION,
+                    event="reply.post",
+                    target=ReplyTarget(
+                        kind=card_kind,
+                        address=card_channel,
+                        conversation_id=thread if in_requesting_channel else None,
+                        reply_ref=None,
+                    ),
+                    message=card_message,
+                    requested_by=qevent.author,
+                ),
+                route=TargetRoute(endpoint=card_endpoint, adapter=card_adapter),
             )
+            card_ts = card_ack.ref
         except Exception as exc:  # noqa: BLE001 - the pause stands without the card
             logger.warning("approval card post failed for %s: %s", created.id, exc)
         else:
@@ -1362,6 +1992,13 @@ class Kernel:
                         ts=card_ts,
                         summary=summary,
                         endpoint=card_endpoint,
+                        # The whole destination, not just the endpoint: the
+                        # settle path posts to THIS card, so it must re-use the
+                        # kind and adapter the card was posted through rather
+                        # than rebuilding them from the resume turn (which, for
+                        # a policy-routed card, is a different channel entirely).
+                        kind=card_kind,
+                        adapter=card_adapter,
                         # Pair the ref to the approval it belongs to (#1199).
                         # The entry is keyed by thread, so this is the only
                         # thing that lets the resume turn tell "my card" from a
@@ -1381,17 +2018,20 @@ class Kernel:
         logger.info("thread %s suspended awaiting approval %s", thread, created.id)
 
     async def _consume(
-        self, qevent: QueuedTurn, turn: TurnStream, nav: NavPack | None = None
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        turn: TurnStream,
+        nav: NavAffordance | None = None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator()
         reply = _ThrottledReply(
             self._sink,
-            channel=qevent.reply_handle.channel,
-            ts=qevent.reply_handle.placeholder,
+            target=self._target_for(qevent),
+            route=route,
             min_interval_s=self._config.slack_edit_min_interval_s,
             nav=nav,
             no_edit=self._config.slack_no_edit_streaming,
-            endpoint=qevent.reply_handle.endpoint,
             # Reply delivery is best-effort ONLY on an approval-resume turn (the
             # granted tool has already executed in the runner): a dead reply
             # endpoint with no default transport completes the turn instead of
@@ -1404,6 +2044,7 @@ class Kernel:
             # _is_approval_resume. That shared coverage is deliberate and
             # plan-ratified, not an oversight.
             best_effort=self._is_approval_resume(qevent.event_id),
+            on_ref=lambda ref: self._adopt_ref(qevent, ReplyAck(ref=ref)),
         )
         try:
             # ``async with`` releases the aiohttp response on every exit path
@@ -1484,14 +2125,14 @@ class Kernel:
             status=acc.status,
         )
 
-    async def _escalate(self, qevent: QueuedTurn, message: str) -> None:
+    async def _escalate(
+        self,
+        qevent: QueuedTurn,
+        route: TargetRoute,
+        message: str,
+    ) -> None:
         logger.warning("escalating event %s: %s", qevent.event_id, message)
-        await self._sink.update(
-            channel=qevent.reply_handle.channel,
-            ts=qevent.reply_handle.placeholder,
-            text=message,
-            endpoint=qevent.reply_handle.endpoint,
-        )
+        await self._reply_for(qevent, route, message)
 
     def _backoff(self, attempt: int) -> float:
         raw: float = self._config.retry_backoff_base_s * (2 ** (attempt - 1))

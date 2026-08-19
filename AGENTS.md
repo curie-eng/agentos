@@ -131,6 +131,8 @@ services (Slack, Anthropic, GitHub); NEVER mock Postgres/Valkey/Langfuse -- run
 integration tests against the dev stack below. A change that only makes tests
 pass by weakening assertions is a regression. At parity seams, include at least
 one negative or secondary-path test per AC (see the parity-seam registry).
+A fix PR changing `apps/*/tests/`, `packages/*/tests/`, `cli/tests/`, or `charts/curie/ci/` is expected to be verifiable with the exact command
+`curie dev verify-fix-pin <CHANGE> <SELECTOR>`.
 Assertions about an external API or SDK's shape or auth must be grounded in
 provider docs or observed behavior, cited in a test comment, never in the
 implementation's own assumption. Any read-modify-write on a versioned row needs a

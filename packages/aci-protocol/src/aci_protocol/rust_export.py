@@ -36,7 +36,7 @@ from .service_config import (
     WORKER_GROUP_DEFAULT,
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
-from .turn import QueuedTurn, ReplyHandle
+from .turn import QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -162,12 +162,15 @@ def _struct_fields(model: type[BaseModel], skip: set[str], public: bool) -> list
         if field_name in skip:
             continue
         rust = _rust_type(field.annotation)
+        _, nullable = _split_optional(field.annotation)
         if field_name == WIRE_VERSION_FIELD:
             # The version field is mandatory and compatibility-checked on decode,
             # matching the NDJSON decoder. Detected by name (WIRE_VERSION_FIELD),
             # not by type, so dropping the old Literal does not silently remove
             # the guard and let #[serde(default)] make version optional.
             out.append('    #[serde(deserialize_with = "require_compatible_protocol_version")]')
+        elif field.is_required() and nullable:
+            out.append('    #[serde(deserialize_with = "deserialize_required_nullable")]')
         elif not field.is_required():
             # Any other field with a Pydantic default is omittable on the wire,
             # so Rust accepts it missing too.
@@ -271,6 +274,17 @@ where
 }"""
 
 
+_REQUIRED_NULLABLE_DESERIALIZER = """fn deserialize_required_nullable<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}"""
+
+
 _TESTS = """#[cfg(test)]
 mod tests {
     use super::*;
@@ -325,30 +339,78 @@ mod tests {
     }
 
     #[test]
+    fn reply_handle_accepts_explicit_null_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test","placeholder":null,"endpoint":"https://adapter.example/hook","adapter":"agentmail_sandbox"}"#;
+        let decoded: ReplyHandle = serde_json::from_str(raw).unwrap();
+        assert_eq!(decoded.kind, "email");
+        assert_eq!(decoded.channel, "agent@example.test");
+        assert_eq!(decoded.placeholder, None);
+        assert_eq!(decoded.endpoint.as_deref(), Some("https://adapter.example/hook"));
+        assert_eq!(decoded.adapter.as_deref(), Some("agentmail_sandbox"));
+    }
+
+    #[test]
+    fn reply_handle_rejects_omitted_placeholder() {
+        let raw = r#"{"kind":"email","channel":"agent@example.test"}"#;
+        let error = serde_json::from_str::<ReplyHandle>(raw).unwrap_err();
+        assert!(error.to_string().contains("missing field `placeholder`"));
+    }
+
+"""
+
+# The version-gate tests, kept as a template whose fixture versions are derived
+# from PROTOCOL_VERSION at render time. Hardcoded literals here silently invert
+# on every version bump -- a fixture written as "an incompatible minor" becomes
+# the current version, and the test then asserts the opposite of its own name.
+# The placeholders are substituted, not f-string interpolated, so the Rust stays
+# readable (it is dense with braces).
+_VERSION_TESTS = """    #[test]
     fn rejects_incompatible_version_event() {
-        let raw = r#"{"type":"final","version":"9.9.9","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"@INCOMPATIBLE@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
-    fn rejects_incompatible_minor() {
-        let raw = r#"{"type":"final","version":"0.3.0","text":"x","status":"done"}"#;
+    fn rejects_incompatible_near_version() {
+        let raw = r#"{"type":"final","version":"@INCOMPATIBLE_NEAR@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_err());
     }
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.2.7","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"@COMPATIBLE_PATCH@","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.2.0","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"@CURRENT@","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }
 """
+
+
+def _version_tests() -> str:
+    """Render the version-gate tests with fixtures derived from PROTOCOL_VERSION.
+
+    Compatibility is same ``major.minor`` under 0.x (same ``major`` from 1.0 on),
+    so the compatible fixture differs only in the patch component. The near-miss
+    incompatible fixture follows the same split: under 0.x a minor bump is the
+    breaking axis, so it is ``{major}.{minor + 1}.0``; from 1.0 on a minor bump
+    is compatible and only a major bump breaks, so it is ``{major + 1}.0.0``.
+    ``9.9.9`` stands in for a version from a wholly different line.
+    Deterministic: every fixture is a pure function of PROTOCOL_VERSION.
+    """
+
+    major, minor, patch = (int(part) for part in PROTOCOL_VERSION.split("."))
+    near_incompatible = f"{major}.{minor + 1}.0" if major == 0 else f"{major + 1}.0.0"
+    return (
+        _VERSION_TESTS.replace("@INCOMPATIBLE@", "9.9.9")
+        .replace("@INCOMPATIBLE_NEAR@", near_incompatible)
+        .replace("@COMPATIBLE_PATCH@", f"{major}.{minor}.{patch + 1}")
+        .replace("@CURRENT@", PROTOCOL_VERSION)
+    )
 
 
 def render_rust() -> str:
@@ -369,6 +431,7 @@ def render_rust() -> str:
         f'pub const EVAL_CONSUMER_GROUP_DEFAULT: &str = "{EVAL_CONSUMER_GROUP_DEFAULT}";',
         f'pub const STREAM_PAYLOAD_FIELD: &str = "{STREAM_PAYLOAD_FIELD}";',
         _VERSION_GUARD,
+        _REQUIRED_NULLABLE_DESERIALIZER,
         _string_enum(
             "SessionStatus",
             tuple(m.value for m in SessionStatus),
@@ -378,6 +441,15 @@ def render_rust() -> str:
         # No default variant: GateKind is only referenced as Option<GateKind>,
         # which is Default regardless of the enum's own derives.
         _string_enum("GateKind", tuple(m.value for m in GateKind)),
+        # QueuedTurn.source carries a serde(default), so this enum needs a Default
+        # variant for that attribute to compile. SLACK is the right one: it is the
+        # same non-job value the Python model defaults to, so a pre-upgrade payload
+        # decodes identically in both lanes.
+        _string_enum(
+            "TurnSource",
+            tuple(m.value for m in TurnSource),
+            default=TurnSource.SLACK.value,
+        ),
         _struct(Budget),
         _struct(OtelConfig),
         _struct(SessionConfig),
@@ -395,6 +467,7 @@ def render_rust() -> str:
             (TextDelta, ToolNote, Final, ErrorEvent, SideEffectFlag),
         ),
         _TESTS.rstrip("\n"),
+        _version_tests().rstrip("\n"),
     ]
     return "\n\n".join(blocks) + "\n"
 

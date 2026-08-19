@@ -850,17 +850,33 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed(make_eval_harness, bund
 RUNNER_TOKEN_ENV = "CURIE_RUNNER_TOKEN"
 
 
-def _suite_bundle(suite: EvalSuite) -> bytes:
+def _suite_bundle(
+    suite: EvalSuite,
+    *,
+    trajectory: dict[str, object] | str | None = None,
+    cases_payload: bytes | None = None,
+) -> bytes:
     """A minimal tar.gz carrying evals/cases.json, so the real
     load_suite_from_bundle returns a real suite (the RustFS fetch is the only
     faked boundary)."""
-    payload = suite.model_dump_json().encode("utf-8")
+    payload = cases_payload or suite.model_dump_json().encode("utf-8")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         info = tarfile.TarInfo("evals/cases.json")
         info.size = len(payload)
         tf.addfile(info, io.BytesIO(payload))
+        if trajectory is not None:
+            trajectory_payload = (
+                trajectory if isinstance(trajectory, str) else json.dumps(trajectory)
+            ).encode("utf-8")
+            trajectory_info = tarfile.TarInfo("evals/trajectory.json")
+            trajectory_info.size = len(trajectory_payload)
+            tf.addfile(trajectory_info, io.BytesIO(trajectory_payload))
     return buf.getvalue()
+
+
+def _trajectory_sidecar(specs: list[dict[str, object]]) -> dict[str, object]:
+    return {"specs": specs}
 
 
 class _FakeBundleStore:
@@ -1177,7 +1193,7 @@ def test_a_fake_run_carrying_a_failure_still_posts_its_report(monkeypatch) -> No
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item)
+        await consumer._run_and_report(item, "test-stream-id")
 
     asyncio.run(go())
 
@@ -1209,7 +1225,7 @@ def test_a_real_run_still_posts_its_report(monkeypatch) -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item)
+        await consumer._run_and_report(item, "test-stream-id")
 
     asyncio.run(go())
 
@@ -1271,11 +1287,15 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
         token: Any = None,
         model: Any = None,
         fake: Any = None,
+        stream_id: str | None,
+        scorer: Any = None,
     ) -> EvalRunResult:
         captured["base_url"] = base_url
         captured["token"] = token
         captured["model"] = model
         captured["fake"] = fake
+        captured["stream_id"] = stream_id
+        captured["scorer"] = scorer
         return EvalRunResult(version=version, suite=suite.name, results=[])
 
     monkeypatch.setattr(stream_module, "run_eval_suite", _capture_run)
@@ -1296,12 +1316,14 @@ def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item)
+        await consumer._run_and_report(item, "test-stream-id")
 
     asyncio.run(go())
 
     assert captured["base_url"] == "http://sandbox.local:8080"
     assert captured["token"] == "tok-eval-xyz"
+    assert captured["stream_id"] == "test-stream-id"
+    assert captured["scorer"] is None
 
 
 @pytest.mark.parametrize("fake_model", [True, False])
@@ -1339,7 +1361,7 @@ def test_eval_threads_the_workers_fake_state_into_run_eval_suite(
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
 
     async def go() -> None:
-        await consumer._run_and_report(item)
+        await consumer._run_and_report(item, "test-stream-id")
 
     asyncio.run(go())
 
@@ -1432,3 +1454,535 @@ def test_committed_fixture_loads_from_bundle_with_name_override(
     assert len(suite.cases) == 1
     assert suite.cases[0].grader.grade("I am the example agent.") is True
     assert suite.cases[0].grader.grade("literally anything") is False
+
+
+def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="right_order",
+                        input="right",
+                        grader=Grader(kind=CONTAINS, expected="text grader pass"),
+                    ),
+                    EvalCase(
+                        id="wrong_order",
+                        input="wrong",
+                        grader=Grader(kind=CONTAINS, expected="text grader pass"),
+                    ),
+                ],
+            )
+            fake.responses = {
+                "right": "text grader miss",
+                "wrong": "text grader pass",
+            }
+            fake.tool_calls = {
+                "right": ["search", "fetch"],
+                "wrong": ["fetch", "search"],
+            }
+            cases_payload = (
+                json.dumps(suite.model_dump(mode="json"), indent=2, sort_keys=True)
+                + "\n"
+            ).encode("utf-8")
+            sidecar = _trajectory_sidecar(
+                [
+                    {
+                        "case_id": case_id,
+                        "expected": ["search", "fetch"],
+                        "mode": "exact",
+                        "threshold": 1.0,
+                    }
+                    for case_id in ("right_order", "wrong_order")
+                ],
+            )
+            reporter = _FakeReporter()
+            bundle_ref = upload(
+                _suite_bundle(
+                    suite,
+                    trajectory=sidecar,
+                    cases_payload=cases_payload,
+                )
+            )
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=reporter,
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="trajectory",
+                sha="trajectory_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            by_id = {row.case_id: row for row in result.results}
+            assert by_id["right_order"].outcome is EvalOutcome.PASS
+            assert by_id["right_order"].detail is None
+            assert by_id["wrong_order"].outcome is EvalOutcome.FAIL
+            assert by_id["wrong_order"].detail == (
+                "mode=exact expected=['search', 'fetch'] "
+                "observed=['fetch', 'search']"
+            )
+            assert by_id["wrong_order"].error is None
+            assert reporter.reports[0].passed_count == 1
+            assert reporter.reports[0].total == 2
+
+    asyncio.run(go())
+
+
+def test_bundle_trajectory_sidecar_fails_closed_for_a_missing_spec(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="missing",
+                        input="run",
+                        grader=Grader(kind=CONTAINS, expected="text grader pass"),
+                    )
+                ],
+            )
+            fake.responses = {"run": "text grader pass"}
+            fake.tool_calls = {"run": ["search", "fetch"]}
+            cases_payload = suite.model_dump_json().encode("utf-8")
+            sidecar = _trajectory_sidecar([])
+            bundle_ref = upload(
+                _suite_bundle(
+                    suite,
+                    trajectory=sidecar,
+                    cases_payload=cases_payload,
+                )
+            )
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="trajectory",
+                sha="missing_spec_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            case = result.results[0]
+            assert case.outcome is EvalOutcome.FAIL
+            assert case.detail == "no trajectory spec for case 'missing'"
+            assert case.error is None
+            assert len(fake.seen) == 1
+
+    asyncio.run(go())
+
+
+def test_bundle_without_trajectory_sidecar_keeps_ordinary_grading(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="ordinary",
+                cases=[
+                    EvalCase(
+                        id="ordinary",
+                        input="run",
+                        grader=Grader(kind=CONTAINS, expected="text grader pass"),
+                    )
+                ],
+            )
+            fake.responses = {"run": "text grader pass"}
+            fake.tool_calls = {"run": ["fetch", "search"]}
+            bundle_ref = upload(_suite_bundle(suite))
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="ordinary",
+                sha="ordinary_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            case = result.results[0]
+            assert case.outcome is EvalOutcome.PASS
+            assert case.detail is None
+            assert len(fake.seen) == 1
+
+    asyncio.run(go())
+
+
+def test_invalid_bundle_trajectory_sidecar_fails_before_running_cases(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="known",
+                        input="run",
+                        grader=Grader(kind=CONTAINS, expected="text grader pass"),
+                    )
+                ],
+            )
+            fake.responses = {"run": "text grader pass"}
+            cases_payload = suite.model_dump_json().encode("utf-8")
+            bundle_ref = upload(
+                _suite_bundle(
+                    suite,
+                    trajectory="{",
+                    cases_payload=cases_payload,
+                )
+            )
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="trajectory",
+                sha="invalid_sidecar_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            assert len(result.results) == 1
+            case = result.results[0]
+            assert case.outcome is EvalOutcome.FAIL
+            assert case.detail is not None
+            detail = case.detail.lower()
+            assert "trajectory" in detail
+            assert "invalid" in detail
+            assert case.error is None
+            assert fake.seen == []
+
+    asyncio.run(go())
+
+
+def test_trajectory_sidecar_ignores_specs_for_unknown_suite_cases(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="known",
+                        input="run",
+                        grader=Grader(kind=CONTAINS, expected="text must miss"),
+                    )
+                ],
+            )
+            fake.responses = {"run": "unrelated"}
+            fake.tool_calls = {"run": ["search"]}
+            sidecar = _trajectory_sidecar(
+                [
+                    {
+                        "case_id": "known",
+                        "expected": ["search"],
+                        "mode": "exact",
+                        "threshold": 1.0,
+                    },
+                    {
+                        "case_id": "not_in_suite",
+                        "expected": ["unused"],
+                        "mode": "exact",
+                        "threshold": 1.0,
+                    },
+                ]
+            )
+            bundle_ref = upload(_suite_bundle(suite, trajectory=sidecar))
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="trajectory",
+                sha="unknown_spec_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            assert len(result.results) == 1
+            assert result.results[0].outcome is EvalOutcome.PASS
+            assert result.results[0].detail is None
+            assert len(fake.seen) == 1
+
+    asyncio.run(go())
+
+
+def test_trajectory_sidecar_rejects_duplicate_suite_case_ids(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="duplicate",
+                        input="first",
+                        grader=Grader(kind=CONTAINS, expected="text pass"),
+                    ),
+                    EvalCase(
+                        id="duplicate",
+                        input="second",
+                        grader=Grader(kind=CONTAINS, expected="text pass"),
+                    ),
+                ],
+            )
+            fake.responses = {"first": "text pass", "second": "text pass"}
+            fake.tool_calls = {"first": ["Read"], "second": ["Read"]}
+            cases_payload = suite.model_dump_json().encode("utf-8")
+            sidecar = _trajectory_sidecar(
+                [
+                    {
+                        "case_id": "duplicate",
+                        "expected": ["Read"],
+                        "mode": "exact",
+                        "threshold": 1.0,
+                    }
+                ],
+            )
+            bundle_ref = upload(
+                _suite_bundle(
+                    suite,
+                    trajectory=sidecar,
+                    cases_payload=cases_payload,
+                )
+            )
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="trajectory",
+                sha="duplicate_case_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            assert len(result.results) == 2
+            assert all(row.outcome is EvalOutcome.FAIL for row in result.results)
+            assert all(
+                row.detail is not None
+                and "duplicate" in row.detail.lower()
+                and "case" in row.detail.lower()
+                for row in result.results
+            )
+            assert fake.seen == []
+
+    asyncio.run(go())
+
+
+def test_ordinary_suite_keeps_duplicate_case_ids_when_no_sidecar_selects_trajectory(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="ordinary",
+                cases=[
+                    EvalCase(
+                        id="duplicate",
+                        input="first",
+                        grader=Grader(kind=CONTAINS, expected="text pass"),
+                    ),
+                    EvalCase(
+                        id="duplicate",
+                        input="second",
+                        grader=Grader(kind=CONTAINS, expected="text pass"),
+                    ),
+                ],
+            )
+            fake.responses = {"first": "text pass", "second": "text pass"}
+            bundle_ref = upload(_suite_bundle(suite))
+            consumer = _consumer(
+                WorkerConfig(fake_model=False),
+                bundle_store=store,
+                substrate=_UnusedSubstrate(),
+                reporter=_FakeReporter(),
+                recorder=None,
+                repo_lookup=_StubRepo(),
+            )
+            item = _item(
+                suite="ordinary",
+                sha="ordinary_duplicate_sha",
+                bundle_ref=bundle_ref,
+                target_url=base_url,
+            )
+
+            result = await consumer._run_and_report(item, "test-stream-id")
+
+            assert [row.outcome for row in result.results] == [
+                EvalOutcome.PASS,
+                EvalOutcome.PASS,
+            ]
+            assert len(fake.seen) == 2
+
+    asyncio.run(go())
+
+
+def test_stream_records_the_trigger_identity_and_selected_trajectory_scorer(
+    make_eval_harness,
+    bundles,
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            suite = EvalSuite(
+                name="trajectory",
+                cases=[
+                    EvalCase(
+                        id="ordered",
+                        input="run",
+                        grader=Grader(kind=CONTAINS, expected="text must miss"),
+                    )
+                ],
+            )
+            fake.responses = {"run": "unrelated"}
+            fake.tool_calls = {"run": ["Read", "Bash"]}
+            cases_payload = suite.model_dump_json().encode("utf-8")
+            bundle_ref = upload(
+                _suite_bundle(
+                    suite,
+                    trajectory=_trajectory_sidecar(
+                        [
+                            {
+                                "case_id": "ordered",
+                                "expected": ["Read", "Bash"],
+                                "mode": "exact",
+                                "threshold": 1.0,
+                            }
+                        ],
+                    ),
+                    cases_payload=cases_payload,
+                )
+            )
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(f"test:evals:{token}", f"g:{token}")
+            client = AsyncRedis(
+                host=_VH,
+                port=_VP,
+                password=_VPW,
+                decode_responses=True,
+            )
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                await consumer.ensure_group()
+                sha = f"trajectory_identity_{token}"
+                item = _item(
+                    suite="trajectory",
+                    sha=sha,
+                    bundle_ref=bundle_ref,
+                    target_url=base_url,
+                    model="resolved_model",
+                )
+                stream_id = await client.xadd(
+                    cfg.eval_stream,
+                    {STREAM_PAYLOAD_FIELD: item.model_dump_json()},
+                )
+
+                await _drain_one(consumer, reports)
+
+                trace: dict[str, Any] | None = None
+                for _ in range(40):
+                    response = await lf_client.get(
+                        f"{cfg.langfuse_host}/api/public/traces",
+                        params={"tags": f"version:{sha}"},
+                        auth=(cfg.langfuse_public_key, cfg.langfuse_secret_key),
+                    )
+                    traces = (
+                        response.json().get("data", [])
+                        if response.status_code == 200
+                        else []
+                    )
+                    if traces:
+                        trace = traces[0]
+                        break
+                    await asyncio.sleep(1)
+
+                assert trace is not None
+                metadata = trace["metadata"]
+                assert metadata["stream_id"] == stream_id
+                assert metadata["scorer"] == "trajectory"
+                assert metadata["model"] == "resolved_model"
+                assert metadata["outcome"] == "pass"
+                assert metadata["case_count"] == 1
+
+            await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())

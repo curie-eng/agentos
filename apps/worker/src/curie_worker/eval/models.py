@@ -193,6 +193,13 @@ class EvalOutcome(StrEnum):
     PLUMBING_OK = "plumbing_ok"
 
 
+class EvalScorer(StrEnum):
+    """The scorer selected by the run layer for an eval run."""
+
+    GRADER = "grader"
+    TRAJECTORY = "trajectory"
+
+
 class EvalCaseResult(BaseModel):
     """The outcome of running one case: its verdict, the output, and any error.
 
@@ -202,6 +209,10 @@ class EvalCaseResult(BaseModel):
     inconsistently, and ``None`` keeps an unmigrated reader fail-safe: it is falsy,
     so a truthiness check under-reports rather than ever going false-green, and
     nothing ever claims a row failed that no grader judged.
+
+    ``detail`` explains a scorer verdict without claiming that the runner or
+    turn failed. Runtime and transport failures remain in ``error``. This keeps
+    a deterministic trajectory mismatch distinct from a broken execution.
 
     ``cost_usd`` is the dollar cost the runner attributed to this case's turn
     when the harness reported usage/pricing; it is ``None`` when cost is not
@@ -216,6 +227,7 @@ class EvalCaseResult(BaseModel):
     output: str
     latency_ms: float
     error: str | None = None
+    detail: str | None = None
     cost_usd: float | None = None
 
     @computed_field  # type: ignore[prop-decorator]
@@ -241,6 +253,8 @@ class EvalRunResult(BaseModel):
     suite: str
     results: list[EvalCaseResult]
     model: str | None = None
+    stream_id: str | None = None
+    scorer: EvalScorer = EvalScorer.GRADER
 
     @property
     def total(self) -> int:

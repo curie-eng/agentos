@@ -122,6 +122,19 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/clickhouse-logging-assertions.sh
 
+      # Prove the tenant capacity ceiling actually binds the pods it is meant to.
+      # The quota is PriorityClass-scoped, so if its scope is not the name the
+      # sandbox pods carry it matches nothing and enforces nothing -- silently,
+      # because the object exists and `used: 0` reads as "nothing consumed"
+      # rather than "matching nothing". Observed live: a sandbox holding
+      # `limits.cpu: 1` running while the quota reported used 0, with the scoped
+      # class absent from the cluster entirely (#1534). Compares the two rendered
+      # objects against each other, not a value against itself.
+      - name: helm render assertions (sandbox quota scope)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/sandbox-quota-scope-assertions.sh
+
       - name: helm render assertions (otel collector checksum)
         run: |
           set -euo pipefail
@@ -281,6 +294,13 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/worker-object-store-assertions.sh
+
+      # A default worker missing these values runs eval suites that cannot
+      # record or report results.
+      - name: helm render assertions (worker eval wiring)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/worker-eval-wiring-assertions.sh
 
       # This otherwise Python-free chart job needs the workspace because the
       # web-identity gate below does not stop at the rendered YAML: it builds

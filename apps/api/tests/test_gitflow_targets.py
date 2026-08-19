@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 from curie_api.gitflow import TargetUnresolved, _target_agent_name, resolve_target_agent
-from curie_api.models import Agent, Environment
+from curie_api.models import Agent, AgentChannel, Environment
 from curie_test_support.scaffold import scaffolded_deploy_yaml
 from plugin_format.deploy_targets import DeployTarget, DeployTargetsFile, validate_deploy_targets
 
@@ -24,7 +24,12 @@ REPO = "acme-corp/acme-bot"
 
 
 def agent(name: str, repo: str | None = REPO) -> Agent:
-    return Agent(id=uuid.uuid4(), name=name, slack_channel=f"C-{name}", repo_full_name=repo)
+    return Agent(
+        id=uuid.uuid4(),
+        name=name,
+        channel=AgentChannel(kind="slack", address=f"C-{name}"),
+        repo_full_name=repo,
+    )
 
 
 def targets(text: str):

@@ -113,6 +113,7 @@ def aggregate(
             outcome=EvalOutcome.PLUMBING_OK,
             output=rep.output,
             latency_ms=total_latency,
+            detail=rep.detail,
             cost_usd=cost,
         )
 
@@ -129,14 +130,16 @@ def aggregate(
 
     outcome = EvalOutcome.PASS if green else EvalOutcome.FAIL
     variance = f"{passes}/{graded_count} samples passed ({bar})"
+    representative = _representative(samples, outcome)
     # Variance rides `error` only on a RED aggregate, matching the runner's
     # convention that `error` explains why a case is not green; a flaky-but-green
     # case (e.g. 2/3 under majority) reports GREEN and leaves `error` clear.
     return EvalCaseResult(
         case_id=case_id,
         outcome=outcome,
-        output=_representative(samples, outcome).output,
+        output=representative.output,
         latency_ms=total_latency,
         error=None if green else f"variance-aware grading failed: {variance}",
+        detail=representative.detail,
         cost_usd=cost,
     )

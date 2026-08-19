@@ -24,7 +24,11 @@ REPO = "octo/trigger-10"
 def _create_agent(client: Any, auth_headers: dict[str, str], name: str) -> dict[str, Any]:
     resp = client.post(
         "/agents",
-        json={"name": name, "slack_channel": "C000000K01", "repo_full_name": REPO},
+        json={
+            "name": name,
+            "channel": {"kind": "slack", "address": "C000000K01"},
+            "repo_full_name": REPO,
+        },
         headers=auth_headers,
     )
     assert resp.status_code == 201, resp.text
@@ -37,6 +41,7 @@ async def _seed_version_and_dev_deployment(
     version_label: str,
     commit_sha: str | None,
     bundle_ref: str | None,
+    bundle_sha256: str | None,
     deploy: bool = True,
 ) -> dict[str, str | None]:
     """Insert a version (with commit_sha/bundle_ref) and, optionally, an active
@@ -55,6 +60,14 @@ async def _seed_version_and_dev_deployment(
                 commit_sha=commit_sha,
                 bundle_ref=bundle_ref,
             )
+            if bundle_sha256 is not None:
+                assert bundle_ref is not None
+                version = await crud.attach_bundle(
+                    session,
+                    version,
+                    bundle_ref,
+                    bundle_sha256,
+                )
             version_id = str(version.id)
             if deploy:
                 await crud.create_deployment_row(
@@ -66,7 +79,12 @@ async def _seed_version_and_dev_deployment(
                 )
     finally:
         await engine.dispose()
-    return {"version_id": version_id, "sha": commit_sha, "bundle_ref": bundle_ref}
+    return {
+        "version_id": version_id,
+        "sha": commit_sha,
+        "bundle_ref": bundle_ref,
+        "bundle_sha256": bundle_sha256,
+    }
 
 
 def _seed(
@@ -75,6 +93,7 @@ def _seed(
     version_label: str = "v1",
     commit_sha: str | None = "cafef00d",
     bundle_ref: str | None = "bundles/x/y.tar.gz",
+    bundle_sha256: str | None = None,
     deploy: bool = True,
 ) -> dict[str, str | None]:
     return asyncio.run(
@@ -83,6 +102,7 @@ def _seed(
             version_label=version_label,
             commit_sha=commit_sha,
             bundle_ref=bundle_ref,
+            bundle_sha256=bundle_sha256,
             deploy=deploy,
         )
     )
@@ -142,6 +162,52 @@ def test_trigger_enqueues_for_active_dev_deployment(
     assert req.bundle_ref == seeded["bundle_ref"]
     assert req.target_url is None
     assert req.model is None  # no model requested -> worker default
+
+
+def test_trigger_uses_bundle_sha_for_a_local_version_without_a_commit(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _create_agent(client, auth_headers, "trigger-local-bundle-sha")
+    bundle_sha = "b" * 64
+    seeded = _seed(
+        agent["id"],
+        commit_sha=None,
+        bundle_ref="bundles/local/version.tar.gz",
+        bundle_sha256=bundle_sha,
+    )
+
+    resp = client.post(
+        "/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["version_id"] == seeded["version_id"]
+    assert body["sha"] == bundle_sha
+    payload = _payload_for_stream_id(body["stream_id"])
+    assert payload is not None
+    job = EvalJob.model_validate(payload)
+    assert job.sha == bundle_sha
+    assert job.bundle_ref == seeded["bundle_ref"]
+
+
+def test_trigger_rejects_a_version_with_no_commit_or_bundle_sha(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _create_agent(client, auth_headers, "trigger-no-version-identity")
+    _seed(
+        agent["id"],
+        commit_sha=None,
+        bundle_ref="bundles/local/version.tar.gz",
+        bundle_sha256=None,
+    )
+
+    resp = client.post(
+        "/evals/trigger", json={"agent_id": agent["id"]}, headers=auth_headers
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert _count_eval_entries_for_agent(agent["id"]) == 0
 
 
 def test_trigger_threads_requested_model_onto_the_job(

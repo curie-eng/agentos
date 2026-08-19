@@ -887,6 +887,31 @@ worker:
   # --reuse-values` that sets the dispatcher tokens) clears it back to empty in
   # the same command, so that upgrade un-wires any stub routing.
   slackApiBaseUrl: ""
+  # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+  # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
+  # production posture: the configured Slack origin (slackApiBaseUrl, or real
+  # Slack) is the only endpoint the worker will send the bot token to, and every
+  # cross-origin endpoint a turn names is refused before any request.
+  #
+  # DEV ONLY. It exists for `curie cluster message`, whose throwaway stub binds a
+  # host and port the single slackApiBaseUrl cannot also name -- and, with
+  # `--listen-port 0`, an EPHEMERAL port. An entry that omits the port
+  # (http://host.docker.internal) therefore trusts ANY port on that host, so
+  # setting one on a real deployment widens where the platform bot token can go.
+  # A LAN-host dev setup (`--listen-host <ip>`) must name that host here itself.
+  # Rendered only when non-empty.
+  slackTrustedOrigins: ""
+  # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
+  # shared secret. The slug is the operator-chosen `adapter` on the agent's
+  # channel binding row; the worker presents the matching secret as the
+  # X-Curie-Adapter-Secret header on every reply event it delivers to that
+  # adapter, and the adapter verifies it BEFORE any side effect. Per-adapter
+  # rather than per-kind so compromising one adapter yields one secret, for one
+  # binding. An adapter with no entry here makes its egress RAISE rather than
+  # send anonymously: an unauthenticated platform request lets any reachable pod
+  # be impersonated. Stored in the chart Secret (key adapterCredentials), never
+  # inlined into a manifest.
+  adapterCredentials: {}
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
   # worker override the fixed env block does not cover.
@@ -1440,15 +1465,24 @@ resourceQuota:
   # The PriorityClass name this quota's scopeSelector keys on, so the quota
   # binds only sandbox pods -- NOT the platform pods (api/worker/dispatcher)
   # or the data tier, which in the N=1 self-host topology share this same
-  # release namespace. This is the sandbox PriorityClass ADR-0059 decision 5 /
-  # issue #759 defines; #759 is being implemented in parallel and this is an
-  # assumed name pending that PR landing. If #759 ships a different name,
-  # override this value (or reconcile the two constant strings) so the
-  # scopeSelector actually matches. A name that matches no pod yet (#759 not
-  # merged) makes this quota inertly present rather than an error -- Kubernetes
+  # release namespace.
+  #
+  # EMPTY MEANS DERIVE, and empty is what you want. The quota's scope then takes
+  # `priorityClasses.sandbox.name` -- the same value agent-sandbox.yaml stamps on
+  # the sandbox pod template -- so the two sides cannot desynchronize and a
+  # rename propagates to both at once.
+  #
+  # This used to be an independent constant defaulting to "curie-sandbox", which
+  # made renaming the sandbox PriorityClass silently disable the entire tenant
+  # ceiling: the scope kept matching the old name, nothing carried it, and the
+  # quota reported `used: 0` while sandboxes ran unbounded (#1534). Kubernetes
   # does not validate a scopeSelector's PriorityClass name against an existing
-  # object.
-  sandboxPriorityClassName: curie-sandbox
+  # object, so nothing anywhere reported it.
+  #
+  # Set this ONLY for a PriorityClass managed outside this chart
+  # (`priorityClasses.sandbox.create: false`) whose name differs from
+  # `priorityClasses.sandbox.name`. Setting it overrides the derivation.
+  sandboxPriorityClassName: ""
   hard:
     requestsCpu: "4"
     requestsMemory: 8Gi

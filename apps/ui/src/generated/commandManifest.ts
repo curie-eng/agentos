@@ -932,7 +932,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -1050,7 +1050,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2443,7 +2443,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel (errors if zero or multiple agents are deployed)",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -2612,7 +2612,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Slack channel id to send as; must match the target agent's slack_channel. Omit to use the sole deployed agent's channel",
+              "help": "Slack channel id to send as; must match the target agent's channel. Omit to use the sole deployed agent's channel",
               "id": "channel",
               "long": "channel",
               "positional": false,
@@ -3920,9 +3920,30 @@ export const commandManifest = {
           "name": "contracts"
         },
         {
-          "about": "Render-assert the Helm chart: run every assertion script in `charts/curie/ci/`, the same set helm-ci runs on a `charts/curie/**` change (#1481). Reports per-script pass or fail and exits non-zero if any failed, so one run surfaces every problem",
+          "about": "Render-assert the Helm chart: discover and run every executable assertion script in `charts/curie/ci/`, the same set helm-ci runs on a `charts/curie/**` change (#1481). Reports per-script pass or fail and exits non-zero if any failed, so one run surfaces every problem",
           "hidden": false,
           "name": "chart-check"
+        },
+        {
+          "about": "Prove a changed test fails when only the change's product hunks are reversed",
+          "args": [
+            {
+              "global": false,
+              "help": "Commit or pull request to verify",
+              "id": "change",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Changed test selector to run before and after reversal",
+              "id": "selector",
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "verify-fix-pin"
         },
         {
           "about": "Run the scripted CLI end-to-end test (`bash cli/scripts/e2e.sh`)",

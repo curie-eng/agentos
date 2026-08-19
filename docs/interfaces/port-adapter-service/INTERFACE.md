@@ -130,21 +130,27 @@ A NONE seam has no implementation to leak, so what belongs here is the distance
 between the recorded intent and the tree, and the things a first implementer
 would trip over:
 
-- **The credential rule the decision states is violated by today's egress.**
-  `AsyncSlackSink` (`apps/worker/src/curie_worker/slack_sink.py::AsyncSlackSink`)
-  delivers every per-turn reply through one client holding a single Slack bot
-  token, presented to whatever endpoint the turn names, and the
-  unreachable-endpoint fallback re-sends that reply's content to the default
-  transport. Both are correct for a one-workspace install and wrong the moment a
-  vendor endpoint coexists with real Slack: the vendor would be handed the
-  platform's token, and an outage would leak a vendor turn's reply into Slack.
-  ADR-0096 writes this down precisely because it is a prerequisite, not a
-  follow-up.
-- **The binding surface is still a literal Slack column.** `Agent`
-  (`apps/api/src/curie_api/models.py::Agent`) binds an agent by `slack_channel`,
-  and the API's validators reject ids that are not Slack-shaped, so a vendor
-  would today have to mint Slack-shaped channel ids exactly as the CLI stub does.
-  The rename is a migration plus a contract change, not a refactor.
+- **Fixed — the credential rule the decision states.** Egress used to deliver
+  every per-turn reply through one client holding a single Slack bot token,
+  presented to whatever endpoint the turn named, with an unreachable-endpoint
+  fallback that re-sent the reply's content to the default transport. Both were
+  correct for a one-workspace install and wrong the moment a vendor endpoint
+  coexists with real Slack. ADR-0096 D4.2 closed it: a non-Slack binding is
+  delivered by `HttpReplyAdapter`
+  (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) under a
+  per-adapter secret selected by the route's `adapter` slug, with no transport
+  fallback of any kind, and `SlackReplyAdapter`
+  (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) refuses an
+  endpoint that is not the worker's configured, trusted Slack origin rather than
+  handing it the platform bot token.
+- **Fixed (#1459, ADR-0096) — the binding surface.** The agents table used to
+  carry a literal `slack_channel` column and the API's validators rejected ids
+  that were not Slack-shaped, so a vendor would have had to mint Slack-shaped
+  channel ids exactly as the CLI stub does. The binding is now a neutral
+  `{kind, address}` pair (`apps/api/src/curie_api/schemas.py::ChannelBinding`) on
+  its own table (`apps/api/src/curie_api/models.py::AgentChannel`), validated by
+  a kind-dispatched write gate
+  (`apps/api/src/curie_api/schemas.py::_validate_channel_binding`).
 - **The interactivity return path has no scoped credential.** Approval resolution
   sits behind the single platform-wide key, and the scoped token minted for the
   sandbox is deliberately rejected everywhere but the state router. A scoped

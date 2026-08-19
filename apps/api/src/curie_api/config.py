@@ -290,6 +290,50 @@ class Settings(BaseSettings):
     runner_namespace: str = "curie"
     runner_pod_label_selector: str = "app.kubernetes.io/component=runner-sandbox"
 
+    # Channel ingress (ADR-0096 phase 2, #1459). The turn body bound is enforced
+    # BEFORE authentication and before JSON parsing (`routers/channels.py`), so an
+    # oversized body is refused without the server ever HMAC-verifying or
+    # deserializing it -- the same posture `github_webhook_max_body_bytes` takes
+    # above, two orders of magnitude tighter because a turn is a message, not a
+    # git payload, and 256 KiB is far above any real email body an adapter
+    # extracts. The route is reachable from outside the first-party network, so
+    # the bound is what keeps it from being an unauthenticated memory-pressure
+    # surface.
+    channel_turn_max_body_bytes: int = 256 * 1024  # 256 KiB
+    # The delivery claim's lease: how long ONE in-flight ingress request owns a
+    # `delivery_id` before a retry may take it. Deliberately short -- it bounds
+    # how long a delivery whose winner died stays un-enqueued (nothing else
+    # recovers that case), while being far longer than the enqueue it covers.
+    channel_delivery_lease_s: int = 300
+    # There is deliberately NO receipt TTL beside the lease above. Once the turn
+    # is enqueued the claim key becomes a PERMANENT receipt: an expiry on it lets
+    # the same `delivery_id` win a fresh `SET NX` after the window and enqueue a
+    # second time, so the correspondent is answered twice, silently, days later
+    # (the divergence from the dispatcher's `dedupe_ttl_seconds`, which guards a
+    # queue rather than an outward-facing reply).
+    #
+    # How many NEW deliveries one binding may enqueue per window. A `chn` token
+    # is scoped to a binding but not metered by one, so a compromised adapter can
+    # otherwise submit unlimited unique `delivery_id`s and fill the shared stream
+    # (and, since receipts are permanent, the shared Valkey) until every tenant is
+    # affected. Counted per binding and per fixed window, on the claim -- so an
+    # adapter's retries of a delivery it already got through are free -- and
+    # exceeded requests are refused 429 rather than queued. It bounds the rate of
+    # NEW work, not the depth of unconsumed work: the API cannot observe what the
+    # worker has consumed without infrastructure phase 2 does not build.
+    # Inbound hook ingress (ADR-0079, #269). Body bound sized like the GitHub
+    # webhook's rather than the channel turn's: a hook payload is a machine
+    # document, not a person's message, and the whole document becomes the turn
+    # text today.
+    hook_max_body_bytes: int = 1024 * 1024
+    # Metered per AGENT: the thing worth bounding is how much work one agent's
+    # upstreams can create, and a per-hook counter would let a source multiply
+    # its own allowance by inventing hook names.
+    hook_backlog_limit: int = 64
+    hook_backlog_window_s: int = 60
+    channel_binding_backlog_limit: int = 64
+    channel_binding_backlog_window_s: int = 60
+
     def valkey_dsn(self) -> str:
         if self.valkey_url:
             return self.valkey_url

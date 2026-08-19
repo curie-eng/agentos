@@ -14,7 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use curie_aci_protocol::{
-    QueuedTurn, ReplyHandle, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD, WORKER_GROUP_DEFAULT,
+    QueuedTurn, ReplyHandle, TurnSource, RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD,
+    WORKER_GROUP_DEFAULT,
 };
 use redis::aio::MultiplexedConnection;
 use redis::streams::{StreamInfoGroupsReply, StreamPendingCountReply, StreamPendingReply};
@@ -39,7 +40,12 @@ const EVENT_ID_PREFIX: &str = "EvSIM-";
 /// `reply_handle`). ``endpoint`` is this turn's reply target (issue #19): the base
 /// URL the worker delivers the reply through, so the CLI stub receives it without
 /// re-pointing the worker's global setting. ``None`` uses the worker default.
+///
+/// ``kind`` is the routing half of the pair the worker resolves on (ADR-0096
+/// phase 2). It is a required parameter with no defaulted overload: a caller that
+/// could omit it would put the address-only fallback back on the wire.
 pub fn synthetic_turn(
+    kind: impl Into<String>,
     channel: impl Into<String>,
     author: impl Into<String>,
     text: impl Into<String>,
@@ -53,11 +59,20 @@ pub fn synthetic_turn(
         author: author.into(),
         text: text.into(),
         reply_handle: ReplyHandle {
+            kind: kind.into(),
             channel: channel.into(),
-            placeholder: placeholder.into(),
+            placeholder: Some(placeholder.into()),
             endpoint,
+            // The CLI's stub keeps the Slack shape, so its route is the
+            // configured `SLACK_API_BASE_URL` dev origin, not a named adapter.
+            adapter: None,
         },
         received_at: now_rfc3339(),
+        // The CLI drives a turn on a person's behalf, so it is a message and not
+        // a job: `local message` and `cluster message` are someone typing. Named
+        // rather than left to serde's default for the same reason `kind` is --
+        // the operator lane should say what it produces.
+        source: TurnSource::Slack,
     }
 }
 
@@ -375,6 +390,7 @@ mod tests {
     #[test]
     fn payload_json_carries_the_exact_seam_field_names() {
         let turn = synthetic_turn(
+            "slack",
             "C-SIM-x",
             "U-curie-chat",
             "hello",
@@ -396,9 +412,14 @@ mod tests {
                 "event_id",
                 "received_at",
                 "reply_handle",
+                // ADR-0079: what STARTED this turn, as distinct from where its
+                // reply goes (reply_handle.kind). The CLI produces a person's
+                // message, so it is always "slack" on this lane.
+                "source",
                 "text",
             ]
         );
+        assert_eq!(object["source"], "slack");
         // channel and placeholder are nested in the channel-neutral reply_handle.
         assert_eq!(object["reply_handle"]["channel"], "C-SIM-x");
         assert_eq!(object["reply_handle"]["placeholder"], "1720000000.000200");
@@ -412,6 +433,7 @@ mod tests {
         // Issue #19: a CLI-minted turn carries its own reply endpoint so the worker
         // posts back to this stub without re-pointing its global setting.
         let turn = synthetic_turn(
+            "slack",
             "C-SIM-x",
             "U-curie-chat",
             "hi",
@@ -436,10 +458,18 @@ mod tests {
         // #770/ADR-0078: the connected-transport path posts a REAL placeholder and
         // enqueues against its ts with NO per-turn endpoint, so the turn rides the
         // worker's default (connected) transport -- exactly like a real mention.
-        let turn = synthetic_turn("C-real", "U-curie-chat", "hi", "1.1", "1717.42", None);
+        let turn = synthetic_turn(
+            "slack",
+            "C-real",
+            "U-curie-chat",
+            "hi",
+            "1.1",
+            "1717.42",
+            None,
+        );
         assert!(turn.reply_handle.endpoint.is_none());
         // The placeholder is the real Slack ts we posted, not a stub-minted one.
-        assert_eq!(turn.reply_handle.placeholder, "1717.42");
+        assert_eq!(turn.reply_handle.placeholder, Some("1717.42".into()));
         let value: serde_json::Value = serde_json::from_str(&payload_json(&turn).unwrap()).unwrap();
         assert!(value["reply_handle"]["endpoint"].is_null());
         assert_eq!(value["reply_handle"]["placeholder"], "1717.42");
@@ -465,11 +495,14 @@ mod tests {
             author: "U-curie-message".into(),
             text: "hi".into(),
             reply_handle: ReplyHandle {
+                kind: "slack".into(),
                 channel: "C-SIM-x".into(),
-                placeholder: "1720000000.000200".into(),
+                placeholder: Some("1720000000.000200".into()),
                 endpoint: None,
+                adapter: None,
             },
             received_at: "2026-07-21T00:00:00Z".into(),
+            source: TurnSource::Slack,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

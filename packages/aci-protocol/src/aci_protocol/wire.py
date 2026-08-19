@@ -36,12 +36,14 @@ would break that property.
 mirror had bare types, so it could construct a payload the API 422-rejects --
 the live bug stranding the durable-approval path. Resolved strict:
 
-- ``conversation_id``, ``author``, ``summary``, ``reply_channel``,
-  ``reply_placeholder``, ``dedupe_key``: ``min_length=1``. An empty string now
-  raises **at the worker**, at construction, instead of producing a 422 from the
-  API. Nothing that previously *succeeded* now fails -- those payloads were
-  already being rejected downstream. The failure just moves to the source with a
-  clear message.
+- ``conversation_id``, ``author``, ``summary``, ``reply_channel``, and
+  ``dedupe_key``: ``min_length=1``. An empty string now raises **at the worker**,
+  at construction, instead of producing a 422 from the API. Nothing that
+  previously *succeeded* now fails -- those payloads were already being rejected
+  downstream. The failure just moves to the source with a clear message.
+- ``reply_placeholder``: required ``str | None`` with ``min_length=1`` for a
+  nonnull value. ``None`` explicitly represents no placeholder to edit; omitting
+  the key remains invalid, and an empty nonnull string remains invalid.
 - ``gate_kind``: ``str | None`` -> ``GateKind | None``. A worker sending an
   unrecognized string now raises locally rather than 422ing. Per #544/ADR-0046
   this field is **authority-bearing** (it decides whether a gate may grant), so
@@ -122,15 +124,26 @@ class ApprovalRequest(_AciModel):
     against ``card_channel``. ``gate_kind``/``granted_tool`` are the durable gate
     provenance (#544, Decision C) written by the runner; both stay optional for
     the rolling-deploy window.
+
+    ``reply_kind``/``reply_channel`` are the durable twin of ``ReplyHandle``'s
+    routing pair (ADR-0096), and ``reply_adapter`` the durable twin of its egress
+    selector. ``reply_kind`` is REQUIRED, deliberately unlike ``gate_kind`` above:
+    an absent kind puts the silent misroute back on the resume path, where it is
+    least observable, and ADR-0096 phase 2 buys the right to reject it with a
+    quiescent cutover rather than a rolling-deploy window. ``reply_adapter`` is
+    nullable because ``slack`` legitimately has no adapter -- its route is the
+    worker's configured Slack origin.
     """
 
     agent_id: uuid.UUID | None = None
     conversation_id: str = Field(min_length=1)
     author: str = Field(min_length=1)
     summary: str = Field(min_length=1)
+    reply_kind: str = Field(min_length=1)
     reply_channel: str = Field(min_length=1)
-    reply_placeholder: str = Field(min_length=1)
+    reply_placeholder: str | None = Field(min_length=1)
     reply_endpoint: str | None = None
+    reply_adapter: str | None = None
     dedupe_key: str = Field(min_length=1)
     route: str | None = None
     card_channel: str | None = None

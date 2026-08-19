@@ -290,12 +290,16 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
 
     echo
     echo "=== curie local eval --dry-run (suite parity) ==="
-    assert_suite "local" "$("$BIN" --json local eval --cases "$WORKDIR/bundle/evals/cases.json" --dry-run)"
+    local eval_args=(local eval)
+    if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
+    fi
+    assert_suite "local" "$(cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie local eval ==="
-        "$BIN" local eval --cases "$WORKDIR/bundle/evals/cases.json"
+        (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
     fi"#;
     assert!(
         text.contains(contract),
@@ -312,12 +316,16 @@ fn live_local_release_rung_grades_its_own_weather_cases_copy() {
 
     echo
     echo "=== curie local eval --dry-run (suite parity, release compose stack) ==="
-    assert_suite "local-release" "$("$BIN" --json local eval --cases "$WORKDIR/bundle-release/evals/cases.json" --dry-run)"
+    local eval_args=(local eval)
+    if [[ ! -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle-release/evals/cases.json")
+    fi
+    assert_suite "local-release" "$(cd "$WORKDIR/bundle-release" && "$BIN" --json "${eval_args[@]}" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie local eval (release compose stack) ==="
-        "$BIN" local eval --cases "$WORKDIR/bundle-release/evals/cases.json"
+        (cd "$WORKDIR/bundle-release" && "$BIN" "${eval_args[@]}")
     fi"#;
     assert!(
         text.contains(contract),
@@ -335,11 +343,14 @@ fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
     // array plus that one call rather than the whole block, because the block
     // carries the #1602/#1603 rationale comments and a reworded comment must not
     // red this contract.
-    let contract = r#"local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+    let contract = r#"local eval_args=(cluster eval)
+    if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
+    fi
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
-    assert_suite "cluster" "$("$BIN" --json "${eval_args[@]}" --dry-run)""#;
+    assert_suite "cluster" "$(cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}" --dry-run)""#;
     assert!(
         text.contains(r#"assert_finalized_reply "cluster" "$out""#),
         "the live cluster rung must keep its plumbing assertion; ladder \
@@ -352,7 +363,7 @@ fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
          suite-parity dry-run; ladder contents:\n{text}"
     );
     assert!(
-        text.contains(r#"if ! "$BIN" --json "${eval_args[@]}"; then"#),
+        text.contains(r#"if ! (cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}"); then"#),
         "the live cluster rung must still RUN cluster eval against the deployed \
          weather bundle cases and forward the message listen host -- through the \
          SAME array as the dry-run, so neither call can lose it -- and report \
@@ -379,7 +390,7 @@ fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
 fn live_cluster_rung_emits_the_graded_reply_for_passing_cases() {
     let text = ladder();
     assert!(
-        text.contains(r#"if ! "$BIN" --json "${eval_args[@]}"; then"#),
+        text.contains(r#"if ! (cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}"); then"#),
         "the live cluster rung must run its eval with `--json` so a PASSING \
          case's reply text lands in the job log; without it a dishonest green \
          (a fabricated temperature) is indistinguishable from an honest one; \
@@ -447,6 +458,10 @@ fn write_ladder_stubs(dir: &Path) {
         &dir.join("curie"),
         r#"#!/bin/sh
 set -u
+
+if [ -n "${STUB_INVOCATION_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$STUB_INVOCATION_LOG"
+fi
 
 # `--plugin-dir <dir>` is the last pair on every deploy the ladder makes, so the
 # final argument is the bundle directory that rung packed.
@@ -578,6 +593,9 @@ print(json.dumps({
     "local up --minimal")
         echo "stub: compose stack up"
         ;;
+    "local up")
+        echo "stub: full compose stack up"
+        ;;
     "--json local deploy --plugin-dir "*)
         printf '%s' "$bundle_dir" > "$STUB_STATE/last_plugin_dir"
         emit_deploy "${STUB_LOCAL_SHA256:-$(sha_of_bundle "$bundle_dir")}"
@@ -595,10 +613,16 @@ print(json.dumps({
     "--json local eval --cases "*--dry-run*)
         emit_plan local 1 weather
         ;;
+    "--json local eval --dry-run")
+        emit_plan local 1 weather
+        ;;
     "--json cluster eval --cases "*--dry-run*)
         # Only the cluster count is an override: it is the knob the suite
         # divergence control moves. Everything else is the constant the weather
         # bundle declares.
+        emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
+        ;;
+    "--json cluster eval --dry-run")
         emit_plan cluster "${STUB_CLUSTER_PLAN_COUNT:-1}" weather
         ;;
     # The two LIVE grades, and they are deliberately asymmetric: the local rung
@@ -606,7 +630,7 @@ print(json.dumps({
     # case's reply is auditable in the job log (#1602). The dry-run arms above
     # must stay above this one, since `--json cluster eval --cases *` matches a
     # dry-run argv too and the first matching arm wins.
-    "local eval --cases "*|"--json cluster eval --cases "*)
+    "local eval --cases "*|"--json cluster eval --cases "*|"local eval"|"--json cluster eval")
         if [ -n "${STUB_EVAL_MARKER:-}" ]; then
             printf '%s\n' called > "$STUB_EVAL_MARKER"
         fi
@@ -772,6 +796,10 @@ fn require_local_stub_port_free() {
 ///   exported value turns the skill rung into an `exit 97`.
 fn run_ladder(harness: &Path, envs: &[(&str, &str)]) -> Output {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    run_ladder_script(&script, harness, envs)
+}
+
+fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Output {
     let path = format!(
         "{}:{}",
         harness.display(),
@@ -801,6 +829,50 @@ fn run_ladder(harness: &Path, envs: &[(&str, &str)]) -> Output {
         command.env(key, value);
     }
     command.output().expect("run the real ladder script")
+}
+
+fn run_eval_argument_control(trajectory: bool) -> (Output, String) {
+    require_local_stub_port_free();
+    let root = tempfile::tempdir().expect("create isolated ladder root");
+    let scripts = root.path().join("cli/scripts");
+    let evals = root.path().join("examples/weather/evals");
+    fs::create_dir_all(&scripts).expect("create script directory");
+    fs::create_dir_all(&evals).expect("create eval directory");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    let script = scripts.join("e2e-ladder.sh");
+    fs::copy(source, &script).expect("copy ladder script");
+    fs::write(
+        evals.join("cases.json"),
+        r#"{"name":"weather","cases":[{"id":"weather","input":"weather","grader":{"kind":"contains","expected":"sunny"}}]}"#,
+    )
+    .expect("write cases");
+    if trajectory {
+        fs::write(
+            evals.join("trajectory.json"),
+            r#"{"specs":[{"case_id":"weather","expected":["WebSearch"],"mode":"exact","threshold":1.0}]}"#,
+        )
+        .expect("write trajectory sidecar");
+    }
+
+    let harness = tempfile::tempdir().expect("create harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+    let invocation_log = harness.path().join("invocations.log");
+    let invocation_log_value = invocation_log.display().to_string();
+    let output = run_ladder_script(
+        &script,
+        harness.path(),
+        &[
+            ("CURIE_E2E_TIERS", "local,cluster"),
+            ("CURIE_E2E_LIVE", "1"),
+            ("CURIE_CREDENTIALS", "test-credential"),
+            ("CURIE_API_URL", &api_url),
+            ("STUB_FAKE_MODEL", ""),
+            ("STUB_INVOCATION_LOG", &invocation_log_value),
+        ],
+    );
+    let invocations = fs::read_to_string(invocation_log).unwrap_or_default();
+    (output, invocations)
 }
 
 /// Whether some ONE line of the transcript carries every one of `needles`.
@@ -851,6 +923,76 @@ fn weather_bundle_sha256() -> String {
         .output()
         .expect("hash the weather bundle tree");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
+    let (trajectory_output, trajectory_invocations) = run_eval_argument_control(true);
+    let trajectory_transcript = transcript(&trajectory_output);
+    assert_eq!(
+        trajectory_output.status.code(),
+        Some(0),
+        "trajectory ladder failed:\n{trajectory_transcript}"
+    );
+    let trajectory_evals = trajectory_invocations
+        .lines()
+        .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
+        .collect::<Vec<_>>();
+    assert_eq!(trajectory_evals.len(), 4, "{trajectory_invocations}");
+    assert!(
+        trajectory_evals
+            .iter()
+            .all(|line| !line.contains("--cases")),
+        "trajectory eval must use the deployed bundle instead of an explicit cases override: \
+         {trajectory_invocations}"
+    );
+    let trajectory_starts = trajectory_invocations
+        .lines()
+        .filter(|line| line.starts_with("local up"))
+        .collect::<Vec<_>>();
+    assert_eq!(trajectory_starts, ["local up"], "{trajectory_invocations}");
+    assert!(
+        trajectory_starts
+            .iter()
+            .all(|line| !line.contains("--minimal")),
+        "trajectory scoring requires the full local profile: {trajectory_invocations}"
+    );
+    for tier in ["local", "cluster"] {
+        assert!(
+            has_line_with(
+                &trajectory_transcript,
+                &[tier, r#"grade 1 case(s) from suite "weather""#,],
+            ),
+            "trajectory dry run must expose the standard suite and case count for {tier}: \
+             {trajectory_transcript}"
+        );
+    }
+
+    let (ordinary_output, ordinary_invocations) = run_eval_argument_control(false);
+    let ordinary_transcript = transcript(&ordinary_output);
+    assert_eq!(
+        ordinary_output.status.code(),
+        Some(0),
+        "ordinary ladder failed:\n{ordinary_transcript}"
+    );
+    let ordinary_evals = ordinary_invocations
+        .lines()
+        .filter(|line| line.contains("local eval") || line.contains("cluster eval"))
+        .collect::<Vec<_>>();
+    assert_eq!(ordinary_evals.len(), 4, "{ordinary_invocations}");
+    assert!(
+        ordinary_evals.iter().all(|line| line.contains("--cases")),
+        "ordinary eval must retain its explicit cases path: {ordinary_invocations}"
+    );
+    let ordinary_starts = ordinary_invocations
+        .lines()
+        .filter(|line| line.starts_with("local up"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordinary_starts,
+        ["local up --minimal"],
+        "ordinary grading must retain the minimal local profile: {ordinary_invocations}"
+    );
 }
 
 /// POSITIVE CONTROL. Every rung -- skill, local and cluster -- reports the same

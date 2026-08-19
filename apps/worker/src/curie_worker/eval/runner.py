@@ -250,6 +250,7 @@ class EvalRunner:
             outcome=EvalOutcome.PASS if verdict.passed else EvalOutcome.FAIL,
             output=output,
             latency_ms=_elapsed_ms(start),
+            detail=verdict.detail,
             # Real token usage x model pricing (#390). None when the model is
             # unpriced or the runner reported no usage, so the matrix omits this
             # case from the model's cost rollup rather than counting it as free.

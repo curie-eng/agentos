@@ -23,14 +23,19 @@ const SUMMARY = {
 // `posted` records the raw create bodies so a test can assert exactly what the UI
 // sent (e.g. the channel is trimmed before it hits the backend).
 async function stubBackend(page: Page) {
-  const agents: { id: string; name: string; slack_channel: string; created_at: string }[] = [];
-  const posted: { name: string; slack_channel: string }[] = [];
+  const agents: {
+    id: string;
+    name: string;
+    channel: { kind: string; address: string };
+    created_at: string;
+  }[] = [];
+  const posted: { name: string; channel: { kind: string; address: string } }[] = [];
 
   await page.route(/\/api\/agents(\?.*)?$/, async (route) => {
     if (route.request().method() === "POST") {
       const body = JSON.parse(route.request().postData() ?? "{}");
       posted.push(body);
-      const agent = { id: "ag-" + (agents.length + 1), name: body.name, slack_channel: body.slack_channel, created_at: "2026-07-05T00:00:00Z" };
+      const agent = { id: "ag-" + (agents.length + 1), name: body.name, channel: body.channel, created_at: "2026-07-05T00:00:00Z" };
       agents.push(agent);
       return route.fulfill(json(201, agent));
     }
@@ -119,8 +124,10 @@ test("a channel copied with surrounding spaces is trimmed before it is stored", 
   await page.getByRole("button", { name: "Deploy" }).click();
   await expect(page.getByTestId("deployed-panel")).toBeVisible({ timeout: 10_000 });
   // The worker matches the stored channel value exactly, so the spaces must be
-  // gone by the time the create request is sent.
-  expect(posted.at(-1)?.slack_channel).toBe("C01SPACED");
+  // gone by the time the create request is sent. Both sub-fields are asserted:
+  // the binding carries an explicit kind, not a bare channel string.
+  expect(posted.at(-1)?.channel.kind).toBe("slack");
+  expect(posted.at(-1)?.channel.address).toBe("C01SPACED");
 });
 
 test("no fixture agent (deal-desk) leaks anywhere in wired mode", async ({ page }) => {

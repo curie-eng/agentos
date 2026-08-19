@@ -8,10 +8,26 @@ export interface AppConfig {
   org_name: string;
 }
 
+// A channel-neutral binding: one agent binds exactly one channel (ADR-0089),
+// so the wire always carries a singular object, never an array or a plural
+// `channels` field. `kind` selects which address shape applies ("slack" is
+// the only kind the console can create today); `address` is the channel-kind
+// identifier the worker resolves against.
+export interface ChannelBinding {
+  kind: string;
+  address: string;
+}
+
+// The worker resolves an agent's binding against `channel.address`, not a
+// bare `slack_channel` column. This is the console's fast local check for the
+// one kind it can create; it is a soft check (warns, never blocks) because
+// the authoritative gate lives server-side (apps/api schemas.py).
+export const SLACK_ADDRESS_RE = /^[CDG][A-Z0-9]+$/;
+
 export interface AgentOut {
   id: string;
   name: string;
-  slack_channel: string;
+  channel: ChannelBinding;
   // Per-agent model id, forwarded as CURIE_MODEL at boot (#254). null uses the
   // platform default model.
   model: string | null;
@@ -131,7 +147,7 @@ function describeError(body: unknown): string | null {
 
 export async function createAgent(input: {
   name: string;
-  slack_channel: string;
+  channel: ChannelBinding;
   // Optional per-agent model id (#254). Omit for the platform default.
   model?: string;
 }): Promise<AgentOut> {
@@ -431,7 +447,7 @@ export async function getConfig(): Promise<AppConfig> {
 // platform default that clearing is supposed to restore.
 export async function updateAgent(
   agentId: string,
-  patch: { slack_channel?: string; model?: string | null },
+  patch: { channel?: ChannelBinding; model?: string | null },
 ): Promise<AgentOut> {
   const resp = await fetch(url(`/agents/${agentId}`), {
     method: "PATCH",
@@ -699,7 +715,7 @@ export interface ApprovalOut {
   author: string;
   summary: string;
   reply_channel: string;
-  reply_placeholder: string;
+  reply_placeholder: string | null;
   reply_endpoint: string | null;
   dedupe_key: string;
   route: string | null;

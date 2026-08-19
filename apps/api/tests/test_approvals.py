@@ -85,6 +85,10 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "conversation_id": f"th-{uuid.uuid4().hex[:8]}",
         "author": "U1",
         "summary": "Give ACME a 20% discount",
+        # Required since ADR-0096 phase 2 (`ApprovalRequest.reply_kind`): the
+        # durable twin of the turn's routing half, so a resume replays the kind
+        # it was raised on rather than re-deriving it from the binding.
+        "reply_kind": "slack",
         "reply_channel": "C1",
         "reply_placeholder": "p-1",
         "dedupe_key": uuid.uuid4().hex,
@@ -120,6 +124,36 @@ def _seed_raw_approval(approval_id: uuid.UUID, summary: str) -> None:
                         "ph": "p-1",
                         "dedupe": uuid.uuid4().hex,
                     },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def _seed_slack_binding(address: str) -> None:
+    """One agent bound to `address` under kind `slack`, with raw SQL.
+
+    The provenance a pre-0022 approval is backfilled from: migration 0022 joins
+    `approvals.reply_channel` to `agent_channels.address` and refuses to guess a
+    PENDING row's kind when nothing matches.
+    """
+
+    async def _run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                agent_id = uuid.uuid4()
+                await conn.execute(
+                    text("INSERT INTO curie.agents (id, name) VALUES (:id, :name)"),
+                    {"id": agent_id, "name": f"binding-{agent_id.hex[:8]}"},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+                        "VALUES (:id, :agent, 'slack', :addr)"
+                    ),
+                    {"id": uuid.uuid4(), "agent": agent_id, "addr": address},
                 )
         finally:
             await engine.dispose()
@@ -163,6 +197,23 @@ def _read_resumed_at(approval_id: str) -> datetime | None:
             async with sessionmaker() as session:
                 approval = await session.get(Approval, uuid.UUID(approval_id))
                 return None if approval is None else approval.resumed_at
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
+def _read_reply_placeholder(approval_id: str) -> str | None:
+    """Read the stored reply target without relying on the API response model."""
+
+    async def _run() -> str | None:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                approval = await session.get(Approval, uuid.UUID(approval_id))
+                assert approval is not None
+                return approval.reply_placeholder
         finally:
             await engine.dispose()
 
@@ -335,6 +386,7 @@ def test_create_get_list_round_trip(
         headers=auth_headers,
     )
     assert [a["id"] for a in listed.json()] == [body["id"]]
+    assert listed.json()[0]["reply_placeholder"] == payload["reply_placeholder"]
 
 
 def test_create_tolerates_unknown_field_from_a_newer_worker(
@@ -379,6 +431,47 @@ def test_create_is_idempotent_on_dedupe_key(
     replay = approvals_client.post("/approvals", json=payload, headers=auth_headers)
     assert replay.status_code == 200
     assert replay.json()["id"] == first.json()["id"]
+
+
+def test_create_round_trips_a_post_once_reply_target(
+    approvals_client: TestClient, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    """A reply without a placeholder keeps its explicit channel and endpoint."""
+
+    payload = _payload(
+        reply_channel="C_POST_ONCE",
+        reply_placeholder=None,
+        reply_endpoint="http://localhost:9999/api/",
+    )
+    created = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["reply_channel"] == payload["reply_channel"]
+    assert body["reply_placeholder"] is None
+    assert body["reply_endpoint"] == payload["reply_endpoint"]
+    assert _read_reply_placeholder(body["id"]) is None
+
+    fetched = approvals_client.get(f"/approvals/{body['id']}", headers=auth_headers)
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["reply_placeholder"] is None
+
+    listed = approvals_client.get(
+        "/approvals",
+        params={"status_filter": "pending", "conversation_id": payload["conversation_id"]},
+        headers=auth_headers,
+    )
+    assert [approval["id"] for approval in listed.json()] == [body["id"]]
+    assert listed.json()[0]["reply_placeholder"] is None
+
+    existing = approvals_client.post(
+        "/approvals",
+        json=_payload(reply_placeholder="p-existing"),
+        headers=auth_headers,
+    )
+    assert existing.status_code == 201, existing.text
+    assert existing.json()["reply_placeholder"] == "p-existing"
+    assert _read_reply_placeholder(existing.json()["id"]) == "p-existing"
 
 
 def test_resolve_once_and_enqueue_resume_turn(
@@ -651,7 +744,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
         "/agents",
         json={
             "name": f"deal-desk-{uuid.uuid4().hex[:8]}",
-            "slack_channel": "C0LOCALDEV",
+            "channel": {"kind": "slack", "address": "C0LOCALDEV"},
             "approval_routes": {
                 "deal-desk": {
                     "channel": "C0BOUND01",
@@ -792,6 +885,12 @@ def test_backfill_classifies_existing_rows(isolated_migration_db: None) -> None:
         permission_id, 'Tool call awaiting approval: Bash {"command": "deploy"}'
     )
     _seed_raw_approval(policy_id, "Give ACME a 20% discount")
+    # Migration 0022 backfills `reply_kind` BY PROVENANCE and refuses a PENDING
+    # approval whose `reply_channel` matches no binding (ADR-0096 phase 2), so C1
+    # needs the slack binding a real install would have. Seeded at 0021, the
+    # revision that creates `agent_channels`: the table does not exist at 0014.
+    command.upgrade(cfg, "0021")
+    _seed_slack_binding("C1")
     command.upgrade(cfg, "head")
 
     assert _read_provenance(permission_id) == ("permission", "Bash")
@@ -826,9 +925,10 @@ def test_gate_kind_check_constraint_rejects_unknown_values(
                 await conn.execute(
                     text(
                         "INSERT INTO curie.approvals (id, conversation_id, "
-                        "author, summary, reply_channel, reply_placeholder, "
-                        "dedupe_key, status, gate_kind) VALUES (:id, :conv, "
-                        ":author, :summary, :ch, :ph, :dedupe, 'pending', :gk)"
+                        "author, summary, reply_kind, reply_channel, "
+                        "reply_placeholder, dedupe_key, status, gate_kind) "
+                        "VALUES (:id, :conv, :author, :summary, 'slack', :ch, "
+                        ":ph, :dedupe, 'pending', :gk)"
                     ),
                     {
                         "id": uuid.uuid4(),
@@ -1533,7 +1633,7 @@ def _agent_with_routes(
         "/agents",
         json={
             "name": f"routed-{uuid.uuid4().hex[:8]}",
-            "slack_channel": "C0AGENT001",
+            "channel": {"kind": "slack", "address": "C0AGENT001"},
             "approval_routes": routes,
         },
         headers=headers,

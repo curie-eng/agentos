@@ -115,6 +115,48 @@ def _cost_of(trace: dict[str, Any]) -> float | None:
     return None
 
 
+def _detail_of(trace: dict[str, Any] | None) -> str | None:
+    """The scorer explanation on an eval trace, when the recorder supplied one.
+
+    ``error`` remains reserved for a turn that did not complete. ``detail`` is
+    the grader's explanation of a completed verdict, such as a trajectory
+    mismatch, and is intentionally not inferred from ``error``.
+    """
+    if trace is None:
+        return None
+    detail = (trace.get("metadata") or {}).get("detail")
+    return detail if isinstance(detail, str) else None
+
+
+def _stream_id_of(trace: dict[str, Any] | None) -> str | None:
+    if trace is None:
+        return None
+    stream_id = (trace.get("metadata") or {}).get("stream_id")
+    return stream_id if isinstance(stream_id, str) and stream_id else None
+
+
+def _scorer_of(
+    trace: dict[str, Any] | None,
+) -> Literal["grader", "trajectory"] | None:
+    if trace is None:
+        return None
+    scorer = (trace.get("metadata") or {}).get("scorer")
+    if scorer == "grader":
+        return "grader"
+    if scorer == "trajectory":
+        return "trajectory"
+    return None
+
+
+def _case_count_of(trace: dict[str, Any] | None) -> int | None:
+    if trace is None:
+        return None
+    case_count = (trace.get("metadata") or {}).get("case_count")
+    if isinstance(case_count, int) and not isinstance(case_count, bool):
+        return case_count
+    return None
+
+
 def _supersedes(
     trace: dict[str, Any], current: dict[str, Any] | None, ts: str
 ) -> bool:
@@ -187,6 +229,10 @@ def build_matrix(
                     version=version,
                     status=_status(version, case),
                     model=_model_of(latest.get((version, case))),
+                    detail=_detail_of(latest.get((version, case))),
+                    stream_id=_stream_id_of(latest.get((version, case))),
+                    scorer=_scorer_of(latest.get((version, case))),
+                    case_count=_case_count_of(latest.get((version, case))),
                 )
                 for version in versions
             ],

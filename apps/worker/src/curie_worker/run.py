@@ -35,6 +35,7 @@ from .heartbeat import run_heartbeat
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
+from .reply_sink import ReplySinkRouter, build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
     AffinityStore,
@@ -45,7 +46,6 @@ from .sandbox import (
     SandboxSubstrate,
     SubstrateConfig,
 )
-from .slack_sink import AsyncSlackSink
 from .threadlock import ThreadLock
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,10 @@ class Runtime:
     killswitch: KillSwitch
     eval_consumer: EvalStreamConsumer
     runner: RunnerClient
+    # Held here for the same reason the runner client is: the HTTP egress adapter
+    # keeps ONE aiohttp session for the process's life, so the sink needs a
+    # disposal site alongside the other long-lived transports.
+    sink: ReplySinkRouter
     async_redis: AsyncRedis
     eval_redis: AsyncRedis
     eval_http: httpx.AsyncClient
@@ -260,10 +264,11 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     approval_client = ApprovalClient(
         api_base_url=config.api_base_url, api_key=config.api_key, client=eval_http
     )
+    sink = build_reply_sink(config)
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
-        sink=AsyncSlackSink(config.slack_bot_token, base_url=config.slack_api_base_url or None),
+        sink=sink,
         lock=ThreadLock(
             async_redis,
             ttl_ms=config.lock_ttl_ms,
@@ -321,6 +326,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         killswitch=killswitch,
         eval_consumer=eval_consumer,
         runner=runner,
+        sink=sink,
         async_redis=async_redis,
         eval_redis=eval_redis,
         eval_http=eval_http,
@@ -441,6 +447,7 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
         )
     finally:
         await rt.runner.close()
+        await rt.sink.aclose()
         await rt.eval_http.aclose()
         await rt.async_redis.aclose()
         await rt.eval_redis.aclose()

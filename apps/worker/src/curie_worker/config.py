@@ -15,6 +15,7 @@ field name (VALKEY_HOST, DATABASE_URL, S3_ENDPOINT_URL, LANGFUSE_HOST, ...).
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 from typing import Annotated
@@ -36,7 +37,7 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from pydantic import BeforeValidator, Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
     PydanticBaseSettingsSource,
 )
@@ -61,6 +62,71 @@ def _parse_bool(value: object) -> bool:
 
 
 Bool = Annotated[bool, BeforeValidator(_parse_bool)]
+
+
+def _parse_adapter_credentials(value: object) -> object:
+    """Parse ``CURIE_ADAPTER_CREDENTIALS`` (a JSON object) into a dict.
+
+    A real dict passes through, so kwarg construction in tests is unchanged. A
+    blank env var is an empty map (no adapter credentials configured), which
+    makes every non-Slack egress fail closed rather than send anonymously.
+    Malformed JSON is a startup error on purpose: a worker that silently came up
+    with no credentials would look healthy and deliver nothing.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("CURIE_ADAPTER_CREDENTIALS must be a JSON object")
+        return parsed
+    return value
+
+
+# ``NoDecode`` is load-bearing, not decoration: see ``TrustedOrigins`` below.
+# Without it a blank ``CURIE_ADAPTER_CREDENTIALS`` (the documented "none
+# configured" value) is JSON-decoded by the settings source and raises before
+# ``_parse_adapter_credentials`` can map it to ``{}``.
+AdapterCredentials = Annotated[
+    dict[str, str], NoDecode, BeforeValidator(_parse_adapter_credentials)
+]
+
+
+def _parse_trusted_origins(value: object) -> object:
+    """Parse ``CURIE_SLACK_TRUSTED_ORIGINS`` (comma-separated URLs) into a tuple.
+
+    A real sequence passes through, so kwarg construction in tests is unchanged.
+    Blank entries are dropped, so an empty or whitespace-only env var means "no
+    extra trusted origins" -- the closed default, where the configured Slack
+    origin is the only one honored.
+
+    Each entry is ``scheme://host[:port]``. An entry WITH a port matches that
+    origin exactly. An entry that OMITS the port
+    (``http://host.docker.internal``) trusts any port on that scheme+host, which
+    exists for one reason: the CLI's dev stub binds an EPHEMERAL port on
+    ``curie chat`` and on ``cluster message --listen-port 0``, so no fixed port
+    can be configured ahead of time. A portless entry is therefore a DEV-ONLY
+    affordance -- it trusts every port on a host, so production must never set
+    one (and should usually set nothing at all, leaving the configured Slack
+    origin as the only trusted one).
+    """
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    if isinstance(value, (list, tuple)):
+        return tuple(str(part).strip() for part in value if str(part).strip())
+    return value
+
+
+# ``NoDecode`` hands the validator the RAW env string. pydantic-settings treats
+# a tuple field as "complex" and JSON-decodes it inside the env source, BEFORE
+# any field validator runs -- so the comma list compose.dev.yaml exports
+# ("http://localhost,http://127.0.0.1,...") raised SettingsError and killed the
+# worker at boot, and the BeforeValidator below was only ever reachable when the
+# env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
+TrustedOrigins = Annotated[
+    tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)
+]
 
 
 class WorkerConfig(BaseSettings):
@@ -102,6 +168,31 @@ class WorkerConfig(BaseSettings):
     # overrides this per turn, so a real workspace and a no-Slack CLI stub can
     # coexist on one worker instead of contending for this single setting.
     slack_api_base_url: str = ""
+
+    # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
+    # D4.4), comma-separated. Empty by default, which leaves the configured
+    # ``slack_api_base_url`` (or real Slack) as the only trusted origin. This
+    # exists for the dev/CLI stub: `local message` advertises
+    # ``host.docker.internal`` and `cluster message` a routable host, neither of
+    # which the single default base URL can also name, so the origin pin would
+    # otherwise refuse the local loop. It is deliberately OPERATOR CONFIG and
+    # never wire-supplied -- an origin an operator typed is trusted; an origin a
+    # turn carried is exactly the credential-capture vector D4.4 closes.
+    slack_trusted_origins: TrustedOrigins = Field(
+        default=(), validation_alias="CURIE_SLACK_TRUSTED_ORIGINS"
+    )
+
+    # Per-ADAPTER egress credentials (ADR-0096 D4.2), a JSON object mapping an
+    # operator-chosen adapter slug (the binding row's ``adapter``) to the secret
+    # the worker presents as ``X-Curie-Adapter-Secret``. Per-adapter rather than
+    # per-kind so compromising one adapter yields one secret, for one binding.
+    # An adapter with no entry here makes its egress RAISE rather than send
+    # anonymously: an unauthenticated platform request lets any reachable pod be
+    # impersonated and gives the adapter no way to tell the platform from an
+    # attacker.
+    adapter_credentials: AdapterCredentials = Field(
+        default_factory=dict, validation_alias="CURIE_ADAPTER_CREDENTIALS"
+    )
 
     # Postgres (read-only): resolve channel -> agent -> deployment -> version.
     # Matches the API's DATABASE_URL / DB_SCHEMA so the worker reads the same DB.
@@ -350,6 +441,22 @@ class WorkerConfig(BaseSettings):
     # Markers
     idempotency_ttl_s: int = 86400
 
+    # The completion outbox (ADR-0096 EB-B6). ``grace`` keeps the sweeper out of
+    # the kernel's own emit window, so the normal path is not racing a sweeper on
+    # every turn; ``max_retention`` is how long an undelivered completion is kept
+    # before it is cleared LOUDLY, well beyond any outage worth riding out.
+    completion_sweep_grace_s: float = 60.0
+    completion_max_retention_s: float = 604800.0
+    # One sweep pass is BOUNDED twice over, because the startup sweep runs
+    # against exactly the backlog an outage left behind: at most ``batch``
+    # members are sampled per pass, and the pass stops once ``budget`` seconds
+    # have elapsed. Each delivery attempt is an HTTP call with the sink's own
+    # timeout, so an unbounded pass over an unreachable adapter is measured in
+    # hours. The sweeper runs on the maintenance cadence, so the remainder is
+    # simply drained by the passes that follow.
+    completion_sweep_batch: int = Field(default=64, gt=0)
+    completion_sweep_budget_s: float = Field(default=30.0, gt=0)
+
     # Crash recovery: reclaim stream entries pending longer than this, and run
     # the orphan-claim reaper, on this cadence.
     #
@@ -533,6 +640,18 @@ class WorkerConfig(BaseSettings):
 
     def side_effect_key(self, event_id: str) -> str:
         return f"{self.key_prefix}:sidefx:{event_id}"
+
+    def completion_key(self, event_id: str) -> str:
+        # The durable outbox record for this event's ``turn.completed``. NO TTL:
+        # a payload that expires under a longer-lived set membership is a
+        # completion lost silently (EB-B6(f)).
+        return f"{self.key_prefix}:completion:{event_id}"
+
+    def completions_pending_key(self) -> str:
+        # The sweep index. A SET, not a SCAN over the keyspace: the maintenance
+        # loop must not scan a production Valkey, and a redelivery-only sweep
+        # would never reach a turn whose stream entry was already acked.
+        return f"{self.key_prefix}:completions:pending"
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"

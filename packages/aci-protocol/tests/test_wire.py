@@ -79,9 +79,11 @@ def _full_approval_request() -> ApprovalRequest:
         conversation_id="c1",
         author="u1",
         summary="deploy the thing",
+        reply_kind="email",
         reply_channel="C1",
         reply_placeholder="1.0",
         reply_endpoint="https://example.test/api",
+        reply_adapter="agentmail-sandbox",
         dedupe_key="e1",
         route="ops",
         card_channel="C2",
@@ -96,6 +98,10 @@ def _minimal_approval_request_fields() -> dict[str, object]:
         "conversation_id": "c1",
         "author": "u1",
         "summary": "deploy the thing",
+        # Required alongside `reply_channel` (plan EB-A15): the durable record's
+        # routing half. Its presence here is what makes the "minimal" payload
+        # minimal rather than incomplete.
+        "reply_kind": "slack",
         "reply_channel": "C1",
         "reply_placeholder": "1.0",
         "dedupe_key": "e1",
@@ -138,9 +144,11 @@ def test_approval_request_round_trips_identically() -> None:
     assert restored.conversation_id == "c1"
     assert restored.author == "u1"
     assert restored.summary == "deploy the thing"
+    assert restored.reply_kind == "email"
     assert restored.reply_channel == "C1"
     assert restored.reply_placeholder == "1.0"
     assert restored.reply_endpoint == "https://example.test/api"
+    assert restored.reply_adapter == "agentmail-sandbox"
     assert restored.dedupe_key == "e1"
     assert restored.route == "ops"
     assert restored.card_channel == "C2"
@@ -174,6 +182,9 @@ def test_approval_request_minimal_payload_lands_on_documented_defaults() -> None
     assert restored == original
     assert restored.agent_id is None
     assert restored.reply_endpoint is None
+    # Nullable because `slack` legitimately has no adapter: its route is the
+    # worker's configured Slack origin (plan D4.4, EB-A7).
+    assert restored.reply_adapter is None
     assert restored.route is None
     assert restored.card_channel is None
     assert restored.gate_kind is None
@@ -203,6 +214,41 @@ def test_constructing_eval_report_with_unknown_field_is_strict() -> None:
 def test_constructing_approval_request_with_unknown_field_is_strict() -> None:
     with pytest.raises(ValidationError):
         ApprovalRequest(**_minimal_approval_request_fields(), bogus=1)  # type: ignore[arg-type]
+
+
+# --- T-A12: the durable record carries the routing half too -------------------
+
+
+def test_approval_request_without_reply_kind_is_rejected() -> None:
+    """T-A12 / AC2 (plan EB-A15, finding 2).
+
+    `ApprovalRequest` is the model approvals actually use (`schemas.py` re-exports
+    it as `ApprovalCreate`), so this is where the durable record's routing half is
+    made non-optional. Required, not optional, for D1's reason: a `reply_kind`
+    that can be absent puts the silent misroute back on the RESUME path, where it
+    is least observable -- the reply lands in the wrong channel days later.
+
+    Note this model's own docstring calls `gate_kind`/`granted_tool` "optional for
+    the rolling-deploy window". Phase 2 deliberately does not follow that
+    precedent; the quiescent cutover (plan section 6.1) is what buys the right to
+    reject it.
+    """
+
+    fields = _minimal_approval_request_fields()
+    del fields["reply_kind"]
+
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_approval_request_rejects_an_empty_reply_kind() -> None:
+    """T-A12, the min_length half. `reply_kind` mirrors `reply_channel`'s
+    `Field(min_length=1)`, so a producer cannot satisfy "required" with `""` --
+    an empty kind resolves to no binding and would drop every resume silently.
+    """
+
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**{**_minimal_approval_request_fields(), "reply_kind": ""})  # type: ignore[arg-type]
 
 
 # --- Tolerant consumer --------------------------------------------------------
@@ -255,6 +301,27 @@ def test_eval_job_with_explicit_null_bundle_ref_succeeds() -> None:
 def test_approval_request_empty_conversation_id_raises() -> None:
     fields = _minimal_approval_request_fields()
     fields["conversation_id"] = ""
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_approval_request_without_reply_placeholder_raises() -> None:
+    fields = _minimal_approval_request_fields()
+    del fields["reply_placeholder"]
+    with pytest.raises(ValidationError):
+        ApprovalRequest(**fields)  # type: ignore[arg-type]
+
+
+def test_approval_request_with_null_reply_placeholder_succeeds() -> None:
+    fields = _minimal_approval_request_fields()
+    fields["reply_placeholder"] = None
+    request = ApprovalRequest.model_validate(fields)
+    assert request.reply_placeholder is None
+
+
+def test_approval_request_with_empty_reply_placeholder_raises() -> None:
+    fields = _minimal_approval_request_fields()
+    fields["reply_placeholder"] = ""
     with pytest.raises(ValidationError):
         ApprovalRequest(**fields)  # type: ignore[arg-type]
 

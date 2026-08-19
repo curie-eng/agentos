@@ -495,11 +495,18 @@ enum Command {
 enum DevAction {
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
-    /// Render-assert the Helm chart: run every assertion script in
-    /// `charts/curie/ci/`, the same set helm-ci runs on a `charts/curie/**`
-    /// change (#1481). Reports per-script pass or fail and exits non-zero if any
-    /// failed, so one run surfaces every problem.
+    /// Render-assert the Helm chart: discover and run every executable assertion
+    /// script in `charts/curie/ci/`, the same set helm-ci runs on a
+    /// `charts/curie/**` change (#1481). Reports per-script pass or fail and exits
+    /// non-zero if any failed, so one run surfaces every problem.
     ChartCheck,
+    /// Prove a changed test fails when only the change's product hunks are reversed.
+    VerifyFixPin {
+        /// Commit or pull request to verify.
+        change: String,
+        /// Changed test selector to run before and after reversal.
+        selector: String,
+    },
     /// Run the scripted CLI end-to-end test (`bash cli/scripts/e2e.sh`).
     E2e,
     /// Run the cold-start parity ladder across the skill, local, and cluster
@@ -941,7 +948,7 @@ enum LocalAction {
         /// The user message text.
         text: String,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel (errors
+        /// channel. Omit to use the sole deployed agent's channel (errors
         /// if zero or multiple agents are deployed).
         #[arg(long)]
         channel: Option<String>,
@@ -992,7 +999,7 @@ enum LocalAction {
         #[arg(long)]
         cases: Option<PathBuf>,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel.
+        /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
         channel: Option<String>,
         /// Valkey password (compose default `valkeypass`). Prefer the
@@ -1517,7 +1524,7 @@ enum ClusterAction {
         /// The user message text.
         text: String,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel (errors
+        /// channel. Omit to use the sole deployed agent's channel (errors
         /// if zero or multiple agents are deployed).
         #[arg(long)]
         channel: Option<String>,
@@ -1594,7 +1601,7 @@ enum ClusterAction {
         #[arg(long)]
         cases: Option<PathBuf>,
         /// Slack channel id to send as; must match the target agent's
-        /// slack_channel. Omit to use the sole deployed agent's channel.
+        /// channel. Omit to use the sole deployed agent's channel.
         #[arg(long)]
         channel: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
@@ -1992,33 +1999,44 @@ async fn run(command: Option<Command>) -> Result<()> {
             SecretsAction::Unset { name } => secrets::unset(secrets::UnsetSecretOpts { name }),
         },
         Some(Command::Dev { action }) => match action {
-            DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh").await,
+            DevAction::Contracts => commands::dev_script("scripts/check-contracts.sh", &[]).await,
             DevAction::ChartCheck => commands::dev_chart_check().await,
-            DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh").await,
-            DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh").await,
-            DevAction::ChartRuntimeE2e => {
-                commands::dev_script("scripts/chart-runtime-e2e.sh").await
+            DevAction::VerifyFixPin { change, selector } => {
+                commands::dev_script(
+                    "cli/scripts/verify-fix-pin.sh",
+                    &[change.as_str(), selector.as_str()],
+                )
+                .await
             }
-            DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh").await,
-            DevAction::PluginCompat => commands::dev_script("scripts/check-plugin-compat.sh").await,
+            DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
+            DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
+            DevAction::ChartRuntimeE2e => {
+                commands::dev_script("scripts/chart-runtime-e2e.sh", &[]).await
+            }
+            DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
+            DevAction::PluginCompat => {
+                commands::dev_script("scripts/check-plugin-compat.sh", &[]).await
+            }
             DevAction::EvalFalsifiability => {
-                commands::dev_script("cli/scripts/eval-falsifiability.sh").await
+                commands::dev_script("cli/scripts/eval-falsifiability.sh", &[]).await
             }
             DevAction::FieldParity => {
-                commands::dev_script("cli/scripts/check-field-parity.sh").await
+                commands::dev_script("cli/scripts/check-field-parity.sh", &[]).await
             }
-            DevAction::EmitParity => commands::dev_script("cli/scripts/check-emit-parity.sh").await,
+            DevAction::EmitParity => {
+                commands::dev_script("cli/scripts/check-emit-parity.sh", &[]).await
+            }
             DevAction::SchemaBaseline => {
-                commands::dev_script("cli/scripts/refresh-schema-baseline.sh").await
+                commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
             }
             DevAction::NetpolCheck => {
-                commands::dev_script("scripts/check-netpol-enforcement.sh").await
+                commands::dev_script("scripts/check-netpol-enforcement.sh", &[]).await
             }
             DevAction::VersionCheck => {
-                commands::dev_script("scripts/check-version-consistency.sh").await
+                commands::dev_script("scripts/check-version-consistency.sh", &[]).await
             }
             DevAction::WireTolerance => {
-                commands::dev_script("scripts/check-wire-tolerance.sh").await
+                commands::dev_script("scripts/check-wire-tolerance.sh", &[]).await
             }
             DevAction::BumpVersion { version, dry_run } => {
                 commands::bump_version(&version, dry_run).await

@@ -322,6 +322,61 @@ def test_a_graded_run_scores_every_case_and_is_not_tagged_plumbing() -> None:
     asyncio.run(go())
 
 
+def test_scorer_detail_is_recorded_separately_from_runtime_error() -> None:
+    async def go() -> None:
+        run = EvalRunResult(
+            version="v1",
+            suite="trajectory",
+            results=[
+                EvalCaseResult(
+                    case_id="missing",
+                    outcome=EvalOutcome.FAIL,
+                    output="all done",
+                    latency_ms=1.0,
+                    detail="no trajectory spec for case 'missing'",
+                )
+            ],
+        )
+
+        batch = await _capture_batch(run)
+        metadata = _trace_by_case(batch, "missing")["metadata"]
+        assert metadata["detail"] == "no trajectory spec for case 'missing'"
+        assert metadata["error"] is None
+
+    asyncio.run(go())
+
+
+def test_every_trace_records_the_authoritative_run_case_count() -> None:
+    async def go() -> None:
+        run = EvalRunResult(
+            version="v1",
+            suite="trajectory",
+            stream_id="2000-0",
+            results=[
+                EvalCaseResult(
+                    case_id="ordered",
+                    outcome=EvalOutcome.PASS,
+                    output="all done",
+                    latency_ms=1.0,
+                ),
+                EvalCaseResult(
+                    case_id="missing",
+                    outcome=EvalOutcome.FAIL,
+                    output="all done",
+                    latency_ms=1.0,
+                    detail="no trajectory spec for case 'missing'",
+                ),
+            ],
+        )
+
+        batch = await _capture_batch(run)
+        traces = [event["body"] for event in batch if event["type"] == "trace-create"]
+        assert len(traces) == 2
+        assert {trace["metadata"]["case_count"] for trace in traces} == {2}
+
+    asyncio.run(go())
+
+
 def test_records_per_case_results_and_reads_them_back() -> None:
     async def go() -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:

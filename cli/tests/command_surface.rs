@@ -169,6 +169,33 @@ fn process_dev_help_lists_the_plugin_compat_gate() {
     );
 }
 
+#[test]
+fn process_dev_help_lists_verify_fix_pin() {
+    let output = run_help(&["dev"]);
+    assert!(
+        output.status.success(),
+        "expected success for dev help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        help_lists_subcommand(&text, "verify-fix-pin"),
+        "missing verify-fix-pin\n{text}"
+    );
+
+    let leaf = run_help(&["dev", "verify-fix-pin"]);
+    assert!(
+        leaf.status.success(),
+        "expected success for verify-fix-pin help\n{}",
+        output_text(&leaf)
+    );
+    let leaf_text = output_text(&leaf);
+    assert!(
+        leaf_text.contains("<CHANGE>") && leaf_text.contains("<SELECTOR>"),
+        "verify-fix-pin help must require a change and selector\n{leaf_text}"
+    );
+}
+
 /// The checked-in manifest must equal what `curie schema` emits from the live
 /// clap grammar. This is the generated-artifact + CI drift gate (mirroring the
 /// schema-export discipline for `packages/aci-protocol` / `packages/plugin-format`):

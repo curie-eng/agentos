@@ -11,8 +11,16 @@ Nothing reads this table yet. Slice 1 lands the store and the two exchange
 endpoints wired to nothing; ``require_api_key`` starts accepting a session in
 slice 2 (#1045).
 
-Revision ID: 0021
-Revises: 0020
+This same DDL shipped on the v0.6.x line as revision ``0021``, which is the id
+this line spends on ``0021_agent_channels`` (#1705). So a database upgrading
+from v0.6.x already holds ``console_sessions``, created by byte identical
+statements, and reaches this revision with the work already done. ``upgrade``
+therefore checks before it creates: without that check the upgrade path dies on
+a DuplicateTableError, one revision after the reconciliation that carried the
+binding table across.
+
+Revision ID: 0026
+Revises: 0025
 Create Date: 2026-07-28
 """
 
@@ -21,8 +29,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0021"
-down_revision: str | None = "0020"
+revision: str = "0026"
+down_revision: str | None = "0025"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -30,6 +38,15 @@ SCHEMA = "curie"
 
 
 def upgrade() -> None:
+    already_created = (
+        op.get_bind()
+        .execute(sa.text(f"SELECT to_regclass('{SCHEMA}.console_sessions')"))
+        .scalar()
+        is not None
+    )
+    if already_created:
+        return
+
     op.create_table(
         "console_sessions",
         sa.Column(
