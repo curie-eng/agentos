@@ -301,6 +301,7 @@ pub struct UpOpts {
     pub chart: String,
     pub no_expose: bool,
     pub set: Vec<String>,
+    pub set_string: Vec<String>,
     /// Named model providers (validated against [`parse_egress_provider`]) whose
     /// API host(s) runner egress is opened to. Resolved to narrow host-route
     /// CIDRs at install time into [`resolved_egress_cidrs`]; empty means no
@@ -347,6 +348,12 @@ pub struct UpOpts {
     /// generating strong per-release randoms (the first-class dev escape hatch
     /// that replaces hand-passing `--set` for every secret).
     pub dev: bool,
+}
+
+impl UpOpts {
+    fn operator_sets(&self) -> Vec<String> {
+        self.set.iter().chain(&self.set_string).cloned().collect()
+    }
 }
 
 pub struct DownOpts {
@@ -460,8 +467,9 @@ pub(crate) fn validate_up_inputs(
 ) -> Result<()> {
     validate_web_egress_cidrs(&opts.allow_web_egress)
         .context("invalid --allow-web-egress value")?;
-    check_runner_model_conflict(opts.model.as_deref(), &opts.set)?;
-    check_github_token_conflict(github_token, clear_github_token, &opts.set)?;
+    let operator_sets = opts.operator_sets();
+    check_runner_model_conflict(opts.model.as_deref(), &operator_sets)?;
+    check_github_token_conflict(github_token, clear_github_token, &operator_sets)?;
     for host in &opts.allow_egress_host {
         parse_egress_provider(host)?;
     }
@@ -530,16 +538,12 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 /// The canonical model providers `--allow-egress-host` accepts, each paired with
 /// the API hostname(s) its runner must reach, in the order shown in help and
 /// error text. The single source of truth for both the accepted-provider set and
-/// their egress hosts, so adding a provider is a one-line edit here.
+/// their egress hosts.
 ///
 /// This set is deliberately limited to the providers the runner can drive
-/// end-to-end today (`anthropic` via `sk-ant-` keys, `openrouter` via `sk-or-`
-/// keys). Opening egress to a host the runner cannot actually talk to gives
-/// false confidence, so a provider is only listed once the runner has runtime
-/// support for it. When the runner gains that support for additional providers
-/// (e.g. the `PROVIDER_BASE_URLS` base-URL providers zhipu/moonshot/deepseek, or
-/// native OpenAI/Gemini), layer them in here at the same time so the egress
-/// convenience list never advertises a provider the harness cannot use.
+/// end to end today. Opening egress to a host the runner cannot actually talk to
+/// gives false confidence, so a provider is only listed once the runner has
+/// runtime support for it. Native OpenAI and Gemini remain unsupported here.
 ///
 /// HOSTNAMES, never CIDRs: provider IPs rotate, so they are resolved to narrow
 /// host routes at install time (see [`resolve_provider_egress_cidrs`]) instead of
@@ -548,6 +552,9 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 const EGRESS_PROVIDERS: &[(&str, &[&str])] = &[
     ("anthropic", &["api.anthropic.com"]),
     ("openrouter", &["openrouter.ai"]),
+    ("zhipu", &["api.z.ai"]),
+    ("moonshot", &["api.moonshot.ai"]),
+    ("deepseek", &["api.deepseek.com"]),
 ];
 
 /// The API hostname(s) a named model provider's runner must reach, or `None`
@@ -779,7 +786,8 @@ pub fn sealed_credential_warning(
     if credentials_present && !any_egress_opened {
         Some(
             "a real model credential is set but the sandbox is sealed -- no egress opened, so the \
-             model is unreachable. Pass --allow-egress-host <anthropic|openrouter> \
+             model is unreachable. Pass --allow-egress-host \
+             <anthropic|openrouter|zhipu|moonshot|deepseek> \
              (or --allow-web-egress <CIDR>) and re-run."
                 .to_string(),
         )
@@ -837,7 +845,7 @@ pub fn model_egress_status_lines(
         ));
         lines.push((
             false,
-            "Replies will be canned. Set CURIE_CREDENTIALS (an Anthropic API key) and re-run `curie cluster up` to enable the real model.".into(),
+            "Replies will be canned. Set CURIE_CREDENTIALS to an Anthropic, OpenRouter, Zhipu, Moonshot, or DeepSeek credential and configure matching egress before re-running `curie cluster up` to enable the real model. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL.".into(),
         ));
     }
     lines
@@ -1066,7 +1074,33 @@ fn resolve_github_app_values(
 /// The PREVIOUS key is only ever preserved, never generated: it exists solely
 /// because an operator deliberately rotated, and inventing one would claim an
 /// overlap that never happened.
-fn resolve_sealing_values(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SealingPrivateKeyDisposition {
+    OperatorSet,
+    Deferred,
+    Preserved,
+    Generated,
+}
+
+fn sealing_private_key_disposition(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> SealingPrivateKeyDisposition {
+    if operator_set_keys(operator_sets).contains(crate::sealing::SEALING_PRIVATE_KEY) {
+        return SealingPrivateKeyDisposition::OperatorSet;
+    }
+    if preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY).is_some() {
+        return SealingPrivateKeyDisposition::Preserved;
+    }
+    if dry_run {
+        SealingPrivateKeyDisposition::Deferred
+    } else {
+        SealingPrivateKeyDisposition::Generated
+    }
+}
+
+fn resolve_preserved_sealing_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
@@ -1074,14 +1108,8 @@ fn resolve_sealing_values(
     let mut resolved = Vec::new();
 
     if !overridden.contains(crate::sealing::SEALING_PRIVATE_KEY) {
-        match preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
-            Some(current) => {
-                resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current))
-            }
-            None => resolved.push((
-                crate::sealing::SEALING_PRIVATE_KEY.to_string(),
-                crate::sealing::generate_keypair().private_key,
-            )),
+        if let Some(current) = preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
+            resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current));
         }
     }
     if !overridden.contains(crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY) {
@@ -1093,6 +1121,25 @@ fn resolve_sealing_values(
                 previous,
             ));
         }
+    }
+    resolved
+}
+
+fn resolve_sealing_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let mut resolved = resolve_preserved_sealing_values(existing, operator_sets);
+    if sealing_private_key_disposition(existing, operator_sets, false)
+        == SealingPrivateKeyDisposition::Generated
+    {
+        resolved.insert(
+            0,
+            (
+                crate::sealing::SEALING_PRIVATE_KEY.to_string(),
+                crate::sealing::generate_keypair().private_key,
+            ),
+        );
     }
     resolved
 }
@@ -1115,8 +1162,32 @@ fn resolve_preserved_values(
 ) -> Vec<(String, String)> {
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
-    all.extend(resolve_sealing_values(existing, operator_sets));
+    all.extend(resolve_preserved_sealing_values(existing, operator_sets));
     all
+}
+
+/// Resolve managed values for an actual or previewed `cluster up`.
+///
+/// An offline preview has no evidence that the sealing key is absent, so it
+/// carries only values that are positively known to exist. A live completion
+/// may generate the current sealing key after the release read proves it is
+/// absent.
+fn resolve_managed_values_for_up(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> Vec<(String, String)> {
+    let mut values = resolve_preserved_values(existing, operator_sets);
+    if sealing_private_key_disposition(existing, operator_sets, dry_run)
+        == SealingPrivateKeyDisposition::Generated
+    {
+        values.extend(
+            resolve_sealing_values(existing, operator_sets)
+                .into_iter()
+                .filter(|(key, _)| key == crate::sealing::SEALING_PRIVATE_KEY),
+        );
+    }
+    values
 }
 
 /// The chart value holding the model credential. Named here so the secret
@@ -1127,12 +1198,68 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 /// present -- see `up_commands`, which pushes both inside one `if let`.
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
+const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+
+fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
+    key == parent
+        || key
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
+}
+
+/// Carry the runner configuration recorded by a prior real model install into
+/// a plain rerun. Explicit inputs replace their recorded family.
+fn resolve_preserved_runner_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+
+    if !opts.fake_model
+        && opts.local_model.is_none()
+        && opts.credentials.is_none()
+        && !overridden.contains(MODEL_CREDENTIAL_KEY)
+    {
+        opts.credentials = preserved_value(existing, MODEL_CREDENTIAL_KEY);
+    }
+
+    if !opts.fake_model
+        && opts.local_model.is_none()
+        && opts.model.is_none()
+        && !overridden.contains(RUNNER_MODEL_KEY)
+    {
+        opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
+    }
+
+    let egress_replaced = !opts.allow_egress_host.is_empty()
+        || !opts.allow_web_egress.is_empty()
+        || overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
+    if egress_replaced {
+        return;
+    }
+
+    let mut recorded = BTreeMap::new();
+    if let Some(values) = existing {
+        crate::installation::flatten_values(values, "", &mut recorded);
+    }
+    opts.set.extend(
+        recorded
+            .into_iter()
+            .filter(|(key, _)| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY))
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
 /// on the release but absent from `curie.yaml` is normally reset to the chart
-/// default -- except for the families [`resolve_preserved_values`] re-supplies,
-/// which survive untouched. Reporting those as removals would be the exact
+/// default -- except for the families [`resolve_preserved_values`] and
+/// [`resolve_preserved_runner_values`] re-supply, which survive untouched.
+/// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
 /// Reads the same constants `up` reads, so a new preserved family is picked up
@@ -1371,10 +1498,10 @@ pub fn stateful_components_from_list(list: &serde_json::Value) -> Vec<(String, S
 /// `helm template` rather than a dry-run upgrade: it needs no cluster and
 /// cannot mutate, so the guard is safe to run before deciding whether to
 /// proceed.
-pub async fn chart_stateful_components(
+pub(crate) async fn chart_stateful_components(
     chart: &str,
     o: &CommonOpts,
-    value_sets: &[String],
+    value_plan: &UpValuePlan,
 ) -> Result<Vec<(String, String)>> {
     let mut args = vec![
         plain("template"),
@@ -1383,10 +1510,7 @@ pub async fn chart_stateful_components(
         plain("-n"),
         plain(&o.namespace),
     ];
-    for entry in value_sets {
-        args.push(plain("--set"));
-        args.push(plain(entry));
-    }
+    value_plan.append_command_args(&mut args);
     let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
     if !ok {
         bail!("could not render the target chart to check for removed stateful components: {err}");
@@ -1827,6 +1951,7 @@ data:
         assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 
+    /// Source: https://github.com/helm/helm/blob/v3.16.4/pkg/kube/client.go#L452-L455
     /// Helm upgrade honors only the exact lowercase `keep` value.
     #[test]
     fn helm_upgrade_exact_keep_annotation_is_not_at_risk() {
@@ -1952,12 +2077,18 @@ pub(crate) fn complete_up_opts(
     clear_github_token: bool,
     resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
+    let operator_sets = opts.operator_sets();
+    resolve_preserved_runner_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
-        opts.secrets = resolve_generated_secrets(existing, &opts.set)?;
-        opts.secrets
-            .extend(resolve_preserved_values(existing, &opts.set));
+        opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
+        opts.secrets.extend(resolve_managed_values_for_up(
+            existing,
+            &operator_sets,
+            opts.common.dry_run,
+        ));
     }
-    opts.github_token = resolve_github_token(existing, &opts.set, github_token, clear_github_token);
+    opts.github_token =
+        resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
     if resolve_provider_egress
         && !opts.allow_egress_host.is_empty()
         && opts.resolved_egress_cidrs.is_empty()
@@ -2108,6 +2239,7 @@ enum DiffParticipation {
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
     Set {
+        flag: HelmSetFlag,
         expression: String,
         effective: Vec<(String, String)>,
     },
@@ -2115,6 +2247,12 @@ enum PlannedHelmValues {
         values: Vec<(String, String)>,
         diff: DiffParticipation,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelmSetFlag {
+    Set,
+    SetString,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -2127,6 +2265,7 @@ impl UpValuePlan {
         let key = key.into();
         let value = value.into();
         self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::Set,
             expression: format!("{key}={value}"),
             effective: vec![(key, value)],
         });
@@ -2138,6 +2277,19 @@ impl UpValuePlan {
             .map(|(key, value)| (key.trim().to_string(), value.to_string()))
             .collect();
         self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::Set,
+            expression,
+            effective,
+        });
+    }
+
+    fn set_string_expression(&mut self, expression: String) {
+        let effective = operator_set_entries(std::slice::from_ref(&expression))
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+            .collect();
+        self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::SetString,
             expression,
             effective,
         });
@@ -2153,8 +2305,13 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::Set { expression, .. } => {
-                    args.push(plain("--set"));
+                PlannedHelmValues::Set {
+                    flag, expression, ..
+                } => {
+                    args.push(plain(match flag {
+                        HelmSetFlag::Set => "--set",
+                        HelmSetFlag::SetString => "--set-string",
+                    }));
                     args.push(plain(expression));
                 }
                 PlannedHelmValues::SecretFile { values, .. } => {
@@ -2243,12 +2400,18 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
     if let Some(model) = &o.model {
-        if explicit_runner_model(&o.set).is_none() {
+        if explicit_runner_model(&o.operator_sets()).is_none() {
             plan.set(RUNNER_MODEL_KEY, model);
         }
     }
     for expression in &o.set {
         plan.set_expression(expression.clone());
+    }
+    // Helm merges `--set-string` after `--set`, while `effective_values` uses
+    // insertion order. Keep the declared lane after the typed lane so duplicate
+    // keys resolve identically.
+    for expression in &o.set_string {
+        plan.set_string_expression(expression.clone());
     }
     plan
 }
@@ -3195,19 +3358,61 @@ async fn run_prepared_up(
 ) -> Result<ClusterUpOutput> {
     let ui = crate::ui::ui();
     if !opts.dev {
-        let preserved = resolve_preserved_values(existing.as_ref(), &opts.set);
+        let operator_sets = opts.operator_sets();
+        let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
         if !preserved.is_empty() {
-            ui.note(&format!(
-                "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; \
-                 re-run those verbs only to change them",
-                preserved.len()
-            ));
+            let sealing_values = preserved
+                .iter()
+                .filter(|(key, _)| crate::sealing::SEALING_MANAGED_KEYS.contains(&key.as_str()))
+                .count();
+            let message = if sealing_values == preserved.len() {
+                format!(
+                    "preserving {} sealing value(s) recorded by the release",
+                    preserved.len()
+                )
+            } else if sealing_values == 0 {
+                format!(
+                    "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; re-run those verbs only to change them",
+                    preserved.len()
+                )
+            } else {
+                format!(
+                    "preserving {} value(s), including {} sealing value(s), recorded by the release",
+                    preserved.len(),
+                    sealing_values
+                )
+            };
+            ui.note(&message);
         }
-        if existing.is_none() && !opts.secrets.is_empty() && !opts.common.dry_run {
-            ui.note(&format!(
-                "generated strong per-release secrets for {} required chart credential(s); re-running `cluster up` reuses them",
-                opts.secrets.len()
-            ));
+        match sealing_private_key_disposition(
+            existing.as_ref(),
+            &operator_sets,
+            opts.common.dry_run,
+        ) {
+            SealingPrivateKeyDisposition::Generated => {
+                ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
+            }
+            SealingPrivateKeyDisposition::Deferred => {
+                ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
+            }
+            SealingPrivateKeyDisposition::OperatorSet | SealingPrivateKeyDisposition::Preserved => {
+            }
+        }
+        if existing.is_none() && !opts.common.dry_run {
+            let generated_required_secrets = opts
+                .secrets
+                .iter()
+                .filter(|(key, _)| {
+                    REQUIRED_SECRETS
+                        .iter()
+                        .any(|(required, _)| *required == key.as_str())
+                })
+                .count();
+            if generated_required_secrets > 0 {
+                ui.note(&format!(
+                    "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
+                ));
+            }
         }
     }
     // `existing.is_some()` means this is an UPGRADE: an API pod is already
@@ -3277,7 +3482,7 @@ async fn run_prepared_up(
             }
         }
     }
-    if set_passthrough_leaks_github_token(&opts.set) {
+    if set_passthrough_leaks_github_token(&opts.operator_sets()) {
         ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
@@ -3341,11 +3546,17 @@ async fn run_prepared_up(
         ownership_candidates.push((ns, existed_before));
     }
 
-    // Provider egress is opened iff a provider was named: on a live run
-    // resolve_provider_egress_cidrs bails on an empty/failed resolution (so a
-    // non-empty allow_egress_host always yields non-empty resolved_egress_cidrs),
-    // and under --dry-run resolution is skipped but the intent still counts.
-    let any_egress = !opts.allow_egress_host.is_empty() || !opts.allow_web_egress.is_empty();
+    // Count named provider intent on both live and dry runs, plus egress
+    // implied by allow_egress_host resolution. Preserve explicit web egress
+    // and nonempty allowedEgress overrides supplied through either value lane.
+    let any_egress = !opts.allow_egress_host.is_empty()
+        || !opts.allow_web_egress.is_empty()
+        || operator_set_entries(&opts.operator_sets())
+            .into_iter()
+            .any(|(key, value)| {
+                key_is_or_descends_from(key.trim(), ALLOWED_EGRESS_KEY)
+                    && !matches!(value.trim(), "" | "[]")
+            });
     for (warn, msg) in model_egress_status_lines(
         opts.credentials.is_some(),
         opts.local_model.is_some(),
@@ -4612,6 +4823,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4632,6 +4844,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4662,6 +4875,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4682,6 +4896,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4715,6 +4930,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: true,
             credentials: None,
@@ -4731,6 +4947,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
             chart: "charts/curie".into(),
@@ -4872,6 +5089,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4888,6 +5106,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4919,6 +5138,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4938,6 +5158,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4969,6 +5190,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4992,6 +5214,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5073,6 +5296,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -5103,6 +5327,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5144,6 +5369,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -5170,6 +5396,7 @@ mod tests {
         let sealed_cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5196,6 +5423,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -6337,6 +6565,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -6527,6 +6756,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -6569,6 +6799,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -6601,6 +6832,7 @@ mod tests {
             dev: true,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -6621,6 +6853,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -7070,15 +7303,19 @@ mod tests {
 
     #[test]
     fn provider_egress_hosts_maps_known_providers_and_rejects_unknown() {
-        // The two runner-drivable providers map to their canonical API host(s).
-        assert_eq!(
-            provider_egress_hosts("anthropic").unwrap().to_vec(),
-            vec!["api.anthropic.com"]
-        );
-        assert_eq!(
-            provider_egress_hosts("openrouter").unwrap().to_vec(),
-            vec!["openrouter.ai"]
-        );
+        for (provider, hosts) in [
+            ("anthropic", vec!["api.anthropic.com"]),
+            ("openrouter", vec!["openrouter.ai"]),
+            ("zhipu", vec!["api.z.ai"]),
+            ("moonshot", vec!["api.moonshot.ai"]),
+            ("deepseek", vec!["api.deepseek.com"]),
+        ] {
+            assert_eq!(
+                provider_egress_hosts(provider).unwrap(),
+                hosts,
+                "{provider}"
+            );
+        }
 
         // `openai` and `gemini` are not runner-drivable today, so they are NOT
         // known providers: they fall through to `None` rather than minting an
@@ -7101,7 +7338,7 @@ mod tests {
     #[test]
     fn parse_egress_provider_accepts_known_and_errs_usage_on_unknown() {
         // Each runner-drivable provider parses to its own canonical name.
-        for p in ["anthropic", "openrouter"] {
+        for p in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
             assert_eq!(parse_egress_provider(p).unwrap(), p);
         }
 
@@ -7125,7 +7362,7 @@ mod tests {
         );
         // The message enumerates the accepted providers so the operator can fix
         // the flag without reading source.
-        for p in ["anthropic", "openrouter"] {
+        for p in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
             assert!(
                 err.message.contains(p),
                 "message should list `{p}`: {}",
@@ -7164,9 +7401,9 @@ mod tests {
     fn resolve_provider_egress_cidrs_dedups_sorts_and_covers_all_hosts() {
         use std::net::IpAddr;
         // Injected resolver so the test never touches real DNS. Anthropic and
-        // OpenRouter share 1.1.1.1 to prove deduplication; Anthropic also
+        // OpenRouter share 1.1.1.1 to prove deduplication. Anthropic also
         // yields an IPv6 address to prove the v4/v6 mix. All addresses are
-        // globally routable so they survive the split-horizon guard.
+        // globally routable so they survive the split horizon guard.
         let resolve = |host: &str| -> std::io::Result<Vec<IpAddr>> {
             Ok(match host {
                 "api.anthropic.com" => {
@@ -7178,15 +7415,27 @@ mod tests {
                 "openrouter.ai" => {
                     vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()]
                 }
+                "api.z.ai" => vec!["8.8.8.8".parse().unwrap()],
+                "api.moonshot.ai" => vec!["8.8.4.4".parse().unwrap()],
+                "api.deepseek.com" => vec!["9.9.9.9".parse().unwrap()],
                 other => panic!("unexpected host {other}"),
             })
         };
-        let providers = vec!["anthropic".to_string(), "openrouter".to_string()];
+        let providers = ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"]
+            .map(str::to_string)
+            .to_vec();
         let cidrs = resolve_provider_egress_cidrs(&providers, resolve).unwrap();
-        // Deduplicated (one 1.1.1.1/32) and sorted for a stable install argv.
+        // Deduplicated to one 1.1.1.1/32 and sorted for a stable install argv.
         assert_eq!(
             cidrs,
-            vec!["1.0.0.1/32", "1.1.1.1/32", "2606:4700::1111/128"]
+            vec![
+                "1.0.0.1/32",
+                "1.1.1.1/32",
+                "2606:4700::1111/128",
+                "8.8.4.4/32",
+                "8.8.8.8/32",
+                "9.9.9.9/32"
+            ]
         );
     }
 
@@ -7371,6 +7620,12 @@ mod tests {
         assert!(warn.contains("unreachable"), "{warn}");
         assert!(warn.contains("--allow-egress-host"), "{warn}");
         assert!(warn.contains("--allow-web-egress"), "{warn}");
+        for provider in ["anthropic", "openrouter", "zhipu", "moonshot", "deepseek"] {
+            assert!(
+                warn.contains(provider),
+                "warning should name {provider}: {warn}"
+            );
+        }
 
         // Every other combination stays silent.
         assert!(sealed_credential_warning(true, true).is_none());
@@ -7440,6 +7695,22 @@ mod tests {
     }
 
     #[test]
+    fn model_egress_status_lines_canned_guidance_requires_native_base_urls() {
+        let lines = model_egress_status_lines(false, false, false, &[], false, false);
+        let canned = lines
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .find(|message| message.contains("Replies will be canned"))
+            .expect("canned reply guidance");
+
+        for provider in ["Zhipu", "Moonshot", "DeepSeek"] {
+            assert!(canned.contains(provider), "{canned}");
+        }
+        assert!(canned.contains("worker runtime base URL"), "{canned}");
+        assert!(canned.contains("matching egress"), "{canned}");
+    }
+
+    #[test]
     fn model_egress_status_lines_dry_run_skips_past_tense_note() {
         // Under dry-run the handler prints its own "a live run resolves..."
         // note, so this fn emits no past-tense "egress opened" line.
@@ -7465,6 +7736,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -7507,6 +7779,7 @@ mod tests {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -7546,6 +7819,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: true,
             credentials: None,
@@ -7584,6 +7858,7 @@ mod tests {
         up_commands(&UpOpts {
             common: common(),
             github_token: plan,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -7968,6 +8243,7 @@ mod tests {
             dev: true,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -8008,6 +8284,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),

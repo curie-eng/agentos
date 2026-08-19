@@ -19,8 +19,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use anyhow::{bail, Context, Result};
 
 /// Where a sealed value is written in `connectors.yaml`, for the paste snippet.
-fn snippet(connector: &str, env_name: &str, blob: &str) -> String {
-    format!("connectors:\n  {connector}:\n    sealed_secrets:\n      {env_name}: {blob}")
+fn snippet(env_name: &str, blob: &str) -> String {
+    format!("    sealed_secrets:\n      {env_name}: {blob}")
 }
 
 pub struct SealOpts {
@@ -51,19 +51,46 @@ impl crate::ui::CliOutput for SealOutput {
             "env_name": self.env_name,
             "sealed": self.sealed,
             "public_key": self.public_key,
-            "yaml": snippet(&self.connector, &self.env_name, &self.sealed),
+            "yaml": snippet(&self.env_name, &self.sealed),
         })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        ui.payload_plain(&snippet(&self.connector, &self.env_name, &self.sealed));
+        ui.payload_plain(&snippet(&self.env_name, &self.sealed));
         ui.note(&format!(
             "sealed to public key {}. Only a cluster holding the matching private \
-             key can read it, so this is safe to commit. Paste the block above into \
-             connectors.yaml.",
-            self.public_key
+             key can read it, so this is safe to commit. The block above belongs under \
+             connectors.{} in connectors.yaml, but connector validation rejects \
+             sealed_secrets until #1434 lands, so it cannot be used yet.",
+            self.public_key, self.connector
         ));
     }
+}
+
+/// A connector name becomes a Kubernetes resource name component.
+fn validate_connector(name: &str) -> Result<()> {
+    let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = !name.is_empty()
+        && name.len() <= 40
+        && name
+            .bytes()
+            .all(|byte| is_alphanumeric(byte) || byte == b'-')
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| is_alphanumeric(*byte))
+        && name
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| is_alphanumeric(*byte));
+    if !valid {
+        return Err(crate::exit::CliError::usage(format!(
+            "connector name `{name}` must be a lower case RFC 1123 label of at most 40 characters"
+        ))
+        .with_fix("use lower case letters, digits, and internal hyphens, for example grafana")
+        .into());
+    }
+    Ok(())
 }
 
 /// An env var name, held to the same shape `curie secrets set` requires.
@@ -121,10 +148,8 @@ fn read_value(opts: &SealOpts) -> Result<String> {
 }
 
 pub async fn seal(opts: SealOpts) -> Result<SealOutput> {
+    validate_connector(&opts.connector)?;
     validate_env_name(&opts.env_name)?;
-    if opts.connector.trim().is_empty() {
-        bail!("--connector names the connector in connectors.yaml that reads this value");
-    }
 
     let public_key = match &opts.public_key {
         Some(key) => {
@@ -171,14 +196,32 @@ mod tests {
     use crate::sealing;
 
     #[test]
-    fn the_snippet_is_pasteable_yaml_in_the_shape_connectors_uses() {
-        let text = snippet("grafana", "GRAFANA_TOKEN", "AgBv3n2K");
-        let parsed: serde_json::Value =
-            serde_norway::from_str(&text).expect("the snippet must be valid YAML");
+    fn the_snippet_merges_under_a_connector_without_replacing_siblings() {
+        let fragment = snippet("GRAFANA_TOKEN", "AgBv3n2K");
+        assert_eq!(
+            fragment, "    sealed_secrets:\n      GRAFANA_TOKEN: AgBv3n2K",
+            "the paste guidance must contain only the connector child block"
+        );
+
+        let document = format!(
+            "connectors:\n  grafana:\n    image: grafana/example-connector:1.0\n{fragment}\n  slack:\n    image: slack/example-connector:1.0\n"
+        );
+        let parsed: serde_json::Value = serde_norway::from_str(&document)
+            .expect("the connector document with the pasted fragment must be valid YAML");
         assert_eq!(
             parsed["connectors"]["grafana"]["sealed_secrets"]["GRAFANA_TOKEN"],
             serde_json::json!("AgBv3n2K"),
-            "the snippet must nest exactly where connectors.yaml reads it"
+            "the fragment must nest where the connector reads sealed values"
+        );
+        assert_eq!(
+            parsed["connectors"]["grafana"]["image"],
+            serde_json::json!("grafana/example-connector:1.0"),
+            "pasting the fragment must preserve the connector image"
+        );
+        assert_eq!(
+            parsed["connectors"]["slack"]["image"],
+            serde_json::json!("slack/example-connector:1.0"),
+            "pasting the fragment must preserve sibling connectors"
         );
     }
 

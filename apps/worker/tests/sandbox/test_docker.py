@@ -289,6 +289,9 @@ def test_get_claim_surfaces_the_container_created_at() -> None:
 
     view = client.get_claim("t1")
     assert view is not None
+    assert view.quota_rejection is None
+    assert view.ready_reason is None
+    assert view.ready_message is None
     created = view.created_at
     assert created is not None
     assert created.utcoffset() == timedelta(0)  # tz-aware UTC, never naive

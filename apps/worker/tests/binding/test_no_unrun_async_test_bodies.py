@@ -86,8 +86,14 @@ def _unrun_coroutines(tree: ast.AST) -> list[tuple[str, str, int]]:
 
 
 def test_no_test_defines_a_coroutine_it_never_runs() -> None:
+    test_files = _test_files()
+    assert len(test_files) > 150, (
+        f"Async test body scan found {len(test_files)} files under root "
+        f"{REPO_ROOT.resolve()}; expected more than 150"
+    )
+
     problems: list[str] = []
-    for path in _test_files():
+    for path in test_files:
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:  # pragma: no cover - a broken file is another gate's job

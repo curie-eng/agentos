@@ -53,7 +53,12 @@ from curie_worker.kernel import Kernel
 from curie_worker.markers import Markers
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerClient
-from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
+from curie_worker.sandbox import (
+    AffinityStore,
+    QuotaRejection,
+    SandboxSubstrate,
+    SubstrateConfig,
+)
 from curie_worker.sandbox.types import ClaimView, SandboxView
 from curie_worker.threadlock import ThreadLock
 from redis.asyncio import Redis as AsyncRedis
@@ -303,6 +308,9 @@ class _FakeClaim:
     sandbox_name: str
     labels: dict[str, str]
     ready: bool = True
+    quota_rejection: QuotaRejection | None = None
+    ready_reason: str | None = None
+    ready_message: str | None = None
 
 
 @dataclass
@@ -319,6 +327,10 @@ class FakeK8s:
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     sandboxes: dict[str, _FakeSandbox] = field(default_factory=dict)
     claim_envs: list[dict[str, str] | None] = field(default_factory=list)
+    bind_ready: bool = True
+    quota_rejection: QuotaRejection | None = None
+    ready_reason: str | None = None
+    ready_message: str | None = None
 
     def create_claim(
         self,
@@ -334,6 +346,10 @@ class FakeK8s:
             name=name,
             sandbox_name=sandbox_name,
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
+            ready=self.bind_ready and self.quota_rejection is None,
+            quota_rejection=self.quota_rejection,
+            ready_reason=self.ready_reason,
+            ready_message=self.ready_message,
         )
         self.sandboxes[sandbox_name] = _FakeSandbox(name=sandbox_name)
 
@@ -347,6 +363,9 @@ class FakeK8s:
             sandbox_name=claim.sandbox_name if claim.ready else None,
             # This suite never reaps; the claim is simply as new as it looks.
             created_at=datetime.now(UTC),
+            quota_rejection=claim.quota_rejection,
+            ready_reason=claim.ready_reason,
+            ready_message=claim.ready_message,
         )
 
     def delete_claim(self, name: str) -> None:
@@ -515,6 +534,7 @@ async def kernel_harness(
     approvals: object | None = None,
     approval_reader: object | None = None,
     sink: object | None = None,
+    claim_timeout_seconds: float = 3.0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -534,7 +554,7 @@ async def kernel_harness(
             warm_pool="test-pool",
             runner_port=port,
             route_ttl_seconds=60,
-            claim_timeout_seconds=3.0,
+            claim_timeout_seconds=claim_timeout_seconds,
             poll_interval_seconds=0.005,
             key_prefix=names["sandbox_prefix"],
         ),

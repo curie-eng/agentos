@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from .connectors import CONNECTORS_FILE, validate_connectors
 from .manifest import resolve_manifest
 from .models import ApprovalGate, McpConfig, PluginManifest
+from .yaml_loader import safe_load_unique
 
 
 def grantable_routes(
@@ -227,7 +228,7 @@ def connector_server_names(root: str | Path) -> set[str] | None:
     if not path.is_file():
         return set()
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = safe_load_unique(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     parsed, errors = validate_connectors(data)

@@ -622,10 +622,32 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
 pub const CHART_CI_DIR: &str = "charts/curie/ci";
 
 /// One chart assertion script and how it fared.
+#[derive(Serialize)]
 pub struct ChartCheckOutcome {
     /// The script's file name, e.g. `render-assertions.sh`.
     pub name: String,
     pub passed: bool,
+}
+
+/// The result of a successful `curie dev chart-check` run.
+#[derive(Serialize)]
+pub struct ChartCheckOutput {
+    pub passed: usize,
+    pub total: usize,
+    pub scripts: Vec<ChartCheckOutcome>,
+}
+
+impl crate::ui::CliOutput for ChartCheckOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.success(&format!(
+            "all {} chart assertion scripts passed",
+            self.total
+        ));
+    }
 }
 
 /// Discover the assertion scripts `curie dev chart-check` runs: every executable
@@ -663,8 +685,8 @@ fn is_executable(_path: &Path) -> bool {
     true
 }
 
-/// Run every discovered script from `root`, streaming its output, and report how
-/// each one fared.
+/// Run every discovered script from `root`, streaming its stdout and stderr to
+/// this process's stderr, and report how each one fared.
 ///
 /// A failure does not stop the run: the point of the verb is that one invocation
 /// surfaces every problem, rather than making a contributor fix, re-run, and
@@ -691,6 +713,8 @@ pub async fn run_chart_check_scripts(
         let status = tokio::process::Command::new("bash")
             .arg(script)
             .current_dir(root)
+            .stdout(std::io::stderr())
+            .stderr(std::process::Stdio::inherit())
             .status()
             .await
             .with_context(|| format!("failed to invoke bash for {name}"))?;
@@ -750,10 +774,13 @@ pub async fn dev_chart_check() -> Result<()> {
             failed.join(", ")
         );
     }
-    ui.success(&format!(
-        "all {} chart assertion scripts passed",
-        outcomes.len()
-    ));
+    let passed = outcomes.iter().filter(|outcome| outcome.passed).count();
+    let total = outcomes.len();
+    ui.emit(&ChartCheckOutput {
+        passed,
+        total,
+        scripts: outcomes,
+    });
     Ok(())
 }
 
@@ -4292,8 +4319,6 @@ pub struct ApprovalCmd {
 /// re-checks all of these; these exist only so a typo is answered locally with a
 /// fix hint instead of a round trip (the same split the API's own
 /// `_validate_channel_binding` docstring describes).
-static SLACK_CHANNEL_ID: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^[CDG][A-Z0-9]{7,}$").expect("channel id re"));
 static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
@@ -4494,7 +4519,7 @@ fn build_route_bindings(
 
 /// Channel-shape check for one route binding, with the route named in the error.
 fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
-    if !SLACK_CHANNEL_ID.is_match(channel) {
+    if !crate::credcheck::looks_like_slack_channel_id(channel) {
         return Err(crate::exit::CliError::usage(format!(
             "route {route:?}: {channel:?} is not a Slack channel ID. Real Slack events \
              carry the ID and the worker routes on it, so a #name binding never \
@@ -4595,9 +4620,8 @@ fn approval_record_json(r: &crate::api::ApprovalRecord) -> serde_json::Value {
         "summary": r.summary,
         "expires_at": r.expires_at,
         "resolved_by": r.resolved_by,
-        // #1078: the one field --resolve cannot be driven without. Null when
-        // the record names no route, which means the requesting channel is the
-        // approver set rather than a bound one.
+        // #1078: the one field --resolve cannot be driven without. Null only
+        // for an older row or a direct API write that omitted this field.
         "card_channel": r.card_channel,
     })
 }

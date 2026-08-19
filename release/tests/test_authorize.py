@@ -855,8 +855,8 @@ RELEASE_YAML = REPO_ROOT / ".github" / "workflows" / "release.yaml"
 _MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_]+)\s*\}\}")
 
 
-def ci_job_check_run_names() -> set[str]:
-    """The concrete check-run names ci.yaml's jobs produce (issue #811).
+def workflow_job_check_run_names(path: Path) -> set[str]:
+    """The concrete check-run names a workflow's jobs produce (issue #811).
 
     Parses the real workflow rather than any list derived from
     `REQUIRED_CHECK_NAMES` -- deriving the expected set from the constant
@@ -868,7 +868,7 @@ def ci_job_check_run_names() -> set[str]:
     literal `matrix.name`), so a future job that matrixes on a different key
     is handled without editing this helper. A job with no `name:` is skipped.
     """
-    doc = yaml.safe_load(CI_YAML.read_text())
+    doc = yaml.safe_load(path.read_text())
     names: set[str] = set()
     for job in doc["jobs"].values():
         name = job.get("name")
@@ -884,9 +884,35 @@ def ci_job_check_run_names() -> set[str]:
     return names
 
 
+def ci_job_check_run_names() -> set[str]:
+    return workflow_job_check_run_names(CI_YAML)
+
+
 def helm_ci_job_check_run_names() -> set[str]:
-    doc = yaml.safe_load(HELM_CI_YAML.read_text())
-    return {job["name"] for job in doc["jobs"].values() if job.get("name")}
+    return workflow_job_check_run_names(HELM_CI_YAML)
+
+
+class TestHelmCiCheckRunNames:
+    def test_expands_matrix_include_rows(self, tmp_path, monkeypatch):
+        workflow = tmp_path / "helm-ci.yaml"
+        workflow.write_text(
+            """\
+jobs:
+  chart:
+    name: Chart (${{ matrix.helm }})
+    strategy:
+      matrix:
+        include:
+          - helm: 3.16.4
+          - helm: 3.17.0
+"""
+        )
+        monkeypatch.setitem(globals(), "HELM_CI_YAML", workflow)
+
+        assert helm_ci_job_check_run_names() == {
+            "Chart (3.16.4)",
+            "Chart (3.17.0)",
+        }
 
 
 class TestReleaseWorkflowContract:

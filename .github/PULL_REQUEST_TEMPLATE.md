@@ -8,14 +8,6 @@
 
 Closes #
 
-## Release train
-
-<!-- Use main for general bugs, security fixes, and shared changes. Use next only
-     for v0.7 features or bugs unique to unreleased v0.7 work. -->
-
-- [ ] This PR targets `main`.
-- [ ] This PR targets `next`.
-
 ## End-to-end verification
 
 <!-- Behavior-bearing changes only. Classify every tier required or n/a with a

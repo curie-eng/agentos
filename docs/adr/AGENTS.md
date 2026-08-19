@@ -1,8 +1,14 @@
 # ADR contributor procedure
 
-[ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) defines
-when an ADR authorizes implementation. [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
+[ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md), as
+amended by [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
+defines when an ADR authorizes implementation. [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
 defines how Accepted ADR history is preserved.
+
+The ADR requirement applies only to product and platform architecture decisions
+that establish or materially change durable system boundaries. CI configuration,
+build plumbing, and similar delivery mechanics are outside this requirement
+unless they also make such an architectural decision.
 
 ## Status vocabulary
 
@@ -22,8 +28,12 @@ defines how Accepted ADR history is preserved.
 3. Obtain explicit maintainer approval, then publish the status as `Accepted`.
    Existing code and implementation evidence cannot retroactively accept a
    Draft.
-4. Begin implementation only after acceptance. Track the work in a linked
-   GitHub issue and pull request.
+4. Acceptance is the authority for implementation. Normally, publish the ADR as
+   `Accepted` before beginning implementation. As the coordinated exception, an
+   ADR may land `Accepted` alongside implementation only with recorded explicit
+   maintainer approval and a named realizing code path. Without both, acceptance
+   must precede implementation. Track the work in a linked GitHub issue and pull
+   request.
 5. Revise a Draft through review. Once Accepted, preserve its body. Apply only
    the status, back link, pointer repair, and supersession rules in ADR 0045.
 6. Run `bash scripts/check-docs.sh` after any ADR change. Commit the regenerated

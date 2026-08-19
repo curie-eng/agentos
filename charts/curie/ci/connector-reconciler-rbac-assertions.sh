@@ -175,8 +175,10 @@ for required in CURIE_CONNECTOR_RECONCILE CURIE_CONNECTOR_APP_NAME; do
   grep -q "$required" <<<"$DISABLED" &&
     fail g "$required renders with the reconciler disabled; the env gate is not working"
 done
-grep -q "CURIE_API_URL" <<<"$ENABLED" || fail g "enabled render is missing CURIE_API_URL"
-grep -q "CURIE_API_URL" <<<"$DISABLED" || fail g "disabled render is missing CURIE_API_URL"
+for required in CURIE_API_URL CURIE_API_KEY; do
+  grep -q "$required" <<<"$ENABLED" || fail g "enabled render is missing $required"
+  grep -q "$required" <<<"$DISABLED" || fail g "disabled render is missing $required"
+done
 
 # Shared API wiring is not connector specific. The worker needs it in both
 # renders so its runs and eval lanes can call the platform API.

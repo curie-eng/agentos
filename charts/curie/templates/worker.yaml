@@ -127,9 +127,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- $hasWorkerApiUrl := false }}
+      {{- $hasWorkerApiKey := false }}
       {{- range .Values.worker.extraEnv }}
       {{- if eq .name "CURIE_API_URL" }}
       {{- $hasWorkerApiUrl = true }}
+      {{- end }}
+      {{- if eq .name "CURIE_API_KEY" }}
+      {{- $hasWorkerApiKey = true }}
       {{- end }}
       {{- end }}
       containers:
@@ -144,6 +148,9 @@ spec:
             {{- include "curie.env.valkey" . | nindent 12 }}
             {{- if not $hasWorkerApiUrl }}
             {{- include "curie.env.apiUrl" . | nindent 12 }}
+            {{- end }}
+            {{- if not $hasWorkerApiKey }}
+            {{- include "curie.env.apiKey" . | nindent 12 }}
             {{- end }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
@@ -191,12 +198,6 @@ spec:
             - name: CURIE_CONNECTOR_RECONCILE_INTERVAL_S
               value: {{ .Values.worker.connectorReconciler.intervalSeconds | quote }}
 {{- end }}
-            # The API URL and key are unconditional now that worker eval
-            # reporting is wired: the reconciler is no longer the only consumer,
-            # so neither rides the reconciler flag. The URL is rendered above,
-            # skipped only when worker.extraEnv already supplies CURIE_API_URL,
-            # so it cannot be emitted twice.
-            {{- include "curie.env.apiKey" . | nindent 12 }}
             - name: LANGFUSE_HOST
               value: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}
             - name: LANGFUSE_PUBLIC_KEY

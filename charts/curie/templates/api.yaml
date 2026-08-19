@@ -91,7 +91,7 @@ spec:
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
             # public repositories clone with no credential.
             - name: GITHUB_APP_ID
-              value: {{ .Values.api.githubAppId | quote }}
+              value: {{ if .Values.api.githubAppId }}{{ .Values.api.githubAppId | int64 | quote }}{{ else }}""{{ end }}
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:

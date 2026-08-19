@@ -10,6 +10,14 @@
 # script refuses when the gate would go from red to green purely because the
 # baseline moved.
 #
+# The refusal reads SHAPE -- the properties-and-required reading
+# `cli/tests/schema_inventory.rs` uses -- not a byte diff. ADR-0101 versions on a
+# shape change, and that gate already skips `description`, `title` and
+# `$comment` as prose. A byte diff here refused a corrected description outright
+# and demanded a bump that would tell every consumer to refetch a schema whose
+# shape did not move, which is neither what the ADR says nor what
+# `cli/schema/baseline/README.md` says this script does.
+#
 # It also refuses when the gate is currently GREEN and nothing needs refreshing.
 # Running it speculatively is how the baseline stops being a record of the last
 # published revision and becomes a copy of whatever is checked out, which costs
@@ -41,14 +49,60 @@ esac
 shopt -s nullglob
 live_schemas=("$schema_dir"/*.schema.json)
 
+# One schema's `$id` on the first line, then the JSON Pointer of every
+# `properties` key and every `required` entry anywhere in the document,
+# `$defs` included, sorted so the output is a stable fingerprint of the shape.
+# Mirrors `shape`/`walk` in cli/tests/schema_inventory.rs, prose skip included;
+# the two must agree, since that gate is what fails CI and this is what decides
+# whether the baseline may be refreshed for it.
+schema_shape() {
+  python3 - "$1" <<'SHAPE'
+import json, sys
+
+# Prose, not shape: skipping these keeps a reworded description from reading as
+# a compatibility event. Same list as the Rust gate.
+PROSE_KEYS = ("description", "title", "$comment")
+
+
+def walk(node, path, props, required):
+    if isinstance(node, dict):
+        declared = node.get("properties")
+        if isinstance(declared, dict):
+            props.update(f"{path}/properties/{key}" for key in declared)
+        names = node.get("required")
+        if isinstance(names, list):
+            required.update(
+                f"{path}/required/{name}" for name in names if isinstance(name, str)
+            )
+        for key, value in node.items():
+            if key in PROSE_KEYS:
+                continue
+            walk(value, f"{path}/{key}", props, required)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            walk(value, f"{path}/{index}", props, required)
+
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    schema = json.load(handle)
+props, required = set(), set()
+walk(schema, "", props, required)
+print(schema.get("$id", "") if isinstance(schema, dict) else "")
+for entry in sorted(props | required):
+    print(entry)
+SHAPE
+}
+
 mismatched=()
 for f in "${live_schemas[@]}"; do
   name="$(basename "$f")"
   base="$baseline_dir/$name"
   [[ -f "$base" ]] || continue
-  cur_id="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["$id"])' "$f")"
-  base_id="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["$id"])' "$base")"
-  if [[ "$cur_id" == "$base_id" ]] && ! diff -q "$f" "$base" >/dev/null; then
+  cur_shape="$(schema_shape "$f")"
+  base_shape="$(schema_shape "$base")"
+  cur_id="$(head -n1 <<<"$cur_shape")"
+  base_id="$(head -n1 <<<"$base_shape")"
+  if [[ "$cur_id" == "$base_id" && "$cur_shape" != "$base_shape" ]]; then
     mismatched+=("$name ($cur_id)")
   fi
 done
@@ -93,7 +147,7 @@ if (( ${#changed[@]} == 0 && ${#baseline_only[@]} == 0 )); then
 fi
 
 if (( ${#mismatched[@]} > 0 )); then
-  echo "refusing to refresh: these schemas changed while keeping their \$id (ADR-0101)." >&2
+  echo "refusing to refresh: these schemas changed SHAPE while keeping their \$id (ADR-0101)." >&2
   printf '  %s\n' "${mismatched[@]}" >&2
   echo >&2
   echo "Bump the version first -- minor for an added optional property, major for" >&2

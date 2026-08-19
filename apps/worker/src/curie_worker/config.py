@@ -52,8 +52,7 @@ def _parse_bool(value: object) -> bool:
 
     A real bool passes through (so kwarg construction in tests is unchanged); any
     other string is truthy only when it is one of the accepted tokens, matching
-    the previous hand-rolled ``_b`` (note: the worker does not treat "on" as
-    truthy, unlike the dispatcher).
+    the previous hand rolled ``_b``.
     """
     if isinstance(value, bool):
         return value
@@ -563,11 +562,7 @@ class WorkerConfig(BaseSettings):
     # worker's localhost self-dial (#678). Empty means "not split out": the ref
     # falls back to api_base_url, byte-identical to the pre-#678 behavior. That
     # fallback is correct wherever the worker's own api_base_url is already
-    # runner-reachable; it does NOT by itself make an unreachable api_base_url
-    # reachable. The k8s substrate is a separate case -- a default chart install
-    # wires neither CURIE_API_URL nor this on the worker, so its runner state
-    # refs are the same localhost gap in the opposite substrate, out of #678's
-    # docker scope -- see runner_facing_api_base_url.
+    # runner-reachable.
     runner_api_base_url: str = Field(default="", validation_alias="CURIE_RUNNER_API_URL")
     api_key: str = Field(default="curie-dev-key", validation_alias=API_KEY_ENV)
     # ---------------------------------------------------------------------
@@ -618,9 +613,8 @@ class WorkerConfig(BaseSettings):
         network than the worker (the docker substrate: host-net worker, bridge-net
         runner). When it is unset this falls back to api_base_url, byte-identical
         to the pre-#678 behavior -- correct wherever the worker's own api_base_url
-        is already runner-reachable, but not itself a fix for a substrate where it
-        is not (see the field comment on the k8s gap). Callers minting
-        runner-facing refs (CURIE_MEMORY_REF / CURIE_HISTORY_REF) read this,
+        is already runner-reachable. Callers minting runner-facing refs
+        (CURIE_MEMORY_REF / CURIE_HISTORY_REF) read this,
         never api_base_url directly (#678).
         """
         return self.runner_api_base_url or self.api_base_url

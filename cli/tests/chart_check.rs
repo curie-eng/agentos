@@ -34,6 +34,120 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Under `--json`, child process chatter belongs on stderr and stdout is one
+/// machine readable result object. The script intentionally writes each stream
+/// without a newline so inherited stdout cannot be mistaken for a JSON line.
+#[test]
+fn chart_check_json_keeps_child_chatter_off_stdout() {
+    let scratch = tempfile::tempdir().expect("scratch repo");
+    let ci_dir = scratch.path().join(CHART_CI_DIR);
+    std::fs::create_dir_all(&ci_dir).expect("create chart assertion directory");
+    std::fs::create_dir_all(scratch.path().join("runner")).expect("create repo sentinel dir");
+    std::fs::write(scratch.path().join("runner/Dockerfile"), "").expect("write repo sentinel");
+    write_script(
+        &ci_dir,
+        "chatty-assertion.sh",
+        "#!/bin/bash\nprintf 'child stdout without newline'\nprintf 'child stderr without newline' >&2\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args(["--json", "dev", "chart-check"])
+        .current_dir(scratch.path())
+        .output()
+        .expect("run chart-check against scratch repository");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+
+    assert!(
+        output.status.success(),
+        "the passing assertion script must leave chart-check successful; stderr: {stderr}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|error| {
+        panic!(
+            "--json stdout must be exactly one parseable result object, not child chatter: \
+             {error}; stdout: {stdout:?}"
+        )
+    });
+    assert!(
+        payload.is_object(),
+        "--json result must be an object: {payload}"
+    );
+    assert_eq!(payload["passed"], 1, "{payload}");
+    assert_eq!(payload["total"], 1, "{payload}");
+    assert_eq!(
+        payload["scripts"],
+        serde_json::json!([{ "name": "chatty-assertion.sh", "passed": true }]),
+        "{payload}"
+    );
+    assert!(
+        !stdout.contains("child stdout without newline"),
+        "child stdout must not contaminate the result object: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("child stdout without newline"),
+        "captured child stdout must be replayed to stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("child stderr without newline"),
+        "captured child stderr must remain on stderr: {stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+fn shell_scripts_without_execute_permission(dir: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read shell script directory {}: {error}", dir.display()));
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry.expect("read shell script directory entry").path();
+        if path.is_file() && path.extension().is_some_and(|extension| extension == "sh") {
+            let mode = std::fs::metadata(&path)
+                .expect("read shell script metadata")
+                .permissions()
+                .mode();
+            if mode & 0o111 == 0 {
+                found.push(path.strip_prefix(dir).unwrap_or(&path).to_path_buf());
+            }
+        }
+    }
+
+    found.sort();
+    found
+}
+
+/// Every direct shell assertion entry must be executable even though production
+/// discovery intentionally skips files without an execute bit. This inventory
+/// is independent of discovery, so a lost mode cannot become invisible to both
+/// the local verb and its parity check.
+#[cfg(unix)]
+#[test]
+fn every_chart_ci_shell_script_is_executable() {
+    let ci_dir = repo_root().join(CHART_CI_DIR);
+    let missing = shell_scripts_without_execute_permission(&ci_dir);
+    assert!(
+        missing.is_empty(),
+        "every direct *.sh file in {CHART_CI_DIR} must be executable; missing execute permission: {missing:?}"
+    );
+
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let mutant = write_script(
+        scratch.path(),
+        "mode-regression.sh",
+        "#!/bin/bash\nexit 0\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&mutant, std::fs::Permissions::from_mode(0o644))
+        .expect("remove execute permission from scratch script");
+
+    assert_eq!(
+        shell_scripts_without_execute_permission(scratch.path()),
+        vec![PathBuf::from("mode-regression.sh")],
+        "the independent inventory must reject a direct shell script with mode 0644"
+    );
+}
+
 /// AC3: a script added to `charts/curie/ci/` is picked up with no edit to `cli/`.
 ///
 /// The scratch copy stands in for the real directory so the assertion is about

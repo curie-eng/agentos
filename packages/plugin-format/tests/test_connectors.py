@@ -148,6 +148,21 @@ def test_bundle_surfaces_unparseable_yaml(tmp_path: Path) -> None:
     assert any(e.code == "connectors.unreadable" for e in result.errors)
 
 
+def test_bundle_rejects_a_duplicate_connector_name(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "connectors:\n"
+        "  grafana:\n"
+        "    url: https://first.example.com/mcp\n"
+        "  grafana:\n"
+        "    url: https://second.example.com/mcp\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    issue = next(e for e in result.errors if e.code == "connectors.duplicate_connector")
+    assert "grafana" in issue.message
+
+
 def test_bundle_with_a_valid_connector_passes(tmp_path: Path) -> None:
     root = _bundle(
         tmp_path,

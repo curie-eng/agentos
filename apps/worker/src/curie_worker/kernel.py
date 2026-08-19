@@ -86,7 +86,12 @@ from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .reply_sink import ReplySink, TargetRoute
 from .runner_client import RunnerClient, RunnerError, TurnStream
 from .sandbox import SandboxSubstrate
-from .sandbox.types import SandboxError, SandboxHandle, SuspendedThreadError
+from .sandbox.types import (
+    CapacityExhaustedError,
+    SandboxError,
+    SandboxHandle,
+    SuspendedThreadError,
+)
 from .threadlock import ThreadLock
 
 logger = logging.getLogger(__name__)
@@ -1325,6 +1330,33 @@ class Kernel:
                 routed = await self._route_and_start(
                     thread, event, boot_env, packs, source=qevent.source
                 )
+        except CapacityExhaustedError as exc:
+            release_order()
+            rejection = exc.rejection
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s resource=%s "
+                "requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.resource,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
+            if self._is_approval_resume(qevent.event_id):
+                return TurnOutcome(terminal_ok=False, classification="runner-error")
+            await self._reply_for(
+                qevent,
+                route,
+                (
+                    "This agent is at sandbox capacity. ResourceQuota "
+                    f"{rejection.quota_name} rejected {rejection.resource}: "
+                    f"requested {rejection.requested}, observed usage "
+                    f"{rejection.used}, hard limit {rejection.hard}. Try again "
+                    "after another conversation releases its sandbox."
+                ),
+            )
+            return TurnOutcome(terminal_ok=True)
         except (RunnerError, aiohttp.ClientError, TimeoutError, SandboxError) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable

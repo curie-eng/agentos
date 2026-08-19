@@ -36,6 +36,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
+    CapacityExhaustedError,
     ClaimTimeoutError,
     NoRouteError,
     RouteRecord,
@@ -223,8 +224,8 @@ class SandboxSubstrate:
         publishes a dial target, so a claim still inside that window is live
         and routeless at the same time. Reaping it deletes a running sandbox
         out from under a blocked creator, which then polls a claim that no
-        longer exists until its deadline and raises ClaimTimeoutError blaming
-        a saturated node. Age disambiguates: past the grace no creator can
+        longer exists until its deadline and reports a bind timeout. Age
+        disambiguates: past the grace no creator can
         still be waiting, because ``_claim_fresh`` deletes its own claim on
         both failure paths.
 
@@ -343,31 +344,28 @@ class SandboxSubstrate:
         self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
 
     def _await_bound(self, claim_name: str, deadline: float) -> str:
+        last_quota_rejection = None
+        last_ready_condition: tuple[str | None, str | None] | None = None
         while time.monotonic() < deadline:
             claim = self._k8s.get_claim(claim_name)
-            if claim is not None and claim.ready and claim.sandbox_name:
-                return claim.sandbox_name
+            if claim is not None:
+                last_quota_rejection = claim.quota_rejection
+                if claim.ready_reason is not None or claim.ready_message is not None:
+                    last_ready_condition = (claim.ready_reason, claim.ready_message)
+                if claim.ready and claim.sandbox_name:
+                    return claim.sandbox_name
             time.sleep(self._config.poll_interval_seconds)
-        # Name the likeliest cause and where to look. This message is the only
-        # thread an operator has: the turn surfaces to the user as an opaque
-        # `runner-error`, and the shape that produces it most often -- a
-        # CPU-starved node -- sets NO node condition, so pods read Running,
-        # probes green, disk fine, and every dashboard says healthy.
-        #
-        # Seen in production: a Langfuse/ClickHouse merge burst took a 2-vCPU
-        # node to 0.0% idle. The sandbox pod was created and its bundle-fetch
-        # init container started, but nothing finished inside the deadline, so
-        # all three attempts timed out identically with nothing to go on.
+        if last_quota_rejection is not None:
+            raise CapacityExhaustedError(last_quota_rejection)
+        condition_detail = "no Ready condition was observed"
+        if last_ready_condition is not None:
+            reason, message = last_ready_condition
+            condition_detail = (
+                f"last Ready condition had reason={reason!r} and message={message!r}"
+            )
         raise ClaimTimeoutError(
-            f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s. "
-            "The sandbox pod was created but did not become ready in time. The most "
-            "common cause is a CPU-saturated node -- which reports no node condition, "
-            "so pods still look Running and probes still pass. Check `top`/`kubectl top "
-            "node` for idle CPU (not just node conditions), and whether a component "
-            "whose CPU LIMIT approaches the node's capacity is bursting; under "
-            "contention the kernel divides CPU by requests, and bundle-fetch and the "
-            "runner request only 50m each. Other causes: the agent-sandbox controller "
-            "not reconciling, or an unfetchable bundle ref."
+            f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
+            f"{condition_detail}."
         )
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:

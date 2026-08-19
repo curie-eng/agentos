@@ -86,12 +86,65 @@ def test_a_validation_error_is_returned_not_swallowed(
     assert "deploy.bad_env" in r.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "targets:\n  p:\n    env: prod\n",
+        "targets:\n  p:\n    agent: null\n    env: prod\n",
+    ],
+    ids=["omitted", "explicit_null"],
+)
+def test_resolve_and_list_name_a_target_with_no_agent(
+    client: TestClient, auth_headers: dict, content: str
+) -> None:
+    resolved = _resolve(client, auth_headers, content, "p")
+    listed = client.post(
+        "/deploy-targets/list",
+        json={"content": content, "target": "p"},
+        headers=auth_headers,
+    )
+    assert resolved.status_code == listed.status_code == 400
+    assert resolved.json()["detail"] == listed.json()["detail"]
+    detail = resolved.json()["detail"]
+    assert "deploy.missing_agent" in detail
+    assert "targets.p" in detail
+    assert "None" not in detail
+
+
 def test_unparseable_yaml_is_a_400_naming_the_problem(
     client: TestClient, auth_headers: dict
 ) -> None:
     r = _resolve(client, auth_headers, "targets:\n  p:\n   env: [unclosed\n", "p")
     assert r.status_code == 400
     assert "unparseable" in r.json()["detail"]
+
+
+def test_explicit_mapping_tag_on_a_scalar_is_a_400(
+    client: TestClient, auth_headers: dict
+) -> None:
+    r = _resolve(client, auth_headers, "targets: !!map foo\n", "prod")
+    assert r.status_code == 400
+    assert "unparseable" in r.json()["detail"]
+
+
+def test_duplicate_target_name_is_a_400_naming_the_duplicate(
+    client: TestClient, auth_headers: dict
+) -> None:
+    content = (
+        "targets:\n"
+        "  prod:\n"
+        "    agent: first\n"
+        "    env: prod\n"
+        "    slack_channel: C0EXAMPLE1\n"
+        "  prod:\n"
+        "    agent: second\n"
+        "    env: prod\n"
+        "    slack_channel: C0EXAMPLE2\n"
+    )
+    r = _resolve(client, auth_headers, content, "prod")
+    assert r.status_code == 400, r.text
+    assert "deploy.duplicate_target" in r.json()["detail"]
+    assert "prod" in r.json()["detail"]
 
 
 # --------------------------------------------------------------------------- #

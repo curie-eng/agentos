@@ -10,6 +10,11 @@ const IPV4: &str = "1.1.1.1";
 const IPV6: &str = "2606:4700:4700::1111";
 const MODEL_VALUE: &str = "model-value-for-plan";
 const GITHUB_VALUE: &str = "github-value-for-plan";
+const RERUN_CREDENTIAL_SENTINEL: &str = "placeholder credential sentinel";
+const RERUN_MODEL_SENTINEL: &str = "placeholder/model";
+const RERUN_EGRESS_CIDR: &str = "192.0.2.10/32";
+const OVERRIDE_MODEL_SET: &str = "agentSandbox.runner.model=operator/model";
+const OVERRIDE_EGRESS_SET: &str = "security.networkPolicy.allowedEgress[0].cidr=198.51.100.20/32";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -56,6 +61,7 @@ const HELM_UNREACHABLE: &str =
 const HELM_FORBIDDEN: &str = "Error: query: secrets is forbidden: User \"system:serviceaccount:curie:deployer\" cannot list resource \"secrets\" in API group \"\" in the namespace \"parity\"";
 const HELM_EXECUTABLE_NOT_FOUND: &str = "Error: exec: executable kubelogin file not found in PATH";
 const SENTINEL_SEALING_KEY: &str = "SENTINEL_SEALING_PRIVATE_KEY";
+const PRESERVED_SEALING_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 const WARNING_PREFIXED_VALUES: &str = "WARNING: cached discovery information is stale\n{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}";
 const ARRAY_VALUES: &str = "[{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}]";
 
@@ -94,6 +100,8 @@ struct HelmFixture {
     file: PathBuf,
     values_response: HelmValuesResponse,
     log: PathBuf,
+    migration_state: PathBuf,
+    last_exec_script: PathBuf,
 }
 
 impl HelmFixture {
@@ -218,14 +226,63 @@ fi
 if [ "$1" = upgrade ]; then
     previous=''
     sealing_key_present='no'
+    runner_credential_present='no'
+    runner_credential_preserved='no'
+    runner_model_present='no'
+    runner_model_preserved='no'
+    runner_real_mode_preserved='no'
+    runner_egress_preserved='no'
     for argument in "$@"; do
         if [ "$previous" = '-f' ] && grep -q '"sealing"' "$argument" && grep -q '"privateKey"' "$argument"; then
             sealing_key_present='yes'
         fi
+        if [ "$previous" = '-f' ] && grep -Fq '"credentials"' "$argument"; then
+            runner_credential_present='yes'
+        fi
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_EXPECT_RUNNER_CREDENTIAL:-}" ] && grep -Fq "$CURIE_TEST_EXPECT_RUNNER_CREDENTIAL" "$argument"; then
+            runner_credential_preserved='yes'
+        fi
+        case "$argument" in
+            agentSandbox.runner.model=*) runner_model_present='yes' ;;
+        esac
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_MODEL:-}" ] && [ "$argument" = "agentSandbox.runner.model=$CURIE_TEST_EXPECT_RUNNER_MODEL" ]; then
+            runner_model_preserved='yes'
+        fi
+        if [ "$argument" = 'agentSandbox.runner.fakeModel=false' ]; then
+            runner_real_mode_preserved='yes'
+        fi
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}" ] && grep -Fq "$CURIE_TEST_EXPECT_RUNNER_EGRESS" "$argument"; then
+            runner_egress_preserved='yes'
+        fi
+        case "$argument" in
+            *"security.networkPolicy.allowedEgress"*"${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}"*) runner_egress_preserved='yes' ;;
+        esac
         previous="$argument"
     done
     if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
         printf 'SEALING_KEY_PRESENT: %s\n' "$sealing_key_present" >> "$CURIE_TEST_CALL_LOG"
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_CREDENTIAL:-}" ]; then
+            printf 'RUNNER_CREDENTIAL_PRESERVED: %s\n' "$runner_credential_preserved" >> "$CURIE_TEST_CALL_LOG"
+            printf 'RUNNER_MODEL_PRESERVED: %s\n' "$runner_model_preserved" >> "$CURIE_TEST_CALL_LOG"
+            printf 'RUNNER_REAL_MODE_PRESERVED: %s\n' "$runner_real_mode_preserved" >> "$CURIE_TEST_CALL_LOG"
+        fi
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}" ]; then
+            printf 'RUNNER_EGRESS_PRESERVED: %s\n' "$runner_egress_preserved" >> "$CURIE_TEST_CALL_LOG"
+        fi
+        if [ "${CURIE_TEST_EXPECT_FRESH_FAKE_MODEL:-}" = 1 ]; then
+            if [ "$runner_credential_present" = 'no' ] && [ "$runner_model_present" = 'no' ] && [ "$runner_real_mode_preserved" = 'no' ]; then
+                printf 'RUNNER_FRESH_FAKE_MODE: yes\n' >> "$CURIE_TEST_CALL_LOG"
+            else
+                printf 'RUNNER_FRESH_FAKE_MODE: no\n' >> "$CURIE_TEST_CALL_LOG"
+            fi
+        fi
+        if [ "${CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED:-}" = 1 ]; then
+            if [ "$runner_credential_present" = 'no' ] && [ "$runner_model_present" = 'no' ] && [ "$runner_real_mode_preserved" = 'no' ]; then
+                printf 'RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes\n' >> "$CURIE_TEST_CALL_LOG"
+            else
+                printf 'RUNNER_RECORDED_PROVIDER_SUPPRESSED: no\n' >> "$CURIE_TEST_CALL_LOG"
+            fi
+        fi
     fi
     exit 0
 fi
@@ -249,6 +306,14 @@ if [ -n "${{CURIE_TEST_CALL_LOG:-}}" ]; then
     printf 'KUBECTL_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 all="$*"
+script=""
+previous=""
+for argument in "$@"; do
+    if [ "$previous" = '-c' ]; then
+        script="$argument"
+    fi
+    previous="$argument"
+done
 verb=""
 object=""
 while [ $# -gt 0 ]; do
@@ -270,6 +335,27 @@ unexpected() {{
     printf 'unexpected kubectl invocation: %s\n' "$all" >&2
     exit 64
 }}
+migration_target="$CURIE_TEST_MIGRATION_STATE/target"
+migration_source="$CURIE_TEST_MIGRATION_STATE/source.list"
+persist_target() {{
+    target=$(printf '%s\n' "$script" | sed -n "s/.*printf '%s\\\\n' '\\(minio\\|rustfs\\)' > .*/\\1/p")
+    case "$target" in
+        minio|rustfs) printf '%s\n' "$target" > "$migration_target" ;;
+        *) unexpected ;;
+    esac
+}}
+persist_source() {{
+    if [ "${{CURIE_TEST_SOURCE_LIST_FAIL:-}}" = 1 ]; then
+        printf '%s\n' 'source listing failed' >&2
+        exit 1
+    fi
+    if [ -n "${{CURIE_TEST_SOURCE_LIST+x}}" ]; then
+        printf '%s\n' "$CURIE_TEST_SOURCE_LIST" > "$migration_source"
+    else
+        printf '%s\n' '{STAGED_OBJECT}' > "$migration_source"
+    fi
+    cat "$migration_source"
+}}
 case "$verb $object" in
 'get priorityclass')
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
@@ -287,7 +373,10 @@ case "$verb $object" in
         printf '%s\n' '{KUBECTL_FORBIDDEN}' >&2
         exit 1
     fi
-    if [ -n "${{CURIE_TEST_KUBECTL_STS:-}}" ]; then
+    if [ -n "${{CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE:-}}" ] &&
+       grep -q '^HELM_CALL: upgrade ' "$CURIE_TEST_CALL_LOG"; then
+        printf '%s\n' "$CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE"
+    elif [ -n "${{CURIE_TEST_KUBECTL_STS:-}}" ]; then
         printf '%s\n' "$CURIE_TEST_KUBECTL_STS"
     else
         printf '%s\n' '{KUBECTL_EMPTY_LIST}'
@@ -303,20 +392,85 @@ case "$verb $object" in
     esac
     ;;
 'get secret')
-    printf '%s\n' 'parity-secrets'
+    printf '%s\n' "${{CURIE_TEST_RELEASE_SECRET:-parity-secrets}}"
     ;;
-'run '*|'wait '*|'delete pod')
-    # Staging-pod lifecycle: nothing to say, just succeed.
-    : ;;
+'run '*)
+    mkdir -p "$CURIE_TEST_MIGRATION_STATE"
+    ;;
+'wait '*)
+    :
+    ;;
+'delete pod')
+    case "$all" in
+        *store-migration*) rm -f "$migration_target" "$migration_source" ;;
+    esac
+    ;;
 'exec '*)
+    printf '%s' "$script" > "$CURIE_TEST_LAST_EXEC_SCRIPT"
     # One answer per in-pod script the migration runs, keyed on the script
     # itself: a single canned answer here would let the export and the verify
     # read each other's output.
-    case "$all" in
+    case "$script" in
+        *'aws s3 ls'*'/migration/source.list'*|*'/migration/source.list'*'aws s3 ls'*)
+            persist_source
+            case "$script" in
+                *'/migration/target'*) persist_target ;;
+            esac
+            ;;
+        *'printf'*'/migration/target'*|*'echo '*'/migration/target'*)
+            persist_target
+            ;;
+        *'cat /migration/target'*)
+            if [ ! -s "$migration_target" ]; then
+                printf '%s\n' 'planned migration target is missing' >&2
+                exit 1
+            fi
+            cat "$migration_target"
+            ;;
+        *'cat /migration/source.list'*)
+            if [ ! -s "$migration_source" ]; then
+                printf '%s\n' 'persisted source inventory is missing' >&2
+                exit 1
+            fi
+            cat "$migration_source"
+            ;;
         *'wc -l'*) printf '%s\n' '1' ;;
-        *'-printf'*) printf '%s\n' '{STAGED_OBJECT}' ;;
-        *'aws s3 ls'*) printf '%s\n' '{STAGED_OBJECT}' ;;
+        *'-printf'*)
+            if [ -n "${{CURIE_TEST_STAGED_LIST+x}}" ]; then
+                printf '%s\n' "$CURIE_TEST_STAGED_LIST"
+            else
+                printf '%s\n' '{STAGED_OBJECT}'
+            fi
+            ;;
+        *'aws s3 ls'*)
+            case "$script" in
+                *'parity-minio.parity.svc.cluster.local'*)
+                    if [ "${{CURIE_TEST_SOURCE_LIST_FAIL:-}}" = 1 ]; then
+                        printf '%s\n' 'source listing failed' >&2
+                        exit 1
+                    fi
+                    if [ -n "${{CURIE_TEST_SOURCE_LIST+x}}" ]; then
+                        printf '%s\n' "$CURIE_TEST_SOURCE_LIST"
+                    else
+                        printf '%s\n' '{STAGED_OBJECT}'
+                    fi
+                    ;;
+                *'parity-rustfs.parity.svc.cluster.local'*)
+                    if [ "${{CURIE_TEST_TARGET_LIST_FAIL:-}}" = 1 ]; then
+                        printf '%s\n' 'target listing failed' >&2
+                        exit 1
+                    fi
+                    if [ -n "${{CURIE_TEST_TARGET_LIST+x}}" ]; then
+                        printf '%s\n' "$CURIE_TEST_TARGET_LIST"
+                    else
+                        printf '%s\n' '{STAGED_OBJECT}'
+                    fi
+                    ;;
+                *) unexpected ;;
+            esac
+            ;;
         *'aws s3 sync'*) printf '%s\n' 'synced' ;;
+        *'/migration/'*) unexpected ;;
         *) unexpected ;;
     esac
     ;;
@@ -330,11 +484,16 @@ exit 0
         );
 
         let log = temp.path().join("calls.log");
+        let migration_state = temp.path().join("migration");
+        fs::create_dir(&migration_state).expect("create migration state directory");
+        let last_exec_script = temp.path().join("last-exec-script");
         Self {
             temp,
             file,
             values_response,
             log,
+            migration_state,
+            last_exec_script,
         }
     }
 
@@ -344,6 +503,28 @@ exit 0
     /// than panicking.
     fn calls(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn seed_migration_evidence(&self, target: &str, source: &str) {
+        fs::write(self.migration_state.join("target"), format!("{target}\n"))
+            .expect("write planned migration target");
+        fs::write(
+            self.migration_state.join("source.list"),
+            format!("{source}\n"),
+        )
+        .expect("write persisted source inventory");
+    }
+
+    fn migration_target(&self) -> Option<String> {
+        fs::read_to_string(self.migration_state.join("target")).ok()
+    }
+
+    fn migration_source(&self) -> Option<String> {
+        fs::read_to_string(self.migration_state.join("source.list")).ok()
+    }
+
+    fn last_exec_script(&self) -> String {
+        fs::read_to_string(&self.last_exec_script).expect("captured in pod shell")
     }
 
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -360,10 +541,19 @@ exit 0
             .args(args)
             .env("PATH", path)
             .env("CURIE_TEST_CALL_LOG", &self.log)
+            .env("CURIE_TEST_MIGRATION_STATE", &self.migration_state)
+            .env("CURIE_TEST_LAST_EXEC_SCRIPT", &self.last_exec_script)
             .env_remove("CURIE_TEST_KUBECTL_STS")
+            .env_remove("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE")
             .env_remove("CURIE_TEST_KUBECTL_FAIL")
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
             .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
+            .env_remove("CURIE_TEST_RELEASE_SECRET")
+            .env_remove("CURIE_TEST_SOURCE_LIST_FAIL")
+            .env_remove("CURIE_TEST_SOURCE_LIST")
+            .env_remove("CURIE_TEST_STAGED_LIST")
+            .env_remove("CURIE_TEST_TARGET_LIST_FAIL")
+            .env_remove("CURIE_TEST_TARGET_LIST")
             .env_remove("CURIE_CREDENTIALS")
             .env_remove("CURIE_MODEL_CREDENTIALS")
             .env_remove("CURIE_GITHUB_TOKEN")
@@ -432,6 +622,31 @@ exit 0
     }
 
     fn cluster_up(&self) -> Output {
+        self.cluster_up_with(&["--fake-model"], &[])
+    }
+
+    fn cluster_up_with(&self, extra: &[&str], env: &[(&str, &str)]) -> Output {
+        let chart = repo_root().join("charts/curie");
+        let mut args = vec![
+            "cluster",
+            "up",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--set", "agentSandbox.controller.deploy=false"]);
+        self.run(&args, env)
+    }
+
+    fn cluster_up_without_credentials(&self, env: &[(&str, &str)]) -> Output {
+        self.cluster_up_with(&[], env)
+    }
+
+    fn cluster_up_dry_run(&self) -> Output {
         let chart = repo_root().join("charts/curie");
         self.run(
             &[
@@ -446,6 +661,7 @@ exit 0
                 "--fake-model",
                 "--set",
                 "agentSandbox.controller.deploy=false",
+                "--dry-run",
             ],
             &[],
         )
@@ -454,6 +670,20 @@ exit 0
 
 fn provider_egress_fixture() -> String {
     json!({"api.anthropic.com": [IPV4, IPV6]}).to_string()
+}
+
+fn recorded_runner_values() -> HelmValuesResponse {
+    HelmValuesResponse::Object(json!({
+        "agentSandbox": {"runner": {
+            "credentials": RERUN_CREDENTIAL_SENTINEL,
+            "fakeModel": false,
+            "model": RERUN_MODEL_SENTINEL
+        }},
+        "security": {"networkPolicy": {"allowedEgress": [{
+            "cidr": RERUN_EGRESS_CIDR,
+            "ports": [{"port": 443, "protocol": "TCP"}]
+        }]}}
+    }))
 }
 
 fn json_output(output: Output, verb: &str) -> Value {
@@ -621,8 +851,64 @@ fn live_minio_statefulset() -> String {
     .to_string()
 }
 
+fn live_mixed_store_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "parity-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            },
+            {
+                "metadata": {"name": "parity-valkey"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "valkey"}}}
+            },
+            {
+                "metadata": {"name": "parity-clickhouse"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "clickhouse"}}}
+            }
+        ]
+    })
+    .to_string()
+}
+
+fn live_rustfs_statefulset() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-rustfs"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+        }]
+    })
+    .to_string()
+}
+
+fn live_both_store_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "parity-rustfs"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+            }
+        ]
+    })
+    .to_string()
+}
+
 fn installation_with_effective_values() -> &'static str {
-    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  dispatcher.deploy: \"false\"\n  worker.replicas: \"3\"\n"
+    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  example.mode: disabled\n  worker.replicas: \"3\"\n"
 }
 
 #[derive(Clone, Copy)]
@@ -850,6 +1136,424 @@ fn existing_values_null_is_an_existing_release() {
 }
 
 #[test]
+fn store_migration_preview_mounts_the_discovered_release_secret() {
+    let fixture = HelmFixture::new("", HelmValuesResponse::Absent);
+    let chart = repo_root().join("charts/curie");
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "acme-minio"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/component": "minio"
+            }}}
+        }]
+    })
+    .to_string();
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+            "--dry-run",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
+        ],
+    );
+    let preview = json_output(output, "cluster migrate-store --dry-run")["plan"]
+        .as_array()
+        .expect("migration preview plan")
+        .iter()
+        .map(|line| line.as_str().expect("preview command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        fixture.calls().contains("KUBECTL_CALL: -n acme get secret"),
+        "the preview must discover the release Secret before planning its consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        preview.contains(r#""secretName":"acme-curie-secrets""#),
+        "the staging pod must mount the discovered Secret: {preview}"
+    );
+    assert!(
+        !preview.contains(r#""secretName":"acme-secrets""#),
+        "the preview must not guess a Secret name the chart does not render: {preview}"
+    );
+}
+
+#[test]
+fn store_migration_export_preview_mounts_the_discovered_release_secret() {
+    let fixture = HelmFixture::new("", HelmValuesResponse::Absent);
+    let chart = repo_root().join("charts/curie");
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "acme-minio"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/component": "minio"
+            }}}
+        }]
+    })
+    .to_string();
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "export",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+            "--dry-run",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
+        ],
+    );
+    let preview = json_output(output, "cluster migrate-store --phase export --dry-run")["plan"]
+        .as_array()
+        .expect("migration export preview plan")
+        .iter()
+        .map(|line| line.as_str().expect("preview command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        fixture.calls().contains("KUBECTL_CALL: -n acme get secret"),
+        "the export preview must discover the release Secret before planning its consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        preview.contains(r#""secretName":"acme-curie-secrets""#),
+        "the export staging pod must mount the discovered Secret: {preview}"
+    );
+    assert!(
+        !preview.contains(r#""secretName":"acme-secrets""#),
+        "the export staging pod must not guess a Secret name the chart does not render: {preview}"
+    );
+}
+
+#[test]
+fn cluster_up_reports_a_preserved_sealing_key_as_preserved() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "sealing": {"privateKey": PRESERVED_SEALING_KEY}
+        })),
+    );
+    let output = fixture.cluster_up();
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with a recorded sealing key");
+
+    assert!(
+        visible.contains("preserving 1") && visible.contains("sealing"),
+        "the existing sealing key must be counted and named as preserved:\n{visible}"
+    );
+    assert!(
+        !visible.contains("generated") || !visible.contains("sealing"),
+        "a recorded sealing key must not be reported as generated:\n{visible}"
+    );
+    assert!(
+        fixture.calls().contains("SEALING_KEY_PRESENT: yes"),
+        "the preserved key must reach the Helm consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        !visible.contains(PRESERVED_SEALING_KEY)
+            && !fixture.calls().contains(PRESERVED_SEALING_KEY),
+        "the preserved private key must remain redacted from output and command logs"
+    );
+}
+
+#[test]
+fn cluster_up_reports_a_new_sealing_key_as_generated_not_preserved() {
+    for (release_state, values_response) in [
+        ("absent release", HelmValuesResponse::Absent),
+        (
+            "existing release without a sealing key",
+            HelmValuesResponse::Object(json!({"ui": {"deploy": false}})),
+        ),
+    ] {
+        let fixture = HelmFixture::new(installation_for_the_stateful_guard(), values_response);
+        let output = fixture.cluster_up();
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        json_output(output, &format!("cluster up for {release_state}"));
+        let calls = fixture.calls();
+
+        assert!(
+            visible.contains(
+                "generated a sealing private key for this release; later cluster up runs preserve it"
+            ),
+            "{release_state} must report the generated sealing key exactly:\n{visible}"
+        );
+        assert!(
+            !visible.contains("preserving"),
+            "{release_state} must not report preservation for a generated key:\n{visible}"
+        );
+        assert!(
+            !visible.contains("cluster comms"),
+            "{release_state} must not attribute generation to cluster comms:\n{visible}"
+        );
+        assert!(
+            !visible.contains("cluster github-app"),
+            "{release_state} must not attribute generation to cluster github-app:\n{visible}"
+        );
+        assert!(
+            calls.contains("HELM_CALL: get values "),
+            "{release_state} must inspect the release values:\n{calls}"
+        );
+        assert!(
+            calls.contains("SEALING_KEY_PRESENT: yes"),
+            "the generated key for {release_state} must reach the Helm consumer:\n{calls}"
+        );
+    }
+}
+
+#[test]
+fn cluster_up_dry_run_defers_sealing_resolution_without_inventing_a_key() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let output = fixture.cluster_up_dry_run();
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up --dry-run");
+
+    assert!(
+        fixture.calls().is_empty(),
+        "the offline preview must not inspect the release:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        !visible.contains("sealing.privateKey"),
+        "an offline preview cannot honestly choose or invent the private key:\n{visible}"
+    );
+    assert!(
+        visible.contains("live run")
+            && visible.contains("sealing")
+            && visible.contains("preserv")
+            && visible.contains("generat"),
+        "the preview must explain that live release discovery decides preservation or generation:\n{visible}"
+    );
+}
+
+#[test]
+fn cluster_up_rerun_preserves_existing_runner_model_and_egress_configuration() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+
+    let output = fixture.cluster_up_without_credentials(&[
+        (
+            "CURIE_TEST_EXPECT_RUNNER_CREDENTIAL",
+            RERUN_CREDENTIAL_SENTINEL,
+        ),
+        ("CURIE_TEST_EXPECT_RUNNER_MODEL", RERUN_MODEL_SENTINEL),
+        ("CURIE_TEST_EXPECT_RUNNER_EGRESS", RERUN_EGRESS_CIDR),
+    ]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the credential sentinel leaked into command output: {visible}"
+    );
+    assert!(
+        !visible.contains("the sandbox is sealed -- no egress opened")
+            && !visible.contains("Pass --allow-egress-host"),
+        "a rerun preserving egress must not claim it is sealed or ask the operator to reopen it: {visible}"
+    );
+    json_output(output, "cluster up rerun");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: get values parity -n parity -o json"),
+        "a rerun must read the recorded release values: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_CREDENTIAL_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner credential through Helm's private values file: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_MODEL_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner model: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_REAL_MODE_PRESERVED: yes"),
+        "a rerun with a recorded credential must keep the real model enabled: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_EGRESS_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner egress route: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the credential sentinel leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_explicit_model_modes_suppress_recorded_provider_configuration() {
+    for (name, args, expected_value) in [
+        (
+            "local model",
+            &["--local-model", "qwen3:4b"] as &[&str],
+            Some("inference.model=qwen3:4b"),
+        ),
+        ("fake model", &["--fake-model"], None),
+    ] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        let output = fixture.cluster_up_with(
+            args,
+            &[("CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED", "1")],
+        );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+            "the recorded credential leaked during {name}: {visible}"
+        );
+        json_output(output, name);
+
+        let calls = fixture.calls();
+        assert!(
+            calls.contains("RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes"),
+            "{name} must suppress the recorded provider credential and model: {calls}"
+        );
+        if let Some(expected_value) = expected_value {
+            assert!(
+                calls.contains(expected_value),
+                "{name} must select the requested local model: {calls}"
+            );
+        }
+        assert!(
+            !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+            "the recorded credential leaked into the command log during {name}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn cluster_up_explicit_model_replaces_recorded_model() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(&["--set", OVERRIDE_MODEL_SET], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked while replacing the model: {visible}"
+    );
+    json_output(output, "cluster up with explicit model");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(OVERRIDE_MODEL_SET),
+        "the explicit model must reach Helm: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_MODEL_SENTINEL),
+        "the recorded model must not accompany the explicit model: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_explicit_egress_replaces_recorded_egress() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(&["--set", OVERRIDE_EGRESS_SET], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked while replacing egress: {visible}"
+    );
+    json_output(output, "cluster up with explicit egress");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(OVERRIDE_EGRESS_SET),
+        "the explicit egress route must reach Helm: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_EGRESS_CIDR),
+        "the recorded egress route must not accompany the explicit route: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_fresh_release_without_credentials_stays_fake() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    json_output(
+        fixture.cluster_up_without_credentials(&[("CURIE_TEST_EXPECT_FRESH_FAKE_MODEL", "1")]),
+        "fresh cluster up",
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("RUNNER_FRESH_FAKE_MODE: yes"),
+        "a fresh release without credentials must leave the runner in fake mode: {calls}"
+    );
+}
+
+#[test]
 fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values() {
     let fixture = HelmFixture::new(
         installation_with_effective_values(),
@@ -913,6 +1617,144 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     assert_eq!(diff_keys, apply_keys, "apply plan: {apply}; diff: {diff}");
+}
+
+#[test]
+fn apply_string_egress_does_not_warn_that_model_credential_is_sealed() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\nset:\n  security.networkPolicy.allowedEgress[0].cidr: \"198.51.100.20/32\"\n",
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulset = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-rustfs"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+        }]
+    })
+    .to_string();
+
+    let output = fixture.apply(
+        &[],
+        &[
+            ("CURIE_APPLY_TEST_MODEL_KEY", MODEL_VALUE),
+            ("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str()),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains("the sandbox is sealed"),
+        "an allowed egress string override must suppress the sealed credential warning: {visible}"
+    );
+    assert!(
+        !visible.contains(MODEL_VALUE),
+        "the model credential leaked during apply: {visible}"
+    );
+    json_output(output, "apply with string egress override");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(&format!("--set-string {OVERRIDE_EGRESS_SET}")),
+        "the string egress override must reach Helm through its original value lane: {calls}"
+    );
+    assert!(
+        !calls.contains(MODEL_VALUE),
+        "the model credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn numeric_looking_declared_set_values_use_helm_string_semantics() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  example.label: plain\n  example.leadingZero: \"00123\"\n  ui.deploy: disabled\n  worker.replicas: \"3\"\n",
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulset = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-rustfs"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+        }]
+    })
+    .to_string();
+
+    let output = fixture.apply(
+        &[],
+        &[("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str())],
+    );
+    let calls = fixture.calls();
+    assert!(
+        output.status.success(),
+        "apply failed with stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let template = calls
+        .lines()
+        .find(|line| line.starts_with("HELM_CALL: template "))
+        .unwrap_or_else(|| panic!("stateful guard did not render the chart:\n{calls}"));
+    let upgrade = calls
+        .lines()
+        .find(|line| line.starts_with("HELM_CALL: upgrade "))
+        .unwrap_or_else(|| panic!("apply did not upgrade the release:\n{calls}"));
+
+    for command in [template, upgrade] {
+        let tokens = command.split_whitespace().collect::<Vec<_>>();
+        assert!(
+            tokens
+                .windows(2)
+                .any(|pair| pair == ["--set", "ui.deploy=false"]),
+            "modeled values must retain Helm typed semantics: {command}"
+        );
+        let modeled_index = tokens
+            .windows(2)
+            .position(|pair| pair == ["--set", "ui.deploy=false"])
+            .expect("modeled ui value");
+        let declared_index = tokens
+            .windows(2)
+            .position(|pair| pair == ["--set-string", "ui.deploy=disabled"])
+            .unwrap_or_else(|| panic!("declared ui override missing: {command}"));
+        assert!(
+            modeled_index < declared_index,
+            "declared string override must follow the modeled value: {command}"
+        );
+        for setting in [
+            "api.githubAppId=4475970",
+            "example.label=plain",
+            "example.leadingZero=00123",
+            "ui.deploy=disabled",
+            "worker.replicas=3",
+        ] {
+            assert!(
+                tokens
+                    .windows(2)
+                    .any(|pair| pair == ["--set-string", setting]),
+                "declared value must use Helm string semantics: {command}"
+            );
+            assert!(
+                !tokens.windows(2).any(|pair| pair == ["--set", setting]),
+                "declared value reached Helm through the typed lane: {command}"
+            );
+        }
+    }
+
+    let diff = json_output(fixture.diff(&[]), "diff");
+    for (key, value) in [
+        ("ui.deploy", "disabled"),
+        ("api.githubAppId", "<secret>"),
+        ("example.label", "plain"),
+        ("example.leadingZero", "00123"),
+        ("worker.replicas", "3"),
+    ] {
+        assert_added(&diff, key, value);
+    }
 }
 
 #[test]
@@ -1062,10 +1904,15 @@ fn migrate_store_alone_still_migrates() {
         installation_for_the_stateful_guard(),
         HelmValuesResponse::Absent,
     );
+    let live_before = live_minio_statefulset();
+    let live_after = live_rustfs_statefulset();
 
     let output = fixture.apply(
         &["--migrate-store"],
-        &[("CURIE_TEST_KUBECTL_STS", &live_minio_statefulset())],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+        ],
     );
 
     let calls = fixture.calls();
@@ -1094,19 +1941,869 @@ fn migrate_store_alone_still_migrates() {
     // The export must be COMPLETE before the upgrade deletes the old store, and
     // the import must run after it. Staging alone, then upgrading, is the
     // failure mode that empties the store.
+    let exported = calls
+        .find("aws s3 sync s3://curie-bundles /stage")
+        .unwrap_or_else(|| panic!("the export must copy the source into staging:\n{calls}"));
     let staged = calls
-        .find("find /stage -type f | wc -l")
-        .unwrap_or_else(|| panic!("the export must count what it staged:\n{calls}"));
+        .find("find . -type f -printf")
+        .unwrap_or_else(|| panic!("the export must inventory what it staged:\n{calls}"));
+    let source_capture = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-minio.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("the export must capture the final source inventory:\n{calls}"));
     let imported = calls
         .find("aws s3 sync /stage")
         .unwrap_or_else(|| panic!("the import must load the staged objects back:\n{calls}"));
     assert!(
-        staged < upgrade && upgrade < imported,
+        exported < staged && staged < upgrade && upgrade < imported,
         "the export completes before the upgrade and the import runs after it:\n{calls}"
     );
+    let source_read = upgrade
+        + calls[upgrade..]
+            .find("/migration/source.list")
+            .unwrap_or_else(|| {
+                panic!("the import must read the persisted source inventory:\n{calls}")
+            });
+    let target_listing = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-rustfs.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("the migration must verify the planned target:\n{calls}"));
+    let released = calls
+        .rfind("KUBECTL_CALL: delete pod")
+        .unwrap_or_else(|| panic!("a verified migration must release staging:\n{calls}"));
     assert!(
-        calls.contains("KUBECTL_CALL: delete pod"),
+        target_listing < released,
         "a verified migration releases the staging pod:\n{calls}"
+    );
+    assert!(
+        exported < source_capture
+            && source_capture < upgrade
+            && upgrade < source_read
+            && source_read < target_listing
+            && target_listing < released,
+        "the safe path must export, capture source evidence, upgrade, read that evidence, verify the target, then release staging:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_live_store_that_disagrees_with_the_planned_target() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+    let live_after = live_minio_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let upgrade = calls
+        .find("HELM_CALL: upgrade")
+        .unwrap_or_else(|| panic!("the migration must reach the planned upgrade:\n{calls}"));
+    assert!(
+        !output.status.success(),
+        "a live minio store cannot satisfy the planned rustfs target; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !calls[upgrade..].contains("aws s3 sync /stage"),
+        "the migration must not import into the detected old store:\n{calls}"
+    );
+    assert!(
+        !calls[upgrade..].contains("KUBECTL_CALL: delete pod"),
+        "a target disagreement must retain the staged copy:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_standalone_import_dry_run_reads_no_live_state() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+            "--dry-run",
+        ],
+        &[],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.is_empty(),
+        "standalone import dry run must not read the cluster or persisted state:\n{calls}"
+    );
+    let json = json_output(output, "cluster migrate-store --phase import --dry-run");
+    let plan = json["plan"]
+        .as_array()
+        .expect("standalone import dry run plan array");
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("cat /migration/target")),
+        "the plan must show the persisted target read: {json}"
+    );
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("cat /migration/source.list")),
+        "the plan must show the persisted source proof read: {json}"
+    );
+}
+
+#[test]
+fn migrate_store_split_export_then_import_uses_persisted_evidence() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let chart = repo_root().join("charts/curie");
+    let live_before = live_minio_statefulset();
+    let inventory = "100 bundle.tar\n200 second_bundle.tar";
+
+    let exported = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "export",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_SOURCE_LIST", inventory),
+            ("CURIE_TEST_STAGED_LIST", inventory),
+        ],
+    );
+
+    let export_json = json_output(exported, "cluster migrate-store --phase export");
+    assert_eq!(export_json["phase"], "export", "{export_json}");
+    assert_eq!(export_json["to"], "rustfs", "{export_json}");
+    assert_eq!(export_json["objects"], 2, "{export_json}");
+    assert_eq!(
+        fixture.migration_target().as_deref(),
+        Some("rustfs\n"),
+        "export must persist its planned target for a later process"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n200 second_bundle.tar\n"),
+        "export must persist its final source inventory for a later process"
+    );
+
+    let before_import = fixture.calls().len();
+    let live_after = live_rustfs_statefulset();
+    let imported = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_after.as_str()),
+            ("CURIE_TEST_STAGED_LIST", inventory),
+            ("CURIE_TEST_TARGET_LIST", inventory),
+        ],
+    );
+
+    let import_json = json_output(imported, "cluster migrate-store --phase import");
+    assert_eq!(import_json["phase"], "import", "{import_json}");
+    assert_eq!(import_json["store"], "rustfs", "{import_json}");
+    assert_eq!(import_json["objects"], 2, "{import_json}");
+    assert_eq!(import_json["verified"], true, "{import_json}");
+    assert_eq!(import_json["staging_kept"], false, "{import_json}");
+    let calls = fixture.calls();
+    let import_calls = &calls[before_import..];
+    assert!(
+        import_calls.contains("/migration/target"),
+        "the second process must read the target exported by the first:\n{import_calls}"
+    );
+    assert!(
+        import_calls.contains("/migration/source.list"),
+        "the second process must read the source inventory exported by the first:\n{import_calls}"
+    );
+    assert!(
+        import_calls.contains("http://parity-rustfs.parity.svc.cluster.local:9000"),
+        "the second process must import into the persisted rustfs target:\n{import_calls}"
+    );
+    assert!(
+        fixture.migration_target().is_none() && fixture.migration_source().is_none(),
+        "verified import may release the staging pod and its evidence"
+    );
+}
+
+#[test]
+fn migrate_store_standalone_import_refuses_a_detected_store_that_disagrees_with_the_plan() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    fixture.seed_migration_evidence("rustfs", STAGED_OBJECT);
+    let live = live_minio_statefulset();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[("CURIE_TEST_KUBECTL_STS", live.as_str())],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "cluster migrate-store --phase import");
+    let message = error["error"].as_str().expect("error message string");
+    assert!(
+        message.contains("rustfs") && message.contains("minio"),
+        "the refusal must name the planned and detected stores: {error}"
+    );
+    assert!(
+        calls.contains("/migration/target"),
+        "standalone import must read the persisted plan:\n{calls}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: get svc")
+            && !calls.contains("aws s3 sync /stage")
+            && !calls.contains("KUBECTL_CALL: delete pod"),
+        "a plan disagreement must stop before target lookup, import, or staging deletion:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_target().as_deref(),
+        Some("rustfs\n"),
+        "a target disagreement must retain the persisted plan"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n"),
+        "a target disagreement must retain the persisted source proof"
+    );
+}
+
+#[test]
+fn migrate_store_standalone_import_refuses_an_unknown_persisted_target() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    fixture.seed_migration_evidence("seaweedfs", STAGED_OBJECT);
+    let live = live_rustfs_statefulset();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[("CURIE_TEST_KUBECTL_STS", live.as_str())],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "cluster migrate-store --phase import");
+    let message = error["error"].as_str().expect("error message string");
+    assert!(
+        message.contains("unknown") && message.contains("seaweedfs"),
+        "the refusal must name the malformed persisted target: {error}"
+    );
+    assert!(
+        !calls.contains("aws s3 sync /stage") && !calls.contains("KUBECTL_CALL: delete pod"),
+        "an unknown target must stop before import or staging deletion:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_target().as_deref(),
+        Some("seaweedfs\n"),
+        "an unknown target must retain the persisted evidence"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n"),
+        "an unknown target must retain the source proof"
+    );
+}
+
+#[test]
+fn migrate_store_standalone_import_refuses_both_live_stores() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    fixture.seed_migration_evidence("rustfs", STAGED_OBJECT);
+    let live = live_both_store_statefulsets();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[("CURIE_TEST_KUBECTL_STS", live.as_str())],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "cluster migrate-store --phase import");
+    let message = error["error"].as_str().expect("error message string");
+    assert!(
+        message.contains("both minio and rustfs"),
+        "the refusal must name the ambiguous live stores: {error}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: get svc")
+            && !calls.contains("aws s3 sync /stage")
+            && !calls.contains("KUBECTL_CALL: delete pod"),
+        "ambiguous live stores must stop before target lookup, import, or staging deletion:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_target().as_deref(),
+        Some("rustfs\n"),
+        "ambiguous live stores must retain the persisted plan"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n"),
+        "ambiguous live stores must retain the source proof"
+    );
+}
+
+#[test]
+fn migrate_store_requires_a_successful_source_listing_before_deleting_staging() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+    let live_after = live_rustfs_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+            ("CURIE_TEST_SOURCE_LIST_FAIL", "1"),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let source_listing = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-minio.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("verification must list the planned source store:\n{calls}"));
+    assert!(
+        !output.status.success(),
+        "a failed source listing leaves the migration unverified; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("source listing failed"),
+        "the source listing failure must remain diagnosable:\n{reported}"
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "a failed final source inventory must stop before the destructive upgrade:\n{calls}"
+    );
+    assert!(
+        !calls[source_listing..].contains("KUBECTL_CALL: delete pod"),
+        "a failed source listing must retain the staged copy:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_late_source_object_before_the_upgrade() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+    let live_after = live_rustfs_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+            (
+                "CURIE_TEST_SOURCE_LIST",
+                "100 bundle.tar\n200 late_bundle.tar",
+            ),
+            ("CURIE_TEST_STAGED_LIST", STAGED_OBJECT),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let source_listing = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-minio.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("the export must capture the final source inventory:\n{calls}"));
+    assert!(
+        calls[..source_listing].contains("aws s3 sync s3://curie-bundles /stage"),
+        "the late write check must follow the export copy:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "a source object absent from staging must refuse the migration; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("late_bundle.tar"),
+        "the late source object must be named in the refusal:\n{reported}"
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade") && !calls.contains("aws s3 sync /stage"),
+        "a source versus staging mismatch must stop before upgrade and import:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n200 late_bundle.tar\n"),
+        "the failed preupgrade check must retain its final source evidence"
+    );
+}
+
+#[test]
+fn migrate_store_keeps_staging_when_the_target_omits_a_source_object() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+    let live_after = live_rustfs_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+            (
+                "CURIE_TEST_SOURCE_LIST",
+                "100 bundle.tar\n200 late_bundle.tar",
+            ),
+            (
+                "CURIE_TEST_STAGED_LIST",
+                "100 bundle.tar\n200 late_bundle.tar",
+            ),
+            ("CURIE_TEST_TARGET_LIST", STAGED_OBJECT),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let source_listing = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-minio.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("verification must list the planned source store:\n{calls}"));
+    let target_listing = calls
+        .find("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-rustfs.parity.svc.cluster.local:9000")
+        .unwrap_or_else(|| panic!("verification must list the planned target store:\n{calls}"));
+    assert!(
+        source_listing < target_listing,
+        "verification must compare the source snapshot with the target result:\n{calls}"
+    );
+    let upgrade = calls.find("HELM_CALL: upgrade").unwrap_or_else(|| {
+        panic!("equal source and staging inventories must reach the upgrade:\n{calls}")
+    });
+    assert!(
+        upgrade < target_listing,
+        "the target mismatch must be detected after the safe preupgrade check:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "a target missing a source object must be unverified; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("late_bundle.tar"),
+        "the unsafe target object must be named in the failure:\n{reported}"
+    );
+    assert!(
+        !calls[target_listing..].contains("KUBECTL_CALL: delete pod"),
+        "an incomplete target must retain the staged copy:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n200 late_bundle.tar\n"),
+        "failed target verification must retain the persisted source proof"
+    );
+}
+
+#[test]
+fn migrate_store_import_exits_nonzero_when_the_target_listing_fails() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    fixture.seed_migration_evidence("rustfs", STAGED_OBJECT);
+    let live = live_rustfs_statefulset();
+
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_TARGET_LIST_FAIL", "1"),
+        ],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("/migration/target") && calls.contains("/migration/source.list"),
+        "standalone import must use the persisted plan and source proof:\n{calls}"
+    );
+    assert!(
+        calls.contains("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-rustfs.parity.svc.cluster.local:9000"),
+        "the import must attempt target verification:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "a failed target listing must not report a verified migration; stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reported.contains("target listing failed"),
+        "the target listing failure must remain diagnosable:\n{reported}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: delete pod"),
+        "failed target verification must retain the staged copy:\n{calls}"
+    );
+    assert_eq!(
+        fixture.migration_target().as_deref(),
+        Some("rustfs\n"),
+        "failed target verification must retain the planned target"
+    );
+    assert_eq!(
+        fixture.migration_source().as_deref(),
+        Some("100 bundle.tar\n"),
+        "failed target verification must retain the source proof"
+    );
+}
+
+#[test]
+fn apply_import_failure_names_the_standalone_recovery_command() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_before = live_minio_statefulset();
+    let live_after = live_rustfs_statefulset();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live_before.as_str()),
+            ("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE", live_after.as_str()),
+            ("CURIE_TEST_TARGET_LIST_FAIL", "1"),
+        ],
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: upgrade")
+            && calls.contains("aws s3 ls s3://curie-bundles --recursive --endpoint-url http://parity-rustfs.parity.svc.cluster.local:9000"),
+        "the fixture must fail during import verification after the upgrade:\n{calls}"
+    );
+    assert!(
+        !output.status.success(),
+        "apply import verification failure must exit nonzero; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|parse_error| {
+        panic!(
+            "apply import verification failure did not emit one JSON error object: {parse_error}; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    assert!(error.get("fix").is_some(), "apply error payload: {error}");
+    let message = error["error"].as_str().expect("error message string");
+    assert!(
+        message.contains("curie cluster migrate-store --phase import"),
+        "an applied upgrade with failed import must name the standalone recovery command: {error}"
+    );
+    let upgrade = calls
+        .find("HELM_CALL: upgrade")
+        .expect("the fixture reached the applied upgrade");
+    assert!(
+        !calls[upgrade..].contains("KUBECTL_CALL: delete pod"),
+        "failed apply import verification must retain staging after the upgrade:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_source_listing_shell_preserves_a_failed_aws_status() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_minio_statefulset();
+
+    let _ = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_SOURCE_LIST_FAIL", "1"),
+        ],
+    );
+
+    let script = fixture.last_exec_script();
+    assert!(
+        script.contains("aws s3 ls")
+            && script.contains("parity-minio.parity.svc.cluster.local")
+            && script.contains("/migration/source.list"),
+        "the public CLI must expose the source evidence shell to the kubectl surface: {script}"
+    );
+
+    let shell_bin = fixture.temp.path().join("source-listing-shell-bin");
+    fs::create_dir(&shell_bin).expect("create source listing shell bin directory");
+    let aws_log = fixture.temp.path().join("source-aws-calls.log");
+    write_exec(
+        &shell_bin,
+        "aws",
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_AWS_LOG"
+if [ "$1" = configure ]; then
+    exit 0
+fi
+if [ "$1" = s3 ] && [ "$2" = ls ]; then
+    printf '%s\n' 'forced aws source listing failure' >&2
+    exit 42
+fi
+printf 'unexpected aws invocation: %s\n' "$*" >&2
+exit 64
+"#,
+    );
+    write_exec(
+        &shell_bin,
+        "cat",
+        "#!/bin/sh\nprintf '%s\\n' 'fixture-secret'\n",
+    );
+    write_exec(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
+    let source_raw = fixture.temp.path().join("source.raw");
+    let source_tmp = fixture.temp.path().join("source.list.tmp");
+    let target_tmp = fixture.temp.path().join("target.tmp");
+    let bash_env = fixture.temp.path().join("source-listing-bash-env");
+    fs::write(
+        &bash_env,
+        "enable -n [\ntrap 'source_raw=\"$CURIE_TEST_SOURCE_RAW\"; source_tmp=\"$CURIE_TEST_SOURCE_TMP\"; target_tmp=\"$CURIE_TEST_TARGET_TMP\"' DEBUG\n",
+    )
+    .expect("write source listing bash environment");
+    let mut paths = vec![shell_bin];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    let path = std::env::join_paths(paths).expect("join source listing shell PATH");
+
+    let shell_output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASH_ENV", &bash_env)
+        .env("PATH", path)
+        .env("CURIE_TEST_AWS_LOG", &aws_log)
+        .env("CURIE_TEST_SOURCE_RAW", &source_raw)
+        .env("CURIE_TEST_SOURCE_TMP", &source_tmp)
+        .env("CURIE_TEST_TARGET_TMP", &target_tmp)
+        .output()
+        .expect("execute the generated source listing shell");
+    let aws_calls = fs::read_to_string(&aws_log).expect("read fake source aws calls");
+    assert!(
+        aws_calls.lines().any(|line| line.starts_with("s3 ls ")),
+        "the generated source shell must reach the failing aws listing:\n{aws_calls}"
+    );
+    assert_eq!(
+        shell_output.status.code(),
+        Some(42),
+        "the exact generated source shell must preserve aws exit 42; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&shell_output.stdout),
+        String::from_utf8_lossy(&shell_output.stderr)
+    );
+}
+
+#[test]
+fn migrate_store_listing_shell_preserves_a_failed_aws_status() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    fixture.seed_migration_evidence("rustfs", STAGED_OBJECT);
+    let live = live_rustfs_statefulset();
+
+    let _ = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "import",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_TARGET_LIST_FAIL", "1"),
+        ],
+    );
+
+    let script = fixture.last_exec_script();
+    assert!(
+        script.contains("aws s3 ls") && script.contains("parity-rustfs.parity.svc.cluster.local"),
+        "the public CLI must expose the target listing shell to the kubectl surface: {script}"
+    );
+
+    let shell_bin = fixture.temp.path().join("listing-shell-bin");
+    fs::create_dir(&shell_bin).expect("create listing shell bin directory");
+    let aws_log = fixture.temp.path().join("aws-calls.log");
+    write_exec(
+        &shell_bin,
+        "aws",
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_AWS_LOG"
+if [ "$1" = configure ]; then
+    exit 0
+fi
+if [ "$1" = s3 ] && [ "$2" = ls ]; then
+    printf '%s\n' 'forced aws listing failure' >&2
+    exit 1
+fi
+printf 'unexpected aws invocation: %s\n' "$*" >&2
+exit 64
+"#,
+    );
+    write_exec(
+        &shell_bin,
+        "cat",
+        "#!/bin/sh\nprintf '%s\\n' 'fixture-secret'\n",
+    );
+    write_exec(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
+    let bash_env = fixture.temp.path().join("listing-bash-env");
+    fs::write(&bash_env, "enable -n [\n").expect("write bash environment");
+    let mut paths = vec![shell_bin];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    let path = std::env::join_paths(paths).expect("join listing shell PATH");
+
+    let shell_output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASH_ENV", &bash_env)
+        .env("PATH", path)
+        .env("CURIE_TEST_AWS_LOG", &aws_log)
+        .output()
+        .expect("execute the generated listing shell");
+    let aws_calls = fs::read_to_string(&aws_log).expect("read fake aws calls");
+    assert!(
+        aws_calls.lines().any(|line| line.starts_with("s3 ls ")),
+        "the generated shell must reach the failing aws listing:\n{aws_calls}"
+    );
+    assert!(
+        !shell_output.status.success(),
+        "the exact generated listing shell must preserve aws exit one; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&shell_output.stdout),
+        String::from_utf8_lossy(&shell_output.stderr)
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_mixed_removed_and_renamed_batch() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulsets = live_mixed_store_statefulsets();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_HELM_MIXED_STATEFULSETS", "1"),
+            ("CURIE_TEST_KUBECTL_STS", &live_statefulsets),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "apply --migrate-store");
+    let message = error["error"].as_str().expect("apply error message string");
+    assert!(
+        message.contains("nameOverride"),
+        "a renamed StatefulSet must direct the operator to nameOverride:\n{message}"
+    );
+    assert!(
+        message.contains("parity-minio")
+            && message.contains("parity-postgres")
+            && message.contains("parity-curie-postgres"),
+        "the refusal must include the removed store and renamed StatefulSet:\n{message}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: run "),
+        "a mixed batch must stop before the migration export:\n{calls}"
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "a mixed batch must stop before the upgrade:\n{calls}"
     );
 }
 

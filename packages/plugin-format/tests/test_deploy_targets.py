@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from plugin_format import validate_bundle
 from plugin_format.deploy_targets import validate_deploy_targets
 
@@ -91,10 +92,17 @@ def test_env_defaults_to_dev_so_a_target_must_opt_in_to_prod() -> None:
     assert parsed.targets["p"].env == "dev"
 
 
-def test_agent_may_be_omitted_to_mean_the_manifest_name() -> None:
-    parsed, _ = validate_deploy_targets({"targets": {"p": {"env": "prod"}}})
-    assert parsed is not None
-    assert parsed.targets["p"].agent is None
+@pytest.mark.parametrize(
+    "target",
+    [{"env": "prod"}, {"agent": None, "env": "prod"}],
+    ids=["omitted", "explicit_null"],
+)
+def test_missing_agent_names_the_target(target: dict[str, object]) -> None:
+    _, errors = validate_deploy_targets({"targets": {"p": target}})
+    messages = [message for code, message in errors if code == "deploy.missing_agent"]
+    assert len(messages) == 1
+    assert "targets.p" in messages[0]
+    assert "None" not in messages[0]
 
 
 def test_unknown_key_is_rejected_not_ignored() -> None:
@@ -115,11 +123,80 @@ def test_bundle_surfaces_a_target_error(tmp_path: Path) -> None:
     assert any(e.code == "deploy.bad_env" for e in result.errors)
 
 
+@pytest.mark.parametrize(
+    "target_yaml",
+    ["    env: prod\n", "    agent: null\n    env: prod\n"],
+    ids=["omitted", "explicit_null"],
+)
+def test_bundle_refuses_a_missing_agent_at_load_time(
+    tmp_path: Path, target_yaml: str
+) -> None:
+    root = _bundle(tmp_path, f"targets:\n  p:\n{target_yaml}")
+    result = validate_bundle(str(root))
+    issues = [error for error in result.errors if error.code == "deploy.missing_agent"]
+    assert not result.valid
+    assert len(issues) == 1
+    assert "targets.p" in issues[0].message
+    assert "None" not in issues[0].message
+
+
 def test_bundle_surfaces_unparseable_yaml(tmp_path: Path) -> None:
     root = _bundle(tmp_path, "targets:\n  p:\n   env: [unclosed\n")
     result = validate_bundle(str(root))
     assert not result.valid
     assert any(e.code == "deploy.unreadable" for e in result.errors)
+
+
+def test_bundle_rejects_a_duplicate_target_name(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "targets:\n"
+        "  prod:\n"
+        "    agent: first\n"
+        "    env: prod\n"
+        "  prod:\n"
+        "    agent: second\n"
+        "    env: prod\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    issue = next(e for e in result.errors if e.code == "deploy.duplicate_target")
+    assert "prod" in issue.message
+
+
+def test_bundle_allows_an_explicit_override_of_a_merged_target_field(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "targets:\n"
+        "  dev: &base\n"
+        "    agent: acme\n"
+        "    env: dev\n"
+        "    slack_channel: C0EXAMPLE1\n"
+        "  prod:\n"
+        "    <<: *base\n"
+        "    env: prod\n",
+    )
+    assert validate_bundle(str(root)).valid
+
+
+def test_bundle_allows_chained_merge_anchors(tmp_path: Path) -> None:
+    root = _bundle(
+        tmp_path,
+        "targets:\n"
+        "  dev: &dev\n"
+        "    agent: acmedev\n"
+        "    env: dev\n"
+        "    slack_channel: C0EXAMPLE1\n"
+        "  candidate: &candidate\n"
+        "    <<: *dev\n"
+        "    agent: acmecandidate\n"
+        "  prod:\n"
+        "    <<: *candidate\n"
+        "    agent: acmeprod\n"
+        "    env: prod\n"
+        "    slack_channel: C0EXAMPLE2\n",
+    )
+    assert validate_bundle(str(root)).valid
 
 
 def test_the_real_acme_bot_routing_validates(tmp_path: Path) -> None:

@@ -27,8 +27,11 @@ CLAUDE_CONTRIBUTION = HarnessContribution(
     aliases=frozenset({"claude-sdk", "claude-code"}),
     image="curie-runner",
     install=InstallSpec(
-        packages=("@anthropic-ai/claude-code",),
-        notes="runs as a non-root user; see runner/Dockerfile",
+        packages=("claude-agent-sdk",),
+        notes=(
+            "includes its bundled runtime and runs as a non-root user; "
+            "see runner/Dockerfile"
+        ),
     ),
     auth=AuthSpec(
         credential_env_keys=sdk_auth.DEFAULT_CREDENTIAL_ENV_KEYS,

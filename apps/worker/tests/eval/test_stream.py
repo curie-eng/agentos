@@ -146,6 +146,9 @@ class _FakeK8s:
             ready=True,
             sandbox_name=claim.sandbox_name,
             created_at=datetime.now(UTC),
+            quota_rejection=None,
+            ready_reason=None,
+            ready_message=None,
         )
 
     def delete_claim(self, name: str) -> None:

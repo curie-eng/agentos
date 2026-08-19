@@ -54,6 +54,8 @@ jobs:
         run: uv lock --check
       - name: Sync workspace
         run: uv sync
+      - name: Alembic revision gate
+        run: uv run python scripts/check-alembic-revisions.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy
@@ -238,11 +240,6 @@ jobs:
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
           python3 -m pip install --user --break-system-packages "ziglang==0.16.0"
           cargo install cargo-zigbuild --locked --version 0.23.0
-      # x86_64 only. The floor is a property of the toolchain, not the
-      # architecture, so building both would double the cost to re-prove the
-      # same thing -- and the arm64 artifact cannot be EXECUTED here without
-      # dragging in qemu. The static assertion below covers arm64 at release
-      # time; this job's job is to prove the floor is real, not merely declared.
       # Both Linux targets, the same way a tag builds them. arm64 is here as
       # much for the artifact as for the check: it is the target that cannot be
       # obtained any other way between releases, and the one a Graviton cluster
@@ -264,6 +261,7 @@ jobs:
       # The floor asserted above is a claim about symbols. This is the claim
       # under test: Amazon Linux 2023 is glibc 2.34, it is what the deployment
       # runbook provisions, and it is where `curie --version` died.
+      # The Amazon Linux execution check remains x86_64 only because arm64 execution would require qemu.
       - name: Run it on Amazon Linux 2023
         run: |
           set -euo pipefail
@@ -1167,7 +1165,10 @@ jobs:
     name: E2E required
     runs-on: ubuntu-latest
     needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster]
-    if: ${{ always() }}
+    # A cancelled run leaves no evidence and must rerun. In a completed run,
+    # every dependency outcome reaches the strict matcher below, which rejects
+    # selected results other than success.
+    if: ${{ !cancelled() }}
     steps:
       - name: Require exact selected outcomes
         env:
@@ -1181,6 +1182,15 @@ jobs:
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
         run: |
           set -euo pipefail
+
+          validate_selected_outcomes() {
+            if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                  "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
+                  "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
+              return 1
+            fi
+            return 0
+          }
 
           if [[ "$CHANGES_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
@@ -1204,26 +1214,31 @@ jobs:
             cluster_expected="success"
           fi
 
-          if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
-                "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
-                "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
+          if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
             exit 1
           fi
 
-          negative_skill_local_expected="skipped"
-          if [[ "true" == "true" || "false" == "true" ]]; then
-            negative_skill_local_expected="success"
-          fi
-          negative_local_release_expected="skipped"
-          negative_cluster_expected="skipped"
-          if [[ "success" != "success" ||
-                "skipped" == "$negative_skill_local_expected" ||
-                "skipped" == "$negative_local_release_expected" ||
-                "skipped" == "$negative_cluster_expected" ]]; then
-            echo "Selected and skipped negative control passed"
+          negative_skill_local_result="$skill_local_expected"
+          negative_local_release_result="$local_release_expected"
+          negative_cluster_result="$cluster_expected"
+          if [[ "$skill_local_expected" == "success" ]]; then
+            negative_skill_local_result="skipped"
+          elif [[ "$local_release_expected" == "success" ]]; then
+            negative_local_release_result="skipped"
+          elif [[ "$cluster_expected" == "success" ]]; then
+            negative_cluster_result="skipped"
           else
+            negative_skill_local_result="success"
+          fi
+
+          if SKILL_LOCAL_RESULT="$negative_skill_local_result" \
+            LOCAL_RELEASE_RESULT="$negative_local_release_result" \
+            CLUSTER_RESULT="$negative_cluster_result" \
+            validate_selected_outcomes; then
             echo "Selected and skipped negative control failed" >&2
             exit 1
           fi
+          echo "Selected and skipped negative control passed"
+
           echo "E2E required passed"

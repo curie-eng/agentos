@@ -285,8 +285,8 @@ pub fn primer() -> Primer {
                 detail: "The platform blocks the author of the turn that raised a request from resolving it, under every approver set. Testing an approval flow therefore needs a second actor: pass `--as <other-user>` on the resolve.",
             },
             Landmine {
-                title: "A group-bound route with no bot token on the API refuses every click",
-                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED, so every resolution is refused as not-an-approver with nothing naming the token as the cause. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
+                title: "A group route with no bot token on the API refuses every click",
+                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED: every resolution reports `could not verify approver group membership`; the refusal does not name the missing token. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
             },
             Landmine {
                 title: "Silence after a request usually means an unbound route",
@@ -298,7 +298,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "A real model in-cluster needs its provider's egress opened",
-                detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter); a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
+                detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter/zhipu/moonshot/deepseek). Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration; a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
             },
             Landmine {
                 title: "The skill runner executes an immutable snapshot taken at `skill up`",
@@ -328,7 +328,7 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
-                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live; on cluster, also open the provider egress with --allow-egress-host <provider> or the model stays unreachable.",
+                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live; on cluster, also open the provider egress with --allow-egress-host <provider>. Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration or the model stays unreachable.",
             },
             Recovery {
                 symptom: "the agent answers but never calls your MCP tools",
@@ -348,7 +348,15 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "a resolve is refused with \"you are not an approver\"",
-                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
+                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"could not verify approvers\"",
+                fix: "The declared approvers block is malformed, so the platform cannot determine who may resolve. Correct its `users` or `group` value, then replace the complete route map.",
+            },
+            Recovery {
+                symptom: "a resolve is refused with \"could not verify approver group membership\"",
+                fix: "Slack group membership could not be verified, so the platform fails CLOSED. The refusal does not name the missing token. Check the API's SLACK_BOT_TOKEN, its `usergroups:read` scope and reinstallation, and Slack availability.",
             },
             Recovery {
                 symptom: "a command \"does not exist\"",

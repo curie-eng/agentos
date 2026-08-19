@@ -52,10 +52,12 @@ the same commands.
 **Python (all packages, from root):**
 Run this local Python CI baseline. Do not use `--profile full` for startup
 because it can start stale application images.
+Set `base=next` when your worktree targets `next`.
 
 ```bash
 (
   set -e
+  base=${base:-main}
   export COMPOSE_PROJECT_NAME=curie-implement-baseline
   exec 9>/tmp/curie-implement-baseline.lock
   if ! flock -n 9; then
@@ -66,6 +68,7 @@ because it can start stale application images.
   trap 'docker compose --profile full -f compose.dev.yaml down -v; rm -f "$wire_lock"' EXIT
   uv lock --check
   uv sync
+  uv run python scripts/check-alembic-revisions.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports
@@ -85,8 +88,8 @@ because it can start stale application images.
   done
   curl -fsS http://localhost:23000/api/public/health >/dev/null
   (cd apps/api && uv run alembic upgrade head)
-  git fetch --no-tags --depth=1 origin main || true
-  git show origin/main:packages/aci-protocol/schema/wire.lock > "$wire_lock" 2>/dev/null || true
+  git fetch --no-tags --depth=1 origin "$base" || true
+  git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true
   uv run python -m aci_protocol.wire_lock --check-base "$wire_lock"
   uv run pytest -q
 )
@@ -587,10 +590,13 @@ runtime verification, commits, and pull requests.
 Two different tools; do not conflate them.
 
 Draft ADRs may merge for discussion, but they cannot authorize implementation.
-Implementation may start only after the ADR is published as `Accepted` with
-explicit maintainer approval, and it is tracked in a linked GitHub issue and
-pull request. Follow [`docs/adr/AGENTS.md`](docs/adr/AGENTS.md) for the complete
-procedure.
+Acceptance is the authority for implementation. Normally, publish the ADR as
+`Accepted` with explicit maintainer approval before beginning implementation.
+As the coordinated exception, an ADR may land `Accepted` alongside
+implementation only with recorded explicit maintainer approval and a named
+realizing code path. Without both, acceptance must precede implementation. Track
+the work in a linked GitHub issue and pull request. Follow
+[`docs/adr/AGENTS.md`](docs/adr/AGENTS.md) for the complete procedure.
 
 - Write an **ADR** (`docs/adr/`, see ADR-0001) only for a **cross-cutting
   architectural decision that closes the door on alternatives.** It is a choice

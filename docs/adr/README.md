@@ -129,10 +129,17 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0097 | [One file declares an installation](0097-one-file-declares-an-installation.md) | Accepted |
 | 0098 | [Thinking depth is an operator knob, never a bundle one](0098-thinking-depth-is-an-operator-knob-never-a-bundle-one.md) | Accepted |
 | 0099 | [Hooks are bundle-declared turns the system starts](0099-hooks-are-bundle-declared-turns-the-system-starts.md) | Draft |
+| 0100 | [Agents search their own surface through the channel port](0100-agents-search-their-own-surface-through-the-channel-port.md) | Draft |
 | 0101 | [Closed schemas version on every change: minor for optional, major for required](0101-schema-compatibility-for-closed-schemas.md) | Accepted |
 | 0102 | [Accepted alongside implementation with explicit approval](0102-accepted-alongside-implementation-with-explicit-approval.md) | Accepted |
 | 0103 | [Previous schema shape gate](0103-previous-schema-shape-gate.md) | Accepted |
 | 0104 | [A named security posture is computed from the layers that exist, never configured](0104-a-named-security-posture-is-computed-not-configured.md) | Accepted |
+| 0105 | [External native session checkpoints are a harness capability](0105-external-native-session-checkpoints.md) | Draft |
+| 0106 | [An approver is an authenticated principal, never a caller-asserted string](0106-an-approver-is-an-authenticated-principal.md) | Draft |
+| 0107 | [An agent reads its own runs through a first-party surface, scoped by structured identity](0107-an-agent-reads-its-own-runs-through-a-first-party-scoped-surface.md) | Draft |
+| 0108 | [A deploy target carries its environment's values](0108-a-deploy-target-carries-its-environments-values.md) | Draft |
+| 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
+| 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -35,10 +35,11 @@ pub struct Installation {
     pub credentials: Credentials,
     #[serde(default)]
     pub comms: Comms,
-    /// Verbatim `helm --set key=value` escape hatch, for anything this schema
-    /// does not model yet. Present deliberately: without it, adopting the file
-    /// would mean giving up settings that flags can express, and nobody would
-    /// adopt it.
+    /// Verbatim values emitted as `helm --set-string key=value` for chart settings
+    /// this schema does not model yet. Every accepted value remains a string.
+    /// Values shaped like booleans or null after trimmed ASCII case normalization
+    /// are refused because Helm treats every nonempty string as true in template
+    /// conditions. Use a modeled `curie.yaml` field when typed behavior is required.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
 }
@@ -148,6 +149,19 @@ impl Installation {
                 bail!("platform.egress[].host must not be empty");
             }
         }
+        for (key, value) in &self.set {
+            let trimmed = value.trim();
+            if ["true", "false", "null"]
+                .iter()
+                .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
+            {
+                bail!(
+                    "set.{key} cannot use `{value}` because set values are always strings and \
+                     Helm treats every nonempty string as true in template conditions. \
+                     Use a modeled curie.yaml field for typed boolean or null behavior."
+                );
+            }
+        }
         // Refuse rather than ignore. A declared-but-unapplied credential is the
         // failure this whole ADR exists to prevent: the file would say the App
         // is configured while the cluster disagreed, which is exactly the
@@ -221,12 +235,8 @@ impl Installation {
         Ok(())
     }
 
-    /// The `--set key=value` tokens this file implies, in a stable order so a
-    /// plan diff is readable and a test can pin it.
-    ///
-    /// Platform toggles render before the `set:` escape hatch so an explicit
-    /// `set:` entry wins on a later-key-wins reading, matching how a trailing
-    /// `--set` beats an earlier one on the helm command line.
+    /// The modeled `--set key=value` tokens this file implies, in a stable
+    /// order so a plan diff is readable and a test can pin it.
     pub fn helm_sets(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(ui) = self.platform.ui {
@@ -235,10 +245,15 @@ impl Installation {
         if let Some(inference) = self.platform.inference {
             out.push(format!("inference.deploy={inference}"));
         }
-        for (key, value) in &self.set {
-            out.push(format!("{key}={value}"));
-        }
         out
+    }
+
+    /// The declared string tokens this file implies, in stable key order.
+    pub fn helm_set_strings(&self) -> Vec<String> {
+        self.set
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
     }
 
     /// Provider names for `--allow-egress-host`, validated downstream by
@@ -288,6 +303,10 @@ mod tests {
         assert_eq!(cfg.install.namespace, "acme");
         assert_eq!(cfg.install.release, "acme");
         assert!(cfg.helm_sets().is_empty(), "no platform toggles declared");
+        assert!(
+            cfg.helm_set_strings().is_empty(),
+            "no declared string values"
+        );
         assert!(cfg.credential_names().is_empty());
     }
 
@@ -401,17 +420,50 @@ mod tests {
     }
 
     #[test]
-    fn explicit_set_entries_render_after_platform_toggles() {
+    fn declared_set_entries_remain_verbatim_after_platform_toggles() {
         let raw = format!(
-            "{}platform:\n  ui: false\nset:\n  security.gvisor.mode: \"off\"\n",
+            "{}platform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  \
+             example.label: plain\n  example.leadingZero: \"00123\"\n  worker.replicas: \"3\"\n",
             minimal()
         );
         let cfg = Installation::parse(&raw).unwrap();
         assert_eq!(
             cfg.helm_sets(),
-            vec!["ui.deploy=false", "security.gvisor.mode=off"],
-            "a later --set wins on the helm command line, so escape-hatch keys go last"
+            vec!["ui.deploy=false"],
+            "modeled settings must remain in the Helm typed lane"
         );
+        assert_eq!(
+            cfg.helm_set_strings(),
+            vec![
+                "api.githubAppId=4475970",
+                "example.label=plain",
+                "example.leadingZero=00123",
+                "worker.replicas=3",
+            ],
+            "declared strings must retain their exact value in the Helm string lane"
+        );
+    }
+
+    #[test]
+    fn boolean_and_null_shaped_declared_set_values_are_rejected() {
+        for value in ["\"true\"", "\" FALSE \"", "\"Null\""] {
+            let raw = format!("{}set:\n  example.value: {value}\n", minimal());
+            let err =
+                Installation::parse(&raw).expect_err(&format!("quoted {value} must be rejected"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("set.example.value"),
+                "error must name the rejected key: {message}"
+            );
+            assert!(
+                message.contains("set values are always strings"),
+                "error must explain the string contract: {message}"
+            );
+            assert!(
+                message.contains("Use a modeled curie.yaml field"),
+                "error must give the operator a safe next action: {message}"
+            );
+        }
     }
 
     #[test]
@@ -671,6 +723,7 @@ fn plan_installation_inner(
         chart: String::new(),
         no_expose: false,
         set: cfg.helm_sets(),
+        set_string: cfg.helm_set_strings(),
         allow_egress_host: cfg.egress_hosts(),
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],
@@ -761,26 +814,6 @@ async fn complete_installation_plan(
         );
         desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
     }
-    // The model credential is declared by NAME, and `up_value_plan` only carries
-    // its key when a VALUE resolved. So on an install whose credentials are not
-    // in place yet -- exactly the state `diff` exists to describe -- the key
-    // vanished from the desired state and diff called it a reset: "the release
-    // carries this, your file does not declare it, declare it in curie.yaml to
-    // keep it." For a model API key, in a file whose own header says it holds
-    // NAMES and never secrets. Same defect #1415 fixed for the sealing key,
-    // reached by a different route.
-    //
-    // Comms three lines up already had this right, and this mirrors it: a
-    // DECLARED credential is part of the desired state whether or not it
-    // resolves in this shell, because apply is what supplies it -- and apply
-    // refuses outright while it cannot. `desired` feeds the diff report only;
-    // the argv apply actually runs is built from `up_values`, untouched here.
-    if let Some(name) = cfg.credentials.model.as_ref() {
-        desired.insert(
-            crate::ops::MODEL_CREDENTIAL_KEY.to_string(),
-            resolved.get(name).cloned().unwrap_or_default(),
-        );
-    }
     Ok(EffectiveInstallationPlan {
         cfg,
         up,
@@ -807,8 +840,8 @@ enum GuardVerdict {
     /// Nothing the release runs would be deleted by this apply.
     Clear,
     /// This apply would delete stateful component(s), carrying the operator
-    /// facing refusal text.
-    WouldRemove(String),
+    /// facing causes.
+    WouldRemove(Vec<crate::ops::StatefulRemoval>),
 }
 
 /// Decide whether an apply would delete a stateful component the release runs.
@@ -816,7 +849,10 @@ enum GuardVerdict {
 /// Runs even under `--dry-run`: the plan a dry run prints is exactly the plan
 /// that would destroy the store, so an operator reading it deserves the same
 /// warning the real run would give.
-async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict> {
+async fn guard_stateful_removal(
+    up: &crate::ops::UpOpts,
+    value_plan: &crate::ops::UpValuePlan,
+) -> Result<GuardVerdict> {
     let live = crate::ops::live_stateful_components(&up.common)
         .await
         .context("could not check whether this apply would remove stateful components")?;
@@ -827,21 +863,12 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict>
         // rather than a silent empty answer (#1351).
         return Ok(GuardVerdict::Clear);
     }
-    // The same effective values the upgrade would send, so the render reflects
-    // what this apply would actually create rather than the chart's defaults.
-    let sets: Vec<String> = crate::ops::up_value_plan(up)
-        .effective_values()
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, &sets).await?;
+    let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, value_plan).await?;
     let removed = crate::ops::removed_stateful_components(&live, &rendered);
     if removed.is_empty() {
         return Ok(GuardVerdict::Clear);
     }
-    Ok(GuardVerdict::WouldRemove(stateful_removal_message(
-        &removed,
-    )))
+    Ok(GuardVerdict::WouldRemove(removed))
 }
 
 /// The refusal text, factored out so its ordering is testable with no cluster.
@@ -900,12 +927,17 @@ fn stateful_removal_message(removed: &[crate::ops::StatefulRemoval]) -> String {
         .iter()
         .any(|r| r.cause == RemovalCause::ComponentGone)
     {
-        msg.push_str(
+        let migration_instruction = if renamed.is_empty() {
+            "Re-run with --migrate-store"
+        } else {
+            "After fixing the renames, re-run with --migrate-store"
+        };
+        msg.push_str(&format!(
             "Component(s) the chart does not render at all usually mean a chart version \
-             renamed or removed them. Re-run with --migrate-store and apply will carry \
-             the data across itself: it stages every object, upgrades, loads them back, \
-             and verifies per object.\n\n",
-        );
+                 renamed or removed them. {migration_instruction} and apply will carry \
+                 the data across itself: it stages every object, upgrades, loads them back, \
+                 and verifies per object.\n\n"
+        ));
     }
 
     msg.push_str("Use --allow-stateful-removal only to proceed WITHOUT the data.");
@@ -981,10 +1013,21 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     let migrating = if allow_stateful_removal {
         false
     } else {
-        match guard_stateful_removal(&up).await? {
+        // Guard the exact upgrade plan, including preserved values carried through
+        // the private values file.
+        match guard_stateful_removal(&up, &up_values).await? {
             GuardVerdict::Clear => false,
-            GuardVerdict::WouldRemove(_) if migrate_store => true,
-            GuardVerdict::WouldRemove(msg) => bail!("{msg}"),
+            GuardVerdict::WouldRemove(removed)
+                if migrate_store
+                    && removed.iter().all(|removal| {
+                        matches!(&removal.cause, crate::ops::RemovalCause::ComponentGone)
+                    }) =>
+            {
+                true
+            }
+            GuardVerdict::WouldRemove(removed) => {
+                bail!("{}", stateful_removal_message(&removed))
+            }
         }
     };
 
@@ -1014,27 +1057,37 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
         return Ok(ApplyOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
 
-    // Load the staged objects into whatever the upgrade created, and verify per
-    // object. `run_import` retains the staging pod when anything is missing, so
-    // a partial load stays recoverable.
+    // Load the staged objects into the planned target. Import returns only once
+    // the persisted source inventory is present there at the same sizes.
     if migrating {
         let common = crate::ops::CommonOpts {
             namespace: cfg.install.namespace.clone(),
             release: cfg.install.release.clone(),
             dry_run: false,
         };
-        let imported = crate::migrate_store::run_import(&common, BUNDLE_BUCKET, false).await?;
-        if let crate::migrate_store::MigrateStoreOutput::Imported { missing, .. } = &imported {
-            if !missing.is_empty() {
-                bail!(
-                    "the upgrade applied, but {} staged object(s) did not reach the new \
-                     store. The staging pod has been kept -- it holds the only other \
-                     copy. Re-run `curie cluster migrate-store --phase import` before \
-                     deleting it.",
-                    missing.len()
-                );
-            }
-        }
+        let recovery_command = format!(
+            "`curie cluster migrate-store --phase import --namespace {} --release {}`",
+            common.namespace, common.release
+        );
+        let target = crate::migrate_store::read_planned_target(&common)
+            .await
+            .with_context(|| {
+                format!(
+                    "the upgrade applied, but the planned migration target could not be verified; the staging pod remains available. Retry with {recovery_command}"
+                )
+            })?;
+        crate::migrate_store::run_import_to_planned_target(
+            &common,
+            target,
+            BUNDLE_BUCKET,
+            false,
+        )
+            .await
+            .with_context(|| {
+                format!(
+                    "the upgrade applied, but store import verification did not complete; the staging pod remains available. Retry with {recovery_command}"
+                )
+            })?;
     }
 
     Ok(ApplyOutput::Applied {
@@ -1570,13 +1623,18 @@ mod stateful_guard_message_tests {
                 cause: crate::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
             },
         ]);
-        assert!(msg.contains("nameOverride"), "{msg}");
-        assert!(msg.contains("--migrate-store"), "{msg}");
+        let rename = msg.find("nameOverride").expect("must name the rename fix");
+        let migrate = msg
+            .find("After fixing the renames, re-run with --migrate-store")
+            .expect("migration must be conditional on fixing the rename first");
         let discard = msg.find("--allow-stateful-removal").unwrap();
         assert!(
-            msg.find("--migrate-store").unwrap() < discard
-                && msg.find("nameOverride").unwrap() < discard,
-            "the data-preserving remedies must still come before the discard flag:\n{msg}"
+            rename < migrate && migrate < discard,
+            "fix the rename first, then migrate, and offer discard only last:\n{msg}"
+        );
+        assert!(
+            !msg.contains("Re-run with --migrate-store"),
+            "must not offer migration unconditionally while a rename still blocks it:\n{msg}"
         );
     }
 }
@@ -1845,6 +1903,42 @@ mod diff_tests {
             };
             assert_eq!(entry.unresolved_credential.as_deref(), Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_credential_set_survives_the_environment() {
+        let _lock = CREDENTIAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
+        env.set(
+            "CURIE_MODEL_CREDENTIALS",
+            "model credential from environment",
+        );
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_MODEL_CREDENTIALS\n",
+            "set:\n",
+            "  agentSandbox.runner.credentials: model credential from set\n",
+        ))
+        .expect("configuration parses");
+        let local = plan_installation(cfg, true).expect("installation plans");
+
+        let plan = complete_installation_plan(local)
+            .await
+            .expect("completed plan");
+
+        assert_eq!(
+            plan.desired
+                .get(crate::ops::MODEL_CREDENTIAL_KEY)
+                .map(String::as_str),
+            Some("model credential from set"),
+            "the explicit set value must remain in the desired map"
+        );
     }
 
     #[test]
@@ -2362,41 +2456,6 @@ mod apply_tests {
             resolve_credentials_lenient(&cfg, &|_| Ok(None)).expect("must not refuse");
         assert!(resolved.is_empty());
         assert_eq!(missing, vec!["MODEL_KEY", "APP_TOK", "BOT_TOK"]);
-    }
-
-    /// The rc.1 -> rc.2 defect, reached by its other route.
-    ///
-    /// Running the published rc.2 against the live release with no credentials
-    /// exported reported
-    ///
-    ///   ! agentSandbox.runner.credentials: <secret> (reset to chart default)
-    ///
-    /// and the legend beside a reset reads "Declare it in curie.yaml to keep
-    /// it." The file DOES declare it -- by name, which is the only thing it may
-    /// carry -- so the advice is both wrong and, followed literally for a model
-    /// API key, the one thing that file's own header forbids.
-    ///
-    /// A declared credential belongs in the desired state whether or not it
-    /// resolves in this shell. Apply supplies it, and refuses while it cannot.
-    #[tokio::test]
-    async fn a_declared_but_unresolved_model_credential_is_not_a_reset() {
-        let cfg = cfg_with_all_names();
-        let (mut local, missing) = plan_installation_lenient(cfg).expect("lenient plan");
-        assert!(
-            missing.contains(&"MODEL_KEY".to_string()),
-            "fixture must leave the model credential unresolved: {missing:?}"
-        );
-        local.up.common.dry_run = true;
-        let plan = complete_installation_plan(local)
-            .await
-            .expect("dry-run plan needs no cluster");
-        assert!(
-            plan.desired.contains_key(crate::ops::MODEL_CREDENTIAL_KEY),
-            "a declared credential must stay in the desired state unresolved, or \
-             diff reports it as a reset and tells the operator to paste the key \
-             into curie.yaml. desired: {:?}",
-            plan.desired.keys().collect::<Vec<_>>()
-        );
     }
 
     /// Apply keeps refusing. Resolving BEFORE mutating is what stops a missing

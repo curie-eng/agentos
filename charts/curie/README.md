@@ -302,8 +302,9 @@ both env vars:
 ```yaml
 rustfs:
   deploy: false
-  host: my-bucket.s3.us-east-1.amazonaws.com
+  host: s3.us-east-1.amazonaws.com
   port: 443
+  region: us-east-1
   auth:
     accessKey: ""            # selects the key-free path
 api:
@@ -320,6 +321,12 @@ agentSandbox:
       annotations:
         eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/curie-runner
 ```
+
+The bundle fetch uses path style addressing, so it appends
+`agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
+region, change the region in `rustfs.host` and set `rustfs.region` to control
+the SigV4 signing region used by the bundle fetch init container. This setting
+does not configure the API or worker S3 clients.
 
 Scope the runner's role to the bundle bucket, **read-only**. NetworkPolicy
 selects pods rather than containers, so any identity the bundle-fetch init

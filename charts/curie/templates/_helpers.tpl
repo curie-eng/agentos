@@ -146,7 +146,7 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 {{- if .Values.rustfs.deploy -}}
 {{- printf "%s-rustfs" (include "curie.fullname" .) -}}
 {{- else -}}
-{{- required "rustfs.deploy is false: set rustfs.host to your external S3-compatible endpoint" .Values.rustfs.host -}}
+{{- required "rustfs.deploy is false: set rustfs.host to your external S3-compatible hostname" .Values.rustfs.host -}}
 {{- end -}}
 {{- end -}}
 
@@ -184,6 +184,9 @@ http
      no metadata access and leaves Rail 1 intact. */}}
 {{- define "curie.rustfs.staticCredentials" -}}
 {{- if .Values.rustfs.auth.accessKey -}}
+{{- if and .Values.rustfs.deploy (not .Values.rustfs.existingSecret) (not .Values.rustfs.auth.secretKey) -}}
+{{- fail "rustfs.auth.secretKey is empty but rustfs.deploy is true and rustfs.existingSecret is empty. The in-chart RustFS requires secret material for static credentials. Either set rustfs.auth.secretKey, or set rustfs.existingSecret to a Secret containing rustfsSecretKey." -}}
+{{- end -}}
 true
 {{- else if .Values.rustfs.deploy -}}
 {{- fail "rustfs.auth.accessKey is empty but rustfs.deploy is true. The in-chart RustFS is configured with those static credentials and has no web-identity path, so clearing the key would leave every bundle read and write unauthenticated against it. Either set rustfs.auth.accessKey, or set rustfs.deploy=false and point rustfs.host at an external store that accepts the ServiceAccount's projected token (see the chart README, 'Key-free object store auth')." -}}

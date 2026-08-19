@@ -410,6 +410,9 @@ class DockerSandboxClient:
             # substrate runs one reaper over both tiers, so returning None here
             # would silently stop reaping local orphans.
             created_at=created,
+            quota_rejection=None,
+            ready_reason=None,
+            ready_message=None,
         )
 
     def delete_claim(self, name: str) -> None:

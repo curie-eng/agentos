@@ -41,12 +41,14 @@ CHART=${CHART:-charts/curie}
 # `rm -f` an empty argument it ignores rather than an unbound variable.
 STATIC_RENDERED=""
 WEB_IDENTITY_RENDERED=""
+REGION_OVERRIDE_RENDERED=""
 WEB_IDENTITY_VALUES=""
 WEB_IDENTITY_TOKEN=""
-trap 'rm -f "${STATIC_RENDERED:-}" "${WEB_IDENTITY_RENDERED:-}" "${WEB_IDENTITY_VALUES:-}" "${WEB_IDENTITY_TOKEN:-}"' EXIT
+trap 'rm -f "${STATIC_RENDERED:-}" "${WEB_IDENTITY_RENDERED:-}" "${REGION_OVERRIDE_RENDERED:-}" "${WEB_IDENTITY_VALUES:-}" "${WEB_IDENTITY_TOKEN:-}"' EXIT
 
 STATIC_RENDERED=$(mktemp)
 WEB_IDENTITY_RENDERED=$(mktemp)
+REGION_OVERRIDE_RENDERED=$(mktemp)
 WEB_IDENTITY_VALUES=$(mktemp)
 # Stands in for the projected ServiceAccount token the EKS pod-identity webhook
 # mounts. Its CONTENT is never read here: the web-identity provider hands back
@@ -92,6 +94,8 @@ EOF
 helm template curie "$CHART" --namespace dev > "$STATIC_RENDERED"
 helm template curie "$CHART" --namespace dev \
   --values "$WEB_IDENTITY_VALUES" > "$WEB_IDENTITY_RENDERED"
+helm template curie "$CHART" --namespace dev \
+  --set rustfs.region=eu-west-1 > "$REGION_OVERRIDE_RENDERED"
 
 # Assertion 1: clearing the access key while the in-chart RustFS is deployed is
 # refused at render. That store is configured with those very credentials and
@@ -106,7 +110,25 @@ if helm template curie "$CHART" --namespace dev \
 fi
 echo "ok: an empty access key with the in-chart RustFS is refused at render"
 
-python3 - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" <<'PY'
+# Assertion 2: the in-chart RustFS also requires its secret material. Empty
+# secretKey must fail before installation, while an explicitly named external
+# Secret is a legitimate source for that value and must still render.
+if helm template curie "$CHART" --namespace dev \
+  --set rustfs.auth.secretKey="" > /dev/null 2>&1; then
+  echo "FAIL: clearing rustfs.auth.secretKey with rustfs.deploy=true and no existingSecret must be refused" >&2
+  exit 1
+fi
+echo "ok: an empty secret key with the in-chart RustFS is refused at render"
+
+if ! helm template curie "$CHART" --namespace dev \
+  --set rustfs.auth.secretKey="" \
+  --set rustfs.existingSecret=externally-managed-rustfs > /dev/null; then
+  echo "FAIL: an existing RustFS Secret with an empty rustfs.auth.secretKey must render" >&2
+  exit 1
+fi
+echo "ok: an existing RustFS Secret with an empty rustfs.auth.secretKey renders"
+
+python3 - "$STATIC_RENDERED" "$WEB_IDENTITY_RENDERED" "$REGION_OVERRIDE_RENDERED" <<'PY'
 import ipaddress, sys, yaml
 
 CREDENTIAL_KEYS = ("S3_ACCESS_KEY", "S3_SECRET_KEY")
@@ -242,8 +264,20 @@ def assert_web_identity(path):
     print("ok: web-identity: no S3 credential env or shell export reaches any consumer")
 
 
+def assert_bundle_fetch_region(path, expected_region):
+    _, _, bundle_fetch, _, _, _ = read(path)
+    rendered = bundle_fetch.get("AWS_DEFAULT_REGION", {}).get("value")
+    assert rendered == expected_region, (
+        f"bundle-fetch AWS_DEFAULT_REGION rendered as {rendered!r}; expected "
+        f"{expected_region!r} from rustfs.region"
+    )
+    print(f"ok: bundle-fetch AWS_DEFAULT_REGION renders {expected_region}")
+
+
 assert_static(sys.argv[1])
 assert_web_identity(sys.argv[2])
+assert_bundle_fetch_region(sys.argv[1], "us-east-1")
+assert_bundle_fetch_region(sys.argv[3], "eu-west-1")
 PY
 
 # Everything above reads the rendered YAML. That is necessary and not
