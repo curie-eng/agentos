@@ -65,15 +65,20 @@ files**, both optional, both invisible to Claude Code:
   names the credentials it needs (`secrets`, `secret_files`, `sealed_secrets`) by NAME only, never by
   value. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
-  `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_server`, and others).
+  `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
+  `connectors.duplicate_server`, and others). Authored mapping keys are checked for
+  duplicates before validation, so a repeated connector name is rejected rather than
+  silently replaced by the last YAML value.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of
   `{agent, env, slack_channel}` where `env` is `dev` or `prod`. Validated by
   `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
-  `deploy.*` codes (`deploy.not_object`, `deploy.bad_target_name`, `deploy.bad_env`,
-  `deploy.missing_agent` (a declared target must name its agent; the error names the target key),
-  `deploy.bad_agent_name`, `deploy.bad_slack_channel`).
+  `deploy.*` codes (`deploy.not_object`, `deploy.duplicate_target`, `deploy.bad_target_name`,
+  `deploy.bad_env`, `deploy.missing_agent` (a declared target must name its agent; the error names
+  the target key), `deploy.bad_agent_name`, `deploy.bad_slack_channel`). Authored mapping keys are
+  checked for duplicates before validation, so a repeated target name fails closed instead of
+  silently selecting the last YAML value.
 
 The two overlay files are not independent of the manifest, which is the part a second consumer is
 most likely to miss: `connectors.yaml` feeds manifest validation. The set of gate names

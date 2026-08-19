@@ -435,6 +435,20 @@ def test_connector_names_poison_to_none_on_unparseable_yaml(tmp_path) -> None:
     assert connector_server_names(root) is None
 
 
+def test_connector_names_poison_to_none_on_duplicate_name(tmp_path) -> None:
+    root = _connectors(
+        tmp_path,
+        "connectors:\n"
+        "  grafana:\n"
+        "    url: https://first.example.com/mcp\n"
+        "  grafana:\n"
+        "    url: https://second.example.com/mcp\n",
+    )
+    assert connector_server_names(root) is None, (
+        "duplicate grafana must poison connector names"
+    )
+
+
 def test_connector_names_poison_to_none_on_invalid_connectors(tmp_path) -> None:
     # A connector that does not validate is never mounted, so its name is not a
     # tool surface a gate may be namespaced to: unknowable, not empty.

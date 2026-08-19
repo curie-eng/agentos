@@ -33,6 +33,7 @@ from .models import (
     TriggerDeclaration,
 )
 from .reserved_env import is_reserved_boot_env_name
+from .yaml_loader import DuplicateKeyError, safe_load_unique
 
 # The hooks field is a mapping of event name -> list of matcher entries. Reused
 # to validate both the inline object and a declared hooks file.
@@ -112,7 +113,14 @@ def _validate_deploy_targets(root: Path, c: _Collector) -> None:
     if not path.is_file():
         return
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = safe_load_unique(path.read_text(encoding="utf-8"))
+    except DuplicateKeyError as exc:
+        c.error(
+            "deploy.duplicate_target",
+            f"{DEPLOY_FILE}: duplicate target key {exc.key!r}",
+            DEPLOY_FILE,
+        )
+        return
     except (OSError, yaml.YAMLError) as exc:
         c.error("deploy.unreadable", f"{DEPLOY_FILE}: {exc}", DEPLOY_FILE)
         return
@@ -132,7 +140,14 @@ def _validate_connectors(root: Path, c: _Collector) -> None:
     if not path.is_file():
         return
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = safe_load_unique(path.read_text(encoding="utf-8"))
+    except DuplicateKeyError as exc:
+        c.error(
+            "connectors.duplicate_connector",
+            f"{CONNECTORS_FILE}: duplicate connector key {exc.key!r}",
+            CONNECTORS_FILE,
+        )
+        return
     except (OSError, yaml.YAMLError) as exc:
         c.error("connectors.unreadable", f"{CONNECTORS_FILE}: {exc}", CONNECTORS_FILE)
         return
