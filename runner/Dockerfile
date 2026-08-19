@@ -6,12 +6,11 @@
 #
 #   docker build -f runner/Dockerfile -t curie-runner .
 #
-# The claude-agent-sdk drives the `claude` CLI, so the image carries Node plus the
-# @anthropic-ai/claude-code CLI alongside the Python runner. With
-# CURIE_FAKE_MODEL=1 the container answers synthetic events offline (no CLI/model
-# call), which is how the container smoke round-trips without a credential.
-# The frozen workspace packages require the Python base below; Node 22 is
-# required by the Claude Code CLI the SDK spawns. Add Node to the Python base.
+# The claude-agent-sdk supplies and drives its bundled platform `claude`
+# executable. The image carries Node and npm only for pinned MCP packages. With
+# CURIE_FAKE_MODEL=1 the container answers synthetic events offline (no CLI or
+# model call), which is how the container smoke round trips without a credential.
+# The frozen workspace packages require the Python base below.
 # Node comes from the official image rather than NodeSource's apt repo. That
 # repo's setup script (`deb.nodesource.com/setup_22.x`) started returning 403 to
 # everyone on 2026-07-27, which broke every runner-image build repo-wide: curl
@@ -35,9 +34,6 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# The Claude Code CLI the SDK spawns for a real (non-fake) session.
-RUN npm install -g @anthropic-ai/claude-code@2.1.231
-
 # Off-the-shelf MCP servers pre-installed at build time so a bundle that
 # declares one starts it from the on-disk binary with NO runtime network fetch
 # (the runner rootfs is read-only at runtime, so an `npx`-style fetch would fail
@@ -56,27 +52,27 @@ COPY packages/aci-protocol ./packages/aci-protocol
 COPY packages/plugin-format ./packages/plugin-format
 COPY runner ./runner
 
-# One venv. Install the local packages first, then the runner without redeps,
-# then its direct registry dependencies exported from the tested workspace
-# uv.lock. The local packages are installed by path first so the
+# One venv. Install every local project without dependencies, then install the
+# full registry dependency closure exported from the tested workspace uv.lock.
+# The local packages are installed by path first so the
 # "aci-protocol"/"plugin-format" requirements resolve to the copied trees, not
 # a same-named PyPI distribution.
 RUN python3 -m venv /app/.venv \
     && /app/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /app/.venv/bin/pip install --no-cache-dir ./packages/aci-protocol ./packages/plugin-format \
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps ./packages/aci-protocol ./packages/plugin-format \
     && /app/.venv/bin/pip install --no-cache-dir --no-deps ./runner \
     && python3 runner/export_dependency_pins.py < uv.lock > /tmp/runner-dependency-pins.txt \
-    && /app/.venv/bin/pip install --no-cache-dir -r /tmp/runner-dependency-pins.txt
+    && /app/.venv/bin/pip install --no-cache-dir --no-deps -r /tmp/runner-dependency-pins.txt
 
 # Run as a non-root user. The claude-agent-sdk spawns
 # `claude --dangerously-skip-permissions` (permission_mode=bypassPermissions),
 # and Claude Code refuses that flag under uid 0 ("cannot be used with root/sudo
 # privileges"), so a root image fails every real-model boot. uid:gid 1000:1000
 # matches the A2 chart hardening (runAsUser/runAsGroup/fsGroup 1000) and HOME is
-# /home/runner (one of the chart's writablePaths). The venv and the global npm
-# `claude` CLI live in root-owned, world-readable paths, so uid 1000 imports the
-# deps and executes the CLI without owning them. HOME is the only writable path
-# the runtime needs; under the A2 read-only rootfs the chart mounts writable
+# /home/runner (one of the chart's writablePaths). The venv contains the SDK and
+# its bundled runtime in root owned, world readable paths, so uid 1000 imports
+# the dependencies and executes the CLI without owning them. HOME is the only
+# writable path the runtime needs; under the A2 read-only rootfs the chart mounts
 # emptyDirs at /tmp and /home/runner, and nothing here writes elsewhere.
 RUN groupadd --gid 1000 runner \
     && useradd --uid 1000 --gid 1000 --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner \

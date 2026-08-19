@@ -128,9 +128,9 @@ file would be misleading without saying so:
   `sealed_secrets` is present, on the grounds that refusing beats deploying a
   connector without the credential it needs. Nothing in the reconciler imports
   the sealing module. So `curie seal` hands an author a snippet that today makes
-  their bundle fail validation, and the CLI does not warn. The refusal was
-  briefly lifted and then deliberately restored, so this is a live gate rather
-  than an oversight.
+  their bundle fail validation. Human output warns that connector validation
+  rejects the snippet until #1434 lands. The refusal was briefly lifted and
+  then deliberately restored, so this is a live gate rather than an oversight.
 - **No version marker, so a format change is indistinguishable from
   corruption.** The envelope is bare base64 with nothing to negotiate on. Any
   future change — a different construction, a compressed payload, additional

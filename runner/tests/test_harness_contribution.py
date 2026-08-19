@@ -30,6 +30,10 @@ def test_claude_contribution_image_identity() -> None:
     assert get_contribution().image == "curie-runner"
 
 
+def test_claude_contribution_install_uses_the_bundled_sdk_runtime() -> None:
+    assert get_contribution().install.packages == ("claude-agent-sdk",)
+
+
 def test_claude_contribution_model_override_env_keys() -> None:
     assert get_contribution().model_override_env_keys == (
         MODEL_BASE_URL_ENV,

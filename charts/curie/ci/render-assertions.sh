@@ -899,5 +899,55 @@ EOF
 assert_worker_api key_override curie http://curie-api:8000 operator operatorapisecret apiKey -f "$WORKER_API_KEY_OVERRIDE"
 echo "  ok: default and connector enabled renders use one chart API key reference; operator key override renders once without a chart duplicate"
 
+echo "=== Assertion 13: security probe uses the configured RustFS port (#1507) ==="
+SECURITY_PROBE_PORT="$TMP/security_probe_port.yaml"
+helm template curie "$CHART" \
+  --set rustfs.port=9100 \
+  --show-only templates/security-probe.yaml > "$SECURITY_PROBE_PORT"
+python3 - "$SECURITY_PROBE_PORT" <<'PYEOF'
+import sys
+
+import yaml
+
+manifest = sys.argv[1]
+docs = [doc for doc in yaml.safe_load_all(open(manifest)) if doc]
+probes = []
+for doc in docs:
+    if doc.get("kind") != "Job":
+        continue
+    containers = doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+    probe_containers = [container for container in containers if container.get("name") == "probe"]
+    if probe_containers:
+        probes.extend(probe_containers)
+
+if len(probes) != 1:
+    raise SystemExit(f"expected exactly one security probe container, found {len(probes)}")
+
+entries = [
+    entry
+    for entry in probes[0].get("env", [])
+    if entry.get("name") == "DATATIER_TARGETS"
+]
+if len(entries) != 1:
+    raise SystemExit(f"DATATIER_TARGETS appears {len(entries)} times in the security probe")
+
+targets = entries[0].get("value", "").split()
+expected = "curie-rustfs:9100"
+forbidden = "curie-rustfs:9000"
+failures = []
+if expected not in targets:
+    failures.append(
+        f"must include the configured RustFS target {expected!r}"
+    )
+if forbidden in targets:
+    failures.append(
+        f"must exclude the default RustFS target {forbidden!r} after rustfs.port=9100"
+    )
+if failures:
+    raise SystemExit(f"DATATIER_TARGETS {' and '.join(failures)}; got {targets!r}")
+
+print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
+PYEOF
+
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; and the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; and the security probe uses the configured RustFS port in DATATIER_TARGETS."

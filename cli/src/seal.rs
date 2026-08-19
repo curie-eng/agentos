@@ -59,8 +59,9 @@ impl crate::ui::CliOutput for SealOutput {
         ui.payload_plain(&snippet(&self.env_name, &self.sealed));
         ui.note(&format!(
             "sealed to public key {}. Only a cluster holding the matching private \
-             key can read it, so this is safe to commit. Merge the block above under \
-             connectors.{} in connectors.yaml.",
+             key can read it, so this is safe to commit. The block above belongs under \
+             connectors.{} in connectors.yaml, but connector validation rejects \
+             sealed_secrets until #1434 lands, so it cannot be used yet.",
             self.public_key, self.connector
         ));
     }

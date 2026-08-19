@@ -8,12 +8,15 @@ use std::process::{Command, Output};
 
 const SEAL_VALUE: &str = "placeholder-seal-value";
 
-fn run_seal(connector: &str) -> Output {
+fn run_seal(connector: &str, json: bool) -> Output {
     let keypair = curie::sealing::generate_keypair();
     let connector_arg = format!("--connector={connector}");
-    Command::new(env!("CARGO_BIN_EXE_curie"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if json {
+        command.arg("--json");
+    }
+    command
         .args([
-            "--json",
             "seal",
             &connector_arg,
             "GRAFANA_TOKEN",
@@ -97,7 +100,7 @@ fn seal_rejects_invalid_connector_names_as_usage_with_a_fix() {
     ];
 
     for connector in invalid {
-        let output = run_seal(&connector);
+        let output = run_seal(&connector, true);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
@@ -121,7 +124,7 @@ fn seal_rejects_invalid_connector_names_as_usage_with_a_fix() {
 #[test]
 fn seal_accepts_the_connector_name_length_boundary_and_interior_dash() {
     for connector in ["a".repeat(40), "grafana-cloud".to_string()] {
-        let output = run_seal(&connector);
+        let output = run_seal(&connector, true);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
@@ -137,4 +140,59 @@ fn seal_accepts_the_connector_name_length_boundary_and_interior_dash() {
             "a sealed value must not expose its plaintext"
         );
     }
+}
+
+#[test]
+fn seal_human_output_warns_before_pasting_rejected_sealed_secrets() {
+    let human = run_seal("grafana", false);
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    let human_output = format!("{human_stdout}{human_stderr}");
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Success.code()),
+        "human seal must succeed\nstdout: {human_stdout}\nstderr: {human_stderr}"
+    );
+    assert!(
+        human_stdout.contains("sealed_secrets"),
+        "human seal must retain the paste block:\n{human_stdout}"
+    );
+    assert!(
+        human_output.contains("connector validation")
+            && human_output.contains("sealed_secrets")
+            && human_output.contains("#1434")
+            && human_output.contains("until"),
+        "human seal must warn that connector validation rejects sealed_secrets until #1434 lands:\n{human_output}"
+    );
+    let human_output_lower = human_output.to_ascii_lowercase();
+    assert!(
+        !human_output_lower.contains("merge") && !human_output_lower.contains("paste"),
+        "human seal must locate the block without telling the user to merge or paste it:\n{human_output}"
+    );
+
+    let json = run_seal("grafana", true);
+    let json_stdout = String::from_utf8_lossy(&json.stdout);
+    let json_stderr = String::from_utf8_lossy(&json.stderr);
+    assert_eq!(
+        json.status.code(),
+        Some(ExitClass::Success.code()),
+        "JSON seal must succeed\nstdout: {json_stdout}\nstderr: {json_stderr}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .unwrap_or_else(|err| panic!("JSON seal must emit only JSON: {err}; {json_stdout}"));
+    let fields = payload.as_object().expect("JSON seal must emit an object");
+    assert_eq!(
+        fields
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["connector", "env_name", "sealed", "public_key", "yaml"]
+            .into_iter()
+            .collect(),
+        "JSON seal must retain its exact machine readable shape"
+    );
+    assert!(
+        !json_stdout.contains("#1434") && !json_stderr.contains("#1434"),
+        "the human warning must not appear in JSON mode:\nstdout: {json_stdout}\nstderr: {json_stderr}"
+    );
 }
