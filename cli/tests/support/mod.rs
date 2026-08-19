@@ -22,9 +22,9 @@ pub fn valkey_url() -> String {
     std::env::var("TEST_VALKEY_URL").unwrap_or_else(|_| DEFAULT_VALKEY_URL.to_string())
 }
 
-/// Connect and PING; return `None` (with a skip note) when Valkey is not
-/// reachable, mirroring the dispatcher's `pytest.skip`. CI does not start the
-/// compose stack, so the Valkey-backed tests skip there rather than failing.
+/// Connect and PING. Local runs return `None` with a skip note when Valkey is
+/// unreachable. CI sets `CI_REQUIRE_VALKEY_TESTS`, which turns a missing Valkey
+/// into a test failure so the required Rust check cannot pass without coverage.
 pub async fn valkey_or_skip(test: &str) -> Option<redis::aio::MultiplexedConnection> {
     let url = valkey_url();
     let connect = async {
@@ -36,6 +36,9 @@ pub async fn valkey_or_skip(test: &str) -> Option<redis::aio::MultiplexedConnect
     match connect.await {
         Ok(conn) => Some(conn),
         Err(err) => {
+            if std::env::var_os("CI_REQUIRE_VALKEY_TESTS").is_some() {
+                panic!("{test}: required Valkey is not reachable at {url}: {err}");
+            }
             eprintln!("skipping {test}: Valkey not reachable at {url}: {err}");
             None
         }

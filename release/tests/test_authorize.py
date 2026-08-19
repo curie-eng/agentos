@@ -892,6 +892,19 @@ def helm_ci_job_check_run_names() -> set[str]:
     return workflow_job_check_run_names(HELM_CI_YAML)
 
 
+class TestRustValkeyWorkflowContract:
+    def test_rust_job_requires_and_connects_to_valkey_guarded_tests(self):
+        workflow = yaml.safe_load(CI_YAML.read_text())
+        rust = workflow["jobs"]["rust"]
+
+        assert rust["env"]["CI_REQUIRE_VALKEY_TESTS"] == "1"
+        assert rust["env"]["TEST_VALKEY_URL"] == "redis://localhost:26379"
+
+        valkey = rust["services"]["valkey"]
+        assert str(valkey["image"]).startswith("valkey/")
+        assert "26379:6379" in valkey["ports"]
+
+
 class TestHelmCiCheckRunNames:
     def test_expands_matrix_include_rows(self, tmp_path, monkeypatch):
         workflow = tmp_path / "helm-ci.yaml"

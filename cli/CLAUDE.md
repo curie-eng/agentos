@@ -199,6 +199,9 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
 ```bash
 cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
+The Rust CI job sets `CI_REQUIRE_VALKEY_TESTS` and starts Valkey, so Valkey-backed
+tests execute in CI. Contributors need a reachable Valkey, such as the compose
+Valkey, for equivalent local coverage.
 
 Scripted E2E (real runner container, fake model, fully offline by default):
 ```bash
