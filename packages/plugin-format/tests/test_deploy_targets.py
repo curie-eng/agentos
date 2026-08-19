@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from plugin_format import validate_bundle
 from plugin_format.deploy_targets import validate_deploy_targets
 
@@ -91,10 +92,17 @@ def test_env_defaults_to_dev_so_a_target_must_opt_in_to_prod() -> None:
     assert parsed.targets["p"].env == "dev"
 
 
-def test_agent_may_be_omitted_to_mean_the_manifest_name() -> None:
-    parsed, _ = validate_deploy_targets({"targets": {"p": {"env": "prod"}}})
-    assert parsed is not None
-    assert parsed.targets["p"].agent is None
+@pytest.mark.parametrize(
+    "target",
+    [{"env": "prod"}, {"agent": None, "env": "prod"}],
+    ids=["omitted", "explicit_null"],
+)
+def test_missing_agent_names_the_target(target: dict[str, object]) -> None:
+    _, errors = validate_deploy_targets({"targets": {"p": target}})
+    messages = [message for code, message in errors if code == "deploy.missing_agent"]
+    assert len(messages) == 1
+    assert "targets.p" in messages[0]
+    assert "None" not in messages[0]
 
 
 def test_unknown_key_is_rejected_not_ignored() -> None:
@@ -113,6 +121,23 @@ def test_bundle_surfaces_a_target_error(tmp_path: Path) -> None:
     result = validate_bundle(str(root))
     assert not result.valid
     assert any(e.code == "deploy.bad_env" for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "target_yaml",
+    ["    env: prod\n", "    agent: null\n    env: prod\n"],
+    ids=["omitted", "explicit_null"],
+)
+def test_bundle_refuses_a_missing_agent_at_load_time(
+    tmp_path: Path, target_yaml: str
+) -> None:
+    root = _bundle(tmp_path, f"targets:\n  p:\n{target_yaml}")
+    result = validate_bundle(str(root))
+    issues = [error for error in result.errors if error.code == "deploy.missing_agent"]
+    assert not result.valid
+    assert len(issues) == 1
+    assert "targets.p" in issues[0].message
+    assert "None" not in issues[0].message
 
 
 def test_bundle_surfaces_unparseable_yaml(tmp_path: Path) -> None:

@@ -561,7 +561,19 @@ def resolve_target_agent(
             "deploys to. Declare a target (ADR-0089).",
         )
 
-    matching = [t for t in targets.targets.values() if t.env == environment.value]
+    matching = [
+        (key, target)
+        for key, target in targets.targets.items()
+        if target.env == environment.value
+    ]
+    agent_names: list[str] = []
+    for key, target in matching:
+        if target.agent is None:
+            raise TargetUnresolved(
+                "deploy.missing_agent",
+                f"targets.{key}: agent is required for every declared target",
+            )
+        agent_names.append(target.agent)
     if not matching:
         # Not an error: a repository may deploy only prod from main and leave
         # dev to the CLI. Ignoring matches how an unmatched branch behaves.
@@ -570,11 +582,11 @@ def resolve_target_agent(
         raise TargetUnresolved(
             "deploy.ambiguous_env",
             f"deploy.yaml declares {len(matching)} targets with env "
-            f"{environment.value!r} ({', '.join(sorted(str(t.agent) for t in matching))}); "
+            f"{environment.value!r} ({', '.join(sorted(agent_names))}); "
             "one branch cannot deploy to two agents in one push.",
         )
 
-    wanted = matching[0].agent
+    wanted = agent_names[0]
     for agent in repo_agents:
         if agent.name == wanted:
             return agent
@@ -619,7 +631,7 @@ def _target_agent_name(targets: DeployTargetsFile | None, environment: Environme
     if targets is None:
         return None
     matching = [t for t in targets.targets.values() if t.env == environment.value]
-    return str(matching[0].agent) if len(matching) == 1 else None
+    return matching[0].agent if len(matching) == 1 else None
 
 
 async def _sibling_bundle(
