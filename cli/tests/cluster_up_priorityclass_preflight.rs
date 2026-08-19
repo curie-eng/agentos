@@ -158,6 +158,21 @@ case "$mode" in
     absent)
         exit 0
         ;;
+    unmanaged)
+        printf '{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"%s"}}\n' \
+            "$name"
+        exit 0
+        ;;
+    helm-without-annotations)
+        printf '{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"%s","labels":{"app.kubernetes.io/managed-by":"Helm"}}}\n' \
+            "$name"
+        exit 0
+        ;;
+    helm-without-release-namespace)
+        printf '{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"%s","labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"%s"}}}\n' \
+            "$name" "$foreign_release"
+        exit 0
+        ;;
     malformed)
         printf '%s\n' '{"metadata":'
         exit 0
@@ -354,6 +369,84 @@ fn foreign_owners_for_both_roles_block_with_exact_remediation() {
         ["shared-platform", "shared-sandbox"],
         "the preflight must aggregate both rendered conflicts before failing"
     );
+}
+
+#[test]
+fn unmanaged_platform_class_blocks_with_exact_remediation() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        "shared-platform",
+        "unmanaged",
+        DEFAULT_SANDBOX,
+        "absent",
+        &["--set", "priorityClasses.platform.name=shared-platform"],
+    );
+    let shown = assert_failed_before_upgrade(&fixture, &output);
+
+    for expected in [
+        "shared-platform",
+        "exists without complete Helm ownership metadata",
+        "--set priorityClasses.platform.create=false --set priorityClasses.platform.name=shared-platform",
+        "--set priorityClasses.platform.name=<different-name>",
+    ] {
+        assert!(
+            shown.contains(expected),
+            "the unmanaged platform conflict must contain `{expected}`:\n{shown}"
+        );
+    }
+    assert_eq!(fixture.queries(), ["shared-platform", DEFAULT_SANDBOX]);
+}
+
+#[test]
+fn helm_labelled_sandbox_class_without_release_annotations_blocks_with_exact_remediation() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "absent",
+        "shared-sandbox",
+        "helm-without-annotations",
+        &["--set", "priorityClasses.sandbox.name=shared-sandbox"],
+    );
+    let shown = assert_failed_before_upgrade(&fixture, &output);
+
+    for expected in [
+        "shared-sandbox",
+        "exists without complete Helm ownership metadata",
+        "--set priorityClasses.sandbox.create=false --set priorityClasses.sandbox.name=shared-sandbox",
+        "--set priorityClasses.sandbox.name=<different-name>",
+    ] {
+        assert!(
+            shown.contains(expected),
+            "the incomplete sandbox ownership conflict must contain `{expected}`:\n{shown}"
+        );
+    }
+    assert_eq!(fixture.queries(), [DEFAULT_PLATFORM, "shared-sandbox"]);
+}
+
+#[test]
+fn helm_labelled_platform_class_without_release_namespace_blocks_with_exact_remediation() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        "shared-platform",
+        "helm-without-release-namespace",
+        DEFAULT_SANDBOX,
+        "absent",
+        &["--set", "priorityClasses.platform.name=shared-platform"],
+    );
+    let shown = assert_failed_before_upgrade(&fixture, &output);
+
+    for expected in [
+        "shared-platform",
+        "exists without complete Helm ownership metadata",
+        "--set priorityClasses.platform.create=false --set priorityClasses.platform.name=shared-platform",
+        "--set priorityClasses.platform.name=<different-name>",
+    ] {
+        assert!(
+            shown.contains(expected),
+            "the incomplete platform ownership conflict must contain `{expected}`:\n{shown}"
+        );
+    }
+    assert_eq!(fixture.queries(), ["shared-platform", DEFAULT_SANDBOX]);
 }
 
 #[test]
