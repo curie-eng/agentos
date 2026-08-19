@@ -121,6 +121,66 @@ def _dockerfile_python_pins(instructions: list[str]) -> dict[str, list[str]]:
     return pins
 
 
+def _dockerfile_pip_violations(instructions: list[str]) -> list[Violation]:
+    violations: list[Violation] = []
+    controls = {"&&", "||", ";"}
+    for instruction in instructions:
+        tokens = _shell_tokens(instruction)
+        if not tokens or tokens[0].upper() != "RUN":
+            continue
+        for index, token in enumerate(tokens[:-1]):
+            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
+                tokens[index + 1] != "install"
+            ):
+                continue
+            command: list[str] = []
+            for operand in tokens[index + 2 :]:
+                if operand in controls:
+                    break
+                command.append(operand)
+            skip_next = False
+            for operand in command:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if operand in {"-r", "--requirement"}:
+                    skip_next = True
+                    continue
+                if operand.startswith("-") or operand == "pip" or operand.startswith(
+                    ("./", "../", "/")
+                ):
+                    continue
+                if "==" not in operand:
+                    violations.append(
+                        Violation(operand, "pip install is missing an exact version")
+                    )
+    return violations
+
+
+def _installs_generated_runner_requirements(instructions: list[str]) -> bool:
+    controls = {"&&", "||", ";"}
+    for instruction in instructions:
+        tokens = _shell_tokens(instruction)
+        if not tokens or tokens[0].upper() != "RUN":
+            continue
+        for index, token in enumerate(tokens[:-1]):
+            if not _PIP_EXECUTABLE.fullmatch(token.rsplit("/", 1)[-1]) or (
+                tokens[index + 1] != "install"
+            ):
+                continue
+            command: list[str] = []
+            for operand in tokens[index + 2 :]:
+                if operand in controls:
+                    break
+                command.append(operand)
+            if any(
+                option in {"-r", "--requirement"} and requirement == _REQUIREMENTS_PATH
+                for option, requirement in zip(command, command[1:], strict=False)
+            ):
+                return True
+    return False
+
+
 def _split_npm_operand(operand: str) -> tuple[str, str | None]:
     version_at = operand.rfind("@")
     if version_at <= 0:
@@ -188,7 +248,10 @@ def _find_violations(lock_text: str, dockerfile_text: str) -> list[Violation]:
     expected = _locked_runner_dependencies(lock_text)
     instructions = _logical_instructions(dockerfile_text)
     pins = _dockerfile_python_pins(instructions)
-    violations = _npm_violations(instructions)
+    violations = _dockerfile_pip_violations(instructions) + _npm_violations(instructions)
+
+    if _installs_generated_runner_requirements(instructions):
+        pins = {package: [version] for package, version in expected.items()} | pins
 
     for package, versions in pins.items():
         if len(versions) > 1:
@@ -319,6 +382,26 @@ def test_dockerfile_generates_python_requirements_from_the_lock_exporter() -> No
         for instruction in instructions
     )
     assert _dockerfile_python_pins(instructions) == {}
+
+
+def test_actual_runner_dockerfile_matches_locked_dependencies() -> None:
+    assert _find_violations(
+        _UV_LOCK.read_text(encoding="utf-8"),
+        _DOCKERFILE.read_text(encoding="utf-8"),
+    ) == []
+
+
+def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    mutated = (
+        dockerfile
+        + "\nRUN /app/.venv/bin/pip install --no-cache-dir --upgrade "
+        "claude-agent-sdk aiohttp\n"
+    )
+
+    assert Violation(
+        "claude-agent-sdk", "pip install is missing an exact version"
+    ) in _find_violations(_UV_LOCK.read_text(encoding="utf-8"), mutated)
 
 
 def test_prechange_drift_reports_all_four_violations() -> None:
