@@ -1864,7 +1864,7 @@
       "name": "cluster",
       "subcommands": [
         {
-          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model; without it the install is sealed (fake model, canned replies). A real model is still unreachable behind the fail-closed sandbox until you open its egress with --allow-egress-host <provider> (or --allow-web-egress <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their matching base URL in worker runtime configuration, in addition to a credential and named egress",
+          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. A real model is still unreachable behind the fail-closed sandbox until you open its egress with --allow-egress-host <provider> (or --allow-web-egress <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their matching base URL in worker runtime configuration, in addition to a credential and named egress",
           "args": [
             {
               "default_values": [

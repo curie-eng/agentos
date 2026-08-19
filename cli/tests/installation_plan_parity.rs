@@ -10,6 +10,11 @@ const IPV4: &str = "1.1.1.1";
 const IPV6: &str = "2606:4700:4700::1111";
 const MODEL_VALUE: &str = "model-value-for-plan";
 const GITHUB_VALUE: &str = "github-value-for-plan";
+const RERUN_CREDENTIAL_SENTINEL: &str = "placeholder credential sentinel";
+const RERUN_MODEL_SENTINEL: &str = "placeholder/model";
+const RERUN_EGRESS_CIDR: &str = "192.0.2.10/32";
+const OVERRIDE_MODEL_SET: &str = "agentSandbox.runner.model=operator/model";
+const OVERRIDE_EGRESS_SET: &str = "security.networkPolicy.allowedEgress[0].cidr=198.51.100.20/32";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -219,14 +224,63 @@ fi
 if [ "$1" = upgrade ]; then
     previous=''
     sealing_key_present='no'
+    runner_credential_present='no'
+    runner_credential_preserved='no'
+    runner_model_present='no'
+    runner_model_preserved='no'
+    runner_real_mode_preserved='no'
+    runner_egress_preserved='no'
     for argument in "$@"; do
         if [ "$previous" = '-f' ] && grep -q '"sealing"' "$argument" && grep -q '"privateKey"' "$argument"; then
             sealing_key_present='yes'
         fi
+        if [ "$previous" = '-f' ] && grep -Fq '"credentials"' "$argument"; then
+            runner_credential_present='yes'
+        fi
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_EXPECT_RUNNER_CREDENTIAL:-}" ] && grep -Fq "$CURIE_TEST_EXPECT_RUNNER_CREDENTIAL" "$argument"; then
+            runner_credential_preserved='yes'
+        fi
+        case "$argument" in
+            agentSandbox.runner.model=*) runner_model_present='yes' ;;
+        esac
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_MODEL:-}" ] && [ "$argument" = "agentSandbox.runner.model=$CURIE_TEST_EXPECT_RUNNER_MODEL" ]; then
+            runner_model_preserved='yes'
+        fi
+        if [ "$argument" = 'agentSandbox.runner.fakeModel=false' ]; then
+            runner_real_mode_preserved='yes'
+        fi
+        if [ "$previous" = '-f' ] && [ -n "${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}" ] && grep -Fq "$CURIE_TEST_EXPECT_RUNNER_EGRESS" "$argument"; then
+            runner_egress_preserved='yes'
+        fi
+        case "$argument" in
+            *"security.networkPolicy.allowedEgress"*"${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}"*) runner_egress_preserved='yes' ;;
+        esac
         previous="$argument"
     done
     if [ -n "${CURIE_TEST_CALL_LOG:-}" ]; then
         printf 'SEALING_KEY_PRESENT: %s\n' "$sealing_key_present" >> "$CURIE_TEST_CALL_LOG"
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_CREDENTIAL:-}" ]; then
+            printf 'RUNNER_CREDENTIAL_PRESERVED: %s\n' "$runner_credential_preserved" >> "$CURIE_TEST_CALL_LOG"
+            printf 'RUNNER_MODEL_PRESERVED: %s\n' "$runner_model_preserved" >> "$CURIE_TEST_CALL_LOG"
+            printf 'RUNNER_REAL_MODE_PRESERVED: %s\n' "$runner_real_mode_preserved" >> "$CURIE_TEST_CALL_LOG"
+        fi
+        if [ -n "${CURIE_TEST_EXPECT_RUNNER_EGRESS:-}" ]; then
+            printf 'RUNNER_EGRESS_PRESERVED: %s\n' "$runner_egress_preserved" >> "$CURIE_TEST_CALL_LOG"
+        fi
+        if [ "${CURIE_TEST_EXPECT_FRESH_FAKE_MODEL:-}" = 1 ]; then
+            if [ "$runner_credential_present" = 'no' ] && [ "$runner_model_present" = 'no' ] && [ "$runner_real_mode_preserved" = 'no' ]; then
+                printf 'RUNNER_FRESH_FAKE_MODE: yes\n' >> "$CURIE_TEST_CALL_LOG"
+            else
+                printf 'RUNNER_FRESH_FAKE_MODE: no\n' >> "$CURIE_TEST_CALL_LOG"
+            fi
+        fi
+        if [ "${CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED:-}" = 1 ]; then
+            if [ "$runner_credential_present" = 'no' ] && [ "$runner_model_present" = 'no' ] && [ "$runner_real_mode_preserved" = 'no' ]; then
+                printf 'RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes\n' >> "$CURIE_TEST_CALL_LOG"
+            else
+                printf 'RUNNER_RECORDED_PROVIDER_SUPPRESSED: no\n' >> "$CURIE_TEST_CALL_LOG"
+            fi
+        fi
     fi
     exit 0
 fi
@@ -434,23 +488,28 @@ exit 0
     }
 
     fn cluster_up(&self) -> Output {
+        self.cluster_up_with(&["--fake-model"], &[])
+    }
+
+    fn cluster_up_with(&self, extra: &[&str], env: &[(&str, &str)]) -> Output {
         let chart = repo_root().join("charts/curie");
-        self.run(
-            &[
-                "cluster",
-                "up",
-                "--namespace",
-                "parity",
-                "--release",
-                "parity",
-                "--chart",
-                chart.to_str().expect("UTF 8 chart path"),
-                "--fake-model",
-                "--set",
-                "agentSandbox.controller.deploy=false",
-            ],
-            &[],
-        )
+        let mut args = vec![
+            "cluster",
+            "up",
+            "--namespace",
+            "parity",
+            "--release",
+            "parity",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--set", "agentSandbox.controller.deploy=false"]);
+        self.run(&args, env)
+    }
+
+    fn cluster_up_without_credentials(&self, env: &[(&str, &str)]) -> Output {
+        self.cluster_up_with(&[], env)
     }
 
     fn cluster_up_dry_run(&self) -> Output {
@@ -477,6 +536,20 @@ exit 0
 
 fn provider_egress_fixture() -> String {
     json!({"api.anthropic.com": [IPV4, IPV6]}).to_string()
+}
+
+fn recorded_runner_values() -> HelmValuesResponse {
+    HelmValuesResponse::Object(json!({
+        "agentSandbox": {"runner": {
+            "credentials": RERUN_CREDENTIAL_SENTINEL,
+            "fakeModel": false,
+            "model": RERUN_MODEL_SENTINEL
+        }},
+        "security": {"networkPolicy": {"allowedEgress": [{
+            "cidr": RERUN_EGRESS_CIDR,
+            "ports": [{"port": 443, "protocol": "TCP"}]
+        }]}}
+    }))
 }
 
 fn json_output(output: Output, verb: &str) -> Value {
@@ -1104,6 +1177,196 @@ fn cluster_up_dry_run_defers_sealing_resolution_without_inventing_a_key() {
             && visible.contains("preserv")
             && visible.contains("generat"),
         "the preview must explain that live release discovery decides preservation or generation:\n{visible}"
+    );
+}
+
+#[test]
+fn cluster_up_rerun_preserves_existing_runner_model_and_egress_configuration() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+
+    let output = fixture.cluster_up_without_credentials(&[
+        (
+            "CURIE_TEST_EXPECT_RUNNER_CREDENTIAL",
+            RERUN_CREDENTIAL_SENTINEL,
+        ),
+        ("CURIE_TEST_EXPECT_RUNNER_MODEL", RERUN_MODEL_SENTINEL),
+        ("CURIE_TEST_EXPECT_RUNNER_EGRESS", RERUN_EGRESS_CIDR),
+    ]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the credential sentinel leaked into command output: {visible}"
+    );
+    assert!(
+        !visible.contains("the sandbox is sealed -- no egress opened")
+            && !visible.contains("Pass --allow-egress-host"),
+        "a rerun preserving egress must not claim it is sealed or ask the operator to reopen it: {visible}"
+    );
+    json_output(output, "cluster up rerun");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: get values parity -n parity -o json"),
+        "a rerun must read the recorded release values: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_CREDENTIAL_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner credential through Helm's private values file: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_MODEL_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner model: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_REAL_MODE_PRESERVED: yes"),
+        "a rerun with a recorded credential must keep the real model enabled: {calls}"
+    );
+    assert!(
+        calls.contains("RUNNER_EGRESS_PRESERVED: yes"),
+        "a rerun must preserve the recorded runner egress route: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the credential sentinel leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_explicit_model_modes_suppress_recorded_provider_configuration() {
+    for (name, args, expected_value) in [
+        (
+            "local model",
+            &["--local-model", "qwen3:4b"] as &[&str],
+            Some("inference.model=qwen3:4b"),
+        ),
+        ("fake model", &["--fake-model"], None),
+    ] {
+        let fixture = HelmFixture::new(
+            installation_for_the_stateful_guard(),
+            recorded_runner_values(),
+        );
+        let output = fixture.cluster_up_with(
+            args,
+            &[("CURIE_TEST_EXPECT_RECORDED_PROVIDER_SUPPRESSED", "1")],
+        );
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+            "the recorded credential leaked during {name}: {visible}"
+        );
+        json_output(output, name);
+
+        let calls = fixture.calls();
+        assert!(
+            calls.contains("RUNNER_RECORDED_PROVIDER_SUPPRESSED: yes"),
+            "{name} must suppress the recorded provider credential and model: {calls}"
+        );
+        if let Some(expected_value) = expected_value {
+            assert!(
+                calls.contains(expected_value),
+                "{name} must select the requested local model: {calls}"
+            );
+        }
+        assert!(
+            !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+            "the recorded credential leaked into the command log during {name}: {calls}"
+        );
+    }
+}
+
+#[test]
+fn cluster_up_explicit_model_replaces_recorded_model() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(&["--set", OVERRIDE_MODEL_SET], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked while replacing the model: {visible}"
+    );
+    json_output(output, "cluster up with explicit model");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(OVERRIDE_MODEL_SET),
+        "the explicit model must reach Helm: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_MODEL_SENTINEL),
+        "the recorded model must not accompany the explicit model: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_explicit_egress_replaces_recorded_egress() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values(),
+    );
+    let output = fixture.cluster_up_with(&["--set", OVERRIDE_EGRESS_SET], &[]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !visible.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked while replacing egress: {visible}"
+    );
+    json_output(output, "cluster up with explicit egress");
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains(OVERRIDE_EGRESS_SET),
+        "the explicit egress route must reach Helm: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_EGRESS_CIDR),
+        "the recorded egress route must not accompany the explicit route: {calls}"
+    );
+    assert!(
+        !calls.contains(RERUN_CREDENTIAL_SENTINEL),
+        "the recorded credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_fresh_release_without_credentials_stays_fake() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    json_output(
+        fixture.cluster_up_without_credentials(&[("CURIE_TEST_EXPECT_FRESH_FAKE_MODEL", "1")]),
+        "fresh cluster up",
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("RUNNER_FRESH_FAKE_MODE: yes"),
+        "a fresh release without credentials must leave the runner in fake mode: {calls}"
     );
 }
 
