@@ -66,6 +66,7 @@ because it can start stale application images.
   trap 'docker compose --profile full -f compose.dev.yaml down -v; rm -f "$wire_lock"' EXIT
   uv lock --check
   uv sync
+  uv run python scripts/check-alembic-revisions.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports

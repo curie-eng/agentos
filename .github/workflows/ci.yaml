@@ -54,6 +54,8 @@ jobs:
         run: uv lock --check
       - name: Sync workspace
         run: uv sync
+      - name: Alembic revision gate
+        run: uv run python scripts/check-alembic-revisions.py
       - name: Ruff
         run: uv run ruff check .
       - name: Mypy
