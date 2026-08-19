@@ -259,6 +259,7 @@ jobs:
       # The floor asserted above is a claim about symbols. This is the claim
       # under test: Amazon Linux 2023 is glibc 2.34, it is what the deployment
       # runbook provisions, and it is where `curie --version` died.
+      # The Amazon Linux execution check remains x86_64 only because arm64 execution would require qemu.
       - name: Run it on Amazon Linux 2023
         run: |
           set -euo pipefail

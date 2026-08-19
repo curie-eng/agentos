@@ -19,7 +19,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use anyhow::{bail, Context, Result};
 
 /// Where a sealed value is written in `connectors.yaml`, for the paste snippet.
-fn snippet(_connector: &str, env_name: &str, blob: &str) -> String {
+fn snippet(env_name: &str, blob: &str) -> String {
     format!("    sealed_secrets:\n      {env_name}: {blob}")
 }
 
@@ -51,12 +51,12 @@ impl crate::ui::CliOutput for SealOutput {
             "env_name": self.env_name,
             "sealed": self.sealed,
             "public_key": self.public_key,
-            "yaml": snippet(&self.connector, &self.env_name, &self.sealed),
+            "yaml": snippet(&self.env_name, &self.sealed),
         })
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        ui.payload_plain(&snippet(&self.connector, &self.env_name, &self.sealed));
+        ui.payload_plain(&snippet(&self.env_name, &self.sealed));
         ui.note(&format!(
             "sealed to public key {}. Only a cluster holding the matching private \
              key can read it, so this is safe to commit. Merge the block above under \
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn the_snippet_merges_under_a_connector_without_replacing_siblings() {
-        let fragment = snippet("grafana", "GRAFANA_TOKEN", "AgBv3n2K");
+        let fragment = snippet("GRAFANA_TOKEN", "AgBv3n2K");
         assert_eq!(
             fragment, "    sealed_secrets:\n      GRAFANA_TOKEN: AgBv3n2K",
             "the paste guidance must contain only the connector child block"

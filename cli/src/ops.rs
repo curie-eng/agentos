@@ -3269,7 +3269,7 @@ async fn run_prepared_up(
                 .count();
             let message = if sealing_values == preserved.len() {
                 format!(
-                    "preserving {} sealing value(s) recorded by the release; use --set only to replace them",
+                    "preserving {} sealing value(s) recorded by the release",
                     preserved.len()
                 )
             } else if sealing_values == 0 {
@@ -3279,7 +3279,7 @@ async fn run_prepared_up(
                 )
             } else {
                 format!(
-                    "preserving {} value(s), including {} sealing value(s), recorded by the release; use the owning command only to replace them",
+                    "preserving {} value(s), including {} sealing value(s), recorded by the release",
                     preserved.len(),
                     sealing_values
                 )

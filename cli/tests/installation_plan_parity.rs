@@ -928,6 +928,74 @@ fn store_migration_preview_mounts_the_discovered_release_secret() {
 }
 
 #[test]
+fn store_migration_export_preview_mounts_the_discovered_release_secret() {
+    let fixture = HelmFixture::new("", HelmValuesResponse::Absent);
+    let chart = repo_root().join("charts/curie");
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "acme-minio"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/component": "minio"
+            }}}
+        }]
+    })
+    .to_string();
+    let credential = "export-credential-for-plan";
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "export",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+            "--dry-run",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
+            ("CURIE_CREDENTIALS", credential),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview = json_output(output, "cluster migrate-store --phase export --dry-run")["plan"]
+        .as_array()
+        .expect("migration export preview plan")
+        .iter()
+        .map(|line| line.as_str().expect("preview command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        fixture.calls().contains("KUBECTL_CALL: -n acme get secret"),
+        "the export preview must discover the release Secret before planning its consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        preview.contains(r#""secretName":"acme-curie-secrets""#),
+        "the export staging pod must mount the discovered Secret: {preview}"
+    );
+    assert!(
+        !preview.contains(r#""secretName":"acme-secrets""#),
+        "the export staging pod must not guess a Secret name the chart does not render: {preview}"
+    );
+    assert!(
+        !visible.contains(credential) && !fixture.calls().contains(credential),
+        "the export preview must not leak credentials through output or command logs"
+    );
+}
+
+#[test]
 fn cluster_up_reports_a_preserved_sealing_key_as_preserved() {
     let fixture = HelmFixture::new(
         installation_for_the_stateful_guard(),
