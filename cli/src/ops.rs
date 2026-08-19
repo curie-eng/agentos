@@ -1951,6 +1951,7 @@ data:
         assert!(removed_stateful_components(&live, &rendered).is_empty());
     }
 
+    /// Source: https://github.com/helm/helm/blob/v3.16.4/pkg/kube/client.go#L452-L455
     /// Helm upgrade honors only the exact lowercase `keep` value.
     #[test]
     fn helm_upgrade_exact_keep_annotation_is_not_at_risk() {

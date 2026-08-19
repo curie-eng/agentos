@@ -6,13 +6,9 @@
 #
 # This was a real outage. worker.yaml set none of the four variables, so the
 # worker fell back to its compose default (http://localhost:29000) and every
-# bundle fetch got ECONNREFUSED. Both symptoms pointed elsewhere:
-#
-#   * every Slack turn died as ClaimTimeoutError after 90s, and that message
-#     names a CPU-saturated node first -- on an install idling at 11% CPU
-#   * the post-deploy eval silently stopped running with "unresolvable
-#     suite/bundle", which alerts nothing, because a suite that cannot resolve
-#     looks exactly like a suite nobody asked for
+# bundle fetch got ECONNREFUSED. The post-deploy eval silently stopped running
+# with "unresolvable suite/bundle", which alerts nothing, because a suite that
+# cannot resolve looks exactly like a suite nobody asked for.
 #
 # So this asserts AGREEMENT, not presence. Presence alone would still pass the
 # day someone points the worker at a different-but-populated endpoint.
@@ -139,8 +135,7 @@ def assert_contract(docs, label, expected_endpoint):
     for k in sorted(keys - worker_keys):
         failures.append(
             f"worker is missing {k}. Its config defaults these to the compose stack "
-            "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED -- and "
-            "the symptom is a ClaimTimeoutError that blames the node's CPU."
+            "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED."
         )
     for k in sorted(worker_keys - keys):
         failures.append(f"worker has {k}, but api does not")

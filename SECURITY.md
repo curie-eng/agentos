@@ -131,7 +131,8 @@ admins maintain (issue #632).
 
 ### Enforced in the tree (CI)
 
-- **Secret scanning on pushes to main and pull requests targeting main, plus a weekly full-history sweep.** The
+- **Secret scanning on pushes to and pull requests targeting both `main` and
+  `next`, plus a weekly full-history sweep.** The
   `Secret Scan` workflow scans pull request commits from base to head, and full
   history on pushes, scheduled runs, and manual runs. Its scanner image is pinned
   to an immutable digest so this sensitive path cannot change under us.
@@ -155,18 +156,19 @@ maintained by repository admins:
   detected after it lands.
 - **Dependabot alerts** and **Dependabot security updates** enabled; the open
   alert set is triaged (fixed, or dismissed with a recorded reason).
-- **The `main` branch ruleset** requires all required status checks to pass and
-  to be **up to date with `main`** before merge (no stale-green merges), and all
-  **review conversations resolved**. The audit, secret-scan, and CodeQL checks are
-  among the required set.
+- **The `main` and `next` branch rulesets provide equal protection.** Each
+  requires all required status checks to pass, each pull request to be **up to
+  date with its target branch** before merge (no stale-green merges), and all
+  **review conversations resolved**. The audit, secret-scan, and CodeQL checks
+  are among the required set.
 
 ### Bypass path and auditability
 
-The `main` ruleset applies to everyone, including admins, save an explicit
-bypass-actor list. Only repository or organization admins may bypass it, and only
-to recover from a stuck state — e.g. a required check wedged by infrastructure
-rather than by the change under review. Every bypass is recorded in the
-organization audit log (ruleset-bypass events), and every merge's check state is
-visible on its PR, so a bypass is observable after the fact and is expected to be
-justified in the PR. Routine merges never bypass; the ruleset is the default and
-only path.
+The `main` and `next` rulesets apply to everyone, including admins, save explicit
+bypass-actor lists. Only repository or organization admins may bypass them, and
+only to recover from a stuck state — e.g. a required check wedged by
+infrastructure rather than by the change under review. Every bypass is recorded
+in the organization audit log (ruleset-bypass events), and every merge's check
+state is visible on its PR, so a bypass is observable after the fact and is
+expected to be justified in the PR. Routine merges never bypass; the rulesets
+are the default and only paths.

@@ -27,8 +27,12 @@ unless they also make such an architectural decision.
 3. Obtain explicit maintainer approval, then publish the status as `Accepted`.
    Existing code and implementation evidence cannot retroactively accept a
    Draft.
-4. Begin implementation only after acceptance. Track the work in a linked
-   GitHub issue and pull request.
+4. Acceptance is the authority for implementation. Normally, publish the ADR as
+   `Accepted` before beginning implementation. As the coordinated exception, an
+   ADR may land `Accepted` alongside implementation only with recorded explicit
+   maintainer approval and a named realizing code path. Without both, acceptance
+   must precede implementation. Track the work in a linked GitHub issue and pull
+   request.
 5. Revise a Draft through review. Once Accepted, preserve its body. Apply only
    the status, back link, pointer repair, and supersession rules in ADR 0045.
 6. Run `bash scripts/check-docs.sh` after any ADR change. Commit the regenerated
