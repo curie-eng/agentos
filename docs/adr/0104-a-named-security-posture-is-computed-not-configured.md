@@ -4,6 +4,11 @@ Date: 2026-08-10
 
 Status: Accepted
 
+**Partially superseded when [ADR 0110](0110-deterministic-security-posture-classification.md)
+is Accepted.** When Accepted, ADR 0110 supersedes only Decision section 4 of
+this ADR by defining `declared`, the classification order, and the tie break
+that makes a posture name unique. The rest of this ADR remains in force.
+
 Implements [#1226](https://github.com/curie-eng/curie/issues/1226).
 
 Deliberately does NOT depend on [#158](https://github.com/curie-eng/curie/issues/158)
