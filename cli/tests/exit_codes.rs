@@ -10,12 +10,12 @@ const SEAL_VALUE: &str = "placeholder-seal-value";
 
 fn run_seal(connector: &str) -> Output {
     let keypair = curie::sealing::generate_keypair();
+    let connector_arg = format!("--connector={connector}");
     Command::new(env!("CARGO_BIN_EXE_curie"))
         .args([
             "--json",
             "seal",
-            "--connector",
-            connector,
+            &connector_arg,
             "GRAFANA_TOKEN",
             "--public-key",
             &keypair.public_key,

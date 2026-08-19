@@ -903,20 +903,6 @@ pub fn upgrade_cmd(o: &CommonOpts, chart: &str, values_path: &str) -> OpsCommand
     )
 }
 
-/// Wait for the new store's StatefulSet to be ready before importing into it.
-pub fn wait_store_cmd(o: &CommonOpts, store: StoreKind) -> OpsCommand {
-    OpsCommand::new(
-        "kubectl",
-        vec![
-            plain("rollout"),
-            plain("status"),
-            plain(format!("statefulset/{}", store.suffix())),
-            plain("-n"),
-            plain(&o.namespace),
-        ],
-    )
-}
-
 /// Write helm values to a fresh 0600 file, created with restrictive permissions
 /// atomically so the secrets inside are never briefly world-readable.
 fn write_private_values(body: &str) -> Result<String> {
@@ -978,7 +964,7 @@ pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Migra
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
     let image = "amazon/aws-cli:2.32.6";
-    let secret = format!("{}-secrets", o.release);
+    let secret = crate::ops::release_secret_name_or_default(&o.namespace, &o.release).await;
     if o.dry_run {
         let ep = endpoint_for("<store-service>", &o.namespace);
         let cmds = [
