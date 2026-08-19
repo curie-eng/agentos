@@ -16,6 +16,7 @@ from curie_runner import RunnerConfig
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.connectors import build_mcp_servers, derive_mcp_servers
+from curie_runner.plugin import PluginBundleError
 from curie_runner.state import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
 
@@ -439,6 +440,110 @@ def test_the_boot_path_mounts_the_platform_approval_server_over_a_colliding_conn
     # The control on the boot path: the platform winning must not cost the
     # bundle the connectors it declared.
     assert mounted["grafana"] is grafana
+
+
+# --------------------------------------------------------------------------- #
+# A third-party server in the bundle's own `.mcp.json` stays external
+# (#1690, ADR 0113)
+#
+# Hosting is a `connectors.yaml` decision and only a `connectors.yaml` decision:
+# `_read` opens that one file, and the entries it derives are the only ones
+# Curie ever creates a Service and Deployment for. A bundle's own `.mcp.json` is
+# a different channel entirely -- it rides `ClaudeAgentOptions.plugins` as the
+# read-only bundle directory the SDK loads for itself, never through
+# `build_mcp_servers`, which merges only the platform's servers with the
+# connectors.yaml-derived ones. So a remote upstream declared there is dialed at
+# the address its author wrote, and no container of Curie's is started for it.
+#
+# The tests below are the pin on that separation. THE RED: make
+# `derive_mcp_servers` enumerate `.mcp.json` -- the plausible regression, since
+# both files name MCP servers -- and the exact-set assertions
+# (`set(servers) == {"conn"}` here, `set(mounted) == {APPROVAL_SERVER_NAME,
+# "grafana"}` on the boot path) go red on the extra key. Make it REWRITE the
+# upstream entry to a Service DNS URL and the byte-identity assertion on
+# `.mcp.json` plus the "no derived entry carries the upstream host" assertion go
+# red as well.
+# --------------------------------------------------------------------------- #
+UPSTREAM = "https://mcp.example-upstream.com/mcp"
+UPSTREAM_MCP_JSON = {"mcpServers": {"github-upstream": {"type": "http", "url": UPSTREAM}}}
+
+
+def test_a_third_party_mcp_json_server_is_not_a_connector_curie_hosts(tmp_path: Path) -> None:
+    # One bundle, both channels: a `build:` connector Curie hosts, and a remote
+    # upstream the author reaches directly. Only the first is Curie's to create
+    # a Service for, so only the first may appear in the derived entries -- the
+    # upstream is not there, not renamed, and not rewritten to Service DNS.
+    servers = derive_mcp_servers(_bundle(tmp_path, BUILT, mcp=UPSTREAM_MCP_JSON), **SCOPE)
+    assert set(servers) == {"conn"}
+    assert not any(UPSTREAM in entry.get("url", "") for entry in servers.values())
+    # The control on the same bundle: the connector Curie DOES host still gets
+    # the Service it created, so "the upstream is absent" is not bought by
+    # deriving nothing at all.
+    assert "svc.cluster.local" in servers["conn"]["url"]
+
+
+def test_mounting_connectors_never_rewrites_the_bundles_own_mcp_json(tmp_path: Path) -> None:
+    # "Nothing rewrites `.mcp.json`; the bundle stays the read-only artifact that
+    # was deployed" (connectors.py). Byte identity is the check, because an
+    # injected entry or a rewritten URL would both be a silent edit to a signed,
+    # deployed artifact.
+    root = _bundle(tmp_path, BUILT, mcp=UPSTREAM_MCP_JSON)
+    before = (root / ".mcp.json").read_bytes()
+    build_mcp_servers(
+        platform={APPROVAL_SERVER_NAME: {"platform": "approval"}},
+        derived=derive_mcp_servers(root, **SCOPE),
+    )
+    assert (root / ".mcp.json").read_bytes() == before
+    assert json.loads(before)["mcpServers"]["github-upstream"]["url"] == UPSTREAM
+
+
+def test_the_boot_path_mounts_nothing_for_a_third_party_mcp_json_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pin on the WIRING rather than the helper, through a boot env the
+    # worker really renders. The bundle's own upstream must reach the SDK on the
+    # plugins channel -- the read-only bundle directory, loaded verbatim -- and
+    # must never appear on the platform `mcp_servers` channel, which is where
+    # the servers Curie hosts and derives URLs for ride.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    root = _bundle(tmp_path, HOSTED, mcp=UPSTREAM_MCP_JSON)
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    options = build_runner(config, fake_model=False)._factory()._options
+
+    mounted = options.mcp_servers
+    # Exact, not `"github-upstream" not in mounted`: an extra key of any name is
+    # a server Curie would be hosting that the bundle never declared to it.
+    assert set(mounted) == {APPROVAL_SERVER_NAME, "grafana"}
+    assert "svc.cluster.local" in mounted["grafana"]["url"]
+
+    # The other half of "stays external": it is not dropped either. The SDK gets
+    # the bundle directory itself, and the upstream entry in it is untouched.
+    assert options.plugins == [{"type": "local", "path": str(root)}]
+    loaded = json.loads((Path(options.plugins[0]["path"]) / ".mcp.json").read_text())
+    assert loaded["mcpServers"]["github-upstream"] == {"type": "http", "url": UPSTREAM}
+
+
+def test_a_name_in_both_channels_fails_the_boot_instead_of_picking_a_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The collision precedence, pinned where the code actually decides it: there
+    # is none. `_reject_connector_name_collisions` refuses the bundle ("one
+    # name, one owner"), and the runner runs that same validator through
+    # load_plugins at boot, so the bundle never loads. A residual collision
+    # therefore cannot reach build_mcp_servers, whose platform-wins rule is a
+    # separate fence over Curie's OWN server names (#1200), not over this one.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    collide = {"mcpServers": {"grafana": {"type": "http", "url": UPSTREAM}}}
+    config = _config_for(
+        _bundle(tmp_path, HOSTED, mcp=collide),
+        release="curie",
+        agent="acme-dev",
+        namespace="curie",
+    )
+    with pytest.raises(PluginBundleError) as exc:
+        build_runner(config, fake_model=False)
+    assert "connectors.duplicate_server" in str(exc.value)
+    assert "grafana" in str(exc.value)
 
 
 def test_the_reserved_list_matches_the_runner_constants() -> None:
