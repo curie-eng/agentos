@@ -13,12 +13,14 @@
 #   kubernetes    ON.  Read-only cluster access. The only connector you need to
 #                      make this bot useful, and the only one with no external
 #                      dependency beyond the cluster itself.
-#   k8s-write     OFF. One gated write verb. Needs an image you build, a second
-#                      credential, and an approval route. See README.md,
-#                      "Level up: the gated write path".
+#   k8s-write     OFF. One gated write verb. Needs a second credential, an
+#                      approval route, and one `curie build` to turn the source
+#                      in `connectors/k8s-write/` into a pinned image. See
+#                      README.md, "Level up: the gated write path".
 #   grafana       OFF. Logs, metrics, alerts, profiles. Needs a Grafana and a
 #                      Viewer service-account token.
-#   tempo         OFF. Distributed traces. Needs Grafana plus an image you build.
+#   tempo         OFF. Distributed traces. Needs Grafana, plus the same
+#                      `curie build` the write connector needs.
 #
 # Turning one on is uncommenting its block and supplying its secret. Turning one
 # off is commenting it back out -- the connector disappears and so do its tools,
@@ -137,19 +139,27 @@ connectors:
 #
 # ENABLING IT IS NOT JUST UNCOMMENTING. You must:
 #
-#   1. Build the image from `connectors/k8s-write/` and push it to a registry
-#      your cluster can pull from. There is no public image for this on purpose
-#      -- the allowlist and the credential are yours, and so is the artifact.
-#      Build it multi-arch; the Dockerfile says why.
-#   2. Apply `manifests/write-role.yaml` (after editing its namespace and
+#   1. Apply `manifests/write-role.yaml` (after editing its namespace and
 #      `resourceNames`) and store the resulting kubeconfig as
-#      K8S_WRITE_KUBECONFIG.
-#   3. Set `image:` below to what you pushed, and `K8S_WRITE_ALLOWLIST` to the
-#      one `namespace/deployment` this bot may roll.
+#      K8S_WRITE_KUBECONFIG. This comes FIRST: a declared connector secret with
+#      no stored value fails the deploy, so the credential exists before the
+#      connector does.
+#   2. Set `K8S_WRITE_ALLOWLIST` below to the one `namespace/deployment` this
+#      bot may roll.
+#   3. Build the image:
+#
+#          curie build --plugin-dir examples/sre-bot --registry <your-registry>
+#
+#      That builds every connector this file declares a `build:` for, on every
+#      platform it names, pushes them, and records the resolved digests in
+#      `connectors.lock.yaml`. There is no public image for this on purpose --
+#      the allowlist and the credential are yours, and so is the artifact -- and
+#      no `image:` line to edit: the digest lives in the lock, never here.
 #   4. Add the approval gate to `.claude-plugin/plugin.json`. It is NOT shipped:
 #      bundle validation rejects a gate that names an undeclared connector, so a
 #      gate for a commented-out connector would fail the build for everyone who
-#      never enables this. README.md carries the exact JSON.
+#      never enables this. The gate therefore travels WITH this uncomment, in
+#      the same change; README.md carries the exact JSON.
 #
 # Full walkthrough: README.md, "Level up: the gated write path".
 #
@@ -162,16 +172,26 @@ connectors:
 # never fires.
 #
 #   k8s-write:
-#     # Whatever you built and pushed in step 1. Pinned by digest or an
-#     # immutable tag, never `:latest` -- see the pinning note on `kubernetes`
-#     # above, which is not theoretical.
+#     # Where the image comes FROM, instead of what it is. `curie build` builds
+#     # this context and records the digest it resolved in
+#     # `connectors.lock.yaml`; the deploy renders that digest and nothing else,
+#     # so the pinning note on `kubernetes` above -- which is not theoretical --
+#     # is satisfied by construction here rather than by remembering to type an
+#     # immutable tag.
+#     #
+#     # `platforms` is required rather than defaulted, because a silently
+#     # single-arch image builds clean, passes CI, and then fails to pull on a
+#     # node of the other architecture as "no matching manifest".
 #     #
 #     # PACKAGE VISIBILITY, if you push to a registry that has the concept: a
 #     # newly published package is often PRIVATE by default, and an anonymous
 #     # node pull then gets a 403 that surfaces as ImagePullBackOff rather than
-#     # as a permissions error. Verify with an anonymous manifest fetch before
-#     # blaming the cluster.
-#     image: <your-registry>/sre-bot-k8s-write-mcp:v1
+#     # as a permissions error. That trap is about the registry you pushed to,
+#     # so it survives the change of who does the building. Verify with an
+#     # anonymous manifest fetch before blaming the cluster.
+#     build:
+#       context: connectors/k8s-write
+#       platforms: [linux/amd64, linux/arm64]
 #     unhosted_url: ${K8S_WRITE_MCP_URL}
 #     env:
 #       # Defence in depth alongside the Role's `resourceNames`. A ceiling
@@ -288,14 +308,18 @@ connectors:
 # Grafana, just to an endpoint mcp-grafana has no tool for: the datasource
 # proxy. So this adds a capability without adding a credential.
 #
-# NO PUBLIC IMAGE. Build it from `connectors/tempo/` and push it to a registry
-# your cluster pulls from, then set `image:` to what you pushed. Pin it by
-# digest or an immutable tag -- a floating `:latest` already cost this connector
-# a CrashLoopBackOff once, when the flags verified at check time were not the
-# flags present at pull time.
+# NO PUBLIC IMAGE, and nothing to build by hand: the `build:` block below is
+# built by the same `curie build --plugin-dir examples/sre-bot --registry
+# <your-registry>` that builds the write connector. What that resolves to is a
+# digest, recorded in `connectors.lock.yaml` and rendered verbatim -- which is
+# the point, because a floating `:latest` already cost this connector a
+# CrashLoopBackOff once, when the flags verified at check time were not the
+# flags present at pull time. A digest cannot be repointed after review.
 #
 #   tempo:
-#     image: <your-registry>/sre-bot-tempo-mcp:v1
+#     build:
+#       context: connectors/tempo
+#       platforms: [linux/amd64, linux/arm64]
 #     unhosted_url: ${TEMPO_MCP_URL}
 #     env:
 #       # Same install-specific line as the grafana block above, same reason.

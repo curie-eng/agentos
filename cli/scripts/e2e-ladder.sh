@@ -79,6 +79,25 @@
 #                            rung 1 (cli/scripts/e2e.sh reads this same var
 #                            itself rather than being told by the ladder).
 #   CURIE_BIN              path to a prebuilt curie binary (skip cargo build)
+#   CURIE_E2E_CONNECTOR_BUNDLE
+#                          opt-in: path to a bundle that declares connectors
+#                            (examples/sre-bot) to drive every named rung
+#                            through INSTEAD of the fixed weather bundle, so the
+#                            rungs assert hosted-connector parity (ADR 0113,
+#                            #1690). Unset by default: the default ladder's
+#                            bundle stays fixed, so this is an added rung input
+#                            rather than a change to the existing gate.
+#   CURIE_E2E_CONNECTOR_REGISTRY
+#                          registry ref (e.g. ghcr.io/acme-corp) for the
+#                            connector build. Unset builds the host platform
+#                            into the local Docker daemon, which the skill and
+#                            local rungs accept and the CLUSTER rung refuses by
+#                            design, so the cluster rung requires this.
+#   CURIE_E2E_CONNECTOR_OMIT_SECRET
+#                          name ONE of the fixture's three credentials to skip
+#                            provisioning. The falsifiable negative: the rung
+#                            must then fail closed on the missing credential
+#                            rather than starting a connector without it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -87,6 +106,48 @@ LIVE="${CURIE_E2E_LIVE:-0}"
 # Fixed, not an env knob: the ladder asserts PLUMBING, so the bundle it ships is
 # a fixed input of the test rather than something a caller varies.
 BUNDLE_SRC="$REPO_ROOT/examples/weather"
+
+# --- the connector rung input (ADR 0113, #1690), opt-in and off by default ---
+#
+# Set CURIE_E2E_CONNECTOR_BUNDLE and every named rung runs a scratch copy of
+# THAT bundle instead, with its connectors turned on by a checked-in fixture and
+# its images built from source before the first rung. The default above is
+# untouched, so this adds a rung input and changes no existing gate.
+CONNECTOR_BUNDLE="${CURIE_E2E_CONNECTOR_BUNDLE:-}"
+CONNECTOR_REGISTRY="${CURIE_E2E_CONNECTOR_REGISTRY:-}"
+CONNECTOR_OMIT_SECRET="${CURIE_E2E_CONNECTOR_OMIT_SECRET:-}"
+# A whole file, never a scripted uncomment: see the fixture's own header for why
+# a `sed` against a comment block is the green-but-vacuous failure this rung
+# exists to prevent.
+CONNECTOR_FIXTURE="$REPO_ROOT/cli/scripts/fixtures/sre-bot-connectors-enabled.yaml"
+# The connectors the fixture builds FROM SOURCE, and the tool set each must
+# serve. These two are the subject of the assertion; the fixture's third
+# connector is an ordinary `image:` one, hosted beside them as the control.
+CONNECTOR_BUILT=(k8s-write tempo)
+CONNECTOR_TOOLS_K8S_WRITE="restart_deployment"
+CONNECTOR_TOOLS_TEMPO="get_trace,list_trace_tag_values,list_trace_tags,search_traces"
+# The port every connector in the fixture serves on (`ConnectorSpec.port`'s
+# default). Release, agent and namespace are deliberately NOT constants here:
+# each rung reads them off the scope its own tier handed the runner, which is
+# what makes the assertion a parity check rather than a restatement.
+CONNECTOR_PORT=8000
+# Pinned by the first rung to report an entry set, matched by every later one --
+# the same shape as PARITY_DIGEST, and compared byte for byte.
+CONNECTOR_ENTRIES=""
+CONNECTOR_ENTRY_RUNGS=""
+# `name=image` lines from the one `curie build --plugin-dir` receipt this run
+# produced, so every rung is checked against what THIS run resolved.
+CONNECTOR_IMAGES=""
+# The scope the last rung's tier actually handed its runner, recorded by
+# assert_connector_parity so the post-teardown sweep looks for those exact
+# names.
+CONNECTOR_SCOPE_RELEASE=""
+CONNECTOR_SCOPE_AGENT=""
+CONNECTOR_SCOPE_NAMESPACE=""
+# The runner this script's own skill-tier connector case boots. Never the
+# default name: that one belongs to whatever real `skill up` a developer has
+# going on this box.
+CONNECTOR_RUNNER_NAME="curie-ladder-connectors-$$"
 # Hardcoded, and deliberately NOT an env knob: the stub port is the constant
 # DEFAULT_LOCAL_STUB_PORT in cli/src/message.rs, pinned to the compose worker's
 # SLACK_API_BASE_URL. An override would only move this script's precheck, so it
@@ -97,6 +158,27 @@ PROMPT="What is the weather in Denver right now?"
 # ONLY as a live-mode negative control -- "the reply must not be this" -- never
 # as a pass condition. Matching it to green is the #612 bypass.
 FAKE_SENTINEL="all done"
+
+# The component label every connector container carries, in both the skill start
+# path and the local compose overlay (cli/src/docker.rs
+# CONNECTOR_COMPONENT_LABEL). Teardown reaps by label, so this is the only
+# handle that selects a connector container; its NAME differs between the two
+# tiers (`curie-connector-<session>-<name>` vs compose's own).
+CONNECTOR_LABEL="curietech.ai/component=connector"
+
+if [[ -n "$CONNECTOR_BUNDLE" ]]; then
+    if [[ ! -d "$CONNECTOR_BUNDLE" ]]; then
+        echo "error: CURIE_E2E_CONNECTOR_BUNDLE is set to '$CONNECTOR_BUNDLE', which is not a directory." >&2
+        exit 1
+    fi
+    # Absolutized once: every later use is from another directory.
+    CONNECTOR_BUNDLE="$(cd "$CONNECTOR_BUNDLE" && pwd)"
+    BUNDLE_SRC="$CONNECTOR_BUNDLE"
+    # The connector bundle is not a weather bot, and a prompt it cannot answer
+    # would make a live rung's grade meaningless. Plumbing is still all a fake
+    # rung asserts.
+    PROMPT="Is any pod crashlooping right now?"
+fi
 
 # Set once the ladder itself brought the compose stack up. The thread that
 # brought a stack up owns tearing it down, so a stack that was already running
@@ -184,6 +266,20 @@ cleanup() {
     # the case itself once `skill down` has removed it.
     if (( CONFLICT_CREATED )); then
         docker rm -f "$CONFLICT_NAME" >/dev/null 2>&1
+    fi
+    # Connector containers this run's own bundle started, matched by the exact
+    # aliases derived from the scope a rung recorded -- never a bare sweep of
+    # the connector label, which is host-wide and would reach a concurrent
+    # session's connectors. A normal path has already reaped these through the
+    # tier's own `down`; this covers the run that died before reaching it.
+    if [[ -n "$CONNECTOR_SCOPE_RELEASE" ]]; then
+        local connector object survivor
+        for connector in kubernetes "${CONNECTOR_BUILT[@]}"; do
+            object="$(connector_object_name "$CONNECTOR_SCOPE_RELEASE" "$CONNECTOR_SCOPE_AGENT" "$connector" 2>/dev/null)" || continue
+            survivor="$(connector_container_for_alias "$object.$CONNECTOR_SCOPE_NAMESPACE.svc.cluster.local")" || continue
+            echo "sweeping stranded connector container $survivor"
+            docker rm -f "$survivor" >/dev/null 2>&1
+        done
     fi
     rm -rf "$WORKDIR"
     exit "$code"
@@ -666,6 +762,543 @@ case_leftover_runner_container() {
     echo "skill down --name cleared the leftover with no recorded state"
 }
 
+# ---------------------------------------------------------------------------
+# The connector rung (ADR 0113, #1690). Everything below is inert unless
+# CURIE_E2E_CONNECTOR_BUNDLE is set.
+# ---------------------------------------------------------------------------
+
+connector_mode() {
+    [[ -n "$CONNECTOR_BUNDLE" ]]
+}
+
+# Two distinct, well-formed, scratch-scoped kubeconfigs plus the tempo token,
+# provisioned into THIS RUN's process environment and the scratch bundle copies
+# only. Nothing of the operator's is read, written or restored: the CLI resolves
+# a connector credential from the environment first and the host vault second
+# (cli/src/commands.rs resolve_connector_secret), so exporting is sufficient and
+# `curie secrets set` -- which writes the operator's real store -- is never run.
+#
+# The kubeconfigs need no cluster. These rungs assert HOSTING, not live
+# Kubernetes access: the write connector refuses to start without a kubeconfig
+# file and starts with a well-formed one, which is exactly the fail-closed
+# behavior under test.
+provision_connector_credentials() {
+    local creds="$WORKDIR/connector-creds"
+    mkdir -p "$creds"
+    chmod 700 "$creds"
+
+    local name
+    for name in K8S_READONLY_KUBECONFIG K8S_WRITE_KUBECONFIG GRAFANA_SERVICE_ACCOUNT_TOKEN; do
+        if [[ "$CONNECTOR_OMIT_SECRET" == "$name" ]]; then
+            echo "connector credentials: SKIPPING $name deliberately (CURIE_E2E_CONNECTOR_OMIT_SECRET)."
+            echo "connector credentials: the rung below MUST now fail closed on the missing credential. A rung that starts a connector anyway is the failure this run is looking for."
+            continue
+        fi
+        case "$name" in
+            K8S_READONLY_KUBECONFIG|K8S_WRITE_KUBECONFIG)
+                # A SEPARATE credential per connector, never one reused: that is
+                # the example's own rule (examples/sre-bot/connectors.yaml), and
+                # reusing one here would quietly assert the opposite shape.
+                local user="ladder-reader" file="$creds/readonly.kubeconfig"
+                if [[ "$name" == "K8S_WRITE_KUBECONFIG" ]]; then
+                    user="ladder-writer"
+                    file="$creds/writer.kubeconfig"
+                fi
+                cat > "$file" <<YAML
+apiVersion: v1
+kind: Config
+clusters: [{name: ladder, cluster: {server: https://kubernetes.default.svc}}]
+users: [{name: $user, user: {token: not-a-real-token-$user}}]
+contexts: [{name: ladder, context: {cluster: ladder, user: $user}}]
+current-context: ladder
+YAML
+                chmod 600 "$file"
+                export "$name"="$(cat "$file")"
+                ;;
+            GRAFANA_SERVICE_ACCOUNT_TOKEN)
+                # A placeholder, and sufficient: the tempo connector refuses to
+                # start without one, and the tool call this rung makes is an
+                # input-validation path that never reaches Grafana.
+                export GRAFANA_SERVICE_ACCOUNT_TOKEN="not-a-real-token-ladder"
+                ;;
+        esac
+        echo "connector credentials: $name provisioned into this run's environment only"
+    done
+}
+
+# Turn the example's commented-out connectors on in ONE scratch copy, and give
+# the copy the approval gate that must travel with them.
+#
+# The gate is applied here rather than shipped as a second fixture file so it
+# cannot drift from the committed plugin.json it patches: bundle validation
+# rejects a gate naming an undeclared connector, so the two changes are one
+# change, and a fixture pair could be edited apart.
+prepare_connector_bundle() {
+    local dir="$1"
+    cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
+    python3 -c '
+import json, sys
+path = sys.argv[1]
+with open(path) as fh:
+    manifest = json.load(fh)
+# The exact block examples/sre-bot/README.md documents at "Declare the approval
+# gate". The tool name carries no plugin infix, deliberately: a Curie connector
+# is a platform-supplied server, so the prefixed form the deploy error advises
+# validates, deploys and never fires.
+manifest["approvalPolicy"] = {
+    "gates": [{"gate": "mcp__k8s-write__restart_deployment", "route": "sre-approvals"}]
+}
+with open(path, "w") as fh:
+    json.dump(manifest, fh, indent=2)
+    fh.write("\n")
+' "$dir/.claude-plugin/plugin.json"
+    echo "connector fixture applied to $dir (connectors.yaml + the approvalPolicy gate that travels with it)"
+}
+
+# One build before the first rung, so every rung consumes the same lock and the
+# bundle bytes each rung packs are identical (the PARITY_DIGEST assertion).
+#
+# Without --registry this builds the host platform into the local Docker daemon
+# and records the local image id, which the skill and local rungs accept and the
+# cluster rung refuses by design -- so the cluster rung requires a registry.
+build_connector_images() {
+    local dir="$1"
+    local out
+    local build_args=(--json build --plugin-dir "$dir")
+    if [[ -n "$CONNECTOR_REGISTRY" ]]; then
+        build_args+=(--registry "$CONNECTOR_REGISTRY")
+        echo "=== curie build --plugin-dir (registry delivery: $CONNECTOR_REGISTRY) ==="
+    else
+        echo "=== curie build --plugin-dir (local-daemon delivery) ==="
+    fi
+    out="$("$BIN" "${build_args[@]}")"
+    printf '%s\n' "$out"
+    # name=image lines, read back from the receipt rather than by parsing the
+    # lock file: the receipt is the CLI's own agent-facing contract, and it says
+    # what this run actually resolved.
+    CONNECTOR_IMAGES="$(printf '%s' "$out" | python3 -c '
+import json, sys
+payload = json.loads(sys.stdin.read())
+records = payload["connectors"]
+if not records:
+    sys.exit("the build receipt lists no connectors, so the fixture declared nothing to build")
+for record in records:
+    print("%s=%s" % (record["name"], record["image"]))
+')"
+    printf '%s\n' "$CONNECTOR_IMAGES"
+}
+
+# The image `curie build` resolved for one connector.
+connector_image() {
+    local want="$1" line
+    while IFS= read -r line; do
+        if [[ "$line" == "$want="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <<< "$CONNECTOR_IMAGES"
+    echo "no build receipt entry for connector '$want'" >&2
+    return 1
+}
+
+# A hand mirror of connector_render.object_name / service_dns, which is what
+# BOTH sides derive independently: the CLI names the container's network alias
+# from it, and the runner derives the URL it dials from it. The ladder recomputes
+# it from the scope the RUNNER was actually given, so a tier whose two sides
+# disagree fails here instead of surfacing as a connection timeout mid-turn.
+connector_object_name() {
+    local release="$1" agent="$2" connector="$3"
+    local name="$release-$agent-mcp-$connector"
+    if (( ${#name} > 63 )); then
+        echo "connector object name '$name' exceeds 63 characters, so the CLI truncates it with a digest and this ladder's hand mirror no longer matches. Shorten the fixture's agent or connector name." >&2
+        return 1
+    fi
+    printf '%s' "$name"
+}
+
+# The one compose worker this ladder's stack is running, selected exactly the
+# way probe_local_fake_model selects it (project label plus service label), so
+# the connector scope is read off the same container whose model mode is read.
+local_worker_container() {
+    local line workers=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && workers+=("$line")
+    done < <(docker ps --filter 'label=com.docker.compose.project=curie' --filter 'label=com.docker.compose.service=curie-worker' --format '{{.Names}}')
+    if (( ${#workers[@]} != 1 )); then
+        echo "connector scope probe: expected exactly one running curie-worker in the compose project 'curie', found ${#workers[@]} (${workers[*]:-none})." >&2
+        return 1
+    fi
+    printf '%s' "${workers[0]}"
+}
+
+# One env var read off a running container's inspected environment.
+container_env_value() {
+    local container="$1" key="$2" dump line
+    if ! dump="$(docker inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}')"; then
+        echo "could not inspect '$container' to read $key" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done <<< "$dump"
+    printf ''
+}
+
+# The connector container answering to one alias, by LABEL then by alias --
+# never by name, which differs between the skill start path
+# (`curie-connector-<session>-<name>`) and the local compose overlay's own.
+connector_container_for_alias() {
+    local alias="$1" container aliases
+    while IFS= read -r container; do
+        [[ -n "$container" ]] || continue
+        aliases="$(docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{range .Aliases}}{{println .}}{{end}}{{end}}' 2>/dev/null || true)"
+        if grep -qxF "$alias" <<< "$aliases"; then
+            printf '%s' "$container"
+            return 0
+        fi
+    done < <(docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}}')
+    return 1
+}
+
+# The MCP probe itself: an initialize / notifications/initialized / tools/list
+# round trip, and optionally one deterministic tool call, against a connector's
+# real URL. Written once into $WORKDIR and piped to `python -` inside a
+# connector container, so it needs no image the ladder does not already run and
+# no host port -- connectors deliberately publish none.
+write_connector_probe() {
+    cat > "$WORKDIR/mcp_probe.py" <<'PY'
+"""Handshake with one connector over streamable HTTP and report its tools.
+
+argv: <url> <expected-tools-csv> [<tool-to-call>]
+
+Runs INSIDE a connector container, dialing another connector by the network
+alias Curie assigned it, so a pass covers three things at once: the alias
+resolves, the server is serving MCP, and its tool surface is the expected one.
+"""
+
+import json
+import sys
+import urllib.request
+
+url, expected_csv = sys.argv[1], sys.argv[2]
+call_tool = sys.argv[3] if len(sys.argv) > 3 else ""
+expected = sorted(name for name in expected_csv.split(",") if name)
+
+state = {"session": None, "version": "2024-11-05"}
+
+
+def post(body, notification=False):
+    headers = {
+        "Content-Type": "application/json",
+        # Both, because a streamable-HTTP server may answer either shape.
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": state["version"],
+    }
+    if state["session"]:
+        headers["mcp-session-id"] = state["session"]
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        session = response.headers.get("mcp-session-id")
+        if session:
+            state["session"] = session
+        raw = response.read().decode("utf-8", "replace")
+    if notification:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:].strip())
+    return json.loads(raw)
+
+
+def fail(message):
+    sys.stderr.write("%s: %s\n" % (url, message))
+    raise SystemExit(1)
+
+
+try:
+    handshake = post(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": state["version"],
+                "capabilities": {},
+                "clientInfo": {"name": "curie-e2e-ladder", "version": "0"},
+            },
+        }
+    )
+except Exception as exc:
+    fail("the MCP handshake did not complete: %s: %s" % (type(exc).__name__, exc))
+
+if not isinstance(handshake, dict) or "result" not in handshake:
+    fail("initialize returned no result: %r" % (handshake,))
+state["version"] = handshake["result"].get("protocolVersion", state["version"])
+
+post({"jsonrpc": "2.0", "method": "notifications/initialized"}, notification=True)
+
+listed = post({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+if not isinstance(listed, dict) or "result" not in listed:
+    fail("tools/list returned no result: %r" % (listed,))
+tools = sorted(tool["name"] for tool in listed["result"]["tools"])
+if expected and tools != expected:
+    fail("tools/list returned %s; expected %s" % (",".join(tools), ",".join(expected)))
+
+if call_tool:
+    # Deterministic and ungated by construction: an empty argument takes the
+    # server's own input-validation path, so it needs no live backend and
+    # cannot depend on data that changes between rungs.
+    called = post(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": call_tool, "arguments": {"trace_id": ""}},
+        }
+    )
+    body = json.dumps(called)
+    if "trace_id is required" not in body:
+        fail("%s did not take its input-validation path: %s" % (call_tool, body[:400]))
+
+print("OK %s" % ",".join(tools))
+PY
+}
+
+# Cross-rung entry parity. The entry the runner mounts is
+# `http://<release>-<agent>-mcp-<connector>.<namespace>.svc.cluster.local:<port>/mcp`,
+# and the NAMESPACE is the one component that legitimately differs between tiers
+# -- it is the namespace the connector is deployed into. So the pinned, byte-
+# compared value is everything else: the object name, the port and the path,
+# which is the part both sides derive independently and the part a release or
+# agent drift would move. Each rung's full URL is printed beside it.
+assert_connector_entries() {
+    local label="$1" entries="$2"
+    if [[ -z "$CONNECTOR_ENTRIES" ]]; then
+        CONNECTOR_ENTRIES="$entries"
+        CONNECTOR_ENTRY_RUNGS="$CONNECTOR_ENTRY_RUNGS $label"
+        echo "$label: connector MCP entries pinned for this ladder run:"
+        printf '%s\n' "$entries"
+        return 0
+    fi
+    if [[ "$entries" != "$CONNECTOR_ENTRIES" ]]; then
+        echo "$label: connector MCP entries DIVERGED from the pinned set." >&2
+        echo "pinned:" >&2
+        printf '%s\n' "$CONNECTOR_ENTRIES" >&2
+        echo "$label:" >&2
+        printf '%s\n' "$entries" >&2
+        echo "fix: the tiers do not agree on the address a connector answers to, so a turn on one of them dials a name nothing owns. Compare the connector scope each tier hands the runner." >&2
+        return 1
+    fi
+    CONNECTOR_ENTRY_RUNGS="$CONNECTOR_ENTRY_RUNGS $label"
+    echo "$label: connector MCP entries match the pinned set"
+}
+
+# The whole per-rung connector assertion.
+#
+# `kind` is docker (skill, local, local-release) or kubectl (cluster), and the
+# release/agent/namespace are read from the scope the TIER handed the runner --
+# never hardcoded here. That is what makes this a parity assertion rather than a
+# restatement: the ladder recomputes the address from the runner's own inputs
+# and then requires a connector to be answering on it.
+assert_connector_parity() {
+    local label="$1" kind="$2" release="$3" agent="$4" namespace="$5"
+    local connector object alias url entries="" host_ref="" image expected probe_pod=""
+
+    if [[ -z "$release" || -z "$agent" || -z "$namespace" ]]; then
+        echo "$label: the tier reported an incomplete connector scope (release='$release' agent='$agent' namespace='$namespace'), so no connector address can be derived. A partial scope switches connectors off entirely." >&2
+        return 1
+    fi
+    echo "$label: connector scope as the tier gave it to the runner: release=$release agent=$agent namespace=$namespace"
+    # Recorded so the post-teardown sweep looks for the same names this rung
+    # just proved were up, rather than re-deriving them once the tier that
+    # reported them is gone.
+    CONNECTOR_SCOPE_RELEASE="$release"
+    CONNECTOR_SCOPE_AGENT="$agent"
+    CONNECTOR_SCOPE_NAMESPACE="$namespace"
+
+    for connector in kubernetes "${CONNECTOR_BUILT[@]}"; do
+        object="$(connector_object_name "$release" "$agent" "$connector")" || return 1
+        alias="$object.$namespace.svc.cluster.local"
+        url="http://$alias:$CONNECTOR_PORT/mcp"
+        entries="$entries$connector=$object:$CONNECTOR_PORT/mcp"$'\n'
+
+        if [[ "$kind" == "docker" ]]; then
+            local container
+            if ! container="$(connector_container_for_alias "$alias")"; then
+                echo "$label: no running container labeled $CONNECTOR_LABEL answers to the alias '$alias', which is the name the runner derives and dials." >&2
+                docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}} {{.Image}}' >&2 || true
+                return 1
+            fi
+            image="$(docker inspect "$container" --format '{{.Config.Image}}')"
+            echo "$label: $connector is up as $container on $url"
+            [[ "$connector" == "tempo" ]] && host_ref="$container"
+        else
+            if ! kubectl -n "$namespace" get "deployment/$object" >/dev/null 2>&1; then
+                echo "$label: no Deployment $object exists in namespace $namespace, so the connector the runner would dial at $url is not running." >&2
+                return 1
+            fi
+            # Applied does not mean serving: the pod can still be pulling its
+            # image or starting up when the Deployment object first appears,
+            # which is exactly the race that sent the MCP probe below
+            # "Connection refused" against a live cluster. Wait for the
+            # rollout to finish before this connector is dialed.
+            if ! kubectl -n "$namespace" rollout status "deployment/$object" --timeout=120s; then
+                echo "$label: deployment/$object in namespace $namespace did not become available within 120s, so the MCP probe that follows would race pod startup." >&2
+                return 1
+            fi
+            image="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+            echo "$label: $connector is up as deployment/$object on $url"
+            [[ "$connector" == "tempo" ]] && host_ref="$object"
+        fi
+
+        # The built connectors run the exact artifact the build resolved, and
+        # nothing else: that is the entire point of the lock (ADR 0113). The
+        # third connector is an ordinary pinned `image:`, checked against the
+        # fixture rather than the receipt.
+        if [[ " ${CONNECTOR_BUILT[*]} " == *" $connector "* ]]; then
+            expected="$(connector_image "$connector")" || return 1
+            if [[ "$image" != "$expected" ]]; then
+                echo "$label: $connector is running image '$image', but the build resolved '$expected'. A tier that starts anything else has lost the pin the lock exists to hold." >&2
+                return 1
+            fi
+            echo "$label: $connector runs the resolved image $image"
+        fi
+    done
+
+    if [[ -z "$host_ref" ]]; then
+        echo "$label: the tempo connector was not located, so there is nothing to run the MCP probe from." >&2
+        return 1
+    fi
+
+    # On a real cluster the connector NetworkPolicy admits ingress ONLY from
+    # pods labeled app.kubernetes.io/component=runner-sandbox (plus the
+    # release's own name/instance labels; see
+    # charts/curie/templates/security-networkpolicy.yaml) -- verified live: a
+    # plain pod dialing a healthy connector gets "Connection refused". Probing
+    # from a pod carrying those same three labels is the positive half of ADR
+    # 0113's proof ("the runner can use the same hosted MCP server
+    # configuration"); a bare pod being refused is the isolation negative, not
+    # a bug in this probe. The docker-hosted rungs have no such policy to
+    # satisfy, so only the kubectl kind needs this stand-in.
+    if [[ "$kind" != "docker" ]]; then
+        probe_pod="$release-$agent-mcp-probe"
+        kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+        kubectl -n "$namespace" run "$probe_pod" \
+            --image="$(connector_image tempo)" \
+            --restart=Never \
+            --labels="app.kubernetes.io/name=curie,app.kubernetes.io/instance=$release,app.kubernetes.io/component=runner-sandbox" \
+            --command -- sleep 300
+        if ! kubectl -n "$namespace" wait --for=condition=Ready "pod/$probe_pod" --timeout=60s; then
+            echo "$label: the runner-shaped probe pod $probe_pod never became Ready, so the MCP probe cannot run from it." >&2
+            kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+
+    # The probe runs FROM the tempo container (docker) or the runner-shaped
+    # probe pod (kubectl) and dials each built connector by its alias, so a
+    # pass covers alias resolution and netpol admission as well as serving.
+    local probe_out tools
+    for connector in "${CONNECTOR_BUILT[@]}"; do
+        object="$(connector_object_name "$release" "$agent" "$connector")" || return 1
+        url="http://$object.$namespace.svc.cluster.local:$CONNECTOR_PORT/mcp"
+        local probe_args=("$url")
+        if [[ "$connector" == "tempo" ]]; then
+            probe_args+=("$CONNECTOR_TOOLS_TEMPO" "get_trace")
+        else
+            probe_args+=("$CONNECTOR_TOOLS_K8S_WRITE")
+        fi
+        if [[ "$kind" == "docker" ]]; then
+            probe_out="$(docker exec -i "$host_ref" python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {
+                echo "$label: the MCP probe against $connector failed." >&2
+                return 1
+            }
+        else
+            probe_out="$(kubectl -n "$namespace" exec -i "$probe_pod" -- python - "${probe_args[@]}" < "$WORKDIR/mcp_probe.py")" || {
+                echo "$label: the MCP probe against $connector failed." >&2
+                kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+                return 1
+            }
+        fi
+        tools="${probe_out#OK }"
+        echo "$label: $connector handshook and served tools/list -> $tools"
+    done
+    echo "$label: the write verb was NOT exercised, deliberately: an approval round trip needs a second human actor, which no automated rung can supply without faking the thing under test. It is proved by the example's hands-on walkthrough instead."
+
+    if [[ -n "$probe_pod" ]]; then
+        kubectl -n "$namespace" delete pod "$probe_pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    fi
+
+    assert_connector_entries "$label" "$entries"
+}
+
+# After a teardown, nothing labeled as a connector may survive. Scoped to the
+# aliases this run's own bundle uses, never a bare host-wide label sweep: the
+# label is host-wide and another session's connectors are not this run's to
+# report on.
+assert_connectors_reaped() {
+    local label="$1" connector object alias survivor
+    if [[ -z "$CONNECTOR_SCOPE_RELEASE" ]]; then
+        echo "$label: no connector scope was recorded by this rung, so there is nothing to sweep for. assert_connector_parity must run before this." >&2
+        return 1
+    fi
+    for connector in kubernetes "${CONNECTOR_BUILT[@]}"; do
+        object="$(connector_object_name "$CONNECTOR_SCOPE_RELEASE" "$CONNECTOR_SCOPE_AGENT" "$connector")" || return 1
+        alias="$object.$CONNECTOR_SCOPE_NAMESPACE.svc.cluster.local"
+        if survivor="$(connector_container_for_alias "$alias")"; then
+            echo "$label: teardown left the connector container '$survivor' running (alias $alias)." >&2
+            return 1
+        fi
+    done
+    echo "$label: no connector containers survived teardown"
+}
+
+# The unchanged path, asserted rather than assumed: a bundle that declares no
+# hosted connector must start none. Scoped to the compose project this ladder
+# owns, for the same reason every other sweep here is.
+assert_no_connector_containers() {
+    local label="$1" survivors
+    survivors="$(docker ps --filter "label=$CONNECTOR_LABEL" --filter 'label=curietech.ai/project=curie' --format '{{.Names}}')"
+    if [[ -n "$survivors" ]]; then
+        echo "$label: this bundle declares no hosted connector, but connector containers are running for this project:" >&2
+        printf '%s\n' "$survivors" >&2
+        return 1
+    fi
+    echo "$label: no connector containers for a bundle that declares none"
+}
+
+# The skill tier's connector leg, run by the ladder itself rather than inside
+# cli/scripts/e2e.sh: that script owns its own up/message/down cycle and has
+# torn everything down by the time it returns, so there is no moment in it at
+# which a connector can be observed. Same bundle copy, its own runner name.
+case_connector_hosting_skill() {
+    echo
+    echo "=== case: the skill tier hosts the bundle's connectors (ADR 0113) ==="
+    # --fake-model unconditionally: this case sends no turn, so a model
+    # credential would be a prerequisite it does not need.
+    "$BIN" skill up --fake-model --plugin-dir "$WORKDIR/bundle" --name "$CONNECTOR_RUNNER_NAME"
+
+    local release agent namespace code=0
+    release="$(container_env_value "$CONNECTOR_RUNNER_NAME" CURIE_CONNECTOR_RELEASE)"
+    agent="$(container_env_value "$CONNECTOR_RUNNER_NAME" CURIE_CONNECTOR_AGENT)"
+    namespace="$(container_env_value "$CONNECTOR_RUNNER_NAME" CURIE_CONNECTOR_NAMESPACE)"
+    assert_connector_parity "skill" docker "$release" "$agent" "$namespace" || code=1
+
+    # Torn down whatever the assertion said, so a failed assertion cannot strand
+    # containers; the teardown sweep below only runs when there is a recorded
+    # scope to sweep for.
+    (cd "$WORKDIR/bundle" && "$BIN" skill down) || code=1
+    if (( code == 0 )); then
+        assert_connectors_reaped "skill" || code=1
+    fi
+    return "$code"
+}
+
 # Rung 1: the existing skill-tier round trip. Still exactly one implementation
 # and never copied -- but no longer unparameterized: it is handed THIS run's
 # bundle copy through CURIE_E2E_BUNDLE, so rung 1 boots and grades the same
@@ -713,6 +1346,10 @@ rung_skill() {
     assert_bundle_identity "skill" "$digest"
 
     case_leftover_runner_container
+
+    if connector_mode; then
+        case_connector_hosting_skill
+    fi
 }
 
 # Rung 2: the compose tier, cold start to teardown.
@@ -763,11 +1400,12 @@ rung_local() {
     # receipt's bundle.sha256 -- the platform's server-side hash of the bytes this
     # rung uploaded -- is the ONLY surface that reports this tier's artifact
     # identity. Read from stdout only; the human text is on stderr.
-    local deploy_json digest agent_id deployment_id
+    local deploy_json digest agent_id agent_name deployment_id
     deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle")"
     printf '%s\n' "$deploy_json"
     digest="$(deploy_field "local" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local" "$deploy_json" agent.id)"
+    agent_name="$(deploy_field "local" "$deploy_json" agent.name)"
     deployment_id="$(deploy_field "local" "$deploy_json" deployment.id)"
 
     echo
@@ -781,6 +1419,19 @@ rung_local() {
     local observed_mode
     observed_mode="$(probe_local_fake_model)"
     assert_model_mode "local" "$observed_mode"
+
+    echo
+    echo "=== assert the bundle's connectors (ADR 0113) ==="
+    if connector_mode; then
+        local worker
+        worker="$(local_worker_container)"
+        assert_connector_parity "local" docker \
+            "$(container_env_value "$worker" CURIE_RELEASE)" \
+            "$agent_name" \
+            "$(container_env_value "$worker" CURIE_NAMESPACE)"
+    else
+        assert_no_connector_containers "local"
+    fi
 
     echo
     echo "=== curie local message --json ==="
@@ -842,6 +1493,9 @@ rung_local() {
             return 1
         fi
         echo "no curie containers running"
+        if connector_mode; then
+            assert_connectors_reaped "local"
+        fi
     fi
 
     # Last, not at the deploy step: see assert_bundle_identity's comment. The
@@ -939,11 +1593,12 @@ rung_local_release() {
     # cold-start deploy. The copies now pack to the same digest by construction
     # (their regular-file mtimes are normalized where they are created), so a
     # separate copy no longer means a separate identity.
-    local deploy_json digest agent_id deployment_id
+    local deploy_json digest agent_id agent_name deployment_id
     deploy_json="$("$BIN" --json local deploy --plugin-dir "$WORKDIR/bundle-release")"
     printf '%s\n' "$deploy_json"
     digest="$(deploy_field "local-release" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "local-release" "$deploy_json" agent.id)"
+    agent_name="$(deploy_field "local-release" "$deploy_json" agent.name)"
     deployment_id="$(deploy_field "local-release" "$deploy_json" deployment.id)"
 
     echo
@@ -959,6 +1614,19 @@ rung_local_release() {
     local observed_mode
     observed_mode="$(probe_local_fake_model)"
     assert_model_mode "local-release" "$observed_mode"
+
+    echo
+    echo "=== assert the bundle's connectors (ADR 0113) ==="
+    if connector_mode; then
+        local worker
+        worker="$(local_worker_container)"
+        assert_connector_parity "local-release" docker \
+            "$(container_env_value "$worker" CURIE_RELEASE)" \
+            "$agent_name" \
+            "$(container_env_value "$worker" CURIE_NAMESPACE)"
+    else
+        assert_no_connector_containers "local-release"
+    fi
 
     echo
     echo "=== curie local message --json (release-compose stack) ==="
@@ -1004,6 +1672,9 @@ rung_local_release() {
             return 1
         fi
         echo "no curie containers running"
+        if connector_mode; then
+            assert_connectors_reaped "local-release"
+        fi
     fi
 
     assert_bundle_identity "local-release" "$digest"
@@ -1048,11 +1719,12 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # --json for the receipt: `cluster status --json` carries no digest, so the
     # deploy receipt's bundle.sha256 is the only artifact-identity surface here
     # too.
-    local deploy_json digest agent_id deployment_id deployment_status deployment_environment
+    local deploy_json digest agent_id agent_name deployment_id deployment_status deployment_environment
     deploy_json="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle")"
     printf '%s\n' "$deploy_json"
     digest="$(deploy_field "cluster" "$deploy_json" bundle.sha256)"
     agent_id="$(deploy_field "cluster" "$deploy_json" agent.id)"
+    agent_name="$(deploy_field "cluster" "$deploy_json" agent.name)"
     deployment_id="$(deploy_field "cluster" "$deploy_json" deployment.id)"
     deployment_status="$(deploy_field "cluster" "$deploy_json" deployment.status)"
     deployment_environment="$(deploy_field "cluster" "$deploy_json" deployment.environment)"
@@ -1098,6 +1770,23 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     local observed_mode
     observed_mode="$(probe_cluster_fake_model)"
     assert_model_mode "cluster" "$observed_mode"
+
+    if connector_mode; then
+        echo
+        echo "=== assert the bundle's connectors (ADR 0113) ==="
+        # Read off the installed release's own worker, the same deployment
+        # probe_cluster_fake_model reads, so the scope is the one the cluster
+        # actually hands the runner rather than a ladder assumption. The
+        # namespace is genuinely different here from the skill and local rungs
+        # -- it is the namespace the release is installed into -- which is why
+        # the pinned entry set excludes it.
+        local cluster_release cluster_namespace
+        cluster_release="$(kubectl -n curie get deployment/curie-worker \
+            -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_RELEASE")].value}')"
+        cluster_namespace="$(kubectl -n curie get deployment/curie-worker \
+            -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
+        assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
+    fi
 
     echo
     echo "=== curie cluster message --json ==="
@@ -1218,6 +1907,31 @@ fi
 cp -r "$BUNDLE_SRC" "$WORKDIR/bundle"
 cp -r "$BUNDLE_SRC" "$WORKDIR/bundle-release"
 
+# The connector rung's inputs, and the ORDER is load-bearing. The fixture and
+# the lock are packed like any other bundle file, so both must land before the
+# mtime normalization below and before any rung packs -- otherwise the copies
+# pack to different bytes and every multi-rung run is red by construction.
+if connector_mode; then
+    echo
+    echo "=== connector bundle: fixture, credentials, build ==="
+    if (( RUN_CLUSTER )) && [[ -z "$CONNECTOR_REGISTRY" ]]; then
+        echo "error: the cluster rung is named and CURIE_E2E_CONNECTOR_REGISTRY is unset." >&2
+        echo "why: without a registry the build delivers into the local Docker daemon, and a cluster deploy refuses a local-daemon lock by design -- the nodes cannot pull it." >&2
+        echo "fix: export CURIE_E2E_CONNECTOR_REGISTRY=<ref you can push to>, or drop cluster from CURIE_E2E_TIERS." >&2
+        exit 1
+    fi
+    prepare_connector_bundle "$WORKDIR/bundle"
+    prepare_connector_bundle "$WORKDIR/bundle-release"
+    provision_connector_credentials
+    write_connector_probe
+    # ONE build, and its lock is COPIED to the second copy rather than built
+    # again: a second build would resolve its own image reference, and the two
+    # copies would then pack to different bytes. Every rung consumes this one
+    # lock unchanged, which is what makes the digest assertion meaningful.
+    build_connector_images "$WORKDIR/bundle"
+    cp "$WORKDIR/bundle/connectors.lock.yaml" "$WORKDIR/bundle-release/connectors.lock.yaml"
+fi
+
 # Normalize every regular file's mtime across both copies. This is load-bearing,
 # not hygiene: the digest every rung asserts on identifies an ARCHIVE, not a
 # source tree, because pack_tar_gz embeds per-file mtime (cli/src/bundle.rs), and
@@ -1297,6 +2011,21 @@ else
     echo "bundle identity: $PARITY_DIGEST, reported by rung(s):$PARITY_RUNGS"
     if (( $(wc -w <<< "$PARITY_RUNGS") < 2 )); then
         echo "note: only one rung reported a digest, so the CROSS-RUNG digest comparison was vacuous for this tier set -- only that rung's own identity was recorded. This is NOT a cross-rung parity claim."
+    fi
+fi
+if connector_mode; then
+    if [[ -z "$CONNECTOR_ENTRIES" ]]; then
+        echo "connectors: NOT asserted by any rung that ran, so nothing about connector hosting was proven."
+    else
+        echo "connectors: hosted and serving MCP at rung(s):$CONNECTOR_ENTRY_RUNGS, on the entries"
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] && echo "  $entry"
+        done <<< "$CONNECTOR_ENTRIES"
+        echo "connectors: the entry set above is the object name, port and path -- the part both sides derive independently. The namespace differs by tier by design and is printed per rung above."
+        if (( $(wc -w <<< "$CONNECTOR_ENTRY_RUNGS") < 2 )); then
+            echo "note: only one rung asserted connectors, so the CROSS-RUNG comparison was vacuous for this tier set. This is NOT a cross-tier connector parity claim."
+        fi
+        echo "connectors: the gated write verb was NOT exercised at any rung -- an approval round trip needs a second human actor. Read this as hosting parity only."
     fi
 fi
 echo "suite: \"$EXPECT_SUITE\" with $EXPECT_CASE_COUNT case(s), resolved by the tier's own loader at rung(s):$SUITE_RUNGS"
