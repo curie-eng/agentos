@@ -301,6 +301,12 @@ DIGEST_IMAGE = (
     "0000000000000000000000000000000000000000000000000000000000000000"
 )
 
+# What `curie build --plugin-dir <dir>` records with no `--registry`: the local
+# Docker daemon's image id. Bare `sha256:<hex>` with no repository, so nothing
+# outside that one daemon can pull it -- which is exactly why the render that
+# feeds a cluster applier has to refuse it.
+LOCAL_DAEMON_IMAGE = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
 
 def _built(root: Path) -> Path:
     """A bundle whose one connector is declared as source, with its context."""
@@ -476,6 +482,36 @@ def test_the_connectors_route_renders_the_locked_digest(
     assert body["mcp_entries"]["k8s-write"]["url"].startswith(
         f"http://{RELEASE}-acme-bot-mcp-k8s-write.{NAMESPACE}.svc.cluster.local:"
     )
+
+
+def test_the_connectors_route_refuses_a_local_daemon_lock(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # Everything that calls this route APPLIES what it returns to a cluster --
+    # the worker's connector reconcile loop
+    # (`curie_worker.connector_loop.HttpManifestSource`, ADR-0090) and
+    # `curie cluster deploy`'s `sync_connectors` (`cli/src/main.rs`, ADR-0086).
+    # A `local-daemon` lock records a bare image id no node can pull, so
+    # rendering it hands the applier a Deployment that ImagePullBackOffs minutes
+    # after the deploy reported success, with every gate green. The bundle
+    # itself is valid and stores fine (intake keeps `portable=False`, since a
+    # local-tier version is a legitimate artifact) -- the refusal has to happen
+    # at the render, which is what this pins.
+    root = _built(tmp_path)
+    _write_lock(root, image=LOCAL_DAEMON_IMAGE, delivery="local-daemon")
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _archive(root))
+
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=auth_headers,
+    )
+    # 422, not 500: the request is well formed and the bundle is stored; what
+    # cannot be produced is an applicable manifest. A 500 sends the operator to
+    # the API logs instead of to the rebuild the message names.
+    assert resp.status_code == 422, resp.text
+    assert "local-daemon" in resp.text
+    assert "--registry" in resp.text, "the refusal must name the rebuild that fixes it"
 
 
 def test_a_lockless_build_bundle_never_becomes_a_version(

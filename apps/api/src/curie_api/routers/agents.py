@@ -294,14 +294,34 @@ async def read_version_connectors(
             # Resolve every `build:` connector to the digest the bundle already
             # records before anything renders (ADR 0113). `apply_lock` reads a
             # recorded fact and never resolves or builds one, so the API stays a
-            # pure renderer under ADR-0087; `portable=False` because a
-            # local-tier version is a legitimate stored artifact whose manifests
-            # nothing applies.
-            declared = connector_lock.apply_lock(
-                bundles.read_connectors(Path(tmp)),
-                bundles.read_connector_lock(Path(tmp)),
-                portable=False,
-            )
+            # pure renderer under ADR-0087.
+            #
+            # `portable=True` because EVERY consumer of this route applies what
+            # it returns to a Kubernetes cluster: the worker's connector
+            # reconcile loop (`curie_worker.connector_loop.HttpManifestSource`,
+            # ADR-0090) and `curie cluster deploy`'s `sync_connectors`
+            # (`cli/src/main.rs`, ADR-0086). Nothing reads these manifests for
+            # display. A `local-daemon` lock records a bare docker image id that
+            # names nothing a node can pull, so rendering one here yields a
+            # Deployment that ImagePullBackOffs long after the deploy reported
+            # success -- with every gate green. Bundle intake keeps
+            # `portable=False` (`plugin_format.validate`): a local-tier version
+            # is a legitimate stored artifact. The refusal belongs at the render
+            # that feeds an applier, which is this one.
+            try:
+                declared = connector_lock.apply_lock(
+                    bundles.read_connectors(Path(tmp)),
+                    bundles.read_connector_lock(Path(tmp)),
+                    portable=True,
+                )
+            except ValueError as exc:
+                # 422, matching how this service reports a stored bundle that
+                # cannot yield a deployable artifact (`create_deployment`,
+                # `upload_bundle`): the request is well formed, the bundle is
+                # not applicable. A 500 would read as an API fault and send the
+                # operator to the API logs instead of to `curie build
+                # --plugin-dir <dir> --registry <ref>`, which the message names.
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"
