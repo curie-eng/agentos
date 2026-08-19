@@ -60,11 +60,43 @@ jobs:
 
   # Graded sibling of ci.yaml's e2e-ladder: same skill + local rung mechanics,
   # armed live against the real model instead of the fake fixture.
+  #
+  # Two legs, not one run of each mode in sequence: the `default` leg is the
+  # existing nightly coverage (the fixed weather bundle, no hosted connector,
+  # and the rung that asserts "declares none, starts none"), and the `connector`
+  # leg drives the SAME rungs through examples/sre-bot with its connectors
+  # turned on, so hosted connector builds are exercised nightly (ADR 0113,
+  # #1690). A matrix rather than a second step in one job because each leg needs
+  # the full 30-minute budget, and `fail-fast: false` so a red connector leg
+  # never cancels the default leg's graded result.
+  #
+  # The connector leg runs the FAKE model, not live. Its value is the hosting
+  # plumbing (source builds, lock identity, the hermetic and changed-source
+  # cases, teardown reaping), which the fake rungs assert fully. A live grade
+  # of the sre-bot suite cannot express what it is meant to assert here: its
+  # capability case requires reaching a real Kubernetes cluster, and this
+  # runner has none, so whether it reds or greens would turn on nothing but how
+  # the model phrases its non-answer -- the same falsifiability failure #1603
+  # removed from the cluster rung's weather grade. A live connector leg needs a
+  # cluster the runner can reach, or a report-only grade; either is a follow-up.
   ladder-skill-local:
-    name: Graded parity ladder (skill + local, live model)
+    name: Graded parity ladder (skill + local, ${{ matrix.mode }} bundle)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: build-cli
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Empty is the OFF value the ladder reads (an unset/empty
+          # CURIE_E2E_CONNECTOR_BUNDLE leaves the fixed weather bundle in
+          # place), so this leg runs exactly what it ran before.
+          - mode: default
+            connector_bundle: ""
+            live: "1"
+          - mode: connector
+            connector_bundle: examples/sre-bot
+            live: ""
     steps:
       - uses: actions/checkout@v7
         with:
@@ -125,12 +157,22 @@ jobs:
       # the OpenRouter credential from CURIE_CREDENTIALS (the one env key the CLI
       # reads; an sk-or- key auto-selects OPENROUTER_BASE_URL). The secret
       # travels only as this env mapping, never on a run: or argv line.
-      - name: Graded parity ladder (skill + local rungs, live model)
+      # CURIE_E2E_CONNECTOR_BUNDLE is the matrix's only lever: empty on the
+      # default leg (the ladder keeps its fixed weather bundle and its
+      # hermetic no-hosting case), examples/sre-bot on the connector leg, where
+      # the ladder builds that bundle's `build:` connectors from source before
+      # the first rung and adds the hosting and changed-source rebuild cases.
+      # No CURIE_E2E_CONNECTOR_REGISTRY: these two rungs deliver into the local
+      # Docker daemon by design, which only the cluster rung refuses.
+      - name: Graded parity ladder (skill + local rungs)
         env:
           CURIE_BIN: cli/target/release/curie
           CURIE_BASE_TAG: ci-local
           CURIE_E2E_TIERS: skill,local
-          CURIE_E2E_LIVE: "1"
+          # Live on the default leg only; the connector leg is fake-model
+          # plumbing on purpose (see the job comment above).
+          CURIE_E2E_LIVE: ${{ matrix.live }}
+          CURIE_E2E_CONNECTOR_BUNDLE: ${{ matrix.connector_bundle }}
           CURIE_CREDENTIALS: ${{ secrets.OPENROUTER_API_KEY }}
           CURIE_MODEL: ${{ inputs.model || 'z-ai/glm-5.2' }}
         run: bash cli/scripts/e2e-ladder.sh
@@ -427,7 +469,12 @@ jobs:
       # -> `cluster message` (reply asserted). The model is baked at install
       # time, but apply_model_mode still hard-exits under CURIE_E2E_LIVE if no
       # credential is in env, so CURIE_CREDENTIALS is supplied here too.
-      # CURIE_E2E_LISTEN_HOST was exported to the job env above.
+      # CURIE_E2E_LISTEN_HOST was exported to the job env above. No
+      # CURIE_E2E_CONNECTOR_BUNDLE here: the cluster connector rung needs a
+      # registry it can push digest-pinned images to (the nodes cannot pull a
+      # local-daemon lock), and this job has none -- every image reaches the
+      # cluster through `kind load`, with no registry auth anywhere in the
+      # workflow -- so the cluster connector rung stays unwired until one exists.
       - name: Graded parity ladder (cluster rung, live model)
         env:
           CURIE_BIN: cli/target/release/curie
