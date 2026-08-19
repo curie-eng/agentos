@@ -2263,6 +2263,95 @@ fn apply_import_failure_names_the_standalone_recovery_command() {
 }
 
 #[test]
+fn migrate_store_source_listing_shell_preserves_a_failed_aws_status() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live = live_minio_statefulset();
+
+    let _ = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_SOURCE_LIST_FAIL", "1"),
+        ],
+    );
+
+    let script = fixture.last_exec_script();
+    assert!(
+        script.contains("aws s3 ls")
+            && script.contains("parity-minio.parity.svc.cluster.local")
+            && script.contains("/migration/source.list"),
+        "the public CLI must expose the source evidence shell to the kubectl surface: {script}"
+    );
+
+    let shell_bin = fixture.temp.path().join("source-listing-shell-bin");
+    fs::create_dir(&shell_bin).expect("create source listing shell bin directory");
+    let aws_log = fixture.temp.path().join("source-aws-calls.log");
+    write_exec(
+        &shell_bin,
+        "aws",
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_AWS_LOG"
+if [ "$1" = configure ]; then
+    exit 0
+fi
+if [ "$1" = s3 ] && [ "$2" = ls ]; then
+    printf '%s\n' 'forced aws source listing failure' >&2
+    exit 42
+fi
+printf 'unexpected aws invocation: %s\n' "$*" >&2
+exit 64
+"#,
+    );
+    write_exec(
+        &shell_bin,
+        "cat",
+        "#!/bin/sh\nprintf '%s\\n' 'fixture-secret'\n",
+    );
+    write_exec(&shell_bin, "[", "#!/bin/sh\nexit 0\n");
+    let source_raw = fixture.temp.path().join("source.raw");
+    let source_tmp = fixture.temp.path().join("source.list.tmp");
+    let target_tmp = fixture.temp.path().join("target.tmp");
+    let bash_env = fixture.temp.path().join("source-listing-bash-env");
+    fs::write(
+        &bash_env,
+        "enable -n [\ntrap 'source_raw=\"$CURIE_TEST_SOURCE_RAW\"; source_tmp=\"$CURIE_TEST_SOURCE_TMP\"; target_tmp=\"$CURIE_TEST_TARGET_TMP\"' DEBUG\n",
+    )
+    .expect("write source listing bash environment");
+    let mut paths = vec![shell_bin];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    let path = std::env::join_paths(paths).expect("join source listing shell PATH");
+
+    let shell_output = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASH_ENV", &bash_env)
+        .env("PATH", path)
+        .env("CURIE_TEST_AWS_LOG", &aws_log)
+        .env("CURIE_TEST_SOURCE_RAW", &source_raw)
+        .env("CURIE_TEST_SOURCE_TMP", &source_tmp)
+        .env("CURIE_TEST_TARGET_TMP", &target_tmp)
+        .output()
+        .expect("execute the generated source listing shell");
+    let aws_calls = fs::read_to_string(&aws_log).expect("read fake source aws calls");
+    assert!(
+        aws_calls.lines().any(|line| line.starts_with("s3 ls ")),
+        "the generated source shell must reach the failing aws listing:\n{aws_calls}"
+    );
+    assert_eq!(
+        shell_output.status.code(),
+        Some(42),
+        "the exact generated source shell must preserve aws exit 42; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&shell_output.stdout),
+        String::from_utf8_lossy(&shell_output.stderr)
+    );
+}
+
+#[test]
 fn migrate_store_listing_shell_preserves_a_failed_aws_status() {
     let fixture = HelmFixture::new(
         installation_for_the_stateful_guard(),
