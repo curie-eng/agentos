@@ -4,6 +4,11 @@
 when an ADR authorizes implementation. [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
 defines how Accepted ADR history is preserved.
 
+The ADR requirement applies only to product and platform architecture decisions
+that establish or materially change durable system boundaries. CI configuration,
+build plumbing, and similar delivery mechanics are outside this requirement
+unless they also make such an architectural decision.
+
 ## Status vocabulary
 
 1. `Draft` is open for discussion and revision. It may merge, but it does not
