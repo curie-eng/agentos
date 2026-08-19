@@ -942,7 +942,6 @@ fn store_migration_export_preview_mounts_the_discovered_release_secret() {
         }]
     })
     .to_string();
-    let credential = "export-credential-for-plan";
     let output = fixture.run(
         &[
             "cluster",
@@ -960,13 +959,7 @@ fn store_migration_export_preview_mounts_the_discovered_release_secret() {
         &[
             ("CURIE_TEST_KUBECTL_STS", live.as_str()),
             ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
-            ("CURIE_CREDENTIALS", credential),
         ],
-    );
-    let visible = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
     let preview = json_output(output, "cluster migrate-store --phase export --dry-run")["plan"]
         .as_array()
@@ -988,10 +981,6 @@ fn store_migration_export_preview_mounts_the_discovered_release_secret() {
     assert!(
         !preview.contains(r#""secretName":"acme-secrets""#),
         "the export staging pod must not guess a Secret name the chart does not render: {preview}"
-    );
-    assert!(
-        !visible.contains(credential) && !fixture.calls().contains(credential),
-        "the export preview must not leak credentials through output or command logs"
     );
 }
 

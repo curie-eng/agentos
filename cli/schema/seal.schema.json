@@ -24,7 +24,7 @@
     },
     "yaml": {
       "type": "string",
-      "description": "A YAML child fragment carrying the sealed value. Merge it under connectors.<name> in connectors.yaml so existing connector fields and sibling connectors remain intact."
+      "description": "A ready-to-paste connectors.yaml fragment carrying the sealed value at the path the loader reads."
     }
   },
   "required": ["connector", "env_name", "sealed", "public_key", "yaml"]
