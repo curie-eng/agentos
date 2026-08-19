@@ -341,7 +341,7 @@ def render_networkpolicy(
 def render_ingress_networkpolicy(
     release: str, agent: str, app_name: str, connector: str, spec: ConnectorSpec
 ) -> dict[str, Any]:
-    """Ingress to this connector: the sandbox, and nothing else.
+    """Ingress to this connector: any sandbox in this release, and nothing else.
 
     The egress policy above says where the sandbox may GO. It says nothing
     about who may ARRIVE, and those are not the same question. Without this,

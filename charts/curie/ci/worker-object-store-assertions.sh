@@ -24,7 +24,8 @@
 # and leaves both pods in CreateContainerConfigError.
 set -euo pipefail
 
-CHART=${CHART:-charts/curie}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHART="${CHART:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 EXTERNAL_VALUES=$(mktemp)
 trap 'rm -f "$EXTERNAL_VALUES"' EXIT
 

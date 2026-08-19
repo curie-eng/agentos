@@ -9,10 +9,10 @@
 //!
 //! Pruning is the reason this is not a bare `kubectl apply`. Every object
 //! carries a label naming the agent that declared it, so removing a connector
-//! from `connectors.yaml` removes its Deployment, Service, and NetworkPolicy on
-//! the next deploy. Without that, a deleted connector leaves a pod running with
-//! a credential mounted and nothing referencing it -- the kind of leak nobody
-//! notices because nothing breaks.
+//! from `connectors.yaml` removes its Deployment, Service, and NetworkPolicies
+//! on the next deploy. Without that, a deleted connector leaves a pod running
+//! with a credential mounted and nothing referencing it -- the kind of leak
+//! nobody notices because nothing breaks.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn prune_with_nothing_declared_removes_everything_owned() {
         // The connector was deleted from connectors.yaml: its Deployment,
-        // Service, and NetworkPolicy must go, or a pod keeps running with a
+        // Service, and two NetworkPolicies must go, or a pod keeps running with a
         // credential mounted and nothing referencing it.
         let args = prune_args("ns", "acme-bot", &[]);
         assert!(!args.iter().any(|a| a.starts_with("--field-selector")));
