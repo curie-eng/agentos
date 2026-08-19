@@ -38,8 +38,11 @@ EOF
 # Capture Helm output in Python so a large manifest cannot be truncated by a
 # shell command substitution or redirected into the script's stdin.
 python3 - "$CHART" "$EXTERNAL_VALUES" <<'PY'
+import copy
+import io
 import subprocess
 import sys
+from contextlib import redirect_stdout
 
 import yaml
 
@@ -258,6 +261,92 @@ def assert_contract(docs, label, expected_endpoint):
     print(f"ok: {label}: S3_SECRET_KEY is a ref -> {ref['name']}/{ref['key']}")
 
 
-assert_contract(render(), "default", "http://curie-rustfs:9000")
+def probe_env(docs, kind, component, container_name, init=False):
+    for d in docs:
+        if d.get("kind") != kind:
+            continue
+        if d["metadata"].get("labels", {}).get("app.kubernetes.io/component") != component:
+            continue
+        pod_template = "template" if kind == "Deployment" else "podTemplate"
+        pod_spec = d["spec"][pod_template]["spec"]
+        containers = pod_spec.get("initContainers" if init else "containers", [])
+        matches = [c for c in containers if c.get("name") == container_name]
+        assert len(matches) == 1
+        return matches[0].get("env", [])
+    raise AssertionError(f"{kind} {component} was not rendered")
+
+
+def expect_failure(docs, messages):
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured):
+            assert_contract(docs, "default probe", "http://curie-rustfs:9000")
+    except SystemExit as error:
+        assert error.code == 1
+    else:
+        raise AssertionError("object store contract probe unexpectedly passed")
+
+    output = captured.getvalue()
+    for message in messages:
+        assert message in output, f"missing diagnostic {message!r} in:\n{output}"
+    for unsupported in ("Traceback", "ClaimTimeoutError", "Slack turn", "CPU"):
+        assert unsupported not in output, f"unsupported diagnostic {unsupported!r} in:\n{output}"
+
+
+default_docs = render()
+assert_contract(default_docs, "default", "http://curie-rustfs:9000")
+
+missing_api_key = copy.deepcopy(default_docs)
+api_env = probe_env(missing_api_key, "Deployment", "api", "api")
+api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
+expect_failure(
+    missing_api_key,
+    (
+        "api is missing object-store key S3_ACCESS_KEY",
+        "worker has S3_ACCESS_KEY, but api does not",
+    ),
+)
+
+three_divergences = copy.deepcopy(default_docs)
+api_env = probe_env(three_divergences, "Deployment", "api", "api")
+worker_env = probe_env(three_divergences, "Deployment", "worker", "worker")
+bundle_env = probe_env(
+    three_divergences,
+    "SandboxTemplate",
+    "agent-sandbox",
+    "bundle-fetch",
+    init=True,
+)
+api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
+worker_endpoint = next(
+    entry for entry in worker_env if entry.get("name") == "S3_ENDPOINT_URL"
+)
+worker_endpoint.pop("valueFrom", None)
+worker_endpoint["value"] = "http://other-object-store:9000"
+bundle_bucket = next(
+    entry for entry in bundle_env if entry.get("name") == "BUNDLE_BUCKET"
+)
+bundle_bucket.pop("valueFrom", None)
+bundle_bucket["value"] = "other-bucket"
+expect_failure(
+    three_divergences,
+    (
+        "api is missing object-store key S3_ACCESS_KEY",
+        "worker has S3_ACCESS_KEY, but api does not",
+        "api and worker disagree on S3_ENDPOINT_URL",
+        "bundle fetch BUNDLE_BUCKET disagrees with api BUNDLE_BUCKET",
+    ),
+)
+
+unsupported_diagnostic = copy.deepcopy(default_docs)
+worker_env = probe_env(unsupported_diagnostic, "Deployment", "worker", "worker")
+worker_env[:] = [
+    entry for entry in worker_env if entry.get("name") != "S3_ACCESS_KEY"
+]
+expect_failure(
+    unsupported_diagnostic,
+    ("worker is missing S3_ACCESS_KEY",),
+)
+
 assert_contract(render(EXTERNAL_VALUES), "external", "https://s3.example.com:443")
 PY
