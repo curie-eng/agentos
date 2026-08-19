@@ -89,6 +89,17 @@ BIN=""
 
 say() { printf '%s\n' "$*" >&2; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# Exit 2 means "you invoked this wrong", exit 1 means "the spike ran and
+# something failed". A caller that cannot tell those apart retries a typo.
+usage_die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+
+# A --repo-url may carry userinfo (https://user:token@host/...). The token must
+# never reach stderr, state.json, or the emitted JSON; the unredacted URL is
+# used only for the clone itself. Unanchored and global, because git's own
+# error output embeds the URL mid-line (fatal: unable to access '<url>').
+redact_url() {
+    printf '%s' "$1" | sed -E "s#([a-z+]+://)[^/@[:space:]']+@#\1***@#g"
+}
 
 # ---------------------------------------------------------------- arg parsing
 
@@ -98,25 +109,25 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
 fi
 case "$MODE" in
     run|follow-up|down) ;;
-    *) die "unknown mode '$MODE'. Expected one of: run, follow-up, down." ;;
+    *) usage_die "unknown mode '$MODE'. Expected one of: run, follow-up, down." ;;
 esac
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo-url)
-            [[ $# -ge 2 ]] || die "--repo-url needs a value"
+            [[ $# -ge 2 ]] || usage_die "--repo-url needs a value"
             REPO_URL="$2"
             REPO_URL_OVERRIDDEN=1
             shift 2 ;;
         --live) LIVE=1; shift ;;
         --keep) KEEP=1; shift ;;
-        *) die "unknown argument '$1' for mode '$MODE'" ;;
+        *) usage_die "unknown argument '$1' for mode '$MODE'" ;;
     esac
 done
 if [[ "$MODE" != "run" ]] && (( REPO_URL_OVERRIDDEN || LIVE || KEEP )); then
     # A follow-up cannot change the repo or the model mode: both were fixed when
     # `run` brought the stack up, and accepting the flag would imply otherwise.
-    die "--repo-url, --live, and --keep apply to \`run\` only; '$MODE' reads them from the recorded state."
+    usage_die "--repo-url, --live, and --keep apply to \`run\` only; '$MODE' reads them from the recorded state."
 fi
 
 # --------------------------------------------------------------- prerequisites
@@ -128,6 +139,13 @@ require_tools() {
     done
     if (( ${#missing[@]} )); then
         die "missing required tool(s): ${missing[*]}. Install them and re-run."
+    fi
+    # Only a default `run` publishes the fixture over a daemon: a --repo-url run
+    # starts none (that is the whole point of the escape hatch the
+    # missing-daemon message below points at), and follow-up/down reuse or kill
+    # what run left, so neither may be blocked by an absent daemon binary.
+    if (( REPO_URL_OVERRIDDEN )) || [[ "$MODE" != "run" ]]; then
+        return 0
     fi
     # `git daemon` ships as a separate binary in git-core and is absent from
     # some slim installs; discovering that AFTER building an image and booting a
@@ -170,6 +188,24 @@ kill_git_daemon() {
     # practice, and a stray child holding the port is caught by the port
     # precheck on the next run rather than silently reused.
     wait "$pid" 2>/dev/null || true
+}
+
+# Only once the compose stack is gone: while it is up, a sandbox carrying this
+# label may belong to a live session that is not this spike's, and force-removing
+# it would break work this script has no business touching.
+sweep_sandbox_orphans() {
+    if stack_running; then
+        return 0
+    fi
+    local orphans
+    orphans="$(docker ps -a --filter "label=$SANDBOX_LABEL" --format '{{.Names}}' \
+        | grep '^curie-thread-' || true)"
+    if [[ -n "$orphans" ]]; then
+        say "removing leftover sandbox containers:"
+        printf '%s\n' "$orphans" >&2
+        # shellcheck disable=SC2086
+        docker rm -f $orphans >/dev/null 2>&1 || true
+    fi
 }
 
 assert_no_survivors() {
@@ -369,8 +405,9 @@ mode_run() {
     fi
     # A connect probe rather than `ss`/`lsof`, so the precheck needs no extra
     # binary and reports the condition that actually matters: something is
-    # already answering on the port the daemon must bind.
-    if timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$GIT_PORT" 2>/dev/null; then
+    # already answering on the port the daemon must bind. Irrelevant under
+    # --repo-url, which binds nothing.
+    if (( ! REPO_URL_OVERRIDDEN )) && timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$GIT_PORT" 2>/dev/null; then
         die "port $GIT_PORT is already in use; the spike's throwaway git daemon cannot bind it. Set CURIE_RD_SPIKE_GIT_PORT to a free port."
     fi
 
@@ -395,29 +432,35 @@ DOCKERFILE
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    say
-    say "=== create the deterministic test repository ==="
-    local src="$WORK/repo-src"
-    mkdir -p "$src"
-    (
-        cd "$src"
-        git init -q -b main
-        # Local, never global: this box's identity must not leak into the
-        # fixture, and the sha has to be reproducible run over run.
-        git config user.name "Curie Spike"
-        git config user.email "spike@example.invalid"
-        printf 'remote-dev spike fixture repository\n' > README.md
-        printf 'sentinel=unchanged\n' > SENTINEL.txt
-        git add -A
-        GIT_AUTHOR_DATE="$FIXED_DATE" GIT_COMMITTER_DATE="$FIXED_DATE" \
-            git commit -q -m "seed remote-dev spike fixture"
-    )
-    local expected_sha
-    expected_sha="$(git -C "$src" rev-parse HEAD)"
-    say "fixture HEAD: $expected_sha"
+    local expected_sha=""
+    if (( REPO_URL_OVERRIDDEN )); then
+        say
+        say "=== --repo-url given: no fixture repository, no mirror to serve ==="
+        say "the sandbox clones the URL you passed, so this spike publishes nothing."
+    else
+        say
+        say "=== create the deterministic test repository ==="
+        local src="$WORK/repo-src"
+        mkdir -p "$src"
+        (
+            cd "$src"
+            git init -q -b main
+            # Local, never global: this box's identity must not leak into the
+            # fixture, and the sha has to be reproducible run over run.
+            git config user.name "Curie Spike"
+            git config user.email "spike@example.invalid"
+            printf 'remote-dev spike fixture repository\n' > README.md
+            printf 'sentinel=unchanged\n' > SENTINEL.txt
+            git add -A
+            GIT_AUTHOR_DATE="$FIXED_DATE" GIT_COMMITTER_DATE="$FIXED_DATE" \
+                git commit -q -m "seed remote-dev spike fixture"
+        )
+        expected_sha="$(git -C "$src" rev-parse HEAD)"
+        say "fixture HEAD: $expected_sha"
 
-    mkdir -p "$WORK/serve"
-    git clone -q --bare "$src" "$WORK/serve/repo.git"
+        mkdir -p "$WORK/serve"
+        git clone -q --bare "$src" "$WORK/serve/repo.git"
+    fi
 
     say
     say "=== curie local up --minimal (CURIE_RUNNER_IMAGE=$SPIKE_IMAGE) ==="
@@ -436,34 +479,39 @@ DOCKERFILE
         CURIE_RUNNER_IMAGE="$SPIKE_IMAGE" CURIE_FAKE_MODEL=1 "$BIN" local up --minimal >&2
     fi
 
-    say
-    say "=== serve the fixture over git:// ==="
-    git daemon --export-all --base-path="$WORK/serve" --port="$GIT_PORT" \
-        --reuseaddr --pid-file="$GIT_PID_FILE" >/dev/null 2>&1 &
-    GIT_DAEMON_PID=$!
-    # Sanity-check the daemon actually serves before anything downstream depends
-    # on it, so a clone failure inside the sandbox means a SANDBOX networking
-    # problem and not a dead daemon.
-    local probe="$WORK/daemon-probe"
-    local ok=0
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        if git clone -q "git://127.0.0.1:$GIT_PORT/repo.git" "$probe" 2>/dev/null; then
-            ok=1
-            break
-        fi
-        sleep 0.5
-    done
-    rm -rf "$probe"
-    (( ok )) || die "the throwaway git daemon on port $GIT_PORT never served the fixture from the host, so the sandbox has no chance either."
-    say "git daemon serving on port $GIT_PORT (pid $GIT_DAEMON_PID, host clone verified)"
+    if (( REPO_URL_OVERRIDDEN )); then
+        say
+        say "=== --repo-url given: no git daemon, and no gateway to resolve ==="
+    else
+        say
+        say "=== serve the fixture over git:// ==="
+        git daemon --export-all --base-path="$WORK/serve" --port="$GIT_PORT" \
+            --reuseaddr --pid-file="$GIT_PID_FILE" >/dev/null 2>&1 &
+        GIT_DAEMON_PID=$!
+        # Sanity-check the daemon actually serves before anything downstream
+        # depends on it, so a clone failure inside the sandbox means a SANDBOX
+        # networking problem and not a dead daemon.
+        local probe="$WORK/daemon-probe"
+        local ok=0
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if git clone -q "git://127.0.0.1:$GIT_PORT/repo.git" "$probe" 2>/dev/null; then
+                ok=1
+                break
+            fi
+            sleep 0.5
+        done
+        rm -rf "$probe"
+        (( ok )) || die "the throwaway git daemon on port $GIT_PORT never served the fixture from the host, so the sandbox has no chance either."
+        say "git daemon serving on port $GIT_PORT (pid $GIT_DAEMON_PID, host clone verified)"
 
-    local gateway
-    gateway="$(docker network inspect curie_runner -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
-    if [[ -z "$REPO_URL" ]]; then
+        # Only the fixture path needs the gateway: it is the sandbox's route back
+        # to a daemon bound on the host.
+        local gateway
+        gateway="$(docker network inspect curie_runner -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
         [[ -n "$gateway" ]] || die "could not resolve the curie_runner network gateway, so the sandbox has no route back to the host's git daemon. Pass --repo-url with a URL the sandbox can reach."
         REPO_URL="git://$gateway:$GIT_PORT/repo.git"
     fi
-    say "repo url for the sandbox: $REPO_URL"
+    say "repo url for the sandbox: $(redact_url "$REPO_URL")"
 
     say
     say "=== curie --json local deploy --plugin-dir $BUNDLE_SRC ==="
@@ -504,13 +552,19 @@ DOCKERFILE
 
     say
     say "=== checkout-supervisor: clone into the sandbox ==="
-    local clone_err
+    # The unredacted URL appears exactly here, as the clone's argv, and nowhere
+    # else: every other mention of it goes through redact_url.
+    local clone_err safe_url
+    safe_url="$(redact_url "$REPO_URL")"
     if ! clone_err="$(docker exec "$container" git clone "$REPO_URL" "$SANDBOX_REPO" 2>&1)"; then
-        say "the sandbox could not clone $REPO_URL. git said:"
-        printf '%s\n' "$clone_err" >&2
+        say "the sandbox could not clone $safe_url. git said:"
+        # git's own stderr echoes the remote URL (userinfo included), so it goes
+        # through the same redaction as every other mention.
+        redact_url "$clone_err" >&2
+        printf '\n' >&2
         die "clone into the sandbox failed -- this is the falsifiable negative path, and it just fired."
     fi
-    say "cloned $REPO_URL into $SANDBOX_REPO"
+    say "cloned $safe_url into $SANDBOX_REPO"
 
     local observed_sha reported_expected=""
     observed_sha="$(docker exec "$container" git -C "$SANDBOX_REPO" rev-parse HEAD | tr -d '\r\n')"
@@ -553,10 +607,13 @@ DOCKERFILE
     say "diff observed, and it carries the sentinel change"
 
     mkdir -p "$STATE_DIR"
+    # The REDACTED url is what gets recorded: `follow-up` never re-clones, so it
+    # has no use for the credential, and state.json is a world-readable file
+    # under /tmp.
     jq -n \
         --arg workdir "$WORK" \
         --arg container "$container" \
-        --arg repo_url "$REPO_URL" \
+        --arg repo_url "$safe_url" \
         --arg pid "${GIT_DAEMON_PID:-}" \
         --argjson keep "$KEEP" \
         --argjson live "$LIVE" \
@@ -565,7 +622,7 @@ DOCKERFILE
           git_daemon_pid: $pid, keep: ($keep == 1), live: ($live == 1),
           expected_head_sha: $expected_sha}' > "$STATE_FILE"
 
-    emit_result run "$container" "$edit_actor" "$diff" "$observed_sha" "$reported_expected" "$REPO_URL"
+    emit_result run "$container" "$edit_actor" "$diff" "$observed_sha" "$reported_expected" "$safe_url"
 }
 
 # ============================================================== mode: follow-up
@@ -578,6 +635,8 @@ mode_follow_up() {
     local container repo_url expected_sha state_live
     WORK="$(jq -r '.workdir' "$STATE_FILE")"
     container="$(jq -r '.container' "$STATE_FILE")"
+    # Already redacted when `run` recorded it, and kept that way: a follow-up
+    # turn never re-clones, so the credential is not needed here at all.
     repo_url="$(jq -r '.repo_url' "$STATE_FILE")"
     expected_sha="$(jq -r '.expected_head_sha // ""' "$STATE_FILE")"
     state_live="$(jq -r '.live' "$STATE_FILE")"
@@ -640,41 +699,49 @@ mode_down() {
     resolve_bin
     say "=== remote-dev spike: down ==="
 
-    local pid=""
+    # Ownership comes from what THIS spike recorded, never from "a stack happens
+    # to be running": a running stack with no spike state is somebody else's, and
+    # tearing it down is exactly the damage this mode must not do.
+    local pid="" owned=0
     if [[ -f "$STATE_FILE" ]]; then
+        owned=1
         pid="$(jq -r '.git_daemon_pid // ""' "$STATE_FILE")"
         WORK="$(jq -r '.workdir // ""' "$STATE_FILE")"
     fi
-    if [[ -z "$pid" && -f "$GIT_PID_FILE" ]]; then
-        pid="$(cat "$GIT_PID_FILE" 2>/dev/null || true)"
+    if [[ -f "$GIT_PID_FILE" ]]; then
+        # A weaker signal than state.json -- a `run` that died before writing its
+        # state leaves this behind -- but it is still unambiguously this spike's
+        # leftover, so it still authorizes the teardown.
+        owned=1
+        [[ -n "$pid" ]] || pid="$(cat "$GIT_PID_FILE" 2>/dev/null || true)"
     fi
 
-    if stack_running; then
-        say "=== curie local down ==="
+    if (( owned )); then
+        # Unconditional, not gated on the stack being up: `local down` is safe on
+        # a stopped stack, and gating it would strand the volumes and networks of
+        # a spike whose containers already exited.
+        say "=== curie local down (spike state found, so this stack is ours) ==="
         "$BIN" local down >&2 || say "warning: \`local down\` failed; sweeping anyway."
+        kill_git_daemon "$pid"
+        sweep_sandbox_orphans
+        rm -rf "$STATE_DIR"
+        assert_no_survivors
+        say "spike torn down"
+        return 0
+    fi
+
+    say "no spike state at $STATE_FILE and no $GIT_PID_FILE, so this spike owns no teardown."
+    if stack_running; then
+        # Reported, never touched, and never a failure: this is the normal
+        # outcome of running `down` on a box where someone else has a stack up.
+        say "a compose stack IS running; it is not this spike's, so it is left alone:"
+        docker ps --filter 'label=com.docker.compose.project=curie' --format '{{.Names}}' >&2
+        say "its sandbox containers are left alone too -- a live session may own them."
     else
-        say "no compose stack running"
+        sweep_sandbox_orphans
     fi
-    kill_git_daemon "$pid"
-
-    # Only once the compose stack is gone: while it is up, a sandbox carrying
-    # this label may belong to a live session that is not this spike's, and
-    # force-removing it would break work this script has no business touching.
-    if ! stack_running; then
-        local orphans
-        orphans="$(docker ps -a --filter "label=$SANDBOX_LABEL" --format '{{.Names}}' \
-            | grep '^curie-thread-' || true)"
-        if [[ -n "$orphans" ]]; then
-            say "removing leftover sandbox containers:"
-            printf '%s\n' "$orphans" >&2
-            # shellcheck disable=SC2086
-            docker rm -f $orphans >/dev/null 2>&1 || true
-        fi
-    fi
-
     rm -rf "$STATE_DIR"
-    assert_no_survivors
-    say "spike torn down"
+    say "nothing of this spike's was left to tear down."
 }
 
 case "$MODE" in
