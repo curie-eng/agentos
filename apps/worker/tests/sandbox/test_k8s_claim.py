@@ -9,13 +9,58 @@ named entries fails ``test_bundle_ref_targets_init_containers_by_name``.
 
 from __future__ import annotations
 
+import copy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
     KubernetesSandboxClient,
     _claim_view,
+)
+
+# Captured live with `kubectl get sandboxclaims` in JSON form. The controller's
+# direct Pod admission failure emitted no Warning quota Event, so this Ready
+# condition is the machine readable cluster evidence for the rejection.
+LIVE_QUOTA_REJECTED_CLAIM: dict[str, Any] = {
+    "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+    "kind": "SandboxClaim",
+    "metadata": {
+        "annotations": {
+            "agents.x-k8s.io/controller-first-observed-at": "2026-08-19T10:24:42.828003465Z"
+        },
+        "creationTimestamp": "2026-08-19T10:24:42Z",
+        "generation": 1,
+        "name": "acme-claim",
+        "namespace": "acme-quota",
+        "resourceVersion": "12345",
+        "uid": "00000000-0000-0000-0000-000000000000",
+    },
+    "status": {
+        "conditions": [
+            {
+                "lastTransitionTime": "2026-08-19T10:24:42Z",
+                "message": (
+                    'Error seen: pods "acme-claim" is forbidden: exceeded quota: '
+                    "acme-sandbox-quota, requested: limits.cpu=1, used: limits.cpu=0, "
+                    "limited: limits.cpu=1m"
+                ),
+                "observedGeneration": 1,
+                "reason": "ReconcilerError",
+                "status": "False",
+                "type": "Ready",
+            }
+        ],
+        "sandbox": {"name": "acme-claim"},
+    },
+}
+
+ISSUE_QUOTA_REJECTION_MESSAGE = (
+    'Error seen: pods "curie-thread-example" is forbidden: exceeded quota: '
+    "curie-sandbox-quota, requested: limits.cpu=1, used: limits.cpu=8, "
+    "limited: limits.cpu=8"
 )
 
 
@@ -137,6 +182,115 @@ def test_claim_view_surfaces_the_creation_timestamp() -> None:
         {"metadata": {"name": "claim-4", "creationTimestamp": "not-a-timestamp"}}
     )
     assert malformed.created_at is None
+
+
+def test_claim_view_classifies_live_resource_quota_condition() -> None:
+    view = _claim_view(copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM))
+
+    assert view.name == "acme-claim"
+    assert view.ready is False
+    assert view.sandbox_name == "acme-claim"
+    assert view.created_at == datetime(2026, 8, 19, 10, 24, 42, tzinfo=UTC)
+    assert view.quota_rejection == QuotaRejection(
+        quota_name="acme-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="0",
+        hard="1m",
+    )
+    assert view.ready_reason == "ReconcilerError"
+    assert view.ready_message == LIVE_QUOTA_REJECTED_CLAIM["status"]["conditions"][0][
+        "message"
+    ]
+
+
+def test_claim_view_classifies_issue_example_at_eight_of_eight() -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0]["message"] = ISSUE_QUOTA_REJECTION_MESSAGE
+
+    view = _claim_view(claim)
+
+    assert view.quota_rejection == QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="8",
+        hard="8",
+    )
+    assert view.ready_reason == "ReconcilerError"
+    assert view.ready_message == ISSUE_QUOTA_REJECTION_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("status", "True"), ("type", "Provisioned")],
+)
+def test_quota_message_requires_failed_ready_condition(field: str, value: str) -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0][field] = value
+
+    assert _claim_view(claim).quota_rejection is None
+
+
+def test_quota_message_with_another_reason_is_not_classified() -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0]["reason"] = "ProvisioningFailed"
+
+    assert _claim_view(claim).quota_rejection is None
+
+
+def test_reconciler_error_without_exceeded_quota_clause_is_not_classified() -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0]["message"] = (
+        'Error seen: pods "curie-thread-example" is forbidden: User "system:serviceaccount:'
+        'curie1572:worker" cannot create resource "pods"'
+    )
+
+    assert _claim_view(claim).quota_rejection is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            'Error seen: pods "curie-thread-example" is forbidden: exceeded quota: '
+            "curie-sandbox-quota, requested: limits.cpu=1, used: limits.cpu=8"
+        ),
+        (
+            'Error seen: pods "curie-thread-example" is forbidden: exceeded quota: '
+            "curie-sandbox-quota, requested: limits.cpu, used: limits.cpu=8, "
+            "limited: limits.cpu=8"
+        ),
+        (
+            'Error seen: pods "curie-thread-example" is forbidden: exceeded quota: '
+            "curie-sandbox-quota, requested: requests.cpu=1, used: limits.cpu=8, "
+            "limited: limits.cpu=8"
+        ),
+    ],
+    ids=["missing_map", "malformed_map", "nonoverlapping_maps"],
+)
+def test_incomplete_quota_maps_are_not_classified(message: str) -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0]["message"] = message
+
+    assert _claim_view(claim).quota_rejection is None
+
+
+def test_quota_parser_selects_first_common_resource_in_sorted_order() -> None:
+    claim = copy.deepcopy(LIVE_QUOTA_REJECTED_CLAIM)
+    claim["status"]["conditions"][0]["message"] = (
+        'Error seen: pods "curie-thread-example" is forbidden: exceeded quota: '
+        "curie-sandbox-quota, requested: requests.memory=1Gi,limits.cpu=1, "
+        "used: limits.cpu=8,requests.memory=2Gi, limited: requests.memory=4Gi,limits.cpu=8"
+    )
+
+    assert _claim_view(claim).quota_rejection == QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="8",
+        hard="8",
+    )
 
 
 def test_connector_secrets_are_never_written_to_the_claim() -> None:

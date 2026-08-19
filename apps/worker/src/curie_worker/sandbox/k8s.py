@@ -23,6 +23,7 @@ from .types import (
     MANAGED_BY_VALUE,
     ClaimView,
     OperatingMode,
+    QuotaRejection,
     SandboxView,
 )
 
@@ -76,6 +77,92 @@ def _conditions_ready(status: dict[str, Any]) -> bool:
     return False
 
 
+def _ready_condition(status: dict[str, Any]) -> tuple[str | None, str | None]:
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        return None, None
+    for condition in conditions:
+        if not isinstance(condition, dict) or condition.get("type") != "Ready":
+            continue
+        reason = condition.get("reason")
+        message = condition.get("message")
+        return (
+            reason if isinstance(reason, str) else None,
+            message if isinstance(message, str) else None,
+        )
+    return None, None
+
+
+def _resource_map(raw: str) -> dict[str, str] | None:
+    values: dict[str, str] = {}
+    for entry in raw.split(","):
+        key, separator, value = entry.strip().partition("=")
+        if (
+            not separator
+            or not key
+            or not value
+            or "=" in value
+            or any(character.isspace() for character in key + value)
+            or key in values
+        ):
+            return None
+        values[key] = value
+    return values or None
+
+
+def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
+    conditions = status.get("conditions")
+    if not isinstance(conditions, list):
+        return None
+    for condition in conditions:
+        if not isinstance(condition, dict):
+            continue
+        if (
+            condition.get("type") != "Ready"
+            or condition.get("status") != "False"
+            or condition.get("reason") != "ReconcilerError"
+        ):
+            continue
+        message = condition.get("message")
+        if not isinstance(message, str):
+            continue
+
+        _prefix, marker, details = message.partition("exceeded quota: ")
+        if not marker or "exceeded quota: " in details:
+            continue
+        quota_name, marker, details = details.partition(", requested: ")
+        if (
+            not marker
+            or not quota_name
+            or any(character.isspace() for character in quota_name)
+        ):
+            continue
+        requested_raw, marker, details = details.partition(", used: ")
+        if not marker:
+            continue
+        used_raw, marker, hard_raw = details.partition(", limited: ")
+        if not marker:
+            continue
+
+        requested = _resource_map(requested_raw)
+        used = _resource_map(used_raw)
+        hard = _resource_map(hard_raw)
+        if requested is None or used is None or hard is None:
+            continue
+        common = sorted(requested.keys() & used.keys() & hard.keys())
+        if not common:
+            continue
+        resource = common[0]
+        return QuotaRejection(
+            quota_name=quota_name,
+            resource=resource,
+            requested=requested[resource],
+            used=used[resource],
+            hard=hard[resource],
+        )
+    return None
+
+
 def _parse_timestamp(raw: object) -> datetime | None:
     """A cluster creation instant as tz-aware UTC, or None when unreadable.
 
@@ -107,11 +194,15 @@ def _parse_timestamp(raw: object) -> datetime | None:
 def _claim_view(obj: dict[str, Any]) -> ClaimView:
     status = obj.get("status") or {}
     sandbox = (status.get("sandbox") or {}).get("name")
+    ready_reason, ready_message = _ready_condition(status)
     return ClaimView(
         name=obj["metadata"]["name"],
         ready=_conditions_ready(status),
         sandbox_name=sandbox,
         created_at=_parse_timestamp(obj["metadata"].get("creationTimestamp")),
+        quota_rejection=_quota_rejection(status),
+        ready_reason=ready_reason,
+        ready_message=ready_message,
     )
 
 

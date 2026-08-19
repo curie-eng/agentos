@@ -125,6 +125,17 @@ class SubstrateConfig:
 
 
 @dataclass(frozen=True)
+class QuotaRejection:
+    """Observed ResourceQuota evidence from a rejected sandbox claim."""
+
+    quota_name: str
+    resource: str
+    requested: str
+    used: str
+    hard: str
+
+
+@dataclass(frozen=True)
 class ClaimView:
     """What the substrate needs to know about a SandboxClaim."""
 
@@ -143,6 +154,9 @@ class ClaimView:
     # Required, with no default: a default would let an adapter silently omit
     # the field and silently disable the reaper's guard on that tier.
     created_at: datetime | None
+    quota_rejection: QuotaRejection | None
+    ready_reason: str | None
+    ready_message: str | None
 
 
 @dataclass(frozen=True)
@@ -200,6 +214,18 @@ class SandboxError(Exception):
 
 class ClaimTimeoutError(SandboxError):
     """The claim did not bind a ready sandbox within the configured timeout."""
+
+
+class CapacityExhaustedError(SandboxError):
+    """A sandbox claim was rejected by an observed ResourceQuota limit."""
+
+    def __init__(self, rejection: QuotaRejection) -> None:
+        self.rejection = rejection
+        super().__init__(
+            f"ResourceQuota {rejection.quota_name} rejected "
+            f"{rejection.resource}={rejection.requested}; current usage is "
+            f"{rejection.used}/{rejection.hard}"
+        )
 
 
 class NoRouteError(SandboxError):

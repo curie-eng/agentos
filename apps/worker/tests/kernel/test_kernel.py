@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 
+import pytest
 from aci_protocol import (
     ErrorEvent,
     Final,
@@ -25,6 +26,7 @@ from aci_protocol import (
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks, NavPack
 from curie_worker.runner_client import RunnerError
+from curie_worker.sandbox import QuotaRejection
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -258,6 +260,117 @@ def test_retries_are_bounded_then_escalate(make_harness) -> None:
 
             assert len(h.runner.opened) == 3
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("slack_no_edit_streaming", [False, True])
+def test_quota_capacity_is_terminal_without_retry_or_runner_turn(
+    make_harness, slack_no_edit_streaming: bool
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            max_attempts=3,
+            slack_no_edit_streaming=slack_no_edit_streaming,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                resource="limits.cpu",
+                requested="2",
+                used="7",
+                hard="8",
+            )
+            endpoint = "http://127.0.0.1:43199"
+            ev = _qevent("go", endpoint=endpoint)
+
+            await h.kernel.process_event(ev)
+
+            expected = (
+                "This agent is at sandbox capacity. ResourceQuota curie-sandbox-quota "
+                "rejected limits.cpu: requested 2, observed usage 7, hard limit 8. "
+                "Try again after another conversation releases its sandbox."
+            )
+            expected_updates = [("C1", "p-1", expected)]
+            if not slack_no_edit_streaming:
+                expected_updates.insert(0, ("C1", "p-1", h.config.booting_text))
+            assert h.sink.updates == expected_updates
+            assert h.sink.update_endpoints == [endpoint] * len(expected_updates)
+            assert len(h.fake_k8s.claim_envs) == 1
+            assert h.runner.opened == []
+            assert h.kernel._order_locks == {}
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_approval_resume_capacity_retries_then_escalates(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            thread = "t-approval-capacity"
+            await asyncio.to_thread(h.substrate.claim, thread)
+            await asyncio.to_thread(h.substrate.suspend, thread, history_ref="history-1")
+            h.fake_k8s.claim_envs.clear()
+            h.fake_k8s.quota_rejection = QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                resource="limits.cpu",
+                requested="1",
+                used="8",
+                hard="8",
+            )
+            endpoint = "http://127.0.0.1:43199"
+            ev = _qevent(
+                "approved continuation",
+                thread=thread,
+                event_id="approval-example-resolved",
+                endpoint=endpoint,
+            )
+
+            await h.kernel.process_event(ev)
+
+            assert len(h.fake_k8s.claim_envs) == 3
+            assert h.runner.opened == []
+            assert h.sink.updates == [
+                (
+                    "C1",
+                    "p-1",
+                    "The run failed (runner-error) after 3 attempt(s). Flagging for a human.",
+                )
+            ]
+            assert h.sink.update_endpoints == [endpoint]
+            assert h.kernel._order_locks == {}
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_claim_timeout_without_quota_retries_then_escalates(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            max_attempts=3,
+            slack_no_edit_streaming=True,
+            claim_timeout_seconds=0.02,
+        ) as h:
+            h.fake_k8s.bind_ready = False
+            ev = _qevent("go")
+
+            await h.kernel.process_event(ev)
+
+            assert len(h.fake_k8s.claim_envs) == 3
+            assert h.runner.opened == []
+            assert h.sink.updates == [
+                (
+                    "C1",
+                    "p-1",
+                    "The run failed (runner-error) after 3 attempt(s). Flagging for a human.",
+                )
+            ]
+            assert "sandbox capacity" not in h.sink.updates[0][2].lower()
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
     asyncio.run(go())
 
