@@ -56,6 +56,7 @@ const HELM_UNREACHABLE: &str =
 const HELM_FORBIDDEN: &str = "Error: query: secrets is forbidden: User \"system:serviceaccount:curie:deployer\" cannot list resource \"secrets\" in API group \"\" in the namespace \"parity\"";
 const HELM_EXECUTABLE_NOT_FOUND: &str = "Error: exec: executable kubelogin file not found in PATH";
 const SENTINEL_SEALING_KEY: &str = "SENTINEL_SEALING_PRIVATE_KEY";
+const PRESERVED_SEALING_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 const WARNING_PREFIXED_VALUES: &str = "WARNING: cached discovery information is stale\n{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}";
 const ARRAY_VALUES: &str = "[{\"sealing\":{\"privateKey\":\"SENTINEL_SEALING_PRIVATE_KEY\"}}]";
 
@@ -303,7 +304,7 @@ case "$verb $object" in
     esac
     ;;
 'get secret')
-    printf '%s\n' 'parity-secrets'
+    printf '%s\n' "${{CURIE_TEST_RELEASE_SECRET:-parity-secrets}}"
     ;;
 'run '*|'wait '*|'delete pod')
     # Staging-pod lifecycle: nothing to say, just succeed.
@@ -364,6 +365,7 @@ exit 0
             .env_remove("CURIE_TEST_KUBECTL_FAIL")
             .env_remove("CURIE_TEST_KUBECTL_FORBIDDEN")
             .env_remove("CURIE_TEST_HELM_MIXED_STATEFULSETS")
+            .env_remove("CURIE_TEST_RELEASE_SECRET")
             .env_remove("CURIE_CREDENTIALS")
             .env_remove("CURIE_MODEL_CREDENTIALS")
             .env_remove("CURIE_GITHUB_TOKEN")
@@ -446,6 +448,27 @@ exit 0
                 "--fake-model",
                 "--set",
                 "agentSandbox.controller.deploy=false",
+            ],
+            &[],
+        )
+    }
+
+    fn cluster_up_dry_run(&self) -> Output {
+        let chart = repo_root().join("charts/curie");
+        self.run(
+            &[
+                "cluster",
+                "up",
+                "--namespace",
+                "parity",
+                "--release",
+                "parity",
+                "--chart",
+                chart.to_str().expect("UTF 8 chart path"),
+                "--fake-model",
+                "--set",
+                "agentSandbox.controller.deploy=false",
+                "--dry-run",
             ],
             &[],
         )
@@ -846,6 +869,215 @@ fn existing_values_null_is_an_existing_release() {
     assert!(
         diff["entries"].is_array(),
         "valid null values must produce a completed diff for the existing release: {diff}"
+    );
+}
+
+#[test]
+fn store_migration_preview_mounts_the_discovered_release_secret() {
+    let fixture = HelmFixture::new("", HelmValuesResponse::Absent);
+    let chart = repo_root().join("charts/curie");
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "acme-minio"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/component": "minio"
+            }}}
+        }]
+    })
+    .to_string();
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+            "--dry-run",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
+        ],
+    );
+    let preview = json_output(output, "cluster migrate-store --dry-run")["plan"]
+        .as_array()
+        .expect("migration preview plan")
+        .iter()
+        .map(|line| line.as_str().expect("preview command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        fixture.calls().contains("KUBECTL_CALL: -n acme get secret"),
+        "the preview must discover the release Secret before planning its consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        preview.contains(r#""secretName":"acme-curie-secrets""#),
+        "the staging pod must mount the discovered Secret: {preview}"
+    );
+    assert!(
+        !preview.contains(r#""secretName":"acme-secrets""#),
+        "the preview must not guess a Secret name the chart does not render: {preview}"
+    );
+}
+
+#[test]
+fn store_migration_export_preview_mounts_the_discovered_release_secret() {
+    let fixture = HelmFixture::new("", HelmValuesResponse::Absent);
+    let chart = repo_root().join("charts/curie");
+    let live = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "acme-minio"},
+            "spec": {"selector": {"matchLabels": {
+                "app.kubernetes.io/component": "minio"
+            }}}
+        }]
+    })
+    .to_string();
+    let output = fixture.run(
+        &[
+            "cluster",
+            "migrate-store",
+            "--phase",
+            "export",
+            "--namespace",
+            "acme",
+            "--release",
+            "acme",
+            "--chart",
+            chart.to_str().expect("UTF 8 chart path"),
+            "--dry-run",
+        ],
+        &[
+            ("CURIE_TEST_KUBECTL_STS", live.as_str()),
+            ("CURIE_TEST_RELEASE_SECRET", "acme-curie-secrets"),
+        ],
+    );
+    let preview = json_output(output, "cluster migrate-store --phase export --dry-run")["plan"]
+        .as_array()
+        .expect("migration export preview plan")
+        .iter()
+        .map(|line| line.as_str().expect("preview command"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        fixture.calls().contains("KUBECTL_CALL: -n acme get secret"),
+        "the export preview must discover the release Secret before planning its consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        preview.contains(r#""secretName":"acme-curie-secrets""#),
+        "the export staging pod must mount the discovered Secret: {preview}"
+    );
+    assert!(
+        !preview.contains(r#""secretName":"acme-secrets""#),
+        "the export staging pod must not guess a Secret name the chart does not render: {preview}"
+    );
+}
+
+#[test]
+fn cluster_up_reports_a_preserved_sealing_key_as_preserved() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({
+            "sealing": {"privateKey": PRESERVED_SEALING_KEY}
+        })),
+    );
+    let output = fixture.cluster_up();
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with a recorded sealing key");
+
+    assert!(
+        visible.contains("preserving 1") && visible.contains("sealing"),
+        "the existing sealing key must be counted and named as preserved:\n{visible}"
+    );
+    assert!(
+        !visible.contains("generated") || !visible.contains("sealing"),
+        "a recorded sealing key must not be reported as generated:\n{visible}"
+    );
+    assert!(
+        fixture.calls().contains("SEALING_KEY_PRESENT: yes"),
+        "the preserved key must reach the Helm consumer:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        !visible.contains(PRESERVED_SEALING_KEY)
+            && !fixture.calls().contains(PRESERVED_SEALING_KEY),
+        "the preserved private key must remain redacted from output and command logs"
+    );
+}
+
+#[test]
+fn cluster_up_reports_a_new_sealing_key_as_generated_not_preserved() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Object(json!({"ui": {"deploy": false}})),
+    );
+    let output = fixture.cluster_up();
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up adding its first sealing key");
+
+    assert!(
+        visible.contains("generated") && visible.contains("sealing"),
+        "a live release missing the key must report its new sealing key separately:\n{visible}"
+    );
+    assert!(
+        !visible.contains("preserving 1"),
+        "a newly generated sealing key must not inflate the preserved count:\n{visible}"
+    );
+    assert!(
+        fixture.calls().contains("SEALING_KEY_PRESENT: yes"),
+        "the generated key must reach the Helm consumer:\n{}",
+        fixture.calls()
+    );
+}
+
+#[test]
+fn cluster_up_dry_run_defers_sealing_resolution_without_inventing_a_key() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let output = fixture.cluster_up_dry_run();
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up --dry-run");
+
+    assert!(
+        fixture.calls().is_empty(),
+        "the offline preview must not inspect the release:\n{}",
+        fixture.calls()
+    );
+    assert!(
+        !visible.contains("sealing.privateKey"),
+        "an offline preview cannot honestly choose or invent the private key:\n{visible}"
+    );
+    assert!(
+        visible.contains("live run")
+            && visible.contains("sealing")
+            && visible.contains("preserv")
+            && visible.contains("generat"),
+        "the preview must explain that live release discovery decides preservation or generation:\n{visible}"
     );
 }
 

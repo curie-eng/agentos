@@ -1066,7 +1066,33 @@ fn resolve_github_app_values(
 /// The PREVIOUS key is only ever preserved, never generated: it exists solely
 /// because an operator deliberately rotated, and inventing one would claim an
 /// overlap that never happened.
-fn resolve_sealing_values(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SealingPrivateKeyDisposition {
+    OperatorSet,
+    Deferred,
+    Preserved,
+    Generated,
+}
+
+fn sealing_private_key_disposition(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> SealingPrivateKeyDisposition {
+    if operator_set_keys(operator_sets).contains(crate::sealing::SEALING_PRIVATE_KEY) {
+        return SealingPrivateKeyDisposition::OperatorSet;
+    }
+    if preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY).is_some() {
+        return SealingPrivateKeyDisposition::Preserved;
+    }
+    if dry_run {
+        SealingPrivateKeyDisposition::Deferred
+    } else {
+        SealingPrivateKeyDisposition::Generated
+    }
+}
+
+fn resolve_preserved_sealing_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
 ) -> Vec<(String, String)> {
@@ -1074,14 +1100,8 @@ fn resolve_sealing_values(
     let mut resolved = Vec::new();
 
     if !overridden.contains(crate::sealing::SEALING_PRIVATE_KEY) {
-        match preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
-            Some(current) => {
-                resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current))
-            }
-            None => resolved.push((
-                crate::sealing::SEALING_PRIVATE_KEY.to_string(),
-                crate::sealing::generate_keypair().private_key,
-            )),
+        if let Some(current) = preserved_value(existing, crate::sealing::SEALING_PRIVATE_KEY) {
+            resolved.push((crate::sealing::SEALING_PRIVATE_KEY.to_string(), current));
         }
     }
     if !overridden.contains(crate::sealing::SEALING_PREVIOUS_PRIVATE_KEY) {
@@ -1093,6 +1113,25 @@ fn resolve_sealing_values(
                 previous,
             ));
         }
+    }
+    resolved
+}
+
+fn resolve_sealing_values(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) -> Vec<(String, String)> {
+    let mut resolved = resolve_preserved_sealing_values(existing, operator_sets);
+    if sealing_private_key_disposition(existing, operator_sets, false)
+        == SealingPrivateKeyDisposition::Generated
+    {
+        resolved.insert(
+            0,
+            (
+                crate::sealing::SEALING_PRIVATE_KEY.to_string(),
+                crate::sealing::generate_keypair().private_key,
+            ),
+        );
     }
     resolved
 }
@@ -1115,8 +1154,32 @@ fn resolve_preserved_values(
 ) -> Vec<(String, String)> {
     let mut all = resolve_comms_values(existing, operator_sets);
     all.extend(resolve_github_app_values(existing, operator_sets));
-    all.extend(resolve_sealing_values(existing, operator_sets));
+    all.extend(resolve_preserved_sealing_values(existing, operator_sets));
     all
+}
+
+/// Resolve managed values for an actual or previewed `cluster up`.
+///
+/// An offline preview has no evidence that the sealing key is absent, so it
+/// carries only values that are positively known to exist. A live completion
+/// may generate the current sealing key after the release read proves it is
+/// absent.
+fn resolve_managed_values_for_up(
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+    dry_run: bool,
+) -> Vec<(String, String)> {
+    let mut values = resolve_preserved_values(existing, operator_sets);
+    if sealing_private_key_disposition(existing, operator_sets, dry_run)
+        == SealingPrivateKeyDisposition::Generated
+    {
+        values.extend(
+            resolve_sealing_values(existing, operator_sets)
+                .into_iter()
+                .filter(|(key, _)| key == crate::sealing::SEALING_PRIVATE_KEY),
+        );
+    }
+    values
 }
 
 /// The chart value holding the model credential. Named here so the secret
@@ -1954,8 +2017,11 @@ pub(crate) fn complete_up_opts(
 ) -> Result<UpOpts> {
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &opts.set)?;
-        opts.secrets
-            .extend(resolve_preserved_values(existing, &opts.set));
+        opts.secrets.extend(resolve_managed_values_for_up(
+            existing,
+            &opts.set,
+            opts.common.dry_run,
+        ));
     }
     opts.github_token = resolve_github_token(existing, &opts.set, github_token, clear_github_token);
     if resolve_provider_egress
@@ -3197,17 +3263,54 @@ async fn run_prepared_up(
     if !opts.dev {
         let preserved = resolve_preserved_values(existing.as_ref(), &opts.set);
         if !preserved.is_empty() {
-            ui.note(&format!(
-                "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; \
-                 re-run those verbs only to change them",
-                preserved.len()
-            ));
+            let sealing_values = preserved
+                .iter()
+                .filter(|(key, _)| crate::sealing::SEALING_MANAGED_KEYS.contains(&key.as_str()))
+                .count();
+            let message = if sealing_values == preserved.len() {
+                format!(
+                    "preserving {} sealing value(s) recorded by the release",
+                    preserved.len()
+                )
+            } else if sealing_values == 0 {
+                format!(
+                    "preserving {} value(s) recorded by `cluster comms` / `cluster github-app`; re-run those verbs only to change them",
+                    preserved.len()
+                )
+            } else {
+                format!(
+                    "preserving {} value(s), including {} sealing value(s), recorded by the release",
+                    preserved.len(),
+                    sealing_values
+                )
+            };
+            ui.note(&message);
         }
-        if existing.is_none() && !opts.secrets.is_empty() && !opts.common.dry_run {
-            ui.note(&format!(
-                "generated strong per-release secrets for {} required chart credential(s); re-running `cluster up` reuses them",
-                opts.secrets.len()
-            ));
+        match sealing_private_key_disposition(existing.as_ref(), &opts.set, opts.common.dry_run) {
+            SealingPrivateKeyDisposition::Generated => {
+                ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
+            }
+            SealingPrivateKeyDisposition::Deferred => {
+                ui.note("a live run discovers sealing state and preserves an existing private key or generates one when absent; skipped here to keep --dry-run offline");
+            }
+            SealingPrivateKeyDisposition::OperatorSet | SealingPrivateKeyDisposition::Preserved => {
+            }
+        }
+        if existing.is_none() && !opts.common.dry_run {
+            let generated_required_secrets = opts
+                .secrets
+                .iter()
+                .filter(|(key, _)| {
+                    REQUIRED_SECRETS
+                        .iter()
+                        .any(|(required, _)| *required == key.as_str())
+                })
+                .count();
+            if generated_required_secrets > 0 {
+                ui.note(&format!(
+                    "generated strong per-release secrets for {generated_required_secrets} required chart credential(s); re-running `cluster up` reuses them"
+                ));
+            }
         }
     }
     // `existing.is_some()` means this is an UPGRADE: an API pod is already
