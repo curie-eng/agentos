@@ -11,6 +11,7 @@ agent to create.
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, status
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
+from plugin_format.yaml_loader import DuplicateKeyError, safe_load_unique
 
 from ..auth import require_api_key
 from ..schemas import ListedTargets, NamedTarget, ResolvedTarget, ResolveTargetRequest
@@ -27,7 +28,12 @@ def _parse(content: str) -> DeployTargetsFile:
     """
 
     try:
-        data = yaml.safe_load(content)
+        data = safe_load_unique(content)
+    except DuplicateKeyError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"deploy.duplicate_target: deploy.yaml contains duplicate key {exc.key!r}",
+        ) from exc
     except yaml.YAMLError as exc:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, f"deploy.yaml is unparseable: {exc}"

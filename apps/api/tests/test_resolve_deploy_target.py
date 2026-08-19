@@ -119,6 +119,34 @@ def test_unparseable_yaml_is_a_400_naming_the_problem(
     assert "unparseable" in r.json()["detail"]
 
 
+def test_explicit_mapping_tag_on_a_scalar_is_a_400(
+    client: TestClient, auth_headers: dict
+) -> None:
+    r = _resolve(client, auth_headers, "targets: !!map foo\n", "prod")
+    assert r.status_code == 400
+    assert "unparseable" in r.json()["detail"]
+
+
+def test_duplicate_target_name_is_a_400_naming_the_duplicate(
+    client: TestClient, auth_headers: dict
+) -> None:
+    content = (
+        "targets:\n"
+        "  prod:\n"
+        "    agent: first\n"
+        "    env: prod\n"
+        "    slack_channel: C0EXAMPLE1\n"
+        "  prod:\n"
+        "    agent: second\n"
+        "    env: prod\n"
+        "    slack_channel: C0EXAMPLE2\n"
+    )
+    r = _resolve(client, auth_headers, content, "prod")
+    assert r.status_code == 400, r.text
+    assert "deploy.duplicate_target" in r.json()["detail"]
+    assert "prod" in r.json()["detail"]
+
+
 # --------------------------------------------------------------------------- #
 # Listing every target (onboarding)
 # --------------------------------------------------------------------------- #

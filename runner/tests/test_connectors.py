@@ -96,6 +96,28 @@ def test_unreadable_connectors_file_mounts_nothing_rather_than_crashing(tmp_path
     assert servers == {}
 
 
+def test_explicit_mapping_tag_on_a_scalar_mounts_nothing(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(
+        _bundle(tmp_path, "connectors: !!map foo\n"), **SCOPE
+    )
+    assert servers == {}
+
+
+def test_duplicate_connector_name_mounts_nothing(tmp_path: Path) -> None:
+    servers = derive_mcp_servers(
+        _bundle(
+            tmp_path,
+            "connectors:\n"
+            "  grafana:\n"
+            "    url: https://first.example.com/mcp\n"
+            "  grafana:\n"
+            "    url: https://second.example.com/mcp\n",
+        ),
+        **SCOPE,
+    )
+    assert servers == {}, "duplicate grafana must mount nothing"
+
+
 def test_invalid_connectors_file_mounts_nothing(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, "connectors:\n  Bad_Name:\n    image: x:1\n"), **SCOPE

@@ -13,7 +13,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-import yaml
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -29,6 +28,7 @@ from plugin_format import (
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
 from plugin_format.validate import DEPLOY_FILE
+from plugin_format.yaml_loader import safe_load_unique
 
 # Re-exported so existing catchers (gitflow.py, routers/bundles.py, tests) keep
 # resolving ``bundles.UnsupportedArchive`` after the extraction logic moved to
@@ -108,7 +108,7 @@ def read_connectors(root: Path) -> ConnectorsFile:
     path = bundle_root(root) / CONNECTORS_FILE
     if not path.is_file():
         return ConnectorsFile()
-    parsed, errors = validate_connectors(yaml.safe_load(path.read_text(encoding="utf-8")))
+    parsed, errors = validate_connectors(safe_load_unique(path.read_text(encoding="utf-8")))
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return ConnectorsFile()
     return parsed
@@ -127,7 +127,9 @@ def read_deploy_targets(root: Path) -> DeployTargetsFile | None:
     path = bundle_root(root) / DEPLOY_FILE
     if not path.is_file():
         return None
-    parsed, errors = validate_deploy_targets(yaml.safe_load(path.read_text(encoding="utf-8")))
+    parsed, errors = validate_deploy_targets(
+        safe_load_unique(path.read_text(encoding="utf-8"))
+    )
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return None
     return parsed
