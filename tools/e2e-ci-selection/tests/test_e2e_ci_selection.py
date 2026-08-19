@@ -333,7 +333,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-release",
         "e2e-ladder-cluster",
     }
-    assert job["if"] == "${{ always() }}"
+    assert job["if"] == "${{ !cancelled() }}"
 
     candidates = [
         step
@@ -410,6 +410,7 @@ def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> Non
         {"local_selected": "true", "skill_local_result": "cancelled"},
         {"local_release_selected": "true", "local_release_result": "failure"},
         {"cluster_selected": "true", "cluster_result": "skipped"},
+        {"cluster_selected": "true", "cluster_result": "cancelled"},
         {"skill_local_result": "success"},
         {"local_release_result": "success"},
         {"cluster_result": "success"},
