@@ -17,6 +17,7 @@ which shipped bare binaries.
 | Asset | What it is |
 |---|---|
 | `curie-x86_64-unknown-linux-gnu` | CLI binary, Linux x86_64 |
+| `curie-aarch64-unknown-linux-gnu` | CLI binary, Linux aarch64 |
 | `curie-aarch64-apple-darwin` | CLI binary, macOS Apple silicon |
 | `curie-<version>.tgz` | packaged Helm chart |
 | `compose.release.yaml` | the self-contained local stack |
@@ -44,11 +45,12 @@ and its signature:
 ```bash
 VERSION=vX.Y.Z          # the release you are installing
 REPO=curie-eng/curie
-# Resolve the right asset for this machine. The release ships Linux x86_64 and
-# macOS Apple silicon; anything else builds from source (see cli/).
+# Resolve the right asset for this machine. The release ships Linux x86_64,
+# Linux aarch64, and macOS Apple silicon; anything else builds from source (see cli/).
 ASSET=
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64)                 ASSET=curie-x86_64-unknown-linux-gnu ;;
+  Linux/aarch64)                ASSET=curie-aarch64-unknown-linux-gnu ;;
   Darwin/arm64|Darwin/aarch64)  ASSET=curie-aarch64-apple-darwin ;;
 esac
 : "${ASSET:?no prebuilt binary for this platform; build the CLI from source in cli/}"
