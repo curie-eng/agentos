@@ -30,13 +30,18 @@ extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `appro
 does not define. Leniency is what lets the Claude Code base and these extensions coexist; the
 earlier "does not invent format extensions" framing was wrong.
 
-The manifest is not the whole bundle either. Two **Curie-only root files** sit beside the Claude
-Code surfaces and are validated by the same entry point: `connectors.yaml` (ADR-0086, Accepted) and
-`deploy.yaml` (ADR-0089, Accepted). Neither has a Claude Code counterpart, so neither is lenient:
-both parse under `extra="forbid"` (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec`,
+The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude
+Code surfaces and are validated by the same entry point: `connectors.yaml` (ADR-0086, Accepted), its
+generated companion `connectors.lock.yaml` (ADR-0113, Accepted), and `deploy.yaml` (ADR-0089,
+Accepted). None has a Claude Code counterpart, so none is lenient:
+all three parse under `extra="forbid"` (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec`,
+`packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockEntry`,
 `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget`), because there is no
 external producer that could legitimately carry a key the models do not know, so an unrecognised key
-is a typo rather than a future Claude Code field. What a bundle actually is, then, is the Claude Code
+is a typo rather than a future Claude Code field. The lock is the one root file no human authors --
+`curie build` writes it and the bundle carries it -- but it is part of the format all the same,
+because a second consumer that ignores it deploys a different image than the one the bundle's source
+was built into. What a bundle actually is, then, is the Claude Code
 plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin end to end.
 
 ## Current contract
@@ -55,20 +60,59 @@ with `name`/`description` required and `allowed_tools` aliased to the verbatim `
 `.mcp.json` file) where the validator enforces each server define `command` (stdio) or `url`
 (remote).
 
-Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates two **Curie-only root
-files**, both optional, both invisible to Claude Code:
+Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates three **Curie-only root
+files**, each absent from a bundle that needs none, all three invisible to Claude Code:
 
 - `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
-  one of two forms, hosted (`image`, plus `args`/`env`/`port`) or remote (`url`, plus `headers`), and
-  names the credentials it needs (`secrets`, `secret_files`, `sealed_secrets`) by NAME only, never by
+  one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`),
+  hosted from source (`build`, ADR-0113, the same hosted form with the image sourced rather than
+  named), or remote (`url`, plus `headers`). More than one set on one connector is
+  `connectors.ambiguous`, none set is `connectors.underspecified`. A `build` block
+  (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorBuild`) carries a
+  bundle-relative `context`, a `dockerfile` under it, and a required non-empty `platforms` list; it
+  never carries a digest, which lives only in the lock. Every entry names the credentials it needs
+  (`secrets`, `secret_files`, `sealed_secrets`) by NAME only, never by
   value. Validated by `packages/plugin-format/src/plugin_format/validate.py::_validate_connectors`,
   which emits `connectors.*` codes (`connectors.not_object`, `connectors.ambiguous`,
   `connectors.underspecified`, `connectors.reserved_name`, `connectors.duplicate_connector`,
-  `connectors.duplicate_server`, and others). Authored mapping keys are checked for
+  `connectors.duplicate_server`, `connectors.build_context_escapes`,
+  `connectors.build_no_platforms`, and others). Authored mapping keys are checked for
   duplicates before validation, so a repeated connector name is rejected rather than
   silently replaced by the last YAML value.
+- `connectors.lock.yaml` (ADR-0113,
+  `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockFile`) records what each
+  declared `build` resolved to. It is **generated, not authored**: `curie build` writes it and it is
+  packed into the bundle like any other file, so the platform holds the exact digest a version
+  deployed rather than that fact living in local CLI state. One
+  `packages/plugin-format/src/plugin_format/connector_lock.py::ConnectorLockEntry` per built
+  connector carries `image`, `delivery` (`registry` or `local-daemon`), the `platforms` the build
+  targeted, and `source_digest`. Identity is a digest and only a digest: `image` is
+  `<repo>@sha256:<64 hex>` for `registry` delivery and a bare `sha256:<64 hex>` image ID for
+  `local-daemon`, and a mutable tag is refused, because a tag can be repointed at a different
+  artifact after review. `source_digest` is the content-derived identity of the build INPUT
+  (`packages/plugin-format/src/plugin_format/connector_lock.py::source_digest_of`), hashing the
+  context's files -- each one's bytes plus whether it is executable by its owner, the one mode bit
+  the build context tar carries into the image -- and the declared `build` block together, honoring
+  the context's `.dockerignore`. The generated `connectors.lock.yaml` is excluded so writing the
+  lock cannot invalidate the digest it just recorded, but only when the declared `build.context` is
+  the bundle root (`.` or empty), which is the one place `curie build` writes it. Under a
+  subdirectory context, a `connectors.lock.yaml` at the top of that context is authored input the
+  daemon receives and is hashed like any other file.
+  `packages/plugin-format/src/plugin_format/validate.py::_validate_connector_lock` is where intake
+  refuses: a `build` connector whose declared context is not in the bundle is
+  `connectors.build_context_missing`, one with no lock entry is `connectors.lock_missing`, one whose
+  recomputed
+  source digest no longer matches is `connectors.lock_stale`, an unreadable or unknown-version file
+  is `connectors.lock_unreadable` / `connectors.lock_unsupported_version`, and a lock whose image
+  does not match the delivery it claims is `connectors.lock_invalid`. That last check is delegated to
+  `packages/plugin-format/src/plugin_format/connector_lock.py::apply_lock`, the single place a
+  `build` connector becomes an ordinary `image` one, so a hand-edited lock is refused by the same
+  rule a generated one passes. The recomputation is pure hashing over the extracted tree -- no
+  Docker, no registry, no network -- which is what lets the API run it and stay a pure renderer
+  (ADR-0087). Delivery is deliberately NOT judged here: a `local-daemon` lock is legitimate for a
+  local-tier deploy, and refusing it belongs to the cluster preflight.
 - `deploy.yaml` (ADR-0089, `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTargetsFile`)
   declares named deploy targets under a `targets` map, each a
   `packages/plugin-format/src/plugin_format/deploy_targets.py::DeployTarget` of
@@ -80,7 +124,7 @@ files**, both optional, both invisible to Claude Code:
   checked for duplicates before validation, so a repeated target name fails closed instead of
   silently selecting the last YAML value.
 
-The two overlay files are not independent of the manifest, which is the part a second consumer is
+The overlay files are not independent of the manifest, which is the part a second consumer is
 most likely to miss: `connectors.yaml` feeds manifest validation. The set of gate names
 `approvalPolicy` may legally use is built from BOTH the bundle's declared MCP servers and its
 `connectors.yaml` connectors, under two different namespacing rules (a plugin-loaded server's live
@@ -192,4 +236,4 @@ error codes).
 - **Guide:** [workflow-agent-conversion.md](./workflow-agent-conversion.md) — converting an existing workflow agent (deterministic pipeline + LLM at the edges) onto a bundle end to end (#275).
 - **Epic(s):** [#30](https://github.com/curie-eng/curie/issues/30) — document the dead `hooks` field and new approval/trigger declarations: each field's meaning, validation contract, and runner consumption
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the plugin format is the distribution wedge; not one of the six swap-readiness Jobs
-- **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md) — freezes `plugin-format` (with `aci-protocol`) as an interface built first; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) (Accepted) — adds `connectors.yaml` to the bundle root; [ADR-0089](../../adr/0089-bundles-declare-their-deploy-targets.md) (Accepted) — adds `deploy.yaml` to the bundle root
+- **ADR(s):** [ADR-0005](../../adr/0005-claude-agent-sdk-adapter-and-frozen-aci.md) — freezes `plugin-format` (with `aci-protocol`) as an interface built first; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) (Accepted) — adds `connectors.yaml` to the bundle root; [ADR-0089](../../adr/0089-bundles-declare-their-deploy-targets.md) (Accepted) — adds `deploy.yaml` to the bundle root; [ADR-0113](../../adr/0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) (Accepted) — adds the `build:` connector form and the generated `connectors.lock.yaml` that pins what it resolved to

@@ -92,7 +92,11 @@ The declaration side is frozen in the bundle format: `CONNECTORS_FILE`
 (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`), a
 mapping of name to `ConnectorSpec`
 (`packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec`). A spec
-is one of two forms, hosted (`image`) or remote (`url`), and unlike the rest of
+is one of three mutually exclusive forms — hosted by reference (`image`), hosted
+from source (`build`, ADR-0113, a `ConnectorBuild`
+(`packages/plugin-format/src/plugin_format/connectors.py::ConnectorBuild`) naming
+a bundle-relative `context`, its `dockerfile` and the `platforms` to build), or
+remote (`url`) — and unlike the rest of
 that package it forbids unknown keys: `connectors.yaml` is Curie's own file with
 no external producer, so an unrecognised key is a typo rather than a Claude Code
 extension to tolerate. Credentials are declared by **name** in three holder
@@ -110,6 +114,18 @@ the version subresource `read_version_connectors`
 the file and `connector_mcp_entries`
 (`apps/api/src/curie_api/bundles.py::connector_mcp_entries`) deriving the
 `.mcp.json` the sandbox dials.
+
+A `build` spec never reaches `render` unresolved. `read_version_connectors` puts
+the declaration and the bundle's `connectors.lock.yaml` (parsed by
+`read_connector_lock`,
+`apps/api/src/curie_api/bundles.py::read_connector_lock`) through `apply_lock`
+(`packages/plugin-format/src/plugin_format/connector_lock.py::apply_lock`), which
+rewrites every `build` connector into an ordinary `image` one carrying the locked
+digest — so `render`, the MCP entry derivation and `is_hosted` are untouched by
+the new form, and there is exactly one place a mutable tag can be refused.
+`apply_lock` reads a recorded fact and never resolves or builds one, which is what
+keeps the API a pure renderer under ADR-0087, and `render` raises rather than
+emitting a null image if it is ever handed an unresolved `build` spec.
 
 The reconciler is off by default. `WorkerConfig`
 (`apps/worker/src/curie_worker/config.py::WorkerConfig`) reads
