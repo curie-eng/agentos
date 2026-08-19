@@ -72,6 +72,7 @@ files**, both optional, both invisible to Claude Code:
   `{agent, env, slack_channel}` where `env` is `dev` or `prod`. Validated by
   `packages/plugin-format/src/plugin_format/validate.py::_validate_deploy_targets`, which emits
   `deploy.*` codes (`deploy.not_object`, `deploy.bad_target_name`, `deploy.bad_env`,
+  `deploy.missing_agent` (a declared target must name its agent; the error names the target key),
   `deploy.bad_agent_name`, `deploy.bad_slack_channel`).
 
 The two overlay files are not independent of the manifest, which is the part a second consumer is

@@ -15,10 +15,10 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from curie_api.gitflow import TargetUnresolved, resolve_target_agent
+from curie_api.gitflow import TargetUnresolved, _target_agent_name, resolve_target_agent
 from curie_api.models import Agent, Environment
 from curie_test_support.scaffold import scaffolded_deploy_yaml
-from plugin_format.deploy_targets import validate_deploy_targets
+from plugin_format.deploy_targets import DeployTarget, DeployTargetsFile, validate_deploy_targets
 
 REPO = "acme-corp/acme-bot"
 
@@ -119,6 +119,41 @@ def test_two_targets_for_one_environment_are_refused() -> None:
     with pytest.raises(TargetUnresolved) as caught:
         resolve_target_agent(ambiguous, Environment.prod, [agent("acme-bot")], None)
     assert caught.value.code == "deploy.ambiguous_env"
+
+
+def test_a_selected_target_missing_its_agent_is_refused() -> None:
+    invalid = DeployTargetsFile(targets={"prod_target": DeployTarget(env="prod")})
+
+    with pytest.raises(TargetUnresolved) as caught:
+        resolve_target_agent(invalid, Environment.prod, [agent("acme-bot")], None)
+
+    message = str(caught.value)
+    assert caught.value.code == "deploy.missing_agent"
+    assert "prod_target" in message
+    assert "None" not in message
+
+
+def test_a_missing_agent_is_reported_before_environment_ambiguity() -> None:
+    invalid = DeployTargetsFile(
+        targets={
+            "missing_target": DeployTarget(env="prod"),
+            "valid_target": DeployTarget(agent="acme-bot", env="prod"),
+        }
+    )
+
+    with pytest.raises(TargetUnresolved) as caught:
+        resolve_target_agent(invalid, Environment.prod, [agent("acme-bot")], None)
+
+    message = str(caught.value)
+    assert caught.value.code == "deploy.missing_agent"
+    assert "missing_target" in message
+    assert "None" not in message
+
+
+def test_the_early_target_lookup_preserves_a_missing_agent() -> None:
+    invalid = DeployTargetsFile(targets={"prod_target": DeployTarget(env="prod")})
+
+    assert _target_agent_name(invalid, Environment.prod) is None
 
 
 # --------------------------------------------------------------------------- #

@@ -59,8 +59,8 @@ class DeployTarget(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    # Which agent this target binds. Defaults to the manifest name, so a
-    # single-agent bundle need not repeat itself.
+    # Which agent this target binds. Validation requires it on every declared
+    # target, while the nullable shape preserves the existing schema.
     agent: str | None = None
     env: str = "dev"
     slack_channel: str | None = None
@@ -117,7 +117,14 @@ def validate_deploy_targets(data: Any) -> tuple[DeployTargetsFile | None, list[t
                     "never be selected.",
                 )
             )
-        if target.agent is not None and not _is_valid_name(target.agent):
+        if target.agent is None:
+            errors.append(
+                (
+                    "deploy.missing_agent",
+                    f"{where}: agent is required for every declared target",
+                )
+            )
+        elif not _is_valid_name(target.agent):
             errors.append(
                 (
                     "deploy.bad_agent_name",
