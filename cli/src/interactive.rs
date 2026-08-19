@@ -1324,9 +1324,9 @@ fn ensure_model_credential_available(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &App,
 ) -> Result<()> {
-    const RECOVERY: &str = "A supported model credential is required. Set \
-        `CURIE_MODEL_BASE_URL` to choose the provider endpoint, then save the value with \
-        `curie secrets set <NAME>` or `export <NAME>=...` and retry";
+    const RECOVERY: &str =
+        "A model credential is required. `CURIE_MODEL_BASE_URL` selects the endpoint. Use \
+        `curie secrets set <NAME>` or `export <NAME>=...`, then retry";
     const NAMES: &[&str] = &[
         "CURIE_CREDENTIALS",
         "ANTHROPIC_API_KEY",
