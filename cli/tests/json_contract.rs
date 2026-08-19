@@ -839,10 +839,10 @@ fn eval_schema_gate_has_teeth() {
 
 use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, BumpVersionOutput, CheckMatch, CheckReport, DeclaredServer,
-    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryOutput,
-    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, SkillMessageOutput, SweepRow,
-    VersionsOutput,
+    ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
+    CheckMatch, CheckReport, DeclaredServer, DeleteOutput, DeployOutput, KillOutput,
+    ListAgentsOutput, LocalAgentSummary, MemoryOutput, ResetThreadOutput, ResumeOutput,
+    SkillApprovalsOutput, SkillMessageOutput, SweepRow, VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -871,6 +871,25 @@ fn dry_run_plan_validates() {
         ],
     };
     assert_valid("dry-run.schema.json", &plan.to_json());
+}
+
+#[test]
+fn chart_check_output_validates() {
+    let output = ChartCheckOutput {
+        passed: 2,
+        total: 2,
+        scripts: vec![
+            ChartCheckOutcome {
+                name: "first-assertion.sh".to_string(),
+                passed: true,
+            },
+            ChartCheckOutcome {
+                name: "second-assertion.sh".to_string(),
+                passed: true,
+            },
+        ],
+    };
+    assert_valid("chart-check.schema.json", &output.to_json());
 }
 
 #[test]

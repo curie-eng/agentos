@@ -819,7 +819,7 @@ def test_a_remote_connector_renders_no_policies() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `spec.port` is read in five places, and every one of them has to read the
+# `spec.port` is read in six places, and every one of them has to read the
 # DECLARED port. The default is 8000, so a reader that hardcodes it keeps
 # working for every connector that never sets `port:` and breaks only for the
 # ones that do -- silently, and with a different symptom per reader. These
@@ -861,3 +861,30 @@ def test_a_wrong_url_port_makes_the_sandbox_dial_a_port_nothing_serves(port: int
     spec = ConnectorSpec(image="grafana/mcp-grafana:0.17.2", port=port)
     url = r.mcp_entry("acme-rel", "acme-bot", "acme-ns", "grafana", spec)["url"]
     assert url == f"http://acme-rel-acme-bot-mcp-grafana.acme-ns.svc.cluster.local:{port}/mcp"
+
+
+@pytest.mark.parametrize("port", [9876, 9999])
+def test_connector_env_port_placeholders_use_the_declared_port(port: int) -> None:
+    spec = ConnectorSpec(
+        image="grafana/mcp-grafana:0.17.2",
+        port=port,
+        env={
+            "ALLOWED_HOSTS": "${CURIE_ALLOWED_HOSTS}",
+            "CONNECTOR_PORT": "${CURIE_CONNECTOR_PORT}",
+            "CONNECTOR_URL": "${CURIE_CONNECTOR_URL}",
+        },
+    )
+    env = next(o for o in _objs(spec=spec) if o["kind"] == "Deployment")["spec"]["template"][
+        "spec"
+    ]["containers"][0]["env"]
+    assert {entry["name"]: entry["value"] for entry in env} == {
+        "ALLOWED_HOSTS": (
+            f"acme-bot-acme-bot-mcp-grafana:{port},"
+            f"acme-bot-acme-bot-mcp-grafana.acme-bot:{port},"
+            f"acme-bot-acme-bot-mcp-grafana.acme-bot.svc.cluster.local:{port}"
+        ),
+        "CONNECTOR_PORT": str(port),
+        "CONNECTOR_URL": (
+            f"http://acme-bot-acme-bot-mcp-grafana.acme-bot.svc.cluster.local:{port}"
+        ),
+    }
