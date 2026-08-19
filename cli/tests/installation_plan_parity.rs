@@ -621,6 +621,32 @@ fn live_minio_statefulset() -> String {
     .to_string()
 }
 
+fn live_mixed_store_statefulsets() -> String {
+    json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "metadata": {"name": "parity-minio"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "minio"}}}
+            },
+            {
+                "metadata": {"name": "parity-postgres"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "postgres"}}}
+            },
+            {
+                "metadata": {"name": "parity-valkey"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "valkey"}}}
+            },
+            {
+                "metadata": {"name": "parity-clickhouse"},
+                "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "clickhouse"}}}
+            }
+        ]
+    })
+    .to_string()
+}
+
 fn installation_with_effective_values() -> &'static str {
     "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  dispatcher.deploy: \"false\"\n  worker.replicas: \"3\"\n"
 }
@@ -1107,6 +1133,45 @@ fn migrate_store_alone_still_migrates() {
     assert!(
         calls.contains("KUBECTL_CALL: delete pod"),
         "a verified migration releases the staging pod:\n{calls}"
+    );
+}
+
+#[test]
+fn migrate_store_refuses_a_mixed_removed_and_renamed_batch() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulsets = live_mixed_store_statefulsets();
+
+    let output = fixture.apply(
+        &["--migrate-store"],
+        &[
+            ("CURIE_TEST_HELM_MIXED_STATEFULSETS", "1"),
+            ("CURIE_TEST_KUBECTL_STS", &live_statefulsets),
+        ],
+    );
+
+    let calls = fixture.calls();
+    let error = json_error(output, "apply --migrate-store");
+    let message = error["error"].as_str().expect("apply error message string");
+    assert!(
+        message.contains("nameOverride"),
+        "a renamed StatefulSet must direct the operator to nameOverride:\n{message}"
+    );
+    assert!(
+        message.contains("parity-minio")
+            && message.contains("parity-postgres")
+            && message.contains("parity-curie-postgres"),
+        "the refusal must include the removed store and renamed StatefulSet:\n{message}"
+    );
+    assert!(
+        !calls.contains("KUBECTL_CALL: run "),
+        "a mixed batch must stop before the migration export:\n{calls}"
+    );
+    assert!(
+        !calls.contains("HELM_CALL: upgrade"),
+        "a mixed batch must stop before the upgrade:\n{calls}"
     );
 }
 
