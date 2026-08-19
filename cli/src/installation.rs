@@ -35,10 +35,11 @@ pub struct Installation {
     pub credentials: Credentials,
     #[serde(default)]
     pub comms: Comms,
-    /// Verbatim `helm --set key=value` escape hatch, for anything this schema
-    /// does not model yet. Present deliberately: without it, adopting the file
-    /// would mean giving up settings that flags can express, and nobody would
-    /// adopt it.
+    /// Verbatim values emitted as `helm --set-string key=value` for chart settings
+    /// this schema does not model yet. Every accepted value remains a string.
+    /// Values shaped like booleans or null after trimmed ASCII case normalization
+    /// are refused because Helm treats every nonempty string as true in template
+    /// conditions. Use a modeled `curie.yaml` field when typed behavior is required.
     #[serde(default)]
     pub set: BTreeMap<String, String>,
 }
@@ -148,6 +149,19 @@ impl Installation {
                 bail!("platform.egress[].host must not be empty");
             }
         }
+        for (key, value) in &self.set {
+            let trimmed = value.trim();
+            if ["true", "false", "null"]
+                .iter()
+                .any(|reserved| trimmed.eq_ignore_ascii_case(reserved))
+            {
+                bail!(
+                    "set.{key} cannot use `{value}` because set values are always strings and \
+                     Helm treats every nonempty string as true in template conditions. \
+                     Use a modeled curie.yaml field for typed boolean or null behavior."
+                );
+            }
+        }
         // Refuse rather than ignore. A declared-but-unapplied credential is the
         // failure this whole ADR exists to prevent: the file would say the App
         // is configured while the cluster disagreed, which is exactly the
@@ -221,12 +235,8 @@ impl Installation {
         Ok(())
     }
 
-    /// The `--set key=value` tokens this file implies, in a stable order so a
-    /// plan diff is readable and a test can pin it.
-    ///
-    /// Platform toggles render before the `set:` escape hatch so an explicit
-    /// `set:` entry wins on a later-key-wins reading, matching how a trailing
-    /// `--set` beats an earlier one on the helm command line.
+    /// The modeled `--set key=value` tokens this file implies, in a stable
+    /// order so a plan diff is readable and a test can pin it.
     pub fn helm_sets(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(ui) = self.platform.ui {
@@ -235,10 +245,15 @@ impl Installation {
         if let Some(inference) = self.platform.inference {
             out.push(format!("inference.deploy={inference}"));
         }
-        for (key, value) in &self.set {
-            out.push(format!("{key}={value}"));
-        }
         out
+    }
+
+    /// The declared string tokens this file implies, in stable key order.
+    pub fn helm_set_strings(&self) -> Vec<String> {
+        self.set
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
     }
 
     /// Provider names for `--allow-egress-host`, validated downstream by
@@ -288,6 +303,10 @@ mod tests {
         assert_eq!(cfg.install.namespace, "acme");
         assert_eq!(cfg.install.release, "acme");
         assert!(cfg.helm_sets().is_empty(), "no platform toggles declared");
+        assert!(
+            cfg.helm_set_strings().is_empty(),
+            "no declared string values"
+        );
         assert!(cfg.credential_names().is_empty());
     }
 
@@ -401,17 +420,50 @@ mod tests {
     }
 
     #[test]
-    fn explicit_set_entries_render_after_platform_toggles() {
+    fn declared_set_entries_remain_verbatim_after_platform_toggles() {
         let raw = format!(
-            "{}platform:\n  ui: false\nset:\n  security.gvisor.mode: \"off\"\n",
+            "{}platform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  \
+             example.label: plain\n  example.leadingZero: \"00123\"\n  worker.replicas: \"3\"\n",
             minimal()
         );
         let cfg = Installation::parse(&raw).unwrap();
         assert_eq!(
             cfg.helm_sets(),
-            vec!["ui.deploy=false", "security.gvisor.mode=off"],
-            "a later --set wins on the helm command line, so escape-hatch keys go last"
+            vec!["ui.deploy=false"],
+            "modeled settings must remain in the Helm typed lane"
         );
+        assert_eq!(
+            cfg.helm_set_strings(),
+            vec![
+                "api.githubAppId=4475970",
+                "example.label=plain",
+                "example.leadingZero=00123",
+                "worker.replicas=3",
+            ],
+            "declared strings must retain their exact value in the Helm string lane"
+        );
+    }
+
+    #[test]
+    fn boolean_and_null_shaped_declared_set_values_are_rejected() {
+        for value in ["\"true\"", "\" FALSE \"", "\"Null\""] {
+            let raw = format!("{}set:\n  example.value: {value}\n", minimal());
+            let err =
+                Installation::parse(&raw).expect_err(&format!("quoted {value} must be rejected"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("set.example.value"),
+                "error must name the rejected key: {message}"
+            );
+            assert!(
+                message.contains("set values are always strings"),
+                "error must explain the string contract: {message}"
+            );
+            assert!(
+                message.contains("Use a modeled curie.yaml field"),
+                "error must give the operator a safe next action: {message}"
+            );
+        }
     }
 
     #[test]
@@ -671,6 +723,7 @@ fn plan_installation_inner(
         chart: String::new(),
         no_expose: false,
         set: cfg.helm_sets(),
+        set_string: cfg.helm_set_strings(),
         allow_egress_host: cfg.egress_hosts(),
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],
@@ -796,7 +849,10 @@ enum GuardVerdict {
 /// Runs even under `--dry-run`: the plan a dry run prints is exactly the plan
 /// that would destroy the store, so an operator reading it deserves the same
 /// warning the real run would give.
-async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict> {
+async fn guard_stateful_removal(
+    up: &crate::ops::UpOpts,
+    value_plan: &crate::ops::UpValuePlan,
+) -> Result<GuardVerdict> {
     let live = crate::ops::live_stateful_components(&up.common)
         .await
         .context("could not check whether this apply would remove stateful components")?;
@@ -807,14 +863,7 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict>
         // rather than a silent empty answer (#1351).
         return Ok(GuardVerdict::Clear);
     }
-    // The same effective values the upgrade would send, so the render reflects
-    // what this apply would actually create rather than the chart's defaults.
-    let sets: Vec<String> = crate::ops::up_value_plan(up)
-        .effective_values()
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect();
-    let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, &sets).await?;
+    let rendered = crate::ops::chart_stateful_components(&up.chart, &up.common, value_plan).await?;
     let removed = crate::ops::removed_stateful_components(&live, &rendered);
     if removed.is_empty() {
         return Ok(GuardVerdict::Clear);
@@ -964,7 +1013,9 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     let migrating = if allow_stateful_removal {
         false
     } else {
-        match guard_stateful_removal(&up).await? {
+        // Guard the exact upgrade plan, including preserved values carried through
+        // the private values file.
+        match guard_stateful_removal(&up, &up_values).await? {
             GuardVerdict::Clear => false,
             GuardVerdict::WouldRemove(removed)
                 if migrate_store

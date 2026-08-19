@@ -2571,6 +2571,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             chart,
                             no_expose,
                             set,
+                            set_string: vec![],
                             allow_egress_host,
                             // Populated by ops::up (resolve named providers to host
                             // routes on a live run); empty here so the pure builder and

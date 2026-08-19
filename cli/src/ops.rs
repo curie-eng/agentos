@@ -301,6 +301,7 @@ pub struct UpOpts {
     pub chart: String,
     pub no_expose: bool,
     pub set: Vec<String>,
+    pub set_string: Vec<String>,
     /// Named model providers (validated against [`parse_egress_provider`]) whose
     /// API host(s) runner egress is opened to. Resolved to narrow host-route
     /// CIDRs at install time into [`resolved_egress_cidrs`]; empty means no
@@ -347,6 +348,12 @@ pub struct UpOpts {
     /// generating strong per-release randoms (the first-class dev escape hatch
     /// that replaces hand-passing `--set` for every secret).
     pub dev: bool,
+}
+
+impl UpOpts {
+    fn operator_sets(&self) -> Vec<String> {
+        self.set.iter().chain(&self.set_string).cloned().collect()
+    }
 }
 
 pub struct DownOpts {
@@ -460,8 +467,9 @@ pub(crate) fn validate_up_inputs(
 ) -> Result<()> {
     validate_web_egress_cidrs(&opts.allow_web_egress)
         .context("invalid --allow-web-egress value")?;
-    check_runner_model_conflict(opts.model.as_deref(), &opts.set)?;
-    check_github_token_conflict(github_token, clear_github_token, &opts.set)?;
+    let operator_sets = opts.operator_sets();
+    check_runner_model_conflict(opts.model.as_deref(), &operator_sets)?;
+    check_github_token_conflict(github_token, clear_github_token, &operator_sets)?;
     for host in &opts.allow_egress_host {
         parse_egress_provider(host)?;
     }
@@ -1434,10 +1442,10 @@ pub fn stateful_components_from_list(list: &serde_json::Value) -> Vec<(String, S
 /// `helm template` rather than a dry-run upgrade: it needs no cluster and
 /// cannot mutate, so the guard is safe to run before deciding whether to
 /// proceed.
-pub async fn chart_stateful_components(
+pub(crate) async fn chart_stateful_components(
     chart: &str,
     o: &CommonOpts,
-    value_sets: &[String],
+    value_plan: &UpValuePlan,
 ) -> Result<Vec<(String, String)>> {
     let mut args = vec![
         plain("template"),
@@ -1446,10 +1454,7 @@ pub async fn chart_stateful_components(
         plain("-n"),
         plain(&o.namespace),
     ];
-    for entry in value_sets {
-        args.push(plain("--set"));
-        args.push(plain(entry));
-    }
+    value_plan.append_command_args(&mut args);
     let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
     if !ok {
         bail!("could not render the target chart to check for removed stateful components: {err}");
@@ -2015,15 +2020,17 @@ pub(crate) fn complete_up_opts(
     clear_github_token: bool,
     resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
+    let operator_sets = opts.operator_sets();
     if !opts.dev {
-        opts.secrets = resolve_generated_secrets(existing, &opts.set)?;
+        opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
             existing,
-            &opts.set,
+            &operator_sets,
             opts.common.dry_run,
         ));
     }
-    opts.github_token = resolve_github_token(existing, &opts.set, github_token, clear_github_token);
+    opts.github_token =
+        resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
     if resolve_provider_egress
         && !opts.allow_egress_host.is_empty()
         && opts.resolved_egress_cidrs.is_empty()
@@ -2174,6 +2181,7 @@ enum DiffParticipation {
 #[derive(Clone, PartialEq, Eq)]
 enum PlannedHelmValues {
     Set {
+        flag: HelmSetFlag,
         expression: String,
         effective: Vec<(String, String)>,
     },
@@ -2181,6 +2189,12 @@ enum PlannedHelmValues {
         values: Vec<(String, String)>,
         diff: DiffParticipation,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelmSetFlag {
+    Set,
+    SetString,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -2193,6 +2207,7 @@ impl UpValuePlan {
         let key = key.into();
         let value = value.into();
         self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::Set,
             expression: format!("{key}={value}"),
             effective: vec![(key, value)],
         });
@@ -2204,6 +2219,19 @@ impl UpValuePlan {
             .map(|(key, value)| (key.trim().to_string(), value.to_string()))
             .collect();
         self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::Set,
+            expression,
+            effective,
+        });
+    }
+
+    fn set_string_expression(&mut self, expression: String) {
+        let effective = operator_set_entries(std::slice::from_ref(&expression))
+            .into_iter()
+            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+            .collect();
+        self.entries.push(PlannedHelmValues::Set {
+            flag: HelmSetFlag::SetString,
             expression,
             effective,
         });
@@ -2219,8 +2247,13 @@ impl UpValuePlan {
     fn append_command_args(&self, args: &mut Vec<CmdArg>) {
         for entry in &self.entries {
             match entry {
-                PlannedHelmValues::Set { expression, .. } => {
-                    args.push(plain("--set"));
+                PlannedHelmValues::Set {
+                    flag, expression, ..
+                } => {
+                    args.push(plain(match flag {
+                        HelmSetFlag::Set => "--set",
+                        HelmSetFlag::SetString => "--set-string",
+                    }));
                     args.push(plain(expression));
                 }
                 PlannedHelmValues::SecretFile { values, .. } => {
@@ -2309,12 +2342,18 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     }
     plan.secret_file(o.secrets.clone(), DiffParticipation::Preserve);
     if let Some(model) = &o.model {
-        if explicit_runner_model(&o.set).is_none() {
+        if explicit_runner_model(&o.operator_sets()).is_none() {
             plan.set(RUNNER_MODEL_KEY, model);
         }
     }
     for expression in &o.set {
         plan.set_expression(expression.clone());
+    }
+    // Helm merges `--set-string` after `--set`, while `effective_values` uses
+    // insertion order. Keep the declared lane after the typed lane so duplicate
+    // keys resolve identically.
+    for expression in &o.set_string {
+        plan.set_string_expression(expression.clone());
     }
     plan
 }
@@ -3261,7 +3300,8 @@ async fn run_prepared_up(
 ) -> Result<ClusterUpOutput> {
     let ui = crate::ui::ui();
     if !opts.dev {
-        let preserved = resolve_preserved_values(existing.as_ref(), &opts.set);
+        let operator_sets = opts.operator_sets();
+        let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
         if !preserved.is_empty() {
             let sealing_values = preserved
                 .iter()
@@ -3286,7 +3326,11 @@ async fn run_prepared_up(
             };
             ui.note(&message);
         }
-        match sealing_private_key_disposition(existing.as_ref(), &opts.set, opts.common.dry_run) {
+        match sealing_private_key_disposition(
+            existing.as_ref(),
+            &operator_sets,
+            opts.common.dry_run,
+        ) {
             SealingPrivateKeyDisposition::Generated => {
                 ui.note("generated a sealing private key for this release; later cluster up runs preserve it");
             }
@@ -3380,7 +3424,7 @@ async fn run_prepared_up(
             }
         }
     }
-    if set_passthrough_leaks_github_token(&opts.set) {
+    if set_passthrough_leaks_github_token(&opts.operator_sets()) {
         ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
@@ -4715,6 +4759,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4735,6 +4780,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4765,6 +4811,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec!["worker.replicas=2".into(), "dispatcher.deploy=false".into()],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4785,6 +4832,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -4818,6 +4866,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: true,
             credentials: None,
@@ -4834,6 +4883,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec!["anthropic".into()],
             resolved_egress_cidrs: vec!["192.0.2.10/32".into()],
             chart: "charts/curie".into(),
@@ -4975,6 +5025,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -4991,6 +5042,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5022,6 +5074,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -5041,6 +5094,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5072,6 +5126,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec!["agentSandbox.runner.model=z-ai/glm-5.2".into()],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -5095,6 +5150,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5176,6 +5232,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -5206,6 +5263,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5247,6 +5305,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into(), "198.51.100.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -5273,6 +5332,7 @@ mod tests {
         let sealed_cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -5299,6 +5359,7 @@ mod tests {
             dev: false,
             no_expose: false,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -6440,6 +6501,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -6630,6 +6692,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -6672,6 +6735,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -6704,6 +6768,7 @@ mod tests {
             dev: true,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -6724,6 +6789,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -7606,6 +7672,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: false,
             credentials: Some("sk-ant-secretsecret".into()),
@@ -7648,6 +7715,7 @@ mod tests {
             common: common(),
             github_token: GithubTokenPlan::Untouched,
             model: None,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -7687,6 +7755,7 @@ mod tests {
             dev: false,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec!["203.0.113.0/24".into()],
             fake_model: true,
             credentials: None,
@@ -7725,6 +7794,7 @@ mod tests {
         up_commands(&UpOpts {
             common: common(),
             github_token: plan,
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),
@@ -8109,6 +8179,7 @@ mod tests {
             dev: true,
             no_expose: true,
             set: vec![],
+            set_string: vec![],
             allow_web_egress: vec![],
             fake_model: false,
             credentials: None,
@@ -8149,6 +8220,7 @@ mod tests {
         let cmds = up_commands(&UpOpts {
             common: common(),
             github_token: GithubTokenPlan::Set(GH_SENTINEL.into()),
+            set_string: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),

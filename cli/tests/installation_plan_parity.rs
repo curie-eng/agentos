@@ -671,7 +671,7 @@ fn live_mixed_store_statefulsets() -> String {
 }
 
 fn installation_with_effective_values() -> &'static str {
-    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  dispatcher.deploy: \"false\"\n  worker.replicas: \"3\"\n"
+    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  example.mode: disabled\n  worker.replicas: \"3\"\n"
 }
 
 #[derive(Clone, Copy)]
@@ -1171,6 +1171,95 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     assert_eq!(diff_keys, apply_keys, "apply plan: {apply}; diff: {diff}");
+}
+
+#[test]
+fn numeric_looking_declared_set_values_use_helm_string_semantics() {
+    let fixture = HelmFixture::new(
+        "version: 1\ninstall:\n  namespace: parity\n  release: parity\nplatform:\n  ui: false\nset:\n  api.githubAppId: \"4475970\"\n  example.label: plain\n  example.leadingZero: \"00123\"\n  ui.deploy: disabled\n  worker.replicas: \"3\"\n",
+        HelmValuesResponse::Absent,
+    );
+    let live_statefulset = json!({
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [{
+            "metadata": {"name": "parity-rustfs"},
+            "spec": {"selector": {"matchLabels": {"app.kubernetes.io/component": "rustfs"}}}
+        }]
+    })
+    .to_string();
+
+    let output = fixture.apply(
+        &[],
+        &[("CURIE_TEST_KUBECTL_STS", live_statefulset.as_str())],
+    );
+    let calls = fixture.calls();
+    assert!(
+        output.status.success(),
+        "apply failed with stdout:\n{}\nstderr:\n{}\ncalls:\n{calls}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let template = calls
+        .lines()
+        .find(|line| line.starts_with("HELM_CALL: template "))
+        .unwrap_or_else(|| panic!("stateful guard did not render the chart:\n{calls}"));
+    let upgrade = calls
+        .lines()
+        .find(|line| line.starts_with("HELM_CALL: upgrade "))
+        .unwrap_or_else(|| panic!("apply did not upgrade the release:\n{calls}"));
+
+    for command in [template, upgrade] {
+        let tokens = command.split_whitespace().collect::<Vec<_>>();
+        assert!(
+            tokens
+                .windows(2)
+                .any(|pair| pair == ["--set", "ui.deploy=false"]),
+            "modeled values must retain Helm typed semantics: {command}"
+        );
+        let modeled_index = tokens
+            .windows(2)
+            .position(|pair| pair == ["--set", "ui.deploy=false"])
+            .expect("modeled ui value");
+        let declared_index = tokens
+            .windows(2)
+            .position(|pair| pair == ["--set-string", "ui.deploy=disabled"])
+            .unwrap_or_else(|| panic!("declared ui override missing: {command}"));
+        assert!(
+            modeled_index < declared_index,
+            "declared string override must follow the modeled value: {command}"
+        );
+        for setting in [
+            "api.githubAppId=4475970",
+            "example.label=plain",
+            "example.leadingZero=00123",
+            "ui.deploy=disabled",
+            "worker.replicas=3",
+        ] {
+            assert!(
+                tokens
+                    .windows(2)
+                    .any(|pair| pair == ["--set-string", setting]),
+                "declared value must use Helm string semantics: {command}"
+            );
+            assert!(
+                !tokens.windows(2).any(|pair| pair == ["--set", setting]),
+                "declared value reached Helm through the typed lane: {command}"
+            );
+        }
+    }
+
+    let diff = json_output(fixture.diff(&[]), "diff");
+    for (key, value) in [
+        ("ui.deploy", "disabled"),
+        ("api.githubAppId", "<secret>"),
+        ("example.label", "plain"),
+        ("example.leadingZero", "00123"),
+        ("worker.replicas", "3"),
+    ] {
+        assert_added(&diff, key, value);
+    }
 }
 
 #[test]

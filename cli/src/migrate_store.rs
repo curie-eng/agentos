@@ -695,11 +695,12 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
         .collect();
     // migrate_store reasons about COMPONENTS only (which store is which); the
     // resource names the guard also needs are irrelevant here.
-    let rendered: Vec<String> = crate::ops::chart_stateful_components(chart, o, &[])
-        .await?
-        .into_iter()
-        .map(|(component, _)| component)
-        .collect();
+    let rendered: Vec<String> =
+        crate::ops::chart_stateful_components(chart, o, &crate::ops::UpValuePlan::default())
+            .await?
+            .into_iter()
+            .map(|(component, _)| component)
+            .collect();
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
     let image = "amazon/aws-cli:2.32.6";
@@ -956,11 +957,12 @@ pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Migra
         .collect();
     // migrate_store reasons about COMPONENTS only (which store is which); the
     // resource names the guard also needs are irrelevant here.
-    let rendered: Vec<String> = crate::ops::chart_stateful_components(chart, o, &[])
-        .await?
-        .into_iter()
-        .map(|(component, _)| component)
-        .collect();
+    let rendered: Vec<String> =
+        crate::ops::chart_stateful_components(chart, o, &crate::ops::UpValuePlan::default())
+            .await?
+            .into_iter()
+            .map(|(component, _)| component)
+            .collect();
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
     let image = "amazon/aws-cli:2.32.6";
