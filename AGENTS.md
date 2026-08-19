@@ -512,8 +512,11 @@ contributor target. Select `next` only for v0.7 work.
 
 Before accepting PRs against either branch, an administrator must protect both
 `main` and `next` with the same pull request review and required check rules,
-and must prohibit force pushes and branch deletion. Do not use an unprotected
-release train branch.
+and must prohibit force pushes and branch deletion. Those protections must use
+strict required status checks and require pull requests to be up to date with
+their base before merge, so namespace checks such as ADR number validation are
+evaluated against the current base. Do not use an unprotected release train
+branch.
 
 Bug fixes, security fixes, and anything shared by both lines land on the stable
 `main` line first. v0.7 features land on `next`.
