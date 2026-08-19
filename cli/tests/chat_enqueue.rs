@@ -91,6 +91,7 @@ async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
             "event_id",
             "received_at",
             "reply_handle",
+            "source",
             "text",
         ]
     );
