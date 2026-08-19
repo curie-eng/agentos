@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from plugin_format import connector_lock
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
@@ -290,7 +291,17 @@ async def read_version_connectors(
                 max_compression_ratio=settings.bundle_max_compression_ratio,
                 max_members=settings.bundle_max_members,
             )
-            declared = bundles.read_connectors(Path(tmp))
+            # Resolve every `build:` connector to the digest the bundle already
+            # records before anything renders (ADR 0113). `apply_lock` reads a
+            # recorded fact and never resolves or builds one, so the API stays a
+            # pure renderer under ADR-0087; `portable=False` because a
+            # local-tier version is a legitimate stored artifact whose manifests
+            # nothing applies.
+            declared = connector_lock.apply_lock(
+                bundles.read_connectors(Path(tmp)),
+                bundles.read_connector_lock(Path(tmp)),
+                portable=False,
+            )
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"

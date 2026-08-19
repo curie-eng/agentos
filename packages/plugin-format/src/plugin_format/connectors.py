@@ -7,7 +7,7 @@ and a NetworkPolicy -- roughly 180 lines of Kubernetes to stand up one server,
 per bundle, each copy independently right or wrong.
 
 ``connectors.yaml`` closes that. A bundle declares intent; the platform derives
-the objects. Two forms:
+the objects. Three forms:
 
     connectors:
       grafana:                                  # hosted: Curie runs the image
@@ -16,9 +16,19 @@ the objects. Two forms:
         env: {GRAFANA_URL: "https://grafana.example.com"}
         secrets: [GRAFANA_SERVICE_ACCOUNT_TOKEN]
 
+      k8s-write:                                # hosted: Curie BUILDS the image
+        build:
+          context: connectors/k8s-write
+          platforms: [linux/amd64, linux/arm64]
+        secret_files: {K8S_WRITE_KUBECONFIG: /secrets/kubeconfig}
+
       internal:                                 # remote: already running
         url: https://mcp.internal/mcp
         secrets: [INTERNAL_TOKEN]
+
+The ``build`` form (ADR 0113) replaces only where the image comes FROM. Every
+other field keeps its exact meaning, and the resolved digest lives in
+``connectors.lock.yaml``, never here -- see ``connector_lock``.
 
 Secrets are NAMES only. Values arrive at deploy time through the existing
 mechanism (ADR-0009), so this introduces no new way to carry a credential and
@@ -28,6 +38,7 @@ a bundle stays safe to commit.
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -65,8 +76,38 @@ class SecretRef(BaseModel):
         return self.key or self.name
 
 
+class ConnectorBuild(BaseModel):
+    """Where a connector's image comes FROM, when the bundle carries its source.
+
+    ADR 0113: an operator should not have to build an image, put it somewhere
+    pullable, and paste a reference back into the bundle by hand. The bundle
+    declares the build input -- which is what a reviewer can actually read in a
+    source change -- and `curie build` records what it resolved to in
+    ``connectors.lock.yaml``. The digest never appears here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Bundle-relative by construction. ADR 0113 requires the context be
+    # constrained to the extracted bundle "without accepting arbitrary host
+    # paths", so an absolute path or one that normalizes out of the bundle root
+    # is refused by `validate_connectors` rather than resolved.
+    context: str
+    # Relative to the context, defaulted because the common case omits it. A
+    # reader that left this empty would build whatever the daemon's own default
+    # happens to be, which is a different file in a different place.
+    dockerfile: str = "Dockerfile"
+    # Required rather than defaulted. A silently single-arch build passes every
+    # declaration check and then fails after apply as "no matching manifest for
+    # linux/arm64" -- the exact failure
+    # `examples/sre-bot/connectors/k8s-write/Dockerfile:1-5` documents -- and a
+    # default would pick an architecture on the author's behalf without saying
+    # so.
+    platforms: list[str]
+
+
 class ConnectorSpec(BaseModel):
-    """One declared connector. Exactly one of ``image`` or ``url``.
+    """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
 
     Strict, unlike the rest of this package. The leniency mandate exists because
     real Claude Code plugin bundles carry keys this MVP does not model, and
@@ -80,6 +121,11 @@ class ConnectorSpec(BaseModel):
 
     # -- hosted form --
     image: str | None = None
+    # The same hosted form, sourced rather than referenced (ADR 0113). Mutually
+    # exclusive with `image`: two image sources on one connector means whichever
+    # the reader picks silently ignores the other, and the ignored one is the
+    # one the author edited last.
+    build: ConnectorBuild | None = None
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     port: int = 8000
@@ -197,7 +243,11 @@ class ConnectorSpec(BaseModel):
 
     @property
     def is_hosted(self) -> bool:
-        return self.image is not None
+        # Hosted-ness is about WHO RUNS THE PROCESS, not about whether the image
+        # reference has been resolved yet. A `build:` connector with no lock
+        # applied is hosted and unrenderable, which `connector_render.render`
+        # refuses explicitly rather than emitting `image: null`.
+        return self.image is not None or self.build is not None
 
 
 class ConnectorsFile(BaseModel):
@@ -262,6 +312,87 @@ def _is_valid_name(name: str) -> bool:
     return len(name) <= _NAME_MAX and bool(_NAME_RE.fullmatch(name))
 
 
+# An OCI platform string: `os/arch`, optionally `os/arch/variant` (`linux/arm/v7`
+# is a real target, so rejecting the third segment would be a false positive that
+# blocks a legitimate build). A typo like `linux/amd_64` otherwise reaches buildx
+# verbatim and fails there with a message about the daemon rather than the bundle.
+_PLATFORM_RE = re.compile(r"[a-z0-9]+/[a-z0-9]+(/v[0-9]+)?")
+
+
+def _escapes(path: str) -> bool:
+    """Is this bundle-relative path absolute, empty, or outside the bundle root?
+
+    Textual, because this validator sees a declaration and not always a tree:
+    the CLI's ``resolve_context`` / ``resolve_dockerfile`` canonicalize on top of
+    this and additionally refuse a symlink, which no amount of string inspection
+    can see.
+    """
+
+    if not path.strip():
+        return True
+    parts = PurePosixPath(path).parts
+    if PurePosixPath(path).is_absolute():
+        return True
+    depth = 0
+    for part in parts:
+        if part == "..":
+            depth -= 1
+            if depth < 0:
+                return True
+        elif part != ".":
+            depth += 1
+    return False
+
+
+def _validate_build(
+    where: str, build: ConnectorBuild, errors: list[tuple[str, str]]
+) -> None:
+    """The `build:` form's own rules (ADR 0113).
+
+    Each condition carries its own code so a caller can assert the exact outcome
+    rather than "something was wrong", and all of them accumulate like every
+    other check here, so an author sees the whole file in one pass.
+    """
+
+    if _escapes(build.context):
+        errors.append(
+            (
+                "connectors.build_context_escapes",
+                f"{where}: `build.context` is {build.context!r}; it must be a path inside "
+                "the bundle. An absolute path makes the operator's own machine the build "
+                "context, and an empty one normalizes to the bundle root on one reader "
+                "and to the process working directory on another",
+            )
+        )
+    if _escapes(build.dockerfile):
+        errors.append(
+            (
+                "connectors.build_dockerfile_escapes",
+                f"{where}: `build.dockerfile` is {build.dockerfile!r}; it must be a path "
+                "inside the build context. The CLI reads this file before the bundle is "
+                "packed, which is before every other guard in the pipeline",
+            )
+        )
+    if not build.platforms:
+        errors.append(
+            (
+                "connectors.build_no_platforms",
+                f"{where}: `build.platforms` is empty. A silently single-arch build passes "
+                "every declaration check and then fails after apply as `no matching "
+                "manifest for linux/arm64`, so the target set is stated, never guessed",
+            )
+        )
+    for platform in build.platforms:
+        if not _PLATFORM_RE.fullmatch(platform):
+            errors.append(
+                (
+                    "connectors.build_bad_platform",
+                    f"{where}: `{platform}` is not an OCI platform. Use `os/arch` or "
+                    "`os/arch/variant`, such as `linux/amd64` or `linux/arm/v7`",
+                )
+            )
+
+
 def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[str, str]]]:
     """Validate parsed ``connectors.yaml`` content.
 
@@ -304,22 +435,28 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     f"the agent would lose {lost} -- rename the connector",
                 )
             )
-        if spec.image and spec.url:
+        forms = [bool(spec.image), bool(spec.build), bool(spec.url)]
+        if sum(forms) > 1:
             errors.append(
                 (
                     "connectors.ambiguous",
-                    f"{where}: set either `image` (Curie runs it) or `url` (already "
-                    "running), not both -- otherwise it is unclear who owns the process",
+                    f"{where}: set exactly one of `image` (Curie runs it), `build` (Curie "
+                    "builds it, then runs it) or `url` (already running) -- otherwise it "
+                    "is unclear who owns the process, and which image source wins is "
+                    "decided by whichever reader looks first",
                 )
             )
-        if not spec.image and not spec.url:
+        if not any(forms):
             errors.append(
                 (
                     "connectors.underspecified",
-                    f"{where}: set `image` for Curie to run it, or `url` to point at "
-                    "something already running",
+                    f"{where}: set `image` for Curie to run it, `build` for Curie to build "
+                    "it from source in this bundle, or `url` to point at something already "
+                    "running",
                 )
             )
+        if spec.build is not None:
+            _validate_build(where, spec.build, errors)
         if spec.url and (spec.args or spec.env):
             errors.append(
                 (
@@ -389,7 +526,7 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "the places it can leak from for no benefit",
                 )
             )
-        if spec.image and spec.headers:
+        if spec.is_hosted and spec.headers:
             errors.append(
                 (
                     "connectors.hosted_has_headers",

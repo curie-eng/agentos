@@ -11,6 +11,7 @@ pub mod channel;
 pub mod chat;
 pub mod commands;
 pub mod comms;
+pub mod connector_build;
 pub mod connectors;
 pub mod credcheck;
 pub mod discover;

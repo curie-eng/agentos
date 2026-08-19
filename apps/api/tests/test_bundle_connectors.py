@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_api import bundles
@@ -270,3 +271,235 @@ def test_a_referenced_secret_points_outside_curies_own_secret(tmp_path: Path) ->
     ref = next(e for e in env if e["name"] == "GRAFANA_TOKEN")["valueFrom"]["secretKeyRef"]
     assert ref["name"] == "grafana-mcp"
     assert "value" not in next(e for e in env if e["name"] == "GRAFANA_TOKEN")
+
+
+# --------------------------------------------------------------------------- #
+# A source-built connector resolves to its pinned digest before render -- ADR 0113
+#
+# The API stays a pure renderer: `apply_lock` reads a fact the bundle already
+# carries and never resolves, builds, or contacts a registry. What changes is
+# that the render path must APPLY it. An earlier draft of this work claimed the
+# resolution happened in `render_connector_manifests` and never wired it, which
+# is the defect these tests exist to make impossible.
+# --------------------------------------------------------------------------- #
+BUILT = (
+    "connectors:\n"
+    "  k8s-write:\n"
+    "    build:\n"
+    "      context: connectors/k8s-write\n"
+    "      platforms: [linux/amd64, linux/arm64]\n"
+    "    env: {K8S_WRITE_ALLOWLIST: 'acme-ns/acme-api'}\n"
+)
+
+# `<repo>@sha256:` plus 64 lowercase hex is the OCI manifest digest form
+# (https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests),
+# which is what `docker buildx build --push --metadata-file` reports as
+# `containerimage.digest`. Spelled out rather than derived from the
+# implementation, so a change to how Curie composes the reference fails here.
+DIGEST_IMAGE = (
+    "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+
+def _built(root: Path) -> Path:
+    """A bundle whose one connector is declared as source, with its context."""
+
+    _bundle(root, BUILT)
+    context = root / "b" / "connectors" / "k8s-write"
+    context.mkdir(parents=True, exist_ok=True)
+    (context / "Dockerfile").write_text(
+        "FROM scratch\nCOPY server.py /server.py\n", encoding="utf-8"
+    )
+    (context / "server.py").write_text("print('acme')\n", encoding="utf-8")
+    return root
+
+
+def _write_lock(root: Path, *, image: str = DIGEST_IMAGE, delivery: str = "registry") -> None:
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    build = ConnectorBuild.model_validate(
+        {"context": "connectors/k8s-write", "platforms": ["linux/amd64", "linux/arm64"]}
+    )
+    digest = connector_lock.source_digest_of(root / "b" / "connectors" / "k8s-write", build)
+    (root / "b" / connector_lock.CONNECTOR_LOCK_FILE).write_text(
+        "version: 1\n"
+        "connectors:\n"
+        "  k8s-write:\n"
+        f"    image: {image}\n"
+        f"    delivery: {delivery}\n"
+        "    platforms: [linux/amd64, linux/arm64]\n"
+        f"    source_digest: {digest}\n",
+        encoding="utf-8",
+    )
+
+
+def test_read_connector_lock_returns_none_when_the_bundle_carries_no_lock(tmp_path: Path) -> None:
+    # None is the shape every caller must handle: an ordinary `image:` bundle
+    # has no lock and never will. Raising here would break every existing
+    # version's render.
+    assert bundles.read_connector_lock(_bundle(tmp_path, HOSTED)) is None
+
+
+def test_a_built_connector_renders_the_locked_digest_and_no_build(tmp_path: Path) -> None:
+    from plugin_format import connector_lock
+
+    root = _built(tmp_path)
+    _write_lock(root)
+    declared = connector_lock.apply_lock(
+        bundles.read_connectors(root), bundles.read_connector_lock(root), portable=False
+    )
+    dep = next(
+        o
+        for o in bundles.render_connector_manifests(
+            declared,
+            release=RELEASE,
+            agent=AGENT,
+            namespace=NAMESPACE,
+            app_name=APP_NAME,
+            secret_name=SECRET_NAME,
+        )
+        if o["kind"] == "Deployment"
+    )
+    assert dep["spec"]["template"]["spec"]["containers"][0]["image"] == DIGEST_IMAGE
+
+
+def test_render_connector_manifests_stays_a_pure_function_of_its_arguments(tmp_path: Path) -> None:
+    # The resolution happens one level up, in the router. This function keeps
+    # receiving an ordinary ConnectorsFile and grew no lock parameter, which is
+    # what keeps it a pure function of its arguments under ADR-0087. Handed an
+    # UNRESOLVED build it must raise rather than quietly emit `image: null`.
+    root = _built(tmp_path)
+    _write_lock(root)
+    with pytest.raises(ValueError):
+        bundles.render_connector_manifests(
+            bundles.read_connectors(root),
+            release=RELEASE,
+            agent=AGENT,
+            namespace=NAMESPACE,
+            app_name=APP_NAME,
+            secret_name=SECRET_NAME,
+        )
+
+
+def test_the_mcp_entry_is_the_same_before_and_after_the_lock_is_applied(tmp_path: Path) -> None:
+    # The URL is derived from the Service, never from the image, so skill,
+    # local and cluster mount one byte-identical entry whether the connector was
+    # built from source or pulled by an authored reference. That identity is
+    # what ADR 0113's parity claim rests on, and it is why nothing in the runner
+    # or in `.mcp.json` has to learn that a connector was built.
+    from plugin_format import connector_lock
+    from plugin_format.connectors import validate_connectors
+
+    root = _built(tmp_path)
+    _write_lock(root)
+    resolved = connector_lock.apply_lock(
+        bundles.read_connectors(root), bundles.read_connector_lock(root), portable=False
+    )
+    authored, errors = validate_connectors(
+        {
+            "connectors": {
+                "k8s-write": {
+                    "image": DIGEST_IMAGE,
+                    "env": {"K8S_WRITE_ALLOWLIST": "acme-ns/acme-api"},
+                }
+            }
+        }
+    )
+    assert errors == []
+    kwargs = {"release": RELEASE, "agent": AGENT, "namespace": NAMESPACE}
+    assert bundles.connector_mcp_entries(resolved, **kwargs) == bundles.connector_mcp_entries(
+        authored, **kwargs
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Through the real route: the API consumer that must apply the lock (AC-A17)
+#
+# Real Postgres + real RustFS from the compose stack, matching the round-trip
+# tests in test_bundles.py: nothing here is mocked. Asserting on the helper
+# alone would leave the router free to keep calling `read_connectors` directly,
+# which is exactly the wiring gap review finding 8 named -- the resolution was
+# claimed and never wired. Deleting the `apply_lock` call in the router must
+# make this fail, and it fails as `image: None`, not as an import error.
+# --------------------------------------------------------------------------- #
+def _archive(root: Path) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        tf.add(root / "b", arcname="acme-bot")
+    return buf.getvalue()
+
+
+def _version_with_bundle(client: Any, headers: dict[str, str], archive: bytes) -> tuple[str, str]:
+    agent = client.post(
+        "/agents",
+        json={"name": "acme-bot", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
+        headers=headers,
+    ).json()
+    version = client.post(
+        f"/agents/{agent['id']}/versions",
+        json={"version_label": "v1", "created_by": "acme"},
+        headers=headers,
+    ).json()
+    upload = client.put(
+        f"/agents/{agent['id']}/versions/{version['id']}/bundle",
+        files={"file": ("acme-bot.tar.gz", archive)},
+        headers=headers,
+    )
+    assert upload.status_code == 201, upload.text
+    return agent["id"], version["id"]
+
+
+def test_the_connectors_route_renders_the_locked_digest(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _built(tmp_path)
+    _write_lock(root)
+    agent_id, version_id = _version_with_bundle(client, auth_headers, _archive(root))
+
+    resp = client.get(
+        f"/agents/{agent_id}/versions/{version_id}/connectors",
+        params={"release": RELEASE, "namespace": NAMESPACE, "app_name": APP_NAME},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    dep = next(o for o in body["manifests"] if o["kind"] == "Deployment")
+    image = dep["spec"]["template"]["spec"]["containers"][0]["image"]
+    assert image == DIGEST_IMAGE, "the router must apply the lock before rendering"
+    # The entry is Service-derived, so it is identical to the entry an authored
+    # `image:` connector of the same name produces. That is the parity claim.
+    assert body["mcp_entries"]["k8s-write"]["url"].startswith(
+        f"http://{RELEASE}-acme-bot-mcp-k8s-write.{NAMESPACE}.svc.cluster.local:"
+    )
+
+
+def test_a_lockless_build_bundle_never_becomes_a_version(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    # The upload path's half of the intake rule. The bundle is refused before it
+    # is stored, so the version carries no bundle_ref and the connectors route
+    # has nothing to render -- rather than the deployment going active with a
+    # connector that was never built.
+    root = _built(tmp_path)  # no lock written
+    agent = client.post(
+        "/agents",
+        json={"name": "acme-bot", "channel": {"kind": "slack", "address": "C0EXAMPLE1"}},
+        headers=auth_headers,
+    ).json()
+    version = client.post(
+        f"/agents/{agent['id']}/versions",
+        json={"version_label": "v1", "created_by": "acme"},
+        headers=auth_headers,
+    ).json()
+    resp = client.put(
+        f"/agents/{agent['id']}/versions/{version['id']}/bundle",
+        files={"file": ("acme-bot.tar.gz", _archive(root))},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert "connectors.lock_missing" in resp.text
