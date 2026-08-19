@@ -1566,7 +1566,7 @@ fn short_digest(digest: &str) -> String {
 
 /// Release everything a boot that has already packed its snapshot leaves behind
 /// when it aborts: the ollama sidecar, the hosted connectors, the network
-/// `start` owns, and the snapshot itself.
+/// `start` owns, the credentials it staged, and the snapshot itself.
 ///
 /// One definition for all three abort arms between the pack and a recorded
 /// state, because nothing else will ever collect these: no state was saved, so
@@ -1596,6 +1596,11 @@ async fn release_boot_scaffolding(
     if let Some(net) = owned_network {
         let _ = docker::remove_network(net).await;
     }
+    // After the connectors, never before: a tree still bind-mounted into a
+    // running container cannot be wiped cleanly, the same ordering
+    // `connector_teardown_plan` holds. Resolved credentials must not outlive a
+    // boot that no `skill down` can find.
+    let _ = crate::connector_build::wipe_connector_secrets(plugin_dir);
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
 }
 
@@ -8285,6 +8290,41 @@ mod tests {
             vec![format!("{}:/plugin:ro", bundle.dir().display())]
         );
     }
+
+    /// An aborted boot releases the credentials it staged, not just the
+    /// containers. Deleting the wipe from `release_boot_scaffolding` fails here.
+    ///
+    /// Nothing else will ever collect them: no state was recorded, so no `skill
+    /// down` can find the bundle (#1087). Driven with no sidecar, no connector
+    /// and no network so it reaches no Docker daemon -- what is under test is
+    /// the release list, not the removals.
+    #[tokio::test]
+    async fn an_aborted_boot_releases_the_staged_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::connector_build::stage_secret_file(
+            dir.path(),
+            "kubernetes",
+            "/secrets/kubeconfig",
+            "creds",
+        )
+        .unwrap();
+        let root = crate::connector_build::connector_secrets_root(dir.path());
+        assert!(root.exists());
+
+        super::release_boot_scaffolding(
+            None,
+            &[],
+            None,
+            &dir.path().join(".curie/snapshots/never-packed"),
+            dir.path(),
+        )
+        .await;
+
+        assert!(
+            !root.exists(),
+            "a resolved credential must not outlive the boot that staged it"
+        );
+    }
 }
 
 /// Which nullable override a `<tier> overrides` invocation intends to change.
@@ -8766,9 +8806,11 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     let (bundle_name, _version) = read_manifest(&plugin_dir)?;
 
     // buildx writes its build result here; a private per-run directory rather
-    // than the bundle, so a metadata file never rides the upload.
+    // than the bundle, so a metadata file never rides the upload. The system
+    // temp dir is shared with every other user on the box, so the directory is
+    // the owner's alone rather than the 0755 a default umask would give it.
     let metadata_dir = std::env::temp_dir().join(format!("curie-build-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&metadata_dir)
+    create_private_dir(&metadata_dir)
         .with_context(|| format!("create {}", metadata_dir.display()))?;
 
     let ui = crate::ui::ui();
@@ -8835,6 +8877,26 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
     Ok(ConnectorBuildOutput {
         connectors: records,
     })
+}
+
+/// Create a directory only its owner can enter, in one step.
+///
+/// The mode rides the create rather than a `set_permissions` after it: in a
+/// shared `/tmp` the window between the two is a window in which anyone can
+/// read what lands there, and buildx starts writing as soon as it is handed the
+/// path. Non-unix keeps the platform default, as the other cfg splits here do.
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// Run one connector's build and read back the immutable reference it produced.
@@ -9184,7 +9246,8 @@ pub fn connectors_needing_rebuild(
 // The local tier's connector bring-up
 // ---------------------------------------------------------------------------
 
-/// Generate the connector compose overlay for a deployed bundle and bring it up.
+/// Reconcile this agent's connector containers against the deployed bundle, then
+/// generate the connector compose overlay and bring the declared set up.
 ///
 /// One helper, both local deploy callers (`local deploy` and `deploy-local`), so
 /// the shorthand cannot upload a source-built bundle and start no connector.
@@ -9206,28 +9269,59 @@ pub async fn bring_up_local(
         .iter()
         .filter(|(_, spec)| spec.url.is_none() && spec.unhosted_url.is_none())
         .collect();
+
+    // Fail closed BEFORE anything is reaped, staged, written, or started -- the
+    // same refusal `skill up` performs, which this path used to skip. A declared
+    // secret with no value here would otherwise be written into the overlay as a
+    // `${NAME}` nothing populates: compose warns, expands it to empty, and the
+    // connector comes up authenticating with nothing. It runs above the reap so
+    // a bundle that cannot come up does not first tear down the connectors that
+    // are serving.
+    refuse_missing_connector_secrets(&decl)?;
+
+    // Reconcile before starting: compose only ADDS the services the overlay
+    // names, so a connector this bundle version dropped or renamed would keep
+    // running -- serving the runner an MCP endpoint the bundle no longer
+    // declares. It is deliberately NOT `--remove-orphans` and not a
+    // project-label sweep: this compose project holds the api/worker stack and
+    // every other locally deployed agent's connectors, so the reap is scoped to
+    // this agent's own containers and, within those, to the names the new
+    // desired set does not contain. A zero-connector bundle reaches this with an
+    // empty desired set, which is how the last one gets removed.
+    let desired: std::collections::BTreeSet<String> = hosted
+        .iter()
+        .map(|(connector, _)| {
+            cb::object_name(&identity.release, &identity.agent, connector.as_str())
+        })
+        .collect();
+    for problem in docker::reap_undesired_connectors(project, &identity.agent, &desired).await {
+        crate::ui::ui().warn(&problem);
+    }
+
     if hosted.is_empty() {
         return Ok(());
     }
 
     let mut secret_values = std::collections::BTreeMap::new();
     for (connector, spec) in &hosted {
-        cb::refuse_out_of_band_secrets(connector, spec)?;
         for name in cb::declared_secret_names(spec) {
-            if let Some(value) = resolve_connector_secret(&name)? {
-                secret_values.insert(name, value);
-            }
+            // The refusal above already proved every one of these resolves, so a
+            // gap here is reported as the missing credential it is rather than
+            // silently skipped.
+            let value = resolve_connector_secret(&name)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
+            secret_values.insert(name, value);
         }
         // Credential files are staged where both emitters expect them, so the
         // container finds bytes rather than an empty mount.
         for (key, declared_path) in &spec.secret_files {
-            if let Some(value) = resolve_connector_secret(key)? {
-                cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
-            }
+            let value = resolve_connector_secret(key)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(key)))?;
+            cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
         }
     }
 
-    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir, &secret_values)?;
+    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
     let path = cb::compose_overlay_path(plugin_dir);
     std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
     std::fs::write(
@@ -9236,7 +9330,10 @@ pub async fn bring_up_local(
     )
     .with_context(|| format!("write {}", path.display()))?;
 
-    let command = cb::compose_up_command(&path, project);
+    // The values reach the containers through the compose child's environment,
+    // where `${NAME}` in the file above expands from -- never through the file,
+    // never through argv, and masked in anything printed.
+    let command = cb::compose_up_command(&path, project, &secret_values);
     let (ok, _out, err) = crate::ops::run_capture(&command)
         .await
         .context("starting the bundle's connectors")?;
@@ -9246,8 +9343,10 @@ pub async fn bring_up_local(
     Ok(())
 }
 
-/// Refuse the WHOLE bundle when a hosted connector declares a secret that has
-/// no value on this box -- before a network, a build, or a container exists.
+/// Refuse the WHOLE bundle when a hosted connector declares a secret this box
+/// must not hand it, or has no value for -- before a network, a build, or a
+/// container exists. Both tiers' single pre-resolution gate, so a name the
+/// bundle must not own is refused here rather than at each caller.
 ///
 /// Bring-up used to skip an unresolved secret silently: `skill up` reported
 /// success, the connector container exited 1 on its own missing-credential
@@ -9259,7 +9358,12 @@ pub async fn bring_up_local(
 fn refuse_missing_connector_secrets(
     decl: &crate::connector_build::ConnectorsFileDecl,
 ) -> Result<()> {
-    // First, so a `from_secret` reference keeps its own, more specific refusal
+    // Ahead of every resolve below: a name the bundle must not own is refused
+    // before a single value is read, because reading it IS the exfiltration --
+    // the sweep below would resolve the operator's own model credential and
+    // report the declaration as satisfied.
+    crate::connector_build::refuse_reserved_secret_names(decl)?;
+    // Then, so a `from_secret` reference keeps its own, more specific refusal
     // (`refuse_out_of_band_secrets` names all three ways forward) instead of
     // being reported as an ordinary unset name by the sweep below.
     for (connector, spec) in &decl.connectors {
@@ -9289,6 +9393,36 @@ fn resolve_connector_secret(name: &str) -> Result<Option<String>> {
     crate::secrets::get_value(name)
 }
 
+/// Which hosted connectors a skill-tier boot starts, each paired with the image
+/// it runs, in declaration order.
+///
+/// The selection is `connector_build::resolved_image`'s, which is also what the
+/// local tier's overlay emits -- one rule, so the two tiers cannot resolve the
+/// same declaration to two different images. Extracted as a pure seam for two
+/// reasons: it is decidable with no Docker daemon, and it leaves the starter
+/// below with no image of its own to compute. The inline lock-first copy it
+/// replaces is what let a stale lock entry hijack a connector whose declaration
+/// had since switched from `build:` to `image:`.
+///
+/// Every image is resolved before the first container starts, so a bundle
+/// missing one is refused whole rather than half-started.
+pub fn skill_connector_plan(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: &crate::connector_build::ConnectorLockFileDecl,
+) -> Result<Vec<(String, String)>> {
+    let mut plan = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        plan.push((
+            connector.clone(),
+            crate::connector_build::resolved_image(connector, spec, lock)?,
+        ));
+    }
+    Ok(plan)
+}
+
 /// Start one container per hosted connector on the runner's private network.
 ///
 /// Returns the container names so `skill down` reaps exactly what this boot
@@ -9308,10 +9442,12 @@ async fn start_skill_connectors(
         connectors: std::collections::BTreeMap::new(),
     });
     let mut started = Vec::new();
-    for (connector, spec) in &decl.connectors {
-        if spec.url.is_some() || spec.unhosted_url.is_some() {
-            continue;
-        }
+    for (connector, image) in skill_connector_plan(decl, &lock)? {
+        let connector = connector.as_str();
+        let spec = decl
+            .connectors
+            .get(connector)
+            .expect("the plan names only this declaration's own connectors");
         cb::refuse_out_of_band_secrets(connector, spec)?;
         let mut secret_values = std::collections::BTreeMap::new();
         for name in cb::declared_secret_names(spec) {
@@ -9324,15 +9460,6 @@ async fn start_skill_connectors(
                 cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
             }
         }
-        let image = match lock.connectors.get(connector) {
-            Some(entry) => entry.image.clone(),
-            None => spec.image.clone().ok_or_else(|| {
-                crate::exit::usage(format!(
-                    "connectors.{connector} declares no `image` and {} records none for it.",
-                    cb::CONNECTOR_LOCK_FILE
-                ))
-            })?,
-        };
         let start = docker::ConnectorStartSpec::from_declaration(
             connector,
             spec,

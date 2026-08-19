@@ -72,8 +72,8 @@ use curie::commands::{connectors_needing_rebuild, ConnectorBuildOutput, Connecto
 use curie::connector_build::{
     self, build_argv, build_plan, digest_from_metadata, digest_pinned_ref, host_platform,
     hosted_secret_names, image_inspect_argv, lock_overwrite_refusal, missing_secrets_error,
-    registry_image_ref, write_lock, ConnectorBuildDecl, ConnectorLockEntryDecl,
-    ConnectorLockFileDecl, ConnectorSpecDecl, Delivery, SecretDecl,
+    refuse_reserved_secret_names, registry_image_ref, write_lock, ConnectorBuildDecl,
+    ConnectorLockEntryDecl, ConnectorLockFileDecl, ConnectorSpecDecl, Delivery, SecretDecl,
 };
 use curie::ui::CliOutput;
 use tempfile::TempDir;
@@ -1007,4 +1007,122 @@ fn the_refusal_is_a_usage_error_naming_every_gap_and_the_fix() {
             "the refusal must carry `{needle}`: {message}"
         );
     }
+}
+
+// ─── The names a connector may not claim ─────────────────────────────────────
+
+/// THE RED for the exfiltration: a connector that declares a model-credential
+/// key gets that credential resolved out of the operator's own environment or
+/// vault and injected into a container the bundle chose the image for. The
+/// refusal is a pure decision over NAMES, so it lands before the resolve sweep
+/// rather than reporting the declaration as satisfied.
+#[test]
+fn a_connector_may_not_declare_a_reserved_model_credential_key() {
+    let decl = declaration(&[("grafana", hosted_with_secret("ANTHROPIC_API_KEY"))]);
+    let err = refuse_reserved_secret_names(&decl).expect_err("a reserved name must be refused");
+    let message = err.to_string();
+    for needle in ["grafana", "ANTHROPIC_API_KEY", "reserved"] {
+        assert!(
+            message.contains(needle),
+            "the refusal must carry `{needle}`: {message}"
+        );
+    }
+    assert_eq!(
+        curie::exit::classify(&err).0,
+        curie::exit::ExitClass::Usage,
+        "a bundle declaring a name it may not own is a usage error, not a runtime failure"
+    );
+}
+
+/// The forward-safe half: a boot key nobody remembered to enumerate is still
+/// refused because it carries the `CURIE_` prefix.
+#[test]
+fn a_connector_may_not_claim_the_curie_boot_namespace() {
+    let decl = declaration(&[("grafana", hosted_with_secret("CURIE_RUNNER_TOKEN"))]);
+    let message = refuse_reserved_secret_names(&decl)
+        .expect_err("the prefix rule must refuse it")
+        .to_string();
+    assert!(message.contains("CURIE_RUNNER_TOKEN"), "{message}");
+}
+
+/// The second channel: same name, same resolution, same operator credential --
+/// only the delivery differs, so the fence covers a `secret_files` key too.
+#[test]
+fn a_credential_file_key_is_held_to_the_same_fence() {
+    let mut spec = hosted_with_secret("GRAFANA_SERVICE_ACCOUNT_TOKEN");
+    spec.secret_files = BTreeMap::from([(
+        "NODE_EXTRA_CA_CERTS".to_string(),
+        "/secrets/ca.pem".to_string(),
+    )]);
+    let decl = declaration(&[("grafana", spec)]);
+    let message = refuse_reserved_secret_names(&decl)
+        .expect_err("a reserved secret_files key must be refused")
+        .to_string();
+    assert!(message.contains("NODE_EXTRA_CA_CERTS"), "{message}");
+}
+
+/// A name outside the env-var shape can never bind, and the check reuses the
+/// one validator `curie secrets set` already holds an operator to.
+#[test]
+fn a_malformed_secret_name_is_refused_by_the_same_gate() {
+    let decl = declaration(&[("grafana", hosted_with_secret("grafana-token"))]);
+    let message = refuse_reserved_secret_names(&decl)
+        .expect_err("a malformed name must be refused")
+        .to_string();
+    assert!(message.contains("grafana-token"), "{message}");
+    assert!(message.contains("environment variable"), "{message}");
+}
+
+/// The over-refusal control: an ordinary credential name passes this gate
+/// untouched and reaches the missing-value refusal exactly as before.
+#[test]
+fn an_ordinary_credential_name_passes_the_fence() {
+    let mut spec = hosted_with_secret("GRAFANA_SERVICE_ACCOUNT_TOKEN");
+    spec.secret_files = BTreeMap::from([(
+        "K8S_READONLY_KUBECONFIG".to_string(),
+        "/secrets/kubeconfig".to_string(),
+    )]);
+    let decl = declaration(&[("grafana", spec)]);
+    assert!(
+        refuse_reserved_secret_names(&decl).is_ok(),
+        "the names the shipped examples declare must keep working"
+    );
+    assert_eq!(
+        hosted_secret_names(&decl),
+        vec![
+            "GRAFANA_SERVICE_ACCOUNT_TOKEN".to_string(),
+            "K8S_READONLY_KUBECONFIG".to_string(),
+        ],
+        "and they still reach the missing-value refusal"
+    );
+}
+
+// ─── The buildx metadata directory ───────────────────────────────────────────
+
+/// buildx's build result lands in a per-run directory under the SHARED system
+/// temp dir, so its mode is the only thing keeping the other accounts on the
+/// box out of it. Created private in one step rather than widened afterwards:
+/// buildx starts writing as soon as it is handed the path.
+///
+/// The helper is asserted rather than `build_connectors` itself, which needs a
+/// Docker daemon and a real build; `build_connectors` has exactly one call site
+/// for it, at the create of `curie-build-<uuid>`.
+#[cfg(unix)]
+#[test]
+fn the_buildx_metadata_directory_is_readable_only_by_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().expect("a scratch temp dir");
+    let dir = tmp.path().join("curie-build-0000");
+    curie::commands::create_private_dir(&dir).expect("create the metadata dir");
+
+    let mode = std::fs::metadata(&dir)
+        .expect("stat the metadata dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "a world-readable directory in /tmp hands every account on the box the build's metadata"
+    );
 }

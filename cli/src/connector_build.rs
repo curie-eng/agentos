@@ -229,15 +229,49 @@ pub fn parse_connectors(document: &str) -> Result<ConnectorsFileDecl> {
     let file: ConnectorsFileDecl =
         serde_norway::from_str(document).with_context(|| format!("parse {CONNECTORS_FILE}"))?;
     for (name, spec) in &file.connectors {
+        check_name(name)?;
         check_spec(name, spec)?;
     }
     Ok(file)
 }
 
+/// The connector name cap and shape, mirroring `plugin_format.connectors`
+/// (`_NAME_MAX`, `_NAME_RE`): an RFC 1123 label, because the name becomes a
+/// Kubernetes object and a DNS label. Change one language and change the other,
+/// or the accept/reject parity this module exists to hold is gone.
+const CONNECTOR_NAME_MAX: usize = 40;
+
+/// Refuse a name neither the platform nor this CLI can carry.
+///
+/// Parity with Python is only half of it. The CLI joins the name into a host
+/// path of its own (`.curie/connector-secrets/<connector>/`), so an unchecked
+/// name is a bundle-authored path component: `../../evil` would put a resolved
+/// credential outside the bundle. Checking at load rather than at each use is
+/// what makes every downstream join safe by construction.
+fn check_name(name: &str) -> Result<()> {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = !name.is_empty()
+        && name.len() <= CONNECTOR_NAME_MAX
+        && name.chars().all(|c| alnum(c) || c == '-')
+        && name.starts_with(alnum)
+        && name.ends_with(alnum);
+    if !valid {
+        bail!(
+            "connectors.{name}: a connector name becomes a Kubernetes object, a DNS label and a \
+             local directory, so it must be lowercase alphanumeric or dashes, start and end \
+             alphanumeric, and be at most {CONNECTOR_NAME_MAX} characters"
+        );
+    }
+    Ok(())
+}
+
 /// Parse and check a `connectors.lock.yaml` document.
 ///
 /// The version is checked here because it is the only thing that lets a future
-/// shape change be refused by an older reader instead of silently misread.
+/// shape change be refused by an older reader instead of silently misread, and
+/// every entry's image is checked against the delivery it claims because this
+/// reader is the last gate before the CLI runs or ships what the lock names
+/// (see [`check_lock_entry`]).
 pub fn parse_lock(document: &str) -> Result<ConnectorLockFileDecl> {
     let lock: ConnectorLockFileDecl =
         serde_norway::from_str(document).with_context(|| format!("parse {CONNECTOR_LOCK_FILE}"))?;
@@ -248,7 +282,81 @@ pub fn parse_lock(document: &str) -> Result<ConnectorLockFileDecl> {
             lock.version
         );
     }
+    // The lock is a second door onto the same names, and a bring-up reads it
+    // whether or not it re-read the declaration.
+    for (name, entry) in &lock.connectors {
+        check_name(name)?;
+        check_lock_entry(name, entry)?;
+    }
     Ok(lock)
+}
+
+/// The digest suffix both well-formed references carry: `sha256:` plus 64
+/// lowercase hex characters. Fixed by the OCI distribution spec's
+/// content-addressable digest grammar, not by anything in this repository.
+const IMAGE_DIGEST_PREFIX: &str = "sha256:";
+const IMAGE_DIGEST_HEX: usize = 64;
+
+/// Does the recorded reference match the delivery it claims?
+///
+/// The Rust twin of `plugin_format.connector_lock._image_matches_delivery`: a
+/// `registry` entry carries `<repo>@sha256:<64 lowercase hex>`, the manifest
+/// digest a registry pull resolves, and a `local-daemon` entry carries a bare
+/// `sha256:<64 lowercase hex>`, the id `docker image inspect --format {{.Id}}`
+/// reports. Nothing else, a tag included: a tag can be repointed at a different
+/// artifact after review, which is the failure ADR 0113 exists to close.
+fn image_matches_delivery(entry: &ConnectorLockEntryDecl) -> bool {
+    match entry.delivery {
+        // Split on the FIRST `@`, so a reference carrying a second one leaves it
+        // inside the digest half, where it is not hex -- the repository half
+        // admits neither an `@` nor whitespace, as Python's `[^@\s]+` does.
+        Delivery::Registry => entry.image.split_once('@').is_some_and(|(repo, digest)| {
+            !repo.is_empty() && !repo.contains(char::is_whitespace) && is_image_digest(digest)
+        }),
+        Delivery::LocalDaemon => is_image_digest(&entry.image),
+    }
+}
+
+fn is_image_digest(reference: &str) -> bool {
+    reference
+        .strip_prefix(IMAGE_DIGEST_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == IMAGE_DIGEST_HEX && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+        })
+}
+
+/// Refuse a lock entry whose image is not a digest of its delivery's shape.
+///
+/// Python refuses this in `apply_lock` rather than in `validate_connector_lock`,
+/// because there the two live one call apart. The CLI has no `apply_lock`: it
+/// reads the lock and runs or renders what it names, so the refusal belongs at
+/// the read. Without it a hand-edited `connectors.lock.yaml` carrying a mutable
+/// tag is run by `curie skill up` and shipped by a deploy, which is exactly the
+/// identity rule ADR 0113 states -- defeated at the one reader that never
+/// asks the platform.
+fn check_lock_entry(name: &str, entry: &ConnectorLockEntryDecl) -> Result<()> {
+    if image_matches_delivery(entry) {
+        return Ok(());
+    }
+    let (delivery, expected) = match entry.delivery {
+        Delivery::Registry => (
+            "registry",
+            "`<repo>@sha256:` plus 64 lowercase hex characters, the manifest digest a registry \
+             pull resolves",
+        ),
+        Delivery::LocalDaemon => (
+            "local-daemon",
+            "a bare `sha256:` plus 64 lowercase hex characters, the image id the local daemon \
+             reports",
+        ),
+    };
+    bail!(
+        "connectors.{name}: {CONNECTOR_LOCK_FILE} records image {:?} for delivery `{delivery}`, \
+         which is not that delivery's digest shape -- it must be {expected}. A mutable tag is \
+         never run or rendered: it can be repointed at a different artifact after review. \
+         Regenerate the lock with `curie build --plugin-dir <dir>`.",
+        entry.image
+    );
 }
 
 /// Read a bundle's `connectors.yaml`, or an empty declaration when it has none.
@@ -1174,11 +1282,35 @@ pub fn connector_secrets_root(plugin_dir: &Path) -> PathBuf {
 }
 
 /// The host path one declared `secret_files` entry is staged at.
+///
+/// The filename carries a digest of the WHOLE declared path, not just its
+/// basename: one connector may declare `/a/token` and `/b/token`, and a
+/// basename-only name stages the second over the first. Producer
+/// (`stage_secret_file`) and consumers (the `docker run` mounts, the compose
+/// overlay) all derive the path here, so the naming is theirs to share.
+///
+/// The basename is reduced to one path-free component because the declared path
+/// is the CONTAINER's: nothing constrains it to a shape the host can hold, and
+/// `..` or a drive-letter component would otherwise be joined verbatim.
 pub fn staged_secret_path(plugin_dir: &Path, connector: &str, declared_path: &str) -> PathBuf {
-    let basename = declared_path.rsplit('/').next().unwrap_or(declared_path);
+    let basename = declared_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(declared_path);
+    let kept: String = basename
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '_' | '-'))
+        .collect();
+    // `..`, `.` and the empty basename all name a directory rather than a file.
+    let stem = if kept.trim_matches('.').is_empty() {
+        "secret"
+    } else {
+        kept.as_str()
+    };
+    let digest = hex(Sha256::digest(declared_path.as_bytes()).as_slice());
     connector_secrets_root(plugin_dir)
         .join(connector)
-        .join(basename)
+        .join(format!("{stem}-{}", &digest[..DIGEST_LEN]))
 }
 
 /// Write one resolved credential where the container will find it.
@@ -1200,6 +1332,14 @@ pub fn stage_secret_file(
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     private_dir(&connector_secrets_root(plugin_dir))?;
     private_dir(parent)?;
+    // Replace, never write over: hardening left any previous staging 0400 (or
+    // 0444 where the chown fell back), so a plain write onto it is EACCES and
+    // a redeploy or credential rotation would wedge until the tree is removed
+    // by hand.
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("replace previously staged {}", path.display()))?;
+    }
     std::fs::write(&path, value).with_context(|| format!("write {}", path.display()))?;
     harden_secret_file(&path)?;
     Ok(path)
@@ -1236,14 +1376,22 @@ fn harden_secret_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Remove the staged credential tree. A no-op when it is already gone, so
-/// `down` after `down` does not error.
-pub fn wipe_connector_secrets(plugin_dir: &Path) -> Result<()> {
-    let root = connector_secrets_root(plugin_dir);
+/// Remove a staged credential tree. A no-op when it is already gone, so `down`
+/// after `down` does not error.
+///
+/// Addressed by the root rather than the bundle directory because teardown
+/// carries the root it recorded (`ConnectorTeardownStep::WipeSecrets`) while an
+/// aborting boot carries only the plugin dir; one implementation serves both.
+pub fn wipe_secrets_root(root: &Path) -> Result<()> {
     if !root.exists() {
         return Ok(());
     }
-    std::fs::remove_dir_all(&root).with_context(|| format!("remove {}", root.display()))
+    std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))
+}
+
+/// The same wipe, addressed by the bundle directory a boot staged into.
+pub fn wipe_connector_secrets(plugin_dir: &Path) -> Result<()> {
+    wipe_secrets_root(&connector_secrets_root(plugin_dir))
 }
 
 // ─── The compose overlay (the local tier's emitter) ──────────────────────────
@@ -1261,7 +1409,18 @@ pub fn compose_overlay_path(plugin_dir: &Path) -> PathBuf {
 
 /// `docker compose ... up -d --wait` for the generated overlay, joined to the
 /// running stack's project so the services land on its network.
-pub fn compose_up_command(overlay: &Path, project: &str) -> crate::ops::OpsCommand {
+///
+/// The resolved secret values ride the compose child's environment as masked
+/// `secret_env`, which is the ONLY channel that carries them: the overlay on
+/// disk holds a `${NAME}` reference, and compose expands it from this
+/// environment at parse time. Taking them here rather than at the call site
+/// makes an up command that starts the overlay without its credentials
+/// unrepresentable.
+pub fn compose_up_command(
+    overlay: &Path,
+    project: &str,
+    secret_values: &BTreeMap<String, String>,
+) -> crate::ops::OpsCommand {
     plain_command(
         "docker",
         vec![
@@ -1275,6 +1434,12 @@ pub fn compose_up_command(overlay: &Path, project: &str) -> crate::ops::OpsComma
             "--wait".into(),
         ],
     )
+    .with_secret_env(
+        secret_values
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 /// Whether a declared connector is one Curie runs (as opposed to one already
@@ -1284,32 +1449,51 @@ fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
 }
 
 /// The image a hosted connector starts from: the locked digest when the bundle
-/// builds it, else the declared `image:`.
-fn resolved_image(
+/// BUILDS it, else the declared `image:`.
+///
+/// The `build:` check is the whole rule (ADR 0113): the lock records what a
+/// declared build resolved to, so it is the identity of a `build:` connector and
+/// of nothing else. Consulting it first -- which both emitters used to do --
+/// lets an entry outlive the declaration that produced it: a connector switched
+/// from `build:` to `image:` keeps running the last source build, and no output
+/// anywhere says the declared image was ignored.
+///
+/// The one rule, called by both emitters, so the skill tier and the local tier
+/// cannot answer this differently.
+pub fn resolved_image(
     connector: &str,
     spec: &ConnectorSpecDecl,
     lock: &ConnectorLockFileDecl,
 ) -> Result<String> {
-    if let Some(entry) = lock.connectors.get(connector) {
-        return Ok(entry.image.clone());
+    if spec.build.is_some() {
+        if let Some(entry) = lock.connectors.get(connector) {
+            return Ok(entry.image.clone());
+        }
     }
     spec.image.clone().ok_or_else(|| {
-        anyhow!(
+        // Usage (exit 2), not a generic failure: no retry of the same argv
+        // clears it, and the fix is the build this bundle never ran.
+        crate::exit::usage(format!(
             "connectors.{connector}: declares no `image` and {CONNECTOR_LOCK_FILE} has no entry \
              for it. Run `curie build --plugin-dir <dir>` first."
-        )
+        ))
     })
 }
 
 /// The generated compose overlay: one service per hosted connector, the same
 /// rendered contract `ConnectorStartSpec` emits with `docker run`.
+///
+/// No resolved secret value enters it. The overlay is serialized to a file under
+/// `.curie/` that outlives the stack, so a declared secret is written as the
+/// `${NAME}` compose reference and the value travels through
+/// [`compose_up_command`]'s masked `secret_env` instead -- the same rule
+/// `ConnectorStartSpec` follows with its bare `-e NAME`.
 pub fn compose_overlay(
     lock: &ConnectorLockFileDecl,
     decl: &ConnectorsFileDecl,
     identity: &ConnectorScope,
     project: &str,
     plugin_dir: &Path,
-    secret_values: &BTreeMap<String, String>,
 ) -> Result<serde_json::Value> {
     let mut services = serde_json::Map::new();
     for (connector, spec) in &decl.connectors {
@@ -1336,10 +1520,15 @@ pub fn compose_overlay(
         }
         for name in declared_secret_names(spec) {
             // Compose has no secretKeyRef, so a declared secret is resolved
-            // locally. Its value stays out of argv: compose reads the file.
-            if let Some(value) = secret_values.get(&name) {
-                environment.insert(name, serde_json::Value::String(value.clone()));
-            }
+            // locally -- but only the REFERENCE is written here. Compose expands
+            // `${NAME}` from its own process environment at parse time, so the
+            // container receives the literal value while this file, which
+            // survives `local down` at 0644, holds nothing but the name.
+            // Unconditional: every declared name must be present in the injected
+            // environment (`bring_up_local` refuses the bring-up otherwise), or
+            // compose warns and expands it to empty.
+            let reference = format!("${{{name}}}");
+            environment.insert(name, serde_json::Value::String(reference));
         }
 
         let volumes: Vec<serde_json::Value> = spec
@@ -1378,13 +1567,24 @@ pub fn compose_overlay(
             serde_json::json!({ "aliases": [alias] }),
         );
         service.insert("networks".into(), serde_json::Value::Object(attachment));
-        service.insert(
-            "labels".into(),
-            serde_json::json!({
-                "curietech.ai/component": "connector",
-                "curietech.ai/project": project,
-            }),
+        let mut labels = serde_json::Map::new();
+        labels.insert(
+            "curietech.ai/component".into(),
+            serde_json::Value::String("connector".into()),
         );
+        labels.insert(
+            "curietech.ai/project".into(),
+            serde_json::Value::String(project.to_string()),
+        );
+        // Which agent's connector, and which one: the local tier shares one
+        // compose project with the main stack and with every other agent, so
+        // these two are the only thing a redeploy can reconcile against
+        // (`docker::connectors_to_reap`). Emitted from the same pairs the skill
+        // tier's `docker run` labels carry, so one reap selector covers both.
+        for (key, value) in crate::docker::connector_identity_labels(&identity.agent, &name) {
+            labels.insert(key, serde_json::Value::String(value));
+        }
+        service.insert("labels".into(), serde_json::Value::Object(labels));
         service.insert("read_only".into(), serde_json::Value::Bool(true));
         service.insert(
             "user".into(),
@@ -1437,6 +1637,70 @@ pub fn hosted_secret_names(decl: &ConnectorsFileDecl) -> Vec<String> {
         names.extend(spec.secret_files.keys().cloned());
     }
     names.into_iter().collect()
+}
+
+/// The non-`CURIE_`-prefixed names a connector secret must never claim.
+///
+/// The twin of `_CREDENTIAL_KEYS | _REDIRECT_CAPTURE_KEYS` in
+/// `packages/plugin-format/src/plugin_format/reserved_env.py`, which is the
+/// policy's authority. This copy exists because the refusal has to fire on THIS
+/// box, before a value is read out of the operator's environment or vault and
+/// handed to a container the bundle controls, and no Python runs that early.
+/// `apps/worker/tests/binding/test_reserved_boot_env_pin.py` is the drift pin
+/// that fails CI if the two lists diverge -- the same mechanism that pins the
+/// Helm list.
+pub const RESERVED_CONNECTOR_SECRET_NAMES: [&str; 8] = [
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "ANTHROPIC_CUSTOM_HEADERS",
+];
+
+/// Whether `name` is reserved: an enumerated platform credential or
+/// redirect/capture key, or anything in the `CURIE_` boot namespace. The prefix
+/// rule is the forward-safe half, mirroring `is_reserved_boot_env_name`.
+fn is_reserved_secret_name(name: &str) -> bool {
+    name.starts_with("CURIE_") || RESERVED_CONNECTOR_SECRET_NAMES.contains(&name)
+}
+
+/// Refuse a hosted connector whose declared secret NAME it must not own.
+///
+/// Scoped to the hosted connectors for the same reason `hosted_secret_names` is:
+/// those are the only declarations this box resolves a value for. A connector
+/// declaring `ANTHROPIC_API_KEY` would otherwise have the operator's own model
+/// credential read out of their environment or vault and injected into a
+/// container the bundle chose the image for -- and at the skill and local tiers
+/// that happens before the runner validates the bundle, so the plugin-format
+/// fence never gets a turn. Names only: no value is read to decide this.
+pub fn refuse_reserved_secret_names(decl: &ConnectorsFileDecl) -> Result<()> {
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        for name in declared_secret_names(spec)
+            .into_iter()
+            .chain(spec.secret_files.keys().cloned())
+        {
+            crate::secrets::validate_name(&name).map_err(|err| {
+                crate::exit::usage(format!(
+                    "connectors.{connector}: `{name}` is not a usable secret name: {err}"
+                ))
+            })?;
+            if is_reserved_secret_name(&name) {
+                return Err(crate::exit::usage(format!(
+                    "connectors.{connector}: `{name}` is a reserved platform boot-env or \
+                     model-credential key and cannot be a connector secret. Curie would resolve \
+                     the operator's own value for it and hand it to this connector's container. \
+                     Rename the variable the connector reads."
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The one refusal both tiers issue when declared secrets have no value here.

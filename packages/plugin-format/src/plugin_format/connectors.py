@@ -43,6 +43,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
+
 # The file this module parses. Defined here, with the parser, so every reader
 # (the deploy validator, the approval-policy gate-name derivation, the API's
 # bundle reader) names one constant rather than its own copy of the string.
@@ -572,6 +574,37 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                     "Use `secrets:` until then.",
                 )
             )
+        # A connector-declared secret NAME is held to exactly the policy a
+        # manifest `secrets` name gets (`validate._validate_secrets`): the same
+        # env-var shape and the same reserved fence, from the same module, so
+        # the two declaration sites cannot drift apart. Without this the fence
+        # was bypassable by moving the name from `plugin.json` to here: a bundle
+        # declaring `secrets: [ANTHROPIC_API_KEY]` has the operator's own model
+        # credential resolved from their environment or vault and handed to the
+        # bundle's own container, and at the skill tier that happens before this
+        # validator ever runs.
+        declared_names = [s if isinstance(s, str) else s.name for s in spec.secrets]
+        declared_names += list(spec.secret_files)
+        for declared_name in declared_names:
+            if not SECRET_NAME_RE.match(declared_name):
+                errors.append(
+                    (
+                        "connectors.secret_name_invalid",
+                        f"{where}: secret name {declared_name!r} must be an env-var-style "
+                        "name (uppercase letters, digits, underscore; not starting with a "
+                        "digit) -- it is delivered as an environment variable, so a name "
+                        "outside that shape can never bind",
+                    )
+                )
+            elif is_reserved_boot_env_name(declared_name):
+                errors.append(
+                    (
+                        "connectors.secret_name_reserved",
+                        f"{where}: secret name {declared_name!r} is reserved: it is a "
+                        "platform boot-env, model-credential, or redirect/capture-capable "
+                        "key and cannot be used for a connector secret",
+                    )
+                )
         seen_secret_names: set[str] = set()
         for secret_name in spec.secret_names():
             if secret_name in seen_secret_names:

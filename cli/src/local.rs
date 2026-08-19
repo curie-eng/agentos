@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::commands::OLLAMA_PORT;
 use crate::docker;
@@ -756,24 +756,52 @@ impl crate::ui::CliOutput for LocalDownOutput {
     }
 }
 
+/// The connector teardown `local down` runs, for a `down` invoked from `cwd`.
+///
+/// Container reaping stays label-scoped rather than file-scoped: `LocalDownOpts`
+/// carries no plugin directory, so a `down` run from anywhere must still reap
+/// what a `local deploy` started (ADR 0113, block B1-8). The staged credential
+/// tree can only be addressed by path, and the local tier records the deployed
+/// bundle's directory nowhere (`.curie/runner.json` is the skill tier's), so the
+/// honest resolution is the one `local deploy` itself defaults to: the current
+/// directory (`--plugin-dir .`). The wipe is added only when that directory
+/// actually holds a staged tree.
+///
+/// The limit that leaves: a `down` run from an unrelated directory, or after a
+/// deploy that pointed `--plugin-dir` elsewhere, still cannot find that bundle's
+/// tree. Accepted, because guessing at another bundle is worse than missing one
+/// -- the containers holding the credentials are reaped either way, and a `down`
+/// or `deploy` from the bundle's own directory clears the tree.
+pub fn connector_teardown_plan_for_down(cwd: &Path) -> Vec<docker::ConnectorTeardownStep> {
+    let staged = crate::connector_build::connector_secrets_root(cwd).is_dir();
+    docker::connector_teardown_plan(COMPOSE_PROJECT, None, staged.then_some(cwd))
+}
+
 pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
     let ui = crate::ui::ui();
     let cmd = down_command(&o);
+    let cwd = std::env::current_dir().context("resolving the current directory")?;
+    let teardown = connector_teardown_plan_for_down(&cwd);
     if o.common.dry_run {
-        return Ok(LocalDownOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![
-                cmd.display(),
-                format!(
-                    "docker rm -f $(docker ps -a --filter label={} -q)",
-                    docker::SANDBOX_LABEL
-                ),
-                format!(
-                    "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
-                    docker::CONNECTOR_COMPONENT_LABEL,
-                    docker::connector_project_label(COMPOSE_PROJECT)
-                ),
-            ],
-        }));
+        let mut lines = vec![
+            cmd.display(),
+            format!(
+                "docker rm -f $(docker ps -a --filter label={} -q)",
+                docker::SANDBOX_LABEL
+            ),
+            format!(
+                "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
+                docker::CONNECTOR_COMPONENT_LABEL,
+                docker::connector_project_label(COMPOSE_PROJECT)
+            ),
+        ];
+        // A removal of files on disk must not be a surprise the plan omitted.
+        for step in &teardown {
+            if let docker::ConnectorTeardownStep::WipeSecrets(path) = step {
+                lines.push(format!("rm -rf {}", path.display()));
+            }
+        }
+        return Ok(LocalDownOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
     if o.wipe {
         ui.warn(&format!(
@@ -797,16 +825,11 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
         "stopping stack"
     };
     run_step(&cl, label, "stopped", &cmd).await?;
-    // Connector containers are label-scoped, never file-scoped: `LocalDownOpts`
-    // carries no plugin directory, so a `down` run from another directory must
-    // still reap what a `local deploy` started (ADR 0113, block B1-8).
-    for problem in docker::run_connector_teardown(&docker::connector_teardown_plan(
-        COMPOSE_PROJECT,
-        None,
-        None,
-    ))
-    .await
-    {
+    // Containers first, then this bundle's staged credential tree when the
+    // directory `down` was run from holds one -- see
+    // `connector_teardown_plan_for_down` for what that resolution can and
+    // cannot reach.
+    for problem in docker::run_connector_teardown(&teardown).await {
         ui.warn(&problem);
     }
     let report = docker::reap_labeled(docker::SANDBOX_LABEL).await;

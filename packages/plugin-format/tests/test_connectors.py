@@ -343,6 +343,94 @@ def test_both_forms_can_be_mixed_on_one_connector() -> None:
     assert parsed.connectors["g"].resolved_secrets() == ["OWNED"]
 
 
+# --------------------------------------------------------------------------- #
+# A connector-declared secret NAME gets the manifest `secrets` policy -- #457
+# --------------------------------------------------------------------------- #
+def test_a_reserved_name_cannot_be_declared_as_a_connector_secret() -> None:
+    # The hole: the fence lived only on plugin.json `secrets`, so moving the
+    # name here bought a connector the operator's own model credential --
+    # resolved from their environment or vault and handed to the bundle's
+    # container before any validator runs at the skill tier.
+    assert "connectors.secret_name_reserved" in _codes(
+        {"connectors": {"g": {"image": "x:1", "secrets": ["ANTHROPIC_API_KEY"]}}}
+    )
+
+
+def test_a_reserved_name_cannot_be_declared_as_a_secret_file_key() -> None:
+    # Same name, same resolution, same per-agent Secret -- only the delivery
+    # differs, so the fence has to cover this key too.
+    assert "connectors.secret_name_reserved" in _codes(
+        {
+            "connectors": {
+                "g": {"image": "x:1", "secret_files": {"HTTPS_PROXY": "/secrets/proxy"}}
+            }
+        }
+    )
+
+
+def test_a_reserved_name_is_refused_through_validate_bundle(tmp_path: Path) -> None:
+    # The consumer path that matters: the API validates an uploaded bundle
+    # through validate_bundle, and the runner validates the packed snapshot
+    # through the same parser -- so a hostile connectors.yaml is refused at
+    # upload rather than discovered at apply.
+    root = _bundle(
+        tmp_path,
+        "connectors:\n  g:\n    image: x:1\n    secrets: [CLAUDE_CODE_OAUTH_TOKEN]\n",
+    )
+    result = validate_bundle(str(root))
+    assert not result.valid
+    assert any(e.code == "connectors.secret_name_reserved" for e in result.errors)
+
+
+def test_the_curie_prefix_is_fenced_for_a_connector_secret() -> None:
+    # The forward-safe half of the rule: a boot key nobody remembered to
+    # enumerate is still reserved because it carries the prefix.
+    assert "connectors.secret_name_reserved" in _codes(
+        {"connectors": {"g": {"image": "x:1", "secrets": ["CURIE_RUNNER_TOKEN"]}}}
+    )
+
+
+def test_a_malformed_secret_name_is_refused() -> None:
+    # A lowercase name cannot be delivered as an env var and consumed by
+    # `${VAR}` expansion, so it would bind to nothing at runtime.
+    codes = _codes({"connectors": {"g": {"image": "x:1", "secrets": ["grafana-token"]}}})
+    assert "connectors.secret_name_invalid" in codes
+    assert "connectors.secret_name_reserved" not in codes, "shape is reported once, not twice"
+
+
+def test_an_ordinary_connector_secret_name_still_validates() -> None:
+    # The over-refusal control: the names the shipped examples declare must
+    # keep validating clean, in both delivery forms.
+    _, errors = validate_connectors(
+        {
+            "connectors": {
+                "grafana": {"image": "x:1", "secrets": ["GRAFANA_SERVICE_ACCOUNT_TOKEN"]},
+                "kubernetes": {
+                    "image": "y:1",
+                    "secret_files": {"K8S_READONLY_KUBECONFIG": "/secrets/kubeconfig"},
+                },
+            }
+        }
+    )
+    assert errors == []
+
+
+def test_the_secret_ref_form_is_held_to_the_same_name_policy() -> None:
+    # `from_secret` moves who holds the VALUE, not which env var the connector
+    # container ends up reading -- a secretKeyRef named ANTHROPIC_BASE_URL
+    # redirects the session exactly the same way.
+    assert "connectors.secret_name_reserved" in _codes(
+        {
+            "connectors": {
+                "g": {
+                    "image": "x:1",
+                    "secrets": [{"name": "ANTHROPIC_BASE_URL", "from_secret": "s"}],
+                }
+            }
+        }
+    )
+
+
 def test_an_empty_from_secret_is_rejected() -> None:
     # It renders a secretKeyRef at a Secret named '', which the API server
     # rejects at APPLY -- long after the deploy looked like it worked.

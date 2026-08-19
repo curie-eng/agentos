@@ -1838,6 +1838,134 @@ pub fn connector_project_label(project: &str) -> String {
     format!("curietech.ai/project={project}")
 }
 
+/// The agent a connector container belongs to.
+///
+/// The project label is not enough to name one agent's containers at the local
+/// tier: every locally deployed agent shares the single `curie` compose project
+/// with the api/worker stack, so reaping by project alone would take out another
+/// agent's connectors (and `--remove-orphans` would take out the stack itself).
+pub const CONNECTOR_AGENT_LABEL_KEY: &str = "curietech.ai/agent";
+
+/// Which declared connector a container is, as the object name both emitters
+/// derive from `(release, agent, connector)`. This is what a redeploy compares
+/// against the new desired set.
+pub const CONNECTOR_OBJECT_LABEL_KEY: &str = "curietech.ai/connector";
+
+/// The `label=key=value` filter that selects one agent's connector containers.
+pub fn connector_agent_label(agent: &str) -> String {
+    format!("{CONNECTOR_AGENT_LABEL_KEY}={agent}")
+}
+
+/// The identity labels every connector container carries, from ONE definition:
+/// the skill tier joins them into `--label key=value`, the compose overlay
+/// writes them as map entries. A container that is not labeled at creation can
+/// never be reconciled, so the two emitters cannot be allowed to drift.
+pub fn connector_identity_labels(agent: &str, object: &str) -> Vec<(String, String)> {
+    vec![
+        (CONNECTOR_AGENT_LABEL_KEY.to_string(), agent.to_string()),
+        (CONNECTOR_OBJECT_LABEL_KEY.to_string(), object.to_string()),
+    ]
+}
+
+/// One connector container Docker currently reports for an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningConnector {
+    pub id: String,
+    /// The object name its [`CONNECTOR_OBJECT_LABEL_KEY`] label carries. Empty
+    /// for a container an older CLI started without the label.
+    pub object: String,
+}
+
+/// List THIS agent's connector containers, id and object name.
+///
+/// Three filters, all of them load-bearing: the component label excludes the
+/// runner and the sandbox, the project label excludes another stack, and the
+/// agent label excludes another agent deployed into this same compose project.
+pub fn agent_connectors_argv(project: &str, agent: &str) -> Vec<String> {
+    vec![
+        "ps".into(),
+        "-a".into(),
+        "--filter".into(),
+        format!("label={CONNECTOR_COMPONENT_LABEL}"),
+        "--filter".into(),
+        format!("label={}", connector_project_label(project)),
+        "--filter".into(),
+        format!("label={}", connector_agent_label(agent)),
+        "--format".into(),
+        format!("{{{{.ID}}}}\t{{{{.Label \"{CONNECTOR_OBJECT_LABEL_KEY}\"}}}}"),
+    ]
+}
+
+/// Parse [`agent_connectors_argv`]'s output.
+pub fn parse_agent_connectors(listing: &str) -> Vec<RunningConnector> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (id, object) = line.split_once('\t').unwrap_or((line, ""));
+            RunningConnector {
+                id: id.trim().to_string(),
+                object: object.trim().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Which of this agent's running connector containers a redeploy must remove:
+/// exactly those the new bundle no longer declares.
+///
+/// Pure, so the scope decision is testable without a daemon -- and the scope IS
+/// the decision. The input is already narrowed to one agent's containers by
+/// [`agent_connectors_argv`], so nothing here can reach the main stack or
+/// another agent; all this adds is "and it is not in the new desired set". A
+/// container carrying no object label (started before the label existed) matches
+/// no desired name and is removed, which is correct either way: if the bundle
+/// still declares it, the bring-up that follows recreates it labeled.
+pub fn connectors_to_reap(
+    running: &[RunningConnector],
+    desired: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    running
+        .iter()
+        .filter(|container| !desired.contains(&container.object))
+        .map(|container| container.id.clone())
+        .collect()
+}
+
+/// Reconcile one agent's connector containers against what the bundle now
+/// declares, returning what it could not do.
+///
+/// Best-effort and warning-shaped, the same choice [`run_connector_teardown`]
+/// makes: a redeploy that refuses to finish because a leftover container would
+/// not die leaves the operator worse off than one that says so and continues.
+pub async fn reap_undesired_connectors(
+    project: &str,
+    agent: &str,
+    desired: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    let listing = match docker(&agent_connectors_argv(project, agent)).await {
+        Ok(listing) => listing,
+        Err(err) => {
+            return vec![format!(
+                "could not list the connector containers already running for '{agent}': {err}"
+            )]
+        }
+    };
+    let stale = connectors_to_reap(&parse_agent_connectors(&listing), desired);
+    if stale.is_empty() {
+        return Vec::new();
+    }
+    let mut rm: Vec<String> = vec!["rm".into(), "-f".into()];
+    rm.extend(stale);
+    match docker(&rm).await {
+        Ok(_) => Vec::new(),
+        Err(err) => vec![format!(
+            "could not remove the connector containers this bundle no longer declares: {err}"
+        )],
+    }
+}
+
 /// The uid a connector container runs as, mirroring `render_deployment`'s
 /// `runAsUser`.
 const CONNECTOR_UID: &str = "65532:65532";
@@ -1933,11 +2061,26 @@ impl ConnectorStartSpec {
                     )
                 })
                 .collect(),
-            labels: vec![
-                CLI_MANAGED_LABEL.to_string(),
-                CONNECTOR_COMPONENT_LABEL.to_string(),
-                connector_project_label(project),
-            ],
+            labels: {
+                let mut labels = vec![
+                    CLI_MANAGED_LABEL.to_string(),
+                    CONNECTOR_COMPONENT_LABEL.to_string(),
+                    connector_project_label(project),
+                ];
+                labels.extend(
+                    connector_identity_labels(
+                        &identity.agent,
+                        &crate::connector_build::object_name(
+                            &identity.release,
+                            &identity.agent,
+                            connector,
+                        ),
+                    )
+                    .into_iter()
+                    .map(|(key, value)| format!("{key}={value}")),
+                );
+                labels
+            },
             docker_env,
         })
     }
@@ -2080,13 +2223,10 @@ pub async fn run_connector_teardown(steps: &[ConnectorTeardownStep]) -> Vec<Stri
                 }
             }
             ConnectorTeardownStep::WipeSecrets(root) => {
-                if root.exists() {
-                    if let Err(err) = std::fs::remove_dir_all(root) {
-                        problems.push(format!(
-                            "could not wipe staged connector credentials at {}: {err}",
-                            root.display()
-                        ));
-                    }
+                if let Err(err) = crate::connector_build::wipe_secrets_root(root) {
+                    problems.push(format!(
+                        "could not wipe staged connector credentials: {err}"
+                    ));
                 }
             }
         }

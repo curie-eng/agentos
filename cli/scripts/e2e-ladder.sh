@@ -1499,11 +1499,15 @@ case_connector_registry_missing_cluster() {
     fi
 
     good="$(connector_image tempo)" || return 1
-    # A tag `registry_image_ref` can never mint: it emits a hex prefix of the
-    # source digest and nothing else (cli/src/connector_build.rs), so this one
-    # cannot collide with a real push and is absent from the registry by
-    # construction rather than by luck.
-    bad="${good%:*}:ladder-absent"
+    # The digest's 64 hex characters replaced, and NOTHING else: the reference
+    # stays `<repo>@sha256:<64 lowercase hex>`, the one shape `parse_lock`
+    # accepts for registry delivery (cli/src/connector_build.rs). A tag here
+    # would be refused at the read instead, and this case would then assert a
+    # green against the lock reader rather than against the registry preflight
+    # it is aimed at. All-f is absent from the registry by construction: it is
+    # the digest of no content anyone has ever pushed, and a sha256 collision
+    # with it is not a thing that happens.
+    bad="${good%@*}@sha256:$(printf 'f%.0s' {1..64})"
 
     cp "$lock" "$backup"
     # The IMAGE only, never the source_digest: moving the digest trips
