@@ -601,6 +601,14 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         echo "stub: runner up"
         echo "  Model    fake (offline, no credential)"
         ;;
+    "skill up --fake-model --plugin-dir "*"/bundle-hermetic --name curie-ladder-hermetic-"*)
+        # The hermetic negative (ADR 0113): a scratch bundle declaring no
+        # hosted connector boots cleanly. Must sit ABOVE the #747 arm, whose
+        # pattern also matches this argv; the case then reads the session off
+        # `docker inspect` and sweeps for connector containers, both answered
+        # by the docker stub below.
+        echo "stub: hermetic runner up"
+        ;;
     "skill up --fake-model --plugin-dir "*" --name "*)
         # The #747 leftover-runner case: a taken container name must be a usage
         # refusal (exit 2) carrying the operator's own remedy, never docker's raw
@@ -717,6 +725,12 @@ case "$*" in
         # other inspect shapes retain their existing configured behavior.
         echo "stub docker: no such object: curie-runner-local" >&2
         exit 1
+        ;;
+    "inspect curie-ladder-hermetic-"*)
+        # The hermetic negative's session read: assert_no_connector_containers
+        # refuses an empty project scope by design, so the runner env must
+        # carry a session id for the sweep to be non-vacuous.
+        echo "CURIE_SESSION_ID=local-stub-hermetic"
         ;;
     "inspect "*)
         # A failed env read, on its own knob: an inspect that dies (the worker

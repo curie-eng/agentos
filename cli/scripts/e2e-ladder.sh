@@ -148,6 +148,14 @@ CONNECTOR_SCOPE_NAMESPACE=""
 # default name: that one belongs to whatever real `skill up` a developer has
 # going on this box.
 CONNECTOR_RUNNER_NAME="curie-ladder-connectors-$$"
+# The runner the changed-source case boots, on its own scratch copy of the
+# bundle. A second name for the same reason as the one above, and a second name
+# rather than a reuse because both runners may be recorded at once if the first
+# case fails before its teardown.
+CHANGED_RUNNER_NAME="curie-ladder-changed-$$"
+# The runner the hermetic negative boots, in the runs where no connector bundle
+# is named at all. Same rule again: never the default name.
+HERMETIC_RUNNER_NAME="curie-ladder-hermetic-$$"
 # Hardcoded, and deliberately NOT an env knob: the stub port is the constant
 # DEFAULT_LOCAL_STUB_PORT in cli/src/message.rs, pinned to the compose worker's
 # SLACK_API_BASE_URL. An override would only move this script's precheck, so it
@@ -901,6 +909,32 @@ connector_image() {
     return 1
 }
 
+# One field of one connector's `connectors.lock.yaml` entry.
+#
+# An awk read of the two-space block serde_norway writes, not a YAML parse: the
+# ladder's python3 use is json-only on purpose and a YAML module would be a new
+# required input. It FAILS LOUDLY on a miss and dumps the file, rather than
+# returning an empty string -- an empty value compared against another empty
+# value is the vacuous green this ladder exists to prevent.
+lock_field() {
+    local dir="$1" connector="$2" key="$3" value
+    value="$(awk -v want="  $connector:" -v key="    $key: " '
+$0 == want { inside = 1; next }
+inside && /^  [^ ]/ { inside = 0 }
+inside && index($0, key) == 1 { print substr($0, length(key) + 1); found = 1; exit }
+END { exit(found ? 0 : 1) }
+' "$dir/connectors.lock.yaml")" || {
+        echo "no '$key' recorded for connector '$connector' in $dir/connectors.lock.yaml. That file's shape is what this read depends on; compare it against ConnectorLockEntryDecl in cli/src/connector_build.rs." >&2
+        cat "$dir/connectors.lock.yaml" >&2 || true
+        return 1
+    }
+    # Quoted only if the value needed it; the comparisons downstream are on the
+    # value, never on its rendering.
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    printf '%s' "$value"
+}
+
 # A hand mirror of connector_render.object_name / service_dns, which is what
 # BOTH sides derive independently: the CLI names the container's network alias
 # from it, and the runner derives the URL it dials from it. The ladder recomputes
@@ -1259,17 +1293,29 @@ assert_connectors_reaped() {
 }
 
 # The unchanged path, asserted rather than assumed: a bundle that declares no
-# hosted connector must start none. Scoped to the compose project this ladder
-# owns, for the same reason every other sweep here is.
+# hosted connector must start none.
+#
+# The PROJECT is a parameter and not a constant, because the tiers do not agree
+# on it: `connector_project_label` (cli/src/docker.rs) stamps the COMPOSE
+# PROJECT at the local tier and the runner's SESSION ID at the skill tier, so
+# the `curietech.ai/project=curie` this used to hardcode selects nothing at all
+# on a skill-tier container -- an empty survivor list every time, which is a
+# green that proves nothing. Scoped rather than swept host-wide for the same
+# reason every other sweep here is scoped: the component label is host-wide and
+# another session's connectors are not this run's to report on.
 assert_no_connector_containers() {
-    local label="$1" survivors
-    survivors="$(docker ps --filter "label=$CONNECTOR_LABEL" --filter 'label=curietech.ai/project=curie' --format '{{.Names}}')"
+    local label="$1" project="$2" survivors
+    if [[ -z "$project" ]]; then
+        echo "$label: no connector project scope was read, so this sweep would match nothing no matter what started. An unscoped negative is a green that proves nothing, which is exactly what this assertion exists to avoid." >&2
+        return 1
+    fi
+    survivors="$(docker ps --filter "label=$CONNECTOR_LABEL" --filter "label=curietech.ai/project=$project" --format '{{.Names}}')"
     if [[ -n "$survivors" ]]; then
-        echo "$label: this bundle declares no hosted connector, but connector containers are running for this project:" >&2
+        echo "$label: this bundle declares no hosted connector, but connector containers are running for project '$project':" >&2
         printf '%s\n' "$survivors" >&2
         return 1
     fi
-    echo "$label: no connector containers for a bundle that declares none"
+    echo "$label: no connector containers for a bundle that declares none (project $project)"
 }
 
 # The skill tier's connector leg, run by the ladder itself rather than inside
@@ -1297,6 +1343,209 @@ case_connector_hosting_skill() {
         assert_connectors_reaped "skill" || code=1
     fi
     return "$code"
+}
+
+# The hermetic negative at the skill tier, and the reason it boots a runner of
+# its own rather than sweeping after `cli/scripts/e2e.sh`: the project label a
+# skill-tier connector container carries is the RUNNER'S SESSION ID
+# (cli/src/docker.rs connector_project_label), which exists only while that
+# runner does. e2e.sh has torn its runner down by the time it returns, so a
+# sweep placed after it has no project to scope to and would assert nothing.
+# This boots the same bundle copy rung 1 just ran, reads the session off the
+# runner it started, and sweeps while it is up.
+case_no_connector_hosting_skill() {
+    echo
+    echo "=== case: a bundle declaring no hosted connector starts none (ADR 0113) ==="
+    # A scratch copy with connectors.yaml removed, because the shared bundle is
+    # NOT connector-free: examples/weather deliberately carries the hosted
+    # netpol-probe fixture (19f9cd48) for the cluster NetworkPolicy gate, and
+    # this case's first run against it proved the point by finding that
+    # connector hosted. The claim under test is about a bundle that declares
+    # none, so build one.
+    rm -rf "$WORKDIR/bundle-hermetic"
+    cp -R "$WORKDIR/bundle" "$WORKDIR/bundle-hermetic"
+    rm -rf "$WORKDIR/bundle-hermetic/.curie" "$WORKDIR/bundle-hermetic/connectors.yaml" \
+        "$WORKDIR/bundle-hermetic/connectors.lock.yaml"
+    # --fake-model unconditionally, for the same reason the connector case does
+    # it: this case sends no turn, so a model credential is a prerequisite it
+    # does not need.
+    "$BIN" skill up --fake-model --plugin-dir "$WORKDIR/bundle-hermetic" --name "$HERMETIC_RUNNER_NAME"
+
+    local session code=0
+    session="$(container_env_value "$HERMETIC_RUNNER_NAME" CURIE_SESSION_ID)"
+    assert_no_connector_containers "skill" "$session" || code=1
+
+    # Torn down whatever the assertion said, so a failed assertion cannot strand
+    # the runner.
+    (cd "$WORKDIR/bundle-hermetic" && "$BIN" skill down) || code=1
+    return "$code"
+}
+
+# An edited connector source must move the lock AND the container that runs it.
+# That is the entire reason `connectors.lock.yaml` records a `source_digest`
+# (ADR 0113): without this, a tier that brought up the previously locked image
+# after a source edit would look identical to a correct run, and every other
+# connector assertion here would still pass.
+#
+# It runs on a THIRD scratch copy, never `$WORKDIR/bundle`: the shared copy's
+# bytes are what every later rung packs and compares (assert_bundle_identity),
+# so mutating it would red the cross-rung digest assertion on a change this case
+# made rather than on a real divergence.
+case_connector_changed_source_skill() {
+    echo
+    echo "=== case: an edited connector source moves the lock and the running container (ADR 0113) ==="
+    local dir="$WORKDIR/bundle-changed"
+    rm -rf "$dir"
+    cp -r "$WORKDIR/bundle" "$dir"
+    # The copy inherits rung 1's recorded runner state, and `skill up` refuses a
+    # directory that already records one.
+    rm -rf "$dir/.curie"
+
+    local before_digest before_image
+    before_digest="$(lock_field "$dir" tempo source_digest)" || return 1
+    before_image="$(lock_field "$dir" tempo image)" || return 1
+    echo "tempo before the edit: source_digest=$before_digest image=$before_image"
+
+    # An appended comment: it moves the bytes the source digest covers and the
+    # layer the image is built from (server.py is the last COPY in the
+    # connector's Dockerfile), and changes nothing the server does.
+    echo "# curie parity ladder changed-source probe ($$)" >> "$dir/connectors/tempo/server.py"
+
+    if [[ -n "$CONNECTOR_REGISTRY" ]]; then
+        # `skill up`'s auto-rebuild resolves into the LOCAL DAEMON, and
+        # `write_lock` refuses to replace a registry-delivered lock with a
+        # local-daemon one behind a bring-up (cli/src/connector_build.rs
+        # lock_overwrite_refusal) -- by design, because only a pushed image is
+        # deployable to a cluster. So when this run built for a registry, the
+        # rebuild is the explicit one that refusal's own fix line names. The
+        # claim under test is unchanged either way: the edit must move the lock
+        # and the container.
+        echo "=== curie build --plugin-dir (changed source, registry delivery: $CONNECTOR_REGISTRY) ==="
+        "$BIN" build --plugin-dir "$dir" --registry "$CONNECTOR_REGISTRY"
+    else
+        echo "the rebuild below is skill up's OWN (cli/src/commands.rs, ADR 0113 Decision 3), not a hand-run build: the production consumer of a stale lock is the tier's bring-up, so that is what this case exercises."
+    fi
+
+    "$BIN" skill up --fake-model --plugin-dir "$dir" --name "$CHANGED_RUNNER_NAME"
+
+    local code=0
+    assert_connector_source_change "$dir" "$before_digest" "$before_image" || code=1
+
+    (cd "$dir" && "$BIN" skill down) || code=1
+    return "$code"
+}
+
+# The assertion half of the case above, split out so the teardown runs whatever
+# it says.
+assert_connector_source_change() {
+    local dir="$1" before_digest="$2" before_image="$3"
+    local after_digest after_image release agent namespace object alias container running
+
+    after_digest="$(lock_field "$dir" tempo source_digest)" || return 1
+    after_image="$(lock_field "$dir" tempo image)" || return 1
+    if [[ "$after_digest" == "$before_digest" ]]; then
+        echo "skill: the tempo connector's source was edited, but connectors.lock.yaml still records source_digest $after_digest. The lock did not notice the edit, so every later tier would bring up the pre-edit image believing it current." >&2
+        return 1
+    fi
+    if [[ "$after_image" == "$before_image" ]]; then
+        echo "skill: the tempo connector's source_digest moved to $after_digest, but the lock still names image '$after_image'. A moved digest that resolves the same artifact is the stale-image bug wearing a fresh label." >&2
+        return 1
+    fi
+    echo "skill: the edit moved the lock: source_digest $before_digest -> $after_digest, image $before_image -> $after_image"
+
+    release="$(container_env_value "$CHANGED_RUNNER_NAME" CURIE_CONNECTOR_RELEASE)"
+    agent="$(container_env_value "$CHANGED_RUNNER_NAME" CURIE_CONNECTOR_AGENT)"
+    namespace="$(container_env_value "$CHANGED_RUNNER_NAME" CURIE_CONNECTOR_NAMESPACE)"
+    if [[ -z "$release" || -z "$agent" || -z "$namespace" ]]; then
+        echo "skill: the runner started from the edited copy reported an incomplete connector scope (release='$release' agent='$agent' namespace='$namespace'), so no connector address can be derived." >&2
+        return 1
+    fi
+    object="$(connector_object_name "$release" "$agent" tempo)" || return 1
+    alias="$object.$namespace.svc.cluster.local"
+    if ! container="$(connector_container_for_alias "$alias")"; then
+        echo "skill: no running container labeled $CONNECTOR_LABEL answers to '$alias' after the rebuild, so the rebuilt connector is not up at all." >&2
+        docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}} {{.Image}}' >&2 || true
+        return 1
+    fi
+    running="$(docker inspect "$container" --format '{{.Config.Image}}')"
+    if [[ "$running" != "$after_image" ]]; then
+        echo "skill: the lock now resolves tempo to '$after_image', but container '$container' is running '$running'. The bring-up started the pre-edit artifact, which is the exact failure the lock's source_digest exists to catch." >&2
+        return 1
+    fi
+    echo "skill: the restarted tempo connector runs the rebuilt image $running"
+}
+
+# A cluster deploy whose locked image the REGISTRY cannot resolve must refuse,
+# and must refuse before it has touched the cluster (ADR 0113, cli/src/commands.rs
+# registry_preflight). The failure this guards against is not theoretical: the
+# lock is what a node pulls from, so an image that is gone from the registry
+# surfaces after apply as a pod stuck on ImagePullBackOff, with a healthy
+# connector Deployment already replaced. Refusing up front is what keeps the
+# running release intact, so both halves are asserted -- the refusal AND the
+# untouched Deployment.
+case_connector_registry_missing_cluster() {
+    local release="$1" agent="$2" namespace="$3"
+    echo
+    echo "=== case: cluster deploy refuses a lock the registry cannot resolve (ADR 0113) ==="
+    local lock="$WORKDIR/bundle/connectors.lock.yaml"
+    local backup="$WORKDIR/connectors.lock.yaml.good"
+    local object before after good bad out code=0
+
+    object="$(connector_object_name "$release" "$agent" tempo)" || return 1
+    before="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+    if [[ -z "$before" ]]; then
+        echo "cluster: deployment/$object reports no container image, so there is no before-and-after to compare the refused deploy against." >&2
+        return 1
+    fi
+
+    good="$(connector_image tempo)" || return 1
+    # A tag `registry_image_ref` can never mint: it emits a hex prefix of the
+    # source digest and nothing else (cli/src/connector_build.rs), so this one
+    # cannot collide with a real push and is absent from the registry by
+    # construction rather than by luck.
+    bad="${good%:*}:ladder-absent"
+
+    cp "$lock" "$backup"
+    # The IMAGE only, never the source_digest: moving the digest trips
+    # `lock_preflight`'s staleness refusal first, and this case would then
+    # assert a green against the wrong refusal entirely.
+    sed -i "s|$good|$bad|" "$lock"
+    if ! grep -qF "$bad" "$lock"; then
+        echo "cluster: connectors.lock.yaml still does not name '$bad' after the edit, so the deploy below would run against a perfectly good lock and prove nothing." >&2
+        cp "$backup" "$lock"
+        touch -t 200001010000 "$lock"
+        return 1
+    fi
+    echo "cluster: tempo's locked image corrupted to '$bad' for this one deploy"
+
+    out="$("$BIN" --json cluster deploy --plugin-dir "$WORKDIR/bundle" 2>&1)" && code=0 || code=$?
+    printf '%s\n' "$out"
+
+    # Restored BEFORE the assertions, so a red one cannot carry a corrupt lock
+    # into the rest of this rung. Restored from the byte-for-byte backup rather
+    # than rebuilt: a rebuild costs minutes and, more to the point, re-stamps the
+    # file's mtime, which pack_tar_gz embeds -- and this copy's packed bytes are
+    # what assert_bundle_identity compares. The fixed epoch is the one the ladder
+    # normalizes every bundle file to.
+    cp "$backup" "$lock"
+    touch -t 200001010000 "$lock"
+
+    if (( code != 2 )); then
+        echo "cluster: a deploy whose locked image the registry cannot resolve must exit 2 (usage), got $code." >&2
+        return 1
+    fi
+    if [[ "$out" != *"registry could not resolve"* ]]; then
+        echo "cluster: the deploy failed, but not with the registry-resolution refusal, so this case never reached the preflight it is aimed at. A deploy that fails for some other reason is not evidence the lock is checked." >&2
+        return 1
+    fi
+    echo "cluster: cluster deploy refused the unresolvable image with exit 2"
+
+    after="$(kubectl -n "$namespace" get "deployment/$object" -o 'jsonpath={.spec.template.spec.containers[*].image}')"
+    if [[ "$after" != "$before" ]]; then
+        echo "cluster: the refused deploy still moved deployment/$object from '$before' to '$after'. A preflight that refuses after touching the cluster has already broken the release it was meant to protect." >&2
+        return 1
+    fi
+    echo "cluster: deployment/$object still runs $before -- the refusal changed nothing on the cluster"
 }
 
 # Rung 1: the existing skill-tier round trip. Still exactly one implementation
@@ -1349,6 +1598,12 @@ rung_skill() {
 
     if connector_mode; then
         case_connector_hosting_skill
+        case_connector_changed_source_skill
+    else
+        # The hermetic claim, exercised on every ordinary run rather than only
+        # in connector mode: the default bundle declares no hosted connector, so
+        # this rung is where "declares none, starts none" is actually testable.
+        case_no_connector_hosting_skill
     fi
 }
 
@@ -1430,7 +1685,10 @@ rung_local() {
             "$agent_name" \
             "$(container_env_value "$worker" CURIE_NAMESPACE)"
     else
-        assert_no_connector_containers "local"
+        # `curie` is the compose project the CLI pins (cli/src/local.rs
+        # COMPOSE_PROJECT), and the project this tier stamps on a connector
+        # container is that same name.
+        assert_no_connector_containers "local" curie
     fi
 
     echo
@@ -1625,7 +1883,9 @@ rung_local_release() {
             "$agent_name" \
             "$(container_env_value "$worker" CURIE_NAMESPACE)"
     else
-        assert_no_connector_containers "local-release"
+        # Same compose project as rung 2: the release compose file the CLI
+        # generates carries the same pinned project name.
+        assert_no_connector_containers "local-release" curie
     fi
 
     echo
@@ -1786,6 +2046,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         cluster_namespace="$(kubectl -n curie get deployment/curie-worker \
             -o 'jsonpath={.spec.template.spec.containers[*].env[?(@.name=="CURIE_NAMESPACE")].value}')"
         assert_connector_parity "cluster" kubectl "$cluster_release" "$agent_name" "$cluster_namespace"
+        case_connector_registry_missing_cluster "$cluster_release" "$agent_name" "$cluster_namespace"
     fi
 
     echo
