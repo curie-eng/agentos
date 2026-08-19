@@ -1,7 +1,7 @@
 # 113. Bundles declare connector build inputs and tiers deliver pinned images
 
 Date: 2026-08-19
-Status: Draft
+Status: Accepted
 
 Issue: #1690
 
@@ -13,34 +13,44 @@ connectors part of a bundle declaration and assigned hosting to Curie. [ADR
 the API as a pure renderer and assigned cluster application to the operator's
 CLI.
 
-That model accepts an `image:` in `connectors.yaml`, but not a source directory.
-`examples/sre-bot` ships `connectors/k8s-write` and `connectors/tempo` as
-Docker build contexts. Before either connector can deploy, an operator must
-build it, put it somewhere the target can pull it, and replace a source
-description with an image reference. The resulting manual state is not a
+MCP specifies the protocol between an MCP client and server. It does not specify
+how a server is built, deployed, given credentials, or connected to the agent.
+`.mcp.json` expresses an MCP connection, either to an HTTP endpoint or to a
+stdio command. It does not say who runs that command or service.
+
+`connectors.yaml` is Curie's declaration for a server it must host. It accepts
+an `image:` today but not a source directory. `examples/sre-bot` ships
+`connectors/k8s-write` and `connectors/tempo` as Docker build contexts. Before
+either connector can deploy, an operator must build it, put it where the target
+can pull it, and edit an image reference. The resulting manual state is not a
 reviewable part of the bundle.
 
 The platform has previously failed when a mutable image tag changed underneath
 a deployment. Connector builds must therefore yield an immutable image identity
 that the rendered connector object can use without another tag resolution.
 
-The parity ladder also gives each tier different artifact transport:
-
-| Tier | Connector result required |
-| --- | --- |
-| skill | No hosted connector. The declaration remains reported but cannot be exercised. |
-| local | An image in the local Docker daemon used by the local connector container. |
-| cluster | An image available to cluster nodes by a registry pull using an immutable digest. |
-
-`tempo` also demonstrates that the builder architecture and the target node
-architecture can differ. The build path needs an observable incompatibility
-failure rather than a late container crash.
+The existing skill contract reports hosted connectors as declared but not
+exercisable. That leaves a connector dependent skill untested until the local
+or cluster rung and breaks the promised parity. `tempo` also demonstrates that
+the builder architecture and the target node architecture can differ. The build
+path needs an observable incompatibility failure rather than a late container
+crash.
 
 ## Decision
 
-**A bundle declares connector source build input. Curie builds that declared
-input before deploy, resolves it to a digest, and renders or starts only the
-digest pinned image.**
+**A bundle uses `.mcp.json` for external MCP servers and `connectors.yaml` for
+MCP servers Curie hosts. Curie builds declared connector source, resolves the
+result to a digest, and runs that digest at every hostable parity tier.**
+
+An external MCP server belongs only in `.mcp.json`. A remote HTTP server remains
+owned by its provider. A stdio server is valid when its executable is already in
+the runner artifact. Curie does not download a package or execute an arbitrary
+`uv` install while a skill starts.
+
+A hosted connector belongs in `connectors.yaml`, whether its OCI image came
+from a third party or from the bundle's own source. Curie generates the MCP
+entry that points at a hosted connector. The bundle author does not repeat an
+unstable service URL in `.mcp.json`.
 
 The declaration is a `build:` form in `connectors.yaml`, mutually exclusive
 with the existing `image:` and `url:` forms. The exact schema is a separate
@@ -53,12 +63,14 @@ operator command may execute the declared build as part of the existing build
 and deploy workflow, but it must not take an unrecorded connector directory or
 leave the resulting image identity only in local CLI state.
 
-For the local tier, the build result is loaded into the local Docker daemon and
-the local connector container uses its digest pinned reference. For the cluster
-tier, the portable delivery path pushes the built artifact to a configured
-registry, obtains its manifest digest, and passes that digest to the existing
-API rendering and CLI application flow. Node image import may support a
-disposable local cluster test, but is not a deployable artifact transport
+For skill, Curie starts the runner and each hosted connector from the local
+Docker daemon on a private network. The runner receives only the generated
+connector URLs and has no host port dependency. For local, Compose starts the
+same digest pinned connector images and uses the same generated MCP entries.
+For cluster, the portable delivery path pushes the built artifact to a
+configured registry, obtains its manifest digest, and passes that digest to the
+existing API rendering and CLI application flow. Node image import may support
+a disposable local cluster test, but is not a deployable artifact transport
 contract because it depends on individual node state.
 
 The renderer and applier never deploy a mutable connector tag. A build either
@@ -66,15 +78,18 @@ produces a pullable digest for the selected tier and target architecture, or
 fails before connector objects are applied. The resolved digest is the only
 identity rendered into a Deployment or used to start the local connector.
 
-This does not change the skill tier. It continues to report a hosted connector
-as declared but not exercisable, as ADR 0086 requires.
+The skill rung is no longer a connector free runner check when the bundle
+declares hosted connectors. It is a Docker backed integration rung that proves
+the runner can use the same hosted MCP server configuration as local and
+cluster. A bundle with no hosted connectors keeps the existing hermetic skill
+behavior.
 
 ## Consequences
 
-The bundle remains reviewable: a source connector, its build settings, and the
-requested target platform all appear in the versioned bundle. The manual
-build, push, and image line edit sequence disappears from the normal local and
-cluster deployment path.
+The bundle remains reviewable: an external MCP connection, a hosted connector
+source or image, its build settings, and the requested target platform all
+appear in versioned files. The manual build, push, and image line edit sequence
+disappears from the normal skill, local, and cluster path.
 
 Connector source builds introduce a distinct build boundary. They must not run
 inside the internet facing API, which remains a pure renderer under ADR 0087.
@@ -83,18 +98,32 @@ access, registry credentials, and cluster application credentials. Build secrets
 and registry credentials remain local to that path and never enter the rendered
 connector objects.
 
-The implementation must add parity evidence for all applicable tiers. A source
-only connector must run locally from the local daemon and deploy to a cluster
-from its pushed digest. A changed source must produce a distinct digest. A
-missing registry artifact or incompatible architecture must fail before a
-connector Deployment is applied. The skill tier must continue to report the
-connector as not exercisable rather than attempting a build or host operation.
+The implementation must add parity evidence for all three hostable tiers using
+the SRE bot. A source only connector must run beside the skill runner from the
+local daemon, run in local Compose, and deploy to a cluster from its pushed
+digest. A changed source must produce a distinct digest. A missing registry
+artifact or incompatible architecture must fail before a connector Deployment
+is applied. A remote third party entry in `.mcp.json` must remain external and
+must not cause Curie to start a connector container.
 
-No implementation is authorized by this Draft. A maintainer must accept this
-ADR, then the frozen connector schema change and its callers must land as their
-own reviewed compatible change before build execution or delivery work begins.
+The frozen connector schema change and its callers must land as their own
+reviewed compatible change before build execution or delivery work begins.
 
 ## Alternatives considered
+
+### Put every MCP server in `connectors.yaml`
+
+Rejected. A remote third party HTTP endpoint and a stdio command that is already
+available in the runner need no Curie hosted workload. Treating them as hosted
+would duplicate the server's owner and blur the distinction between connecting
+to an MCP server and operating one.
+
+### Keep hosted connectors out of the skill rung
+
+Rejected. It makes the first connector dependent test occur after the skill
+rung and makes a skill dependent on a connector behave differently from local
+and cluster. Curie already uses Docker for the runner, so a private Docker
+network is the narrowest shared host substrate.
 
 ### A standalone connector build CLI verb
 
