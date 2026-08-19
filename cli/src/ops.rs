@@ -2545,9 +2545,7 @@ fn priority_class_read_error(
     detail: impl std::fmt::Display,
     transient: bool,
 ) -> anyhow::Error {
-    let fix = format!(
-        "check cluster reachability and permission with `kubectl get priorityclass {name} -o json`"
-    );
+    let fix = "run `curie cluster status`".to_string();
     let message = format!("could not inspect PriorityClass `{name}`: {detail}; {fix}");
     let error = if transient {
         crate::exit::CliError::transient(message)

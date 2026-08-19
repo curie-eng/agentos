@@ -310,8 +310,8 @@ fn assert_read_recovery_hint(shown: &str, class_name: &str) {
         "the read error must name the PriorityClass: {shown}"
     );
     assert!(
-        lower.contains("check") && lower.contains("cluster") && lower.contains("permission"),
-        "the read error must tell the operator to check cluster reachability and permission: {shown}"
+        lower.contains("run `curie cluster status`"),
+        "the read error must tell the operator to run the Curie cluster status command: {shown}"
     );
 }
 
@@ -446,6 +446,44 @@ fn kubectl_failure_blocks_with_a_recovery_hint() {
         "kubectl detail was lost: {shown}"
     );
     assert_read_recovery_hint(&shown, DEFAULT_PLATFORM);
+}
+
+#[test]
+fn priorityclass_read_failure_json_fix_uses_cluster_status() {
+    let fixture = Fixture::new();
+    let output = fixture.run(
+        DEFAULT_PLATFORM,
+        "failure",
+        DEFAULT_SANDBOX,
+        "absent",
+        &["--json"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a forbidden PriorityClass read remains a runtime failure\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "helm upgrade --install must not run after a failed preflight"
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("--json must emit the error payload: {error}"));
+    assert_eq!(
+        payload["fix"], "run `curie cluster status`",
+        "the machine readable recovery action must be the single Curie status command: {payload}"
+    );
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(DEFAULT_PLATFORM)),
+        "the machine readable error must name the PriorityClass: {payload}"
+    );
 }
 
 #[test]

@@ -617,6 +617,87 @@ pub async fn dev_script(rel_path: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+pub async fn dev_e2e_ci_selection(
+    paths: &[PathBuf],
+    base: Option<&str>,
+    head: Option<&str>,
+    push: bool,
+) -> Result<()> {
+    let root = find_repo_root().context(
+        "runner/Dockerfile not found here or in any parent directory. Run `curie dev` \
+         from a curie source checkout.",
+    )?;
+    let selector = root.join("tools/e2e-ci-selection/select.py");
+    let registry = root.join(".github/e2e-selection.yaml");
+    if !selector.is_file() {
+        bail!("selector not found: {}", selector.display());
+    }
+    if !registry.is_file() {
+        bail!("selection registry not found: {}", registry.display());
+    }
+
+    let output_path = (0..100)
+        .find_map(|attempt| {
+            let path = std::env::temp_dir().join(format!(
+                "curie-e2e-ci-selection-{}-{attempt}",
+                std::process::id()
+            ));
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .ok()
+                .map(|_| path)
+        })
+        .context("failed to create temporary selector output")?;
+
+    let selection = async {
+        let mut command = tokio::process::Command::new("uv");
+        command
+            .args([
+                "run",
+                "--no-project",
+                "--with",
+                "pyyaml==6.0.3",
+                "python",
+                "tools/e2e-ci-selection/select.py",
+                "--registry",
+                ".github/e2e-selection.yaml",
+            ])
+            .env("GITHUB_OUTPUT", &output_path)
+            .current_dir(&root);
+        for path in paths {
+            command.arg("--path").arg(path);
+        }
+        if let Some(base) = base {
+            command.arg("--base").arg(base);
+        }
+        if let Some(head) = head {
+            command.arg("--head").arg(head);
+        }
+        if push {
+            command.arg("--push");
+        }
+
+        let status = command
+            .status()
+            .await
+            .context("failed to invoke the end to end CI selector")?;
+        if !status.success() {
+            bail!("end to end CI selector failed ({status})");
+        }
+        std::fs::read_to_string(&output_path).context("failed to read selector output")
+    }
+    .await;
+
+    let cleanup = std::fs::remove_file(&output_path)
+        .with_context(|| format!("failed to remove {}", output_path.display()));
+    let selection = selection?;
+    cleanup?;
+    print!("{selection}");
+    Ok(())
+}
+
 /// The chart assertion scripts live here, and helm-ci runs every one of them on
 /// any `charts/curie/**` change.
 pub const CHART_CI_DIR: &str = "charts/curie/ci";
@@ -4471,8 +4552,8 @@ fn build_route_bindings(
                         ),
                     )
                 })?;
+            validate_route_channel(&name, &input.channel)?;
             let binding: crate::api::ApprovalRouteBinding = input.into();
-            validate_route_channel(&name, &binding.channel)?;
             if let Some(approvers) = &binding.approvers {
                 validate_parsed_approvers(&name, approvers)?;
             }
@@ -4485,9 +4566,9 @@ fn build_route_bindings(
         validate_route_channel(name, channel)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| b.channel = channel.to_string())
+            .and_modify(|b| b.channel = Some(channel.to_string()))
             .or_insert_with(|| crate::api::ApprovalRouteBinding {
-                channel: channel.to_string(),
+                channel: Some(channel.to_string()),
                 approvers: None,
             });
     }
@@ -4734,7 +4815,13 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         // Print WHERE and WHO as separate labelled facts: ADR-0034
                         // unfused these two axes, and a single collapsed line would
                         // re-fuse them in the operator's head.
-                        ui.kv(name, &format!("channel {}", binding.channel));
+                        ui.kv(
+                            name,
+                            &format!(
+                                "channel {}",
+                                binding.channel.as_deref().unwrap_or("(missing)")
+                            ),
+                        );
                         ui.kv("", &format!("  approvers: {}", describe_approvers(binding)));
                     }
                 }
@@ -4746,10 +4833,12 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 /// One line naming who may resolve a route's approvals, including the default.
 fn describe_approvers(binding: &crate::api::ApprovalRouteBinding) -> String {
     match &binding.approvers {
-        None => format!(
-            "members of {} (the default: no approvers block declared)",
-            binding.channel
-        ),
+        None => match binding.channel.as_deref() {
+            Some(channel) => {
+                format!("members of {channel} (the default: no approvers block declared)")
+            }
+            None => "unreadable: no channel or approvers block declared".to_string(),
+        },
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
             // `users` wins over `group`, so a binding carrying both must not read

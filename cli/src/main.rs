@@ -512,6 +512,25 @@ enum DevAction {
     /// Run the cold-start parity ladder across the skill, local, and cluster
     /// tiers, fake model by default (#690, `bash cli/scripts/e2e-ladder.sh`).
     E2eLadder,
+    /// Select the end to end tiers CI would run for paths or revisions.
+    E2eCiSelection {
+        /// Changed path. Repeat for every path in the candidate change.
+        #[arg(
+            long,
+            required_unless_present_any = ["base", "push"],
+            conflicts_with_all = ["base", "head", "push"]
+        )]
+        path: Vec<PathBuf>,
+        /// Base revision for a local branch comparison.
+        #[arg(long, requires = "head", conflicts_with = "push")]
+        base: Option<String>,
+        /// Head revision for a local branch comparison.
+        #[arg(long, requires = "base", conflicts_with = "push")]
+        head: Option<String>,
+        /// Select every tier, matching a push event.
+        #[arg(long, conflicts_with_all = ["path", "base", "head"])]
+        push: bool,
+    },
     /// Runtime E2E the Helm chart on a local cluster: install a trimmed slice,
     /// seed a bundle into RustFS, run the sandbox bundle-fetch init pair, and
     /// exec-assert the runner's view -- the one-command way to satisfy a
@@ -2010,6 +2029,14 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::E2e => commands::dev_script("cli/scripts/e2e.sh", &[]).await,
             DevAction::E2eLadder => commands::dev_script("cli/scripts/e2e-ladder.sh", &[]).await,
+            DevAction::E2eCiSelection {
+                path,
+                base,
+                head,
+                push,
+            } => {
+                commands::dev_e2e_ci_selection(&path, base.as_deref(), head.as_deref(), push).await
+            }
             DevAction::ChartRuntimeE2e => {
                 commands::dev_script("scripts/chart-runtime-e2e.sh", &[]).await
             }

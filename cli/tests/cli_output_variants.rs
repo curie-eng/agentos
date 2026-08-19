@@ -282,14 +282,14 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     (
                         "deal_desk".to_string(),
                         curie::api::ApprovalRouteBinding {
-                            channel: "C0MANAGERS".to_string(),
+                            channel: Some("C0MANAGERS".to_string()),
                             approvers: None,
                         },
                     ),
                     (
                         "finance".to_string(),
                         curie::api::ApprovalRouteBinding {
-                            channel: "C0FINANCE0".to_string(),
+                            channel: Some("C0FINANCE0".to_string()),
                             approvers: Some(curie::api::ApprovalApprovers {
                                 group: Some("S0FINGRP0".to_string()),
                                 users: None,
