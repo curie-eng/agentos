@@ -101,6 +101,13 @@ fn incomplete_matrix_body() -> String {
     body.to_string()
 }
 
+fn unlabelled_model_matrix_body() -> String {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&matrix_body()).expect("valid matrix fixture");
+    body["rows"][0]["cells"][0]["model"] = serde_json::Value::Null;
+    body.to_string()
+}
+
 fn platform_server_with_matrix(
     matrix: impl Fn() -> String + Send + Sync + 'static,
 ) -> support::MockServer {
@@ -447,6 +454,25 @@ fn local_and_cluster_use_the_same_structured_trajectory_verdicts() {
             .is_some_and(|detail| detail.contains("no trajectory spec")),
         "the missing spec verdict must remain explanatory: {local}"
     );
+    assert_platform_flow(&local_requests);
+    assert_platform_flow(&cluster_requests);
+}
+
+#[test]
+fn local_and_cluster_report_trajectory_results_without_a_resolved_model() {
+    let (local_output, local_requests) = run_platform_eval_against(
+        "local",
+        platform_server_with_matrix(unlabelled_model_matrix_body),
+    );
+    let (cluster_output, cluster_requests) = run_platform_eval_against(
+        "cluster",
+        platform_server_with_matrix(unlabelled_model_matrix_body),
+    );
+
+    let local = parsed_output(&local_output);
+    let cluster = parsed_output(&cluster_output);
+    assert_eq!(verdict_projection(&local), verdict_projection(&cluster));
+    assert_eq!(case_result(&local, "ordered")["passed"], true, "{local}");
     assert_platform_flow(&local_requests);
     assert_platform_flow(&cluster_requests);
 }
