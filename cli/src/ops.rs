@@ -1198,12 +1198,68 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 /// present -- see `up_commands`, which pushes both inside one `if let`.
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
+const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+
+fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
+    key == parent
+        || key
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
+}
+
+/// Carry the runner configuration recorded by a prior real model install into
+/// a plain rerun. Explicit inputs replace their recorded family.
+fn resolve_preserved_runner_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+
+    if !opts.fake_model
+        && opts.local_model.is_none()
+        && opts.credentials.is_none()
+        && !overridden.contains(MODEL_CREDENTIAL_KEY)
+    {
+        opts.credentials = preserved_value(existing, MODEL_CREDENTIAL_KEY);
+    }
+
+    if !opts.fake_model
+        && opts.local_model.is_none()
+        && opts.model.is_none()
+        && !overridden.contains(RUNNER_MODEL_KEY)
+    {
+        opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
+    }
+
+    let egress_replaced = !opts.allow_egress_host.is_empty()
+        || !opts.allow_web_egress.is_empty()
+        || overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
+    if egress_replaced {
+        return;
+    }
+
+    let mut recorded = BTreeMap::new();
+    if let Some(values) = existing {
+        crate::installation::flatten_values(values, "", &mut recorded);
+    }
+    opts.set.extend(
+        recorded
+            .into_iter()
+            .filter(|(key, _)| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY))
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+}
+
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
 /// on the release but absent from `curie.yaml` is normally reset to the chart
-/// default -- except for the families [`resolve_preserved_values`] re-supplies,
-/// which survive untouched. Reporting those as removals would be the exact
+/// default -- except for the families [`resolve_preserved_values`] and
+/// [`resolve_preserved_runner_values`] re-supply, which survive untouched.
+/// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
 /// Reads the same constants `up` reads, so a new preserved family is picked up
@@ -2021,6 +2077,7 @@ pub(crate) fn complete_up_opts(
     resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
+    resolve_preserved_runner_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -3488,11 +3545,17 @@ async fn run_prepared_up(
         ownership_candidates.push((ns, existed_before));
     }
 
-    // Provider egress is opened iff a provider was named: on a live run
-    // resolve_provider_egress_cidrs bails on an empty/failed resolution (so a
-    // non-empty allow_egress_host always yields non-empty resolved_egress_cidrs),
-    // and under --dry-run resolution is skipped but the intent still counts.
-    let any_egress = !opts.allow_egress_host.is_empty() || !opts.allow_web_egress.is_empty();
+    // Count named provider intent on both live and dry runs, plus egress
+    // implied by allow_egress_host resolution. Preserve explicit web egress
+    // and nonempty allowedEgress overrides supplied through either value lane.
+    let any_egress = !opts.allow_egress_host.is_empty()
+        || !opts.allow_web_egress.is_empty()
+        || operator_set_entries(&opts.operator_sets())
+            .into_iter()
+            .any(|(key, value)| {
+                key_is_or_descends_from(key.trim(), ALLOWED_EGRESS_KEY)
+                    && !matches!(value.trim(), "" | "[]")
+            });
     for (warn, msg) in model_egress_status_lines(
         opts.credentials.is_some(),
         opts.local_model.is_some(),
