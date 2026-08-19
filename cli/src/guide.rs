@@ -285,8 +285,8 @@ pub fn primer() -> Primer {
                 detail: "The platform blocks the author of the turn that raised a request from resolving it, under every approver set. Testing an approval flow therefore needs a second actor: pass `--as <other-user>` on the resolve.",
             },
             Landmine {
-                title: "A group-bound route with no bot token on the API refuses every click",
-                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED, so every resolution is refused as not-an-approver with nothing naming the token as the cause. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
+                title: "A group route with no bot token on the API refuses every click",
+                detail: "`--route-approvers <name>=group:<S...>` makes the API resolve Slack user-group membership, which needs SLACK_BOT_TOKEN with the `usergroups:read` scope on the API process. Without it the lookup is undetermined and the authorizer fails CLOSED: every resolution reports `could not verify approver group membership`. Bind `users:` instead, or set the token (the scope needs the Slack app reinstalled).",
             },
             Landmine {
                 title: "Silence after a request usually means an unbound route",
@@ -348,7 +348,7 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "a resolve is refused with \"you are not an approver\"",
-                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to (or the requesting channel when the record names no route).",
+                fix: "The route's approver set does not admit that actor from that channel. With no approvers block the card channel's members are the set, so pass `--actor-channel` with the channel that route is bound to. A null `card_channel` is from an older row or a direct API write that omitted the field, so use the requesting channel.",
             },
             Recovery {
                 symptom: "a command \"does not exist\"",

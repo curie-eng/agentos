@@ -439,17 +439,17 @@ def test_curie_dead_letter_stream_reaches_the_dead_letter_field(
     assert config.dead_letter_stream_name() == "operations:dead"
 
 
-# --- Per-service bool divergence (review #178) -------------------------------
+# Worker boolean behavior (review #178)
 #
-# The old worker ``_b`` accepted only ("1", "true", "yes") as truthy -- notably
-# NOT "on", unlike the dispatcher's ``_set_bool``. These lock that divergence.
+# The old worker ``_b`` accepted only ("1", "true", "yes") as truthy. These
+# tests preserve that exact token set.
 
 
 @pytest.mark.parametrize("token", ["1", "true", "yes", "TRUE", "Yes", " yes "])
 def test_bool_shared_truthy_tokens(
     monkeypatch: pytest.MonkeyPatch, token: str
 ) -> None:
-    """The truthy set shared with the dispatcher parses to True (case/space-insensitive)."""
+    """The worker truthy tokens parse to True regardless of case or surrounding space."""
     _clear_all_config_env(monkeypatch)
     monkeypatch.setenv("CURIE_SHIMMER", token)
     monkeypatch.setenv("CURIE_FAKE_MODEL", token)
@@ -464,7 +464,7 @@ def test_bool_shared_truthy_tokens(
 def test_bool_worker_rejects_on_and_falsy_tokens(
     monkeypatch: pytest.MonkeyPatch, token: str
 ) -> None:
-    """The worker does NOT treat "on" as truthy (the dispatcher does); falsy tokens are False."""
+    """The worker parses "on" and the other rejected tokens as False."""
     _clear_all_config_env(monkeypatch)
     monkeypatch.setenv("CURIE_SHIMMER", token)
     monkeypatch.setenv("CURIE_FAKE_MODEL", token)
@@ -547,7 +547,7 @@ def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
     config_region = config_text[config_start:config_end]
 
     test_text = Path(__file__).read_text(encoding="utf-8")
-    test_start = test_text.index("# --- Per-service bool divergence")
+    test_start = test_text.index("# Worker boolean behavior")
     test_end = test_text.index("# --- Eval claim-creation concurrency", test_start)
     test_region = test_text[test_start:test_end]
 

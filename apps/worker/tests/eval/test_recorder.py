@@ -328,7 +328,7 @@ def test_records_per_case_results_and_reads_them_back() -> None:
             try:
                 (await client.get(f"{_LF_HOST}/api/public/health")).raise_for_status()
             except httpx.HTTPError as exc:
-                pytest.skip(f"Langfuse not reachable at {_LF_HOST}: {exc}")
+                pytest.fail(f"Langfuse not reachable at {_LF_HOST}: {exc}")
 
             recorder = LangfuseEvalRecorder(
                 base_url=_LF_HOST, public_key=_LF_PK, secret_key=_LF_SK, client=client

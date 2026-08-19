@@ -165,6 +165,8 @@ const CONNECTORS_YAML: &str = r#"# What this agent needs running. Curie derives 
 #     # `curie secrets set <NAME>`; they never belong in this file.
 #     secrets:
 #       - GRAFANA_SERVICE_ACCOUNT_TOKEN
+#     secret_files:
+#       GRAFANA_CLIENT_CERT: /etc/grafana/client.pem
 #
 #     # Where to reach it on a tier that cannot host it -- `skill` hosts
 #     # nothing, so this is how local development reaches your own copy.

@@ -20,6 +20,9 @@
 /// What went wrong with a pasted value, phrased for the person who pasted it.
 pub type CheckResult = Result<(), String>;
 
+static SLACK_CHANNEL_ID: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^[CDG][A-Z0-9]{7,}$").expect("channel id re"));
+
 /// Credentials whose prefix identifies them, and what to call them.
 const KNOWN_PREFIXES: &[(&str, &str, &str)] = &[
     ("SLACK_APP_TOKEN", "xapp-", "app-level token"),
@@ -114,17 +117,26 @@ pub fn check_model_credential(value: &str) -> CheckResult {
             "that looks like {actual}, not a model credential. Supported shapes are \
              `sk-ant-` (Anthropic), `sk-or-` (OpenRouter), dotted `id.secret`, and \
              bare `sk-`; bare `sk-` and dotted `id.secret` shapes alone do not \
-             identify the provider"
+             identify the provider. Set `CURIE_MODEL_BASE_URL` to choose the provider \
+             endpoint, then provide the value with `curie secrets set <NAME>` or \
+             `export <NAME>=...`"
         )),
         None if looks_like_zhipu_credential(value) => Ok(()),
         None => Err(
             "supported model credential shapes are `sk-ant-` (Anthropic), \
              `sk-or-` (OpenRouter), dotted `id.secret`, and bare `sk-`; \
              bare `sk-` and dotted `id.secret` shapes alone do not identify the \
-             provider"
+             provider. Set `CURIE_MODEL_BASE_URL` to choose the provider endpoint, \
+             then provide the value with `curie secrets set <NAME>` or \
+             `export <NAME>=...`"
                 .to_string(),
         ),
     }
+}
+
+/// Whether a value has the Slack channel shape accepted by the API.
+pub fn looks_like_slack_channel_id(value: &str) -> bool {
+    SLACK_CHANNEL_ID.is_match(value)
 }
 
 /// A Slack channel ID, not a channel name.
@@ -137,18 +149,13 @@ pub fn check_channel_id(value: &str) -> CheckResult {
     if let Some(name) = value.strip_prefix('#') {
         return Err(format!(
             "that is a channel NAME. Curie binds by id: right-click #{name} -> View channel \
-             details, and copy the id at the bottom (it starts with C)"
+             details, and copy the id at the bottom (it starts with C, D, or G)"
         ));
     }
-    let looks_like_id = value.starts_with('C')
-        && value.len() >= 9
-        && value[1..]
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-    if !looks_like_id {
+    if !looks_like_slack_channel_id(value) {
         return Err(
-            "a Slack channel id starts with C and is upper case letters and digits, \
-             e.g. C0EXAMPLE1"
+            "a Slack channel id starts with C, D, or G and continues with upper case \
+             letters and digits, e.g. C0EXAMPLE1, D0EXAMPLE1, or G0EXAMPLE1"
                 .to_string(),
         );
     }
