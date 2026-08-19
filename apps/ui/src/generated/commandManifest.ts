@@ -4030,6 +4030,25 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "bump-version"
+        },
+        {
+          "about": "EXPERIMENTAL THROWAWAY prototype for the remote development spike: claim a managed Agent Sandbox, clone a test repo into it, run a coding turn, and return the resulting git diff (`bash cli/scripts/remote-dev-spike.sh`)",
+          "args": [
+            {
+              "global": false,
+              "help": "Arguments passed straight through to the spike script, e.g. `run --keep`, `follow-up`, `down`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "EXPERIMENTAL THROWAWAY prototype for the remote development spike: claim a managed Agent Sandbox, clone a test repo into it, run a coding turn, and return the resulting git diff (`bash cli/scripts/remote-dev-spike.sh`).\n\nNot a gate, not an E2E test, and not a supported surface: it exists to falsify one product thesis and is expected to be deleted with the spike. Modes: `run` (default), `follow-up`, `down`.",
+          "name": "remote-dev-spike"
         }
       ]
     },
