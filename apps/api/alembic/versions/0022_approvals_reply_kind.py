@@ -65,7 +65,7 @@ old API pod inserting during the window must fail loudly rather than fabricate a
 kind.
 
 Revision ID: 0022
-Revises: 0021
+Revises: 0021a
 Create Date: 2026-08-13
 """
 
@@ -76,7 +76,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0022"
-down_revision: str | None = "0021"
+down_revision: str | None = "0021a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
