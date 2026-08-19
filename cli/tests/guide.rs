@@ -227,7 +227,12 @@ fn guide_documents_the_approval_plane() {
             // refusal must say so while preserving the setup facts below.
             "SLACK_BOT_TOKEN",
             "usergroups:read",
+            // #1431. InvalidApprovers and failed group lookup are independent
+            // refusals. An operator cannot safely infer the missing credential
+            // from the group lookup response itself.
+            "could not verify approvers",
             "could not verify approver group membership",
+            "the refusal does not name the missing token",
             // The two refusals a second approver actually meets. Everything the
             // primer covered before was a first-approver problem.
             "409",
@@ -246,15 +251,20 @@ fn guide_documents_the_approval_plane() {
         );
     }
     let approvals_document = include_str!("../../docs/approvals.md");
-    assert!(
-        approvals_document.contains("could not verify approver group membership"),
-        "approval documentation omits the literal failed group lookup refusal"
-    );
-    assert!(
-        !approvals_document.contains(
-            "every resolution is refused as not-an-approver with nothing naming the token as the cause"
-        ),
-        "approval documentation preserves the obsolete group lookup refusal"
+    let invalid_approvers_row = approvals_document
+        .lines()
+        .find(|line| line.starts_with("| `403 ") && line.contains("could not verify approvers"))
+        .expect("approval troubleshooting has an InvalidApprovers row");
+    let group_lookup_row = approvals_document
+        .lines()
+        .find(|line| {
+            line.starts_with("| `403 ")
+                && line.contains("could not verify approver group membership")
+        })
+        .expect("approval troubleshooting has a failed group lookup row");
+    assert_ne!(
+        invalid_approvers_row, group_lookup_row,
+        "InvalidApprovers and failed group lookup must remain separate troubleshooting rows"
     );
     // The section is structural in the markdown, not a stray landmine mention.
     assert!(
