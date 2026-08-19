@@ -95,3 +95,16 @@ syn = { version = "3", features = ["full", "visit", "extra-traits"] }
 # parsed `syn::Block` (`ToTokens::to_token_stream`) to hand that walk its input.
 proc-macro2 = "1"
 quote = "1"
+
+# Dev builds carried full DWARF, which dominated the target dir. A section dump
+# of one 181MB integration test binary measured .text at 3.5MB against roughly
+# 175MB of .debug_* sections, so about 97% of every artifact was debug info.
+# With 41 integration test targets in cli/tests, each statically linking the
+# whole crate graph, a single target dir reached 175G.
+#
+# line-tables-only keeps file and line numbers in panics and backtraces, which
+# is what the test suite and local debugging actually read. It drops type and
+# variable DWARF, so a step debugger will not resolve locals. For that, build
+# the one target you are debugging with CARGO_PROFILE_DEV_DEBUG=2.
+[profile.dev]
+debug = "line-tables-only"
