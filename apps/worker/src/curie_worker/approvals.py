@@ -85,10 +85,18 @@ class ApprovalReader(Protocol):
 class ApprovalClient:
     """HTTP implementation against the platform API's /approvals endpoint."""
 
-    def __init__(self, *, api_base_url: str, api_key: str, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        *,
+        api_base_url: str,
+        api_key: str,
+        client: httpx.AsyncClient,
+        read_timeout_s: float,
+    ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
         self._headers = {"X-API-Key": api_key} if api_key else {}
         self._client = client
+        self._read_timeout_s = read_timeout_s
 
     async def create(self, request: ApprovalRequest) -> CreatedApproval:
         try:
@@ -118,7 +126,9 @@ class ApprovalClient:
 
         try:
             response = await self._client.get(
-                f"{self._url}/{approval_id}", headers=self._headers
+                f"{self._url}/{approval_id}",
+                headers=self._headers,
+                timeout=self._read_timeout_s,
             )
         except httpx.HTTPError as exc:
             logger.warning("approval read failed for %s: %s", approval_id, exc)

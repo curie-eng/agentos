@@ -656,11 +656,10 @@ class WorkerConfig(BaseSettings):
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"
 
-    def approval_card_key(self, thread_key: str) -> str:
-        # Where a suspended thread's posted approval card lives, so an expiry can
-        # disable it (#419). Keyed by thread: one pending approval per suspended
-        # thread at a time.
-        return f"{self.key_prefix}:approval-card:{thread_key}"
+    def approval_card_key(self, approval_id: str) -> str:
+        # Where a posted approval card lives so its own resolution or expiry can
+        # settle it without sharing identity with another approval on the thread.
+        return f"{self.key_prefix}:approval-card:{approval_id}"
 
     def dead_letter_stream_name(self) -> str:
         """The graveyard stream: the explicit override, else derived ``<stream>:dead``.
