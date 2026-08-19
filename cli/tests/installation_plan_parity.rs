@@ -1285,31 +1285,50 @@ fn cluster_up_reports_a_preserved_sealing_key_as_preserved() {
 
 #[test]
 fn cluster_up_reports_a_new_sealing_key_as_generated_not_preserved() {
-    let fixture = HelmFixture::new(
-        installation_for_the_stateful_guard(),
-        HelmValuesResponse::Object(json!({"ui": {"deploy": false}})),
-    );
-    let output = fixture.cluster_up();
-    let visible = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    json_output(output, "cluster up adding its first sealing key");
+    for (release_state, values_response) in [
+        ("absent release", HelmValuesResponse::Absent),
+        (
+            "existing release without a sealing key",
+            HelmValuesResponse::Object(json!({"ui": {"deploy": false}})),
+        ),
+    ] {
+        let fixture = HelmFixture::new(installation_for_the_stateful_guard(), values_response);
+        let output = fixture.cluster_up();
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        json_output(output, &format!("cluster up for {release_state}"));
+        let calls = fixture.calls();
 
-    assert!(
-        visible.contains("generated") && visible.contains("sealing"),
-        "a live release missing the key must report its new sealing key separately:\n{visible}"
-    );
-    assert!(
-        !visible.contains("preserving 1"),
-        "a newly generated sealing key must not inflate the preserved count:\n{visible}"
-    );
-    assert!(
-        fixture.calls().contains("SEALING_KEY_PRESENT: yes"),
-        "the generated key must reach the Helm consumer:\n{}",
-        fixture.calls()
-    );
+        assert!(
+            visible.contains(
+                "generated a sealing private key for this release; later cluster up runs preserve it"
+            ),
+            "{release_state} must report the generated sealing key exactly:\n{visible}"
+        );
+        assert!(
+            !visible.contains("preserving"),
+            "{release_state} must not report preservation for a generated key:\n{visible}"
+        );
+        assert!(
+            !visible.contains("cluster comms"),
+            "{release_state} must not attribute generation to cluster comms:\n{visible}"
+        );
+        assert!(
+            !visible.contains("cluster github-app"),
+            "{release_state} must not attribute generation to cluster github-app:\n{visible}"
+        );
+        assert!(
+            calls.contains("HELM_CALL: get values "),
+            "{release_state} must inspect the release values:\n{calls}"
+        );
+        assert!(
+            calls.contains("SEALING_KEY_PRESENT: yes"),
+            "the generated key for {release_state} must reach the Helm consumer:\n{calls}"
+        );
+    }
 }
 
 #[test]
