@@ -194,7 +194,11 @@ fn a_bogus_verb_fails_the_gate() {
 }
 
 #[cfg(target_os = "linux")]
-fn cancel_next_local_deploy_prompt(environment: &[(&str, &str)], cancellation: &str) -> String {
+fn cancel_next_local_deploy_prompt(
+    environment: &[(&str, &str)],
+    after_intro: &[&[u8]],
+    cancellation: &str,
+) -> String {
     let config = tempfile::tempdir().expect("create isolated config directory");
     let shell_command = format!(
         "stty rows {CAPTURE_ROWS} cols {CAPTURE_COLUMNS}; exec {} interactive",
@@ -233,7 +237,12 @@ fn cancel_next_local_deploy_prompt(environment: &[(&str, &str)], cancellation: &
 
     let mut input = child.stdin.take().expect("terminal input");
     thread::sleep(Duration::from_millis(200));
-    for keys in [b"\t\t\t\t".as_slice(), b"\r", b"\r", b"\r", b"\x1b"] {
+    for keys in [b"\t\t\t\t".as_slice(), b"\r", b"\r", b"\r"] {
+        input.write_all(keys).expect("send terminal input");
+        input.flush().expect("flush terminal input");
+        thread::sleep(Duration::from_millis(150));
+    }
+    for keys in after_intro {
         input.write_all(keys).expect("send terminal input");
         input.flush().expect("flush terminal input");
         thread::sleep(Duration::from_millis(150));
@@ -275,6 +284,7 @@ fn guided_prompt_cancellation_names_visible_recovery() {
             ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
             ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
         ],
+        &[b"\x1b"],
         "channel",
     );
     assert!(
@@ -291,6 +301,7 @@ fn model_credential_cancellation_names_every_recovery_path() {
             ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
             ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
         ],
+        &[b"\x1b"],
         "model credential",
     );
     for recovery in [
@@ -313,6 +324,7 @@ fn slack_app_token_cancellation_names_every_recovery_path() {
             ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
             ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
         ],
+        &[b"\x1b"],
         "Slack app token",
     );
     for recovery in [
@@ -322,6 +334,73 @@ fn slack_app_token_cancellation_names_every_recovery_path() {
         assert!(
             text.contains(recovery),
             "Slack app token cancellation must show {recovery:?}:\n{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slack_app_token_cancel_choice_names_every_recovery_path() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        &[b"\x1b[B", b"\r"],
+        "Slack app token cancel choice",
+    );
+    for recovery in [
+        "curie secrets set SLACK_APP_TOKEN",
+        "export SLACK_APP_TOKEN=",
+    ] {
+        assert!(
+            text.contains(recovery),
+            "Slack app token cancel choice must show {recovery:?}:\n{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slack_app_token_value_cancellation_names_every_recovery_path() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("CURIE_CREDENTIALS", "sk-EXAMPLE-model-credential"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        &[b"\r", b"\x1b"],
+        "Slack app token value",
+    );
+    for recovery in [
+        "curie secrets set SLACK_APP_TOKEN",
+        "export SLACK_APP_TOKEN=",
+    ] {
+        assert!(
+            text.contains(recovery),
+            "Slack app token value cancellation must show {recovery:?}:\n{text}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn model_credential_value_cancellation_names_every_recovery_path() {
+    let text = cancel_next_local_deploy_prompt(
+        &[
+            ("SLACK_APP_TOKEN", "xapp-EXAMPLE-app-token"),
+            ("SLACK_BOT_TOKEN", "xoxb-EXAMPLE-bot-token"),
+        ],
+        &[b"\r", b"\x1b"],
+        "model credential value",
+    );
+    for recovery in [
+        "CURIE_MODEL_BASE_URL",
+        "curie secrets set <NAME>",
+        "export <NAME>=",
+    ] {
+        assert!(
+            text.contains(recovery),
+            "model credential value cancellation must show {recovery:?}:\n{text}"
         );
     }
 }
