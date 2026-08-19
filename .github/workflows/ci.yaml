@@ -1166,6 +1166,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          validate_selected_outcomes() {
+            if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                  "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
+                  "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
+              return 1
+            fi
+            return 0
+          }
+
           if [[ "$CHANGES_RESULT" != "success" ||
                 ( "$SKILL_SELECTED" != "true" && "$SKILL_SELECTED" != "false" ) ||
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
@@ -1188,26 +1197,31 @@ jobs:
             cluster_expected="success"
           fi
 
-          if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
-                "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
-                "$CLUSTER_RESULT" != "$cluster_expected" ]]; then
+          if ! validate_selected_outcomes; then
             echo "E2E required failed" >&2
             exit 1
           fi
 
-          negative_skill_local_expected="skipped"
-          if [[ "true" == "true" || "false" == "true" ]]; then
-            negative_skill_local_expected="success"
-          fi
-          negative_local_release_expected="skipped"
-          negative_cluster_expected="skipped"
-          if [[ "success" != "success" ||
-                "skipped" == "$negative_skill_local_expected" ||
-                "skipped" == "$negative_local_release_expected" ||
-                "skipped" == "$negative_cluster_expected" ]]; then
-            echo "Selected and skipped negative control passed"
+          negative_skill_local_result="$skill_local_expected"
+          negative_local_release_result="$local_release_expected"
+          negative_cluster_result="$cluster_expected"
+          if [[ "$skill_local_expected" == "success" ]]; then
+            negative_skill_local_result="skipped"
+          elif [[ "$local_release_expected" == "success" ]]; then
+            negative_local_release_result="skipped"
+          elif [[ "$cluster_expected" == "success" ]]; then
+            negative_cluster_result="skipped"
           else
+            negative_skill_local_result="success"
+          fi
+
+          if SKILL_LOCAL_RESULT="$negative_skill_local_result" \
+            LOCAL_RELEASE_RESULT="$negative_local_release_result" \
+            CLUSTER_RESULT="$negative_cluster_result" \
+            validate_selected_outcomes; then
             echo "Selected and skipped negative control failed" >&2
             exit 1
           fi
+          echo "Selected and skipped negative control passed"
+
           echo "E2E required passed"
