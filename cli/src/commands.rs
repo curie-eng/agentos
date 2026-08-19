@@ -17,8 +17,8 @@ use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
 use crate::bundle::pack_tar_gz;
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
-    graded_answer, load_suite, outcome_label, rollup_line, turn_completed, turn_outcome,
-    CaseOutcome, EvalSuite,
+    graded_answer, load_eval, outcome_label, rollup_line, score_turn, turn_completed, CaseOutcome,
+    EvalSuite, TrajectoryScorer,
 };
 use crate::render::{boxed_summary, status_str, TurnPart, TurnPrinter};
 use crate::runner::RunnerClient;
@@ -2123,6 +2123,21 @@ pub fn status_json<T: serde::Serialize>(
 /// report the same shape through `report_eval`/`eval_json`.
 pub type EvalRow = (String, CaseOutcome, f64, String);
 
+/// Eval rows plus optional scorer explanations keyed by case id.
+pub struct EvalReport {
+    pub rows: Vec<EvalRow>,
+    pub details: BTreeMap<String, String>,
+}
+
+impl EvalReport {
+    pub fn from_rows(rows: Vec<EvalRow>) -> Self {
+        Self {
+            rows,
+            details: BTreeMap::new(),
+        }
+    }
+}
+
 /// The three counts every eval surface reports. Split out so the `--json`
 /// payload, the human roll-up, and the exit code all read the SAME tally rather
 /// than each re-deriving it -- `failed` in particular must be counted, never
@@ -2149,6 +2164,14 @@ fn eval_counts(results: &[EvalRow]) -> (usize, usize, usize) {
 /// snapshotted bundle, and on a skill run against a runner this checkout never
 /// recorded.
 pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json::Value {
+    eval_json_with_details(results, &BTreeMap::new(), bundle_digest)
+}
+
+fn eval_json_with_details(
+    results: &[EvalRow],
+    details: &BTreeMap<String, String>,
+    bundle_digest: Option<&str>,
+) -> serde_json::Value {
     // Derive every count from `results` in one pass so the rollup can never
     // disagree with the per-case rows (no caller-supplied passed/total to drift).
     let total = results.len();
@@ -2156,7 +2179,7 @@ pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json
     let cases: Vec<serde_json::Value> = results
         .iter()
         .map(|(id, outcome, seconds, output)| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "id": id,
                 "outcome": outcome,
                 // Tri-state (ADR-0055): a non-graded row claims neither verdict.
@@ -2166,7 +2189,11 @@ pub fn eval_json(results: &[EvalRow], bundle_digest: Option<&str>) -> serde_json
                 "passed": outcome.passed(),
                 "seconds": seconds,
                 "output": output,
-            })
+            });
+            if let Some(detail) = details.get(id) {
+                row["detail"] = serde_json::json!(detail);
+            }
+            row
         })
         .collect();
     serde_json::json!({
@@ -2400,7 +2427,7 @@ pub async fn eval(
     let saved = state::load(Path::new("."))?;
     let state_plugin_dir = saved.as_ref().map(|s| PathBuf::from(s.plugin_dir.clone()));
     let cases_path = resolve_cases_path(cases_path, Path::new("."), state_plugin_dir.as_deref())?;
-    let suite = load_suite(&cases_path)?;
+    let loaded = load_eval(&cases_path)?;
 
     // Model selection (#526): with `--model`, boot a transient runner per model,
     // run the suite against each, and report pass-rate per model -- the one
@@ -2409,7 +2436,8 @@ pub async fn eval(
     // default path drives the already-running runner (whatever model it booted).
     if !models.is_empty() {
         return eval_sweep(
-            &suite,
+            &loaded.suite,
+            loaded.trajectory.as_ref(),
             &models,
             &secrets,
             &image,
@@ -2429,11 +2457,18 @@ pub async fn eval(
     let bundle_digest = recorded_bundle_digest(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
-    let bar = ui.progress_bar(suite.cases.len() as u64, "running evals");
+    let bar = ui.progress_bar(loaded.suite.cases.len() as u64, "running evals");
     // `run_suite_cases` also tallies completion for the `--model` sweep path;
     // the single-runner report doesn't need the count (it already reports the
     // per-case `Fail` either way and exits on any of them), so it is discarded.
-    let (results, _completed) = run_suite_cases(&client, &suite, fake, |_| bar.inc(1)).await?;
+    let (results, _completed) = run_suite_cases(
+        &client,
+        &loaded.suite,
+        fake,
+        loaded.trajectory.as_ref(),
+        |_| bar.inc(1),
+    )
+    .await?;
     bar.finish();
 
     report_eval(&results, bundle_digest.as_deref())
@@ -2467,9 +2502,11 @@ async fn run_suite_cases(
     client: &RunnerClient,
     suite: &EvalSuite,
     fake: bool,
+    trajectory_scorer: Option<&TrajectoryScorer>,
     mut on_case: impl FnMut(usize),
-) -> Result<(Vec<EvalRow>, usize)> {
+) -> Result<(EvalReport, usize)> {
     let mut results = Vec::with_capacity(suite.cases.len());
+    let mut details = BTreeMap::new();
     let mut completed = 0usize;
     for (i, case) in suite.cases.iter().enumerate() {
         // Fresh conversation by default (#550): reset the runner before a case so
@@ -2495,15 +2532,25 @@ async fn run_suite_cases(
         // Capture the graded answer -- the exact text `turn_outcome` judged -- so
         // a red case can be diagnosed from `--json` without a manual re-run
         // (#548). A fake row carries its canned reply for the same reason.
+        let scored = score_turn(case, &events, fake, trajectory_scorer);
+        if let Some(detail) = scored.detail {
+            details.insert(case.id.clone(), detail);
+        }
         results.push((
             case.id.clone(),
-            turn_outcome(case, &events, fake),
+            scored.outcome,
             elapsed,
             graded_answer(&events),
         ));
         on_case(i);
     }
-    Ok((results, completed))
+    Ok((
+        EvalReport {
+            rows: results,
+            details,
+        },
+        completed,
+    ))
 }
 
 /// The `docker run` spec one eval-sweep runner boots with. Split out of
@@ -2804,6 +2851,7 @@ mod eval_bundle {
 /// Run the suite once per model in a fresh runner and report pass-rate per model.
 async fn eval_sweep(
     suite: &EvalSuite,
+    trajectory_scorer: Option<&TrajectoryScorer>,
     models: &[String],
     secrets: &[String],
     image: &str,
@@ -2847,10 +2895,11 @@ async fn eval_sweep(
             // `boot_eval_runner` pins `fake_model: false`, so every sweep runner is a
             // REAL model whatever the standing dev runner is -- the sweep grades,
             // so this in-CLI path never produces a plumbing-only row.
-            let run = run_suite_cases(&client, suite, false, |_| {}).await;
+            let run = run_suite_cases(&client, suite, false, trajectory_scorer, |_| {}).await;
             let _ = docker::remove_container(&name).await;
             let (results, completed) = run?;
             let passed = results
+                .rows
                 .iter()
                 .filter(|(_, o, _, _)| *o == CaseOutcome::Pass)
                 .count();
@@ -3040,14 +3089,14 @@ pub fn report_sweep(rows: &[SweepRow], bundle_digest: Option<&str>) -> Result<()
 /// graded is confirmable from the machine surface. Callers pass `None` when no
 /// locally snapshotted bundle applies (the local/cluster tiers grade a deployed
 /// version), never a digest they did not observe.
-pub fn report_eval(results: &[EvalRow], bundle_digest: Option<&str>) -> Result<()> {
-    let (_passed, failed, _plumbing_ok) = eval_counts(results);
+pub fn report_eval(report: &EvalReport, bundle_digest: Option<&str>) -> Result<()> {
+    let (_passed, failed, _plumbing_ok) = eval_counts(&report.rows);
     // Emit through the one success point (#474), then apply the exit-code side
     // effect for BOTH paths -- the json path had it inline, the human path after.
     // Only a genuine `Fail` (failed > 0) exits non-zero: a plumbing-only run
     // graded nothing but is operationally successful, so it exits 0 (#606/#612).
     crate::ui::ui().emit(&EvalOutput {
-        results,
+        report,
         bundle_digest,
     });
     if failed > 0 {
@@ -3061,7 +3110,7 @@ pub fn report_eval(results: &[EvalRow], bundle_digest: Option<&str>) -> Result<(
 /// `json_contract.rs` stay green); `render` reproduces the per-case table and the
 /// roll-up verdict + per-red-case reply notes.
 struct EvalOutput<'a> {
-    results: &'a [EvalRow],
+    report: &'a EvalReport,
     /// The snapshot digest the evaluated runner mounted (#1087), or `None` when
     /// none applies to this run.
     bundle_digest: Option<&'a str>,
@@ -3069,11 +3118,11 @@ struct EvalOutput<'a> {
 
 impl crate::ui::CliOutput for EvalOutput<'_> {
     fn to_json(&self) -> serde_json::Value {
-        eval_json(self.results, self.bundle_digest)
+        eval_json_with_details(&self.report.rows, &self.report.details, self.bundle_digest)
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        let results = self.results;
+        let results = &self.report.rows;
         let (passed, failed, plumbing_ok) = eval_counts(results);
         let rows: Vec<Vec<String>> = results
             .iter()
@@ -3103,12 +3152,16 @@ impl crate::ui::CliOutput for EvalOutput<'_> {
                 .iter()
                 .filter(|(_, o, _, _)| *o == CaseOutcome::Fail)
             {
-                let shown = if output.is_empty() {
-                    "<no reply text>".to_string()
+                if let Some(detail) = self.report.details.get(name) {
+                    ui.note(&format!("{name}: {detail}"));
                 } else {
-                    output.clone()
-                };
-                ui.note(&format!("{name} replied: {shown}"));
+                    let shown = if output.is_empty() {
+                        "<no reply text>".to_string()
+                    } else {
+                        output.clone()
+                    };
+                    ui.note(&format!("{name} replied: {shown}"));
+                }
             }
             ui.warn(&format!(
                 "{}; {failed} failed",

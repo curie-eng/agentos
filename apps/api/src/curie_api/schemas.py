@@ -1176,6 +1176,10 @@ class EvalCell(BaseModel):
     ``model`` is the model the result was produced under (the matrix's model
     dimension), or ``None`` when the recording run carried no model tag.
 
+    ``detail`` is the scorer's optional explanation for the verdict. It is
+    distinct from a trace's ``error``, which identifies a turn that did not
+    complete.
+
     ``plumbing_ok`` means the case ran to completion but no grader judged it (the
     fake-model tier, ADR-0055). It is a distinct status rather than a pass or a
     fail because it is neither: the fake answers from a canned script, so its cell
@@ -1186,6 +1190,10 @@ class EvalCell(BaseModel):
     version: str
     status: Literal["pass", "fail", "plumbing_ok", "missing"]
     model: str | None = None
+    detail: str | None = None
+    stream_id: str | None = None
+    scorer: Literal["grader", "trajectory"] | None = None
+    case_count: int | None = None
 
 
 class EvalMatrixRow(BaseModel):
@@ -1495,4 +1503,3 @@ class ConsoleSessionOut(BaseModel):
     """
 
     expires_at: datetime
-

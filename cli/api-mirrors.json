@@ -172,16 +172,22 @@
       "omissions": []
     },
     {
+      "struct": "EvalCell",
+      "schema": "EvalCell",
+      "omissions": []
+    },
+    {
+      "struct": "EvalMatrixRow",
+      "schema": "EvalMatrixRow",
+      "omissions": []
+    },
+    {
       "struct": "EvalMatrix",
       "schema": "EvalMatrix",
       "omissions": [
         {
           "field": "cases",
           "why": "The sweep reads the per-(version, model) rollup (model_version_summaries) and the version columns (versions); the per-case identifiers (cases) that label the grid are not read by the CLI."
-        },
-        {
-          "field": "rows",
-          "why": "The per-case pass/fail grid (rows) is carried by the endpoint but unused by the sweep, which needs only the per-model rollup; the existing doc comment on EvalMatrix already states this."
         },
         {
           "field": "models",

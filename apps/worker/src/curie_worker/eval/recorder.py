@@ -110,6 +110,9 @@ class LangfuseEvalRecorder:
                     "version": run.version,
                     "suite": run.suite,
                     "model": run.model,
+                    "stream_id": run.stream_id,
+                    "scorer": run.scorer.value,
+                    "case_count": run.total,
                     "case_id": result.case_id,
                     "outcome": result.outcome.value,
                     # Kept alongside `outcome` so an unmigrated reader stays
@@ -118,6 +121,7 @@ class LangfuseEvalRecorder:
                     "passed": result.passed,
                     "latency_ms": result.latency_ms,
                     "cost_usd": result.cost_usd,
+                    "detail": result.detail,
                     "error": result.error,
                 },
             },

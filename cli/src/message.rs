@@ -36,7 +36,7 @@ use crate::chat::{
     await_reply, await_resume, continue_hint_line, continue_hint_long_line, parse_approval_id,
     resolve_targets, Outcome, SlackStub,
 };
-use crate::evals::{EvalCase, EvalSuite, ExpectedStatus};
+use crate::evals::{EvalCase, EvalSuite, ExpectedStatus, LoadedEval};
 use crate::ops::{plain, require_on_path, run_capture, OpsCommand};
 use crate::queue::{self, connect, diagnostics, synthetic_turn, xadd};
 use crate::state::{save_turn, TurnContext, TurnVerb};
@@ -2169,11 +2169,11 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
 
 /// Resolve the eval suite the way `skill eval` does: an explicit `--cases`
 /// wins, else `evals/cases.json` in the cwd, then the recorded bundle dir.
-fn resolve_suite(explicit: Option<PathBuf>) -> Result<EvalSuite> {
+fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
     let state_plugin_dir = crate::state::load(Path::new("."))?.map(|s| PathBuf::from(s.plugin_dir));
     let path =
         crate::commands::resolve_cases_path(explicit, Path::new("."), state_plugin_dir.as_deref())?;
-    crate::evals::load_suite(&path)
+    crate::evals::load_eval(&path)
 }
 
 /// The shared per-tier eval engine: enqueue one synthetic `QueuedTurn` per case
@@ -2187,7 +2187,7 @@ async fn run_eval_turns(
     suite: &EvalSuite,
     conn: &mut MultiplexedConnection,
     stub: &mut SlackStub,
-) -> Result<Vec<crate::commands::EvalRow>> {
+) -> Result<crate::commands::EvalReport> {
     let ui = crate::ui::ui();
     let total = suite.cases.len();
     let bar = ui.progress_bar(total as u64, "running evals");
@@ -2241,7 +2241,7 @@ async fn run_eval_turns(
         bar.inc(1);
     }
     bar.finish();
-    Ok(results)
+    Ok(crate::commands::EvalReport::from_rows(results))
 }
 
 /// The shared `eval` handler: run the bundle's `evals/cases.json` through the
@@ -2278,14 +2278,27 @@ pub async fn eval(opts: EvalOpts) -> Result<()> {
                 ),
             ));
         }
-        let suite = resolve_suite(opts.cases.clone())?;
-        return eval_sweep(opts, suite).await;
+        let loaded = resolve_eval(opts.cases.clone())?;
+        return eval_sweep(opts, loaded.suite).await;
     }
-    let suite = resolve_suite(opts.cases.clone())?;
+    let loaded = resolve_eval(opts.cases.clone())?;
+    if loaded.trajectory.is_some() {
+        if opts.cases.is_some() {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::unsupported(
+                    "--cases cannot select a local file for a trajectory eval because local and cluster trajectory scoring grades the deployed bundle",
+                )
+                .with_fix(
+                    "drop --cases to grade the deployed trajectory suite, or use skill eval to grade the local file",
+                ),
+            ));
+        }
+        return eval_trajectory_platform(opts, loaded.suite).await;
+    }
     if opts.local {
-        eval_local(opts, suite).await
+        eval_local(opts, loaded.suite).await
     } else {
-        eval_cluster(opts, suite).await
+        eval_cluster(opts, loaded.suite).await
     }
 }
 
@@ -2586,7 +2599,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note("waiting for the eval jobs to land in the matrix (Ctrl-C to stop; jobs keep running)");
     loop {
         let matrix = api
-            .eval_matrix(&suite.name, 5)
+            .eval_matrix(&suite.name, 5, None)
             .await
             .context("reading the eval matrix")?;
         if let Some(rows) = sweep_ready_rows(&matrix, &triggered_sha, &want) {
@@ -2635,6 +2648,196 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         }
         tokio::time::sleep(SWEEP_POLL_INTERVAL).await;
     }
+}
+
+/// Run a sidecar selected eval through the platform scorer and read its case
+/// verdicts from the matrix column created by this trigger.
+async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
+    let ui = crate::ui::ui();
+    let api_base = if opts.local {
+        local_api_base(opts.api_url.as_deref())
+    } else {
+        format!("http://localhost:{}", opts.api_local_port)
+    };
+    if opts.dry_run {
+        let tier = if opts.local { "local" } else { "cluster" };
+        ui.emit(&crate::ui::DryRunPlan {
+            lines: vec![
+                format!(
+                    "grade {} case(s) from suite {:?} against the {tier} tier",
+                    suite.cases.len(),
+                    suite.name
+                ),
+                format!(
+                    "trigger trajectory suite {:?} through the {tier} platform eval plane",
+                    suite.name
+                ),
+                format!(
+                    "POST {api_base}/evals/trigger with no model override, then poll {api_base}/evals/matrix?suite={}",
+                    suite.name
+                ),
+            ],
+        });
+        return Ok(());
+    }
+
+    let (api, _api_pf) = if opts.local {
+        (ApiClient::new(&api_base, &opts.api_key)?, None)
+    } else {
+        require_on_path("kubectl")?;
+        let pf = start_port_forward(
+            &port_forward_command(
+                &opts.namespace,
+                &opts.release,
+                "api",
+                opts.api_local_port,
+                API_REMOTE_PORT,
+            ),
+            opts.api_local_port,
+            "api",
+        )
+        .await?;
+        (ApiClient::new(&api_base, &opts.api_key)?, Some(pf))
+    };
+
+    let agents = api
+        .list_agents()
+        .await
+        .context("listing agents to resolve the trajectory eval target")?;
+    let agent_id = select_agent_id(&agents, opts.channel.as_deref())?;
+    let triggered = api
+        .trigger_eval(&agent_id, Some(&suite.name), None)
+        .await
+        .context("triggering trajectory eval")?;
+    if triggered.suite != suite.name {
+        bail!(
+            "trajectory trigger returned suite {:?}, expected {:?}",
+            triggered.suite,
+            suite.name
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(opts.timeout_secs);
+    loop {
+        let matrix = api
+            .eval_matrix(&suite.name, 5, Some(&triggered.stream_id))
+            .await
+            .context("reading trajectory eval matrix")?;
+        if let Some(report) =
+            trajectory_matrix_report(&matrix, &triggered.sha, &triggered.stream_id)?
+        {
+            return crate::commands::report_eval(&report, None);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {}s waiting for trajectory eval results for suite {:?} at sha {}",
+                opts.timeout_secs,
+                suite.name,
+                triggered.sha,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn trajectory_matrix_report(
+    matrix: &crate::api::EvalMatrix,
+    triggered_sha: &str,
+    triggered_stream_id: &str,
+) -> Result<Option<crate::commands::EvalReport>> {
+    if !matrix
+        .versions
+        .iter()
+        .any(|version| version == triggered_sha)
+    {
+        return Ok(None);
+    }
+
+    if matrix.rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut rows = Vec::with_capacity(matrix.rows.len());
+    let mut details = std::collections::BTreeMap::new();
+    let mut expected_case_count: Option<usize> = None;
+    for matrix_row in &matrix.rows {
+        let Some(cell) = matrix_row
+            .cells
+            .iter()
+            .find(|cell| cell.version == triggered_sha)
+        else {
+            return Ok(None);
+        };
+        if cell.stream_id.as_deref() != Some(triggered_stream_id) {
+            bail!(
+                "stream filtered eval matrix returned case {:?} from a different run",
+                matrix_row.case_id
+            );
+        }
+        if cell.scorer.as_deref() != Some("trajectory") {
+            bail!(
+                "stream filtered eval matrix returned case {:?} without trajectory scoring",
+                matrix_row.case_id
+            );
+        }
+        if cell
+            .model
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            bail!(
+                "stream filtered trajectory result for case {:?} has no resolved model",
+                matrix_row.case_id
+            );
+        }
+        let case_count = cell.case_count.context(format!(
+            "stream filtered trajectory result for case {:?} has no case count",
+            matrix_row.case_id
+        ))?;
+        let case_count = usize::try_from(case_count).context(
+            "stream filtered trajectory case count exceeds this platform's supported size",
+        )?;
+        if case_count == 0 {
+            bail!(
+                "stream filtered trajectory result for case {:?} has an invalid zero case count",
+                matrix_row.case_id
+            );
+        }
+        match expected_case_count {
+            Some(expected) if expected != case_count => bail!(
+                "stream filtered trajectory matrix disagrees on case count: {expected} and {case_count}"
+            ),
+            None => expected_case_count = Some(case_count),
+            _ => {}
+        }
+        let outcome = match cell.status.as_str() {
+            "pass" => crate::evals::CaseOutcome::Pass,
+            "fail" => crate::evals::CaseOutcome::Fail,
+            "plumbing_ok" => crate::evals::CaseOutcome::PlumbingOk,
+            "missing" => return Ok(None),
+            status => bail!(
+                "eval matrix returned unknown status {status:?} for case {:?} at sha {triggered_sha}",
+                matrix_row.case_id
+            ),
+        };
+        if let Some(detail) = &cell.detail {
+            details.insert(matrix_row.case_id.clone(), detail.clone());
+        }
+        rows.push((matrix_row.case_id.clone(), outcome, 0.0, String::new()));
+    }
+    let expected_case_count = expected_case_count
+        .context("stream filtered trajectory matrix contained no authoritative case count")?;
+    if rows.len() < expected_case_count {
+        return Ok(None);
+    }
+    if rows.len() > expected_case_count {
+        bail!(
+            "stream filtered trajectory matrix returned {} cases but declared {expected_case_count}",
+            rows.len()
+        );
+    }
+    Ok(Some(crate::commands::EvalReport { rows, details }))
 }
 
 /// The wanted models' rows in the matrix for the TRIGGERED sha, scoped to the
@@ -3848,6 +4051,7 @@ mod tests {
             suite: "smoke".into(),
             versions: versions.iter().map(|v| v.to_string()).collect(),
             model_version_summaries: summaries,
+            rows: Vec::new(),
         }
     }
 

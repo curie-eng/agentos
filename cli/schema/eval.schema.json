@@ -72,6 +72,13 @@
           "output": {
             "type": "string",
             "description": "The graded answer text (the reply judged). Empty when the turn produced no gradeable text. Carried so a failing case is diagnosable without a re-run (#548)."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional scorer explanation for this verdict. Present for a trajectory failure and omitted when the selected scorer has no additional evidence."
           }
         }
       }

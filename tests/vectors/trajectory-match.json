@@ -1,0 +1,113 @@
+{
+  "comment": "Python match_trajectory owns these verdicts. The Rust skill evaluator replays the same vectors so every eval tier uses identical trajectory semantics.",
+  "vectors": [
+    {
+      "name": "exact match",
+      "mode": "exact",
+      "expected": ["search", "fetch"],
+      "observed": ["search", "fetch"],
+      "threshold": 1.0,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "exact wrong order",
+      "mode": "exact",
+      "expected": ["search", "fetch"],
+      "observed": ["fetch", "search"],
+      "threshold": 1.0,
+      "passed": false,
+      "detail": "mode=exact expected=['search', 'fetch'] observed=['fetch', 'search']"
+    },
+    {
+      "name": "in order allows a gap",
+      "mode": "in_order",
+      "expected": ["search", "summarize"],
+      "observed": ["search", "fetch", "summarize"],
+      "threshold": 1.0,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "in order rejects reversed calls",
+      "mode": "in_order",
+      "expected": ["search", "summarize"],
+      "observed": ["summarize", "search"],
+      "threshold": 1.0,
+      "passed": false,
+      "detail": "mode=in_order expected=['search', 'summarize'] observed=['summarize', 'search']"
+    },
+    {
+      "name": "any order preserves multiplicity",
+      "mode": "any_order",
+      "expected": ["search", "search", "fetch"],
+      "observed": ["fetch", "search", "extra", "search"],
+      "threshold": 1.0,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "any order rejects a missing duplicate",
+      "mode": "any_order",
+      "expected": ["search", "search"],
+      "observed": ["search", "fetch"],
+      "threshold": 1.0,
+      "passed": false,
+      "detail": "mode=any_order expected=['search', 'search'] observed=['search', 'fetch']"
+    },
+    {
+      "name": "precision is one for no observed calls",
+      "mode": "precision",
+      "expected": ["search"],
+      "observed": [],
+      "threshold": 1.0,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "precision passes at the exact two thirds boundary",
+      "mode": "precision",
+      "expected": ["search", "fetch"],
+      "observed": ["search", "fetch", "write"],
+      "threshold": 0.6666666666666666,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "precision fails above the two thirds boundary",
+      "mode": "precision",
+      "expected": ["search", "fetch"],
+      "observed": ["search", "fetch", "write"],
+      "threshold": 0.667,
+      "passed": false,
+      "detail": "mode=precision expected=['search', 'fetch'] observed=['search', 'fetch', 'write'] precision=0.667 threshold=0.667"
+    },
+    {
+      "name": "recall is one for no expected calls",
+      "mode": "recall",
+      "expected": [],
+      "observed": ["extra"],
+      "threshold": 1.0,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "recall passes at the exact two thirds boundary",
+      "mode": "recall",
+      "expected": ["search", "fetch", "write"],
+      "observed": ["search", "fetch"],
+      "threshold": 0.6666666666666666,
+      "passed": true,
+      "detail": null
+    },
+    {
+      "name": "recall fails above the two thirds boundary",
+      "mode": "recall",
+      "expected": ["search", "fetch", "write"],
+      "observed": ["search", "fetch"],
+      "threshold": 0.667,
+      "passed": false,
+      "detail": "mode=recall expected=['search', 'fetch', 'write'] observed=['search', 'fetch'] recall=0.667 threshold=0.667"
+    }
+  ]
+}

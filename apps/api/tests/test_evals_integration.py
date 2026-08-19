@@ -14,7 +14,12 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
-from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
+from curie_worker.eval.models import (
+    EvalCaseResult,
+    EvalOutcome,
+    EvalRunResult,
+    EvalScorer,
+)
 from curie_worker.eval.recorder import LangfuseEvalRecorder
 
 
@@ -59,6 +64,50 @@ async def _seed(suite: str, sha_a: str, sha_b: str) -> None:
         await recorder.record(_result(sha_b, suite, c1=True, c2=True))
 
 
+async def _seed_same_sha_runs(suite: str, sha: str) -> None:
+    settings = get_settings()
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        recorder = LangfuseEvalRecorder(
+            base_url=settings.langfuse_host,
+            public_key=settings.langfuse_public_key,
+            secret_key=settings.langfuse_secret_key,
+            client=http,
+        )
+        await recorder.record(
+            EvalRunResult(
+                version=sha,
+                suite=suite,
+                stream_id="1000-0",
+                scorer=EvalScorer.GRADER,
+                results=[
+                    EvalCaseResult(
+                        case_id="ordered",
+                        outcome=EvalOutcome.PASS,
+                        output="old run",
+                        latency_ms=1.0,
+                    )
+                ],
+            )
+        )
+        await recorder.record(
+            EvalRunResult(
+                version=sha,
+                suite=suite,
+                stream_id="2000-0",
+                scorer=EvalScorer.TRAJECTORY,
+                results=[
+                    EvalCaseResult(
+                        case_id="ordered",
+                        outcome=EvalOutcome.FAIL,
+                        output="new run",
+                        latency_ms=1.0,
+                        detail="mode=in_order expected=['Read', 'Bash'] observed=['Bash']",
+                    )
+                ],
+            )
+        )
+
+
 def test_matrix_reflects_seeded_multi_version_scores(
     client: Any, auth_headers: dict[str, str]
 ) -> None:
@@ -90,6 +139,57 @@ def test_matrix_reflects_seeded_multi_version_scores(
     assert cells.get(("c2", sha_a)) == "fail"
     assert cells.get(("c1", sha_b)) == "pass"
     assert cells.get(("c2", sha_b)) == "pass"
+
+
+def test_matrix_stream_id_filters_to_one_authoritative_run(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    suite = f"stream-matrix-{secrets.token_hex(4)}"
+    sha = "sha" + secrets.token_hex(3)
+    asyncio.run(_seed_same_sha_runs(suite, sha))
+
+    deadline = time.time() + 60
+    unfiltered: dict[str, Any] = {}
+    filtered: dict[str, Any] = {}
+    while time.time() < deadline:
+        unfiltered_response = client.get(
+            "/evals/matrix", params={"suite": suite}, headers=auth_headers
+        )
+        filtered_response = client.get(
+            "/evals/matrix",
+            params={"suite": suite, "stream_id": "1000-0"},
+            headers=auth_headers,
+        )
+        assert unfiltered_response.status_code == 200, unfiltered_response.text
+        assert filtered_response.status_code == 200, filtered_response.text
+        unfiltered = unfiltered_response.json()
+        filtered = filtered_response.json()
+        if unfiltered["rows"] and filtered["rows"]:
+            unfiltered_streams = {
+                cell["stream_id"]
+                for row in unfiltered["rows"]
+                for cell in row["cells"]
+            }
+            filtered_streams = {
+                cell["stream_id"]
+                for row in filtered["rows"]
+                for cell in row["cells"]
+            }
+            if unfiltered_streams == {"2000-0"} and filtered_streams == {"1000-0"}:
+                break
+        time.sleep(2)
+
+    unfiltered_cells = unfiltered["rows"][0]["cells"]
+    assert len(unfiltered_cells) == 1
+    assert unfiltered_cells[0]["stream_id"] == "2000-0"
+    assert unfiltered_cells[0]["status"] == "fail"
+    assert unfiltered_cells[0]["case_count"] == 1
+
+    filtered_cells = filtered["rows"][0]["cells"]
+    assert len(filtered_cells) == 1
+    assert filtered_cells[0]["stream_id"] == "1000-0"
+    assert filtered_cells[0]["status"] == "pass"
+    assert filtered_cells[0]["case_count"] == 1
 
 
 def test_matrix_requires_api_key(client: Any) -> None:

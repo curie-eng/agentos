@@ -17,6 +17,7 @@ from curie_worker.eval import (
     GraderKind,
     SampleConfig,
     ScoreResult,
+    TrajectoryScorer,
 )
 
 CONTAINS = GraderKind.CONTAINS
@@ -420,6 +421,26 @@ def _one_case_suite() -> EvalSuite:
         name="s",
         cases=[EvalCase(id="c", input="q", grader=Grader(kind=CONTAINS, expected="deal-desk"))],
     )
+
+
+def test_scorer_failure_detail_is_preserved_separately_from_runtime_error(
+    make_eval_harness,
+) -> None:
+    """A scorer rejection explains the verdict without claiming the turn broke."""
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, client):
+            fake.responses = {"q": "all done"}
+            result = await EvalRunner(client, scorer=TrajectoryScorer()).run(
+                _one_case_suite(), base_url=base_url, version="v1"
+            )
+
+            case = result.results[0]
+            assert case.outcome is EvalOutcome.FAIL
+            assert case.detail == "no trajectory spec for case 'c'"
+            assert case.error is None
+
+    asyncio.run(go())
 
 
 def test_a_fake_turn_is_never_graded_and_is_neither_pass_nor_fail(make_eval_harness) -> None:

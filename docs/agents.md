@@ -1,8 +1,10 @@
 # agents.md: the verification contract for driving Curie
 
 Curie is a harness that runs the same immutable bundle and the same eval suite
-(the bundle's own evals/cases.json) across three tiers, skill, local, and
-cluster, so an agent that worked locally does not silently break once deployed.
+<!-- doclint:ignore-line -->
+(the bundle's own `evals/cases.json` and optional `evals/trajectory.json`)
+across three tiers, skill, local, and cluster, so an agent that worked locally
+does not silently break once deployed.
 Its CLI's primary user is a coding agent driven by a developer, and this file is
 the contract that agent works to.
 
@@ -68,8 +70,23 @@ banned in this contract, so all three tiers are written out in full:
 - cluster tier: `curie cluster status --json` then `curie cluster eval --json`
 
 At the skill tier the bundle is the session, so there is no separate deploy
-step. `eval` runs the bundle's OWN evals/cases.json, the same file at every
-tier.
+<!-- doclint:ignore-line -->
+step. `eval` runs the bundle's OWN `evals/cases.json` at every tier. When the
+<!-- doclint:ignore-line -->
+bundle also carries `evals/trajectory.json`, every case is scored from the
+observed tool sequence. Skill reads runner tool frames directly. Local and
+cluster trigger the deployed bundle through the platform eval plane and read
+the exact triggered matrix stream. Deploy the changed bundle before running
+`curie local eval --json` or `curie cluster eval --json`. Those two trajectory
+runs refuse `--cases` because a local override cannot alter the deployed
+bundle.
+
+The trajectory sidecar maps each `case_id` to an `expected` tool sequence, a
+`mode` of `exact`, `in_order`, `any_order`, `precision`, or `recall`, and a
+`threshold`. The case file and sidecar are packaged in the same immutable
+deployed bundle. The deploy receipt's `bundle_sha256` is the parity identity
+for local and cluster. A case with no matching spec fails closed with an
+explanatory `detail`; it never passes by omission.
 
 **Success on an eval is `failed` equal to 0 AND `plumbing_ok` equal to 0.**
 `plumbing_ok` counts cases that completed on the fake model and were therefore

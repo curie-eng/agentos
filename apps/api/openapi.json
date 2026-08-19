@@ -1360,8 +1360,30 @@
         "type": "object"
       },
       "EvalCell": {
-        "description": "One cell of the eval matrix: a case's result on a version.\n\n``model`` is the model the result was produced under (the matrix's model\ndimension), or ``None`` when the recording run carried no model tag.\n\n``plumbing_ok`` means the case ran to completion but no grader judged it (the\nfake-model tier, ADR-0055). It is a distinct status rather than a pass or a\nfail because it is neither: the fake answers from a canned script, so its cell\ncarries no comparative information and must never read as a green promotion\ngate.",
+        "description": "One cell of the eval matrix: a case's result on a version.\n\n``model`` is the model the result was produced under (the matrix's model\ndimension), or ``None`` when the recording run carried no model tag.\n\n``detail`` is the scorer's optional explanation for the verdict. It is\ndistinct from a trace's ``error``, which identifies a turn that did not\ncomplete.\n\n``plumbing_ok`` means the case ran to completion but no grader judged it (the\nfake-model tier, ADR-0055). It is a distinct status rather than a pass or a\nfail because it is neither: the fake answers from a canned script, so its cell\ncarries no comparative information and must never read as a green promotion\ngate.",
         "properties": {
+          "case_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Count"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
           "model": {
             "anyOf": [
               {
@@ -1373,6 +1395,21 @@
             ],
             "title": "Model"
           },
+          "scorer": {
+            "anyOf": [
+              {
+                "enum": [
+                  "grader",
+                  "trajectory"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scorer"
+          },
           "status": {
             "enum": [
               "pass",
@@ -1382,6 +1419,17 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "stream_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Id"
           },
           "version": {
             "title": "Version",
@@ -5970,6 +6018,22 @@
               "default": 5,
               "title": "Versions",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "stream_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Stream Id"
             }
           },
           {

@@ -447,3 +447,75 @@ def test_per_version_summaries_surface_a_plumbing_only_row() -> None:
     assert fake.total == 0
     assert fake.plumbing == 2
     assert fake.completed == 0
+
+
+def test_same_sha_cross_agent_runs_keep_one_newest_cell_and_filter_exact_run() -> None:
+    def run_trace(
+        trace_id: str,
+        stream_id: str,
+        agent_id: str,
+        timestamp: str,
+        status: str,
+        scorer: str,
+        model: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "id": trace_id,
+            "timestamp": timestamp,
+            "tags": ["eval", "version:same_sha", "suite:s"],
+            "metadata": {
+                "version": "same_sha",
+                "case_id": "ordered",
+                "outcome": status,
+                "passed": status == "pass",
+                "stream_id": stream_id,
+                "agent_id": agent_id,
+                "scorer": scorer,
+                "model": model,
+                "case_count": 1,
+            },
+        }
+
+    traces = [
+        run_trace(
+            "foreign",
+            "1000-0",
+            "other_agent",
+            "2026-08-19T00:00:00Z",
+            "pass",
+            "grader",
+            None,
+        ),
+        run_trace(
+            "triggered",
+            "2000-0",
+            "requested_agent",
+            "2026-08-19T00:01:00Z",
+            "fail",
+            "trajectory",
+            "resolved_model",
+        ),
+    ]
+
+    unfiltered = build_matrix(traces, "s", 5).model_dump()
+    row = next(row for row in unfiltered["rows"] if row["case_id"] == "ordered")
+    assert len(row["cells"]) == 1
+    newest = row["cells"][0]
+    assert newest["stream_id"] == "2000-0"
+    assert newest["status"] == "fail"
+    assert newest["scorer"] == "trajectory"
+    assert newest["model"] == "resolved_model"
+    assert newest["case_count"] == 1
+
+    requested_traces = [
+        trace
+        for trace in traces
+        if trace["metadata"]["stream_id"] == "1000-0"
+    ]
+    filtered = build_matrix(requested_traces, "s", 5).model_dump()
+    row = next(row for row in filtered["rows"] if row["case_id"] == "ordered")
+    assert len(row["cells"]) == 1
+    exact = row["cells"][0]
+    assert exact["stream_id"] == "1000-0"
+    assert exact["status"] == "pass"
+    assert exact["scorer"] == "grader"
