@@ -158,7 +158,7 @@ maintained by repository admins:
   alert set is triaged (fixed, or dismissed with a recorded reason).
 - **A single repository ruleset (`Default`) covers `main` and `next`, so both
   receive identical protection.** It requires all required status checks to
-  pass and all **review conversations resolved**. The `gitleaks full history`
+  pass and all **review conversations resolved**. The `gitleaks (full history)`
   status check is required, and CodeQL is enforced through the code scanning
   rule.
 
