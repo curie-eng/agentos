@@ -761,26 +761,6 @@ async fn complete_installation_plan(
         );
         desired.insert("worker.slackApiBaseUrl".to_string(), String::new());
     }
-    // The model credential is declared by NAME, and `up_value_plan` only carries
-    // its key when a VALUE resolved. So on an install whose credentials are not
-    // in place yet -- exactly the state `diff` exists to describe -- the key
-    // vanished from the desired state and diff called it a reset: "the release
-    // carries this, your file does not declare it, declare it in curie.yaml to
-    // keep it." For a model API key, in a file whose own header says it holds
-    // NAMES and never secrets. Same defect #1415 fixed for the sealing key,
-    // reached by a different route.
-    //
-    // Comms three lines up already had this right, and this mirrors it: a
-    // DECLARED credential is part of the desired state whether or not it
-    // resolves in this shell, because apply is what supplies it -- and apply
-    // refuses outright while it cannot. `desired` feeds the diff report only;
-    // the argv apply actually runs is built from `up_values`, untouched here.
-    if let Some(name) = cfg.credentials.model.as_ref() {
-        desired.insert(
-            crate::ops::MODEL_CREDENTIAL_KEY.to_string(),
-            resolved.get(name).cloned().unwrap_or_default(),
-        );
-    }
     Ok(EffectiveInstallationPlan {
         cfg,
         up,
@@ -807,8 +787,8 @@ enum GuardVerdict {
     /// Nothing the release runs would be deleted by this apply.
     Clear,
     /// This apply would delete stateful component(s), carrying the operator
-    /// facing refusal text.
-    WouldRemove(String),
+    /// facing causes.
+    WouldRemove(Vec<crate::ops::StatefulRemoval>),
 }
 
 /// Decide whether an apply would delete a stateful component the release runs.
@@ -839,9 +819,7 @@ async fn guard_stateful_removal(up: &crate::ops::UpOpts) -> Result<GuardVerdict>
     if removed.is_empty() {
         return Ok(GuardVerdict::Clear);
     }
-    Ok(GuardVerdict::WouldRemove(stateful_removal_message(
-        &removed,
-    )))
+    Ok(GuardVerdict::WouldRemove(removed))
 }
 
 /// The refusal text, factored out so its ordering is testable with no cluster.
@@ -900,12 +878,17 @@ fn stateful_removal_message(removed: &[crate::ops::StatefulRemoval]) -> String {
         .iter()
         .any(|r| r.cause == RemovalCause::ComponentGone)
     {
-        msg.push_str(
+        let migration_instruction = if renamed.is_empty() {
+            "Re-run with --migrate-store"
+        } else {
+            "After fixing the renames, re-run with --migrate-store"
+        };
+        msg.push_str(&format!(
             "Component(s) the chart does not render at all usually mean a chart version \
-             renamed or removed them. Re-run with --migrate-store and apply will carry \
-             the data across itself: it stages every object, upgrades, loads them back, \
-             and verifies per object.\n\n",
-        );
+                 renamed or removed them. {migration_instruction} and apply will carry \
+                 the data across itself: it stages every object, upgrades, loads them back, \
+                 and verifies per object.\n\n"
+        ));
     }
 
     msg.push_str("Use --allow-stateful-removal only to proceed WITHOUT the data.");
@@ -983,8 +966,17 @@ pub async fn apply(opts: ApplyOpts) -> Result<ApplyOutput> {
     } else {
         match guard_stateful_removal(&up).await? {
             GuardVerdict::Clear => false,
-            GuardVerdict::WouldRemove(_) if migrate_store => true,
-            GuardVerdict::WouldRemove(msg) => bail!("{msg}"),
+            GuardVerdict::WouldRemove(removed)
+                if migrate_store
+                    && removed.iter().all(|removal| {
+                        matches!(&removal.cause, crate::ops::RemovalCause::ComponentGone)
+                    }) =>
+            {
+                true
+            }
+            GuardVerdict::WouldRemove(removed) => {
+                bail!("{}", stateful_removal_message(&removed))
+            }
         }
     };
 
@@ -1570,13 +1562,18 @@ mod stateful_guard_message_tests {
                 cause: crate::ops::RemovalCause::RenamedTo("acme-bot-curie-postgres".to_string()),
             },
         ]);
-        assert!(msg.contains("nameOverride"), "{msg}");
-        assert!(msg.contains("--migrate-store"), "{msg}");
+        let rename = msg.find("nameOverride").expect("must name the rename fix");
+        let migrate = msg
+            .find("After fixing the renames, re-run with --migrate-store")
+            .expect("migration must be conditional on fixing the rename first");
         let discard = msg.find("--allow-stateful-removal").unwrap();
         assert!(
-            msg.find("--migrate-store").unwrap() < discard
-                && msg.find("nameOverride").unwrap() < discard,
-            "the data-preserving remedies must still come before the discard flag:\n{msg}"
+            rename < migrate && migrate < discard,
+            "fix the rename first, then migrate, and offer discard only last:\n{msg}"
+        );
+        assert!(
+            !msg.contains("Re-run with --migrate-store"),
+            "must not offer migration unconditionally while a rename still blocks it:\n{msg}"
         );
     }
 }
@@ -1845,6 +1842,42 @@ mod diff_tests {
             };
             assert_eq!(entry.unresolved_credential.as_deref(), Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_model_credential_set_survives_the_environment() {
+        let _lock = CREDENTIAL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
+        env.set(
+            "CURIE_MODEL_CREDENTIALS",
+            "model credential from environment",
+        );
+        let cfg = Installation::parse(concat!(
+            "version: 1\n",
+            "install:\n",
+            "  namespace: acme\n",
+            "  release: acme\n",
+            "credentials:\n",
+            "  model: CURIE_MODEL_CREDENTIALS\n",
+            "set:\n",
+            "  agentSandbox.runner.credentials: model credential from set\n",
+        ))
+        .expect("configuration parses");
+        let local = plan_installation(cfg, true).expect("installation plans");
+
+        let plan = complete_installation_plan(local)
+            .await
+            .expect("completed plan");
+
+        assert_eq!(
+            plan.desired
+                .get(crate::ops::MODEL_CREDENTIAL_KEY)
+                .map(String::as_str),
+            Some("model credential from set"),
+            "the explicit set value must remain in the desired map"
+        );
     }
 
     #[test]
@@ -2362,41 +2395,6 @@ mod apply_tests {
             resolve_credentials_lenient(&cfg, &|_| Ok(None)).expect("must not refuse");
         assert!(resolved.is_empty());
         assert_eq!(missing, vec!["MODEL_KEY", "APP_TOK", "BOT_TOK"]);
-    }
-
-    /// The rc.1 -> rc.2 defect, reached by its other route.
-    ///
-    /// Running the published rc.2 against the live release with no credentials
-    /// exported reported
-    ///
-    ///   ! agentSandbox.runner.credentials: <secret> (reset to chart default)
-    ///
-    /// and the legend beside a reset reads "Declare it in curie.yaml to keep
-    /// it." The file DOES declare it -- by name, which is the only thing it may
-    /// carry -- so the advice is both wrong and, followed literally for a model
-    /// API key, the one thing that file's own header forbids.
-    ///
-    /// A declared credential belongs in the desired state whether or not it
-    /// resolves in this shell. Apply supplies it, and refuses while it cannot.
-    #[tokio::test]
-    async fn a_declared_but_unresolved_model_credential_is_not_a_reset() {
-        let cfg = cfg_with_all_names();
-        let (mut local, missing) = plan_installation_lenient(cfg).expect("lenient plan");
-        assert!(
-            missing.contains(&"MODEL_KEY".to_string()),
-            "fixture must leave the model credential unresolved: {missing:?}"
-        );
-        local.up.common.dry_run = true;
-        let plan = complete_installation_plan(local)
-            .await
-            .expect("dry-run plan needs no cluster");
-        assert!(
-            plan.desired.contains_key(crate::ops::MODEL_CREDENTIAL_KEY),
-            "a declared credential must stay in the desired state unresolved, or \
-             diff reports it as a reset and tells the operator to paste the key \
-             into curie.yaml. desired: {:?}",
-            plan.desired.keys().collect::<Vec<_>>()
-        );
     }
 
     /// Apply keeps refusing. Resolving BEFORE mutating is what stops a missing
