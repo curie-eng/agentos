@@ -948,7 +948,7 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
     done.push("Try it: in Slack, @mention the bot in that channel (or DM it) and send a");
     done.push("message -- the dispatcher routes it through the worker to your agent.");
     done.push("");
-    for line in troubleshooting_lines(tier, release.as_deref()) {
+    for line in troubleshooting_lines(tier, namespace.as_deref(), release.as_deref()) {
         done.push(line);
     }
     done.push("");
@@ -1223,17 +1223,23 @@ pub(crate) fn planned_prompts(
 /// ones that distinguish the three ways it silently does not: the dispatcher
 /// never connected, the agent was never bound to that channel, or something
 /// earlier in the install is missing.
-pub(crate) fn troubleshooting_lines(tier: Tier, release: Option<&str>) -> Vec<String> {
+pub(crate) fn troubleshooting_lines(
+    tier: Tier,
+    namespace: Option<&str>,
+    release: Option<&str>,
+) -> Vec<String> {
     let mut out = vec!["If the bot does not answer:".to_string()];
     match tier {
         Tier::Cluster => {
+            let ns = namespace.unwrap_or("<namespace>");
             let rel = release.unwrap_or("<release>");
+            let dispatcher = chart_dispatcher_deployment_name(rel);
             out.push(format!(
-                "  1. is the dispatcher connected to Slack?   kubectl logs deploy/{rel}-dispatcher"
+                "  1. is the dispatcher connected to Slack?   kubectl -n {ns} logs deploy/{dispatcher}"
             ));
-            out.push(
-                "  2. did the bind take?                     curie cluster status".to_string(),
-            );
+            out.push(format!(
+                "  2. did the bind take?                     curie cluster status --namespace {ns} --release {rel}"
+            ));
         }
         Tier::Local => {
             out.push("  1. is the dispatcher running?              curie local status".to_string());
@@ -1250,6 +1256,21 @@ pub(crate) fn troubleshooting_lines(tier: Tier, release: Option<&str>) -> Vec<St
             .to_string(),
     );
     out
+}
+
+/// The chart's default `curie.fullname` rule, followed by the dispatcher
+/// suffix from `templates/dispatcher.yaml`. The guided flow only knows the
+/// chosen release, so it intentionally uses the chart's no-override path.
+fn chart_dispatcher_deployment_name(release: &str) -> String {
+    const CHART_NAME: &str = "curie";
+
+    let fullname = if release.contains(CHART_NAME) {
+        release.to_string()
+    } else {
+        format!("{release}-{CHART_NAME}")
+    };
+    let fullname = fullname.chars().take(63).collect::<String>();
+    format!("{}-dispatcher", fullname.trim_end_matches('-'))
 }
 
 fn ensure_secret_available(
@@ -2681,17 +2702,45 @@ mod tests {
     /// The closing view has to cover the ways it silently does NOT work, or it
     /// is only useful when nothing went wrong.
     #[test]
-    fn the_close_names_a_command_for_each_silent_failure() {
-        let lines = troubleshooting_lines(Tier::Cluster, Some("acme-bot")).join("\n");
-        assert!(lines.contains("acme-bot-dispatcher"), "{lines}");
-        assert!(lines.contains("curie cluster status"), "{lines}");
+    fn the_cluster_close_targets_the_rendered_dispatcher_in_the_chosen_namespace() {
+        let namespace = "acme-system";
+        let release = "acme-production";
+        let chart_name = include_str!("../../charts/curie/Chart.yaml")
+            .lines()
+            .find_map(|line| line.strip_prefix("name: "))
+            .expect("chart name");
+        let chart_helpers = include_str!("../../charts/curie/templates/_helpers.tpl");
+        assert!(
+            chart_helpers.contains("{{- if contains $name .Release.Name -}}"),
+            "the expected deployment must follow curie.fullname"
+        );
+        assert!(
+            chart_helpers.contains(
+                "{{- printf \"%s-%s\" .Release.Name $name | trunc 63 | trimSuffix \"-\" -}}"
+            ),
+            "the expected deployment must follow curie.fullname"
+        );
+        let rendered_dispatcher = format!("{release}-{chart_name}-dispatcher");
+        let lines = troubleshooting_lines(Tier::Cluster, Some(namespace), Some(release)).join("\n");
+        assert!(
+            lines.contains(&format!(
+                "kubectl -n {namespace} logs deploy/{rendered_dispatcher}"
+            )),
+            "{lines}"
+        );
+        assert!(
+            lines.contains(&format!(
+                "curie cluster status --namespace {namespace} --release {release}"
+            )),
+            "{lines}"
+        );
         assert!(lines.contains("curie doctor"), "{lines}");
     }
 
     /// And it must not overclaim. The commands succeeding is not a round trip.
     #[test]
     fn the_close_does_not_claim_a_round_trip_was_proven() {
-        let lines = troubleshooting_lines(Tier::Local, None).join("\n");
+        let lines = troubleshooting_lines(Tier::Local, None, None).join("\n");
         assert!(
             lines.contains("not the same as a round trip"),
             "must say what was NOT verified: {lines}"
@@ -2702,7 +2751,7 @@ mod tests {
     /// a usable command rather than an empty deployment reference.
     #[test]
     fn a_missing_release_name_still_renders_a_usable_hint() {
-        let lines = troubleshooting_lines(Tier::Cluster, None).join("\n");
+        let lines = troubleshooting_lines(Tier::Cluster, None, None).join("\n");
         assert!(lines.contains("<release>"), "{lines}");
     }
 
