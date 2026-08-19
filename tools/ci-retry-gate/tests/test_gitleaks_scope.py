@@ -348,7 +348,26 @@ def test_gitleaks_config_keeps_the_slack_identifier_guards() -> None:
     slack_rule = next(rule for rule in config["rules"] if rule["id"] == "slack-conversation-id")
     assert slack_rule["regex"] == r"\b[CGD][0-9][A-Z0-9]{7,9}\b"
 
-    assert r"\bC0EXAMPLE[0-9]\b" in config["allowlist"]["regexes"]
+    # Read the allowlist for what it COVERS, not for one literal spelling. The
+    # CLI validates all three conversation prefixes, so a test needing a fake
+    # DM or private group id has to be able to write one without reddening the
+    # scan, and nothing that merely looks like an id may ride along.
+    rule = re.compile(str(slack_rule["regex"]))
+    allowed = [re.compile(str(pattern)) for pattern in config["allowlist"]["regexes"]]
+
+    for example in ("C0EXAMPLE1", "D0EXAMPLE1", "G0EXAMPLE1"):
+        assert rule.search(example), f"{example} is not the shape the rule catches"
+        assert any(pattern.search(example) for pattern in allowed), (
+            f"{example} is not allowlisted, so any test using it reddens the scan"
+        )
+
+    # Split so no literal here reaches the rule's shape; rejoining is the defect
+    # this file's sibling test already had to fix once.
+    not_an_example = "C0" + "NOTLISTED"
+    assert rule.search(not_an_example), "the negative control must be a real match first"
+    assert not any(pattern.search(not_an_example) for pattern in allowed), (
+        "the EXAMPLE allowlist must not wave through an ordinary looking id"
+    )
 
     assert (
         "Requiring the digit is what separates them from ordinary"
