@@ -28,6 +28,15 @@
 #                         its own local and cluster rungs, so a single
 #                         CURIE_E2E_LIVE=1 now runs every rung live.
 #   CURIE_BIN           path to a prebuilt curie binary (skip cargo build)
+#   CURIE_E2E_BUNDLE    absolute path to an EXISTING bundle directory to drive
+#                         instead of scaffolding one. Unset by default, and
+#                         unset this script behaves exactly as it always has.
+#                         cli/scripts/e2e-ladder.sh sets it so rung 1 drives the
+#                         same artifact and the same case set as every later
+#                         rung, which is what makes the ladder's cross-rung
+#                         identity comparison mean anything. A value that is not
+#                         a directory is a hard error, never a silent fallback to
+#                         the scaffold.
 set -euo pipefail
 
 CLI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,22 +73,88 @@ else
 fi
 
 WORKDIR="$(mktemp -d)"
+
+# Crash-safety state for the #1087 immutability proof further down, which
+# deliberately MUTATES a SKILL.md inside the bundle under test. Declared here,
+# BEFORE the trap is installed, because the trap reads them: under `set -u` a
+# trap that fires before these are assigned would itself die on an unbound
+# variable and skip the whole teardown it exists to perform.
+SKILL_MUTATION_PENDING=0
+SKILL_FILE_PATH=""
+SKILL_FILE_BACKUP=""
+
 cleanup() {
+    # Capture the real status first: everything below is best-effort, and a
+    # teardown command's own status must not become this script's exit code.
+    local rc=$?
+    # Restore BEFORE the `rm -rf` below, because the `cp -p` backup lives under
+    # $WORKDIR: deleting the workdir first would destroy the only copy that can
+    # put the caller's file back. The window this covers is every failure path
+    # between the append and the successful restore -- and with
+    # CURIE_E2E_BUNDLE set that file belongs to a directory this script does NOT
+    # own, so leaving the marker (and, worse, a shifted mtime, which
+    # `pack_tar_gz` folds into the bundle digest) would corrupt the caller's
+    # bundle and make a LATER ladder run fail as if the product were broken.
+    if [[ "$SKILL_MUTATION_PENDING" == "1" ]]; then
+        if [[ -f "$SKILL_FILE_BACKUP" ]]; then
+            cp -p "$SKILL_FILE_BACKUP" "$SKILL_FILE_PATH" || true
+            echo "cleanup: restored $SKILL_FILE_PATH from the pre-mutation backup (content and mtime)" >&2
+        else
+            echo "cleanup: WARNING -- $SKILL_FILE_PATH was mutated but its backup is gone; the file still carries the E2E marker." >&2
+        fi
+        SKILL_MUTATION_PENDING=0
+    fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    if [[ "$rc" -ne 0 && -n "${CURIE_E2E_BUNDLE:-}" ]]; then
+        # Failure path against a caller-supplied bundle only. `skill up` writes
+        # `.curie/runner.json` plus a materialized `.curie/snapshots/<digest>/`
+        # inside the bundle directory, and the success path's final `skill down`
+        # releases them (and asserts the snapshot root is empty). On a failure
+        # that never reaches it, this removes them directly rather than calling
+        # `skill down`: the container is already force-removed above, so the
+        # only thing left to release is these files, and the failure may well BE
+        # a broken `skill down`. Scoped to the caller-supplied case because the
+        # scaffolded bundle lives inside $WORKDIR, which the `rm -rf` below
+        # already takes, and to a non-zero exit so the success path is untouched.
+        rm -rf "${CURIE_E2E_BUNDLE}/.curie"
+    fi
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 echo
-echo "=== curie init --from-spec (non-interactive, agent-authored spec) ==="
-# AC #2: a coding agent writes a spec, the CLI scaffolds a runnable bundle from
-# it with zero prompts, and the spec-scaffolded evals/cases.json runs on the eval
-# path. The grader is falsifiable (it requires the agent to name itself), NOT
-# tuned to the fake model's canned "all done" reply: a grader written to match
-# the fake manufactures a green, and CI carrying one is exactly why #612 went
-# unnoticed. Under --fake-model the grader is never consulted at all -- the run
-# reports the non-graded plumbing_ok (ADR-0055).
-cat > "$WORKDIR/agent-spec.json" <<'EOF'
+echo "=== Resolve the bundle under test ==="
+if [[ -n "${CURIE_E2E_BUNDLE:-}" ]]; then
+    # Fail loudly rather than fall back: a typo silently re-scaffolding
+    # deal-desk would re-open the very skill-vs-local bundle divergence the
+    # ladder's identity comparison exists to close, and it would do so as a
+    # green run.
+    if [[ ! -d "$CURIE_E2E_BUNDLE" ]]; then
+        echo "error: CURIE_E2E_BUNDLE is set to '$CURIE_E2E_BUNDLE', which is not a directory." >&2
+        echo "fix: point it at an existing bundle directory, or unset it to scaffold deal-desk from the inline spec." >&2
+        exit 1
+    fi
+    BUNDLE_DIR="$CURIE_E2E_BUNDLE"
+    echo "bundle: supplied by the caller (CURIE_E2E_BUNDLE), scaffold skipped: $BUNDLE_DIR"
+else
+    BUNDLE_DIR="$WORKDIR/deal-desk"
+    echo "bundle: scaffolded here from the inline agent spec: $BUNDLE_DIR"
+
+    echo
+    echo "=== curie init --from-spec (non-interactive, agent-authored spec) ==="
+    # AC #2: a coding agent writes a spec, the CLI scaffolds a runnable bundle
+    # from it with zero prompts, and the spec-scaffolded evals/cases.json runs on
+    # the eval path. This leg is #325's acceptance evidence and is deliberately
+    # kept as the STANDALONE behavior of this script -- the ladder supplies its
+    # own common bundle instead, so the ladder run no longer carries #325's
+    # scaffold evidence and a bare `bash cli/scripts/e2e.sh` (plus CI's own
+    # --from-spec unit coverage) does.
+    # The grader is falsifiable (it requires the agent to name itself), NOT
+    # tuned to the fake model's canned "all done" reply: a grader written to match
+    # the fake manufactures a green, and CI carrying one is exactly why #612 went
+    # unnoticed. Under --fake-model the grader is never consulted at all -- the run
+    # reports the non-graded plumbing_ok (ADR-0055).
+    cat > "$WORKDIR/agent-spec.json" <<'EOF'
 {
   "name": "deal-desk",
   "description": "Prices and reviews deal desk requests.",
@@ -100,16 +175,23 @@ cat > "$WORKDIR/agent-spec.json" <<'EOF'
   ]
 }
 EOF
-"$BIN" init --from-spec "$WORKDIR/agent-spec.json" --dir "$WORKDIR/deal-desk"
+    "$BIN" init --from-spec "$WORKDIR/agent-spec.json" --dir "$BUNDLE_DIR"
+fi
 
-cd "$WORKDIR/deal-desk"
+cd "$BUNDLE_DIR"
 
-# A second suite for the explicit `--cases` leg. Its graders are real domain
-# graders, deliberately NOT matched to the fake-model script's canned "all done"
-# reply: this run is offline under --fake-model, so the graders are never
-# consulted and the suite reports plumbing_ok. Writing them to match the fake
-# would only re-create the bypass that let #612 ship green.
-cat > evals/e2e-cases.json <<'EOF'
+if [[ -z "${CURIE_E2E_BUNDLE:-}" ]]; then
+    # Standalone only. Writing a file under evals/ into a CALLER-SUPPLIED bundle
+    # would change the packed archive and therefore the bundle digest every
+    # ladder rung asserts on (`.curie` is excluded from the pack,
+    # cli/src/bundle.rs; `evals/` is not).
+    #
+    # A second suite for the explicit `--cases` leg. Its graders are real domain
+    # graders, deliberately NOT matched to the fake-model script's canned "all done"
+    # reply: this run is offline under --fake-model, so the graders are never
+    # consulted and the suite reports plumbing_ok. Writing them to match the fake
+    # would only re-create the bypass that let #612 ship green.
+    cat > evals/e2e-cases.json <<'EOF'
 {
   "name": "e2e",
   "cases": [
@@ -126,6 +208,7 @@ cat > evals/e2e-cases.json <<'EOF'
   ]
 }
 EOF
+fi
 
 echo
 if [[ "$LIVE" == "1" ]]; then
@@ -192,18 +275,46 @@ echo "initial bundle digest: $DIGEST_1"
 
 echo
 echo "=== #1087 AC1: edit the source after boot, confirm the running container keeps the ORIGINAL snapshot ==="
-SKILL_FILE_PATH="$WORKDIR/deal-desk/skills/deal-desk/SKILL.md"
-SKILL_FILE_ORIGINAL="$(cat "$SKILL_FILE_PATH")"
+# Derived from the bundle, not hardcoded to `deal-desk`: a caller-supplied
+# bundle names its skill directory whatever it likes. First match in sorted
+# order, so the choice is deterministic.
+SKILL_FILE_PATH=""
+while IFS= read -r CANDIDATE; do
+    if [[ -z "$SKILL_FILE_PATH" ]]; then
+        SKILL_FILE_PATH="$CANDIDATE"
+    fi
+done < <(find "$BUNDLE_DIR/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort)
+if [[ -z "$SKILL_FILE_PATH" ]]; then
+    echo "error: no skills/*/SKILL.md exists under $BUNDLE_DIR, so the #1087 immutability proof has nothing to mutate." >&2
+    exit 1
+fi
+# The same file inside the runner's read-only /plugin mount, so the mount check
+# below follows the file this proof actually edited.
+SKILL_FILE_REL="${SKILL_FILE_PATH#"$BUNDLE_DIR"/}"
+# `cp -p` into $WORKDIR (outside the bundle, so it never enters the pack), never
+# `$(cat ...)` plus `printf '%s\n'`: that round trip strips trailing newlines and
+# adds exactly one back, which is byte-lossy for any file not ending in exactly
+# one newline, and it gives the restored file a NEW mtime. Both matter now --
+# `pack_tar_gz` embeds per-file mtime (cli/src/bundle.rs:181-184), so a lossy or
+# mtime-shifting restore silently changes the bundle digest the ladder's later
+# rungs assert against, and the failure would read as a product bug.
+SKILL_FILE_BACKUP="$WORKDIR/skill-md-original"
+cp -p "$SKILL_FILE_PATH" "$SKILL_FILE_BACKUP"
 MARKER="e2e-post-boot-source-edit-$$"
+# Claim the mutation BEFORE making it, never after: a failure (or a signal)
+# inside the append itself is exactly the case that has to be recoverable, and a
+# flag set afterwards would leave that window uncovered. The EXIT trap restores
+# from $SKILL_FILE_BACKUP whenever this is still 1.
+SKILL_MUTATION_PENDING=1
 echo "$MARKER" >> "$SKILL_FILE_PATH"
 
-MOUNTED_SKILL_MD="$(docker exec "$CONTAINER" cat /plugin/skills/deal-desk/SKILL.md)"
+MOUNTED_SKILL_MD="$(docker exec "$CONTAINER" cat "/plugin/$SKILL_FILE_REL")"
 if grep -qF "$MARKER" <<<"$MOUNTED_SKILL_MD"; then
-    echo "error: the running container's /plugin/skills/deal-desk/SKILL.md contains the marker '$MARKER', added to the HOST source after boot." >&2
+    echo "error: the running container's /plugin/$SKILL_FILE_REL contains the marker '$MARKER', added to the HOST source after boot." >&2
     echo "expected: the runner keeps executing the immutable snapshot it packed at \`skill up\` time, unaffected by a later host edit." >&2
     exit 1
 fi
-echo "confirmed: the running container's /plugin mount does not see the post-boot host edit"
+echo "confirmed: the running container's /plugin mount does not see the post-boot host edit ($SKILL_FILE_REL)"
 
 STATUS_JSON_1B="$("$BIN" skill status --json)"
 DIGEST_1B="$(printf '%s' "$STATUS_JSON_1B" | python3 -c 'import json,sys; print(json.load(sys.stdin)["bundle_digest"])')"
@@ -219,14 +330,71 @@ echo "=== curie skill message (synthetic event, streamed NDJSON reply) ==="
 "$BIN" skill message "@curie can we approve the Meridian deal at 18% discount?"
 
 echo
-echo "=== curie skill eval (spec-scaffolded evals/cases.json) ==="
-# No --cases: exercise the evals/cases.json the --from-spec scaffold wrote,
-# proving spec -> bundle -> skill eval passes end to end offline (AC #2).
-"$BIN" skill eval
+echo "=== curie skill eval --json (the bundle's own evals/cases.json) ==="
+# No --cases: exercise the bundle's own evals/cases.json. Standalone that is the
+# suite the --from-spec scaffold wrote, proving spec -> bundle -> skill eval
+# passes end to end offline (AC #2); under a caller-supplied bundle it is the
+# ladder's common suite, which is what makes the suite common across rungs with
+# no second env var. --json puts the payload on stdout and the human report on
+# stderr, so ONE run gives both the readable output and the machine-readable
+# rows the assertions below read.
+EVAL_JSON="$("$BIN" --json skill eval)"
+printf '%s\n' "$EVAL_JSON"
+# The skill tier is the one rung that reads its case ids back directly: its rows
+# carry `id` even on the fake model, because a fake turn is reported as the
+# non-graded third state `plumbing_ok` (ADR-0055) rather than being skipped. So
+# assert the ids ARE the bundle's ids, and assert the fake/live grading posture
+# positively: sealed means nothing was graded, live means everything was.
+if [[ "$LIVE" == "1" ]]; then
+    EXPECT_PLUMBING=0
+else
+    EXPECT_PLUMBING=all
+fi
+printf '%s' "$EVAL_JSON" | python3 -c '
+import json, sys
+payload = json.loads(sys.stdin.read())
+expect_plumbing = sys.argv[1]
+suite = json.load(open(sys.argv[2]))
+expected_ids = sorted(c["id"] for c in suite["cases"])
+reported_ids = sorted(c["id"] for c in payload["cases"])
+if reported_ids != expected_ids:
+    sys.exit(
+        "error: skill eval graded case ids %s; the bundle under test declares %s.\n"
+        "expected: the eval path runs the very suite that ships inside the bundle."
+        % (",".join(reported_ids), ",".join(expected_ids))
+    )
+total, passed, failed, plumbing = (
+    payload["total"], payload["passed"], payload["failed"], payload["plumbing_ok"]
+)
+if expect_plumbing == "all":
+    if not (plumbing == total and passed == 0 and failed == 0):
+        sys.exit(
+            "error: a sealed (fake-model) run must report every case as the non-graded "
+            "plumbing_ok and grade nothing; got total=%d passed=%d failed=%d plumbing_ok=%d.\n"
+            "expected: ADR-0055/#612 -- a fake turn returns one canned reply whatever the "
+            "input, so a graded verdict on it is manufactured."
+            % (total, passed, failed, plumbing)
+        )
+elif plumbing != 0:
+    sys.exit(
+        "error: a live run must grade every case, but %d of %d were reported as the "
+        "non-graded plumbing_ok, so the run was sealed against the fake model."
+        % (plumbing, total)
+    )
+print(
+    "confirmed: skill eval ran the case ids the bundle declares (%s) with total=%d passed=%d "
+    "failed=%d plumbing_ok=%d" % (",".join(reported_ids), total, passed, failed, plumbing)
+)
+' "$EXPECT_PLUMBING" "$BUNDLE_DIR/evals/cases.json"
 
-echo
-echo "=== curie skill eval (explicit cases file) ==="
-"$BIN" skill eval --cases evals/e2e-cases.json
+if [[ -z "${CURIE_E2E_BUNDLE:-}" ]]; then
+    echo
+    echo "=== curie skill eval (explicit cases file) ==="
+    # Standalone only, paired with the guard on the heredoc that writes this
+    # file: it does not exist in a caller-supplied bundle, and creating it there
+    # would move that bundle's packed digest.
+    "$BIN" skill eval --cases evals/e2e-cases.json
+fi
 
 echo
 echo "=== curie skill down ==="
@@ -251,12 +419,15 @@ echo "confirmed: re-up on changed source produced a new bundle digest ($DIGEST_1
 
 echo
 echo "=== restore the source and tear down the second runner ==="
-printf '%s\n' "$SKILL_FILE_ORIGINAL" > "$SKILL_FILE_PATH"
+cp -p "$SKILL_FILE_BACKUP" "$SKILL_FILE_PATH"
+# Released only once the restore actually succeeded, so the trap does not skip a
+# restore that never happened (and, on the success path, does not repeat one).
+SKILL_MUTATION_PENDING=0
 "$BIN" skill down
 
 echo
 echo "=== #1087: confirm teardown released the bundle snapshot ==="
-SNAPSHOT_ROOT="$WORKDIR/deal-desk/.curie/snapshots"
+SNAPSHOT_ROOT="$BUNDLE_DIR/.curie/snapshots"
 if [[ -d "$SNAPSHOT_ROOT" ]]; then
     REMAINING="$(find "$SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1)"
     if [[ -n "$REMAINING" ]]; then

@@ -16,6 +16,7 @@ import contextlib
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import aiohttp
 import pytest
@@ -265,6 +266,8 @@ class FakeK8s:
             name=claim.name,
             ready=claim.ready,
             sandbox_name=claim.sandbox_name if claim.ready else None,
+            # This suite never reaps; the claim is simply as new as it looks.
+            created_at=datetime.now(UTC),
         )
 
     def delete_claim(self, name: str) -> None:

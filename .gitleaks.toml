@@ -174,14 +174,6 @@ stopwords = [
   "C000000S03",
   "C000000S04",
   "C000000S05",
-  # S06 to S09 exist only in history: the per-agent secret-delivery work
-  # introduced them and later edited them away, but gitleaks scans every
-  # commit, so an id absent from the tree still fails the scan forever.
-  # Registering them is the only fix that does not rewrite history.
-  "C000000S06",
-  "C000000S07",
-  "C000000S08",
-  "C000000S09",
   "C000000X01",
   "C0000BND1",
   "C0000BND2",
@@ -223,12 +215,12 @@ stopwords = [
   "C0WRONG01",
   "C9999ZZZZ",
   # The channel-neutral agent_channels work (#1491) scrubbed these from the
-  # tree, but gitleaks scans every commit, so the fixtures the seven commits
-  # behind that change introduced still fail the full-history scan on every
-  # push to main. Registering them is the same remedy the S06-to-S09 note
-  # above records, for the same reason: it is the only fix that does not
-  # rewrite history. Every one clears the bar this list sets -- each spells a
-  # word, repeats a character, or is mostly zeroes.
+  # tree, but they survive in commits on an unmerged branch. A push scan no
+  # longer reaches them: #1592 scoped push-event runs to the pushed
+  # branch's own history. The weekly scheduled sweep still scans every ref,
+  # so these entries stay registered rather than being deleted. Every one
+  # clears the bar this list sets -- each spells a word, repeats a
+  # character, or is mostly zeroes.
   "C0000ADD01",
   "C0000DEL01",
   "C0000DEL02",

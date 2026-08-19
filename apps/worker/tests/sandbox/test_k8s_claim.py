@@ -9,11 +9,13 @@ named entries fails ``test_bundle_ref_targets_init_containers_by_name``.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
     KubernetesSandboxClient,
+    _claim_view,
 )
 
 
@@ -101,6 +103,40 @@ def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
     entries = _env_entries(api)
     assert {"name": "CURIE_RUNNER_TOKEN", "value": "tok-26"} in entries
     assert all(e.get("name") != "CURIE_CREDENTIALS" for e in entries)
+
+
+def test_claim_view_surfaces_the_creation_timestamp() -> None:
+    # The reaper's bind-window grace is only as good as the age the real
+    # cluster adapter reports. An adapter that never surfaced the timestamp
+    # would leave every claim at unknown age, which spares every orphan and
+    # disables reaping on the tier that actually runs in production -- and the
+    # substrate's own tests, which drive an in-memory fake, would not see it.
+    view = _claim_view(
+        {"metadata": {"name": "claim-1", "creationTimestamp": "2026-08-16T12:00:00Z"}}
+    )
+    created = view.created_at
+    assert created is not None
+    assert created.utcoffset() == timedelta(0)  # tz-aware UTC, never naive
+    assert created == datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+
+    # A zoneless instant is read AS UTC, never as host-local: interpreting it
+    # in the host's zone shifts the claim's age by that offset, and on a
+    # west-of-UTC host that makes a young claim look old enough to reap.
+    naive = _claim_view(
+        {"metadata": {"name": "claim-3", "creationTimestamp": "2026-08-16T12:00:00"}}
+    )
+    assert naive.created_at == datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+
+    # A claim the cluster gave no creation instant for reads as unknown age.
+    absent = _claim_view({"metadata": {"name": "claim-2"}})
+    assert absent.created_at is None
+
+    # And an unparseable one, so one malformed object cannot raise inside the
+    # maintenance tick and silently end reaping.
+    malformed = _claim_view(
+        {"metadata": {"name": "claim-4", "creationTimestamp": "not-a-timestamp"}}
+    )
+    assert malformed.created_at is None
 
 
 def test_connector_secrets_are_never_written_to_the_claim() -> None:

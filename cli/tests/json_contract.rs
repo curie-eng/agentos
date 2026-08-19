@@ -1251,6 +1251,7 @@ fn credentialless_diff_without_a_release_does_not_claim_every_declared_value_is_
         &helm,
         r##"#!/bin/sh
 if [ "$1" = get ] && [ "$2" = values ]; then
+    printf '%s\n' 'Error: release: not found' >&2
     exit 1
 fi
 if [ "$1" = list ]; then

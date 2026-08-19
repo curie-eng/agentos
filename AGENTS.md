@@ -410,6 +410,59 @@ just that unit tests pass.
   `scripts/chart-runtime-e2e.sh`) is the one-command way to install a trimmed
   slice, run the init containers, and exec-assert.
 
+### The tier decision rule
+
+Applicability is a recorded decision, not a matter of taste. Every
+behavior-bearing change classifies all six tiers below as **required** or
+**not applicable**, and a not-applicable row states a concrete reason naming
+the surface the change does not reach. "Unit tests cover it", "low risk", "CI
+is green", and "no time" are not reasons.
+
+A behavior-bearing change has at least one required tier, on the quick path as
+much as the build path. A classification that marks all six not applicable is
+a claim that the change alters no runtime behavior on any surface: either say
+that plainly and carry no tier, or the tier set is wrong for this change and
+the maintainer decides, but do not proceed on all six not applicable while
+still calling the change behavior-bearing. A change that genuinely bears no
+runtime behavior, which is the documentation, ADR, and strictly
+behavior-preserving refactor case, records that reason once and is exempt,
+including on the build path. Promoting a tier to required is always allowed;
+dropping a required tier is not.
+
+Classification is taken at triage and re-checked whenever the diff grows past
+the scope that was triaged. A tier that becomes reachable is promoted to
+required and proved, not carried on the original classification.
+
+| Tier | Required when the change reaches | Command |
+| --- | --- | --- |
+| skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
+| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
+| local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
+| cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
+| live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
+| external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape | drive the real integration; a replayed fixture or a fake does not close this tier |
+
+### Evidence per acceptance criterion
+
+Every meaningful acceptance criterion needs two observations, not one.
+
+- **Positive proof.** The exact command run against the required tier, the
+  candidate commit it ran against, and the observed outcome showing the
+  criterion met.
+- **A falsifiable negative, or a second independent path.** The same surface
+  observed refusing, failing, or reporting absent once the criterion's
+  precondition is removed: feed the guard a violating input, unset the
+  credential, drop the flag, omit the manifest entry. Where no negative is
+  constructible, assert the same outcome through a second independent path
+  instead. A positive alone cannot separate a working change from a check that
+  would have passed regardless.
+
+Record both against the run, per the run state contract in
+`.claude/skills/implement/SKILL.md`, and expose them in the pull request
+through the checklist in `.github/PULL_REQUEST_TEMPLATE.md`. A required tier
+with no passing evidence record blocks completion; it is reported as a blocker,
+not carried as a note.
+
 ## Playwright: two modes
 
 - **The merge gate is the committed E2E suite** under `apps/ui` (Playwright,

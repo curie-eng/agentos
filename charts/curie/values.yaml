@@ -71,7 +71,12 @@ langfuse:
   nextauthUrl: http://localhost:23000
   # Dev-only secret material. Override in prod or set `existingSecret` to a
   # Secret carrying keys: langfuseEncryptionKey, langfuseSalt,
-  # langfuseNextauthSecret, langfuseInitProjectSecretKey, langfuseInitUserPassword.
+  # langfuseNextauthSecret, langfuseInitProjectSecretKey, langfuseInitUserPassword,
+  # otlpAuthHeader. That last key is the full `Authorization` header value the
+  # OTel Collector sends to Langfuse, `Basic <base64(projectPublicKey:projectSecretKey)>`;
+  # on the existingSecret path the chart no longer derives it, so a Secret without
+  # it leaves the collector pod in CreateContainerConfigError (set
+  # otelCollector.otlpAuthHeader instead if you prefer to keep it in values).
   # ENCRYPTION_KEY must be 64 hex chars (openssl rand -hex 32).
   encryptionKey: "0000000000000000000000000000000000000000000000000000000000000000"
   salt: dev-salt-change-me
@@ -476,9 +481,15 @@ inference:
 otelCollector:
   deploy: true
   image: otel/opentelemetry-collector-contrib:0.119.0
-  # base64("<publicKey>:<secretKey>"). With chart managed init credentials,
-  # an empty value is derived from the resolved project key at render time. With
-  # langfuse.existingSecret, provide a matching explicit value.
+  # Full `Authorization` header, `Basic <base64(publicKey:secretKey)>`, in three
+  # branches. Set here, it always wins and is stored in the chart-managed Secret.
+  # Left empty with chart managed init credentials, it is derived from the
+  # resolved project key at render time, so a sealed install ships the generated
+  # credential. Left empty with langfuse.existingSecret set, the collector reads
+  # an otlpAuthHeader key from that Secret and the chart emits none of its own --
+  # that Secret must carry the key or the collector pod fails with
+  # CreateContainerConfigError. Setting it to the published dev header trips
+  # security.checkDefaultCredentials.
   otlpAuthHeader: ""
   service:
     grpcPort: 4317
@@ -1376,11 +1387,18 @@ security:
   # render if a Langfuse bootstrap identity (langfuse.init.projectSecretKey /
   # langfuse.init.userPassword) still carries the published dev default from this
   # file -- the published admin password is a Langfuse admin-takeover risk on a
-  # reachable UI, and the project secret key also feeds the OTel Collector auth
-  # header. The check compares chart inputs before managed secret resolution.
-  # Clear the gate by overriding those values or supplying
-  # langfuse.existingSecret (the secretKeyRef escape, keys langfuseInitProjectSecretKey
-  # + langfuseInitUserPassword). Off by default so the flagship zero-secret bare
+  # reachable UI, and on the non-existingSecret path the project secret key also
+  # feeds the OTel Collector auth header. These two checks compare chart inputs
+  # before managed secret resolution. Clear them by overriding those values or by
+  # pointing langfuse.existingSecret at a Secret this chart does not manage (the
+  # secretKeyRef escape, keys langfuseInitProjectSecretKey
+  # + langfuseInitUserPassword + otlpAuthHeader). Naming the chart's own Secret does
+  # NOT clear them: the chart still fills those keys from these very values, so the
+  # published defaults would still reach Langfuse and the collector. A third check
+  # refuses the published dev header on whatever the collector would actually send,
+  # whether set directly via otelCollector.otlpAuthHeader or composed by the chart
+  # from the langfuse.init keys, and is NOT cleared by langfuse.existingSecret,
+  # since that header reaches the collector on every path. Off by default so the flagship zero-secret bare
   # install stays green and the dev/e2e overlays render unchanged; flip it on for a
   # shared/production cluster. (#57 will extend this same gate to the remaining
   # chart credentials once its design pass lands.)

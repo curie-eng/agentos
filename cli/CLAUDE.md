@@ -215,10 +215,14 @@ the environment.
 Cold-start parity ladder (issue #690, `curie dev e2e-ladder` ->
 `cli/scripts/e2e-ladder.sh`) -- an E2E test, same as the scripted E2E above, not
 the falsifiability gate below it. It chains three rungs: rung 1 delegates to
-`e2e.sh` unchanged; rung 2 drives `local up --minimal` -> `local deploy` ->
-`local message` (reply asserted) -> `local down`, against `compose.dev.yaml`;
-rung 3 drives `cluster deploy` -> `cluster message` against a pre-installed
-release, a real round trip with no manual port-forward. A fourth,
+`e2e.sh`, passing it the common `examples/weather` bundle via
+`CURIE_E2E_BUNDLE` (a standalone `e2e.sh` run keeps its own `--from-spec`
+scaffold when the var is unset); rung 2 drives `local up --minimal` ->
+`local deploy` -> `local message` (reply asserted) -> `local down`, against
+`compose.dev.yaml`; rung 3 drives `cluster deploy` -> `cluster message`
+against a pre-installed release, a real round trip with no manual
+port-forward. The ladder asserts one bundle identity, one eval suite, and one
+model mode across every rung and fails on divergence. A fourth,
 separately-named `local-release` rung (issue #695) repeats rung 2's exact round
 trip against `compose.release.yaml` instead -- the file
 `compose/generate_release_compose.py` derives from `compose.dev.yaml` and the
