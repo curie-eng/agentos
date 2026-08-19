@@ -69,6 +69,16 @@ An installation that fails ADR 0050 validation or cannot load its policy has no
 posture result because it does not have an effective policy to classify. A
 resolver reports that configuration error rather than assigning a name.
 
+### Worked example
+
+Assume at least one manifest gate and a nonempty configured allowlist. Every
+manifest declared gate is armed, the manifest opts those gates into grantability,
+egress uses its configured allowlist, and no operator only gate is present. The
+ordered resolver returns **Standard** exactly once. Strict fails because
+grantability is nonempty and egress is nonempty. Standard matches because every
+effective armed gate is manifest declared, so evaluation stops before
+Permissive.
+
 ## Consequences
 
 1. A resolver can hand compute one posture name from its inputs without relying
@@ -77,8 +87,6 @@ resolver reports that configuration error rather than assigning a name.
    the operator half of ADR 0050's union.
 3. The three names remain reporting only. This ADR authorizes no resolver,
    enforcement, or configuration change.
-4. ADR 0088 remains an immutable Accepted record even though its body says it
-   remains Draft until maintainers approve the identity modes.
 
 ## Alternatives considered
 
