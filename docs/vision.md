@@ -79,6 +79,10 @@ Six commitments that should hold across every feature we build:
   human at a prompt. Commands are structured, non-interactive, idempotent, and
   self-describing, and the harness tells the agent exactly how to use it, so a
   coding agent can drive the whole loop and a human rarely needs to.
+  That agent-facing CLI contract, including ADR-0041 parity, structured JSON
+  result bodies, and semantic exit classes, applies to the skill, local, and
+  cluster product tiers. The `curie dev` namespace is internal contributor
+  tooling outside that contract, not a fourth product tier.
   The guided walkthrough, invoked by `curie` with no arguments, is a committed
   surface beside the agent facing CLI, so developer cold start work is on
   strategy.
