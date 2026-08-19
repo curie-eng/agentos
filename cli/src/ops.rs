@@ -2447,10 +2447,16 @@ struct PriorityClassOwner {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum PriorityClassOwnership {
+    Absent,
+    Existing(Option<PriorityClassOwner>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct PriorityClassConflict {
     role: PriorityClassRole,
     name: String,
-    owner: PriorityClassOwner,
+    owner: Option<PriorityClassOwner>,
 }
 
 fn priority_class_name_from_render(
@@ -2587,7 +2593,7 @@ fn priority_class_metadata_value<'a>(
     }
 }
 
-async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> {
+async fn priority_class_owner(name: &str) -> Result<PriorityClassOwnership> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -2608,7 +2614,7 @@ async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> 
         ));
     }
     if out.trim().is_empty() {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Absent);
     }
     let value: serde_json::Value = serde_json::from_str(out.trim())
         .map_err(|_| priority_class_read_error(name, "kubectl returned invalid JSON", false))?;
@@ -2636,33 +2642,40 @@ async fn priority_class_owner(name: &str) -> Result<Option<PriorityClassOwner>> 
     let labels = priority_class_metadata_map(metadata, "labels", name)?;
     if priority_class_metadata_value(labels, "app.kubernetes.io/managed-by", name)? != Some("Helm")
     {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     }
     let annotations = priority_class_metadata_map(metadata, "annotations", name)?;
     let Some(release) =
         priority_class_metadata_value(annotations, "meta.helm.sh/release-name", name)?
     else {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     };
     let Some(namespace) =
         priority_class_metadata_value(annotations, "meta.helm.sh/release-namespace", name)?
     else {
-        return Ok(None);
+        return Ok(PriorityClassOwnership::Existing(None));
     };
-    Ok(Some(PriorityClassOwner {
+    Ok(PriorityClassOwnership::Existing(Some(PriorityClassOwner {
         release: release.to_string(),
         namespace: namespace.to_string(),
-    }))
+    })))
 }
 
 async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
     let rendered = rendered_priority_classes(&opts.chart, &opts.common, plan).await?;
     let mut conflicts = Vec::new();
     for (role, name) in rendered {
-        let Some(owner) = priority_class_owner(&name).await? else {
-            continue;
+        let owner = match priority_class_owner(&name).await? {
+            PriorityClassOwnership::Absent => continue,
+            PriorityClassOwnership::Existing(owner) => owner,
         };
-        if owner.release != opts.common.release || owner.namespace != opts.common.namespace {
+        let conflicts_with_target = match owner.as_ref() {
+            None => true,
+            Some(owner) => {
+                owner.release != opts.common.release || owner.namespace != opts.common.namespace
+            }
+        };
+        if conflicts_with_target {
             conflicts.push(PriorityClassConflict { role, name, owner });
         }
     }
@@ -2672,10 +2685,17 @@ async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -
 
     let mut message = String::from("PriorityClass ownership conflicts block installation:");
     for conflict in conflicts {
-        message.push_str(&format!(
-            "\nPriorityClass `{}` is owned by Helm release `{}` in namespace `{}`.",
-            conflict.name, conflict.owner.release, conflict.owner.namespace
-        ));
+        if let Some(owner) = conflict.owner {
+            message.push_str(&format!(
+                "\nPriorityClass `{}` is owned by Helm release `{}` in namespace `{}`.",
+                conflict.name, owner.release, owner.namespace
+            ));
+        } else {
+            message.push_str(&format!(
+                "\nPriorityClass `{}` exists without complete Helm ownership metadata.",
+                conflict.name
+            ));
+        }
         message.push_str(&format!(
             "\nReuse it with `--set priorityClasses.{}.create=false --set priorityClasses.{}.name={}`.",
             conflict.role.key(),
