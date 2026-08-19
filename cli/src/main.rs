@@ -67,16 +67,12 @@ impl<T: TierDefaults> From<AgentTarget<T>> for AgentActionOpts {
 }
 
 /// The connection surface for a cluster governance verb (#524). Unlike the local
-/// tier (which correctly defaults to the compose stack on localhost), a real Helm
-/// release serves the API through its UI `/api` NodePort proxy and randomizes
-/// `api.apiKey` at `cluster up` — so BOTH default to `None` and are DISCOVERED
-/// from the release (mirroring how `cluster deploy` already discovers the URL),
-/// rather than defaulting to `http://localhost:8000` + the `curie-dev-key`
-/// sentinel, which parse cleanly and then fail to connect / 401. An explicit
-/// `--api-url`/`--api-key` (or `CURIE_API_URL`/`CURIE_API_KEY`) still wins.
+/// tier, an omitted URL self-plumbs a loopback tunnel to the release API and an
+/// omitted key is read from the release Secret. An explicit `--api-url` or
+/// `--api-key` value still wins.
 #[derive(Args, Debug, Clone)]
 struct ClusterConn {
-    /// Platform API base URL. Omit to discover the release's UI `/api` proxy.
+    /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
     #[arg(long, env = "CURIE_API_URL")]
     api_url: Option<String>,
     /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
@@ -144,26 +140,58 @@ async fn sync_connectors(
     Ok(())
 }
 
-/// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
-/// otherwise discover it from the release (UI `/api` proxy for the URL, the chart
-/// Secret for the key). Discovery failures are actionable errors naming the
-/// release (see `ops::discover_api_url` / `ops::discover_api_key`).
-async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, String)> {
+/// Resolve a cluster verb's API URL, key, and optional loopback tunnel. Explicit
+/// values win. An omitted URL self-plumbs the release API service, while an
+/// omitted key is read from the release Secret.
+async fn resolve_cluster_conn(
+    conn: ClusterConn,
+    dry_run: bool,
+) -> anyhow::Result<(String, String, Option<tokio::process::Child>)> {
     let ClusterConn {
         api_url,
         api_key,
         namespace,
         release,
     } = conn;
-    let api_url = match api_url {
-        Some(url) => url,
-        None => ops::discover_api_url(&namespace, &release).await?,
-    };
+    let api_key = commands::normalize_deploy_api_key(api_key);
+    let key_auto_discovered = api_key.is_none();
+    let local_port = message::DEFAULT_API_LOCAL_PORT;
+    if dry_run {
+        return Ok((
+            api_url.unwrap_or_else(|| format!("http://localhost:{local_port}")),
+            api_key.unwrap_or_default(),
+            None,
+        ));
+    }
     let api_key = match api_key {
         Some(key) => key,
         None => ops::discover_api_key(&namespace, &release).await?,
     };
-    Ok((api_url, api_key))
+    let (api_url, port_forward) = match commands::deploy_port_forward(
+        api_url.as_deref(),
+        &namespace,
+        &release,
+        local_port,
+        message::API_REMOTE_PORT,
+    ) {
+        Some(pf_cmd) => {
+            let child = message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
+            (format!("http://localhost:{local_port}"), Some(child))
+        }
+        None => {
+            let url = api_url.expect("explicit url when no port-forward");
+            if key_auto_discovered && api::is_insecure_endpoint(&url) {
+                bail!(
+                    "refusing to send the auto-discovered release key over cleartext \
+                     HTTP to {url}: the strong key would leak on the wire. Pass \
+                     --api-key explicitly to acknowledge, use an https:// URL, or omit \
+                     --api-url to reach the release over the loopback port-forward."
+                );
+            }
+            (url, None)
+        }
+    };
+    Ok((api_url, api_key, port_forward))
 }
 
 /// clap `value_parser` for every `--local-model` (#1254). All four sites carry the
@@ -3189,7 +3217,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::kill(
                         AgentActionOpts {
@@ -3208,7 +3237,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 conn,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::resume(AgentActionOpts {
                         api_url,
@@ -3235,7 +3265,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::overrides(
                         AgentActionOpts {
@@ -3256,7 +3287,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 conn,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::budget(
                         AgentActionOpts {
@@ -3277,7 +3309,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::reset_thread(
                         AgentActionOpts {
@@ -3298,7 +3331,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
             } => {
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::delete(
                         AgentActionOpts {
@@ -3318,7 +3352,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::versions(AgentActionOpts {
                         api_url,
@@ -3335,7 +3370,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::memory(AgentActionOpts {
                         api_url,
@@ -3367,7 +3403,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                     conn,
                     dry_run,
                 } = target;
-                let (api_url, api_key) = resolve_cluster_conn(conn).await?;
+                let (api_url, api_key, _cluster_api_pf) =
+                    resolve_cluster_conn(conn, dry_run).await?;
                 emit(
                     commands::approvals(
                         AgentActionOpts {
@@ -4265,11 +4302,12 @@ mod tests {
             namespace: "curie".into(),
             release: "curie".into(),
         };
-        let (url, key) = resolve_cluster_conn(conn)
+        let (url, key, port_forward) = resolve_cluster_conn(conn, false)
             .await
             .expect("explicit conn resolves");
         assert_eq!(url, "https://api.example.test");
         assert_eq!(key, "real-release-key");
+        assert!(port_forward.is_none());
     }
 
     #[test]
