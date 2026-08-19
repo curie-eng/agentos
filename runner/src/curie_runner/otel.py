@@ -15,8 +15,8 @@ opentelemetry SDK's own env parsing applies (it appends ``/v1/traces`` to a base
 ``OTEL_EXPORTER_OTLP_ENDPOINT``). When no endpoint is configured the tracer is a
 no-op, so unit tests and offline runs neither export nor fail.
 
-Per ADR-0076, every attribute this module attaches comes from the closed
-``SpanAttributeKey`` enum below rather than a bare string, so a future call site
+Per ADR-0076, every attribute this module attaches comes from the shared closed
+``SpanAttributeKey`` enum rather than a bare string, so a future call site
 with an unlisted key is a construction-time error, not a silent addition to the
 wire shape. ``SCHEMA_VERSION`` is bumped only when a key is removed, renamed, or
 changes value type; a new optional key is additive and does not bump it.
@@ -28,10 +28,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from enum import StrEnum
 from typing import Any, cast
 
 from aci_protocol import OtelConfig
+from curie_telemetry_schema import SpanAttributeKey as SpanAttributeKey
 from opentelemetry import trace
 from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -49,42 +49,10 @@ _SERVICE_NAME = "curie-runner"
 SCHEMA_VERSION = "v1"
 
 
-class SpanAttributeKey(StrEnum):
-    """The closed set of keys the runner may attach to a span or resource.
-
-    ADR-0076 decision 1. Str-mixin so a member is usable anywhere a plain
-    attribute-value string is expected (e.g. dict keys, f-strings), but every
-    ``set_attribute``/``Resource.create`` call site should pass a member here
-    rather than a literal, so an unlisted key is a construction-time error.
-    """
-
-    TRACE_NAME = "langfuse.trace.name"
-    SESSION_ID = "langfuse.session.id"
-    USER_ID = "langfuse.user.id"
-    # ADR-0076 Stone 3 (#889, epic #512): the resolved terminal decision
-    # (approved/rejected/expired) of the approval a resume turn is resuming
-    # from, threaded in from the worker's authority-free CURIE_APPROVAL_DECISION
-    # boot-env fact. Closes the "did an approval get requested" gap ADR-0038
-    # named open, on the existing span stream.
-    APPROVAL_DECISION = "gen_ai.approval.decision"
-    REQUEST_MODEL = "gen_ai.request.model"
-    MODEL = "model"
-    USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
-    USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
-    USAGE_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read_input_tokens"
-    USAGE_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
-    TOOL_NAME = "gen_ai.tool.name"
-    OPERATION_NAME = "gen_ai.operation.name"
-    SERVICE_NAME = "service.name"
-    CURIE_SESSION_ID = "curie.session_id"
-    CURIE_SANDBOX_ID = "curie.sandbox_id"
-    SCHEMA_VERSION_KEY = "schema.version"
-
-
 # ADR-0076 decision 2: a value-type change to an existing key is a breaking,
 # version-bump-worthy change exactly like a remove or rename, so it needs its
 # own source of truth to diff against -- the type half of the closed schema,
-# parallel to ``SpanAttributeKey`` being the key half. Every member above must
+# parallel to ``SpanAttributeKey`` being the key half. Every member must
 # appear here exactly once, mapped to its value-type name ("str" or "int");
 # the ``gen_ai.usage.*`` token counts are the only "int" members (see
 # ``record_usage`` below and ``redact.py``'s "only str and int attributes are

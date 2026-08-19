@@ -17,6 +17,7 @@ members = [
     "curie-dispatcher",
     "curie-doclint",
     "curie-runner",
+    "curie-telemetry-schema",
     "curie-test-support",
     "curie-wire-tolerance-gate",
     "curie-worker",
@@ -535,6 +536,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
+    { name = "curie-telemetry-schema" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "kubernetes" },
@@ -555,6 +557,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
+    { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "fastapi", specifier = ">=0.139.2" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
@@ -626,6 +629,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "anyio" },
     { name = "claude-agent-sdk" },
+    { name = "curie-telemetry-schema" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "plugin-format" },
@@ -637,10 +641,16 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.3" },
     { name = "anyio", specifier = ">=4.6" },
     { name = "claude-agent-sdk", specifier = ">=0.2.135" },
+    { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30" },
     { name = "opentelemetry-sdk", specifier = ">=1.44.0" },
     { name = "plugin-format", editable = "packages/plugin-format" },
 ]
+
+[[package]]
+name = "curie-telemetry-schema"
+version = "0.0.0"
+source = { editable = "packages/telemetry-schema" }
 
 [[package]]
 name = "curie-test-support"
@@ -711,6 +721,7 @@ dependencies = [
     { name = "curie-channel-protocol" },
     { name = "curie-dispatcher" },
     { name = "curie-runner" },
+    { name = "curie-telemetry-schema" },
     { name = "curie-worker" },
     { name = "plugin-format" },
 ]
@@ -737,6 +748,7 @@ requires-dist = [
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-dispatcher", editable = "apps/dispatcher" },
     { name = "curie-runner", editable = "runner" },
+    { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
     { name = "curie-worker", editable = "apps/worker" },
     { name = "plugin-format", editable = "packages/plugin-format" },
 ]

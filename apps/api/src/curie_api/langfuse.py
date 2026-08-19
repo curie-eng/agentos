@@ -11,6 +11,7 @@ import json
 from typing import Any
 
 import httpx
+from curie_telemetry_schema import SpanAttributeKey
 
 from .config import Settings
 from .schemas import ObservationNode
@@ -44,11 +45,11 @@ def matching_traces(
 
 # The OTel resource attribute the runner stamps (runner/otel.py) so a trace is
 # attributable to the concrete sandbox that served it.
-_SANDBOX_ATTR = "curie.sandbox_id"
+_SANDBOX_ATTR = SpanAttributeKey.CURIE_SANDBOX_ID.value
 
 # The OTel span attribute the runner stamps on the root agent.run span (ADR-0076
 # Stone 3, #889) when a turn resumes a resolved approval.
-_APPROVAL_DECISION_ATTR = "gen_ai.approval.decision"
+_APPROVAL_DECISION_ATTR = SpanAttributeKey.APPROVAL_DECISION.value
 
 
 def _probe_attr(bag: Any, key: str, *, bare_key: str | None = None) -> str | None:
