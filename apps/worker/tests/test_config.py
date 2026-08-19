@@ -10,8 +10,11 @@ BaseSettings refactor.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import socket
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 from curie_worker.config import WorkerConfig
@@ -524,3 +527,81 @@ def test_eval_max_concurrent_claims_rejects_zero(
 
     with pytest.raises(ValueError):
         WorkerConfig()
+
+
+def _load_test_module(module_name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_worker_boolean_explanations_do_not_cite_removed_parser() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    config_text = (
+        repo_root / "apps/worker/src/curie_worker/config.py"
+    ).read_text(encoding="utf-8")
+    config_start = config_text.index("def _parse_bool")
+    config_end = config_text.index("\n\nBool =", config_start)
+    config_region = config_text[config_start:config_end]
+
+    test_text = Path(__file__).read_text(encoding="utf-8")
+    test_start = test_text.index("# --- Per-service bool divergence")
+    test_end = test_text.index("# --- Eval claim-creation concurrency", test_start)
+    test_region = test_text[test_start:test_end]
+
+    removed_helper = "_" + "set" + "_bool"
+    retired_service = "dis" + "patcher"
+
+    for region in (config_region, test_region):
+        assert removed_helper not in region, f"boolean notes still cite {removed_helper}"
+        assert retired_service not in region, (
+            f"boolean notes still compare this parser to {retired_service}"
+        )
+
+
+def test_async_test_body_gate_rejects_a_shallow_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    module = _load_test_module(
+        "issue_1431_async_body_gate",
+        repo_root / "apps/worker/tests/binding/test_no_unrun_async_test_bodies.py",
+    )
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    gate = getattr(module, "test_no_test_defines_a_coroutine_it_never_runs")
+    assert callable(gate)
+
+    with pytest.raises(AssertionError) as exc_info:
+        gate()
+
+    message = str(exc_info.value)
+    assert str(tmp_path.resolve()) in message
+    assert "0" in message
+
+
+def test_recorder_health_precondition_fails_when_service_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    module = _load_test_module(
+        "issue_1431_recorder",
+        repo_root / "apps/worker/tests/eval/test_recorder.py",
+    )
+    unavailable_host = "http://127.0.0.1:1"
+    monkeypatch.setattr(module, "_LF_HOST", unavailable_host)
+    recorder_test = getattr(module, "test_records_per_case_results_and_reads_them_back")
+    assert callable(recorder_test)
+
+    try:
+        recorder_test()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"health precondition skipped at {unavailable_host}: {exc}")
+    except pytest.fail.Exception as exc:
+        message = str(exc)
+        assert "Langfuse not reachable at" in message
+        assert unavailable_host in message
+    else:
+        pytest.fail("health precondition returned successfully while its service was absent")

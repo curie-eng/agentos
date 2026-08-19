@@ -113,3 +113,64 @@ fn a_bogus_verb_fails_the_gate() {
         output_text(&output)
     );
 }
+
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let rest = source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("missing source anchor {start:?}"))
+        .1;
+    rest.split_once(end)
+        .unwrap_or_else(|| panic!("missing source anchor {end:?}"))
+        .0
+}
+
+#[test]
+fn guided_prompt_cancellation_names_visible_recovery() {
+    // The concrete terminal prompt has no injectable input seam. This source
+    // gate therefore pins guidance inside each production call site rather than
+    // accepting the same words from unrelated documentation.
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/interactive.rs"));
+
+    let deploy = source_between(source, "fn deploy_to_slack(", "fn env_credential_present(");
+    let channel_cancel = source_between(
+        deploy,
+        "prompt_checked(",
+        "let plugin_dir = prompt_bundle_dir(",
+    );
+    assert!(
+        channel_cancel.contains("Slack channel ID") && channel_cancel.contains("required"),
+        "channel cancellation must return a visible channel requirement: {channel_cancel}"
+    );
+    assert!(
+        !channel_cancel.contains("return Ok(());"),
+        "channel cancellation must not silently succeed: {channel_cancel}"
+    );
+
+    let secret = source_between(
+        source,
+        "fn ensure_secret_available(",
+        "fn ensure_model_credential_available(",
+    );
+    for recovery in ["curie secrets set {name}", "export {name}="] {
+        assert!(
+            secret.contains(recovery),
+            "secret cancellation must name {recovery:?} at its call site"
+        );
+    }
+
+    let model = source_between(
+        source,
+        "fn ensure_model_credential_available(",
+        "fn model_credential_status(",
+    );
+    for recovery in [
+        "CURIE_MODEL_BASE_URL",
+        "curie secrets set <NAME>",
+        "export <NAME>=",
+    ] {
+        assert!(
+            model.contains(recovery),
+            "model cancellation must name {recovery:?} at its call site"
+        );
+    }
+}

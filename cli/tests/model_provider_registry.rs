@@ -136,9 +136,19 @@ fn rejected_credential_examples_stay_rejected() {
     let registry = load_registry();
     assert!(!registry.rejected_credential_examples.is_empty());
     for credential in &registry.rejected_credential_examples {
-        assert!(
-            check_model_credential(credential).is_err(),
-            "accepted rejected credential {credential:?}"
-        );
+        let error = match check_model_credential(credential) {
+            Ok(()) => panic!("accepted rejected credential {credential:?}"),
+            Err(error) => error,
+        };
+        for recovery in [
+            "CURIE_MODEL_BASE_URL",
+            "curie secrets set <NAME>",
+            "export <NAME>=",
+        ] {
+            assert!(
+                error.contains(recovery),
+                "credential error must name recovery {recovery:?}: {error}"
+            );
+        }
     }
 }

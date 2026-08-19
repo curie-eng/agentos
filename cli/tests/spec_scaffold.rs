@@ -21,7 +21,7 @@ use std::path::Path;
 use std::process::Command;
 
 use curie::evals::{load_suite, GraderKind};
-use curie::scaffold::{read_manifest, scaffold_from_spec};
+use curie::scaffold::{read_manifest, scaffold, scaffold_from_spec};
 use curie::spec::parse;
 
 fn bin() -> &'static str {
@@ -102,6 +102,34 @@ fn scaffolds_the_full_bundle_from_a_valid_spec() {
     // 5. .gitignore ignores local workstation state.
     let gitignore = std::fs::read_to_string(out.join(".gitignore")).unwrap();
     assert!(gitignore.contains(".curie/"), "{gitignore}");
+}
+
+#[test]
+fn default_scaffold_documents_a_file_backed_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), "acme").expect("default scaffold succeeds");
+
+    let connectors = std::fs::read_to_string(dir.path().join("connectors.yaml")).unwrap();
+    let mut lines = connectors.lines();
+    let secret_files = lines
+        .find(|line| line.trim() == "#     secret_files:")
+        .expect("connectors.yaml must show the commented secret_files mapping");
+    assert_eq!(secret_files, "#     secret_files:");
+
+    let projection = lines
+        .next()
+        .expect("secret_files must include a secret name and file path");
+    let mapping = projection
+        .strip_prefix("#       ")
+        .expect("the file projection must remain commented");
+    let (name, path) = mapping
+        .split_once(':')
+        .expect("the file projection must be a YAML mapping");
+    assert!(!name.trim().is_empty(), "the secret name must be nonempty");
+    assert!(
+        path.trim().starts_with('/'),
+        "the projection must show an absolute file path: {projection}"
+    );
 }
 
 /// A spec declaring `secrets` and `approvalPolicy` scaffolds a gated, authed

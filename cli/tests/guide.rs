@@ -223,11 +223,11 @@ fn guide_documents_the_approval_plane() {
             // tree, and each was reachable only from docs/approvals.md, which
             // the primer's own premise says the agent does not read.
             //
-            // The token: a group-bound route with no SLACK_BOT_TOKEN on the API
-            // refuses EVERY click, and the refusal names the approver set
-            // rather than the missing token, so the cause is invisible.
+            // A missing token leaves group membership unverified. The public
+            // refusal must say so while preserving the setup facts below.
             "SLACK_BOT_TOKEN",
             "usergroups:read",
+            "could not verify approver group membership",
             // The two refusals a second approver actually meets. Everything the
             // primer covered before was a first-approver problem.
             "409",
@@ -238,12 +238,53 @@ fn guide_documents_the_approval_plane() {
                 "{label} primer missing the approval fact `{needle}`\n{text}"
             );
         }
+        assert!(
+            !text.contains(
+                "every resolution is refused as not-an-approver with nothing naming the token as the cause"
+            ),
+            "{label} primer preserves the obsolete group lookup refusal\n{text}"
+        );
     }
+    let approvals_document = include_str!("../../docs/approvals.md");
+    assert!(
+        approvals_document.contains("could not verify approver group membership"),
+        "approval documentation omits the literal failed group lookup refusal"
+    );
+    assert!(
+        !approvals_document.contains(
+            "every resolution is refused as not-an-approver with nothing naming the token as the cause"
+        ),
+        "approval documentation preserves the obsolete group lookup refusal"
+    );
     // The section is structural in the markdown, not a stray landmine mention.
     assert!(
         md.contains("## Approvals"),
         "markdown primer has no Approvals section\n{md}"
     );
+}
+
+#[test]
+fn approval_card_channel_null_explanations_preserve_compatibility_meaning() {
+    // #1431: `card_channel` is absent only for an older row or a direct API
+    // write that omitted the field. It does not describe a routeless request.
+    // These are four independent public consumers of that fact.
+    for (surface, text) in [
+        ("approval schema", include_str!("../schema/approvals.schema.json")),
+        ("approval recipe", include_str!("../src/recipes.rs")),
+        ("approval JSON projection", include_str!("../src/commands.rs")),
+        ("approval documentation", include_str!("../../docs/approvals.md")),
+    ] {
+        for fact in ["older row", "direct API write", "omitted"] {
+            assert!(
+                text.contains(fact),
+                "{surface} does not explain null `card_channel` with `{fact}`"
+            );
+        }
+        assert!(
+            !text.contains("names no route"),
+            "{surface} still claims null `card_channel` means the record names no route"
+        );
+    }
 }
 
 #[test]

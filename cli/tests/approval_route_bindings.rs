@@ -21,6 +21,7 @@
 mod support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
+use curie::credcheck::check_channel_id;
 use std::sync::{Arc, Mutex};
 use support::{serve, MockServer, Response};
 
@@ -214,6 +215,37 @@ async fn route_flag_writes_the_channel_binding() {
             assert!(routes["deal_desk"].approvers.is_none());
         }
         _ => panic!("expected the Routes output"),
+    }
+}
+
+#[test]
+fn guided_channel_validation_accepts_slack_channel_kinds() {
+    for channel in ["C0EXAMPLE1", "D0EXAMPLE1", "G0EXAMPLE1"] {
+        check_channel_id(channel)
+            .unwrap_or_else(|error| panic!("guided validation rejected {channel}: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn direct_and_group_channels_reach_the_route_request() {
+    for (channel, bound) in [
+        ("C0EXAMPLE1", r#"{"team":{"channel":"C0EXAMPLE1"}}"#),
+        ("D0EXAMPLE1", r#"{"team":{"channel":"D0EXAMPLE1"}}"#),
+        ("G0EXAMPLE1", r#"{"team":{"channel":"G0EXAMPLE1"}}"#),
+    ] {
+        let server = stub("null", bound);
+        run(
+            &server,
+            ApprovalCmd {
+                route: vec![format!("team={channel}")],
+                ..ApprovalCmd::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("route validation rejected {channel}: {error}"));
+
+        let body = patch_body(&server);
+        assert_eq!(body["approval_routes"]["team"]["channel"], channel);
     }
 }
 
