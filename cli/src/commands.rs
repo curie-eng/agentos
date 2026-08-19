@@ -5,7 +5,6 @@
 //! scaffold, state, evals, render).
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -685,8 +684,8 @@ fn is_executable(_path: &Path) -> bool {
     true
 }
 
-/// Run every discovered script from `root`, streaming its output, and report how
-/// each one fared.
+/// Run every discovered script from `root`, streaming its stdout and stderr to
+/// this process's stderr, and report how each one fared.
 ///
 /// A failure does not stop the run: the point of the verb is that one invocation
 /// surfaces every problem, rather than making a contributor fix, re-run, and
@@ -710,20 +709,17 @@ pub async fn run_chart_check_scripts(
             scripts.len(),
             rel.display()
         ));
-        let output = tokio::process::Command::new("bash")
+        let status = tokio::process::Command::new("bash")
             .arg(script)
             .current_dir(root)
-            .output()
+            .stdout(std::io::stderr())
+            .stderr(std::process::Stdio::inherit())
+            .status()
             .await
             .with_context(|| format!("failed to invoke bash for {name}"))?;
-        {
-            let mut stderr = std::io::stderr().lock();
-            let _ = stderr.write_all(&output.stdout);
-            let _ = stderr.write_all(&output.stderr);
-        }
         outcomes.push(ChartCheckOutcome {
             name,
-            passed: output.status.success(),
+            passed: status.success(),
         });
     }
     Ok(outcomes)

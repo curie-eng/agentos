@@ -75,9 +75,10 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   duplicated: the outputs whose verbs take `--dry-run` are enums carrying a `DryRun`
   variant that delegates to it instead of re-rendering the plan.
 - **`cli/src/commands.rs`**, the largest group, covering the skill and agent verbs
-  and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ListAgentsOutput`,
-  `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`, `EvalOutput`,
-  `DeployOutput`, `KillOutput`, `ResumeOutput`, `BudgetOutput`, `ResetThreadOutput`,
+  and the shared lifecycle results: `InitOutput`, `CheckOutput`, `ChartCheckOutput`,
+  `ListAgentsOutput`, `BumpVersionOutput`, `StatusOutput`, `SkillMessageOutput`,
+  `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
+  `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`.
 - **`cli/src/local.rs`** and **`cli/src/ops.rs`**, the operator verbs, one output per
