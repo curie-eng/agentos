@@ -1148,7 +1148,10 @@ jobs:
     name: E2E required
     runs-on: ubuntu-latest
     needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster]
-    if: ${{ always() }}
+    # A cancelled run leaves no evidence and must rerun. In a completed run,
+    # every dependency outcome reaches the strict matcher below, which rejects
+    # selected results other than success.
+    if: ${{ !cancelled() }}
     steps:
       - name: Require exact selected outcomes
         env:
