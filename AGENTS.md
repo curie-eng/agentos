@@ -52,6 +52,7 @@ the same commands.
 **Python (all packages, from root):**
 Run this local Python CI baseline. Do not use `--profile full` for startup
 because it can start stale application images.
+Set `base=next` when your worktree targets `next`.
 
 ```bash
 (

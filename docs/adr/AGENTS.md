@@ -1,7 +1,8 @@
 # ADR contributor procedure
 
-[ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) defines
-when an ADR authorizes implementation. [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
+[ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md), as
+amended by [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
+defines when an ADR authorizes implementation. [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
 defines how Accepted ADR history is preserved.
 
 The ADR requirement applies only to product and platform architecture decisions

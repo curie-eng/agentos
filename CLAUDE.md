@@ -44,7 +44,10 @@ Workflow for non-trivial work:
   `docs/adr/`. A Draft may merge for discussion but cannot authorize
   implementation.
 - **Obtain explicit maintainer acceptance before implementation.** Acceptance
-  means the ADR is published with `Status: Accepted`.
+  means the ADR is published with `Status: Accepted`. Normally, acceptance must
+  precede implementation. As the coordinated exception, an ADR may land
+  `Accepted` alongside implementation only with recorded explicit maintainer
+  approval and a named realizing code path.
 - **Issues reference their Accepted ADR(s).** A GitHub issue that implements a
   decision links the ADR, so an agent picking up the issue reads the decision's
   intent first and builds to it.
