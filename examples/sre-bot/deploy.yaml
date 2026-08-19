@@ -1,0 +1,68 @@
+# Where this bundle gets deployed (ADR-0089).
+#
+# `connectors.yaml` says what this bundle needs wherever it runs. This file says
+# where THIS repository sends it. Two files because they are different kinds of
+# fact with different lifetimes: a connector changes when the agent's
+# capabilities change, a target changes when the deployment topology does.
+#
+# The routing lives here, in the repository, so it is a reviewable diff rather
+# than flags scattered across whatever CI happens to invoke the deploy. That is
+# not a stylistic preference. Before this file existed, a dev workflow and a
+# prod workflow could both resolve to the SAME agent -- the name came from
+# plugin.json and nothing overrode it -- so a dev merge and a prod merge
+# overwrote each other's active version and contended for one Slack channel.
+# Nothing reported it, because `--env` defaults to dev and the prod invocation
+# omitted it.
+#
+# The BUNDLE is identical for both targets. Only the binding differs, which is
+# what lets prod promote the exact artifact dev validated, and why rewriting
+# plugin.json's `name` per environment was rejected.
+#
+#     curie cluster deploy --plugin-dir examples/sre-bot --target prod
+#     curie cluster deploy --plugin-dir examples/sre-bot --all-targets
+#
+# ---------------------------------------------------------------------------
+# THIS FILE IS ONLY READ WHEN YOU ASK FOR A TARGET
+# ---------------------------------------------------------------------------
+#
+# Worth knowing before you edit anything below, because the file looks like
+# configuration that always applies and is not:
+#
+#     curie cluster deploy --plugin-dir examples/sre-bot
+#         Ignores this file entirely. The agent name comes from plugin.json
+#         (`sre-bot`), and the binding is the CLI's own stub channel. Neither
+#         value below is read.
+#
+#     curie cluster deploy --plugin-dir examples/sre-bot --target prod
+#     curie cluster deploy --plugin-dir examples/sre-bot --all-targets
+#         Reads this file. `--target` picks one entry; `--all-targets` walks
+#         every entry, which is how both agents get created in one command.
+#
+# So the golden path in the README does not touch these values, and the
+# documentation IDs below are inert until you name a target.
+#
+# ---------------------------------------------------------------------------
+# WHEN YOU DO USE TARGETS
+# ---------------------------------------------------------------------------
+#
+# `slack_channel` must be a real channel ID. The dispatcher routes by ID, so a
+# value that names no channel binds the agent to nothing -- and the deploy
+# reports success. The bot then goes silent with nothing in any log to explain
+# it. To find one in Slack: right-click the channel -> View channel details ->
+# the ID is at the bottom of the dialog, starting with `C`.
+#
+# **Use the ID, never the `#name`.** Binding by name is the single most common
+# "I deployed it and nothing happens" failure, and it fails the same silent way.
+#
+# Not using Slack? Drop the `slack_channel` lines. The targets still bind an
+# agent name and an environment, and `curie cluster message` talks to the agent
+# without a channel at all.
+targets:
+  dev:
+    agent: sre-bot-dev
+    env: dev
+    slack_channel: C0EXAMPLE1
+  prod:
+    agent: sre-bot
+    env: prod
+    slack_channel: C0EXAMPLE2

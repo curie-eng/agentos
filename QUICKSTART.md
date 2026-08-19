@@ -154,6 +154,63 @@ curie skill down
 
 You should get a real answer instead of the canned loop.
 
+## Deploy your own SRE bot
+
+The most complete example in this repo is a production triage bot:
+[`examples/sre-bot/`](examples/sre-bot/README.md). Ask it in plain English
+whether anything is broken and it reads your Kubernetes cluster and answers.
+Out of the box it cannot change anything: every tool it holds is read-only and
+its credential cannot even read Secrets. One write verb, rolling a single named
+Deployment behind a human approval card, ships in the box switched off.
+
+This one runs on the **cluster** tier, so unlike the loop above it needs a
+Kubernetes cluster, `kubectl` pointed at it, a model credential, and this repo
+checked out (the bundle is a directory of files, so `curie` needs to see it).
+
+```bash
+# 1. Bring up the platform, which also creates the `curie` namespace the next
+#    step installs into. --allow-egress-host opens the model call; the cluster
+#    sandbox is fail-closed, so a credential alone is not enough.
+export CURIE_CREDENTIALS=sk-ant-...
+curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
+
+# 2. Create the read-only identity the bot authenticates as.
+kubectl apply -f examples/sre-bot/manifests/read-access.yaml
+
+# 3. Assemble a kubeconfig from that identity's token and store it.
+CA=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.ca\.crt}')
+TOKEN=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.token}' | base64 -d)
+export K8S_READONLY_KUBECONFIG="$(cat <<YAML
+apiVersion: v1
+kind: Config
+clusters: [{name: prod, cluster: {server: https://kubernetes.default.svc, certificate-authority-data: $CA}}]
+users: [{name: sre-bot-reader, user: {token: $TOKEN}}]
+contexts: [{name: prod, context: {cluster: prod, user: sre-bot-reader}}]
+current-context: prod
+YAML
+)"
+curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG
+
+# 4. Deploy the bundle. This is also what provisions the secret from step 3
+#    into the namespace; nothing else does.
+curie cluster deploy --plugin-dir examples/sre-bot
+
+# 5. Ask it something.
+curie cluster message "Is any pod crashlooping right now?"
+```
+
+**Step 1 comes first for a reason.** `read-access.yaml` puts a ServiceAccount
+and a token Secret in the `curie` namespace, which does not exist until
+`cluster up` creates it. Apply it on a fresh cluster and you get a PARTIAL
+failure that reads like a success: the cluster-scoped ClusterRole and
+ClusterRoleBinding are created and print `created`, the two namespaced objects
+are not, and the command exits 1.
+
+Drop `--set security.gvisor.mode=off` on a cluster that has `runsc` installed.
+
+The write path, Slack, Grafana, traces, and how to make the skill your own all
+live in [`examples/sre-bot/README.md`](examples/sre-bot/README.md).
+
 ## Where to go next
 
 The `skill` loop is just the runner container. From here:
@@ -170,6 +227,9 @@ The `skill` loop is just the runner container. From here:
   (`curie cluster up` → `cluster deploy` → `cluster message`). Full runbook,
   including credentials, web egress, and the Langfuse login, in
   [`docs/operations.md`](docs/operations.md).
+- **A complete, real-world bundle** — the SRE triage bot's security shape, its
+  gated write path, its RBAC manifests and its falsifiable eval suite, in
+  [`examples/sre-bot/README.md`](examples/sre-bot/README.md).
 - **Working on Curie itself** — the repo-checkout dev stack, tests, and
   from-scratch walkthrough in [`docs/onboarding.md`](docs/onboarding.md) and
   [`AGENTS.md`](AGENTS.md). One-command bootstrap from a clone:
