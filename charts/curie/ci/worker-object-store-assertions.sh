@@ -6,13 +6,9 @@
 #
 # This was a real outage. worker.yaml set none of the four variables, so the
 # worker fell back to its compose default (http://localhost:29000) and every
-# bundle fetch got ECONNREFUSED. Both symptoms pointed elsewhere:
-#
-#   * every Slack turn died as ClaimTimeoutError after 90s, and that message
-#     names a CPU-saturated node first -- on an install idling at 11% CPU
-#   * the post-deploy eval silently stopped running with "unresolvable
-#     suite/bundle", which alerts nothing, because a suite that cannot resolve
-#     looks exactly like a suite nobody asked for
+# bundle fetch got ECONNREFUSED. The post-deploy eval silently stopped running
+# with "unresolvable suite/bundle", which alerts nothing, because a suite that
+# cannot resolve looks exactly like a suite nobody asked for.
 #
 # So this asserts AGREEMENT, not presence. Presence alone would still pass the
 # day someone points the worker at a different-but-populated endpoint.
@@ -38,8 +34,11 @@ EOF
 # Capture Helm output in Python so a large manifest cannot be truncated by a
 # shell command substitution or redirected into the script's stdin.
 python3 - "$CHART" "$EXTERNAL_VALUES" <<'PY'
+import copy
+import io
 import subprocess
 import sys
+from contextlib import redirect_stdout
 
 import yaml
 
@@ -68,7 +67,7 @@ def has_usable_source(entry):
     return bool(entry.get("value")) or bool(entry.get("valueFrom"))
 
 
-def env_of(docs, kind, component, container_name, init=False):
+def container_env(docs, kind, component, container_name, init=False):
     """Select by the component LABEL and the container NAME.
 
     `endswith("-worker")` also matches `<release>-curie-langfuse-worker`, which
@@ -92,8 +91,13 @@ def env_of(docs, kind, component, container_name, init=False):
             f"{kind} {component} must render exactly one container named "
             f"{container_name}, got {len(matches)}"
         )
-        return {e["name"]: e for e in matches[0].get("env", [])}
+        return matches[0].get("env", [])
     return None
+
+
+def env_of(docs, kind, component, container_name, init=False):
+    env = container_env(docs, kind, component, container_name, init)
+    return None if env is None else {entry["name"]: entry for entry in env}
 
 
 def object_store_keys(env):
@@ -136,8 +140,7 @@ def assert_contract(docs, label, expected_endpoint):
     for k in sorted(keys - worker_keys):
         failures.append(
             f"worker is missing {k}. Its config defaults these to the compose stack "
-            "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED -- and "
-            "the symptom is a ClaimTimeoutError that blames the node's CPU."
+            "(http://localhost:29000), so every bundle fetch fails with ECONNREFUSED."
         )
     for k in sorted(worker_keys - keys):
         failures.append(f"worker has {k}, but api does not")
@@ -258,6 +261,82 @@ def assert_contract(docs, label, expected_endpoint):
     print(f"ok: {label}: S3_SECRET_KEY is a ref -> {ref['name']}/{ref['key']}")
 
 
-assert_contract(render(), "default", "http://curie-rustfs:9000")
+def expect_failure(docs, messages):
+    captured = io.StringIO()
+    try:
+        with redirect_stdout(captured):
+            assert_contract(docs, "default probe", "http://curie-rustfs:9000")
+    except SystemExit as error:
+        assert error.code == 1
+    else:
+        raise AssertionError("object store contract probe unexpectedly passed")
+
+    output = captured.getvalue()
+    for message in messages:
+        assert message in output, f"missing diagnostic {message!r} in:\n{output}"
+    for unsupported in ("Traceback", "ClaimTimeoutError", "Slack turn", "CPU"):
+        assert unsupported not in output, f"unsupported diagnostic {unsupported!r} in:\n{output}"
+
+
+default_docs = render()
+assert_contract(default_docs, "default", "http://curie-rustfs:9000")
+
+missing_api_key = copy.deepcopy(default_docs)
+api_env = container_env(missing_api_key, "Deployment", "api", "api")
+assert api_env is not None, "api Deployment was not rendered"
+api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
+expect_failure(
+    missing_api_key,
+    (
+        "api is missing object-store key S3_ACCESS_KEY",
+        "worker has S3_ACCESS_KEY, but api does not",
+    ),
+)
+
+three_divergences = copy.deepcopy(default_docs)
+api_env = container_env(three_divergences, "Deployment", "api", "api")
+assert api_env is not None, "api Deployment was not rendered"
+worker_env = container_env(three_divergences, "Deployment", "worker", "worker")
+assert worker_env is not None, "worker Deployment was not rendered"
+bundle_env = container_env(
+    three_divergences,
+    "SandboxTemplate",
+    "agent-sandbox",
+    "bundle-fetch",
+    init=True,
+)
+assert bundle_env is not None, "SandboxTemplate bundle-fetch was not rendered"
+api_env[:] = [entry for entry in api_env if entry.get("name") != "S3_ACCESS_KEY"]
+worker_endpoint = next(
+    entry for entry in worker_env if entry.get("name") == "S3_ENDPOINT_URL"
+)
+worker_endpoint.pop("valueFrom", None)
+worker_endpoint["value"] = "http://other-object-store:9000"
+bundle_bucket = next(
+    entry for entry in bundle_env if entry.get("name") == "BUNDLE_BUCKET"
+)
+bundle_bucket.pop("valueFrom", None)
+bundle_bucket["value"] = "other-bucket"
+expect_failure(
+    three_divergences,
+    (
+        "api is missing object-store key S3_ACCESS_KEY",
+        "worker has S3_ACCESS_KEY, but api does not",
+        "api and worker disagree on S3_ENDPOINT_URL",
+        "bundle fetch BUNDLE_BUCKET disagrees with api BUNDLE_BUCKET",
+    ),
+)
+
+unsupported_diagnostic = copy.deepcopy(default_docs)
+worker_env = container_env(unsupported_diagnostic, "Deployment", "worker", "worker")
+assert worker_env is not None, "worker Deployment was not rendered"
+worker_env[:] = [
+    entry for entry in worker_env if entry.get("name") != "S3_ACCESS_KEY"
+]
+expect_failure(
+    unsupported_diagnostic,
+    ("worker is missing S3_ACCESS_KEY",),
+)
+
 assert_contract(render(EXTERNAL_VALUES), "external", "https://s3.example.com:443")
 PY
