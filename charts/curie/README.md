@@ -118,16 +118,17 @@ kubectl get pods -n curie-dev -w
 Reach the Langfuse UI after a stock install:
 
 ```bash
-kubectl port-forward -n curie svc/curie-langfuse-web 3000:3000
-# http://localhost:3000
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitProjectSecretKey}' | base64 -d; echo
-kubectl get secret curie-secrets -n curie -o jsonpath='{.data.langfuseInitUserPassword}' | base64 -d; echo
+curie cluster observability
 ```
 
-Log in as `dev@curie.local` with the retrieved admin password. The first
-command retrieves the project secret key for API and OTel authentication.
-The development overlay retains the published development keys
-`pk-lf-curie-dev` and `sk-lf-curie-dev`.
+The command reports the Langfuse UI URL and a connection hint when the Service
+is not externally reachable. Pass `--open` to open a reachable Langfuse URL in
+your browser. It reports access surfaces only and does not read or rotate
+Langfuse credentials.
+
+For a sealed install, Helm's post install notes show how to retrieve the
+generated Langfuse admin password. Sign in as `dev@curie.local` unless
+`langfuse.init.userEmail` was overridden.
 
 App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
 straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /

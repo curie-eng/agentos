@@ -22,6 +22,7 @@ mod support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::credcheck::check_channel_id;
+use curie::ui::CliOutput;
 use std::sync::{Arc, Mutex};
 use support::{serve, MockServer, Response};
 
@@ -211,7 +212,7 @@ async fn route_flag_writes_the_channel_binding() {
 
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+            assert_eq!(routes["deal_desk"].channel.as_deref(), Some("C0MANAGERS"));
             assert!(routes["deal_desk"].approvers.is_none());
         }
         _ => panic!("expected the Routes output"),
@@ -284,7 +285,7 @@ async fn route_approvers_narrows_who_without_moving_where() {
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
             let binding = &routes["finance"];
-            assert_eq!(binding.channel, "C0FINANCE0");
+            assert_eq!(binding.channel.as_deref(), Some("C0FINANCE0"));
             assert_eq!(
                 binding.approvers.as_ref().and_then(|a| a.group.as_deref()),
                 Some("S0FINGRP0")
@@ -340,10 +341,42 @@ async fn list_routes_reads_without_writing() {
     match out {
         ApprovalsOutput::Routes { agent, routes } => {
             assert_eq!(agent, "deal-desk");
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+            assert_eq!(routes["deal_desk"].channel.as_deref(), Some("C0MANAGERS"));
         }
         _ => panic!("expected the Routes output"),
     }
+}
+
+#[tokio::test]
+async fn list_routes_json_distinguishes_a_missing_channel_from_an_empty_channel() {
+    // Older API rows can omit `channel`; that absence means the CLI has no
+    // channel value to report, which differs from a stored explicit empty
+    // string. The read path stays tolerant of the former, but its JSON must
+    // preserve the distinction for an agent deciding whether to repair a row.
+    let routes = r#"{"legacy":{},"intentionally_empty":{"channel":""}}"#;
+    let server = stub(routes, routes);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            list_routes: true,
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("--list-routes should tolerate an older binding without a channel");
+
+    assert_no_write(&server);
+    let json = out.to_json();
+    assert_eq!(
+        json["routes"]["legacy"]["channel"],
+        serde_json::Value::Null,
+        "an omitted API channel must remain absent in list-routes JSON"
+    );
+    assert_eq!(
+        json["routes"]["intentionally_empty"]["channel"], "",
+        "an explicit empty API channel must remain an empty string in list-routes JSON"
+    );
 }
 
 #[tokio::test]
@@ -706,7 +739,7 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
 
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+            assert_eq!(routes["deal_desk"].channel.as_deref(), Some("C0MANAGERS"));
         }
         _ => panic!("expected the Routes output"),
     }
@@ -738,6 +771,35 @@ async fn a_malformed_routes_file_writes_nothing() {
     assert!(
         err.to_string().contains("not a Slack channel ID"),
         "unexpected error: {err}"
+    );
+    assert_no_write(&server);
+}
+
+#[tokio::test]
+async fn a_routes_file_without_a_channel_writes_nothing() {
+    // API responses preserve a missing channel for diagnosis, but an operator
+    // supplied route must name where its approval card is posted.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, r#"{"legacy":{}}"#).expect("write");
+
+    let server = stub("null", "null");
+
+    let Err(err) = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    else {
+        panic!("a route file binding without a channel must be refused");
+    };
+
+    assert!(
+        err.to_string().contains("channel"),
+        "the error must identify the required field: {err}"
     );
     assert_no_write(&server);
 }

@@ -120,11 +120,10 @@ pub struct Agent {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApprovalRouteBinding {
     // The deployed API can return a route binding with no `channel` after a
-    // live rebind, which previously hard-failed every verb that lists agents.
-    // Defaulting to empty is deliberate tolerance, not the fix: the
-    // underlying API/CLI schema mismatch (#1533) is still owed.
+    // live rebind. Preserve that absence so readers can distinguish it from an
+    // explicit empty string.
     #[serde(default)]
-    pub channel: String,
+    pub channel: Option<String>,
     /// Absent means the card channel's members are the approvers, the zero-setup
     /// default. Skipped on serialize so a channel-only write sends no `approvers`
     /// key at all: the API models the block with `extra="forbid"`, and an explicit
@@ -197,7 +196,7 @@ impl From<ApproversInput> for ApprovalApprovers {
 impl From<RouteBindingInput> for ApprovalRouteBinding {
     fn from(input: RouteBindingInput) -> Self {
         ApprovalRouteBinding {
-            channel: input.channel,
+            channel: Some(input.channel),
             approvers: input.approvers.map(Into::into),
         }
     }

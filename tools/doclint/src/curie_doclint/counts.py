@@ -85,6 +85,14 @@ _SCHEMA_INDEX_NAME = "index.json"
 # different claim and use a different verb, so they cannot inflate this one.
 _ACI_POST_ROUTE_RE = re.compile(r"web\.post\(")
 
+# A direct aiohttp POST registration with a literal route path. Anchoring the
+# call at the start of a source line keeps examples and incidental mentions out
+# of the route inventory, while the captured path is the identity the seam docs
+# enumerate.
+_ACI_POST_ROUTE_NAME_RE = re.compile(
+    r'^\s*web\.post\(\s*"(?P<path>/[^"]+)"\s*,', re.MULTILINE
+)
+
 # A `CliOutput` implementation, anchored at column 0. Every one in the crate is
 # written at top level, so an anchored pattern cannot pick up a fixture impl
 # nested inside a test module or a doc example, and the crate spells the trait
@@ -95,6 +103,15 @@ _CLI_OUTPUT_IMPL_RE = re.compile(r"^impl (?:crate::ui::|ui::)?CliOutput for ", r
 # module's import line and would inflate a looser pattern, so the mapping call
 # is what is matched.
 _JSONB_COLUMN_RE = re.compile(r"mapped_column\(JSONB")
+
+# A direct ORM field declaration whose mapping starts with JSONB. The optional
+# annotation covers both the typed production models and the untyped miniature
+# trees used by the gate tests without admitting imports or prose mentions.
+_JSONB_COLUMN_NAME_RE = re.compile(
+    r"^\s*(?P<name>[A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*"
+    r"mapped_column\(\s*JSONB(?:\s*[,)]|\s*$)",
+    re.MULTILINE,
+)
 
 # FastAPI route decorators in a router module, anchored at column 0 so a
 # decorator quoted inside a docstring or a comment cannot inflate the count.
@@ -260,6 +277,25 @@ def _count_jsonb_columns(repo_root: Path) -> int:
     return len(_JSONB_COLUMN_RE.findall(path.read_text(encoding="utf-8")))
 
 
+def _jsonb_column_names(repo_root: Path) -> set[str]:
+    """List the ORM columns declared directly with the JSONB type.
+
+    Args:
+        repo_root: The repository root to resolve the models module against.
+
+    Returns:
+        The column names whose direct ``mapped_column`` declaration starts with
+        ``JSONB``, matching the identities enumerated in the seam doc.
+    """
+    path = repo_root / "apps" / "api" / "src" / "curie_api" / "models.py"
+    if not path.is_file():
+        return set()
+    return {
+        match.group("name")
+        for match in _JSONB_COLUMN_NAME_RE.finditer(path.read_text(encoding="utf-8"))
+    }
+
+
 def _count_aci_post_routes(repo_root: Path) -> int:
     """Count the POST routes the ACI server publishes.
 
@@ -279,6 +315,25 @@ def _count_aci_post_routes(repo_root: Path) -> int:
     if not path.is_file():
         return 0
     return len(_ACI_POST_ROUTE_RE.findall(path.read_text(encoding="utf-8")))
+
+
+def _aci_post_route_names(repo_root: Path) -> set[str]:
+    """List the literal paths in direct ACI POST route registrations.
+
+    Args:
+        repo_root: The repository root to resolve the server module against.
+
+    Returns:
+        The registered route paths, matching the identities enumerated in both
+        ACI seam docs.
+    """
+    path = repo_root / "runner" / "src" / "curie_runner" / "server.py"
+    if not path.is_file():
+        return set()
+    return {
+        match.group("path")
+        for match in _ACI_POST_ROUTE_NAME_RE.finditer(path.read_text(encoding="utf-8"))
+    }
 
 
 def _count_state_api_routes(repo_root: Path) -> int:
@@ -400,20 +455,25 @@ class NameSetClaim:
     likely one, because confining these imports is #844 Phase 2's refactor and
     moving imports between modules is precisely what it does (#1019).
 
-    ``pattern`` must capture the region holding the list in group 1; the names
-    are then read out of it as backticked tokens, so re-ordering or re-wrapping
-    the sentence does not matter but changing the membership does.
+    ``pattern`` must capture the region holding the list in group 1, and
+    ``item_pattern`` captures each identity within that region. Reordering or
+    rewrapping the sentence does not matter, but changing the membership does.
     """
 
     doc: str
     label: str
     pattern: re.Pattern[str]
+    item_pattern: re.Pattern[str]
     lister: Callable[[Path], set[str]]
     source: str
 
 
-# A backticked file name inside the enumerated region.
-_BACKTICKED_NAME_RE = re.compile(r"`([^`]+\.py)`")
+# Backticked identities inside each kind of enumerated region. Keeping these
+# claim specific prevents class names and explanatory inline code from being
+# mistaken for inventory members.
+_BACKTICKED_PY_NAME_RE = re.compile(r"`([^`]+\.py)`")
+_BACKTICKED_ACI_ROUTE_RE = re.compile(r"`(?:POST )?(/v1/[^`]+)`")
+_BACKTICKED_COLUMN_NAME_RE = re.compile(r"`([a-z][a-z0-9_]*)`")
 
 # Every enumeration claim the seam catalog makes.
 NAME_CLAIMS: tuple[NameSetClaim, ...] = (
@@ -423,8 +483,51 @@ NAME_CLAIMS: tuple[NameSetClaim, ...] = (
         # The parenthesised run after the claim sentence. DOTALL because the
         # list wraps across lines in the prose.
         pattern=re.compile(r"claude_agent_sdk`\s+today\s+\(([^)]*)\)", re.DOTALL),
+        item_pattern=_BACKTICKED_PY_NAME_RE,
         lister=_sdk_importing_runner_module_names,
         source="`from`/`import claude_agent_sdk` in runner/src/**/*.py",
+    ),
+    NameSetClaim(
+        doc="docs/interfaces/aci-producer/INTERFACE.md",
+        label="ACI POST endpoints, by route path",
+        pattern=re.compile(
+            r"POST\s+endpoints\s+\([^)]*\):\s*(.*?)(?=\s*Two GETs)",
+            re.DOTALL,
+        ),
+        item_pattern=_BACKTICKED_ACI_ROUTE_RE,
+        lister=_aci_post_route_names,
+        source=(
+            "direct web.post route registrations in "
+            "runner/src/curie_runner/server.py"
+        ),
+    ),
+    NameSetClaim(
+        doc="docs/interfaces/aci-producer/implementing-an-aci-server.md",
+        label="ACI POST routes in the implementer's guide, by path",
+        pattern=re.compile(
+            r"exposes\s+\S+\s+POST\s+routes.*?\n\n(.*?)(?=\n\nPlus two unauthenticated GETs)",
+            re.DOTALL,
+        ),
+        item_pattern=_BACKTICKED_ACI_ROUTE_RE,
+        lister=_aci_post_route_names,
+        source=(
+            "direct web.post route registrations in "
+            "runner/src/curie_runner/server.py"
+        ),
+    ),
+    NameSetClaim(
+        doc="docs/interfaces/relational-db/INTERFACE.md",
+        label="JSONB columns in the API models, by name",
+        pattern=re.compile(
+            r"used on \*\*\S+\*\* columns:\s*(.*?)(?:\. The last one|\.\s*$)",
+            re.DOTALL,
+        ),
+        item_pattern=_BACKTICKED_COLUMN_NAME_RE,
+        lister=_jsonb_column_names,
+        source=(
+            "direct mapped_column(JSONB declarations in "
+            "apps/api/src/curie_api/models.py"
+        ),
     ),
 )
 
@@ -482,7 +585,7 @@ def check_name_sets(
 
         expected = claim.lister(repo_root)
         for region in regions:
-            listed = set(_BACKTICKED_NAME_RE.findall(region))
+            listed = set(claim.item_pattern.findall(region))
             missing = sorted(expected - listed)
             extra = sorted(listed - expected)
             if not missing and not extra:
