@@ -13,6 +13,42 @@ const AGENT_NAME: &str = "deal-desk";
 const VERSION_ID: &str = "22222222-2222-2222-2222-222222222222";
 const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoFullNameVectors {
+    comment: String,
+    valid: Vec<ValidRepoFullNameVector>,
+    invalid: Vec<InvalidRepoFullNameVector>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidRepoFullNameVector {
+    name: String,
+    value: String,
+    why: String,
+    url_path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvalidRepoFullNameVector {
+    name: String,
+    value: String,
+    why: String,
+}
+
+fn repo_full_name_vectors() -> RepoFullNameVectors {
+    let vectors: RepoFullNameVectors =
+        serde_json::from_str(include_str!("../../tests/vectors/repo-full-name.json"))
+            .expect("parse tests/vectors/repo-full-name.json");
+    assert!(
+        !vectors.comment.is_empty(),
+        "the shared repository name contract must explain its purpose"
+    );
+    vectors
+}
+
 fn route(method: &str, path: &str) -> Response {
     match (method, path) {
         ("GET", "/agents") => Response::json(200, "[]"),
@@ -223,6 +259,14 @@ async fn run_deploy(
     channel: Option<&str>,
     repo: Option<&str>,
 ) -> DeployOutcome {
+    run_deploy_result(client, channel, repo).await.unwrap()
+}
+
+async fn run_deploy_result(
+    client: &ApiClient,
+    channel: Option<&str>,
+    repo: Option<&str>,
+) -> anyhow::Result<DeployOutcome> {
     let dir = tempfile::tempdir().unwrap();
     scaffold(dir.path(), AGENT_NAME).unwrap();
     let archive = pack_tar_gz(dir.path()).unwrap();
@@ -238,7 +282,123 @@ async fn run_deploy(
             repo,
         )
         .await
-        .unwrap()
+}
+
+#[tokio::test]
+async fn invalid_repo_full_names_fail_before_any_http_request() {
+    let server = serve(|_req| Response::json(500, r#"{"detail":"request escaped preflight"}"#));
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+
+    for case in repo_full_name_vectors().invalid {
+        let err = match run_deploy_result(&client, None, Some(&case.value)).await {
+            Ok(_) => panic!("{} must be rejected: {}", case.name, case.why),
+            Err(err) => err,
+        };
+        let requests = server.recorded();
+        assert!(
+            requests.is_empty(),
+            "{} reached HTTP before validation with {:?}: {requests:?}",
+            case.name,
+            case.value
+        );
+
+        let message = format!("{err:#}");
+        assert!(
+            (message.contains("repo_full_name") || message.contains("--repo"))
+                && message.contains("owner/name"),
+            "{} returned an unactionable error for {:?}: {message}",
+            case.name,
+            case.value
+        );
+    }
+}
+
+#[tokio::test]
+async fn valid_repo_full_names_preserve_create_behavior() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(200, "[]"),
+        ("POST", "/agents") => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("POST /agents body should be JSON");
+            let repo = body["repo_full_name"]
+                .as_str()
+                .expect("POST /agents should carry repo_full_name");
+            Response::json(201, &agent_json(AGENT_ID, AGENT_NAME, "#old", Some(repo)))
+        }
+        (method, path) => deploy_tail(method, path)
+            .unwrap_or_else(|| panic!("unexpected request: {method} {path}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let vectors = repo_full_name_vectors();
+
+    for case in &vectors.valid {
+        let outcome = run_deploy(&client, None, Some(&case.value)).await;
+        assert_eq!(
+            outcome.agent.repo_full_name.as_deref(),
+            Some(case.value.as_str()),
+            "{} must preserve {:?}: {} (URL path {:?})",
+            case.name,
+            case.value,
+            case.why,
+            case.url_path
+        );
+    }
+
+    let creates: Vec<serde_json::Value> = server
+        .recorded()
+        .into_iter()
+        .filter(|request| request.method == "POST" && request.path == "/agents")
+        .map(|request| {
+            serde_json::from_slice(&request.body).expect("POST /agents body should be JSON")
+        })
+        .collect();
+    assert_eq!(creates.len(), vectors.valid.len());
+    for (body, case) in creates.iter().zip(&vectors.valid) {
+        assert_eq!(body["repo_full_name"].as_str(), Some(case.value.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn valid_repo_full_names_preserve_bind_behavior() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, "#old", None)),
+        ("PATCH", path) if *path == format!("/agents/{AGENT_ID}") => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("PATCH /agents/{id} body should be JSON");
+            let repo = body["repo_full_name"]
+                .as_str()
+                .expect("PATCH /agents/{id} should carry repo_full_name");
+            patched_agent("#old", Some(repo))
+        }
+        (method, path) => deploy_tail(method, path)
+            .unwrap_or_else(|| panic!("unexpected request: {method} {path}")),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    let vectors = repo_full_name_vectors();
+
+    for case in &vectors.valid {
+        let outcome = run_deploy(&client, None, Some(&case.value)).await;
+        assert_eq!(
+            outcome.agent.repo_full_name.as_deref(),
+            Some(case.value.as_str()),
+            "{} must preserve {:?}: {} (URL path {:?})",
+            case.name,
+            case.value,
+            case.why,
+            case.url_path
+        );
+    }
+
+    let patches = patch_bodies(&server);
+    assert_eq!(patches.len(), vectors.valid.len());
+    for (body, case) in patches.iter().zip(&vectors.valid) {
+        assert_eq!(body["repo_full_name"].as_str(), Some(case.value.as_str()));
+        assert!(
+            body.get("channel").is_none(),
+            "{} must bind without changing the channel: {body}",
+            case.name
+        );
+    }
 }
 
 #[tokio::test]

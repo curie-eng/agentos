@@ -11,6 +11,8 @@ from typing import Literal
 
 import httpx
 
+from .repo_full_name import repo_url_path
+
 logger = logging.getLogger(__name__)
 
 State = Literal["success", "failure", "pending", "error"]
@@ -73,6 +75,7 @@ class GitHubStatusReporter:
                 description,
             )
             return state
+        repository_path = repo_url_path(repo_full_name)
         payload: dict[str, str] = {
             "state": state,
             "context": self._context,
@@ -81,7 +84,7 @@ class GitHubStatusReporter:
         if target_url:
             payload["target_url"] = target_url
         resp = await self._client.post(
-            f"{self._api_url}/repos/{repo_full_name}/statuses/{sha}",
+            f"{self._api_url}/repos/{repository_path}/statuses/{sha}",
             json=payload,
             headers={
                 "Accept": "application/vnd.github+json",

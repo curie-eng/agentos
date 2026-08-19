@@ -29,6 +29,7 @@ from pydantic import (
 
 from .config import get_settings
 from .models import Environment
+from .repo_full_name import RepoFullName
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -729,7 +730,7 @@ class AgentCreate(BaseModel):
     # The WRITE model: a create may also configure the reply route (ADR-0096
     # phase 2). `AgentOut.channel` stays the read-only `{kind, address}` pair.
     channel: ChannelBindingWrite
-    repo_full_name: str | None = None
+    repo_full_name: RepoFullName | None = None
     behavior_packs: BehaviorPacksConfig | None = None
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
@@ -807,7 +808,7 @@ class AgentUpdate(BaseModel):
     # SECOND agent of a repo, which the unique index forbade from carrying it --
     # has no other way to be bound. Without this, git-flow cannot find that
     # agent and a target naming it is rejected as unknown.
-    repo_full_name: str | None = None
+    repo_full_name: RepoFullName | None = None
 
     _check_model = field_validator("model")(_validate_model_override)
     _check_thinking = field_validator("thinking")(_validate_thinking_override)

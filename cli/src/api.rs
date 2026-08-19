@@ -495,6 +495,40 @@ fn warn_if_insecure(base_url: &str) {
     }
 }
 
+fn validate_repo_full_name(repo_full_name: &str) -> Result<()> {
+    let Some((owner, repository)) = repo_full_name.split_once('/') else {
+        bail!(
+            "invalid repo_full_name: expected one owner/name pair; the owner must use 1 to 39 \
+             ASCII letters or digits with single nonterminal hyphens, and the name must use 1 \
+             to 100 ASCII letters, digits, dots, underscores, or hyphens other than `.` or `..`"
+        );
+    };
+
+    let owner_valid = (1..=39).contains(&owner.len())
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-')
+        && !owner.contains("--");
+    let repository_valid = (1..=100).contains(&repository.len())
+        && repository != "."
+        && repository != ".."
+        && repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+
+    if !owner_valid || !repository_valid {
+        bail!(
+            "invalid repo_full_name: expected one owner/name pair; the owner must use 1 to 39 \
+             ASCII letters or digits with single nonterminal hyphens, and the name must use 1 \
+             to 100 ASCII letters, digits, dots, underscores, or hyphens other than `.` or `..`"
+        );
+    }
+
+    Ok(())
+}
+
 /// The `POST /agents` body. Pure so the shape is testable without a live API.
 ///
 /// `repo_full_name` is sent only when asked, because a value the caller did not
@@ -743,6 +777,10 @@ impl ApiClient {
         slack_channel: Option<&str>,
         repo_full_name: Option<&str>,
     ) -> Result<(Agent, ChannelOutcome, Option<String>)> {
+        if let Some(repo_full_name) = repo_full_name {
+            validate_repo_full_name(repo_full_name)?;
+        }
+
         let existing = self
             .list_agents()
             .await?

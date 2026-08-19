@@ -48,6 +48,7 @@ from typing import Any, Protocol
 import httpx
 
 from .config import Settings
+from .repo_full_name import InvalidRepoFullName, repo_url_path
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class GitHubBranchTip:
         return 60.0
 
     def sha_for(self, repo_full_name: str, branch: str) -> str | None:
+        repository_path = repo_url_path(repo_full_name)
         now = time.time()
         wait_until = self._retry_at.get(repo_full_name, 0.0)
         if now < wait_until:
@@ -210,7 +212,10 @@ class GitHubBranchTip:
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        url = f"{self._settings.github_api_url.rstrip('/')}/repos/{repo_full_name}/commits/{branch}"
+        url = (
+            f"{self._settings.github_api_url.rstrip('/')}"
+            f"/repos/{repository_path}/commits/{branch}"
+        )
         with httpx.Client(timeout=self._timeout) as client:
             response = client.get(url, headers=headers)
         if response.status_code in (403, 429):
@@ -367,14 +372,24 @@ class CommitPoller:
 
         binding_snapshots = {repo: tuple(names) for repo, names in bindings.items()}
 
-        targets = [
-            PollTarget(
-                repo_full_name=repo,
-                clone_url=gitflow.trusted_clone_url(repo, self._settings),
-                branches=tuple(branch_for_env.values()),
+        targets: list[PollTarget] = []
+        for repo in bindings:
+            try:
+                clone_url = gitflow.trusted_clone_url(repo, self._settings)
+            except InvalidRepoFullName as exc:
+                logger.warning(
+                    "commit poll skipping invalid repository binding repo=%r: %s",
+                    repo,
+                    exc,
+                )
+                continue
+            targets.append(
+                PollTarget(
+                    repo_full_name=repo,
+                    clone_url=clone_url,
+                    branches=tuple(branch_for_env.values()),
+                )
             )
-            for repo in bindings
-        ]
         # to_thread because the tip reader is sync httpx: a blocking call in
         # the event loop would stall every request the API is serving.
         moves: list[Move] = await asyncio.to_thread(moves_to_deploy, targets, self._tips, deployed)

@@ -26,6 +26,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 # The committed, exported contract -- the artifact every generated client and
 # every drift gate reads, not the in-process Pydantic model.
 OPENAPI = Path(__file__).resolve().parents[1] / "openapi.json"
+REPO_FULL_NAME_CORPUS = json.loads(
+    (Path(__file__).resolve().parents[3] / "tests/vectors/repo-full-name.json").read_text()
+)
+VALID_REPOSITORIES: list[dict[str, Any]] = REPO_FULL_NAME_CORPUS["valid"]
+INVALID_REPOSITORIES: list[dict[str, Any]] = REPO_FULL_NAME_CORPUS["invalid"]
 
 
 def _slack(address: str) -> dict[str, str]:
@@ -105,6 +110,72 @@ def test_two_agents_may_share_one_repository(
     )
     assert second.status_code == 201, second.text
     assert second.json()["repo_full_name"] == "octo/shared-repo"
+
+
+@pytest.mark.parametrize("case", INVALID_REPOSITORIES, ids=lambda case: case["name"])
+def test_repo_full_name_invalid_corpus_is_rejected_on_create_and_patch(
+    case: dict[str, str],
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    seed = _create(
+        client,
+        auth_headers,
+        name="repo-patch-target",
+        channel=_slack("C0EXAMPLE1"),
+    )
+    assert seed.status_code == 201, seed.text
+
+    created = _create(
+        client,
+        auth_headers,
+        name="invalid-repo-create",
+        channel=_slack("C0EXAMPLE2"),
+        repo_full_name=case["value"],
+    )
+    patched = client.patch(
+        f"/agents/{seed.json()['id']}",
+        json={"repo_full_name": case["value"]},
+        headers=auth_headers,
+    )
+
+    assert (created.status_code, patched.status_code) == (422, 422), (
+        f"{case['name']} was accepted: create={created.text}, patch={patched.text}"
+    )
+
+
+@pytest.mark.parametrize("case", VALID_REPOSITORIES, ids=lambda case: case["name"])
+def test_repo_full_name_valid_corpus_round_trips_without_normalization(
+    case: dict[str, str],
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    created = _create(
+        client,
+        auth_headers,
+        name="valid-repo-create",
+        channel=_slack("C0EXAMPLE1"),
+        repo_full_name=case["value"],
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["repo_full_name"] == case["value"]
+
+    patch_target = _create(
+        client,
+        auth_headers,
+        name="valid-repo-patch",
+        channel=_slack("C0EXAMPLE2"),
+    )
+    assert patch_target.status_code == 201, patch_target.text
+    patched = client.patch(
+        f"/agents/{patch_target.json()['id']}",
+        json={"repo_full_name": case["value"]},
+        headers=auth_headers,
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["repo_full_name"] == case["value"]
 
 
 def test_two_agents_may_not_share_one_channel(

@@ -198,7 +198,9 @@ def test_the_lifespan_wires_the_poller_to_the_bundle_store(clean_db: None) -> No
 # --------------------------------------------------------------------------- #
 # Rejections are reported, not called "deployed" (#1268)
 # --------------------------------------------------------------------------- #
-async def _capture_pushes(monkeypatch, *, deployed=None, tips=None) -> list[dict]:
+async def _capture_pushes(
+    monkeypatch, *, deployed=None, tips=None, bindings=None
+) -> list[dict]:
     """Run one real poll_once and return every payload it handed the deploy path.
 
     The point of driving the real method: every mutation the battery found
@@ -215,11 +217,26 @@ async def _capture_pushes(monkeypatch, *, deployed=None, tips=None) -> list[dict
         seen.append(payload)
         return WebhookResult(status="deployed")
 
-    await _run_poll_once(monkeypatch, None, on_push=capture, deployed=deployed, tips=tips)
+    await _run_poll_once(
+        monkeypatch,
+        None,
+        on_push=capture,
+        deployed=deployed,
+        tips=tips,
+        bindings=bindings,
+    )
     return seen
 
 
-async def _run_poll_once(monkeypatch, result, *, on_push=None, deployed=None, tips=None) -> None:
+async def _run_poll_once(
+    monkeypatch,
+    result,
+    *,
+    on_push=None,
+    deployed=None,
+    tips=None,
+    bindings=None,
+) -> None:
     """Drive the real poll_once with a stubbed deploy that returns `result`."""
     from contextlib import asynccontextmanager
 
@@ -236,7 +253,7 @@ async def _run_poll_once(monkeypatch, result, *, on_push=None, deployed=None, ti
             # First query lists bindings, second lists deployed state. Both
             # come from the real SQL in the module.
             if "FROM curie.agents" in str(stmt):
-                return Rows([(REPO, "agent")])
+                return Rows(bindings if bindings is not None else [(REPO, "agent")])
             return Rows(deployed or [])
 
     @asynccontextmanager
@@ -471,6 +488,32 @@ async def test_poll_once_deploys_when_the_recorded_sha_differs(monkeypatch) -> N
 
 
 @pytest.mark.anyio
+async def test_invalid_repo_full_name_is_skipped_without_blocking_valid_binding(
+    monkeypatch, caplog
+) -> None:
+    invalid = "octo/../escape?token=x"
+    valid = "Octo-Corp/repo.name_with-parts"
+    tips = Tips(
+        {
+            (invalid, "dev"): "bad123",
+            (valid, "dev"): "good456",
+            (invalid, "main"): None,
+            (valid, "main"): None,
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_api.commitpoller"):
+        seen = await _capture_pushes(
+            monkeypatch,
+            tips=tips,
+            bindings=[(invalid, "bad-agent"), (valid, "good-agent")],
+        )
+
+    assert [payload["repository"]["full_name"] for payload in seen] == [valid]
+    assert invalid in " ".join(record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.anyio
 async def test_run_forever_stops_when_cancelled() -> None:
     """Shutdown cancels this task and awaits it; it must actually end.
 
@@ -561,6 +604,33 @@ def test_a_404_is_still_a_missing_branch(monkeypatch) -> None:
     # by raising on everything.
     tip = _tip(monkeypatch, lambda r: httpx.Response(404, json={}))
     assert tip.sha_for(REPO, "nope") is None
+
+
+def test_a_valid_repository_is_preserved_in_the_commit_poll_url(monkeypatch) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"sha": "abc123"})
+
+    repo = "Octo-Corp/repo.name_with-parts"
+    assert _tip(monkeypatch, handler).sha_for(repo, "dev") == "abc123"
+    assert str(captured[0].url) == (
+        f"https://api.github.com/repos/{repo}/commits/dev"
+    )
+
+
+def test_invalid_repo_full_name_is_rejected_before_commit_poll_http(monkeypatch) -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, json={"sha": "abc123"})
+
+    with pytest.raises(ValueError):
+        _tip(monkeypatch, handler).sha_for("octo/../escape?token=x", "dev")
+
+    assert captured == []
 
 
 # Not re-cloning a commit that already settled (#1267)
