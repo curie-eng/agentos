@@ -73,7 +73,12 @@ from .killswitch import KillSwitch
 from .markers import Markers
 from .runner_client import RunnerClient, RunnerError, TurnStream
 from .sandbox import SandboxSubstrate
-from .sandbox.types import SandboxError, SandboxHandle, SuspendedThreadError
+from .sandbox.types import (
+    CapacityExhaustedError,
+    SandboxError,
+    SandboxHandle,
+    SuspendedThreadError,
+)
 from .slack_sink import SettledCard, SlackSink
 from .threadlock import ThreadLock
 
@@ -816,6 +821,34 @@ class Kernel:
         try:
             async with self._lock.hold(self._config.lock_key(thread)):
                 route = await self._route_and_start(thread, event, boot_env, packs)
+        except CapacityExhaustedError as exc:
+            release_order()
+            rejection = exc.rejection
+            logger.warning(
+                "sandbox capacity exhausted for event %s: quota=%s resource=%s "
+                "requested=%s used=%s hard=%s",
+                qevent.event_id,
+                rejection.quota_name,
+                rejection.resource,
+                rejection.requested,
+                rejection.used,
+                rejection.hard,
+            )
+            if self._is_approval_resume(qevent.event_id):
+                return TurnOutcome(terminal_ok=False, classification="runner-error")
+            await self._sink.update(
+                channel=qevent.reply_handle.channel,
+                ts=qevent.reply_handle.placeholder,
+                text=(
+                    "This agent is at sandbox capacity. ResourceQuota "
+                    f"{rejection.quota_name} rejected {rejection.resource}: "
+                    f"requested {rejection.requested}, observed usage "
+                    f"{rejection.used}, hard limit {rejection.hard}. Try again "
+                    "after another conversation releases its sandbox."
+                ),
+                endpoint=qevent.reply_handle.endpoint,
+            )
+            return TurnOutcome(terminal_ok=True)
         except (RunnerError, aiohttp.ClientError, TimeoutError, SandboxError) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable

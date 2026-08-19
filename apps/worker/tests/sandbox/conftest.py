@@ -22,6 +22,7 @@ from curie_test_support.valkey import (
 from curie_worker.sandbox import (
     AffinityStore,
     ClaimView,
+    QuotaRejection,
     SandboxView,
     SubstrateConfig,
 )
@@ -103,6 +104,9 @@ class FakeClaim:
     # reaper's bind-window grace is driven with no sleeps and no wall-clock
     # dependence; None models an adapter that cannot report an age at all.
     created_at: datetime | None = None
+    quota_rejection: QuotaRejection | None = None
+    ready_reason: str | None = None
+    ready_message: str | None = None
 
 
 @dataclass
@@ -127,6 +131,9 @@ class FakeSandboxClient:
     claims: dict[str, FakeClaim] = field(default_factory=dict)
     sandboxes: dict[str, FakeSandbox] = field(default_factory=dict)
     bind_ready: bool = True
+    quota_rejection: QuotaRejection | None = None
+    ready_reason: str | None = None
+    ready_message: str | None = None
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
@@ -144,8 +151,11 @@ class FakeSandboxClient:
             env=dict(env or {}),
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             sandbox_name=sandbox_name,
-            ready=self.bind_ready,
+            ready=self.bind_ready and self.quota_rejection is None,
             created_at=datetime.now(UTC),
+            quota_rejection=self.quota_rejection,
+            ready_reason=self.ready_reason,
+            ready_message=self.ready_message,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
@@ -164,6 +174,9 @@ class FakeSandboxClient:
             ready=claim.ready,
             sandbox_name=claim.sandbox_name if claim.ready else None,
             created_at=claim.created_at,
+            quota_rejection=claim.quota_rejection,
+            ready_reason=claim.ready_reason,
+            ready_message=claim.ready_message,
         )
 
     def delete_claim(self, name: str) -> None:

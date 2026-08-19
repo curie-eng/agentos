@@ -13,9 +13,11 @@ import pytest
 from aci_protocol import BootEnv
 from curie_worker.sandbox import (
     AffinityStore,
+    CapacityExhaustedError,
     ClaimTimeoutError,
     ClaimView,
     NoRouteError,
+    QuotaRejection,
     RouteRecord,
     RouteState,
     SandboxHandle,
@@ -24,6 +26,7 @@ from curie_worker.sandbox import (
     SubstrateConfig,
     SuspendedThreadError,
 )
+from curie_worker.sandbox.k8s import _claim_view
 
 from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 
@@ -84,6 +87,137 @@ def test_claim_timeout_cleans_up_claim(
     # The unbound claim is not leaked and no route was recorded.
     assert fake_k8s.deleted == fake_k8s.created
     assert affinity.get("T1") is None
+
+
+def test_quota_rejection_waits_for_deadline_and_cleans_up_claim(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="8",
+        hard="8",
+    )
+    fake_k8s.quota_rejection = rejection
+    original_get_claim = fake_k8s.get_claim
+    poll_count = 0
+
+    def get_claim_with_updated_rejection(name: str) -> ClaimView | None:
+        nonlocal poll_count
+        view = original_get_claim(name)
+        if view is None:
+            return None
+        poll_count += 1
+        if poll_count == 1:
+            return replace(
+                view,
+                quota_rejection=replace(rejection, used="7"),
+            )
+        return view
+
+    fake_k8s.get_claim = get_claim_with_updated_rejection  # type: ignore[method-assign]
+    short_config = replace(config, claim_timeout_seconds=0.05)
+    substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
+
+    started = time.monotonic()
+    with pytest.raises(CapacityExhaustedError) as excinfo:
+        substrate.claim("T1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= short_config.claim_timeout_seconds
+    assert excinfo.value.rejection == rejection
+    assert excinfo.value.rejection.quota_name == "curie-sandbox-quota"
+    assert excinfo.value.rejection.resource == "limits.cpu"
+    assert excinfo.value.rejection.requested == "1"
+    assert excinfo.value.rejection.used == "8"
+    assert excinfo.value.rejection.hard == "8"
+    assert poll_count >= 2
+    assert fake_k8s.deleted == fake_k8s.created
+    assert affinity.get("T1") is None
+
+
+def test_transient_quota_rejection_can_clear_before_claim_binds(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="8",
+        hard="8",
+    )
+    original_get_claim = fake_k8s.get_claim
+    poll_count = 0
+
+    def get_claim_after_transient_rejection(name: str) -> ClaimView | None:
+        nonlocal poll_count
+        view = original_get_claim(name)
+        if view is None:
+            return None
+        poll_count += 1
+        if poll_count == 1:
+            return replace(
+                view,
+                ready=False,
+                sandbox_name=None,
+                quota_rejection=rejection,
+                ready_reason="ReconcilerError",
+                ready_message="temporary ResourceQuota rejection",
+            )
+        return view
+
+    fake_k8s.get_claim = get_claim_after_transient_rejection  # type: ignore[method-assign]
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    handle = substrate.claim("T1")
+
+    assert poll_count >= 2
+    assert handle.sandbox_name in fake_k8s.sandboxes
+    assert affinity.get("T1") is not None
+
+
+def test_later_non_quota_condition_replaces_earlier_quota_evidence(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        resource="limits.cpu",
+        requested="1",
+        used="8",
+        hard="8",
+    )
+    fake_k8s.bind_ready = False
+    fake_k8s.ready_reason = "ReconcilerError"
+    fake_k8s.ready_message = "later nonquota condition"
+    original_get_claim = fake_k8s.get_claim
+    poll_count = 0
+
+    def get_claim_after_quota_rejection(name: str) -> ClaimView | None:
+        nonlocal poll_count
+        view = original_get_claim(name)
+        if view is None:
+            return None
+        poll_count += 1
+        if poll_count == 1:
+            return replace(
+                view,
+                quota_rejection=rejection,
+                ready_message="earlier quota rejection",
+            )
+        return view
+
+    fake_k8s.get_claim = get_claim_after_quota_rejection  # type: ignore[method-assign]
+    short_config = replace(config, claim_timeout_seconds=0.05)
+    substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T1")
+
+    message = str(excinfo.value)
+    assert poll_count >= 2
+    assert "later nonquota condition" in message
+    assert "earlier quota rejection" not in message
 
 
 def test_lost_race_adopts_winner_and_retires_loser(
@@ -231,7 +365,7 @@ def test_reap_orphans_spares_an_in_flight_claim(
     # A claim that is still binding has no route yet, so "no live route names
     # it" is ambiguous, not proof of litter. Reaping it deletes a live sandbox
     # out from under the blocked creator, which then polls a claim that is gone
-    # until its deadline and reports a timeout blaming the node.
+    # until its deadline and reports a bind timeout.
     fake_k8s = _ReapDuringBindClient(bind_ready=False)
     substrate = SandboxSubstrate(fake_k8s, affinity, config)
     fake_k8s.substrate = substrate
@@ -491,6 +625,9 @@ class _SlowBindNoFqdnClient(FakeSandboxClient):
             ready=ready,
             sandbox_name=claim.sandbox_name if ready else None,
             created_at=claim.created_at,
+            quota_rejection=None,
+            ready_reason=None,
+            ready_message=None,
         )
 
     def get_sandbox(self, name: str) -> SandboxView | None:
@@ -537,7 +674,75 @@ def test_claim_timeout_error_names_the_budget(
         substrate.claim("T1")
     # The error message names the configured budget so the signature change
     # (one shared deadline) does not silently drop the timeout value.
-    assert str(config.claim_timeout_seconds) in str(excinfo.value)
+    message = str(excinfo.value)
+    assert str(config.claim_timeout_seconds) in message
+    assert "no ready condition was observed" in message.lower()
+    assert "pod was created" not in message.lower()
+    assert "cpu-saturated" not in message.lower()
+    assert "kubectl top" not in message.lower()
+
+
+def test_non_quota_reconciler_error_stays_on_slow_bind_path(
+    fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
+) -> None:
+    view = _claim_view(
+        {
+            "metadata": {"name": "curie-thread-example"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "ReconcilerError",
+                        "message": (
+                            'Error seen: pods "curie-thread-example" is forbidden: User '
+                            '"system:serviceaccount:curie1572:worker" cannot create resource '
+                            '"pods"'
+                        ),
+                    }
+                ]
+            },
+        }
+    )
+    assert view.quota_rejection is None
+    fake_k8s.bind_ready = False
+    fake_k8s.quota_rejection = view.quota_rejection
+    fake_k8s.ready_reason = view.ready_reason
+    fake_k8s.ready_message = view.ready_message
+    original_get_claim = fake_k8s.get_claim
+    poll_count = 0
+
+    def get_claim_with_updated_condition(name: str) -> ClaimView | None:
+        nonlocal poll_count
+        current = original_get_claim(name)
+        if current is None:
+            return None
+        poll_count += 1
+        if poll_count == 1:
+            return replace(
+                current,
+                ready_reason="Provisioning",
+                ready_message="earlier condition",
+            )
+        return current
+
+    fake_k8s.get_claim = get_claim_with_updated_condition  # type: ignore[method-assign]
+    short_config = replace(config, claim_timeout_seconds=0.05)
+    substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T1")
+
+    message = str(excinfo.value)
+    assert "ReconcilerError" in message
+    assert view.ready_message is not None
+    assert view.ready_message in message
+    assert "earlier condition" not in message
+    assert poll_count >= 2
+    assert "pod was created" not in message.lower()
+    assert "cpu-saturated" not in message.lower()
+    assert "kubectl top" not in message.lower()
+    assert fake_k8s.deleted == fake_k8s.created
 
 
 def test_claim_on_suspended_route_refuses_to_fork(
