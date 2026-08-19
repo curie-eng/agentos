@@ -114,7 +114,9 @@ description = "Placeholder values this repo uses deliberately, plus generated ar
 # here is a value a reader is meant to copy and replace.
 regexTarget = "match"
 regexes = [
-  '''\bC0EXAMPLE[0-9]\b''',
+  # All three conversation prefixes: the CLI validates D (DM) and G (legacy
+  # private group) ids alongside C, so their examples need the same cover.
+  '''\b[CGD]0EXAMPLE[0-9]\b''',
   '''\bi-0123456789abcdef0\b''',
   '''\b000000000000\b''',
   '''\bexample\.com\b''',
