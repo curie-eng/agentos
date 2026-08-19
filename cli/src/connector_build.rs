@@ -57,7 +57,7 @@ pub struct ConnectorsFileDecl {
 }
 
 /// One declared connector, a full mirror of `plugin_format.ConnectorSpec`.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorSpecDecl {
     // -- hosted form --
@@ -101,7 +101,7 @@ pub enum SecretDecl {
 }
 
 /// Where a connector's image comes from, when the bundle carries its source.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectorBuildDecl {
     pub context: String,
@@ -117,6 +117,40 @@ fn default_port() -> u32 {
 
 fn default_dockerfile() -> String {
     "Dockerfile".to_string()
+}
+
+/// Hand-written rather than derived, so an omitted `port` is 8000 whether the
+/// value came from a parsed document or from a constructed default. A derived
+/// `Default` would say 0, which is not a port and is not what the Python model
+/// means by "unset".
+impl Default for ConnectorSpecDecl {
+    fn default() -> Self {
+        Self {
+            image: None,
+            build: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            port: default_port(),
+            unhosted_url: None,
+            url: None,
+            headers: BTreeMap::new(),
+            secrets: Vec::new(),
+            sealed_secrets: BTreeMap::new(),
+            secret_files: BTreeMap::new(),
+        }
+    }
+}
+
+/// Same rule for `dockerfile`: an omitted one is `Dockerfile`, never the empty
+/// path a derived `Default` would produce.
+impl Default for ConnectorBuildDecl {
+    fn default() -> Self {
+        Self {
+            context: String::new(),
+            dockerfile: default_dockerfile(),
+            platforms: Vec::new(),
+        }
+    }
 }
 
 // ─── The lock ────────────────────────────────────────────────────────────────
@@ -757,4 +791,653 @@ fn class_matches(class: &[char], candidate: char) -> bool {
         i += 1;
     }
     false
+}
+
+// ─── The build plan: what `curie build --plugin-dir` actually issues ──────────
+
+/// An [`crate::ops::OpsCommand`] whose every token is a plain (non-secret) one.
+/// Connector commands carry no credential in argv by construction, which is the
+/// property `docker_env` exists to keep.
+pub(crate) fn plain_command(program: &str, args: Vec<String>) -> crate::ops::OpsCommand {
+    crate::ops::OpsCommand {
+        program: program.to_string(),
+        args: args.into_iter().map(crate::ops::CmdArg::Plain).collect(),
+        env: Vec::new(),
+        secret_env: Vec::new(),
+    }
+}
+
+/// The tag a local-daemon build produces, before the daemon's image id replaces
+/// it in the lock. Ephemeral by construction: nothing pulls it, and a rebuild
+/// reuses it, which is exactly why the lock records the id instead.
+fn local_build_tag(bundle_name: &str, connector: &str) -> String {
+    format!("curie-connector-{bundle_name}-{connector}:build")
+}
+
+/// How many hex characters of the source digest become the pushed tag. Long
+/// enough that two sources cannot collide in practice, short enough to read.
+const TAG_DIGEST_LEN: usize = 16;
+
+/// The uid every connector container runs as, mirroring `render_deployment`'s
+/// `runAsUser` so a staged credential is readable by the same identity on both
+/// tiers.
+const CONNECTOR_UID: u32 = 65532;
+
+/// One connector's resolved build: the inputs, the command's target, and the
+/// identity the lock will record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorBuildPlan {
+    pub connector: String,
+    /// Canonical, inside the bundle.
+    pub context: PathBuf,
+    /// Canonical, inside the context.
+    pub dockerfile: PathBuf,
+    /// The DECLARED platform set, in declaration order. What the lock records,
+    /// and what the registry path builds; the local-daemon path builds
+    /// [`ConnectorBuildPlan::host_platform`] instead.
+    pub platforms: Vec<String>,
+    /// The one platform a local-daemon build can actually produce.
+    pub host_platform: String,
+    pub delivery: Delivery,
+    /// The `-t` tag this build produces.
+    pub image_ref: String,
+    pub source_digest: String,
+    /// Where buildx writes its build result metadata; registry delivery only.
+    pub metadata_file: Option<PathBuf>,
+}
+
+/// The OCI platform of the machine running the CLI.
+///
+/// A Linux platform always: `docker build --platform darwin/arm64` would ask
+/// the daemon for an image no container runtime can run. The host here means
+/// the ARCH of the machine, never its OS.
+pub fn host_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" | "x86" => "amd64",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        "powerpc64" => "ppc64le",
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+/// Resolve everything one connector's build needs, without contacting anything.
+///
+/// Planning is where a bad declaration fails: a context outside the bundle, a
+/// symlinked Dockerfile, a missing Dockerfile. A planner that returned a plan
+/// for any of those would hand `docker` a path and surface Docker's error
+/// instead of one naming the connector.
+pub fn build_plan(
+    bundle_root: &Path,
+    bundle_name: &str,
+    connector: &str,
+    spec: &ConnectorSpecDecl,
+    registry: Option<&str>,
+    host_platform: &str,
+    metadata_dir: &Path,
+) -> Result<ConnectorBuildPlan> {
+    let build = spec.build.as_ref().ok_or_else(|| {
+        anyhow!("connectors.{connector}: declares no `build` block, so there is nothing to build")
+    })?;
+    check_build(connector, build)?;
+    let context = resolve_context(bundle_root, &build.context)
+        .with_context(|| format!("connectors.{connector}"))?;
+    let dockerfile = resolve_dockerfile(&context, &build.dockerfile)
+        .with_context(|| format!("connectors.{connector}"))?;
+    let source_digest =
+        source_digest_of(&context, build).with_context(|| format!("connectors.{connector}"))?;
+
+    let (delivery, image_ref, metadata_file) = match registry {
+        Some(registry) => (
+            Delivery::Registry,
+            registry_image_ref(registry, bundle_name, connector, &source_digest),
+            Some(metadata_dir.join(format!("{connector}.metadata.json"))),
+        ),
+        None => (
+            Delivery::LocalDaemon,
+            local_build_tag(bundle_name, connector),
+            None,
+        ),
+    };
+
+    Ok(ConnectorBuildPlan {
+        connector: connector.to_string(),
+        context,
+        dockerfile,
+        platforms: build.platforms.clone(),
+        host_platform: host_platform.to_string(),
+        delivery,
+        image_ref,
+        source_digest,
+        metadata_file,
+    })
+}
+
+/// The `docker` command this plan runs.
+///
+/// Two delivery paths, two commands. `docker build` cannot emit a multi-arch
+/// index, so the local-daemon path builds the host platform only; the declared
+/// set stays in the lock so `cluster deploy` can still refuse it.
+pub fn build_argv(plan: &ConnectorBuildPlan) -> crate::ops::OpsCommand {
+    let mut args: Vec<String> = Vec::new();
+    match plan.delivery {
+        Delivery::LocalDaemon => {
+            args.push("build".into());
+            args.push("--platform".into());
+            args.push(plan.host_platform.clone());
+        }
+        Delivery::Registry => {
+            args.push("buildx".into());
+            args.push("build".into());
+            args.push("--platform".into());
+            args.push(plan.platforms.join(","));
+            args.push("--push".into());
+            if let Some(metadata) = &plan.metadata_file {
+                args.push("--metadata-file".into());
+                args.push(metadata.display().to_string());
+            }
+        }
+    }
+    args.push("-f".into());
+    args.push(plan.dockerfile.display().to_string());
+    args.push("-t".into());
+    args.push(plan.image_ref.clone());
+    args.push(plan.context.display().to_string());
+    plain_command("docker", args)
+}
+
+/// Read back the daemon's immutable image id for a tag it just built. The id is
+/// what survives a later rebuild reusing the same tag.
+pub fn image_inspect_argv(tag: &str) -> crate::ops::OpsCommand {
+    plain_command(
+        "docker",
+        vec![
+            "image".into(),
+            "inspect".into(),
+            "--format".into(),
+            "{{.Id}}".into(),
+            tag.to_string(),
+        ],
+    )
+}
+
+/// The push target for one connector: a repository per bundle+connector, tagged
+/// with a prefix of the source digest.
+///
+/// Never a mutable name: `:latest` would let a second build silently replace the
+/// bytes a first deploy resolved.
+pub fn registry_image_ref(
+    registry: &str,
+    bundle: &str,
+    connector: &str,
+    source_digest: &str,
+) -> String {
+    let hex = source_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(source_digest);
+    let tag: String = hex.chars().take(TAG_DIGEST_LEN).collect();
+    format!(
+        "{}/{bundle}-{connector}:{tag}",
+        registry.trim_end_matches('/')
+    )
+}
+
+/// The index digest buildx reports through `--metadata-file`.
+///
+/// `containerimage.digest` is the INDEX digest; `containerimage.config.digest`
+/// is a single-platform config blob and pulling by it fails on a multi-arch
+/// node, so the key is named explicitly rather than pattern-matched.
+pub fn digest_from_metadata(raw: &str) -> Result<String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).context("parse the buildx metadata file")?;
+    parsed
+        .get("containerimage.digest")
+        .and_then(|d| d.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "the buildx metadata file names no `containerimage.digest`, so the push did not \
+                 produce an image; recording an empty reference would surface much later as \
+                 ImagePullBackOff"
+            )
+        })
+}
+
+/// The repository at a digest, with the push tag dropped: a reference exactly
+/// one artifact can resolve.
+pub fn digest_pinned_ref(image_ref: &str, digest: &str) -> String {
+    let repo = match image_ref.split_once('@') {
+        Some((repo, _)) => repo,
+        None => {
+            let tag_start = image_ref
+                .rfind(':')
+                .filter(|colon| image_ref[*colon..].find('/').is_none());
+            match tag_start {
+                Some(colon) => &image_ref[..colon],
+                None => image_ref,
+            }
+        }
+    };
+    format!("{repo}@{digest}")
+}
+
+// ─── The lock write ──────────────────────────────────────────────────────────
+
+/// Why this write must not proceed, or `None` when it may.
+///
+/// The one-directional rule: a local-daemon resolution must not silently
+/// replace a registry one, because only the registry lock is deployable to a
+/// cluster. The reverse is a promotion and needs no ceremony.
+pub fn lock_overwrite_refusal(
+    existing: Option<&ConnectorLockFileDecl>,
+    next: &ConnectorLockFileDecl,
+    force: bool,
+) -> Option<String> {
+    if force {
+        return None;
+    }
+    let existing = existing?;
+    let downgraded: Vec<&str> = next
+        .connectors
+        .iter()
+        .filter(|(name, entry)| {
+            entry.delivery == Delivery::LocalDaemon
+                && existing
+                    .connectors
+                    .get(*name)
+                    .is_some_and(|prior| prior.delivery == Delivery::Registry)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if downgraded.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{CONNECTOR_LOCK_FILE} already resolves {} to a pushed registry image, and this build \
+         resolved it to the local daemon, which a cluster cannot pull. Re-run with --registry \
+         <ref> to keep a pushed image, or with --force to replace the lock deliberately.",
+        downgraded.join(", ")
+    ))
+}
+
+/// Write the lock at the bundle root, atomically, refusing a silent downgrade.
+///
+/// Byte-stable for an unchanged resolution: nothing here stamps a timestamp and
+/// every map is a `BTreeMap`, so "nothing changed" stays visible in
+/// `git status` instead of showing a diff on every rebuild.
+pub fn write_lock(bundle_root: &Path, lock: &ConnectorLockFileDecl, force: bool) -> Result<()> {
+    let existing = load_lock(bundle_root).unwrap_or(None);
+    if let Some(refusal) = lock_overwrite_refusal(existing.as_ref(), lock, force) {
+        return Err(crate::exit::usage(refusal));
+    }
+    let path = bundle_root.join(CONNECTOR_LOCK_FILE);
+    let body = serde_norway::to_string(lock).context("serialize the connector lock")?;
+    let temp = path.with_extension("yaml.tmp");
+    std::fs::write(&temp, body).with_context(|| format!("write {}", temp.display()))?;
+    std::fs::rename(&temp, &path).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+// ─── The rendered container contract, shared by both local emitters ───────────
+
+/// The deployment identity every derived name is built from.
+///
+/// Passed in, never re-derived: `--agent`/`--target` can override the
+/// manifest's name, and a helper that read `plugin.json` again would alias the
+/// connectors under one identity while the runner dialed another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorScope {
+    pub release: String,
+    pub agent: String,
+    pub namespace: String,
+}
+
+/// Every name the sandbox might use to reach this connector, in the order
+/// `connector_render.host_aliases` emits them.
+fn host_aliases(scope: &ConnectorScope, connector: &str, port: u32) -> Vec<String> {
+    let short = object_name(&scope.release, &scope.agent, connector);
+    let dns = service_dns(&scope.release, &scope.agent, connector, &scope.namespace);
+    vec![
+        format!("{short}:{port}"),
+        format!("{short}.{}:{port}", scope.namespace),
+        format!("{dns}:{port}"),
+    ]
+}
+
+/// What each `${CURIE_*}` placeholder expands to for this connector.
+///
+/// A port of `connector_render.substitutions`. Every value is one the bundle
+/// author cannot know, because all of them derive from the Service name Curie
+/// invents.
+pub fn connector_substitutions(
+    scope: &ConnectorScope,
+    connector: &str,
+    port: u32,
+) -> BTreeMap<String, String> {
+    let short = object_name(&scope.release, &scope.agent, connector);
+    let dns = service_dns(&scope.release, &scope.agent, connector, &scope.namespace);
+    BTreeMap::from([
+        (
+            "CURIE_ALLOWED_HOSTS".to_string(),
+            host_aliases(scope, connector, port).join(","),
+        ),
+        ("CURIE_CONNECTOR_HOST".to_string(), short),
+        ("CURIE_CONNECTOR_PORT".to_string(), port.to_string()),
+        (
+            "CURIE_CONNECTOR_URL".to_string(),
+            format!("http://{dns}:{port}"),
+        ),
+    ])
+}
+
+/// Expand `${CURIE_*}` placeholders in one arg or env value.
+pub fn substitute(value: &str, subs: &BTreeMap<String, String>) -> String {
+    let mut out = value.to_string();
+    for (key, replacement) in subs {
+        out = out.replace(&format!("${{{key}}}"), replacement);
+    }
+    out
+}
+
+/// The connector scope the runner needs to derive the same URLs independently.
+///
+/// All three or none: the boot contract drops a partial set entirely, so
+/// emitting two of three silently switches connectors off.
+pub fn connector_scope_env(scope: &ConnectorScope) -> Vec<(String, String)> {
+    vec![
+        (
+            curie_aci_protocol::env_keys::CURIE_CONNECTOR_RELEASE.to_string(),
+            scope.release.clone(),
+        ),
+        (
+            curie_aci_protocol::env_keys::CURIE_CONNECTOR_AGENT.to_string(),
+            scope.agent.clone(),
+        ),
+        (
+            curie_aci_protocol::env_keys::CURIE_CONNECTOR_NAMESPACE.to_string(),
+            scope.namespace.clone(),
+        ),
+    ]
+}
+
+// ─── Staged credentials ──────────────────────────────────────────────────────
+
+/// Where resolved connector credentials are staged for a local bring-up.
+///
+/// Deterministic, not a per-run tempdir: teardown is label-driven and a reap
+/// that never inspected a container cannot discover a random path, so the
+/// credential would survive every `down`. Under `.curie/`, which the packer
+/// excludes and the scaffold gitignores.
+pub fn connector_secrets_root(plugin_dir: &Path) -> PathBuf {
+    plugin_dir.join(".curie").join("connector-secrets")
+}
+
+/// The host path one declared `secret_files` entry is staged at.
+pub fn staged_secret_path(plugin_dir: &Path, connector: &str, declared_path: &str) -> PathBuf {
+    let basename = declared_path.rsplit('/').next().unwrap_or(declared_path);
+    connector_secrets_root(plugin_dir)
+        .join(connector)
+        .join(basename)
+}
+
+/// Write one resolved credential where the container will find it.
+///
+/// The parent directories are `0700` because the file mode is not always
+/// enough: rootless Docker and Docker Desktop map uids differently, so the
+/// `chown` to the container's uid is not always permitted, and where it is not
+/// the file falls back to `0444` inside a private parent.
+pub fn stage_secret_file(
+    plugin_dir: &Path,
+    connector: &str,
+    declared_path: &str,
+    value: &str,
+) -> Result<PathBuf> {
+    let path = staged_secret_path(plugin_dir, connector, declared_path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("staged credential path has no parent"))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    private_dir(&connector_secrets_root(plugin_dir))?;
+    private_dir(parent)?;
+    std::fs::write(&path, value).with_context(|| format!("write {}", path.display()))?;
+    harden_secret_file(&path)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn private_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_secret_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))
+        .with_context(|| format!("restrict {}", path.display()))?;
+    // Where the CLI may not hand the file to the container's uid, the file must
+    // be world-readable instead -- the 0700 parent is what keeps it private.
+    if std::os::unix::fs::chown(path, Some(CONNECTOR_UID), Some(CONNECTOR_UID)).is_err() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+            .with_context(|| format!("widen {} for the container's uid", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_secret_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Remove the staged credential tree. A no-op when it is already gone, so
+/// `down` after `down` does not error.
+pub fn wipe_connector_secrets(plugin_dir: &Path) -> Result<()> {
+    let root = connector_secrets_root(plugin_dir);
+    if !root.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&root).with_context(|| format!("remove {}", root.display()))
+}
+
+// ─── The compose overlay (the local tier's emitter) ──────────────────────────
+
+/// The compose network the worker puts a sandboxed runner on. Joined, never
+/// created: a network of the overlay's own leaves the runner unable to resolve
+/// the alias.
+pub const RUNNER_NETWORK: &str = "curie_runner";
+
+/// Where the generated overlay is written: ephemeral state under `.curie/`, so
+/// it never enters the uploaded bundle and never perturbs the bundle digest.
+pub fn compose_overlay_path(plugin_dir: &Path) -> PathBuf {
+    plugin_dir.join(".curie").join("compose.connectors.yaml")
+}
+
+/// `docker compose ... up -d --wait` for the generated overlay, joined to the
+/// running stack's project so the services land on its network.
+pub fn compose_up_command(overlay: &Path, project: &str) -> crate::ops::OpsCommand {
+    plain_command(
+        "docker",
+        vec![
+            "compose".into(),
+            "-p".into(),
+            project.to_string(),
+            "-f".into(),
+            overlay.display().to_string(),
+            "up".into(),
+            "-d".into(),
+            "--wait".into(),
+        ],
+    )
+}
+
+/// Whether a declared connector is one Curie runs (as opposed to one already
+/// running somewhere else).
+fn is_hosted(spec: &ConnectorSpecDecl) -> bool {
+    spec.url.is_none() && spec.unhosted_url.is_none()
+}
+
+/// The image a hosted connector starts from: the locked digest when the bundle
+/// builds it, else the declared `image:`.
+fn resolved_image(
+    connector: &str,
+    spec: &ConnectorSpecDecl,
+    lock: &ConnectorLockFileDecl,
+) -> Result<String> {
+    if let Some(entry) = lock.connectors.get(connector) {
+        return Ok(entry.image.clone());
+    }
+    spec.image.clone().ok_or_else(|| {
+        anyhow!(
+            "connectors.{connector}: declares no `image` and {CONNECTOR_LOCK_FILE} has no entry \
+             for it. Run `curie build --plugin-dir <dir>` first."
+        )
+    })
+}
+
+/// The generated compose overlay: one service per hosted connector, the same
+/// rendered contract `ConnectorStartSpec` emits with `docker run`.
+pub fn compose_overlay(
+    lock: &ConnectorLockFileDecl,
+    decl: &ConnectorsFileDecl,
+    identity: &ConnectorScope,
+    project: &str,
+    plugin_dir: &Path,
+    secret_values: &BTreeMap<String, String>,
+) -> Result<serde_json::Value> {
+    let mut services = serde_json::Map::new();
+    for (connector, spec) in &decl.connectors {
+        if !is_hosted(spec) {
+            continue;
+        }
+        refuse_out_of_band_secrets(connector, spec)?;
+        let image = resolved_image(connector, spec, lock)?;
+        let subs = connector_substitutions(identity, connector, spec.port);
+        let name = object_name(&identity.release, &identity.agent, connector);
+        let alias = service_dns(
+            &identity.release,
+            &identity.agent,
+            connector,
+            &identity.namespace,
+        );
+
+        let mut environment = serde_json::Map::new();
+        for (key, value) in &spec.env {
+            environment.insert(
+                key.clone(),
+                serde_json::Value::String(substitute(value, &subs)),
+            );
+        }
+        for name in declared_secret_names(spec) {
+            // Compose has no secretKeyRef, so a declared secret is resolved
+            // locally. Its value stays out of argv: compose reads the file.
+            if let Some(value) = secret_values.get(&name) {
+                environment.insert(name, serde_json::Value::String(value.clone()));
+            }
+        }
+
+        let volumes: Vec<serde_json::Value> = spec
+            .secret_files
+            .values()
+            .map(|declared_path| {
+                serde_json::Value::String(format!(
+                    "{}:{declared_path}:ro",
+                    staged_secret_path(plugin_dir, connector, declared_path).display()
+                ))
+            })
+            .collect();
+
+        let mut service = serde_json::Map::new();
+        service.insert("image".into(), serde_json::Value::String(image));
+        if !spec.args.is_empty() {
+            service.insert(
+                "command".into(),
+                serde_json::Value::Array(
+                    spec.args
+                        .iter()
+                        .map(|arg| serde_json::Value::String(substitute(arg, &subs)))
+                        .collect(),
+                ),
+            );
+        }
+        if !environment.is_empty() {
+            service.insert("environment".into(), serde_json::Value::Object(environment));
+        }
+        if !volumes.is_empty() {
+            service.insert("volumes".into(), serde_json::Value::Array(volumes));
+        }
+        let mut attachment = serde_json::Map::new();
+        attachment.insert(
+            RUNNER_NETWORK.to_string(),
+            serde_json::json!({ "aliases": [alias] }),
+        );
+        service.insert("networks".into(), serde_json::Value::Object(attachment));
+        service.insert(
+            "labels".into(),
+            serde_json::json!({
+                "curietech.ai/component": "connector",
+                "curietech.ai/project": project,
+            }),
+        );
+        service.insert("read_only".into(), serde_json::Value::Bool(true));
+        service.insert(
+            "user".into(),
+            serde_json::Value::String(format!("{CONNECTOR_UID}:{CONNECTOR_UID}")),
+        );
+        service.insert("cap_drop".into(), serde_json::json!(["ALL"]));
+        service.insert(
+            "security_opt".into(),
+            serde_json::json!(["no-new-privileges"]),
+        );
+        services.insert(name, serde_json::Value::Object(service));
+    }
+
+    let mut networks = serde_json::Map::new();
+    networks.insert(
+        RUNNER_NETWORK.to_string(),
+        serde_json::json!({ "external": true, "name": RUNNER_NETWORK }),
+    );
+    Ok(serde_json::json!({
+        "services": services,
+        "networks": serde_json::Value::Object(networks),
+    }))
+}
+
+/// The env-var names a declaration's `secrets:` list asks to be forwarded.
+pub fn declared_secret_names(spec: &ConnectorSpecDecl) -> Vec<String> {
+    spec.secrets
+        .iter()
+        .map(|declared| match declared {
+            SecretDecl::Name(name) => name.clone(),
+            SecretDecl::Ref { name, .. } => name.clone(),
+        })
+        .collect()
+}
+
+/// A `from_secret` reference points at a Secret someone else provisioned, and
+/// nothing on a laptop corresponds to it. Starting without the credential would
+/// give a server that 401s on every call, which reads as a broken connector
+/// rather than a missing prerequisite, so bring-up fails closed.
+pub fn refuse_out_of_band_secrets(connector: &str, spec: &ConnectorSpecDecl) -> Result<()> {
+    for declared in &spec.secrets {
+        if let SecretDecl::Ref {
+            name, from_secret, ..
+        } = declared
+        {
+            return Err(crate::exit::usage(format!(
+                "connectors.{connector}: `{name}` references the out-of-band Secret \
+                 `{from_secret}`, which has no local equivalent. Either store the value once \
+                 with `curie secrets set {name}` and declare it as a plain `secrets:` entry, \
+                 point the connector at something already running with `unhosted_url`, or run \
+                 this connector at the cluster tier where the Secret exists."
+            )));
+        }
+    }
+    Ok(())
 }

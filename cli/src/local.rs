@@ -17,6 +17,11 @@ use crate::ops::{plain, require_on_path, run_capture, run_step, OpsCommand};
 /// Dev-channel local-candidate filename probed by the artifact resolver.
 pub const DEFAULT_COMPOSE_FILE: &str = "compose.dev.yaml";
 
+/// The compose project every local-tier command pins, injected as
+/// `COMPOSE_PROJECT_NAME`. Named once so the connector overlay joins the same
+/// project (and therefore the same `curie_runner` network) the stack runs under.
+pub const COMPOSE_PROJECT: &str = "curie";
+
 /// The Docker volume holding this tier's Ollama model cache: compose's
 /// `ollama_data` under the pinned `curie` project name that `up_command`
 /// injects as `COMPOSE_PROJECT_NAME`. Hardcoded to match the compose file, the
@@ -302,7 +307,7 @@ pub fn up_command(o: &LocalOpts) -> OpsCommand {
             // Pin the compose project name so the default network is always
             // `curie_default`, regardless of the working-directory basename
             // (which is what compose otherwise derives the project name from).
-            ("COMPOSE_PROJECT_NAME".into(), "curie".into()),
+            ("COMPOSE_PROJECT_NAME".into(), COMPOSE_PROJECT.into()),
         ]
     } else {
         // Delegate to `fake_model_env_override`, which discriminates on
@@ -373,7 +378,7 @@ pub fn rebuild_command(o: &LocalOpts, service: &str) -> OpsCommand {
             ),
             ("CURIE_MODEL".into(), model.clone()),
             ("CURIE_DOCKER_NETWORK".into(), "curie_runner".into()),
-            ("COMPOSE_PROJECT_NAME".into(), "curie".into()),
+            ("COMPOSE_PROJECT_NAME".into(), COMPOSE_PROJECT.into()),
         ]
     } else {
         fake_model_env_override(o.model_mode).into_iter().collect()
@@ -762,6 +767,11 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
                     "docker rm -f $(docker ps -a --filter label={} -q)",
                     docker::SANDBOX_LABEL
                 ),
+                format!(
+                    "docker rm -f $(docker ps -a -q --filter label={} --filter label={})",
+                    docker::CONNECTOR_COMPONENT_LABEL,
+                    docker::connector_project_label(COMPOSE_PROJECT)
+                ),
             ],
         }));
     }
@@ -787,6 +797,18 @@ pub async fn down(o: LocalDownOpts) -> Result<LocalDownOutput> {
         "stopping stack"
     };
     run_step(&cl, label, "stopped", &cmd).await?;
+    // Connector containers are label-scoped, never file-scoped: `LocalDownOpts`
+    // carries no plugin directory, so a `down` run from another directory must
+    // still reap what a `local deploy` started (ADR 0113, block B1-8).
+    for problem in docker::run_connector_teardown(&docker::connector_teardown_plan(
+        COMPOSE_PROJECT,
+        None,
+        None,
+    ))
+    .await
+    {
+        ui.warn(&problem);
+    }
     let report = docker::reap_labeled(docker::SANDBOX_LABEL).await;
     if let Some(err) = report.error {
         // The stack stopped, but the runner reap did not complete cleanly. Fail

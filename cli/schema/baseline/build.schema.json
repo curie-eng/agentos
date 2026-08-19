@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/build/v1.json",
+  "title": "curie build --plugin-dir --json",
+  "description": "The `curie build --plugin-dir` receipt: one connector record per connector the bundle declared a `build:` for, in the order built. Always one object, even when the bundle declares nothing to build (#485): an empty `connectors` array is the honest 'nothing to build', distinguishable from a command that produced nothing.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "connectors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The connector's declared name in connectors.yaml."
+          },
+          "image": {
+            "type": "string",
+            "description": "The resolved immutable identity recorded in connectors.lock.yaml: `<repo>@sha256:<64 hex>` for registry delivery, a bare `sha256:<64 hex>` image id for local-daemon delivery."
+          },
+          "delivery": {
+            "enum": [
+              "registry",
+              "local-daemon"
+            ],
+            "description": "How the built artifact is delivered to a tier: pushed to a registry the cluster can pull, or loaded into the local Docker daemon."
+          },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The OCI platforms built, as declared (`os/arch`, optionally `/variant`)."
+          },
+          "source_digest": {
+            "type": "string",
+            "description": "The digest of the build context as shipped (the connectors.lock.yaml `source_digest`), which stale-lock detection compares against a recomputation."
+          }
+        },
+        "required": [
+          "name",
+          "image",
+          "delivery",
+          "platforms",
+          "source_digest"
+        ]
+      }
+    }
+  },
+  "required": [
+    "connectors"
+  ]
+}

@@ -479,6 +479,45 @@ def test_worker_traces_to_shipped_collector_by_default():
         )
 
 
+# --- Local-tier connector scope (#1690, ADR 0113 Stream B2) -----------------
+#
+# `config.py`'s `connector_release` / `connector_namespace` already read
+# CURIE_RELEASE / CURIE_NAMESPACE (both default empty), and `binding.py`
+# already forwards them into the sandbox boot env unchanged -- that plumbing
+# was built for the cluster tier (#1118), where Helm supplies `.Release.Name`
+# / `.Release.Namespace`. There is no Helm release at skill/local tier, so
+# nothing has ever set these two on curie-worker: a plain `curie local up`
+# leaves both empty, `binding.py` emits no connector scope at all, and the
+# runner logs "declared but not exercisable in this tier" (#1093) for every
+# hosted connector even once a build-form connector container is started
+# beside it on `curie_runner`. This is the synthetic scope that makes the
+# Docker network alias `connector_render.service_dns(...)` computes for the
+# local connector container and the cluster Service DNS the same string.
+
+
+def test_worker_carries_a_local_tier_connector_scope():
+    """`curie-worker` must resolve a non-empty CURIE_RELEASE and CURIE_NAMESPACE
+    with no manual export, in both the dev document and the generated release
+    document -- the generator copies env through untouched, and a guard on only
+    one of the two leaves the other free to drift (the same reasoning as the
+    OTEL/CURIE_DOCKER_NETWORK pin above).
+    """
+    for label, doc in compose_docs():
+        env = env_map(doc["services"]["curie-worker"])
+        release = resolve_shell_default(env.get("CURIE_RELEASE"))
+        namespace = resolve_shell_default(env.get("CURIE_NAMESPACE"))
+        assert release, (
+            f"{label}: curie-worker CURIE_RELEASE resolves to {release!r}; "
+            "config.py's connector_release stays empty and binding.py emits no "
+            "connector scope for the sandbox to mount, so every hosted "
+            "connector local tier starts is unreachable"
+        )
+        assert namespace, (
+            f"{label}: curie-worker CURIE_NAMESPACE resolves to {namespace!r}; "
+            "config.py's connector_namespace stays empty for the same reason"
+        )
+
+
 def assert_init_containers_adopted(compose_text, label):
     """Assert every one-shot init container is adopted via
     `service_completed_successfully` in every profile combo `curie local up`

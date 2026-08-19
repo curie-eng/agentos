@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from curie_worker.connector_agent import own
 from curie_worker.connector_reconcile import OWNER_LABEL, plan, stamp_hash
 
 
@@ -142,3 +143,71 @@ def test_a_mixed_state_converges_in_one_plan() -> None:
     assert p.delete == [("Secret", "stale")]
     assert p.unchanged == [("Service", "keep")]
     assert p.drifted == [("Deployment", "drift")]
+
+
+# --------------------------------------------------------------------------- #
+# The reconciler inherits the locked digest -- it never resolves a build
+# itself (ADR 0113, #1690)
+# --------------------------------------------------------------------------- #
+def test_a_built_connectors_desired_object_carries_the_locked_digest() -> None:
+    """`apply_lock` is the single resolution point (Section 3,
+    `connector_agent.py:62`: the worker "consumes what the API returns ...
+    inherits the digest from the API render"). `connector_reconcile.plan`
+    itself never touches a `build:` declaration or a lock -- it only ever sees
+    whatever `desired` the caller hands it -- so this drives the REAL
+    `apply_lock` -> `render` -> `own` -> `plan` path end to end rather than
+    poking a Deployment's `image` field by hand, and proves the object `plan`
+    decides to apply carries the resolved digest, not the source declaration.
+    """
+    from plugin_format import connector_render
+    from plugin_format.connector_lock import ConnectorLockFile, apply_lock
+    from plugin_format.connectors import validate_connectors
+
+    digest = "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:" + "3" * 64
+    declared, errors = validate_connectors(
+        {
+            "connectors": {
+                "k8s-write": {
+                    "build": {
+                        "context": "connectors/k8s-write",
+                        "platforms": ["linux/amd64"],
+                    }
+                }
+            }
+        }
+    )
+    assert errors == [], errors
+    lock = ConnectorLockFile.model_validate(
+        {
+            "version": 1,
+            "connectors": {
+                "k8s-write": {
+                    "image": digest,
+                    "delivery": "registry",
+                    "platforms": ["linux/amd64"],
+                    "source_digest": "sha256:" + "4" * 64,
+                }
+            },
+        }
+    )
+    resolved = apply_lock(declared, lock, portable=True)
+    rendered = connector_render.render(
+        release="acme-bot",
+        agent="acme-bot",
+        namespace="acme-bot",
+        app_name="acme-bot",
+        connector="k8s-write",
+        spec=resolved.connectors["k8s-write"],
+        secret_name="conn-secrets",
+    )
+    desired = [own(o, "acme-bot") for o in rendered]
+
+    p = plan(desired=desired, live=[], agent="acme-bot")
+
+    deployment = next(o for o in p.apply if o["kind"] == "Deployment")
+    assert deployment["spec"]["template"]["spec"]["containers"][0]["image"] == digest
+    # The unresolved declaration never reaches the plan at all: only
+    # apply_lock's OUTPUT does. A caller that skipped apply_lock would either
+    # have `render` raise (its own guard) or, if that regressed, apply a
+    # Deployment with no image rather than the locked digest.
+    assert "build" not in str(rendered)

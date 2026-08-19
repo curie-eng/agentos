@@ -7,8 +7,10 @@ URL the agent dials is the one the Service actually has.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
 from aci_protocol import BootEnv, Budget
 from curie_runner import RunnerConfig
 from curie_runner.__main__ import build_runner
@@ -244,6 +246,90 @@ def test_a_boot_that_renders_no_scope_still_mounts_no_hosted_connector(tmp_path:
         namespace=config.connector_namespace,
     )
     assert servers == {}
+
+
+# --------------------------------------------------------------------------- #
+# A build-form connector reaches the runner identically to an image one
+# (#1690, ADR 0113 Stream B2)
+#
+# The runner never resolves a build: `_read` parses connectors.yaml as shipped
+# in the bundle, and `mcp_entry` derives the URL from `is_hosted` and the
+# Service DNS naming convention alone -- it never reads `.image` (Section 3,
+# `connector_render.py:450`: "no code change ... skill, local and cluster
+# produce byte-identical entries"). `is_hosted` is True for a `build:`
+# connector whether or not its lock has been applied (`connectors.py:245`), so
+# these must already pass with no runner change; the digest resolution these
+# pin against lives entirely in `apply_lock`, upstream of the runner.
+# --------------------------------------------------------------------------- #
+BUILT = (
+    "connectors:\n"
+    "  conn:\n"
+    "    build:\n"
+    "      context: connectors/conn\n"
+    "      platforms: [linux/amd64]\n"
+)
+IMAGED = "connectors:\n  conn:\n    image: acme/conn-mcp:1.0\n"
+
+
+def test_a_build_form_connector_yields_the_same_entry_as_an_image_one(tmp_path: Path) -> None:
+    built = derive_mcp_servers(_bundle(tmp_path / "built", BUILT), **SCOPE)
+    imaged = derive_mcp_servers(_bundle(tmp_path / "imaged", IMAGED), **SCOPE)
+    assert built == imaged
+    assert built["conn"]["url"] == (
+        "http://curie-acme-dev-mcp-conn.curie.svc.cluster.local:8000/mcp"
+    )
+
+
+def test_a_build_form_connector_with_no_lock_applied_is_still_hosted(tmp_path: Path) -> None:
+    # A `build:` connector with no lock applied is hosted-and-unrenderable at
+    # the cluster's render step, but the runner's own scope check must not
+    # treat it as unhosted: an unresolved build with a scope present still
+    # mounts, exactly like an image connector does.
+    servers = derive_mcp_servers(_bundle(tmp_path, BUILT), **SCOPE)
+    assert "conn" in servers
+
+
+# --------------------------------------------------------------------------- #
+# The #1093 log: fires for a stranded hosted connector, silent once scoped
+# --------------------------------------------------------------------------- #
+def test_the_1093_log_fires_for_a_scope_less_hosted_connector(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # "declared but not exercisable in this tier" must still fire when neither
+    # a connector scope nor an unhosted_url reaches the bundle -- the honest
+    # answer at the skill tier, and the regression this build-form addition
+    # must not silently swallow.
+    with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
+        derive_mcp_servers(_bundle(tmp_path, HOSTED), release=None, agent=None, namespace=None)
+    assert any(
+        "declared but not exercisable in this tier" in r.message
+        for r in caplog.records
+    )
+
+
+def test_the_1093_log_fires_for_a_scope_less_build_form_connector(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
+        derive_mcp_servers(_bundle(tmp_path, BUILT), release=None, agent=None, namespace=None)
+    assert any(
+        "declared but not exercisable in this tier" in r.message
+        for r in caplog.records
+    )
+
+
+def test_the_1093_log_does_not_fire_once_a_scope_reaches_the_connector(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The scope this ticket makes the local tier able to supply must silence
+    # the log, exactly as it already does on cluster: a connector that is
+    # exercisable here is not "declared but not exercisable" here.
+    with caplog.at_level(logging.INFO, logger="curie_runner.connectors"):
+        derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE)
+    assert not any(
+        "declared but not exercisable in this tier" in r.message
+        for r in caplog.records
+    )
 
 
 # --------------------------------------------------------------------------- #

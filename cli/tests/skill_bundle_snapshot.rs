@@ -60,6 +60,8 @@ fn recorded_runner(base_url: &str, dir: &Path) -> RunnerState {
         model_base_url: None,
         bundle_digest: None,
         bundle_snapshot_dir: None,
+        connector_containers: Vec::new(),
+        connector_network: None,
     }
 }
 

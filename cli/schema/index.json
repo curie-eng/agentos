@@ -70,6 +70,12 @@
       "version": "1.0"
     },
     {
+      "result": "ConnectorBuildOutput",
+      "kind": "CliOutput",
+      "schema": "build.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "DeleteOutput",
       "kind": "CliOutput",
       "schema": "delete.schema.json",
