@@ -262,7 +262,12 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     approval_client = ApprovalClient(
-        api_base_url=config.api_base_url, api_key=config.api_key, client=eval_http
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
+        client=eval_http,
+        # This read runs inside per thread ordering. A short timeout safely
+        # defers card settlement without changing creation or shared clients.
+        read_timeout_s=2.0,
     )
     sink = build_reply_sink(config)
     kernel = Kernel(
