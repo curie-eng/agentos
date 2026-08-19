@@ -1,0 +1,66 @@
+{
+  "$defs": {
+    "TrajectoryCaseSpec": {
+      "description": "One case id and its deterministic trajectory expectation.",
+      "properties": {
+        "case_id": {
+          "title": "Case Id",
+          "type": "string"
+        },
+        "expected": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Expected",
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/TrajectoryMode"
+        },
+        "threshold": {
+          "default": 1.0,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "required": [
+        "case_id",
+        "expected",
+        "mode"
+      ],
+      "title": "TrajectoryCaseSpec",
+      "type": "object"
+    },
+    "TrajectoryMode": {
+      "description": "How an observed tool-call sequence is compared against the expected one.",
+      "enum": [
+        "exact",
+        "in_order",
+        "any_order",
+        "precision",
+        "recall"
+      ],
+      "title": "TrajectoryMode",
+      "type": "string"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/trajectory.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Trajectory specs supplied by the run layer above the frozen case port.",
+  "properties": {
+    "specs": {
+      "items": {
+        "$ref": "#/$defs/TrajectoryCaseSpec"
+      },
+      "title": "Specs",
+      "type": "array"
+    }
+  },
+  "required": [
+    "specs"
+  ],
+  "title": "Curie Trajectory Sidecar",
+  "type": "object"
+}

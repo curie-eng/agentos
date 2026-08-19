@@ -1,0 +1,13 @@
+{
+  "specs": [
+    {
+      "case_id": "reports-a-temperature",
+      "expected": [
+        "WebSearch",
+        "WebFetch"
+      ],
+      "mode": "in_order",
+      "threshold": 1.0
+    }
+  ]
+}

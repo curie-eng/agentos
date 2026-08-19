@@ -377,6 +377,30 @@ pub struct EvalModelVersionSummary {
     pub plumbing: u64,
 }
 
+/// One case and version verdict in the platform eval matrix.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvalCell {
+    pub version: String,
+    pub status: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub stream_id: Option<String>,
+    #[serde(default)]
+    pub scorer: Option<String>,
+    #[serde(default)]
+    pub case_count: Option<u64>,
+}
+
+/// One case row across the versions returned by the eval matrix.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EvalMatrixRow {
+    pub case_id: String,
+    pub cells: Vec<EvalCell>,
+}
+
 /// The eval matrix grid (`EvalMatrix` in openapi.json): `GET /evals/matrix`. The
 /// sweep reads `model_version_summaries` (the per-`(version, model)` dimension)
 /// plus `versions` (the shown version columns, newest first): a `--model` sweep
@@ -384,8 +408,9 @@ pub struct EvalModelVersionSummary {
 /// run's rows cannot satisfy the exit condition on the first poll (issue #608),
 /// and reads the per-version rollup scoped to the triggered sha so a prior sha's
 /// completions cannot mask the triggered sha's zero-completed outcome (#814). The
-/// window-blended `model_summaries` and the per-case `rows`/`cases`/`models` grid
-/// are carried by the endpoint but unused here.
+/// window-blended `model_summaries` and the `cases`/`models` labels are carried
+/// by the endpoint but unused here. The sidecar selected eval path reads `rows`
+/// so it can report the worker scorer's exact verdict and detail.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EvalMatrix {
     pub suite: String,
@@ -395,6 +420,8 @@ pub struct EvalMatrix {
     pub versions: Vec<String>,
     #[serde(default)]
     pub model_version_summaries: Vec<EvalModelVersionSummary>,
+    #[serde(default)]
+    pub rows: Vec<EvalMatrixRow>,
 }
 
 /// The per-agent budget (`BudgetConfig` in openapi.json): the request and
@@ -1264,13 +1291,24 @@ impl ApiClient {
             .context("decoding eval trigger result")
     }
 
-    /// Read the eval matrix for a suite: `GET /evals/matrix?suite=..&versions=..`.
-    /// The sweep polls this for the per-model pass-rate rollup the recorder writes.
-    pub async fn eval_matrix(&self, suite: &str, versions: u32) -> Result<EvalMatrix> {
+    /// Read the eval matrix for a suite, optionally scoped to one triggered run.
+    pub async fn eval_matrix(
+        &self,
+        suite: &str,
+        versions: u32,
+        stream_id: Option<&str>,
+    ) -> Result<EvalMatrix> {
+        let mut query = vec![
+            ("suite", suite.to_string()),
+            ("versions", versions.to_string()),
+        ];
+        if let Some(stream_id) = stream_id {
+            query.push(("stream_id", stream_id.to_string()));
+        }
         let resp = self
             .http
             .get(format!("{}/evals/matrix", self.base_url))
-            .query(&[("suite", suite), ("versions", &versions.to_string())])
+            .query(&query)
             .header("X-API-Key", &self.api_key)
             .send()
             .await

@@ -262,20 +262,14 @@ fn dry_run_json_masks_credentials() {
 /// args beyond placeholders, so `eval` fails cases-resolution and satisfies the
 /// "emits an object" assertion via the CENTRALIZED ERROR-JSON path -- it never
 /// reaches its dry-run PLAN branch, which is the branch that was actually broken.
-/// This drives `eval` with a real `--cases` file so the plan branch is exercised,
-/// and asserts the payload is the PLAN (no `error` key), so an error-path
-/// regression cannot green this test. `--dry-run` touches no network.
+/// This drives `eval` from the real weather bundle so its deployed trajectory
+/// suite resolves without an explicit cases override, and asserts the payload is
+/// the PLAN (no `error` key), so an error-path regression cannot green this test.
+/// `--dry-run` touches no network.
 fn assert_eval_dry_run_plan(tier: &str) {
     let output = Command::new(bin())
-        .args([
-            tier,
-            "eval",
-            "--cases",
-            "examples/weather/evals/cases.json",
-            "--dry-run",
-            "--json",
-        ])
-        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .args([tier, "eval", "--dry-run", "--json"])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/weather"))
         .output()
         .unwrap_or_else(|e| panic!("run curie {tier} eval --dry-run --json: {e}"));
     let stdout = String::from_utf8_lossy(&output.stdout);

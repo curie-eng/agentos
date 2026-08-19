@@ -21,7 +21,7 @@
 # Rung 1 (skill) is the existing `cli/scripts/e2e.sh`, invoked as is
 # so the skill leg has exactly one implementation, and handed THIS run's bundle
 # copy through CURIE_E2E_BUNDLE. Rung 2 (local) is
-# `local up --minimal` -> `local deploy` -> `local message` -> `local down`,
+# `local up` -> `local deploy` -> `local message` -> `local down`,
 # against `compose.dev.yaml`. The `local-release` mode is the same round trip
 # against `compose.release.yaml` instead -- the generated, checkout-free
 # artifact `curie local up` runs on a release binary (issue #695), one half
@@ -734,9 +734,13 @@ rung_local() {
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
-        echo "=== curie local up --minimal ==="
-        # --minimal selects the core profile and blanks the OTel endpoint itself
-        # (core has no collector), so the ladder passes no profiles and no OTel env.
+        local up_args=(local up)
+        if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+            up_args+=(--minimal)
+        fi
+        echo "=== curie ${up_args[*]} ==="
+        # Ordinary bundles use the core profile. A trajectory sidecar selects the
+        # full profile because its matrix read requires Langfuse.
         #
         # Claim ownership BEFORE starting, never after: `local up` blocks for
         # seconds while it waits for health, and containers exist for that whole
@@ -745,7 +749,7 @@ rung_local() {
         # it. Claiming a stack that then fails to boot is harmless, because
         # `local down` is safe against a partial or already-stopped stack.
         LOCAL_STACK_OWNED=1
-        "$BIN" local up --minimal
+        "$BIN" "${up_args[@]}"
     fi
 
     echo
@@ -792,12 +796,16 @@ rung_local() {
 
     echo
     echo "=== curie local eval --dry-run (suite parity) ==="
-    assert_suite "local" "$("$BIN" --json local eval --cases "$WORKDIR/bundle/evals/cases.json" --dry-run)"
+    local eval_args=(local eval)
+    if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
+    fi
+    assert_suite "local" "$(cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie local eval ==="
-        "$BIN" local eval --cases "$WORKDIR/bundle/evals/cases.json"
+        (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
     fi
 
     if (( LOCAL_STACK_OWNED )); then
@@ -870,17 +878,21 @@ rung_local_release() {
     # were already a pull, never a build) -- every curie-owned image it needs
     # must already exist locally under the tag the generator pinned, or `local
     # up` will try to pull a private GHCR image with no credentials. Check only
-    # the core profile's images (--minimal is what this rung brings up) and
+    # the selected profile's images and
     # only the curie-owned ones: postgres/valkey/rustfs are public and pulled
     # on demand same as rung_local already assumes.
+    local compose_profile="core"
+    if [[ -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
+        compose_profile="full"
+    fi
     local missing=0 image
     while IFS= read -r image; do
         [[ "$image" == ghcr.io/curie-eng/curie-* ]] || continue
         if ! docker image inspect "$image" >/dev/null 2>&1; then
-            echo "error: image '$image' is required by compose.release.yaml's core profile and is not present locally." >&2
+            echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
             missing=1
         fi
-    done < <(docker compose -f "$release_compose" --profile core config --images)
+    done < <(docker compose -f "$release_compose" --profile "$compose_profile" config --images)
     if (( missing )); then
         echo "fix: build and tag the missing image(s) locally under the tag compose.release.yaml pins (see .github/workflows/ci.yaml's e2e-ladder job for the exact build+tag steps CI uses), then re-run." >&2
         return 1
@@ -910,9 +922,13 @@ rung_local_release() {
         "$BIN" local down --wipe --yes -f "$release_compose" >/dev/null 2>&1 || true
 
         echo
-        echo "=== curie local up --minimal -f compose.release.yaml ==="
+        local up_args=(local up -f "$release_compose")
+        if [[ "$compose_profile" == "core" ]]; then
+            up_args+=(--minimal)
+        fi
+        echo "=== curie ${up_args[*]} ==="
         LOCAL_STACK_OWNED=1
-        "$BIN" local up --minimal -f "$release_compose"
+        "$BIN" "${up_args[@]}"
     fi
 
     echo
@@ -954,12 +970,16 @@ rung_local_release() {
 
     echo
     echo "=== curie local eval --dry-run (suite parity, release compose stack) ==="
-    assert_suite "local-release" "$("$BIN" --json local eval --cases "$WORKDIR/bundle-release/evals/cases.json" --dry-run)"
+    local eval_args=(local eval)
+    if [[ ! -f "$WORKDIR/bundle-release/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle-release/evals/cases.json")
+    fi
+    assert_suite "local-release" "$(cd "$WORKDIR/bundle-release" && "$BIN" --json "${eval_args[@]}" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie local eval (release compose stack) ==="
-        "$BIN" local eval --cases "$WORKDIR/bundle-release/evals/cases.json"
+        (cd "$WORKDIR/bundle-release" && "$BIN" "${eval_args[@]}")
     fi
 
     if (( LOCAL_STACK_OWNED )); then
@@ -1118,11 +1138,14 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     # for DIFFERENT reasons -- a machine-readable `--dry-run` plan here, an
     # auditable green on the live grade below -- and passing it once per call site
     # is what keeps it from being passed twice at either.
-    local eval_args=(cluster eval --cases "$WORKDIR/bundle/evals/cases.json")
+    local eval_args=(cluster eval)
+    if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
+        eval_args+=(--cases "$WORKDIR/bundle/evals/cases.json")
+    fi
     if [[ -n "${CURIE_E2E_LISTEN_HOST:-}" ]]; then
         eval_args+=(--listen-host "$CURIE_E2E_LISTEN_HOST")
     fi
-    assert_suite "cluster" "$("$BIN" --json "${eval_args[@]}" --dry-run)"
+    assert_suite "cluster" "$(cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}" --dry-run)"
 
     if [[ "$LIVE" == "1" ]]; then
         echo
@@ -1147,7 +1170,7 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
         # turn finalizes with a reply, and under live mode that reply is not the
         # fake sentinel) still fail it, and they are what caught the sandbox
         # reaper race in #1601.
-        if ! "$BIN" --json "${eval_args[@]}"; then
+        if ! (cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}"); then
             echo "cluster: eval reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
         fi
     fi

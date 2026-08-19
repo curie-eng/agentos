@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/eval/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/eval/v1.2.json",
   "title": "curie skill eval --json",
   "description": "The agent-facing payload of `curie skill eval --json`: the outcome roll-up plus one row per eval case.",
   "type": "object",
@@ -72,6 +72,13 @@
           "output": {
             "type": "string",
             "description": "The graded answer text (the reply judged). Empty when the turn produced no gradeable text. Carried so a failing case is diagnosable without a re-run (#548)."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional scorer explanation for this verdict. Present for a trajectory failure and omitted when the selected scorer has no additional evidence."
           }
         }
       }

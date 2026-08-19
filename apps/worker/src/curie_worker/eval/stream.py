@@ -7,7 +7,9 @@ For each entry it:
 
   1. fetches the version's immutable bundle from RustFS by ``bundle_ref`` and loads
      the suite from the bundle's own ``evals/cases.json`` (the same shape the CLI's
-     ``curie skill eval`` reads); the ``suite`` field names it and tags Langfuse;
+     ``curie skill eval`` reads); an optional ``evals/trajectory.json`` selects
+     deterministic trajectory scoring above that frozen format; the ``suite``
+     field names it and tags Langfuse;
   2. runs the suite against the runner: ``target_url`` if given (the dev/test
      shortcut), otherwise provisions a sandbox for the version via the G1
      substrate (the same boot env F2 uses) and tears it down in a finally;
@@ -30,6 +32,7 @@ import logging
 import secrets
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -64,9 +67,11 @@ from ..config import WorkerConfig
 from ..sandbox import SandboxSubstrate
 from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
-from .models import EvalRunResult, EvalSuite
+from .models import EvalCaseResult, EvalOutcome, EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
 from .run import run_eval_suite
+from .scorer import TrajectoryScorer
+from .trajectory import TrajectorySidecar
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,23 @@ _EVAL_READ_ERROR_BACKOFF_S = 0.5
 # Page size for the PEL scan in the delivery-cap check (#535); mirrors the runs
 # lane's _CAP_SCAN_PAGE so the whole pending list is cap-checked, not just its head.
 _EVAL_CAP_SCAN_PAGE = 1000
+
+
+@dataclass(frozen=True)
+class _ExtractedEvalFiles:
+    """Validated cases plus the optional run layer sidecar."""
+
+    suite: EvalSuite
+    trajectory_bytes: bytes | None
+
+
+@dataclass(frozen=True)
+class _LoadedEvalSuite:
+    """One suite and the scorer selection resolved above the frozen port."""
+
+    suite: EvalSuite
+    scorer: TrajectoryScorer | None = None
+    trajectory_error: str | None = None
 
 
 class EvalReporter:
@@ -143,6 +165,26 @@ def load_suite_from_bundle(
     decision 3), or a missing/invalid suite file. The size/ratio caps default
     to ``plugin_format``'s generous fallbacks; ``_load_suite`` passes the
     operator-configured ``WorkerConfig`` values instead."""
+    files = _extract_eval_files(
+        data,
+        suite_name,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+        max_compression_ratio=max_compression_ratio,
+        max_members=max_members,
+    )
+    return None if files is None else files.suite
+
+
+def _extract_eval_files(
+    data: bytes,
+    suite_name: str,
+    *,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+    max_members: int,
+) -> _ExtractedEvalFiles | None:
+    """Extract the eval files used by the run layer."""
+
     try:
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)
@@ -153,14 +195,50 @@ def load_suite_from_bundle(
                 max_compression_ratio=max_compression_ratio,
                 max_members=max_members,
             )
-            cases = next((p for p in dest.rglob("cases.json") if p.parent.name == "evals"), None)
+            cases = next(
+                (path for path in dest.rglob("cases.json") if path.parent.name == "evals"),
+                None,
+            )
             if cases is None:
                 return None
-            loaded = EvalSuite.model_validate_json(cases.read_text())
+            parsed = EvalSuite.model_validate_json(cases.read_bytes())
+            trajectory = cases.parent / "trajectory.json"
+            trajectory_bytes = trajectory.read_bytes() if trajectory.is_file() else None
     except Exception:
         logger.exception("could not load eval suite from bundle")
         return None
-    return EvalSuite(name=suite_name, cases=loaded.cases)
+
+    return _ExtractedEvalFiles(
+        suite=EvalSuite(name=suite_name, cases=parsed.cases),
+        trajectory_bytes=trajectory_bytes,
+    )
+
+
+def _select_scorer(files: _ExtractedEvalFiles) -> _LoadedEvalSuite:
+    """Validate an optional sidecar and select trajectory scoring when present."""
+
+    if files.trajectory_bytes is None:
+        return _LoadedEvalSuite(suite=files.suite)
+
+    try:
+        sidecar = TrajectorySidecar.model_validate_json(files.trajectory_bytes)
+    except Exception as exc:
+        return _LoadedEvalSuite(
+            suite=files.suite,
+            trajectory_error=f"invalid trajectory sidecar: {exc}",
+        )
+
+    case_ids = [case.id for case in files.suite.cases]
+    if len(case_ids) != len(set(case_ids)):
+        return _LoadedEvalSuite(
+            suite=files.suite,
+            trajectory_error="trajectory scoring rejects duplicate suite case ids",
+        )
+
+    return _LoadedEvalSuite(
+        suite=files.suite,
+        scorer=TrajectoryScorer(specs=sidecar.to_spec_map()),
+    )
 
 
 class EvalStreamConsumer(StreamConsumer):
@@ -291,7 +369,7 @@ class EvalStreamConsumer(StreamConsumer):
                 await self._dead_letter(entry_id, fields, reason="unparseable", delivery_count=1)
                 return
             try:
-                result = await self._run_and_report(item)
+                result = await self._run_and_report(item, entry_id)
                 logger.info("eval %s @ %s: %s", item.suite, item.sha, result.summary())
             except Exception:
                 # An unexpected error before the report attempt: leave pending so
@@ -302,25 +380,64 @@ class EvalStreamConsumer(StreamConsumer):
         finally:
             self._inflight_ids.discard(entry_id)
 
-    async def _run_and_report(self, item: EvalJob) -> EvalRunResult:
+    async def _run_and_report(self, item: EvalJob, stream_id: str) -> EvalRunResult:
         repo = await self._repo_lookup.repo_full_name(item.agent_id)
-        suite = await self._load_suite(item)
-        if suite is None:
+        loaded = await self._load_suite(item)
+        if loaded is None:
             return await self._report_failed(item, repo, "unresolvable suite/bundle")
+
+        suite = loaded.suite
+        model = self._eval_model(item)
+        if loaded.trajectory_error is not None:
+            result = EvalRunResult(
+                version=item.sha,
+                suite=suite.name,
+                model=model,
+                stream_id=stream_id,
+                scorer=EvalScorer.TRAJECTORY,
+                results=[
+                    EvalCaseResult(
+                        case_id=case.id,
+                        outcome=EvalOutcome.FAIL,
+                        output="",
+                        latency_ms=0.0,
+                        detail=loaded.trajectory_error,
+                    )
+                    for case in suite.cases
+                ],
+            )
+            if self._recorder is not None:
+                await self._recorder.record(result)
+            await self._report(item, repo, result)
+            return result
 
         base_url, release_key, token = await self._acquire_target(item)
         if base_url is None:
             return await self._report_failed(item, repo, "runner provisioning failed")
         try:
-            result = await run_eval_suite(
-                suite,
-                base_url=base_url,
-                version=item.sha,
-                recorder=self._recorder,
-                token=token,
-                model=self._eval_model(item),
-                fake=self._config.fake_model,
-            )
+            if loaded.scorer is None:
+                result = await run_eval_suite(
+                    suite,
+                    base_url=base_url,
+                    version=item.sha,
+                    recorder=self._recorder,
+                    token=token,
+                    model=model,
+                    fake=self._config.fake_model,
+                    stream_id=stream_id,
+                )
+            else:
+                result = await run_eval_suite(
+                    suite,
+                    base_url=base_url,
+                    version=item.sha,
+                    recorder=self._recorder,
+                    token=token,
+                    model=model,
+                    fake=self._config.fake_model,
+                    scorer=loaded.scorer,
+                    stream_id=stream_id,
+                )
         finally:
             if release_key is not None:
                 await asyncio.to_thread(self._substrate.release, release_key)
@@ -328,7 +445,7 @@ class EvalStreamConsumer(StreamConsumer):
         await self._report(item, repo, result)
         return result
 
-    async def _load_suite(self, item: EvalJob) -> EvalSuite | None:
+    async def _load_suite(self, item: EvalJob) -> _LoadedEvalSuite | None:
         if item.bundle_ref is None:
             return None
         try:
@@ -336,13 +453,14 @@ class EvalStreamConsumer(StreamConsumer):
         except Exception:
             logger.exception("could not fetch bundle %s", item.bundle_ref)
             return None
-        return load_suite_from_bundle(
+        files = _extract_eval_files(
             data,
             item.suite,
             max_uncompressed_bytes=self._config.bundle_max_uncompressed_bytes,
             max_compression_ratio=self._config.bundle_max_compression_ratio,
             max_members=self._config.bundle_max_members,
         )
+        return None if files is None else _select_scorer(files)
 
     async def _acquire_target(self, item: EvalJob) -> tuple[str | None, str | None, str | None]:
         if item.target_url is not None:
@@ -360,9 +478,7 @@ class EvalStreamConsumer(StreamConsumer):
             # claim may begin. The secrets/env prep above is cheap and does not
             # touch the cluster, so it stays outside the slot.
             async with self._claim_slots:
-                handle = await asyncio.to_thread(
-                    self._substrate.claim, release_key, env=env
-                )
+                handle = await asyncio.to_thread(self._substrate.claim, release_key, env=env)
         except SandboxError:
             logger.exception("could not provision a runner for eval %s", item.sha)
             return None, None, None

@@ -241,13 +241,50 @@ disk and targets no environment.
 | `cluster` | The platform on Kubernetes (a Helm release). | optional | yes | `up` `down` `status` `comms` `message` `eval` `deploy` `kill` `resume` `budget` `overrides` `reset-thread` `delete` | Operate and drive a deployed cluster release, and control its agents' lifecycle. |
 
 `eval` is on all three, running the SAME `evals/cases.json` with the SAME
-grader at each tier: a text-matcher case (`exact`/`contains`/`regex`) that
-passes at `skill` re-asserts the same way at `local` and `cluster`.
-`tool_called` cases are the one exception -- `local` and `cluster` can only
-grade the reply text, not the tool-call trajectory, so a `tool_called` case
-only ever passes at `skill eval` (a known gap;
-[ADR-0022](../docs/adr/0022-eval-completeness-tier-parity-and-trace-promotion.md)
-tracks closing it by moving grading server-side).
+grader at each tier. A text matcher case (`exact`, `contains`, or `regex`)
+that passes at `skill` is checked the same way at `local` and `cluster`.
+At `skill`, a `tool_called` grader reads runner tool frames directly. The
+legacy local and cluster reply path cannot observe those frames. Cross tier
+tool observation uses the trajectory sidecar and platform path below.
+
+For sequence scoring, add `evals/trajectory.json` beside `cases.json`. The
+sidecar is owned by the run layer, so it does not change the frozen eval case
+schema. Author the file in this shape:
+
+```json
+{
+  "specs": [
+    {
+      "case_id": "reports-a-temperature",
+      "expected": ["WebSearch", "WebFetch"],
+      "mode": "in_order",
+      "threshold": 1.0
+    }
+  ]
+}
+```
+
+`mode` accepts `exact`, `in_order`, `any_order`, `precision`, or `recall`.
+When the sidecar exists, every case is trajectory scored. A case without a
+matching spec fails closed and prints `no trajectory spec for case ...`.
+The case file and sidecar are packaged in the same immutable deployed bundle.
+The deploy receipt's `bundle_sha256` identifies the exact bundle used for
+local and cluster parity.
+
+Run the same authored suite at each tier:
+
+```bash
+curie skill eval --json
+curie local eval --json
+curie cluster eval --json
+```
+
+The skill tier scores the runner tool frames directly. The local and cluster
+tiers trigger the deployed bundle through the platform eval plane, then poll
+the matrix for the exact triggered stream and scorer. Deploy the changed
+bundle before those platform runs. An explicit `--cases` is refused for a
+local or cluster trajectory run because it cannot replace files inside the
+deployed bundle.
 
 The distinction that matters: `skill` is the **runner-only** loop, talking
 straight to a runner container's ACI (Agent Container Interface) HTTP
@@ -268,7 +305,7 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 | `curie skill versions` | Not available at this tier (exit 4): `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
 | `curie skill memory` | Not available at this tier (exit 4): this tier configures no memory namespace. Use `curie local memory <agent>` or `curie cluster memory <agent>`. |
 | `curie skill message "..."` | Send a synthetic Slack event: POST an ACI `event` frame to the local runner and stream the NDJSON reply (text deltas, tool notes, side effect flags, final). Abort a live turn with Ctrl-C. |
-| `curie skill eval` | Run `evals/cases.json` through the runner as `eval_case` events; prints a per case result table plus a pass or fail rollup; nonzero exit on failure. |
+| `curie skill eval` | Run `evals/cases.json` through the runner as `eval_case` events. When `evals/trajectory.json` exists, score the observed tool frames against its case keyed specs. Prints a per case result table plus a pass or fail rollup, with nonzero exit on failure. |
 | `curie skill status` | Show the local runner's session status. |
 | `curie skill down` | Stop and remove the local runner container. With no `.curie/runner.json` it falls back to container identity, so an orphaned runner is still clearable; `--name <NAME>` targets a container other than `curie-runner-local`. |
 
@@ -283,9 +320,10 @@ in Langfuse traces.
 the local and cluster tiers do with a deployed bundle. So editing a bundle file
 on the host does not reach the running runner: re-run `curie skill up
 --replace` and confirm the new `bundle_digest` in `curie skill status --json`.
-`evals/cases.json` is the exception -- `skill eval` reads it live from source,
-so a contract edit needs no restart. `skill down` (and `--replace`) release the
-snapshot along with the container.
+`evals/cases.json` and its optional `evals/trajectory.json` sidecar are the
+exceptions. `skill eval` reads them live from source, so an eval edit needs no
+restart. `skill down` and `--replace` release the snapshot along with the
+container.
 
 #### `local` target
 
@@ -304,7 +342,7 @@ the optional Slack dispatcher.
 | `curie local observability` | Print the local platform's observability surfaces: Curie Console, Langfuse UI (traces / cost / evals), and the Curie API base. URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser. |
 | `curie local comms --slack` | Connect or disconnect a real Slack workspace for the compose stack.<br>• Resolves `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN` with precedence `--app-token`/`--bot-token` flag > env var > a value persisted with `curie secrets set` (so tokens saved once need no per-session re-export, #749).<br>• Masks them in dry run output.<br>• Starts or stops the dispatcher, and switches the worker between real Slack and the local stub. |
 | `curie local message "..."` | Drive the local compose stack end to end with zero Slack. Enqueues straight to the compose Valkey and lets the containerized worker answer. |
-| `curie local eval` | Run the bundle's `evals/cases.json` through the compose stack's enqueue -> worker -> sandbox -> reply path (one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure.<br>• `--cases` overrides the file.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709).<br>• Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above. |
+| `curie local eval` | Run the deployed bundle's eval suite through the compose platform. Without a trajectory sidecar, it uses the enqueue, worker, sandbox, and reply path with the shared grader. With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709). |
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
 | `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
@@ -361,7 +399,7 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster observability` | Report the release's observability surfaces (Curie Console, Langfuse UI, Curie API base), using the same NodePort discovery as `cluster status`.<br>• Degrades a missing, ClusterIP, or unresolvable surface to a note instead of failing.<br>• URLs are printed only; pass `--open` to also open the browsable ones (Console, Langfuse) in a browser. `--json` never opens a browser.<br>• `--dry-run` prints the read-only discovery commands. |
 | `curie cluster comms --slack` | Connect or disconnect a real Slack workspace with a thin `helm upgrade --reuse-values`; env-backed tokens are masked in dry-run output. |
 | `curie cluster message "..."` | Drive the deployed release end to end. With a connected dispatcher, it posts a placeholder and routes the reply to the agent's bound Slack channel. Without a dispatcher, it uses the terminal reply stub and waits for the reply.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
-| `curie cluster eval` | Run the bundle's `evals/cases.json` through the deployed release (self-plumbed port-forwards + per-turn reply stub, one synthetic turn per case) and grade each captured reply with the SAME grader `skill eval` uses. Prints the identical per-case table + rollup; nonzero exit on failure.<br>• `--cases` overrides the file.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1 (sequential); values above 1 are refused for now (#709).<br>• Only the reply text is observed here, so a `tool_called` case always fails -- see "Using different tiers" above.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#790). |
+| `curie cluster eval` | Run the deployed bundle's eval suite through the Kubernetes platform. Without a trajectory sidecar, it uses the reply stub path with the shared grader. With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709).<br>• Auto discovers the release generated API key and Valkey password from `<release>-secrets` when `--api-key` or `--valkey-password`, and their environment variables, are omitted. A default strong secrets install needs no hand exported credentials (#790). |
 | `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057).<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |

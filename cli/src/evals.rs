@@ -12,6 +12,7 @@
 //! Python models. Grading semantics mirror the platform's `Grader.grade`. This is
 //! the CLI-local seed of the K1 eval machinery, not a replacement for it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -149,6 +150,190 @@ pub struct EvalSuite {
     pub cases: Vec<EvalCase>,
 }
 
+/// One supported comparison for an observed tool sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrajectoryMode {
+    Exact,
+    InOrder,
+    AnyOrder,
+    Precision,
+    Recall,
+}
+
+impl TrajectoryMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::InOrder => "in_order",
+            Self::AnyOrder => "any_order",
+            Self::Precision => "precision",
+            Self::Recall => "recall",
+        }
+    }
+}
+
+fn default_trajectory_threshold() -> f64 {
+    1.0
+}
+
+/// The trajectory expectation supplied above the frozen eval case port.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrajectorySpec {
+    pub case_id: String,
+    pub expected: Vec<String>,
+    pub mode: TrajectoryMode,
+    #[serde(default = "default_trajectory_threshold")]
+    pub threshold: f64,
+}
+
+/// The optional sibling configuration for trajectory scoring.
+#[derive(Debug, Clone, Deserialize)]
+struct TrajectorySidecar {
+    specs: Vec<TrajectorySpec>,
+}
+
+/// A trajectory verdict and its explanation when red.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrajectoryScore {
+    pub passed: bool,
+    pub detail: Option<String>,
+}
+
+/// The case keyed scorer assembled from a validated trajectory sidecar.
+#[derive(Debug, Clone)]
+pub struct TrajectoryScorer {
+    specs: BTreeMap<String, TrajectorySpec>,
+}
+
+impl TrajectoryScorer {
+    pub fn score(&self, case_id: &str, observed: &[&str]) -> TrajectoryScore {
+        let Some(spec) = self.specs.get(case_id) else {
+            return TrajectoryScore {
+                passed: false,
+                detail: Some(format!(
+                    "no trajectory spec for case {}",
+                    python_string(case_id)
+                )),
+            };
+        };
+        match_trajectory(spec, observed)
+    }
+}
+
+/// The immutable cases payload plus its optional run layer scorer.
+#[derive(Debug, Clone)]
+pub struct LoadedEval {
+    pub suite: EvalSuite,
+    pub trajectory: Option<TrajectoryScorer>,
+}
+
+fn python_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("'{escaped}'")
+}
+
+fn python_list(values: &[impl AsRef<str>]) -> String {
+    let items = values
+        .iter()
+        .map(|value| python_string(value.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+fn python_float(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
+    }
+}
+
+/// Rust mirror of the worker's authoritative deterministic matcher.
+pub fn match_trajectory(spec: &TrajectorySpec, observed: &[&str]) -> TrajectoryScore {
+    let expected = spec.expected.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut detail = format!(
+        "mode={} expected={} observed={}",
+        spec.mode.as_str(),
+        python_list(&expected),
+        python_list(observed),
+    );
+
+    let passed = match spec.mode {
+        TrajectoryMode::Exact => observed == expected,
+        TrajectoryMode::InOrder => {
+            let mut expected_index = 0usize;
+            for tool in observed {
+                if expected
+                    .get(expected_index)
+                    .is_some_and(|want| want == tool)
+                {
+                    expected_index += 1;
+                }
+            }
+            expected_index == expected.len()
+        }
+        TrajectoryMode::AnyOrder => {
+            let mut remaining = BTreeMap::<&str, usize>::new();
+            for tool in &expected {
+                *remaining.entry(tool).or_default() += 1;
+            }
+            for tool in observed {
+                if let Some(count) = remaining.get_mut(tool) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            remaining.values().all(|count| *count == 0)
+        }
+        TrajectoryMode::Precision => {
+            let expected_tools = expected.iter().copied().collect::<BTreeSet<_>>();
+            let ratio = if observed.is_empty() {
+                1.0
+            } else {
+                observed
+                    .iter()
+                    .filter(|tool| expected_tools.contains(**tool))
+                    .count() as f64
+                    / observed.len() as f64
+            };
+            detail.push_str(&format!(
+                " precision={ratio:.3} threshold={}",
+                python_float(spec.threshold)
+            ));
+            ratio >= spec.threshold
+        }
+        TrajectoryMode::Recall => {
+            let expected_tools = expected.iter().copied().collect::<BTreeSet<_>>();
+            let observed_tools = observed.iter().copied().collect::<BTreeSet<_>>();
+            let ratio = if expected_tools.is_empty() {
+                1.0
+            } else {
+                expected_tools
+                    .iter()
+                    .filter(|tool| observed_tools.contains(**tool))
+                    .count() as f64
+                    / expected_tools.len() as f64
+            };
+            detail.push_str(&format!(
+                " recall={ratio:.3} threshold={}",
+                python_float(spec.threshold)
+            ));
+            ratio >= spec.threshold
+        }
+    };
+
+    TrajectoryScore {
+        passed,
+        detail: (!passed).then_some(detail),
+    }
+}
+
 /// Validate an assembled suite: reject an empty case list and eagerly compile
 /// every regex grader so a bad pattern fails now, not mid-run. Factored out of
 /// `load_suite` so the spec scaffold path (`spec.rs`) enforces the identical
@@ -185,13 +370,8 @@ pub fn validate_suite(name: &str, cases: &[EvalCase]) -> Result<()> {
     Ok(())
 }
 
-/// Parse the suite object at `path`. Rejects an empty `cases` list, eagerly
-/// compiles every regex grader (so a bad pattern fails at load, not mid-run),
-/// and turns the retired top-level-array format into a targeted migration hint.
-pub fn load_suite(path: &Path) -> Result<EvalSuite> {
-    let body =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&body)
+fn parse_suite(path: &Path, body: &[u8]) -> Result<EvalSuite> {
+    let value: serde_json::Value = serde_json::from_slice(body)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
     if value.is_array() {
         bail!(
@@ -207,6 +387,75 @@ pub fn load_suite(path: &Path) -> Result<EvalSuite> {
         .with_context(|| format!("{} is not a valid eval suite", path.display()))?;
     validate_suite(&suite.name, &suite.cases)?;
     Ok(suite)
+}
+
+/// Parse the suite object at `path`. Rejects an empty `cases` list, eagerly
+/// compiles every regex grader (so a bad pattern fails at load, not mid-run),
+/// and turns the retired top-level-array format into a targeted migration hint.
+pub fn load_suite(path: &Path) -> Result<EvalSuite> {
+    let body = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_suite(path, &body)
+}
+
+/// Load the immutable cases bytes and validate an optional trajectory sidecar.
+///
+/// Specs may omit a case on purpose; the scorer then fails that case closed.
+pub fn load_eval(path: &Path) -> Result<LoadedEval> {
+    let body = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let suite = parse_suite(path, &body)?;
+    let sidecar_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("trajectory.json");
+    if !sidecar_path.is_file() {
+        return Ok(LoadedEval {
+            suite,
+            trajectory: None,
+        });
+    }
+
+    let sidecar_body = std::fs::read(&sidecar_path)
+        .with_context(|| format!("reading {}", sidecar_path.display()))?;
+    let sidecar: TrajectorySidecar = serde_json::from_slice(&sidecar_body).with_context(|| {
+        format!(
+            "{} is not a valid trajectory sidecar",
+            sidecar_path.display()
+        )
+    })?;
+
+    let mut case_ids = BTreeSet::new();
+    for case in &suite.cases {
+        if !case_ids.insert(case.id.as_str()) {
+            bail!(
+                "suite {:?} contains duplicate case id {:?}; trajectory specs require unique case ids",
+                suite.name,
+                case.id,
+            );
+        }
+    }
+    let mut specs = BTreeMap::new();
+    for spec in sidecar.specs {
+        if !(0.0..=1.0).contains(&spec.threshold) {
+            bail!(
+                "{} gives case {:?} threshold {}; expected a value from 0 through 1",
+                sidecar_path.display(),
+                spec.case_id,
+                spec.threshold,
+            );
+        }
+        let case_id = spec.case_id.clone();
+        if specs.insert(case_id.clone(), spec).is_some() {
+            bail!(
+                "{} contains duplicate trajectory spec for case {:?}",
+                sidecar_path.display(),
+                case_id,
+            );
+        }
+    }
+    Ok(LoadedEval {
+        suite,
+        trajectory: Some(TrajectoryScorer { specs }),
+    })
 }
 
 /// The graded answer for a turn: the `final` frame's text when a final arrived,
@@ -322,6 +571,54 @@ pub fn turn_outcome(case: &EvalCase, events: &[OutboundEvent], fake: bool) -> Ca
         CaseOutcome::Pass
     } else {
         CaseOutcome::Fail
+    }
+}
+
+/// One run layer verdict with optional scorer evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoredCaseOutcome {
+    pub outcome: CaseOutcome,
+    pub detail: Option<String>,
+}
+
+/// Grade a turn through the selected run layer scorer.
+///
+/// Completion and fake model truthfulness remain ahead of scoring. This means a
+/// fake turn is plumbing only even when a trajectory sidecar exists, while an
+/// incomplete turn remains a real failure without pretending a matcher ran.
+pub fn score_turn(
+    case: &EvalCase,
+    events: &[OutboundEvent],
+    fake: bool,
+    trajectory_scorer: Option<&TrajectoryScorer>,
+) -> ScoredCaseOutcome {
+    if !turn_completed(case, events) {
+        return ScoredCaseOutcome {
+            outcome: CaseOutcome::Fail,
+            detail: None,
+        };
+    }
+    if fake {
+        return ScoredCaseOutcome {
+            outcome: CaseOutcome::PlumbingOk,
+            detail: None,
+        };
+    }
+    if let Some(scorer) = trajectory_scorer {
+        let observed = trajectory(events);
+        let score = scorer.score(&case.id, &observed);
+        return ScoredCaseOutcome {
+            outcome: if score.passed {
+                CaseOutcome::Pass
+            } else {
+                CaseOutcome::Fail
+            },
+            detail: score.detail,
+        };
+    }
+    ScoredCaseOutcome {
+        outcome: turn_outcome(case, events, false),
+        detail: None,
     }
 }
 

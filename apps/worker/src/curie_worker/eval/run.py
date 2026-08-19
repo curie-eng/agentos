@@ -25,10 +25,11 @@ from pathlib import Path
 import httpx
 
 from ..runner_client import RunnerClient
-from .models import EvalRunResult, EvalSuite
+from .models import EvalRunResult, EvalScorer, EvalSuite
 from .recorder import LangfuseEvalRecorder
 from .runner import EvalRunner
 from .sampling import AggregationPolicy, SampleConfig
+from .scorer import Scorer
 
 
 def load_suite(path: str | Path) -> EvalSuite:
@@ -45,6 +46,8 @@ async def run_eval_suite(
     model: str | None = None,
     fake: bool = False,
     samples: SampleConfig | None = None,
+    scorer: Scorer | None = None,
+    stream_id: str | None,
 ) -> EvalRunResult:
     """Run a suite against a runner endpoint and, if configured, record it.
 
@@ -53,10 +56,12 @@ async def run_eval_suite(
     eval matrix can slice pass-rate/cost by model. ``fake`` says that runner is
     the fake model, whose turns are never graded (ADR-0055). ``samples`` is the
     multi-sample / variance-aware-grading policy (#332); the default (``None`` ->
-    ``n=1``) runs each case once, unchanged.
+    ``n=1``) runs each case once, unchanged. ``scorer`` is selected by the run
+    layer when an optional trajectory sidecar is present; otherwise the runner
+    keeps its ordinary frozen grader scorer.
     """
     async with RunnerClient() as runner:
-        result = await EvalRunner(runner, samples=samples).run(
+        result = await EvalRunner(runner, scorer=scorer, samples=samples).run(
             suite,
             base_url=base_url,
             version=version,
@@ -64,6 +69,8 @@ async def run_eval_suite(
             model=model,
             fake=fake,
         )
+    scorer_name = EvalScorer.TRAJECTORY if scorer is not None else EvalScorer.GRADER
+    result = result.model_copy(update={"stream_id": stream_id, "scorer": scorer_name})
     if recorder is not None:
         await recorder.record(result)
     return result
@@ -103,12 +110,22 @@ async def _main_async(env: Mapping[str, str]) -> int:
                 client=client,
             )
             result = await run_eval_suite(
-                suite, base_url=base_url, version=version, recorder=recorder,
-                model=model, samples=samples,
+                suite,
+                base_url=base_url,
+                version=version,
+                recorder=recorder,
+                model=model,
+                samples=samples,
+                stream_id=None,
             )
     else:
         result = await run_eval_suite(
-            suite, base_url=base_url, version=version, model=model, samples=samples
+            suite,
+            base_url=base_url,
+            version=version,
+            model=model,
+            samples=samples,
+            stream_id=None,
         )
 
     print(result.model_dump_json())

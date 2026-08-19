@@ -744,8 +744,8 @@ jobs:
   # it, taking the release round trip off the ladder's critical path
   # (~30-50s wall-clock). A fresh runner shares no Docker daemon with e2e-ladder
   # so it must rebuild the images; the shared GHA layer cache defuses that --
-  # these builds hit the same ladder-{runner,api,worker} scopes e2e-ladder
-  # populates, so on a warm cache they cost the --load export, not a full
+  # these builds reuse the same cache scopes as the other ladder jobs, so on a
+  # warm cache they cost the --load export, not a full
   # rebuild. Uses the same use:false / build-push-action mechanism.
   e2e-ladder-release:
     name: E2E parity ladder (local-release, fake model)
@@ -807,6 +807,17 @@ jobs:
           load: true
           cache-from: type=gha,scope=ladder-worker
           cache-to: type=gha,mode=max,scope=ladder-worker
+      - name: Build the ui image locally (satisfies the generated release compose, no registry auth)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: apps/ui/Dockerfile
+          builder: ${{ steps.releasecache.outputs.name }}
+          tags: ghcr.io/curie-eng/curie-ui:latest
+          push: false
+          load: true
+          cache-from: type=gha,scope=ladder-ui
+          cache-to: type=gha,mode=max,scope=ladder-ui
       - name: Tag the api image for the generated release compose (ghcr.io/curie-eng/curie-api:latest, no registry auth)
         run: docker tag ghcr.io/curie-eng/curie-api:ci-local ghcr.io/curie-eng/curie-api:latest
       - name: Build the worker-local overlay for the generated release compose (ghcr.io/curie-eng/curie-worker-local:latest, no registry auth)
