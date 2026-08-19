@@ -298,7 +298,7 @@ pub fn primer() -> Primer {
             },
             Landmine {
                 title: "A real model in-cluster needs its provider's egress opened",
-                detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter); a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
+                detail: "The runner sandbox is default-deny egress, so `curie cluster up` with a credential is still sealed and the model unreachable until you pass --allow-egress-host <provider> (anthropic/openrouter/zhipu/moonshot/deepseek). Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration; a web-fetching skill additionally needs --allow-web-egress <CIDR> for its hosts.",
             },
             Landmine {
                 title: "The skill runner executes an immutable snapshot taken at `skill up`",
@@ -328,7 +328,7 @@ pub fn primer() -> Primer {
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
-                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live; on cluster, also open the provider egress with --allow-egress-host <provider> or the model stays unreachable.",
+                fix: "You are on the fake model (--fake-model, or a sealed install). Provide a credential to go live; on cluster, also open the provider egress with --allow-egress-host <provider>. Zhipu, Moonshot, and DeepSeek also need their matching base URL in worker runtime configuration or the model stays unreachable.",
             },
             Recovery {
                 symptom: "the agent answers but never calls your MCP tools",

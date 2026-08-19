@@ -5,6 +5,11 @@ All values are fake placeholders; this never touches a real credential.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import TypedDict, cast
+from urllib.parse import urlparse
+
 import pytest
 from curie_runner.sdk_auth import (
     API_BACKEND_ENV,
@@ -39,6 +44,64 @@ from curie_runner.sdk_auth import (
 # *_TOKEN / *_KEY literals; these are variable names, never values.
 ALT_TOKEN_KEY = "ANTHROPIC_AUTH_TOKEN_ALT"
 MY_CRED_KEY = "MY_CRED"
+
+_PROVIDER_REGISTRY = (
+    Path(__file__).resolve().parents[2]
+    / "tests"
+    / "vectors"
+    / "model-provider-registry.json"
+)
+_PROVIDER_REGISTRY_KEYS = frozenset(
+    {"providers", "unknown_provider_names", "rejected_credential_examples"}
+)
+_PROVIDER_ROW_KEYS = frozenset(
+    {"name", "base_url", "egress_hosts", "credential_examples"}
+)
+
+
+class _ProviderRow(TypedDict):
+    name: str
+    base_url: str | None
+    egress_hosts: list[str]
+    credential_examples: list[str]
+
+
+class _ProviderRegistryDocument(TypedDict):
+    providers: list[_ProviderRow]
+    unknown_provider_names: list[str]
+    rejected_credential_examples: list[str]
+
+
+def _load_provider_registry(raw: str | None = None) -> _ProviderRegistryDocument:
+    registry: object = json.loads(
+        _PROVIDER_REGISTRY.read_text(encoding="utf-8") if raw is None else raw
+    )
+    assert isinstance(registry, dict)
+    assert set(registry) == _PROVIDER_REGISTRY_KEYS
+
+    providers = registry["providers"]
+    assert isinstance(providers, list)
+    assert providers
+    for provider in providers:
+        assert isinstance(provider, dict)
+        assert set(provider) == _PROVIDER_ROW_KEYS
+        assert isinstance(provider["name"], str)
+        assert provider["base_url"] is None or isinstance(provider["base_url"], str)
+        assert isinstance(provider["egress_hosts"], list)
+        assert provider["egress_hosts"]
+        assert all(isinstance(host, str) and host for host in provider["egress_hosts"])
+        assert isinstance(provider["credential_examples"], list)
+        assert provider["credential_examples"]
+        assert all(
+            isinstance(example, str) and example
+            for example in provider["credential_examples"]
+        )
+
+    for key in ("unknown_provider_names", "rejected_credential_examples"):
+        assert isinstance(registry[key], list)
+        assert registry[key]
+        assert all(isinstance(value, str) for value in registry[key])
+    return cast(_ProviderRegistryDocument, registry)
 
 
 def test_anthropic_api_key_maps_to_api_key_env() -> None:
@@ -197,6 +260,32 @@ def test_provider_base_urls_stay_on_anthropic_format() -> None:
     assert PROVIDER_BASE_URLS["moonshot"] == MOONSHOT_BASE_URL
     assert PROVIDER_BASE_URLS["deepseek"] == DEEPSEEK_BASE_URL
     assert PROVIDER_BASE_URLS["openrouter"] == OPENROUTER_BASE_URL
+
+
+def test_provider_registry_matches_runner_authority() -> None:
+    registry = _load_provider_registry()
+    providers = registry["providers"]
+    by_name = {provider["name"]: provider for provider in providers}
+
+    assert len(by_name) == len(providers)
+    assert set(by_name) == {"anthropic", *PROVIDER_BASE_URLS}
+    assert [row["name"] for row in providers if row["base_url"] is None] == [
+        "anthropic"
+    ]
+    assert {
+        name: row["base_url"]
+        for name, row in by_name.items()
+        if row["base_url"] is not None
+    } == PROVIDER_BASE_URLS
+
+    for provider in providers:
+        base_url = provider["base_url"]
+        if base_url is not None:
+            hostname = urlparse(base_url).hostname
+            assert hostname is not None
+            assert provider["egress_hosts"] == [hostname]
+
+    assert not set(registry["unknown_provider_names"]) & set(by_name)
 
 
 @pytest.mark.parametrize(
