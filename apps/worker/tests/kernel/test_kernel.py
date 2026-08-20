@@ -22,6 +22,7 @@ from aci_protocol import (
     SessionStatus,
     SideEffectFlag,
     TextDelta,
+    ToolNote,
     TurnSource,
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyTarget
@@ -82,6 +83,190 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
             assert h.runner.opened == ["hi"]
             assert h.sink.last_text == "Hello world"
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_tool_context_streams_immediately_without_polluting_final_reply(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=60.0) as h:
+            h.runner.default_script = [
+                TextDelta(text="Answer so far"),
+                ToolNote(text="searching...", tool="WebSearch"),
+                TextDelta(text=" and more"),
+                ToolNote(text="opening result", tool="WebSearch"),
+                Final(text="Final answer", status=DONE),
+            ]
+            event = _qevent("research this")
+
+            await h.kernel.process_event(event)
+
+            texts = [text for _, _, text in h.sink.updates]
+            preview = "Answer so far\n  -> [WebSearch] searching..."
+            assert preview in texts
+            assert texts.index(preview) == texts.index("Answer so far") + 1
+            assert [text for text in texts if "  -> " in text] == [preview]
+            assert "Answer so far and more" not in texts
+            assert all("opening result" not in text for text in texts)
+            final_text = h.sink.last_text
+            assert final_text == "Final answer"
+            assert "WebSearch" not in final_text
+
+    asyncio.run(go())
+
+
+def test_tool_context_distinguishes_empty_and_absent_tool_names(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=0.0) as h:
+            h.runner.default_script = [
+                TextDelta(text="Answer so far"),
+                ToolNote(text="empty name", tool=""),
+                ToolNote(text="unnamed", tool=None),
+                Final(text="Final answer", status=DONE),
+            ]
+
+            await h.kernel.process_event(_qevent("research this"))
+
+            texts = [text for _, _, text in h.sink.updates]
+            assert "Answer so far\n  -> [] empty name" in texts
+            assert "Answer so far\n  -> unnamed" in texts
+            assert h.sink.last_text == "Final answer"
+
+    asyncio.run(go())
+
+
+def test_tool_context_delivery_failure_is_fail_soft(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=60.0) as h:
+            h.runner.default_script = [
+                TextDelta(text="Partial answer"),
+                ToolNote(text="running command", tool="Bash"),
+                ToolNote(text="reading output", tool="Bash"),
+                Final(text="Completed answer", status=DONE),
+            ]
+            context_preview = "Partial answer\n  -> [Bash] running command"
+            original_emit = h.sink.emit
+            context_attempts: list[str] = []
+
+            async def fail_context_emit(
+                reply_event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                text = getattr(reply_event, "text", None)
+                if isinstance(text, str) and "\n  -> " in text:
+                    context_attempts.append(text)
+                    raise RuntimeError("injected context delivery failure")
+                return await original_emit(
+                    reply_event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = fail_context_emit  # type: ignore[method-assign]
+            event = _qevent("run it")
+
+            await h.kernel.process_event(event)
+
+            assert context_attempts == [context_preview]
+            assert h.sink.last_text == "Completed answer"
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_failed_context_edit_does_not_suppress_identical_final_delivery(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=60.0) as h:
+            final_text = "Partial answer\n  -> [Bash] running command"
+            h.runner.default_script = [
+                TextDelta(text="Partial answer"),
+                ToolNote(text="running command", tool="Bash"),
+                Final(text=final_text, status=DONE),
+            ]
+            original_emit = h.sink.emit
+            matching_attempts = 0
+
+            async def fail_first_matching_emit(
+                reply_event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                nonlocal matching_attempts
+                if getattr(reply_event, "text", None) == final_text:
+                    matching_attempts += 1
+                    if matching_attempts == 1:
+                        raise RuntimeError("injected context delivery failure")
+                return await original_emit(
+                    reply_event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = fail_first_matching_emit  # type: ignore[method-assign]
+            event = _qevent("run it")
+
+            await h.kernel.process_event(event)
+
+            assert matching_attempts == 2, (
+                "final delivery was not attempted after the failed context edit"
+            )
+            assert h.sink.last_text == final_text
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_message_creating_tool_context_delivery_failure_stays_loud(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.default_script = [
+                ToolNote(text="running command", tool="Bash"),
+                Final(text="Completed answer", status=DONE),
+            ]
+            context_preview = "  -> [Bash] running command"
+            booting = h.config.booting_text
+            original_emit = h.sink.emit
+            failed_updates: list[str] = []
+
+            async def fail_context_emit(
+                reply_event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                text = getattr(reply_event, "text", None)
+                if text == booting:
+                    failed_updates.append(text)
+                    raise RuntimeError("injected booting delivery failure")
+                if text == context_preview:
+                    failed_updates.append(text)
+                    raise RuntimeError("injected message creation failure")
+                return await original_emit(
+                    reply_event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = fail_context_emit  # type: ignore[method-assign]
+            event = _qevent("run it", placeholder=None)
+
+            with pytest.raises(RuntimeError, match="message creation failure"):
+                await h.kernel.process_event(event)
+
+            assert failed_updates == [booting, context_preview]
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+            assert h.sink.last_text is None
 
     asyncio.run(go())
 
@@ -862,6 +1047,7 @@ def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
 
 _MULTI_DELTA = [
     TextDelta(text="a"),
+    ToolNote(text="checking", tool="ExampleTool"),
     TextDelta(text="b"),
     TextDelta(text="c"),
     Final(text="abc final", status=DONE),
@@ -871,13 +1057,30 @@ _MULTI_DELTA = [
 def test_no_edit_streaming_edits_placeholder_once(make_harness) -> None:
     async def go() -> None:
         async with make_harness(slack_no_edit_streaming=True) as h:
-            # Multiple TextDeltas stream, but in no-edit mode the placeholder is
-            # edited EXACTLY once -- the final. No intermediate chat.update calls.
+            # Text and tool frames arrive, but no edit mode updates only the final.
             h.runner.default_script = list(_MULTI_DELTA)
             await h.kernel.process_event(_qevent("go"))
 
             assert len(h.sink.updates) == 1
             assert h.sink.last_text == "abc final"
+
+    asyncio.run(go())
+
+
+def test_no_edit_streaming_suppresses_tool_context_and_finalizes_once(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_no_edit_streaming=True) as h:
+            h.runner.default_script = [
+                TextDelta(text="answer in progress"),
+                ToolNote(text="checking", tool="ExampleTool"),
+                Final(text="final answer", status=DONE),
+            ]
+
+            await h.kernel.process_event(_qevent("go"))
+
+            assert h.sink.updates == [("C1", "p-1", "final answer")]
 
     asyncio.run(go())
 

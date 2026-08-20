@@ -332,6 +332,7 @@ class _ThrottledReply:
         self._min_interval_s = min_interval_s
         self._no_edit = no_edit
         self._last = 0.0
+        self._last_context: float | None = None
         self._last_text: str | None = None
         # Whether this turn's reply delivery is best-effort (#708): set only for an
         # approval-resume turn (the caller derives it from _is_approval_resume). The
@@ -360,6 +361,36 @@ class _ThrottledReply:
         self._last = now
         self._last_text = text
         await self._emit(text)
+
+    async def context(self, text: str) -> None:
+        if self._no_edit:
+            return
+        if not text or text == self._last_text:
+            return
+        now = time.monotonic()
+        # The first context preview is separately eligible even after text;
+        # later previews share the sustained write cadence with text updates.
+        if (
+            self._last_context is not None
+            and now - max(self._last, self._last_context) < self._min_interval_s
+        ):
+            return
+        # Stamp before emitting so a failed edit cannot create a hot retry loop.
+        self._last_context = now
+        self._last = now
+        # A message creating emit must stay fail loud so ref minting and turn
+        # retry semantics remain intact. Only an existing message edit is soft.
+        if self._target.reply_ref is None:
+            await self._emit(text)
+            self._last_text = text
+            return
+        try:
+            await self._emit(text)
+            # Delivery state advances only after the edit succeeds, so a failed
+            # preview cannot suppress an identical final flush.
+            self._last_text = text
+        except Exception as exc:  # noqa: BLE001 - cosmetic progress is best effort
+            logger.warning("context reply update failed: %s", type(exc).__name__)
 
     async def finalize(self, text: str) -> None:
         if text == self._last_text:
@@ -2094,7 +2125,14 @@ class Kernel:
             await reply.stream(acc.rendered())
         elif isinstance(frame, ToolNote):
             # Surfaced for context but not part of the answer buffer.
-            await reply.stream(acc.rendered())
+            note = (
+                f"  -> [{frame.tool}] {frame.text}"
+                if frame.tool is not None
+                else f"  -> {frame.text}"
+            )
+            answer = acc.rendered()
+            preview = f"{answer}\n{note}" if answer else note
+            await reply.context(preview)
         elif isinstance(frame, SideEffectFlag):
             acc.saw_side_effect = True
             # Persist immediately so a crash before done still blocks auto-retry.

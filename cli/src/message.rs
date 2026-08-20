@@ -1040,15 +1040,23 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
     let wait_started = Instant::now();
-    let outcome = await_reply(
-        &mut stub,
-        &mut conn,
-        &opts.stream,
-        &stream_id,
-        &placeholder_ts,
-        Duration::from_secs(opts.timeout_secs),
-    )
-    .await;
+    let outcome = {
+        let mut observe_update = |text: &str| {
+            if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                step.tick_detail(line.trim());
+            }
+        };
+        await_reply(
+            &mut stub,
+            &mut conn,
+            &opts.stream,
+            &stream_id,
+            &placeholder_ts,
+            Duration::from_secs(opts.timeout_secs),
+            &mut observe_update,
+        )
+        .await
+    };
 
     match outcome {
         Outcome::Replied(reply) => {
@@ -1324,16 +1332,27 @@ async fn resume_after_approval(
         // (`resumequeue.resume_event_id`), which is how we recognize that turn on
         // the shared runs stream.
         let resume_event_id = format!("approval-{current_id}-resolved");
-        let observed = await_resume(
-            stub,
-            conn,
-            &opts.stream,
-            &resume_event_id,
-            after_id,
-            placeholder_ts,
-            remaining,
-        )
-        .await;
+        let cl = ui.checklist();
+        let step = cl.step("waiting for resumed worker reply");
+        let observed = {
+            let mut observe_update = |text: &str| {
+                if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                    step.tick_detail(line.trim());
+                }
+            };
+            await_resume(
+                stub,
+                conn,
+                &opts.stream,
+                &resume_event_id,
+                after_id,
+                placeholder_ts,
+                remaining,
+                &mut observe_update,
+            )
+            .await
+        };
+        step.clear();
         match observed.outcome {
             Outcome::Replied(reply) => {
                 ui.emit(&MessageOutcomeOutput::Replied {
@@ -1821,15 +1840,23 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let cl = ui.checklist();
     let step = cl.step("waiting for worker reply");
     let wait_started = Instant::now();
-    let outcome = await_reply(
-        &mut stub,
-        &mut conn,
-        &opts.stream,
-        &stream_id,
-        &placeholder_ts,
-        Duration::from_secs(opts.timeout_secs),
-    )
-    .await;
+    let outcome = {
+        let mut observe_update = |text: &str| {
+            if let Some(line) = text.lines().rev().find(|line| !line.trim().is_empty()) {
+                step.tick_detail(line.trim());
+            }
+        };
+        await_reply(
+            &mut stub,
+            &mut conn,
+            &opts.stream,
+            &stream_id,
+            &placeholder_ts,
+            Duration::from_secs(opts.timeout_secs),
+            &mut observe_update,
+        )
+        .await
+    };
 
     match outcome {
         Outcome::Replied(reply) => {
@@ -2207,6 +2234,7 @@ async fn run_eval_turns(
         );
         let started = Instant::now();
         let stream_id = xadd(conn, &opts.stream, &event).await?;
+        let mut observe_update = |_: &str| {};
         let outcome = await_reply(
             stub,
             conn,
@@ -2214,6 +2242,7 @@ async fn run_eval_turns(
             &stream_id,
             &placeholder_ts,
             Duration::from_secs(opts.timeout_secs),
+            &mut observe_update,
         )
         .await;
         let elapsed = started.elapsed().as_secs_f64();
