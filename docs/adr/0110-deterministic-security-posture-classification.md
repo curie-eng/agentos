@@ -78,8 +78,8 @@ Assume at least one manifest gate and a nonempty configured allowlist. Every
 manifest declared gate is armed, the manifest opts those gates into grantability,
 egress uses its configured allowlist, and no operator only gate is present. The
 ordered resolver returns **Standard** exactly once. Strict fails because
-grantability is nonempty and egress is nonempty. Standard matches because every
-the effective armed gate set `A` is nonempty, so evaluation stops before Permissive.
+grantability is nonempty and egress is nonempty. Standard matches because the
+effective armed gate set `A` is nonempty, so evaluation stops before Permissive.
 
 ## Consequences
 
