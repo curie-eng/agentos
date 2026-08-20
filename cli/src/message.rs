@@ -3646,6 +3646,91 @@ mod tests {
         assert!(!prefers_docker_internal_host("my-eks.example.com", true));
     }
 
+    const ADVERTISE_HOST_CHILD_CASE: &str = "CURIE_TEST_ADVERTISE_HOST_CASE";
+
+    fn run_advertise_host_child(case: &str, path: &std::path::Path) {
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("resolve test executable"))
+                .arg("message::tests::advertise_host_child")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(ADVERTISE_HOST_CHILD_CASE, case)
+                .env("PATH", path)
+                .output()
+                .expect("run advertise host child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "advertise host child failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let sentinel = format!("ADVERTISE_HOST_OK {case}");
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim() == sentinel.as_str()),
+            "advertise host child did not prove case {case} ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertise_host_child() {
+        let Ok(case) = std::env::var(ADVERTISE_HOST_CHILD_CASE) else {
+            return;
+        };
+        match case.as_str() {
+            "kernel_route" => {
+                let target = "192.0.2.1";
+                let socket =
+                    std::net::UdpSocket::bind("0.0.0.0:0").expect("bind route source probe");
+                socket
+                    .connect((target, 6443))
+                    .expect("select route toward documentation address");
+                let expected = socket.local_addr().expect("read route source").ip();
+                let actual = resolve_advertise_host(None)
+                    .await
+                    .expect("derive advertise host");
+                assert_eq!(actual, expected.to_string());
+                assert_ne!(actual, target);
+            }
+            "explicit" => {
+                let actual = resolve_advertise_host(Some("192.0.2.44"))
+                    .await
+                    .expect("accept explicit listen host");
+                assert_eq!(actual, "192.0.2.44");
+            }
+            other => panic!("unknown advertise host child case {other}"),
+        }
+        println!("ADVERTISE_HOST_OK {case}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_advertise_host_uses_kernel_route_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("create kubectl stub directory");
+        let kubectl = tools.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            "#!/bin/sh\nprintf '%s\\n' 'https://192.0.2.1:6443'\n",
+        )
+        .expect("write kubectl stub");
+        let mut permissions = std::fs::metadata(&kubectl)
+            .expect("read kubectl stub metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&kubectl, permissions).expect("make kubectl stub executable");
+
+        run_advertise_host_child("kernel_route", tools.path());
+    }
+
+    #[test]
+    fn explicit_listen_host_bypasses_auto_detection() {
+        let no_tools = tempfile::tempdir().expect("create empty executable directory");
+        run_advertise_host_child("explicit", no_tools.path());
+    }
+
     #[test]
     fn dry_run_lists_the_valkey_forward_and_the_enqueue_with_the_reply_endpoint() {
         let lines = dry_run_lines(&opts(Some("C123")), "10.1.2.3");
