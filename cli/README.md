@@ -76,6 +76,10 @@ always goes to **stdout**; every diagnostic (progress, spinners, helm/kubectl/
 compose chatter) always goes to **stderr** -- so piping or redirecting the
 payload never picks up progress noise.
 
+For `local message` and `cluster message`, interim answer text and tool context
+are transient progress on stderr. Only the finalized reply is the stdout
+result. In JSON mode, stdout remains exactly one JSON object.
+
 On an interactive terminal, progress renders as spinners and a live checklist;
 it degrades automatically to plain, colorless status lines on a non-TTY, in
 CI, or when `NO_COLOR`/`TERM=dumb` are set.
