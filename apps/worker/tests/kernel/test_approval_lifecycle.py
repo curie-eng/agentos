@@ -17,12 +17,14 @@ import aiohttp
 import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from channel_protocol import ConfirmIntent
+from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import (
     ApprovalBackendError,
     ApprovalRequest,
     CreatedApproval,
     SettledApproval,
 )
+from curie_worker.reply_sink import TargetRoute
 from curie_worker.sandbox.types import RouteState
 
 DONE = SessionStatus.DONE
@@ -277,6 +279,153 @@ def test_null_placeholder_turn_reaches_an_approval_and_persists_its_own_ref(
             # ...but the reply ref is the one this turn minted by delivering.
             assert req.reply_placeholder is not None
             assert req.reply_placeholder == h.sink.text_posts[0][1]
+
+    asyncio.run(go())
+
+
+def test_no_edit_placeholderless_approval_uses_one_minted_ref(make_harness) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(
+            approvals=approvals,
+            slack_no_edit_streaming=True,
+        ) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            thread = "th_no_edit_approval"
+            event = _qevent(
+                "please discount",
+                thread=thread,
+                placeholder=None,
+            )
+
+            await h.kernel.process_event(event)
+
+            assert len(h.sink.text_posts) == 1, h.sink.text_posts
+            minted = h.sink.text_posts[0][1]
+            request = approvals.requests[0]
+            assert request.reply_kind == "slack"
+            assert request.reply_endpoint is None
+            assert request.reply_adapter is None
+            assert request.reply_placeholder == minted
+            assert h.sink.updates
+            assert {ref for _, ref, _ in h.sink.updates} == {minted}
+            assert "Awaiting approval (appr-1)" in h.sink.updates[-1][2]
+
+            pending_update_count = len(h.sink.updates)
+            h.runner.default_script = [
+                Final(text="Discount applied.", status=DONE),
+            ]
+            resolution = _qevent(
+                "[approval resolved] approved by U9",
+                thread=thread,
+                event_id="approval-appr-1-resolved",
+                placeholder=request.reply_placeholder,
+            )
+
+            await h.kernel.process_event(resolution)
+
+            assert len(h.sink.text_posts) == 1, h.sink.text_posts
+            assert len(h.sink.updates) == pending_update_count + 1
+            assert h.sink.updates[-1][1] == minted
+            assert h.sink.updates[-1][2] == "Discount applied."
+
+    asyncio.run(go())
+
+
+def test_no_edit_placeholderless_approval_refuses_a_missing_minted_ref(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(
+            approvals=approvals,
+            slack_no_edit_streaming=True,
+        ) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            event = _qevent(
+                "please discount",
+                thread="th_no_edit_missing_ref",
+                placeholder=None,
+            )
+            original_emit = h.sink.emit
+            missing_ref_deliveries = 0
+
+            async def omit_precreation_ref(
+                reply_event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                nonlocal missing_ref_deliveries
+                if (
+                    reply_event.target.reply_ref is None
+                    and getattr(reply_event, "text", None) == "Requesting sign-off"
+                ):
+                    missing_ref_deliveries += 1
+                    return ReplyAck(ref=None)
+                return await original_emit(
+                    reply_event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = omit_precreation_ref
+
+            with pytest.raises(RuntimeError, match="reply ref"):
+                await h.kernel.process_event(event)
+
+            assert missing_ref_deliveries == 1
+            assert approvals.create_calls == 0
+            modes = [s.operating_mode for s in h.fake_k8s.sandboxes.values()]
+            assert modes == ["Running"]
+            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
+def test_stream_minted_ref_survives_a_booting_delivery_failure(make_harness) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(approvals=approvals) as h:
+            h.runner.default_script = _awaiting_script("Give ACME a 20% discount")
+            booting = h.config.booting_text
+            original_emit = h.sink.emit
+            booting_failures = 0
+
+            async def fail_booting_once(
+                event: ReplyEvent,
+                *,
+                route: TargetRoute,
+                best_effort_unreachable: bool = False,
+            ) -> ReplyAck:
+                nonlocal booting_failures
+                if getattr(event, "text", None) == booting and booting_failures == 0:
+                    booting_failures += 1
+                    raise RuntimeError("injected booting delivery failure")
+                return await original_emit(
+                    event,
+                    route=route,
+                    best_effort_unreachable=best_effort_unreachable,
+                )
+
+            h.sink.emit = fail_booting_once
+            event = _qevent(
+                "please discount",
+                placeholder=None,
+                endpoint="http://adapter.example.test/",
+                kind="email",
+                adapter="agentmail",
+            )
+
+            await h.kernel.process_event(event)
+
+            assert booting_failures == 1
+            assert len(h.sink.text_posts) == 1, h.sink.text_posts
+            minted = h.sink.text_posts[0][1]
+            assert approvals.requests[0].reply_placeholder == minted
+            assert len(h.sink.updates) >= 2, h.sink.updates
+            assert {ref for _, ref, _ in h.sink.updates} == {minted}
+            assert "Awaiting approval (appr-1)" in h.sink.updates[-1][2]
 
     asyncio.run(go())
 

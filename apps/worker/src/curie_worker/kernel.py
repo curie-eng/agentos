@@ -1305,8 +1305,10 @@ class Kernel:
         # cold-boot wait is not silent. Best-effort and outside the per-thread lock:
         # a Slack failure here must never fail the turn, and this must not lengthen
         # the critical section. Fires once per attempt (retries re-affirm it).
-        # Suppressed under no-edit streaming: that mode's contract is exactly one
-        # chat.update (the final edit), so it opts out of the pre-boot edit too.
+        # Suppressed under no edit streaming: with a preposted placeholder, the
+        # mode emits one final chat.update. A placeholderless approval is an
+        # exception: its approval path posts the request text before persistence,
+        # then updates that message with the approval notice.
         # A placeholderless job must route first. Otherwise every busy redelivery
         # posts a notice for a turn that never started.
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
@@ -1808,6 +1810,16 @@ class Kernel:
             )
             return
 
+        base = outcome.text.strip()
+        if self._target_for(qevent).reply_ref is None:
+            # A placeholderless approval must be addressable before persistence.
+            # If this delivery fails, let the exception escape so the event stays
+            # retryable instead of creating and suspending an approval whose
+            # requester cannot see it.
+            ack = await self._reply_for(qevent, route, base or summary)
+            if ack.ref is None:
+                raise RuntimeError("approval reply ref was not minted")
+
         try:
             created = await self._approvals.create(
                 ApprovalRequest(
@@ -1867,7 +1879,6 @@ class Kernel:
             # its route expires.
             logger.warning("suspend failed for thread %s: %s", thread, exc)
 
-        base = outcome.text.strip()
         # The notice is a control string the CLI parses by splitting on blank
         # lines and requiring the marker-leading block (cli/src/chat.rs
         # parse_approval_id, the #766 keep-alive). A model-authored blank line or
