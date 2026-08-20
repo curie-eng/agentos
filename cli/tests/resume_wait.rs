@@ -11,9 +11,12 @@
 //! unaffected; run it locally with the compose Valkey up, or point
 //! `TEST_VALKEY_URL` at another instance.
 
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use tokio::sync::Notify;
 

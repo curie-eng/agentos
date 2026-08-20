@@ -2127,7 +2127,7 @@ class Kernel:
             # Surfaced for context but not part of the answer buffer.
             note = (
                 f"  -> [{frame.tool}] {frame.text}"
-                if frame.tool
+                if frame.tool is not None
                 else f"  -> {frame.text}"
             )
             answer = acc.rendered()

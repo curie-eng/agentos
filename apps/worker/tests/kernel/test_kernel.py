@@ -117,6 +117,28 @@ def test_tool_context_streams_immediately_without_polluting_final_reply(
     asyncio.run(go())
 
 
+def test_tool_context_distinguishes_empty_and_absent_tool_names(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(slack_edit_min_interval_s=0.0) as h:
+            h.runner.default_script = [
+                TextDelta(text="Answer so far"),
+                ToolNote(text="empty name", tool=""),
+                ToolNote(text="unnamed", tool=None),
+                Final(text="Final answer", status=DONE),
+            ]
+
+            await h.kernel.process_event(_qevent("research this"))
+
+            texts = [text for _, _, text in h.sink.updates]
+            assert "Answer so far\n  -> [] empty name" in texts
+            assert "Answer so far\n  -> unnamed" in texts
+            assert h.sink.last_text == "Final answer"
+
+    asyncio.run(go())
+
+
 def test_tool_context_delivery_failure_is_fail_soft(make_harness) -> None:
     async def go() -> None:
         async with make_harness(slack_edit_min_interval_s=60.0) as h:
