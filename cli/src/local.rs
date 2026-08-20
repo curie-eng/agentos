@@ -615,7 +615,7 @@ pub async fn up(mut o: LocalOpts) -> Result<LocalUpOutput> {
             ModelMode::FakePinnedDespiteCredential => ui.warn(
                 "Running the FAKE model despite a credential in your shell: CURIE_FAKE_MODEL is pinned on. Unset it or set CURIE_FAKE_MODEL=0 to go live.",
             ),
-            ModelMode::DefaultFake => ui.note(
+            ModelMode::DefaultFake => ui.warn(
                 "Running the fake model (no credential set). Provide a credential (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / CURIE_CREDENTIALS) or --local-model to go live.",
             ),
         }
