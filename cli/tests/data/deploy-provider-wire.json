@@ -1,0 +1,24 @@
+{
+  "plugin": "weather",
+  "label": "v1-123",
+  "environment": "dev",
+  "agent": {
+    "name": "weather",
+    "id": "agt_1"
+  },
+  "version": {
+    "label": "v1-123",
+    "id": "ver_1"
+  },
+  "channel": "unchanged (C0EXAMPLE1)",
+  "bundle": {
+    "ref": "bundles/abc.tar.gz",
+    "sha256": "deadbeef00",
+    "size_bytes": 4096
+  },
+  "deployment": {
+    "id": "dep_1",
+    "environment": "dev",
+    "status": "active"
+  }
+}

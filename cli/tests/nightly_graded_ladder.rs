@@ -454,6 +454,12 @@ const DIVERGENT_DIGEST: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
 /// answers with JSON either way, so tolerating it would hide a deploy that
 /// stopped asking for a receipt).
 fn write_ladder_stubs(dir: &Path) {
+    fs::write(
+        dir.join("deploy-provider-wire.json"),
+        include_str!("data/deploy-provider-wire.json"),
+    )
+    .expect("write deploy provider fixture");
+
     write_executable(
         &dir.join("curie"),
         r#"#!/bin/sh
@@ -504,7 +510,18 @@ print(digest.hexdigest())' "$1"
 # the ladder reads: bundle.sha256, agent.id, version.id, and
 # deployment.{id,environment,status}.
 emit_deploy() {
-    printf '{"plugin":"weather","label":"e2e","environment":"dev","agent":{"name":"weather","id":"%s"},"version":{"label":"e2e","id":"%s"},"channel":"C0LOCALDEV","bundle":{"ref":"weather-e2e.tar.gz","sha256":"%s","size_bytes":2048},"deployment":{"id":"%s","environment":"dev","status":"active"}}\n' "$STUB_AGENT_ID" "$STUB_VERSION_ID" "$1" "$STUB_DEPLOYMENT_ID"
+    python3 -c 'import json, sys
+fixture = json.load(open(sys.argv[1]))
+fixture["agent"]["id"] = sys.argv[2]
+fixture["version"]["id"] = sys.argv[3]
+fixture["deployment"]["id"] = sys.argv[4]
+fixture["bundle"]["sha256"] = sys.argv[5]
+print(json.dumps(fixture, separators=(",", ":")))' \
+        "$STUB_STATE/deploy-provider-wire.json" \
+        "$STUB_AGENT_ID" \
+        "$STUB_VERSION_ID" \
+        "$STUB_DEPLOYMENT_ID" \
+        "$1"
 }
 
 # The DryRunPlan shape (cli/src/ui.rs: {"dry_run":true,"plan":[lines]}) carrying
