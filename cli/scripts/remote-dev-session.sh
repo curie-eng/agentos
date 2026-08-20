@@ -13,7 +13,7 @@
 #       [--plugin-dir <dir>] [--timeout-secs <n>]
 #   curie dev remote-dev-session turn "<instruction>"
 #   curie dev remote-dev-session status
-#   curie dev remote-dev-session finish [--branch <name>] [--push]
+#   curie dev remote-dev-session finish [--branch <name>] [--push] [--pr]
 #   curie dev remote-dev-session down
 #
 # Cluster access comes from the caller's KUBECONFIG and current context. This
@@ -60,6 +60,8 @@ PLUGIN_DIR=""
 TIMEOUT_SECS="240"
 BRANCH=""
 PUSH=0
+PR=0
+FORCE=0
 INSTRUCTION=""
 THREAD=""
 POD=""
@@ -78,8 +80,8 @@ usage:
       --repo-url <url> --task "<text>" [--plugin-dir <dir>] [--timeout-secs <n>]
   remote-dev-session turn "<instruction>"
   remote-dev-session status
-  remote-dev-session finish [--branch <name>] [--push]
-  remote-dev-session down
+  remote-dev-session finish [--branch <name>] [--push] [--pr]
+  remote-dev-session down [--force]
 USAGE
 }
 
@@ -158,8 +160,16 @@ case "$MODE" in
         [[ $# -eq 0 ]] || usage_die "turn takes exactly one instruction argument; quote it"
         [[ -n "$INSTRUCTION" ]] || usage_die "the instruction text must not be empty"
         ;;
-    status|down)
+    status)
         [[ $# -eq 0 ]] || usage_die "$MODE takes no arguments"
+        ;;
+    down)
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --force) FORCE=1; shift ;;
+                *) usage_die "unknown argument '$1' for verb 'down'" ;;
+            esac
+        done
         ;;
     finish)
         while [[ $# -gt 0 ]]; do
@@ -168,6 +178,7 @@ case "$MODE" in
                     [[ $# -ge 2 ]] || usage_die "--branch needs a value"
                     BRANCH="$2"; shift 2 ;;
                 --push) PUSH=1; shift ;;
+                --pr) PUSH=1; PR=1; shift ;;
                 *) usage_die "unknown argument '$1' for verb 'finish'" ;;
             esac
         done
@@ -338,12 +349,14 @@ verb_start() {
 
     say
     say "=== turn 1: session start (claims the managed Agent Sandbox) ==="
-    local out reply thread
-    out="$(send_turn "Remote development session start. The working repository checkout will appear at $SANDBOX_REPO. Your task for this session: $TASK")"
+    # Claim-only on purpose: the checkout does not exist yet, so handing the
+    # model its task here would make it hunt an empty workspace. The task goes
+    # out as its own turn AFTER the clone lands.
+    local out thread
+    out="$(send_turn "Remote development session start. Do nothing yet: the working repository checkout will appear at $SANDBOX_REPO before your next instruction, and that instruction will carry your task.")"
     printf '%s\n' "$out" >&2
     assert_turn_shape "turn-1" "$out"
     thread="$(printf '%s' "$out" | jq -r '.thread // ""')"
-    reply="$(printf '%s' "$out" | jq -r '.reply // ""')"
     [[ -n "$thread" ]] || die "turn-1 finalized but carried no thread identity, so later turns cannot rejoin this session."
 
     say
@@ -369,18 +382,35 @@ verb_start() {
 
     say
     say "=== clone the repository into the sandbox ==="
+    # The shipped release runner has no git; this command only works against an
+    # install whose runner image was derived with git (the Milestone 1 recipe).
+    # Fail that loudly here instead of as a cryptic exec error mid-clone.
+    if ! kubectl exec -n "$NAMESPACE" "$POD" -c "$RUNNER_CONTAINER" -- git --version >/dev/null 2>&1; then
+        die "the runner image in pod $POD has no usable git. This session needs a release whose agentSandbox.runner.image is a git-bearing derivative of the runner (FROM the runner image, apt-get install git); the shipped image does not carry it."
+    fi
     # The unredacted URL appears exactly here, as the clone's argv, and nowhere
-    # else: every other mention of it goes through redact_url.
+    # else: every other mention of it goes through redact_url. The timeout is
+    # load-bearing: on a sealed install the egress NetworkPolicy blackholes the
+    # connection, so an unbounded clone hangs instead of failing.
     local clone_err
-    if ! clone_err="$(kubectl exec -n "$NAMESPACE" "$POD" -c "$RUNNER_CONTAINER" -- git clone "$REPO_URL" "$SANDBOX_REPO" 2>&1)"; then
+    if ! clone_err="$(kubectl exec -n "$NAMESPACE" "$POD" -c "$RUNNER_CONTAINER" -- timeout 120 git clone "$REPO_URL" "$SANDBOX_REPO" 2>&1)"; then
         say "the sandbox could not clone $safe_url. git said:"
         # git's own stderr echoes the remote URL (userinfo included), so it goes
         # through the same redaction as every other mention.
         redact_url "$clone_err" >&2
         printf '\n' >&2
+        say "if this timed out or could not reach the host, the release's runner egress probably does not allow it: the repository's HTTPS ranges must be opened at install time (curie cluster up --allow-web-egress <cidr>)."
         die "clone into the sandbox failed, so the session has no checkout to work on."
     fi
     say "cloned $safe_url into $SANDBOX_REPO"
+
+    say
+    say "=== turn 2: hand the model its task in the now-present checkout ==="
+    local out2 reply
+    out2="$(send_turn "The repository checkout is now present at $SANDBOX_REPO. Begin your task: $TASK" "$thread")"
+    printf '%s\n' "$out2" >&2
+    assert_turn_shape "turn-2" "$out2"
+    reply="$(printf '%s' "$out2" | jq -r '.reply // ""')"
 
     mkdir -p "$STATE_DIR"
     # The REDACTED url is what gets recorded: state.json is a world-readable
@@ -397,7 +427,7 @@ verb_start() {
         '{namespace: $namespace, channel: $channel, listen_host: $listen_host,
           thread: $thread, pod: $pod, repo_url: $repo_url,
           plugin_dir: $plugin_dir, timeout_secs: $timeout_secs,
-          turns: 1, workdirs: []}' > "$STATE_FILE"
+          turns: 2, workdirs: [], unpushed: []}' > "$STATE_FILE"
 
     jq -n \
         --arg namespace "$NAMESPACE" \
@@ -489,7 +519,7 @@ verb_status() {
 # ================================================================== verb: finish
 
 verb_finish() {
-    if (( PUSH )); then
+    if (( PR )); then
         require_tools gh
     else
         require_tools
@@ -497,23 +527,26 @@ verb_finish() {
     load_state
     say "=== remote-dev session: finish ==="
 
-    local diff untracked
-    diff="$(workspace_diff)"
-    [[ -n "$diff" ]] || die "the sandbox's \`git diff\` is empty, so there is nothing to carry out of this session."
-    untracked="$(workspace_porcelain | grep '^??' || true)"
-    if [[ -n "$untracked" ]]; then
-        # Stated, not silently dropped: `git diff` covers tracked edits only, so
-        # a new file the agent created is NOT in the patch this verb applies.
-        say "warning: the checkout has untracked files that a \`git diff\` patch cannot carry:"
-        printf '%s\n' "$untracked" >&2
-    fi
+    # Stage everything first so the patch carries new files and staged edits,
+    # not just tracked modifications; --binary keeps non-text content intact.
+    # The reset afterwards puts the sandbox index back so later turn/status
+    # comparisons keep seeing the working-tree state they expect.
+    local diff
+    kexec git -C "$SANDBOX_REPO" add -A \
+        || die "could not stage the sandbox checkout for extraction."
+    diff="$(kexec git -C "$SANDBOX_REPO" diff --cached --binary)"
+    kexec git -C "$SANDBOX_REPO" reset -q
+    [[ -n "$diff" ]] || die "the sandbox checkout has no changes at all (tracked or new), so there is nothing to carry out of this session."
 
     local parent workdir patch_file
     parent="$(mktemp -d /tmp/curie-remote-dev-session-finish.XXXXXX)"
     workdir="$parent/repo"
     patch_file="$parent/session.patch"
     printf '%s\n' "$diff" > "$patch_file"
-    update_state --arg dir "$parent" '.workdirs += [$dir]'
+    # Recorded as UNPUSHED until a push succeeds: `down` refuses to delete
+    # unpushed workdirs without --force, because after a no-push finish this
+    # directory holds the only copy of the branch.
+    update_state --arg dir "$parent" '.unpushed += [$dir]'
     say "patch written to $patch_file"
 
     # The recorded URL is the REDACTED one, so a repo that needed inline
@@ -547,14 +580,21 @@ verb_finish() {
         say "=== git push -u origin HEAD ==="
         git -C "$workdir" push -u origin HEAD >&2 \
             || die "the push failed from $workdir."
-        say "=== gh pr create --fill ==="
-        local gh_out
-        gh_out="$(cd "$workdir" && gh pr create --fill)" \
-            || die "\`gh pr create --fill\` failed from $workdir."
-        # gh prints progress lines before the URL, so the URL is the last line.
-        pr_url="$(printf '%s\n' "$gh_out" | tail -n1)"
         pushed=true
-        say "pull request: $pr_url"
+        # Pushed work is safe to clean; move it out of the unpushed set.
+        update_state --arg dir "$parent" '.unpushed -= [$dir] | .workdirs += [$dir]'
+        if (( PR )); then
+            say "=== gh pr create --fill ==="
+            local gh_out
+            gh_out="$(cd "$workdir" && gh pr create --fill)" \
+                || die "\`gh pr create --fill\` failed from $workdir."
+            # gh prints progress lines before the URL, so the URL is the last line.
+            pr_url="$(printf '%s\n' "$gh_out" | tail -n1)"
+            say "pull request: $pr_url"
+        else
+            say "pushed; no pull request opened (--push stops at the push). To open one:"
+            say "  cd $workdir && gh pr create --fill"
+        fi
     else
         say
         say "not pushed. From $workdir, run:"
@@ -584,9 +624,17 @@ verb_down() {
     # uninstalled them would take down work it does not own. `down` removes only
     # what this script itself created on the host.
     if [[ -f "$STATE_FILE" ]]; then
-        local dirs
-        dirs="$(jq -r '.workdirs[]? // empty' "$STATE_FILE")"
-        local dir
+        # Unpushed finish workdirs hold the ONLY copy of their branch; without
+        # --force, refuse rather than destroy them.
+        local unpushed
+        unpushed="$(jq -r '.unpushed[]? // empty' "$STATE_FILE")"
+        if [[ -n "$unpushed" ]] && (( ! FORCE )); then
+            say "these finish workdirs hold branches that were never pushed:"
+            printf '  %s\n' "$unpushed" >&2
+            die "refusing to delete unpushed work. Push those branches first (finish printed the commands), or run \`down --force\` to discard them."
+        fi
+        local dirs dir
+        dirs="$(jq -r '(.workdirs[]? // empty), (.unpushed[]? // empty)' "$STATE_FILE")"
         while IFS= read -r dir; do
             [[ -n "$dir" ]] || continue
             say "removing host workdir $dir"
