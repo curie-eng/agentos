@@ -601,14 +601,46 @@ impl ApiClient {
         bail!("{what} failed with {status}: {}", body.trim());
     }
 
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        operation: &'static str,
+    ) -> Result<reqwest::Response> {
+        match request.send().await {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                let transient = err.is_connect() || err.is_timeout();
+                let source = anyhow::Error::new(err).context(operation);
+                let message = if transient {
+                    format!("the platform API at {} is unreachable", self.base_url)
+                } else {
+                    format!(
+                        "the platform API at {} could not send the requested operation",
+                        self.base_url
+                    )
+                };
+                let remedy = if transient {
+                    format!(
+                        "Run `curl -fsS {}/health` to check it, then retry.",
+                        self.base_url
+                    )
+                } else {
+                    "Set --api-url to an absolute http(s) URL, then retry.".to_string()
+                };
+                Err(crate::exit::operator_context(source, message, Some(remedy)))
+            }
+        }
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
         let resp = self
-            .http
-            .get(format!("{}/agents", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/agents", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents",
+            )
+            .await?;
         Self::expect_ok(resp, "listing agents")
             .await?
             .json()
@@ -624,13 +656,14 @@ impl ApiClient {
     ) -> Result<Agent> {
         let body = agent_create_body(name, slack_channel, repo_full_name);
         let resp = self
-            .http
-            .post(format!("{}/agents", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("POST /agents")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/agents", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&body),
+                "POST /agents",
+            )
+            .await?;
         Self::expect_ok(resp, "creating the agent")
             .await?
             .json()
@@ -655,13 +688,14 @@ impl ApiClient {
     /// stored it, so callers report what took rather than what they intended.
     pub async fn update_agent(&self, agent_id: &str, body: &serde_json::Value) -> Result<Agent> {
         let resp = self
-            .http
-            .patch(format!("{}/agents/{agent_id}", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(body)
-            .send()
-            .await
-            .context("PATCH /agents/{id}")?;
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(body),
+                "PATCH /agents/{id}",
+            )
+            .await?;
         Self::expect_ok(resp, "updating the agent")
             .await?
             .json()
@@ -678,13 +712,14 @@ impl ApiClient {
         secrets: &std::collections::BTreeMap<String, String>,
     ) -> Result<Agent> {
         let resp = self
-            .http
-            .patch(format!("{}/agents/{agent_id}", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&json!({ "secrets": secrets }))
-            .send()
-            .await
-            .context("PATCH /agents/{id}")?;
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "secrets": secrets })),
+                "PATCH /agents/{id}",
+            )
+            .await?;
         Self::expect_ok(resp, "binding agent connector secrets")
             .await?
             .json()
@@ -793,13 +828,14 @@ impl ApiClient {
         created_by: &str,
     ) -> Result<Version> {
         let resp = self
-            .http
-            .post(format!("{}/agents/{agent_id}/versions", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&json!({"version_label": version_label, "created_by": created_by}))
-            .send()
-            .await
-            .context("POST /agents/{id}/versions")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/agents/{agent_id}/versions", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({"version_label": version_label, "created_by": created_by})),
+                "POST /agents/{id}/versions",
+            )
+            .await?;
         Self::expect_ok(resp, "creating the version")
             .await?
             .json()
@@ -819,16 +855,17 @@ impl ApiClient {
             .context("building multipart body")?;
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self
-            .http
-            .put(format!(
-                "{}/agents/{agent_id}/versions/{version_id}/bundle",
-                self.base_url
-            ))
-            .header("X-API-Key", &self.api_key)
-            .multipart(form)
-            .send()
-            .await
-            .context("PUT bundle")?;
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/versions/{version_id}/bundle",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .multipart(form),
+                "PUT bundle",
+            )
+            .await?;
         Self::expect_ok(resp, "uploading the bundle")
             .await?
             .json()
@@ -843,17 +880,18 @@ impl ApiClient {
         environment: &str,
     ) -> Result<Deployment> {
         let resp = self
-            .http
-            .post(format!("{}/deployments", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&json!({
-                "agent_id": agent_id,
-                "version_id": version_id,
-                "environment": environment,
-            }))
-            .send()
-            .await
-            .context("POST /deployments")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/deployments", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({
+                        "agent_id": agent_id,
+                        "version_id": version_id,
+                        "environment": environment,
+                    })),
+                "POST /deployments",
+            )
+            .await?;
         Self::expect_ok(resp, "creating the deployment")
             .await?
             .json()
@@ -920,12 +958,13 @@ impl ApiClient {
     /// Flip the agent kill switch on: `POST /agents/{id}/kill` (no request body).
     pub async fn kill_agent(&self, agent_id: &str) -> Result<KillState> {
         let resp = self
-            .http
-            .post(format!("{}/agents/{agent_id}/kill", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("POST /agents/{id}/kill")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/agents/{agent_id}/kill", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{id}/kill",
+            )
+            .await?;
         Self::expect_ok(resp, "killing the agent")
             .await?
             .json()
@@ -936,12 +975,13 @@ impl ApiClient {
     /// Flip the agent kill switch off: `POST /agents/{id}/resume` (no request body).
     pub async fn resume_agent(&self, agent_id: &str) -> Result<KillState> {
         let resp = self
-            .http
-            .post(format!("{}/agents/{agent_id}/resume", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("POST /agents/{id}/resume")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/agents/{agent_id}/resume", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{id}/resume",
+            )
+            .await?;
         Self::expect_ok(resp, "resuming the agent")
             .await?
             .json()
@@ -955,15 +995,16 @@ impl ApiClient {
     /// its next message cold-creates a fresh sandbox.
     pub async fn reset_thread(&self, agent_id: &str, thread_key: &str) -> Result<ThreadResetState> {
         let resp = self
-            .http
-            .post(format!(
-                "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                self.base_url
-            ))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("POST /agents/{id}/threads/{thread_key}/reset")?;
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "POST /agents/{id}/threads/{thread_key}/reset",
+            )
+            .await?;
         Self::expect_ok(resp, "resetting the thread")
             .await?
             .json()
@@ -983,15 +1024,16 @@ impl ApiClient {
         thread_key: &str,
     ) -> Result<ThreadResetState> {
         let resp = self
-            .http
-            .get(format!(
-                "{}/agents/{agent_id}/threads/{thread_key}/reset",
-                self.base_url
-            ))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents/{id}/threads/{thread_key}/reset")?;
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/threads/{thread_key}/reset",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/threads/{thread_key}/reset",
+            )
+            .await?;
         Self::expect_ok(resp, "polling the thread reset state")
             .await?
             .json()
@@ -1002,13 +1044,14 @@ impl ApiClient {
     /// Set the agent budget: `PUT /agents/{id}/budget` with a `BudgetConfig` body.
     pub async fn set_budget(&self, agent_id: &str, budget: &BudgetConfig) -> Result<BudgetConfig> {
         let resp = self
-            .http
-            .put(format!("{}/agents/{agent_id}/budget", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(budget)
-            .send()
-            .await
-            .context("PUT /agents/{id}/budget")?;
+            .send_request(
+                self.http
+                    .put(format!("{}/agents/{agent_id}/budget", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(budget),
+                "PUT /agents/{id}/budget",
+            )
+            .await?;
         Self::expect_ok(resp, "updating the budget")
             .await?
             .json()
@@ -1036,13 +1079,14 @@ impl ApiClient {
         target: &str,
     ) -> Result<ResolvedTarget> {
         let resp = self
-            .http
-            .post(format!("{}/deploy-targets/resolve", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({"content": content, "target": target}))
-            .send()
-            .await
-            .context("resolving the deploy target")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/deploy-targets/resolve", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&serde_json::json!({"content": content, "target": target})),
+                "resolving the deploy target",
+            )
+            .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if is_unrouted(status, &body) {
@@ -1066,13 +1110,14 @@ impl ApiClient {
     /// about where a deploy lands.
     pub async fn list_deploy_targets(&self, content: &str) -> Result<ListedTargets> {
         let resp = self
-            .http
-            .post(format!("{}/deploy-targets/list", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&serde_json::json!({"content": content, "target": ""}))
-            .send()
-            .await
-            .context("listing the deploy targets")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/deploy-targets/list", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&serde_json::json!({"content": content, "target": ""})),
+                "listing the deploy targets",
+            )
+            .await?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         // Same skew guard as `resolve_deploy_target`: a platform predating this
@@ -1100,20 +1145,21 @@ impl ApiClient {
         app_name: &str,
     ) -> Result<ConnectorManifests> {
         let resp = self
-            .http
-            .get(format!(
-                "{}/agents/{agent_id}/versions/{version_id}/connectors",
-                self.base_url
-            ))
-            .query(&[
-                ("release", release),
-                ("namespace", namespace),
-                ("app_name", app_name),
-            ])
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents/{id}/versions/{vid}/connectors")?;
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/versions/{version_id}/connectors",
+                        self.base_url
+                    ))
+                    .query(&[
+                        ("release", release),
+                        ("namespace", namespace),
+                        ("app_name", app_name),
+                    ])
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/versions/{vid}/connectors",
+            )
+            .await?;
         Self::expect_ok(resp, "rendering declared connectors")
             .await?
             .json()
@@ -1123,12 +1169,13 @@ impl ApiClient {
 
     pub async fn list_versions(&self, agent_id: &str) -> Result<Vec<Version>> {
         let resp = self
-            .http
-            .get(format!("{}/agents/{agent_id}/versions", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents/{id}/versions")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/versions", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/versions",
+            )
+            .await?;
         Self::expect_ok(resp, "listing versions")
             .await?
             .json()
@@ -1139,12 +1186,13 @@ impl ApiClient {
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.
     pub async fn list_memory(&self, agent_id: &str) -> Result<Vec<MemoryEntry>> {
         let resp = self
-            .http
-            .get(format!("{}/agents/{agent_id}/memory", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents/{id}/memory")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/agents/{agent_id}/memory", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/memory",
+            )
+            .await?;
         Self::expect_ok(resp, "listing memory")
             .await?
             .json()
@@ -1161,17 +1209,18 @@ impl ApiClient {
     pub async fn list_pending_approvals(&self, agent_id: &str) -> Result<Vec<ApprovalRecord>> {
         let limit = Self::APPROVALS_LIST_LIMIT.to_string();
         let resp = self
-            .http
-            .get(format!("{}/approvals", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .query(&[
-                ("status_filter", "pending"),
-                ("agent_id", agent_id),
-                ("limit", limit.as_str()),
-            ])
-            .send()
-            .await
-            .context("GET /approvals")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/approvals", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&[
+                        ("status_filter", "pending"),
+                        ("agent_id", agent_id),
+                        ("limit", limit.as_str()),
+                    ]),
+                "GET /approvals",
+            )
+            .await?;
         Self::expect_ok(resp, "listing pending approvals")
             .await?
             .json()
@@ -1200,13 +1249,14 @@ impl ApiClient {
             body["actor_channel"] = json!(chan);
         }
         let resp = self
-            .http
-            .post(format!("{}/approvals/{approval_id}/resolve", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("POST /approvals/{id}/resolve")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/approvals/{approval_id}/resolve", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&body),
+                "POST /approvals/{id}/resolve",
+            )
+            .await?;
         Self::expect_ok(resp, "resolving approval")
             .await?
             .json()
@@ -1219,13 +1269,14 @@ impl ApiClient {
     /// agent so the caller can echo the effective gates.
     pub async fn set_approval_tools(&self, agent_id: &str, tools: &[String]) -> Result<Agent> {
         let resp = self
-            .http
-            .patch(format!("{}/agents/{agent_id}", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&json!({ "approval_required_tools": tools }))
-            .send()
-            .await
-            .context("PATCH /agents/{id} (approval gates)")?;
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "approval_required_tools": tools })),
+                "PATCH /agents/{id} (approval gates)",
+            )
+            .await?;
         Self::expect_ok(resp, "updating approval gates")
             .await?
             .json()
@@ -1249,13 +1300,14 @@ impl ApiClient {
         routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
     ) -> Result<Agent> {
         let resp = self
-            .http
-            .patch(format!("{}/agents/{agent_id}", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&json!({ "approval_routes": routes }))
-            .send()
-            .await
-            .context("PATCH /agents/{id} (approval routes)")?;
+            .send_request(
+                self.http
+                    .patch(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "approval_routes": routes })),
+                "PATCH /agents/{id} (approval routes)",
+            )
+            .await?;
         Self::expect_ok(resp, "updating approval routes")
             .await?
             .json()
@@ -1281,13 +1333,14 @@ impl ApiClient {
             body["model"] = json!(model);
         }
         let resp = self
-            .http
-            .post(format!("{}/evals/trigger", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("POST /evals/trigger")?;
+            .send_request(
+                self.http
+                    .post(format!("{}/evals/trigger", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&body),
+                "POST /evals/trigger",
+            )
+            .await?;
         Self::expect_ok(resp, "triggering the eval")
             .await?
             .json()
@@ -1310,13 +1363,14 @@ impl ApiClient {
             query.push(("stream_id", stream_id.to_string()));
         }
         let resp = self
-            .http
-            .get(format!("{}/evals/matrix", self.base_url))
-            .query(&query)
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /evals/matrix")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/evals/matrix", self.base_url))
+                    .query(&query)
+                    .header("X-API-Key", &self.api_key),
+                "GET /evals/matrix",
+            )
+            .await?;
         Self::expect_ok(resp, "reading the eval matrix")
             .await?
             .json()
@@ -1329,13 +1383,14 @@ impl ApiClient {
     /// `approvals` read must union in (#546).
     pub async fn list_deployments(&self, agent_id: &str) -> Result<Vec<Deployment>> {
         let resp = self
-            .http
-            .get(format!("{}/deployments", self.base_url))
-            .query(&[("agent_id", agent_id)])
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /deployments")?;
+            .send_request(
+                self.http
+                    .get(format!("{}/deployments", self.base_url))
+                    .query(&[("agent_id", agent_id)])
+                    .header("X-API-Key", &self.api_key),
+                "GET /deployments",
+            )
+            .await?;
         Self::expect_ok(resp, "listing deployments")
             .await?
             .json()
@@ -1353,15 +1408,16 @@ impl ApiClient {
             files: Vec<BundleFile>,
         }
         let resp = self
-            .http
-            .get(format!(
-                "{}/agents/{agent_id}/versions/{version_id}/files",
-                self.base_url
-            ))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("GET /agents/{id}/versions/{version_id}/files")?;
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/versions/{version_id}/files",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/versions/{version_id}/files",
+            )
+            .await?;
         let files: BundleFiles = Self::expect_ok(resp, "reading bundle files")
             .await?
             .json()
@@ -1373,12 +1429,13 @@ impl ApiClient {
     /// Delete the agent: `DELETE /agents/{id}` (204 No Content on success).
     pub async fn delete_agent(&self, agent_id: &str) -> Result<()> {
         let resp = self
-            .http
-            .delete(format!("{}/agents/{agent_id}", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context("DELETE /agents/{id}")?;
+            .send_request(
+                self.http
+                    .delete(format!("{}/agents/{agent_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}",
+            )
+            .await?;
         Self::expect_ok(resp, "deleting the agent").await?;
         Ok(())
     }

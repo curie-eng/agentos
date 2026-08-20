@@ -376,7 +376,7 @@ fn vault_with_saved_anthropic_key() -> tempfile::TempDir {
 fn skill_up(fixture: &tempfile::TempDir, anthropic_key: Option<&str>) -> Output {
     let mut cmd = Command::new(bin());
     cmd.current_dir(fixture.path().join("bundle"))
-        .args(["skill", "up"])
+        .args(["--debug", "skill", "up"])
         .arg("--name")
         .arg(format!("curie-747-cred-test-{}", std::process::id()))
         .args(["--image", UNRESOLVABLE_IMAGE])

@@ -53,6 +53,27 @@ pub struct CliError {
     pub class: ExitClass,
 }
 
+/// Operator facing context for normal terminal rendering. The original error
+/// remains its source so classification and debug output retain the full chain.
+#[derive(Debug)]
+struct OperatorContext {
+    message: String,
+    remedy: Option<String>,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for OperatorContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OperatorContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// An error whose JSON rendering is a command specific reconciliation
 /// payload instead of the ordinary `{error, fix}` object.
 #[derive(Debug)]
@@ -125,6 +146,31 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// Add operator facing context while preserving `source` for classification
+/// and debug output.
+pub fn operator_context(
+    source: anyhow::Error,
+    message: impl Into<String>,
+    remedy: Option<String>,
+) -> anyhow::Error {
+    anyhow::Error::from(OperatorContext {
+        message: message.into(),
+        remedy,
+        source,
+    })
+}
+
+/// Select the outermost operator context for normal terminal rendering. Errors
+/// without typed context expose only their outer display text.
+pub fn present_error(err: &anyhow::Error) -> (String, Option<String>) {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<OperatorContext>())
+        .map_or_else(
+            || (err.to_string(), None),
+            |context| (context.message.clone(), context.remedy.clone()),
+        )
+}
+
 /// Build a usage error (exit 2) as an `anyhow::Error` ready to `return Err(..)`.
 pub fn usage(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::from(CliError::usage(msg))
@@ -142,11 +188,10 @@ pub fn usage(msg: impl Into<String>) -> anyhow::Error {
 /// while the alternative ALSO rides in the fix. The redundancy is deliberate: the
 /// two consumers read different fields. A machine consumer branches on the
 /// ADR-0021 `{error, fix}` payload, where `fix` is the alternative alone and stays
-/// exactly the shape it was. A human consumer sees only `Display` (`main` renders
-/// `{err:#}` and discards the fix), so an alternative that lived only in `fix`
-/// would tell them why the verb cannot answer and never where it can -- half of
-/// AC2. Composing it into the message is the local fix; rendering `fix` for every
-/// command's human path is a shared-surface gap tracked separately.
+/// exactly the shape it was. A bare [`CliError`] contributes only its `Display`
+/// message to the human presenter, so an alternative that lived only in `fix`
+/// would tell them why the verb cannot answer and never where it can. Composing
+/// it into the message preserves both parts for that human path.
 pub fn unsupported(
     concept: impl std::fmt::Display,
     reason: impl std::fmt::Display,
@@ -263,8 +308,8 @@ mod tests {
 
     #[test]
     fn unsupported_message_carries_reason_and_alternative() {
-        // `main`'s non-json path renders `{err:#}` and drops the fix, so a human
-        // sees the Display surface alone. It must name BOTH why this tier cannot
+        // A bare CliError gives the human presenter its Display message without
+        // its machine fix field. The message must name both why this tier cannot
         // answer and the tier that can, or the redirect never reaches them.
         let err = unsupported(
             "versions",

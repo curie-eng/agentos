@@ -191,6 +191,17 @@ pub async fn docker_with_env(args: &[String], env: &[(String, String)]) -> Resul
     Ok(stdout)
 }
 
+fn docker_operator_error(source: anyhow::Error, message: &str) -> anyhow::Error {
+    crate::exit::operator_context(
+        source,
+        message,
+        Some(
+            "Run `docker info` to verify Docker is installed and the daemon is running, then retry."
+                .to_string(),
+        ),
+    )
+}
+
 /// Run a docker subcommand and capture its status plus both output streams.
 ///
 /// A check container's nonzero verdict is data, so unlike [`docker`] this does
@@ -212,7 +223,8 @@ pub async fn docker_capture_with_env(
     let output = cmd
         .output()
         .await
-        .context("failed to invoke docker; is Docker installed and on PATH?")?;
+        .context("failed to invoke docker; is Docker installed and on PATH?")
+        .map_err(|err| docker_operator_error(err, "Docker is unavailable for this command."))?;
     Ok((
         output.status,
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -224,23 +236,15 @@ pub async fn docker_capture_with_env(
 /// `Ok(false)` when the network already existed, so the caller only claims
 /// ownership (and thus teardown responsibility) for networks it actually made.
 pub async fn create_network(name: &str) -> Result<bool> {
-    let output = Command::new("docker")
-        .args(["network", "create", name])
-        .output()
-        .await
-        .context("failed to invoke docker; is Docker installed and on PATH?")?;
-    if output.status.success() {
+    let args = ["network".into(), "create".into(), name.to_string()];
+    let (status, _stdout, stderr) = docker_capture(&args).await?;
+    if status.success() {
         return Ok(true);
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if stderr.contains("already exists") {
         return Ok(false);
     }
-    bail!(
-        "docker network create failed ({}): {}",
-        output.status,
-        stderr.trim()
-    )
+    bail!("docker network create failed ({}): {}", status, stderr)
 }
 
 pub async fn remove_network(name: &str) -> Result<()> {
@@ -674,19 +678,21 @@ pub async fn run_ollama(container: &str, network: &str, image: &str) -> Result<S
 pub async fn wait_ollama_ready(container: &str, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     loop {
-        let output = Command::new("docker")
-            .args(["exec", container, "ollama", "list"])
-            .output()
-            .await
-            .context("failed to invoke docker; is Docker installed and on PATH?")?;
-        if output.status.success() {
+        let args = [
+            "exec".into(),
+            container.to_string(),
+            "ollama".into(),
+            "list".into(),
+        ];
+        let (status, _stdout, stderr) = docker_capture(&args).await?;
+        if status.success() {
             return Ok(());
         }
         if started.elapsed() >= timeout {
             bail!(
                 "ollama container '{container}' did not become ready within {}s: {}",
                 timeout.as_secs(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                stderr
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

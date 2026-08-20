@@ -3558,7 +3558,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
-                return Err(err.context(opts.connect_hint));
+                return Err(crate::exit::operator_context(err, opts.connect_hint, None));
             }
             return Err(err);
         }
@@ -7462,8 +7462,8 @@ mod tests {
     }
 
     /// AC2: an unavailable verb must name the concept's absence AND point at the
-    /// tier that answers it. `main`'s human path renders `{err:#}` and discards
-    /// the fix, so both halves have to survive on the Display surface alone.
+    /// tier that answers it. The normal human path renders only the outer message
+    /// and does not emit this error's fix, so both halves must remain in Display.
     #[test]
     fn skill_versions_unavailable_message_names_reason_and_alternative() {
         let shown = format!("{:#}", super::skill_versions_unavailable());
