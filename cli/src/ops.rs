@@ -9,10 +9,13 @@
 //! them. That split keeps the argv construction unit-testable with no cluster
 //! and gives one place to mask secrets before anything is printed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
 
 /// One external command: the program plus its argument vector, with secret
 /// argument values tagged so they can be masked in any printed form.
@@ -2746,6 +2749,62 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     plan
 }
 
+fn gvisor_preflight_job_name_from_render(rendered: &str) -> Result<Option<String>> {
+    let mut found = None;
+    for document in rendered.split("\n---") {
+        let document = document.trim();
+        if document.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_norway::from_str(document)
+            .context("could not parse the rendered gVisor preflight Job")?;
+        if value.is_null() {
+            continue;
+        }
+        if value.get("kind").and_then(|kind| kind.as_str()) != Some("Job") {
+            continue;
+        }
+        let name = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.is_empty())
+            .context("the rendered gVisor preflight Job has no name")?;
+        if found.replace(name.to_string()).is_some() {
+            bail!("the gVisor preflight template rendered more than one Job");
+        }
+    }
+    Ok(found)
+}
+
+async fn rendered_gvisor_preflight_job(
+    chart: &str,
+    common: &CommonOpts,
+    plan: &UpValuePlan,
+) -> Result<Option<String>> {
+    let mut args = vec![
+        plain("template"),
+        plain(&common.release),
+        plain(chart),
+        plain("-n"),
+        plain(&common.namespace),
+    ];
+    plan.append_command_args(&mut args);
+    args.push(plain("--show-only"));
+    args.push(plain("templates/preflight-gvisor.yaml"));
+    let (ok, out, err) = run_capture(&OpsCommand::new("helm", args)).await?;
+    if !ok {
+        if err.trim() == "Error: could not find template templates/preflight-gvisor.yaml in chart" {
+            return Ok(None);
+        }
+        bail!(
+            "could not render the gVisor preflight Job: {}",
+            failure_reason(&err)
+        );
+    }
+    gvisor_preflight_job_name_from_render(&out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PriorityClassRole {
     Platform,
@@ -3576,6 +3635,453 @@ pub async fn run_capture(cmd: &OpsCommand) -> Result<(bool, String, String)> {
     ))
 }
 
+fn finish_captured_step(
+    step: crate::ui::Step,
+    ok_detail: &str,
+    cmd: &OpsCommand,
+    ok: bool,
+    out: String,
+    err: String,
+) -> Result<String> {
+    let ui = crate::ui::ui();
+    if ok {
+        step.done(ok_detail);
+    } else {
+        step.fail("failed");
+    }
+    for line in out.lines().chain(err.lines()) {
+        ui.plumbing(line);
+    }
+    // One implementation, shared with the teardown Display message (#1230):
+    // an inline second copy of this rule is how the two drifted before.
+    if !ok {
+        let reason = failure_reason(&err);
+        ui.failure(&format!("`{}` failed: {reason}", cmd.program));
+        bail!("`{}` exited nonzero", cmd.program);
+    }
+    Ok(out)
+}
+
+struct RunningInstall {
+    child: Child,
+    stdout: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    _secret_files: Vec<SecretValuesFileGuard>,
+    program: String,
+}
+
+impl RunningInstall {
+    fn spawn(cmd: &OpsCommand) -> Result<Self> {
+        let (cmd, secret_files) = cmd.materialize_secret_files()?;
+        let mut child = Command::new(&cmd.program)
+            .args(cmd.argv())
+            .envs(cmd.env.iter().chain(cmd.secret_env.iter()).cloned())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to invoke `{}`; is it on PATH?", cmd.program))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("piped install stdout must be available");
+        let mut stderr = child
+            .stderr
+            .take()
+            .expect("piped install stderr must be available");
+        let stdout = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await?;
+            Ok(output)
+        });
+        let stderr = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).await?;
+            Ok(output)
+        });
+        Ok(Self {
+            child,
+            stdout,
+            stderr,
+            _secret_files: secret_files,
+            program: cmd.program,
+        })
+    }
+
+    async fn finish(
+        mut self,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) -> Result<(bool, String, String)> {
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = terminate_process(&mut self.child).await;
+                return Err(error).with_context(|| {
+                    format!("failed to invoke `{}`; is it on PATH?", self.program)
+                });
+            }
+        };
+        let stdout = self
+            .stdout
+            .await
+            .context("joining the Helm stdout reader")??;
+        let stderr = self
+            .stderr
+            .await
+            .context("joining the Helm stderr reader")??;
+        Ok((
+            status.success(),
+            String::from_utf8_lossy(&stdout).to_string(),
+            String::from_utf8_lossy(&stderr).to_string(),
+        ))
+    }
+
+    async fn terminate(mut self) {
+        let _ = terminate_helm_process(&mut self.child).await;
+        self.stdout.abort();
+        self.stderr.abort();
+        let _ = self.stdout.await;
+        let _ = self.stderr.await;
+    }
+}
+
+struct RunningGvisorEventWatch {
+    child: Child,
+    stdout: tokio::io::Lines<BufReader<ChildStdout>>,
+    existing_event_uids: BTreeSet<String>,
+}
+
+fn gvisor_event_selector(namespace: &str, job: &str) -> String {
+    format!(
+        "involvedObject.kind=Job,involvedObject.namespace={namespace},involvedObject.name={job},reason=FailedCreate"
+    )
+}
+
+fn gvisor_event_watch_cmd(namespace: &str, job: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(namespace),
+            plain("--field-selector"),
+            plain(gvisor_event_selector(namespace, job)),
+            plain("--watch"),
+            plain("--output-watch-events"),
+            plain("-o"),
+            plain(
+                r#"jsonpath={.type}{"\u001f"}{.object.metadata.uid}{"\u001f"}{.object.involvedObject.kind}{"\u001f"}{.object.involvedObject.namespace}{"\u001f"}{.object.involvedObject.name}{"\u001f"}{.object.reason}{"\u001f"}{.object.message}{"\n"}"#,
+            ),
+        ],
+    )
+}
+
+fn gvisor_existing_event_uids_cmd(namespace: &str, job: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("events"),
+            plain("-n"),
+            plain(namespace),
+            plain("--field-selector"),
+            plain(gvisor_event_selector(namespace, job)),
+            plain("-o"),
+            plain(r#"jsonpath={range .items[*]}{.metadata.uid}{"\n"}{end}"#),
+        ],
+    )
+}
+
+enum GvisorEventWatchStart {
+    Watching(Box<RunningGvisorEventWatch>),
+    Unavailable,
+}
+
+enum GvisorEventWatchLine {
+    RuntimeClassRejected(String),
+    Ignore,
+}
+
+async fn gvisor_existing_event_uids(namespace: &str, job: &str) -> Option<BTreeSet<String>> {
+    let ui = crate::ui::ui();
+    let snapshot = gvisor_existing_event_uids_cmd(namespace, job);
+    ui.plumbing(&format!("+ {}", snapshot.display()));
+    match run_capture(&snapshot).await {
+        Ok((true, out, _)) => Some(
+            out.lines()
+                .map(str::trim)
+                .filter(|uid| !uid.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Ok((false, out, err)) => {
+            let detail = [err.trim(), out.trim()]
+                .into_iter()
+                .find(|detail| !detail.is_empty())
+                .unwrap_or("kubectl exited nonzero with no output");
+            ui.plumbing(&format!("gVisor event snapshot unavailable: {detail}"));
+            None
+        }
+        Err(error) => {
+            ui.plumbing(&format!("gVisor event snapshot unavailable: {error}"));
+            None
+        }
+    }
+}
+
+fn start_gvisor_event_watch(
+    namespace: &str,
+    job: &str,
+    existing_event_uids: BTreeSet<String>,
+) -> GvisorEventWatchStart {
+    let ui = crate::ui::ui();
+    let watch = gvisor_event_watch_cmd(namespace, job);
+    ui.plumbing(&format!("+ {}", watch.display()));
+    let mut child = match Command::new(&watch.program)
+        .args(watch.argv())
+        .envs(watch.env.iter().chain(watch.secret_env.iter()).cloned())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            ui.plumbing(&format!("gVisor event watch unavailable: {error}"));
+            return GvisorEventWatchStart::Unavailable;
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .expect("piped kubectl event stdout must be available");
+    GvisorEventWatchStart::Watching(Box::new(RunningGvisorEventWatch {
+        child,
+        stdout: BufReader::new(stdout).lines(),
+        existing_event_uids,
+    }))
+}
+
+fn gvisor_event_watch_line(
+    line: &str,
+    namespace: &str,
+    job: &str,
+    existing_event_uids: &BTreeSet<String>,
+) -> GvisorEventWatchLine {
+    let mut fields = line.splitn(7, '\u{001f}');
+    let source = fields.next().unwrap_or_default();
+    let uid = fields.next().unwrap_or_default();
+    let inspect = match source {
+        "ADDED" | "MODIFIED" => !existing_event_uids.contains(uid),
+        _ => false,
+    };
+    if uid.is_empty() || !inspect {
+        return GvisorEventWatchLine::Ignore;
+    }
+    let kind = fields.next().unwrap_or_default();
+    let event_namespace = fields.next().unwrap_or_default();
+    let name = fields.next().unwrap_or_default();
+    let reason = fields.next().unwrap_or_default();
+    let message = fields.next().unwrap_or_default();
+    let missing_runtimeclass = message.contains("RuntimeClass") && message.contains("not found");
+    if kind == "Job"
+        && event_namespace == namespace
+        && name == job
+        && reason == "FailedCreate"
+        && missing_runtimeclass
+    {
+        GvisorEventWatchLine::RuntimeClassRejected(message.to_string())
+    } else {
+        GvisorEventWatchLine::Ignore
+    }
+}
+
+async fn terminate_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    let _ = child.start_kill();
+    child.wait().await
+}
+
+/// Give Helm its interrupt path so it can mark the release failed before a
+/// bounded forced cleanup. A pending install would block the printed recovery.
+async fn terminate_helm_process(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Ok(status);
+    }
+    let interrupted = match child.id() {
+        Some(pid) => Command::new("kill")
+            .arg("-INT")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success()),
+        None => false,
+    };
+    if interrupted {
+        if let Ok(status) = tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            return status;
+        }
+    }
+    terminate_process(child).await
+}
+
+enum GvisorInstallRace {
+    Helm(std::io::Result<std::process::ExitStatus>),
+    RuntimeClassRejected(String),
+}
+
+async fn run_install_with_gvisor_observer(
+    cl: &crate::ui::Checklist,
+    label: &str,
+    ok_detail: &str,
+    cmd: &OpsCommand,
+    namespace: &str,
+    job: &str,
+    namespace_existed_before_install: bool,
+) -> Result<String> {
+    let ui = crate::ui::ui();
+    ui.plumbing(&format!("+ {}", cmd.display()));
+    let step = cl.step(label);
+    let mut watch_start = if namespace_existed_before_install {
+        Some(match gvisor_existing_event_uids(namespace, job).await {
+            Some(existing_event_uids) => {
+                start_gvisor_event_watch(namespace, job, existing_event_uids)
+            }
+            None => GvisorEventWatchStart::Unavailable,
+        })
+    } else {
+        None
+    };
+    let mut install = match RunningInstall::spawn(cmd) {
+        Ok(install) => install,
+        Err(error) => {
+            if let Some(GvisorEventWatchStart::Watching(watch)) = &mut watch_start {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            step.fail("failed");
+            return Err(error);
+        }
+    };
+
+    let mut early_helm_status = None;
+    if !namespace_existed_before_install {
+        // Helm owns `--create-namespace`. Wait for that one object, then use a
+        // single list and watch request that cannot lose an Event between calls.
+        let mut retry_delay = Duration::from_millis(50);
+        loop {
+            match namespace_exists(namespace).await {
+                Ok(true) => {
+                    watch_start = Some(start_gvisor_event_watch(namespace, job, BTreeSet::new()));
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    ui.plumbing(&format!(
+                        "gVisor event watch unavailable while waiting for namespace: {error:#}"
+                    ));
+                    watch_start = Some(GvisorEventWatchStart::Unavailable);
+                    break;
+                }
+            }
+            match install.child.try_wait() {
+                Ok(Some(status)) => {
+                    early_helm_status = Some(Ok(status));
+                    break;
+                }
+                Err(error) => {
+                    early_helm_status = Some(Err(error));
+                    break;
+                }
+                Ok(None) => {}
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(Duration::from_millis(500));
+        }
+    }
+
+    let watch_start = watch_start.unwrap_or(GvisorEventWatchStart::Unavailable);
+    let mut watch = None;
+    let race = if let Some(status) = early_helm_status {
+        GvisorInstallRace::Helm(status)
+    } else {
+        match watch_start {
+            GvisorEventWatchStart::Watching(running_watch) => {
+                watch = Some(*running_watch);
+                let running_watch = watch.as_mut().expect("watch was just installed");
+                let existing_event_uids = running_watch.existing_event_uids.clone();
+                loop {
+                    let outcome = tokio::select! {
+                        status = install.child.wait() => Some(GvisorInstallRace::Helm(status)),
+                        line = running_watch.stdout.next_line() => {
+                            match line {
+                                Ok(Some(line)) => match gvisor_event_watch_line(
+                                    &line,
+                                    namespace,
+                                    job,
+                                    &existing_event_uids,
+                                ) {
+                                    GvisorEventWatchLine::RuntimeClassRejected(rejection) => {
+                                        Some(GvisorInstallRace::RuntimeClassRejected(rejection))
+                                    }
+                                    GvisorEventWatchLine::Ignore => None,
+                                },
+                                Ok(None) | Err(_) => {
+                                    let _ = terminate_process(&mut running_watch.child).await;
+                                    Some(GvisorInstallRace::Helm(install.child.wait().await))
+                                }
+                            }
+                        }
+                    };
+                    if let Some(outcome) = outcome {
+                        break outcome;
+                    }
+                }
+            }
+            GvisorEventWatchStart::Unavailable => {
+                GvisorInstallRace::Helm(install.child.wait().await)
+            }
+        }
+    };
+
+    match race {
+        GvisorInstallRace::Helm(status) => {
+            if let Some(watch) = watch.as_mut() {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            let captured = install.finish(status).await;
+            match captured {
+                Ok((ok, out, err)) => finish_captured_step(step, ok_detail, cmd, ok, out, err),
+                Err(error) => {
+                    step.fail("failed");
+                    Err(error)
+                }
+            }
+        }
+        GvisorInstallRace::RuntimeClassRejected(rejection) => {
+            if let Some(watch) = watch.as_mut() {
+                let _ = terminate_process(&mut watch.child).await;
+            }
+            install.terminate().await;
+            step.fail("failed");
+            let fix = "curie cluster up --set security.gvisor.mode=off";
+            Err(crate::exit::CliError::failure(format!(
+                "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
+            ))
+            .with_fix(fix)
+            .into())
+        }
+    }
+}
+
 /// Run one command under a checklist `step` labeled `label`, capturing its
 /// stdio. Echoes the masked command line and replays the captured output as dim
 /// plumbing (both no-ops unless `--debug`, so default runs stay quiet and the
@@ -3592,22 +4098,7 @@ pub(crate) async fn run_step(
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
     let (ok, out, err) = run_capture(cmd).await?;
-    if ok {
-        step.done(ok_detail);
-    } else {
-        step.fail("failed");
-    }
-    for line in out.lines().chain(err.lines()) {
-        ui.plumbing(line);
-    }
-    if !ok {
-        // One implementation, shared with the teardown Display message (#1230):
-        // an inline second copy of this rule is how the two drifted before.
-        let reason = failure_reason(&err);
-        ui.failure(&format!("`{}` failed: {reason}", cmd.program));
-        bail!("`{}` exited nonzero", cmd.program);
-    }
-    Ok(out)
+    finish_captured_step(step, ok_detail, cmd, ok, out, err)
 }
 
 // ---------------------------------------------------------------------------
@@ -3933,12 +4424,31 @@ async fn run_prepared_up(
             lines: cmds.iter().map(|cmd| cmd.display()).collect(),
         }));
     }
+    let release_namespace_existed_before_install = ownership_candidates
+        .iter()
+        .find_map(|(namespace, existed)| (namespace == &opts.common.namespace).then_some(*existed))
+        .unwrap_or(false);
     require_on_path("helm")?;
     preflight_priority_class_ownership(&opts, &value_plan).await?;
+    let gvisor_preflight_job =
+        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
-        run_step(&cl, &label, "installed", cmd).await?;
+        if let Some(job) = gvisor_preflight_job.as_deref() {
+            run_install_with_gvisor_observer(
+                &cl,
+                &label,
+                "installed",
+                cmd,
+                &opts.common.namespace,
+                job,
+                release_namespace_existed_before_install,
+            )
+            .await?;
+        } else {
+            run_step(&cl, &label, "installed", cmd).await?;
+        }
     }
 
     // #707 stamp ownership only on namespaces this run actually created. A

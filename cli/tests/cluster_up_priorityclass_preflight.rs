@@ -61,6 +61,7 @@ if [ "$1" = "template" ]; then
     platform_create="true"
     sandbox_create="true"
     show_priorityclass="false"
+    show_gvisor_preflight="false"
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --set|--set-string)
@@ -76,14 +77,24 @@ if [ "$1" = "template" ]; then
                 shift
                 if [ "$1" = "templates/priorityclass.yaml" ]; then
                     show_priorityclass="true"
+                elif [ "$1" = "templates/preflight-gvisor.yaml" ]; then
+                    show_gvisor_preflight="true"
                 fi
                 ;;
             --show-only=templates/priorityclass.yaml)
                 show_priorityclass="true"
                 ;;
+            --show-only=templates/preflight-gvisor.yaml)
+                show_gvisor_preflight="true"
+                ;;
         esac
         shift
     done
+
+    if [ "$show_gvisor_preflight" = "true" ]; then
+        printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
+        exit 1
+    fi
 
     first="true"
     if [ "$platform_create" = "true" ]; then
