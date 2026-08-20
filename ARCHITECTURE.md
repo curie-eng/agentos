@@ -24,6 +24,7 @@ was built from, which are preserved in git history.
 
 ## Table of contents
 
+- [Clause status](#clause-status)
 - [Overview](#overview)
 - [Component map](#component-map)
   - [Adopted, not built](#adopted-not-built)
@@ -40,6 +41,72 @@ was built from, which are preserved in git history.
 - [Frozen contracts](#frozen-contracts)
 - [Deployment, CI, and release](#deployment-ci-and-release)
 - [What is built vs deferred](#what-is-built-vs-deferred)
+
+## Clause status
+
+The tables below state what the code enforces for the three load bearing
+claims in this map. They are a documentation pattern borrowed from
+[YC QM's MIT licensed deploy directory](https://github.com/yc-software/qm/blob/main/docs/deploy-directory.md).
+
+`ENFORCED` means product code rejects a violating state, or a required gate
+executes the real consumer and rejects it. `VALIDATED-ONLY` means a checker or
+scheduled run observes the clause, but ordinary operation can diverge or the
+failure is not fatal. `RESERVED` means the intended slot exists without active
+enforcement. This evidence snapshot is `origin/next` commit `1465cb25`, read
+on 2026-08-20.
+
+### Local to production parity
+
+| Clause | Status | Evidence and limit |
+| --- | --- | --- |
+| Skill uses an immutable snapshot | ENFORCED | `cli/src/bundle.rs`, `cli/src/commands.rs`, and `cli/src/docker.rs` materialize and mount a content addressed snapshot read only. The snapshot materialization test in `cli/src/bundle.rs` and `cli/scripts/e2e.sh` AC1 mutate the source after boot and require unchanged mounted bytes and digest. |
+| Every tier uses the same bundle | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` compares independently computed skill, local, local release, and cluster receipt digests in `assert_bundle_identity`. Individual commands do not require a prior rung digest and can deploy different trees. |
+| Every tier uses the same eval suite | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` asserts suite name and count only from each tier's `eval --dry-run` in `assert_suite`. The bundle digest covers the suite bytes, but this dry run check does not read or compare case ids. No product state binds later tier commands to an earlier suite. |
+| Every tier uses the same model mode | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` checks deployed `CURIE_FAKE_MODEL` in `assert_model_mode`, `probe_local_fake_model`, and `probe_cluster_fake_model`. Mode remains independently configurable outside the ladder. |
+| Local runtime binds the newly deployed version | VALIDATED-ONLY | `cli/scripts/e2e-ladder.sh` proves this during a local run in `assert_sole_active_deployment`. The database and worker allow several active deployments and normally resolve prod first. |
+| Cluster runtime binds the newly deployed version | VALIDATED-ONLY | The `rung_cluster` path in `cli/scripts/e2e-ladder.sh` runs `assert_sole_active_deployment` only with `CURIE_API_KEY`. The CI and nightly cluster jobs lack that key and report upload identity proved but runtime binding unproved. |
+| Pull request parity ladder exercises all fake tiers | ENFORCED | `.github/workflows/ci.yaml` jobs `e2e-ladder`, `e2e-ladder-release`, and `e2e-ladder-cluster` drive skill, Compose, generated release Compose, and kind. `e2e-required` rejects a selected job result other than success. |
+| Nightly live ladder exercises live tiers | VALIDATED-ONLY | `.github/workflows/nightly-graded-ladder.yaml` jobs `ladder-skill-local`, `ladder-local-release`, and `ladder-cluster` run with `CURIE_E2E_LIVE=1`. GitHub Actions history from runs `30991073908` through `32231275073` has 10 successes of 20: 6 successes from 15 scheduled runs and 4 successes from 5 manual dispatches. It is a scheduled observation, not a merge gate. |
+
+### Git flow deploy
+
+| Clause | Status | Evidence and limit |
+| --- | --- | --- |
+| Webhook push ingress verifies HMAC | ENFORCED | `apps/api/src/curie_api/routers/github.py::github_webhook` rejects before dispatch unless `gitflow.verify_signature` accepts the raw body and `X-Hub-Signature-256`. `apps/api/tests/test_gitflow_integration.py::test_invalid_signature_is_401` covers the route. `apps/api/src/curie_api/commitpoller.py::CommitPoller` is a separate outbound GitHub API ingress without HMAC. |
+| Webhook and commit poller ingress converge on one push flow | ENFORCED | `apps/api/src/curie_api/routers/github.py` and `apps/api/src/curie_api/commitpoller.py` both hand a push payload to `apps/api/src/curie_api/gitflow.py::process_push`. `apps/api/tests/test_commitpoller.py::test_the_payload_is_shaped_like_a_real_webhook` pins the poller payload shape used by that flow. |
+| Only configured deploy branch refs deploy | ENFORCED | `apps/api/src/curie_api/gitflow.py::environment_for_ref` accepts only exact configured `refs/heads/` values. `test_environment_for_ref_requires_exact_head_ref` and `test_non_deploy_branch_is_ignored` reject tags and other branches. |
+| A deploy archives the pushed SHA | ENFORCED | `apps/api/src/curie_api/gitflow.py::process_push` validates a full SHA and `clone_and_archive` runs `git archive` against the stored repository binding. `test_clone_and_archive_rejects_invalid_sha_before_any_subprocess`, `test_clone_hands_git_the_derived_origin_not_the_payload_url`, and `test_dev_push_deploys_dev_bot` pin that path. |
+| A pushed bundle is validated | ENFORCED | `gitflow.process_push` calls `deploy.validate_archive`, `bundles.extract_and_validate`, and `plugin_format.validate_bundle`. `apps/api/tests/test_gitflow_integration.py::test_malformed_bundle_push_is_rejected` proves an invalid archive cannot become a deployment. |
+| A dev push stores a version and dev deployment | ENFORCED | `gitflow.process_push` calls `crud.create_version_row`, `deploy.store_bundle`, and `crud.create_deployment_row`. `apps/api/tests/test_gitflow_integration.py::test_dev_push_deploys_dev_bot` proves the bundle, version, and deployment in Postgres and RustFS. |
+| Version bundles are write once | VALIDATED-ONLY | `apps/api/src/curie_api/routers/bundles.py::upload_bundle` rejects sequential replacement with 409, and `apps/api/tests/test_bundles.py::test_bundles_are_immutable` pins that behavior. `apps/api/src/curie_api/crud.py::attach_bundle` has no compare and swap, so concurrent uploads are not an enforced immutability invariant. |
+| A new dev bundle fans out one eval job | ENFORCED | `gitflow.process_push` enqueues only for a newly built dev bundle. `apps/api/tests/test_evalqueue_integration.py::test_dev_push_fans_out_prod_push_does_not` proves the Valkey stream write, and `test_redelivered_dev_push_does_not_refan_out` proves deduplication. |
+| A graded eval posts its commit status | VALIDATED-ONLY | `apps/api/src/curie_api/routers/evals.py::report_eval` maps a report through `GitHubStatusReporter.report_eval`, and `apps/api/tests/test_github_checks.py::test_report_eval_posts_the_exact_commit_status` pins that payload. It needs a GitHub token, and `apps/worker/src/curie_worker/eval/stream.py` treats worker reporting failure as nonfatal. |
+| A red eval blocks prod promotion | RESERVED | `apps/api/src/curie_api/gitflow.py::process_push` does not read an eval result or commit status before creating a prod deployment. Curie does not configure or verify external repository branch protection. |
+| A prod deployment reuses an existing built version | ENFORCED | `gitflow.get_version_by_commit` and `_sibling_bundle` reuse stored artifacts when present. `test_main_push_promotes_and_reuses_the_built_version` and `test_prod_promotes_the_exact_artifact_dev_validated` require shared version identity or `bundle_ref` and commit SHA. |
+| A prod push requires a prebuilt dev artifact | RESERVED | `gitflow.process_push` archives and validates before checking for an existing version, then creates or repairs a bundle for either environment. `test_partial_version_is_rebuilt_not_reused` confirms this repair path, so a prod first push can build and deploy. |
+| Webhook and manual deployments share persistence | ENFORCED | Webhooks use `crud.create_version_row` and `crud.create_deployment_row`; `apps/api/src/curie_api/routers/agents.py` and `apps/api/src/curie_api/routers/deployments.py` use the same CRUD rows. |
+| Listed clients use the same bundle validator | ENFORCED | The webhook calls `deploy.validate_archive`; `apps/ui/src/views/wired/WiredAgentDetail.tsx` calls `createVersion`, `uploadBundle`, and `createDeployment`; the upload route uses that validator. `cli/src/api.rs` follows the sequence, pinned by the deploy contract test in `cli/tests/api_deploy.rs`. |
+| The server enforces one deployment pipeline | VALIDATED-ONLY | Listed clients follow the intended sequence, but `schemas.VersionCreate` accepts `bundle_ref` and `apps/api/src/curie_api/routers/deployments.py` permits a deployment with no bundle because `revalidate_stored_bundle` returns when `bundle_ref` is absent. Client behavior is validated, not a server invariant. |
+
+### Eval gate
+
+| Clause | Status | Evidence and limit |
+| --- | --- | --- |
+| Eval cases have one checked schema | ENFORCED | Pydantic owns `apps/worker/schema/eval-cases.schema.json`; `apps/worker/tests/eval/test_schema_compat.py` rejects generated artifact drift; the schema grader deserialization test in `cli/src/evals.rs` rejects a grader kind the Rust loader cannot read. |
+| Text graders determine pass or fail | ENFORCED | `cli/src/evals.rs` serves skill eval through `Grader::grade`; `cli/src/message.rs` serves local and cluster messages through `reply_passes`. `cli/src/commands.rs` exits failure for any genuine case failure, with unit coverage for exact, contains, regex, terminal status, and classified failures. |
+| Trajectory grader semantics agree across languages | ENFORCED | Python `apps/worker/src/curie_worker/eval/scorer.py::match_trajectory` and Rust `cli/src/evals.rs` replay `tests/vectors/trajectory-match.json`. `apps/worker/tests/eval/test_trajectory.py::test_python_matcher_owns_the_shared_cross_language_vectors` and the five mode trajectory test in `cli/tests/trajectory_eval.rs` cover all modes. |
+| One server side grader implementation exists | RESERVED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/models.py` each implement graders. Shared schema and vectors limit drift but do not create one implementation. |
+| Fake models cannot produce a quality pass | ENFORCED | `cli/src/evals.rs` and `apps/worker/src/curie_worker/eval/runner.py` return `PLUMBING_OK` before grading with a fake model. `apps/worker/src/curie_worker/eval/stream.py`, `cli/tests/fake_tier_plumbing.rs`, and worker tests pin the tri state. |
+| Skill, local, and local release grade failures are fatal | ENFORCED | `cli/src/commands.rs` exits 1 for a failed case. `cli/scripts/e2e-ladder.sh` runs skill, local, and local release evals under `set -e`; the associated nightly jobs therefore fail on those grades. |
+| Cluster answer quality failure is fatal | VALIDATED-ONLY | The `rung_cluster` path in `cli/scripts/e2e-ladder.sh` runs live `cluster eval --json` but captures a failure and reports it without failing the rung, citing issue #1603. `examples/weather/evals/cases.json` records why the regex cannot prove forecast provenance. Cluster plumbing remains fatal, answer quality does not. |
+| Cluster workers receive eval reporting environment | ENFORCED | On `next`, `charts/curie/templates/worker.yaml` supplies `CURIE_API_URL`, `CURIE_API_KEY`, and three `LANGFUSE_*` values. `charts/curie/ci/worker-eval-wiring-assertions.sh`, run as `helm render assertions (worker eval wiring)` in `.github/workflows/helm-ci.yaml`, requires one correctly sourced entry with default and connector enabled renders. Issue #1452 and PR #1486 fixed only these five worker reporting environment entries on `next`, not the broader installed cluster gate. |
+| A semantic provenance grader exists | RESERVED | Neither Python nor Rust defines `GraderKind.verifier`. Issue #1603 names it as the prerequisite for a meaningful fatal cluster weather grade; the current exact, contains, regex, and `tool_called` kinds cannot prove source provenance. |
+| A worker consumes, records, and reports an eval | VALIDATED-ONLY | `apps/worker/src/curie_worker/run.py` always supervises `EvalStreamConsumer`. `apps/worker/tests/eval/test_stream.py::test_seam_full_consume_eval_report_cycle` drives Valkey, RustFS bundle load, runner grade, Langfuse record, API report, and acknowledgement, but uses `MockTransport` for the API report hop. It validates the sequence, not the real report route. |
+| GitHub status reporting is unconditional | VALIDATED-ONLY | `apps/api/src/curie_api/github_checks.py` posts only with a configured GitHub token; otherwise it logs and returns the computed state. `apps/api/tests/test_github_checks.py` covers both paths. |
+
+Dev eval fanout and red eval promotion each appear once in
+[Git flow deploy](#git-flow-deploy). They describe that deploy flow, rather
+than separate eval transport claims.
 
 ## Overview
 
