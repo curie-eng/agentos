@@ -287,6 +287,63 @@ while the measured idle need is two orders of magnitude smaller.
 **Reproduced failures**: `PluginBundleError: invalid plugin bundle at /unused`,
 twice, exactly as the chart's warm-pool comment predicts.
 
+### The pre-bind path, measured directly
+
+Decisions 1 and 3 were tested rather than assumed, on the same release, against
+an isolated `SandboxTemplate` and `SandboxWarmPool` created alongside the
+shipped ones so no live claim was disturbed. The template carried the bundle ref
+and `CURIE_PLUGIN_DIR=/bundles/current` **baked in per pool** instead of injected
+per claim.
+
+- Two warm pods pre-fetched, pre-extracted, and pre-booted that bundle, reaching
+  `readyReplicas: 2` in **~28 seconds**. This is a real-model install, so it also
+  shows the chart's "only a fake-model pool boots cleanly" caveat is a
+  consequence of the pool being *generic*, not of the pool being warm. A pool
+  that knows its version boots fine.
+- A `SandboxClaim` carrying **no env at all** bound one of those pods and
+  reached a ready runner in **0.19 seconds**:
+
+  ```
+  0.08s  claim applied (no env)
+  0.13s  bound to sandbox probe-runner-pool-zrp4j
+  0.13s  claim Ready=True (DependenciesReady)
+  0.19s  RUNNER READY
+  ```
+
+  Against the 17.39s cold baseline that is **91x**, and it is the sub-second bind
+  the residency invariant depends on.
+- The bound pod was genuinely usable, not an empty shell: `/bundles/current`
+  contained the bundle's `AGENTS.md`, `evals`, and `skills`. The pool refilled
+  itself afterwards without intervention.
+- An otherwise identical claim carrying **one** env entry did not bind a pool pod.
+  It created its own `Sandbox` named after the claim and attempted a new pod,
+  which is the cold-create path. Its wall clock is **not** established here: the
+  attempt failed on the namespace quota rather than completing, so only the
+  behavioural difference is demonstrated, and a clean timing of that arm is
+  outstanding.
+
+### A third, tighter density cap surfaced while testing
+
+The failed with-env claim reported:
+
+```
+exceeded quota: curie-sandbox-quota, requested: limits.cpu=1,
+used: limits.cpu=8, limited: limits.cpu=8
+```
+
+ADR-0059 decision 4's namespace quota is denominated in `limits.cpu` and set to
+8, while each sandbox declares `limits.cpu: 1`. The namespace therefore admits
+**exactly eight concurrent sandboxes**, even though the same quota allows
+`pods: 50` and its `requests.cpu` was only 400m of an allowed 4000m -- 10% used
+at the moment the limit-denominated dimension hit 100%.
+
+That is the CPU over-declaration of the table above turned into a hard
+concurrency ceiling, and it is tighter than either of the other two caps
+(`max_concurrency` at 16, and node-level CPU requests). It is not an argument
+against the quota, which exists for good reasons; it is an argument that a
+ceiling chosen generously per sandbox becomes a cluster-wide cap when a quota
+counts it, which decision 6 is what fixes.
+
 ## Alternatives considered
 
 - **Many sessions inside one runner process.** Measured and rejected. Each
@@ -354,6 +411,12 @@ twice, exactly as the chart's warm-pool comment predicts.
   sandboxes that can contend for one node's cycles. Decision 6's priority class
   is what keeps that from converting a solved latency problem into a new
   starvation problem.
+
+- Decision 6 has to move the CPU **limit** as well as the request, because
+  ADR-0059 decision 4's quota counts `limits.cpu`. Leaving a generous per-sandbox
+  ceiling in place while raising density means the namespace quota, not the node,
+  becomes the first thing a busy release hits, and it does so at eight sandboxes
+  on the shipped numbers.
 
 - Nothing here changes what a sandbox may *reach*. ADR-0006's rails and
   ADR-0008's tenant boundary are untouched, and a pre-bound runner is bound to

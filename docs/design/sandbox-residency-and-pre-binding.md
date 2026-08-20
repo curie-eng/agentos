@@ -177,10 +177,19 @@ platform already knows the set: `curie.deployments`. Needs a bounded total pool
 count, a reaper for retired versions, and zero pre-warmed pods for deployments
 with no recent traffic.
 
-**W3 does not work before W4.** A pool pod that knows its bundle still cannot be
-bound while `envVarsInjectionPolicy: Overrides` forces per-claim env to replace
-what the pool baked in. This ordering is the single most important thing to carry
-out of this document.
+**W3 is proven, and its dependency on W4 is now sharp rather than assumed.** An
+isolated pool built exactly this way -- bundle ref and `CURIE_PLUGIN_DIR` baked
+into the pool's own template -- pre-booted two pods to ready in ~28s, and a claim
+carrying **no env** bound one of them and reached a ready runner in **0.19s**
+against the 17.39s cold baseline. The bound pod held the real bundle, and the
+pool refilled itself.
+
+The dependency is therefore not "a pool cannot pre-boot"; it demonstrably can.
+It is that **the moment a claim must carry session env, it stops binding a pool
+pod and creates its own sandbox instead.** An otherwise identical claim with one
+env entry did exactly that. So W3 delivers the sub-second bind only for claims
+that carry nothing, which is precisely what W4 makes possible. This ordering is
+the single most important thing to carry out of this document.
 
 Seams touched: `charts/curie/templates/agent-sandbox.yaml`,
 `apps/worker/src/curie_worker/sandbox/substrate.py`, the deployment reconciler.
@@ -243,7 +252,17 @@ optimisation.
 ## Open questions
 
 - **How is a bind authenticated** if the runner token no longer arrives as pod
-  env? This gates W4 and has no answer yet.
+  env? This gates W4 and has no answer yet. It is now the only thing between the
+  measured 0.19s bind and a usable one.
+- **What does the cold path cost when it is not quota-blocked?** The with-env arm
+  of the pre-bind test failed on `curie-sandbox-quota` rather than completing, so
+  its wall clock is unmeasured; only its behaviour (create its own sandbox rather
+  than bind a pool pod) is established.
+- **Should the CPU limit move with the request?** ADR-0059 decision 4's quota
+  counts `limits.cpu`, and at the shipped `limits.cpu: 1` per sandbox the
+  namespace admits eight concurrent sandboxes while its `pods` allowance is 50
+  and its `requests.cpu` sits at 10%. Raising density without moving the ceiling
+  just relocates the wall.
 - **What is the per-session marginal cost inside one process**, if the SDK could
   ever multiplex sessions in one Claude Code child? The measured 259.5 MiB child
   is per-session today; whether it must be is unmeasured, and it is the only
