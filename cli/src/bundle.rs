@@ -506,6 +506,26 @@ mod tests {
     }
 
     #[test]
+    fn pack_cleanliness_ignores_excluded_descendants_but_not_the_exclusion_file() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scaffold::scaffold(dir.path(), "deal-desk").unwrap();
+        std::fs::write(dir.path().join(".curieignore"), "generated-output/\n").unwrap();
+        std::fs::create_dir(dir.path().join("generated-output")).unwrap();
+        std::fs::write(dir.path().join("generated-output/file.txt"), "generated\n").unwrap();
+
+        assert!(git_status_is_clean_for_pack(
+            dir.path(),
+            Path::new(""),
+            b"!! generated-output/file.txt\0",
+        ));
+        assert!(!git_status_is_clean_for_pack(
+            dir.path(),
+            Path::new(""),
+            b" M .curieignore\0",
+        ));
+    }
+
+    #[test]
     fn ignores_curieignore_patterns_that_reach_outside_the_bundle() {
         let dir = tempfile::tempdir().unwrap();
         crate::scaffold::scaffold(dir.path(), "deal-desk").unwrap();

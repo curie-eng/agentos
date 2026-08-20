@@ -246,11 +246,12 @@ class GitHubBranchTip:
 
 
 # The last Git flow authored version commit deployed per (repository, environment).
-# Only matching version and deployment provenance settles this baseline, so
-# public CLI artifacts and console rollbacks do not redefine it. Environment
-# rather than branch because that is what a Deployment records; the caller maps
-# environments back to branch names via Settings, the same mapping
-# `environment_for_ref` uses in the other direction.
+# Only a Git flow authored version with recorded deployment provenance settles
+# this baseline. The authoritative value still comes from the version, so a
+# mutable deployment value cannot redefine it. Environment rather than branch
+# because that is what a Deployment records; the caller maps environments back
+# to branch names via Settings, the same mapping `environment_for_ref` uses in
+# the other direction.
 _DEPLOYED_SQL = """
 SELECT DISTINCT ON (a.repo_full_name, d.environment)
        a.repo_full_name AS repo_full_name,
@@ -260,7 +261,7 @@ FROM {schema}.deployments d
 JOIN {schema}.agents a ON a.id = d.agent_id
 JOIN {schema}.agent_versions v ON v.id = d.version_id
 WHERE a.repo_full_name IS NOT NULL
-  AND d.commit_sha = v.commit_sha
+  AND d.commit_sha IS NOT NULL
   AND v.created_by = :git_flow_created_by
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """

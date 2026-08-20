@@ -691,6 +691,67 @@ def test_prod_promotes_the_exact_artifact_dev_validated(
     assert dev_version["commit_sha"] == prod_version["commit_sha"] == sha
 
 
+def test_dev_push_does_not_reuse_a_cli_bundle_from_a_sibling_agent(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    dev_id = _register(client, auth_headers, "two-agent-dev", "C000000D01")
+    prod_id = _register(client, auth_headers, "two-agent-prod", "C000000E01")
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, TWO_TARGET_FILES)
+
+    cli_version = client.post(
+        f"/agents/{prod_id}/versions",
+        json={
+            "version_label": "cli-sibling-working-tree",
+            "created_by": "cli",
+            "commit_sha": sha,
+        },
+        headers=auth_headers,
+    )
+    assert cli_version.status_code == 201, cli_version.text
+    cli_version_id = cli_version.json()["id"]
+
+    cli_files = {
+        **TWO_TARGET_FILES,
+        "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: cli sibling tree\n---\n",
+    }
+    cli_archive = io.BytesIO()
+    with tarfile.open(fileobj=cli_archive, mode="w:gz") as archive:
+        for rel, content in cli_files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"cli-sibling/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload = client.put(
+        f"/agents/{prod_id}/versions/{cli_version_id}/bundle",
+        files={"file": ("cli-sibling.tar.gz", cli_archive.getvalue())},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+    cli_bundle_ref = upload.json()["bundle_ref"]
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "deployed"
+
+    versions = client.get(f"/agents/{dev_id}/versions", headers=auth_headers).json()
+    assert len(versions) == 1, versions
+    git_version = versions[0]
+    assert git_version["created_by"] == "git-flow"
+    assert git_version["bundle_ref"] != cli_bundle_ref
+
+    stored = client.get(
+        f"/agents/{dev_id}/versions/{git_version['id']}/bundle", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    with tarfile.open(fileobj=io.BytesIO(stored.content), mode="r:*") as archive:
+        skill = archive.extractfile("skills/alpha/SKILL.md")
+        assert skill is not None
+        assert skill.read().decode() == VALID_FILES["skills/alpha/SKILL.md"]
+
+
 def test_a_target_naming_another_repos_agent_is_rejected_end_to_end(
     client: Any,
     auth_headers: dict[str, str],

@@ -415,14 +415,14 @@ async def test_a_deployment_sha_does_not_forge_a_git_flow_poll_baseline(
             store=object(),
             settings=Settings(github_clone_base="https://github.com"),
             eval_queue=object(),
-            tips=Tips({(REPO, "dev"): deployment_sha, (REPO, "main"): None}),
+            tips=Tips({(REPO, "dev"): version_sha, (REPO, "main"): None}),
             interval_seconds=60,
         )
         await poller.poll_once()
     finally:
         await engine.dispose()
 
-    assert [payload["after"] for payload in pushes] == [deployment_sha]
+    assert pushes == []
 
 
 @pytest.mark.parametrize("branches", [(), ("dev",), ("dev", "main")])
