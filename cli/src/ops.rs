@@ -600,6 +600,50 @@ pub fn parse_egress_provider(value: &str) -> Result<&'static str, crate::exit::C
         })
 }
 
+fn credential_egress_provider(credential: &str) -> Option<&'static str> {
+    if credential.starts_with("sk-ant-") {
+        Some("anthropic")
+    } else if credential.starts_with("sk-or-") {
+        Some("openrouter")
+    } else {
+        None
+    }
+}
+
+fn validate_credential_egress_consistency(
+    opts: &UpOpts,
+) -> std::result::Result<(), crate::exit::CliError> {
+    let operator_sets = opts.operator_sets();
+    let explicit_credential = operator_set_entries(&operator_sets)
+        .into_iter()
+        .filter(|(key, _)| key.trim() == MODEL_CREDENTIAL_KEY)
+        .map(|(_, value)| value.trim())
+        .next_back();
+    let Some(detected) = explicit_credential
+        .or(opts.credentials.as_deref())
+        .and_then(credential_egress_provider)
+    else {
+        return Ok(());
+    };
+
+    if opts.allow_egress_host.is_empty()
+        || opts
+            .allow_egress_host
+            .iter()
+            .any(|provider| provider == detected)
+    {
+        return Ok(());
+    }
+
+    let explicit = opts.allow_egress_host.join(", ");
+    Err(crate::exit::CliError::usage(format!(
+        "the configured model credential identifies `{detected}`, but `--allow-egress-host` permits only: {explicit}"
+    ))
+    .with_fix(format!(
+        "include `--allow-egress-host {detected}`, or remove the contradictory provider selection"
+    )))
+}
+
 /// A resolved host address as a single-host CIDR: `/32` for IPv4, `/128` for
 /// IPv6. The egress rule opens exactly that address, nothing wider.
 pub fn ip_to_egress_cidr(ip: std::net::IpAddr) -> String {
@@ -3328,6 +3372,9 @@ pub async fn up(
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
+    // Reject contradictions already visible in argv or the environment before
+    // reading cluster state.
+    validate_credential_egress_consistency(&opts)?;
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -3335,13 +3382,24 @@ pub async fn up(
     } else {
         None
     };
-    let opts = complete_up_opts(
+    let mut opts = complete_up_opts(
         opts,
         existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
-        resolve_provider_egress,
+        false,
     )?;
+    // A release read can restore a credential that was absent from argv and the
+    // environment. Validate that effective value before provider DNS or Helm.
+    validate_credential_egress_consistency(&opts)?;
+    if resolve_provider_egress
+        && !opts.allow_egress_host.is_empty()
+        && opts.resolved_egress_cidrs.is_empty()
+    {
+        opts.resolved_egress_cidrs =
+            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
+                .context("resolving named provider egress hosts")?;
+    }
     let value_plan = up_value_plan(&opts);
     run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
 }

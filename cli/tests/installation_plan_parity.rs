@@ -13,6 +13,9 @@ const GITHUB_VALUE: &str = "github-value-for-plan";
 const RERUN_CREDENTIAL_SENTINEL: &str = "placeholder credential sentinel";
 const RERUN_MODEL_SENTINEL: &str = "placeholder/model";
 const RERUN_EGRESS_CIDR: &str = "192.0.2.10/32";
+const ANTHROPIC_CREDENTIAL: &str = "sk-ant-PLACEHOLDER";
+const OPENROUTER_CREDENTIAL: &str = "sk-or-PLACEHOLDER";
+const AMBIGUOUS_MODEL_CREDENTIAL: &str = "sk-PLACEHOLDER";
 const OVERRIDE_MODEL_SET: &str = "agentSandbox.runner.model=operator/model";
 const OVERRIDE_EGRESS_SET: &str = "security.networkPolicy.allowedEgress[0].cidr=198.51.100.20/32";
 
@@ -674,9 +677,13 @@ fn provider_egress_fixture() -> String {
 }
 
 fn recorded_runner_values() -> HelmValuesResponse {
+    recorded_runner_values_with_credential(RERUN_CREDENTIAL_SENTINEL)
+}
+
+fn recorded_runner_values_with_credential(credential: &str) -> HelmValuesResponse {
     HelmValuesResponse::Object(json!({
         "agentSandbox": {"runner": {
-            "credentials": RERUN_CREDENTIAL_SENTINEL,
+            "credentials": credential,
             "fakeModel": false,
             "model": RERUN_MODEL_SENTINEL
         }},
@@ -724,6 +731,39 @@ fn json_error(output: Output, verb: &str) -> Value {
     assert!(json["error"].is_string(), "{verb} error payload: {json}");
     assert!(json.get("fix").is_some(), "{verb} error payload: {json}");
     json
+}
+
+fn assert_provider_contradiction(
+    output: Output,
+    credential: &str,
+    detected: &str,
+    allowed: &str,
+    verb: &str,
+) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a contradictory provider is a usage error; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = json_error(output, verb);
+    let diagnostic = format!("{} {}", error["error"], error["fix"]).to_ascii_lowercase();
+    for expected in [detected, allowed, "--allow-egress-host"] {
+        assert!(
+            diagnostic.contains(expected),
+            "the contradiction must identify both providers and the correction: {error}"
+        );
+    }
+    assert!(
+        !visible.contains(credential),
+        "the rejected credential leaked into command output: {visible}"
+    );
 }
 
 fn plan(output: Output) -> String {
@@ -910,6 +950,10 @@ fn live_both_store_statefulsets() -> String {
 
 fn installation_with_effective_values() -> &'static str {
     "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\n  github_token: CURIE_APPLY_TEST_GITHUB_TOKEN\nplatform:\n  ui: false\n  inference: true\nset:\n  example.mode: disabled\n  worker.replicas: \"3\"\n"
+}
+
+fn installation_with_provider_contradiction() -> &'static str {
+    "version: 1\ninstall:\n  namespace: parity\n  release: parity\ncredentials:\n  model: CURIE_APPLY_TEST_MODEL_KEY\nplatform:\n  egress:\n    - host: anthropic\n"
 }
 
 #[derive(Clone, Copy)]
@@ -1423,6 +1467,322 @@ fn cluster_up_rerun_preserves_existing_runner_model_and_egress_configuration() {
 }
 
 #[test]
+fn cluster_up_detected_credential_without_provider_installs_sealed() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    let output = fixture.cluster_up_with(&[], &[("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL)]);
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with a sealed OpenRouter credential");
+    assert!(
+        visible.contains("the sandbox is sealed -- no egress opened"),
+        "the bare credential must remain sealed: {visible}"
+    );
+    assert!(
+        !visible.contains(OPENROUTER_CREDENTIAL),
+        "the sealed credential leaked into command output: {visible}"
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: upgrade "),
+        "the sealed credential must not block installation: {calls}"
+    );
+    assert!(
+        !calls.contains("security.networkPolicy.allowedEgress"),
+        "the bare credential must not open provider egress: {calls}"
+    );
+    assert!(
+        !calls.contains(OPENROUTER_CREDENTIAL),
+        "the sealed credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_explicit_openrouter_egress_accepts_detected_credential() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let provider_egress = json!({"openrouter.ai": [IPV4, IPV6]}).to_string();
+
+    let output = fixture.cluster_up_with(
+        &["--allow-egress-host", "openrouter"],
+        &[
+            ("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL),
+            ("CURIE_TEST_PROVIDER_EGRESS_JSON", provider_egress.as_str()),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with explicit OpenRouter egress");
+    assert!(
+        !visible.contains(OPENROUTER_CREDENTIAL),
+        "the OpenRouter credential leaked into command output: {visible}"
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: upgrade "),
+        "the explicit provider must reach the Helm install: {calls}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "security.networkPolicy.allowedEgress[0].cidr={IPV4}/32"
+        )),
+        "the explicit OpenRouter IPv4 route must reach Helm: {calls}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "security.networkPolicy.allowedEgress[1].cidr={IPV6}/128"
+        )),
+        "the explicit OpenRouter IPv6 route must reach Helm: {calls}"
+    );
+    assert!(
+        !calls.contains(OPENROUTER_CREDENTIAL),
+        "the OpenRouter credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_multi_provider_egress_accepts_matching_detected_credential() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let provider_egress = json!({
+        "api.anthropic.com": [IPV4],
+        "openrouter.ai": [IPV6]
+    })
+    .to_string();
+
+    let output = fixture.cluster_up_with(
+        &[
+            "--allow-egress-host",
+            "anthropic",
+            "--allow-egress-host",
+            "openrouter",
+        ],
+        &[
+            ("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL),
+            ("CURIE_TEST_PROVIDER_EGRESS_JSON", provider_egress.as_str()),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(output, "cluster up with two explicit providers");
+    assert!(
+        !visible.contains(OPENROUTER_CREDENTIAL),
+        "the OpenRouter credential leaked into command output: {visible}"
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: upgrade "),
+        "one matching provider in a larger list must allow installation: {calls}"
+    );
+    for expected in [
+        format!("security.networkPolicy.allowedEgress[0].cidr={IPV4}/32"),
+        format!("security.networkPolicy.allowedEgress[1].cidr={IPV6}/128"),
+    ] {
+        assert!(
+            calls.contains(&expected),
+            "both explicit provider routes must reach Helm: {calls}"
+        );
+    }
+    assert!(
+        !calls.contains(OPENROUTER_CREDENTIAL),
+        "the OpenRouter credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_rejects_a_contradictory_provider_before_dns_and_helm() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    let output = fixture.cluster_up_with(
+        &["--allow-egress-host", "anthropic"],
+        &[
+            ("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL),
+            (
+                "CURIE_TEST_PROVIDER_EGRESS_JSON",
+                "PLACEHOLDER invalid provider DNS injection",
+            ),
+        ],
+    );
+    assert_provider_contradiction(
+        output,
+        OPENROUTER_CREDENTIAL,
+        "openrouter",
+        "anthropic",
+        "cluster up with a contradictory provider",
+    );
+    assert!(
+        fixture.calls().is_empty(),
+        "the contradiction must stop before Helm or kubectl: {}",
+        fixture.calls()
+    );
+}
+
+#[test]
+fn cluster_up_rejects_operator_set_credential_before_dns_and_helm() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let credential_set = format!("agentSandbox.runner.credentials={OPENROUTER_CREDENTIAL}");
+
+    let output = fixture.cluster_up_with(
+        &[
+            "--allow-egress-host",
+            "anthropic",
+            "--set",
+            credential_set.as_str(),
+        ],
+        &[(
+            "CURIE_TEST_PROVIDER_EGRESS_JSON",
+            "PLACEHOLDER invalid provider DNS injection",
+        )],
+    );
+    assert_provider_contradiction(
+        output,
+        OPENROUTER_CREDENTIAL,
+        "openrouter",
+        "anthropic",
+        "cluster up with an operator set OpenRouter credential and Anthropic egress",
+    );
+    assert!(
+        fixture.calls().is_empty(),
+        "the operator set contradiction must stop before Helm or kubectl: {}",
+        fixture.calls()
+    );
+}
+
+#[test]
+fn cluster_up_rejects_anthropic_credential_with_openrouter_before_dns_and_helm() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+
+    let output = fixture.cluster_up_with(
+        &["--allow-egress-host", "openrouter"],
+        &[
+            ("CURIE_CREDENTIALS", ANTHROPIC_CREDENTIAL),
+            (
+                "CURIE_TEST_PROVIDER_EGRESS_JSON",
+                "PLACEHOLDER invalid provider DNS injection",
+            ),
+        ],
+    );
+    assert_provider_contradiction(
+        output,
+        ANTHROPIC_CREDENTIAL,
+        "anthropic",
+        "openrouter",
+        "cluster up with an Anthropic credential and OpenRouter egress",
+    );
+    assert!(
+        fixture.calls().is_empty(),
+        "the Anthropic contradiction must stop before Helm or kubectl: {}",
+        fixture.calls()
+    );
+}
+
+#[test]
+fn cluster_up_explicit_openrouter_accepts_ambiguous_bare_sk_credential() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        HelmValuesResponse::Absent,
+    );
+    let provider_egress = json!({"openrouter.ai": [IPV4, IPV6]}).to_string();
+
+    let output = fixture.cluster_up_with(
+        &["--allow-egress-host", "openrouter"],
+        &[
+            ("CURIE_CREDENTIALS", AMBIGUOUS_MODEL_CREDENTIAL),
+            ("CURIE_TEST_PROVIDER_EGRESS_JSON", provider_egress.as_str()),
+        ],
+    );
+    let visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    json_output(
+        output,
+        "cluster up with an explicit provider and an ambiguous bare sk credential",
+    );
+    assert!(
+        !visible.contains(AMBIGUOUS_MODEL_CREDENTIAL),
+        "the ambiguous credential leaked into command output: {visible}"
+    );
+
+    let calls = fixture.calls();
+    assert!(
+        calls.contains("HELM_CALL: upgrade "),
+        "an explicit provider must allow an ambiguous credential through to Helm: {calls}"
+    );
+    for expected in [
+        format!("security.networkPolicy.allowedEgress[0].cidr={IPV4}/32"),
+        format!("security.networkPolicy.allowedEgress[1].cidr={IPV6}/128"),
+    ] {
+        assert!(
+            calls.contains(&expected),
+            "the explicit OpenRouter route must reach Helm: {calls}"
+        );
+    }
+    assert!(
+        !calls.contains(AMBIGUOUS_MODEL_CREDENTIAL),
+        "the ambiguous credential leaked into the command log: {calls}"
+    );
+}
+
+#[test]
+fn cluster_up_rejects_preserved_openrouter_credential_before_dns_or_helm_mutation() {
+    let fixture = HelmFixture::new(
+        installation_for_the_stateful_guard(),
+        recorded_runner_values_with_credential(OPENROUTER_CREDENTIAL),
+    );
+
+    let output = fixture.cluster_up_with(
+        &["--allow-egress-host", "anthropic"],
+        &[(
+            "CURIE_TEST_PROVIDER_EGRESS_JSON",
+            "PLACEHOLDER invalid provider DNS injection",
+        )],
+    );
+    assert_provider_contradiction(
+        output,
+        OPENROUTER_CREDENTIAL,
+        "openrouter",
+        "anthropic",
+        "cluster up with a preserved OpenRouter credential and Anthropic egress",
+    );
+    assert_only_existing_values_read(&fixture, ExistingValuesConsumer::ClusterUp);
+    assert!(
+        !fixture.calls().contains(OPENROUTER_CREDENTIAL),
+        "the preserved credential leaked into the command log: {}",
+        fixture.calls()
+    );
+}
+
+#[test]
 fn cluster_up_explicit_model_modes_suppress_recorded_provider_configuration() {
     for (name, args, expected_value) in [
         (
@@ -1618,6 +1978,62 @@ fn absent_release_diff_matches_apply_dry_run_for_effective_installation_values()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     assert_eq!(diff_keys, apply_keys, "apply plan: {apply}; diff: {diff}");
+}
+
+#[test]
+fn apply_and_diff_do_not_enforce_cluster_up_credential_provider_guard() {
+    let provider_egress = provider_egress_fixture();
+    let env = [
+        ("CURIE_APPLY_TEST_MODEL_KEY", OPENROUTER_CREDENTIAL),
+        ("CURIE_TEST_PROVIDER_EGRESS_JSON", provider_egress.as_str()),
+    ];
+
+    let apply_fixture = HelmFixture::new(
+        installation_with_provider_contradiction(),
+        HelmValuesResponse::Absent,
+    );
+    let apply_output = apply_fixture.apply(&[], &env);
+    let apply_visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&apply_output.stdout),
+        String::from_utf8_lossy(&apply_output.stderr)
+    );
+    json_output(
+        apply_output,
+        "apply with a cluster up provider contradiction",
+    );
+    assert!(
+        apply_fixture.calls().contains("HELM_CALL: upgrade "),
+        "apply must remain outside the cluster up guard: {}",
+        apply_fixture.calls()
+    );
+    assert!(
+        !apply_visible.contains(OPENROUTER_CREDENTIAL)
+            && !apply_fixture.calls().contains(OPENROUTER_CREDENTIAL),
+        "apply leaked the model credential"
+    );
+
+    let diff_fixture = HelmFixture::new(
+        installation_with_provider_contradiction(),
+        HelmValuesResponse::Absent,
+    );
+    let diff_output = diff_fixture.diff(&env);
+    let diff_visible = format!(
+        "{}{}",
+        String::from_utf8_lossy(&diff_output.stdout),
+        String::from_utf8_lossy(&diff_output.stderr)
+    );
+    let diff = json_output(diff_output, "diff with a cluster up provider contradiction");
+    assert_eq!(diff["release_exists"], false, "{diff}");
+    assert!(
+        diff["changes"].as_u64().is_some_and(|changes| changes > 0),
+        "diff must still produce an effective plan: {diff}"
+    );
+    assert!(
+        !diff_visible.contains(OPENROUTER_CREDENTIAL)
+            && !diff_fixture.calls().contains(OPENROUTER_CREDENTIAL),
+        "diff leaked the model credential"
+    );
 }
 
 #[test]
