@@ -11,6 +11,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +31,10 @@ pub struct OpsCommand {
 
 /// A single argv token.
 ///
+/// `HelmSetExpression` preserves a complete `--set` or `--set-string`
+/// expression for execution while masking credential shaped values in every
+/// rendered form.
+///
 /// `SecretSet` is a `helm --set key=value` whose value is a credential: the real
 /// value is used for execution, but only a masked prefix is ever printed (dry-run
 /// or the echoed command line). Note the value still lands in the process argv --
@@ -43,6 +49,7 @@ pub struct OpsCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmdArg {
     Plain(String),
+    HelmSetExpression(String),
     SecretSet { key: String, value: String },
     SecretValuesFile(Vec<(String, String)>),
 }
@@ -56,6 +63,7 @@ impl CmdArg {
     fn value_tokens(&self) -> Vec<String> {
         match self {
             CmdArg::Plain(s) => vec![s.clone()],
+            CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
             CmdArg::SecretValuesFile(_) => {
                 debug_assert!(
@@ -74,6 +82,9 @@ impl CmdArg {
     fn masked_tokens(&self) -> Vec<String> {
         match self {
             CmdArg::Plain(s) => vec![s.clone()],
+            CmdArg::HelmSetExpression(expression) => {
+                vec![mask_helm_set_expression(expression)]
+            }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
             CmdArg::SecretValuesFile(pairs) => {
                 let masked: Vec<String> = pairs
@@ -144,9 +155,10 @@ impl OpsCommand {
     /// Materialize every [`CmdArg::SecretValuesFile`] into a private (0600)
     /// temporary values file and return an equivalent command whose secrets are
     /// delivered via `helm -f <path>` instead of the argv, plus RAII guards that
-    /// delete those files when dropped (so they are cleaned up even if the helm
-    /// run fails). Commands without a secret values file are returned unchanged
-    /// with no guards. Hold the returned guards until the process has finished.
+    /// delete any remaining files when dropped. The signal cleanup handler also
+    /// removes registered files on SIGINT or SIGTERM. Commands without a secret
+    /// values file are returned unchanged with no guards. Hold the returned guards
+    /// until the process has finished.
     pub(crate) fn materialize_secret_files(
         &self,
     ) -> Result<(OpsCommand, Vec<SecretValuesFileGuard>)> {
@@ -175,8 +187,124 @@ impl OpsCommand {
     }
 }
 
-/// A 0600 temporary helm values file holding secret values; deleted on drop so
-/// the secret never outlives the `helm` invocation, even on error.
+#[cfg(unix)]
+#[derive(Default)]
+struct SecretFileRegistry {
+    terminating: bool,
+    paths: BTreeSet<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+static SECRET_FILE_REGISTRY: LazyLock<Mutex<SecretFileRegistry>> =
+    LazyLock::new(|| Mutex::new(SecretFileRegistry::default()));
+
+#[cfg(unix)]
+static SECRET_SIGNAL_INSTALLATION: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+
+#[cfg(unix)]
+fn lock_secret_file_registry() -> MutexGuard<'static, SecretFileRegistry> {
+    SECRET_FILE_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(unix)]
+fn ensure_secret_signal_cleanup() -> Result<()> {
+    match SECRET_SIGNAL_INSTALLATION
+        .get_or_init(|| install_secret_signal_cleanup().map_err(|error| error.to_string()))
+    {
+        Ok(()) => Ok(()),
+        Err(error) => bail!("installing secret values signal cleanup: {error}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_secret_signal_cleanup() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_secret_signal_cleanup() -> std::io::Result<()> {
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::signal::SIGINT,
+        signal_hook::consts::signal::SIGTERM,
+    ])?;
+    std::thread::Builder::new()
+        .name("curie-secret-cleanup".to_string())
+        .spawn(move || {
+            if let Some(signal) = signals.forever().next() {
+                terminate_after_secret_cleanup(signal);
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminate_after_secret_cleanup(signal: i32) -> ! {
+    {
+        let mut registry = lock_secret_file_registry();
+        registry.terminating = true;
+        for path in std::mem::take(&mut registry.paths) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    test_mark_coordination("CURIE_TEST_SECRET_SIGNAL_CLEANED");
+    test_wait_for_coordination("CURIE_TEST_SECRET_RESUME_SIGNAL");
+
+    let _ = signal_hook::low_level::emulate_default_handler(signal);
+    signal_hook::low_level::exit(128 + signal);
+}
+
+#[cfg(unix)]
+fn park_terminating_secret_writer() -> ! {
+    test_mark_coordination("CURIE_TEST_SECRET_WRITER_PARKED");
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_mark_coordination(env_name: &str) {
+    if let Some(path) = std::env::var_os(env_name).map(std::path::PathBuf::from) {
+        let _ = std::fs::write(path, b"ready");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_mark_coordination(_env_name: &str) {}
+
+#[cfg(debug_assertions)]
+fn test_wait_for_coordination(env_name: &str) {
+    if let Some(path) = std::env::var_os(env_name).map(std::path::PathBuf::from) {
+        while !path.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_wait_for_coordination(_env_name: &str) {}
+
+#[cfg(debug_assertions)]
+fn test_pause_after_first_secret_file() {
+    static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if std::env::var_os("CURIE_TEST_SECRET_FIRST_FILE_WRITTEN").is_none()
+        || PAUSED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    test_mark_coordination("CURIE_TEST_SECRET_FIRST_FILE_WRITTEN");
+    test_wait_for_coordination("CURIE_TEST_SECRET_RESUME_WRITER");
+}
+
+#[cfg(not(debug_assertions))]
+fn test_pause_after_first_secret_file() {}
+
+/// A 0600 temporary helm values file holding secret values. Signal cleanup
+/// removes it on SIGINT or SIGTERM; `Drop` removes it on normal completion or
+/// error, so the secret never outlives the `helm` invocation.
 pub(crate) struct SecretValuesFileGuard {
     path: std::path::PathBuf,
 }
@@ -187,40 +315,83 @@ impl SecretValuesFileGuard {
     /// with restrictive permissions atomically so the secret is never briefly
     /// world-readable.
     fn write(pairs: &[(String, String)]) -> Result<Self> {
+        ensure_secret_signal_cleanup()?;
+
         let doc = nest_dotted_keys(pairs);
         let body = serde_json::to_vec(&doc).context("serializing secret helm values")?;
 
         let mut path = std::env::temp_dir();
         path.push(format!("curie-helm-values-{}.yaml", uuid::Uuid::new_v4()));
 
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            let mut registry = lock_secret_file_registry();
+            if registry.terminating {
+                drop(registry);
+                park_terminating_secret_writer();
+            }
+            if !registry.paths.insert(path.clone()) {
+                bail!(
+                    "secret helm values file path collision at {}",
+                    path.display()
+                );
+            }
+            if let Err(error) = create_secret_values_file(&path, &body) {
+                let _ = std::fs::remove_file(&path);
+                registry.paths.remove(&path);
+                return Err(error);
+            }
         }
-        let mut file = opts
-            .open(&path)
-            .with_context(|| format!("creating secret helm values file {}", path.display()))?;
-        // Belt-and-suspenders on platforms where create-time mode is not honored.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("securing secret helm values file {}", path.display()))?;
+
+        #[cfg(not(unix))]
+        if let Err(error) = create_secret_values_file(&path, &body) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
         }
-        use std::io::Write;
-        file.write_all(&body)
-            .with_context(|| format!("writing secret helm values file {}", path.display()))?;
-        Ok(Self { path })
+
+        let guard = Self { path };
+        test_pause_after_first_secret_file();
+        Ok(guard)
     }
+}
+
+fn create_secret_values_file(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("creating secret helm values file {}", path.display()))?;
+    // Belt-and-suspenders on platforms where create-time mode is not honored.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing secret helm values file {}", path.display()))?;
+    }
+    use std::io::Write;
+    file.write_all(body)
+        .with_context(|| format!("writing secret helm values file {}", path.display()))?;
+    Ok(())
 }
 
 impl Drop for SecretValuesFileGuard {
     fn drop(&mut self) {
         // Best-effort cleanup; nothing actionable if the temp file is already gone.
-        let _ = std::fs::remove_file(&self.path);
+        #[cfg(unix)]
+        {
+            let mut registry = lock_secret_file_registry();
+            let _ = std::fs::remove_file(&self.path);
+            registry.paths.remove(&self.path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -259,10 +430,12 @@ pub(crate) fn secret_set(key: &str, value: &str) -> CmdArg {
     }
 }
 
-/// Mask a secret for display: the first 8 characters, then `***`. Long enough to
-/// recognise a token by its prefix (e.g. `xoxb-...`), short enough to leak
-/// nothing usable.
+/// Mask a secret for display. Values of eight characters or fewer are fully
+/// masked; longer values retain the first eight characters for recognition.
 pub fn mask_secret(value: &str) -> String {
+    if value.chars().nth(8).is_none() {
+        return "***".to_string();
+    }
     let shown: String = value.chars().take(8).collect();
     format!("{shown}***")
 }
@@ -972,10 +1145,18 @@ fn random_hex(n_bytes: usize) -> Result<String> {
     Ok(out)
 }
 
-/// The operator's `--set` arguments split into raw `(key, value)` halves: the
-/// single parser behind [`operator_set_keys`] and
-/// [`set_passthrough_leaks_github_token`], though not the only reader of this
-/// grammar in the file ([`explicit_runner_model`] hand-rolls a last-wins
+/// Split one Helm set element into raw `(key, value)` halves. This is the one
+/// entry parser shared by rendering and the consumers of operator sets.
+fn operator_set_entry(part: &str) -> Option<(&str, &str)> {
+    part.split_once('=')
+}
+
+/// The operator's `--set` arguments split into raw `(key, value)` halves for
+/// [`operator_set_keys`] and [`set_passthrough_leaks_github_token`]. Rendering
+/// uses the separate [`mask_helm_set_expression`] parser, which preserves
+/// escaped commas and brace lists while masking credential-shaped values; do
+/// not reuse this naive split for rendering. This is not the only reader of
+/// this grammar in the file ([`explicit_runner_model`] hand-rolls a last-wins
 /// prefix match with different semantics, and is deliberately left alone).
 /// Handles both repeated
 /// `--set` flags and helm's comma-joined `a=1,b=2` form; an element with no `=`
@@ -989,8 +1170,62 @@ fn random_hex(n_bytes: usize) -> Result<String> {
 fn operator_set_entries(sets: &[String]) -> Vec<(&str, &str)> {
     sets.iter()
         .flat_map(|s| s.split(','))
-        .filter_map(|part| part.split_once('='))
+        .filter_map(operator_set_entry)
         .collect()
+}
+
+/// Render one complete Helm set expression while preserving every executed
+/// byte except credential values, which are replaced by their standard mask.
+fn mask_helm_set_expression(expression: &str) -> String {
+    let render_part = |part: &str| match operator_set_entry(part) {
+        Some((key, value)) if !value.is_empty() && is_secret_value_key(key.trim()) => {
+            format!("{key}={}", mask_secret(value))
+        }
+        _ => part.to_string(),
+    };
+
+    let mut rendered = String::with_capacity(expression.len());
+    let mut start = 0;
+    let mut in_brace_list = false;
+    let mut escaped = false;
+    let mut has_equals = false;
+    let mut at_value_start = false;
+
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            at_value_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '=' if !has_equals => {
+                has_equals = true;
+                at_value_start = true;
+            }
+            '{' if at_value_start => {
+                in_brace_list = true;
+                at_value_start = false;
+            }
+            '}' if in_brace_list => in_brace_list = false,
+            ',' if !in_brace_list => {
+                rendered.push_str(&render_part(&expression[start..index]));
+                rendered.push(',');
+                start = index + ch.len_utf8();
+                has_equals = false;
+                at_value_start = false;
+            }
+            _ => at_value_start = false,
+        }
+    }
+
+    if in_brace_list {
+        return "<secret helm set expression>".to_string();
+    }
+
+    rendered.push_str(&render_part(&expression[start..]));
+    rendered
 }
 
 /// The bare value keys an operator already pinned through `--set` (so the CLI
@@ -2437,9 +2672,9 @@ pub(crate) fn complete_up_opts(
 /// [`GITHUB_TOKEN_KEY`], i.e. whether the complete token is riding in argv.
 ///
 /// The pass-through stays legal (it is verbatim by design and breaking it would
-/// break existing operators), but a non-empty one leaks into the process table,
-/// shell history and the printed plan, so `up` steers the operator to the
-/// private input. An EMPTY assignment is the operator clearing the key by hand:
+/// break existing operators), but a non-empty one leaks into the process table
+/// and shell history, so `up` steers the operator to the private input. An EMPTY
+/// assignment is the operator clearing the key by hand:
 /// nothing leaks, so warning about it would be noise on a correct command.
 /// Reads the same [`operator_set_entries`] parse the rest of this file does,
 /// since helm accepts the comma-joined `a=1,b=2` form.
@@ -2645,7 +2880,7 @@ impl UpValuePlan {
                         HelmSetFlag::Set => "--set",
                         HelmSetFlag::SetString => "--set-string",
                     }));
-                    args.push(plain(expression));
+                    args.push(CmdArg::HelmSetExpression(expression.clone()));
                 }
                 PlannedHelmValues::SecretFile { values, .. } => {
                     args.push(CmdArg::SecretValuesFile(values.clone()));
@@ -4360,7 +4595,7 @@ async fn run_prepared_up(
         }
     }
     if set_passthrough_leaks_github_token(&opts.operator_sets()) {
-        ui.warn("a GitHub credential passed with --set lands in the process table, shell history and the printed plan; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
+        ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too");
     }
 
     if !opts.allow_egress_host.is_empty()
@@ -7481,9 +7716,15 @@ mod tests {
     }
 
     #[test]
-    fn mask_secret_shows_eight_then_stars() {
+    fn mask_secret_uses_shared_long_and_short_contract() {
         assert_eq!(mask_secret("xoxb-abcdefghijk"), "xoxb-abc***");
-        assert_eq!(mask_secret("short"), "short***");
+        for value in ["", "a", "short", "12345678"] {
+            assert_eq!(
+                mask_secret(value),
+                "***",
+                "values of eight characters or fewer must reveal no characters: {value:?}"
+            );
+        }
     }
 
     #[test]

@@ -780,6 +780,7 @@ dependencies = [
  "serde_norway",
  "serde_urlencoded",
  "sha2 0.11.0",
+ "signal-hook",
  "syn 3.0.3",
  "tar",
  "tempfile",
