@@ -495,13 +495,15 @@ commands.
 
 ## Release train, branch, and commit conventions
 
-`main` is the stable v0.6.x line. `next` is the v0.7.0 integration branch. It
-is one release train, not a second product line.
+`main` is the stable line. `next` is the integration branch for the next
+feature release. It is one release train, not a second product line. These are
+roles, not versions: neither branch is pinned to a particular release number,
+and the role is what selects your base.
 
 | Change | Worktree base and PR target |
 | --- | --- |
 | General bug fix, security fix, or change shared by both lines | `main` |
-| v0.7 feature or a bug unique to unreleased v0.7 work | `next` |
+| Feature for the next feature release, or a bug unique to that unreleased work | `next` |
 
 Create a short lived `task/<short-description>` branch from the selected base:
 
@@ -511,7 +513,8 @@ git worktree add <path> -b task/<short-description> "$(git rev-parse origin/<bas
 ```
 
 Never commit directly to `main` or `next`. `main` remains the default GitHub
-contributor target. Select `next` only for v0.7 work.
+contributor target. Select `next` only for work belonging to the next feature
+release.
 
 Before accepting PRs against either branch, an administrator must protect both
 `main` and `next` with the same pull request review and required check rules,
@@ -519,9 +522,9 @@ and must prohibit force pushes and branch deletion. Do not use an unprotected
 release train branch.
 
 Bug fixes, security fixes, and anything shared by both lines land on the stable
-`main` line first. v0.7 features land on `next`.
+`main` line first. Features for the next feature release land on `next`.
 
-To cut a v0.7.0 release candidate, merge `main` into `next` through a PR, tag
+To cut a feature release candidate, merge `main` into `next` through a PR, tag
 the release candidate on `next`, and test that candidate extensively. The
 forward merge from `main` into `next` happens at release candidate prep, not
 after every individual fix. Do not routinely cherry pick fixes between release
@@ -535,7 +538,7 @@ CURIE_E2E_TIERS=all curie dev e2e-ladder
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Tag the final v0.7.0 release on `main` only after both commands pass. Only an
+Tag the final feature release on `main` only after both commands pass. Only an
 administrator may retire `next`. Before deleting it, the administrator must
 merge one release workflow and contract test change that removes `next` from the
 workflow trigger branch list, removes the `RELEASE_NEXT_BRANCH` environment

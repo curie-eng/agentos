@@ -21,11 +21,12 @@ New tooling ships as a `curie` subcommand (add the clap surface in
 
 ## Release train selection
 
-`main` is the stable v0.6.x line and `next` is the v0.7.0 integration branch.
-Before starting work, choose the release train from the branch table in
-[`AGENTS.md`](AGENTS.md#release-train-branch-and-commit-conventions), then create
-the worktree and PR against that base. Do not assume `main` is the target for
-every feature.
+`main` is the stable line and `next` is the integration branch for the next
+feature release. Those are roles, not versions, so the branch table does not name
+a release number. Before starting work, choose the release train from that table
+in [`AGENTS.md`](AGENTS.md#release-train-branch-and-commit-conventions), then
+create the worktree and PR against that base. Do not assume `main` is the target
+for every feature.
 
 ## Architecture Decision Records (ADRs)
 
