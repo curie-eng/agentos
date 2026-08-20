@@ -4,9 +4,10 @@ Date: 2026-07-04
 Status: Accepted
 
 **Superseded in part by [ADR 0114](0114-cluster-up-infers-detected-install-facts.md).**
-The gVisor item in the Decision and the final Consequences clause no longer
-require `curie cluster up` to fail when admission reports exactly that the
-`gvisor` RuntimeClass is absent. Every other security rail remains unchanged.
+The final Consequences clause no longer requires gVisor absence to fail review
+when `curie cluster up` receives the exact admission rejection that the
+`gvisor` RuntimeClass is absent. The Decision still keeps gVisor enabled by
+default, and every other security rail remains unchanged.
 
 ## Context
 

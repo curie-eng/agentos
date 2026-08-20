@@ -13,10 +13,10 @@ exactly these clauses:
    reachable.
 2. ADR 0032 rejected Alternative 1, which rejects provider detection from a
    credential prefix.
-3. The ADR 0006 Decision item that makes gVisor a default security rail, and
-   the final Consequences clause that says the absence of every listed rail
-   fails review, only when `curie cluster up` observes the exact admission
-   rejection `RuntimeClass "gvisor" not found`.
+3. The ADR 0006 final Consequences clause that says the absence of every listed
+   rail fails review, only as it applies to gVisor when `curie cluster up`
+   observes the exact admission rejection `RuntimeClass "gvisor" not found`.
+   The ADR 0006 Decision that keeps gVisor enabled by default remains unchanged.
 
 Every other ADR 0032 egress rule and ADR 0006 security rail remains unchanged.
 

@@ -489,13 +489,13 @@ and the rollback re-attaches it with the data intact. Keep the export anyway.
 Notes from the first installs of the chart on fresh clusters, kept for the
 next operator.
 
-- **The agent-sandbox controller is opt-in.** The chart ships the
-  agent-sandbox CRDs, but the vendored controller is gated behind
-  `agentSandbox.controller.deploy`. A cluster that has the CRDs but no
-  controller silently never binds claims, so a first install must set
-  `agentSandbox.controller.deploy=true`. Plain `cluster up` preserves that
-  default when the controller is absent and infers false only when the existing
-  Deployment has complete Helm ownership metadata.
+- **The agent-sandbox controller is enabled by default.** The chart ships the
+  agent-sandbox CRDs and deploys the vendored controller when
+  `agentSandbox.controller.deploy=true`, which is the default. A cluster that
+  has the CRDs but no controller silently never binds claims. Plain `cluster
+  up` keeps the default when the controller is absent and infers
+  `agentSandbox.controller.deploy=false` only when an existing Deployment has
+  complete Helm ownership metadata for another release.
 - **gVisor stays off without runsc on the node.** Use the
   `values-e2e-nogvisor` overlay on nodes without `runsc`. All other
   security rails were verified ON in the first fresh-cluster install:
