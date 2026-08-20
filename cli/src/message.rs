@@ -838,57 +838,27 @@ pub async fn start_port_forward(
     let mut child = tokio::process::Command::new(&cmd.program)
         .args(cmd.argv())
         .kill_on_drop(true)
-        .stdout(if local_port == 0 {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawning `{}` (is kubectl on PATH?)", cmd.program))?;
-    let timeout = Duration::from_secs(15);
-    let deadline = Instant::now() + timeout;
-    let effective_port = if local_port == 0 {
-        let stdout = child
-            .stdout
-            .take()
-            .context("capturing kubectl output for an assigned local port")?;
-        let mut lines = BufReader::new(stdout).lines();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let assigned = tokio::time::timeout(remaining, async {
-            loop {
-                let line = lines
-                    .next_line()
-                    .await
-                    .context("reading kubectl forwarding readiness")?
-                    .context("kubectl exited before reporting an assigned local port")?;
-                if let Some(port) = parse_forwarded_port(&line)? {
-                    return Ok::<u16, anyhow::Error>(port);
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("the {label} port forward never reported an assigned port"))??;
-        std::mem::drop(tokio::spawn(async move {
-            while matches!(lines.next_line().await, Ok(Some(_))) {}
-        }));
-        assigned
-    } else {
-        local_port
-    };
+    let stdout = child
+        .stdout
+        .take()
+        .context("kubectl port forward stdout was not captured")?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let effective_port =
+        wait_for_port_forward_readiness(stdout, local_port, deadline, label).await?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     wait_for_tcp(effective_port, remaining)
         .await
         .with_context(|| {
             format!("the {label} port-forward never opened localhost:{effective_port}")
         })?;
-    // The port accepting TCP is not proof WE bound it. If another process was
-    // already listening on localhost:{effective_port}, kubectl could not bind, so it
-    // exited, and the socket that just answered is the squatter's -- a caller
-    // that then posts a discovered key would leak it to that process. If the
-    // child has already exited by the time TCP connects, it never held the port;
-    // refuse and name the conflict. A child still alive is the happy path (this
-    // stays race-tolerant: only a definitely-exited child trips the guard).
+    // For a fixed request, the exact IPv4 readiness line proves that this child
+    // owned the socket before the TCP check. The TCP check then proves that the
+    // effective IPv4 address is reachable. A child can still exit after printing
+    // readiness, so the try_wait guard catches that exit before returning it.
     if child.try_wait()?.is_some() {
         bail!(
             "the {label} port-forward exited immediately; localhost:{effective_port} is already in \
@@ -913,6 +883,54 @@ fn parse_forwarded_port(line: &str) -> Result<Option<u16>> {
         bail!("kubectl reported zero as its assigned local port");
     }
     Ok(Some(port))
+}
+
+async fn wait_for_port_forward_readiness(
+    stdout: tokio::process::ChildStdout,
+    local_port: u16,
+    deadline: Instant,
+    label: &str,
+) -> Result<u16> {
+    // Kubernetes documents `Forwarding from 127.0.0.1:<port> -> <remote>` at:
+    // https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-cluster/
+    let readiness = if local_port == 0 {
+        "a kubectl forwarding readiness line".to_string()
+    } else {
+        format!("Forwarding from 127.0.0.1:{local_port} ->")
+    };
+    let mut lines = BufReader::new(stdout).lines();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let effective_port = match tokio::time::timeout(remaining, async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .context("reading kubectl forwarding readiness")?
+                .with_context(|| {
+                    format!(
+                        "the {label} port forward did not open 127.0.0.1:{local_port}; \
+                         kubectl closed stdout before reporting {readiness}. The port may already be in use."
+                    )
+                })?;
+            if let Some(port) = parse_forwarded_port(&line)? {
+                if local_port == 0 || (port == local_port && line.starts_with(&readiness)) {
+                    return Ok::<u16, anyhow::Error>(port);
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => bail!(
+            "the {label} port forward did not open 127.0.0.1:{local_port} within 15 seconds; \
+             kubectl never reported {readiness}."
+        ),
+    };
+    std::mem::drop(tokio::spawn(async move {
+        while let Ok(Some(_)) = lines.next_line().await {}
+    }));
+    Ok(effective_port)
 }
 
 /// Poll-connect to `localhost:port` until it accepts or the timeout elapses.
@@ -1696,7 +1714,7 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
                 "api",
             )
             .await?;
-            let api = ApiClient::new(&format!("http://localhost:{api_local_port}"), &opts.api_key)?;
+            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -1764,8 +1782,8 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     };
 
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
     enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &bot_token)
@@ -1847,8 +1865,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // to the stub without a worker-global `helm upgrade`; a real workspace on the
     // same worker keeps replying to real Slack.
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, placeholder_ts) =
@@ -2609,7 +2627,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             "api",
         )
         .await?;
-        let base = format!("http://localhost:{api_local_port}");
+        let base = format!("http://127.0.0.1:{api_local_port}");
         (ApiClient::new(&base, &opts.api_key)?, Some(pf))
     };
 
@@ -2715,7 +2733,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
     let api_base = if opts.local {
         local_api_base(opts.api_url.as_deref())
     } else {
-        format!("http://localhost:{}", opts.api_local_port)
+        format!("http://127.0.0.1:{}", opts.api_local_port)
     };
     if opts.dry_run {
         let tier = if opts.local { "local" } else { "cluster" };
@@ -2755,7 +2773,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
             "api",
         )
         .await?;
-        let effective_api_base = format!("http://localhost:{api_local_port}");
+        let effective_api_base = format!("http://127.0.0.1:{api_local_port}");
         (
             ApiClient::new(&effective_api_base, &opts.api_key)?,
             Some(pf),
@@ -3098,7 +3116,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
                 "api",
             )
             .await?;
-            let api = ApiClient::new(&format!("http://localhost:{api_local_port}"), &opts.api_key)?;
+            let api = ApiClient::new(&format!("http://127.0.0.1:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -3109,8 +3127,8 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let valkey_url = format!(
-        "redis://:{}@localhost:{}",
-        opts.valkey_password, valkey_local_port
+        "redis://:{}@127.0.0.1:{valkey_local_port}",
+        opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
 
@@ -3415,6 +3433,71 @@ mod tests {
             cmd.display(),
             "kubectl -n curie port-forward svc/curie-valkey 56381:6379"
         );
+    }
+
+    #[tokio::test]
+    async fn port_forward_rejects_an_occupied_port_without_owned_readiness() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new("sh", vec![plain("-c"), plain("sleep 0.05; exit 1")]);
+
+        let err = start_port_forward(&cmd, port, "valkey")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("valkey"), "{err}");
+        assert!(err.contains(&port.to_string()), "{err}");
+        assert!(err.contains("closed stdout before reporting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn port_forward_accepts_the_kubectl_readiness_line() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new(
+            "sh",
+            vec![
+                plain("-c"),
+                plain(format!(
+                    "printf 'Forwarding from 127.0.0.1:{port} -> 6379\\n'; sleep 1"
+                )),
+            ],
+        );
+
+        let (mut child, effective_port) = start_port_forward(&cmd, port, "valkey").await.unwrap();
+
+        assert_eq!(effective_port, port);
+        assert!(child.try_wait().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn port_forward_rejects_ipv6_readiness_for_a_fixed_ipv4_port() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = OpsCommand::new(
+            "sh",
+            vec![
+                plain("-c"),
+                plain(format!(
+                    "printf 'Forwarding from [::1]:{port} -> 6379\\n'; sleep 0.5"
+                )),
+            ],
+        );
+
+        let err = start_port_forward(&cmd, port, "valkey")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(&port.to_string()), "{err}");
+        assert!(err.contains("closed stdout before reporting"), "{err}");
     }
 
     #[test]

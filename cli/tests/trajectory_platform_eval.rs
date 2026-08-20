@@ -219,13 +219,15 @@ if "port-forward" not in args:
     sys.exit(64)
 
 mapping = next(arg for arg in reversed(args) if ":" in arg and arg.split(":", 1)[0].isdigit())
-local_port = int(mapping.split(":", 1)[0])
+local_port, remote_port = mapping.split(":", 1)
+local_port = int(local_port)
 backend_host, backend_port = os.environ["CURIE_TEST_API_BACKEND"].rsplit(":", 1)
 
 listener = socket.socket()
 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 listener.bind(("127.0.0.1", local_port))
 listener.listen()
+print(f"Forwarding from 127.0.0.1:{local_port} -> {remote_port}", flush=True)
 
 while True:
     client, _ = listener.accept()
