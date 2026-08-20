@@ -13,7 +13,7 @@ from pathlib import Path
 COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 DECLARATION = re.compile(r"Fix pin: (?P<selector>\S+)")
 DECLARATION_ATTEMPT = re.compile(
-    r"^\s*(?:(?:[>#*_~`+-]+|\d+[.)]|\[[ x]\])\s*)*fix[^\w\r\n]+pin\s*(?::|[-=])",
+    r"^\s*(?:(?:[>#*_~`+-]+|\d+[.)]|\[[ x]\])\s*)*+fix[^\w\r\n]+pin\s*(?::|[-=])",
     re.IGNORECASE,
 )
 SELECTOR = re.compile(

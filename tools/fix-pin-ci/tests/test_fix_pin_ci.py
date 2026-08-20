@@ -79,6 +79,7 @@ def _run_checker(
     include_body: bool = True,
     verifier_exit: int = 0,
     verifier_stdout: str = "PINNED\n",
+    timeout: float | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     event_path = _write_event(tmp_path, body, action=action, include_body=include_body)
     curie, call_log = _write_fake_curie(tmp_path)
@@ -104,6 +105,7 @@ def _run_checker(
         check=False,
         env=environment,
         text=True,
+        timeout=timeout,
     )
     return completed, call_log
 
@@ -171,6 +173,20 @@ def test_supported_nested_python_selectors_call_the_verifier(
 def test_ordinary_fix_pin_prose_skips_without_calling_the_verifier(tmp_path: Path) -> None:
     completed, call_log = _run_checker(
         tmp_path, "This closes the fix pin-related enforcement gap"
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "SKIPPED: no Fix pin declaration"
+    assert not call_log.exists(), "ordinary prose must not run curie"
+
+
+def test_long_decoration_prefix_in_ordinary_prose_skips_within_timeout(
+    tmp_path: Path,
+) -> None:
+    completed, call_log = _run_checker(
+        tmp_path,
+        "#" * 24 + " ordinary prose",
+        timeout=1.0,
     )
 
     assert completed.returncode == 0, completed.stderr
