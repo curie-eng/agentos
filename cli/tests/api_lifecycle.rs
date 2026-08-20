@@ -141,6 +141,28 @@ async fn delete_agent_issues_a_delete() {
 }
 
 #[tokio::test]
+async fn end_deployment_issues_an_authenticated_delete_with_no_body() {
+    let deployment_id = "deployment-active-dev";
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("DELETE", p) if *p == format!("/deployments/{deployment_id}") => Response {
+            status: 204,
+            content_type: "application/json".into(),
+            body: Vec::new(),
+        },
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let client = ApiClient::new(&server.base_url, "k").unwrap();
+    client.end_deployment(deployment_id).await.unwrap();
+
+    let rec = server.recorded();
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0].method, "DELETE");
+    assert_eq!(rec[0].path, format!("/deployments/{deployment_id}"));
+    assert!(rec[0].body.is_empty(), "ending a deployment sends no body");
+    assert_eq!(rec[0].header("x-api-key"), Some("k"));
+}
+
+#[tokio::test]
 async fn find_agent_errors_when_no_agent_matches() {
     let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => Response::json(200, "[]"),
@@ -285,6 +307,187 @@ async fn delete_without_yes_refuses_and_makes_no_request() {
     assert!(
         server.recorded().is_empty(),
         "a refused delete must make no request"
+    );
+}
+
+#[tokio::test]
+async fn delete_handler_ends_every_active_deployment_then_deletes_agent() {
+    let active_dev = "deployment-active-dev";
+    let stopped = "deployment-stopped";
+    let active_prod = "deployment-active-prod";
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if *p == format!("/deployments?agent_id={AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r#"[{{"id":"{active_dev}","environment":"dev","status":"active"}},{{"id":"{stopped}","environment":"staging","status":"stopped"}},{{"id":"{active_prod}","environment":"prod","status":"active"}}]"#
+            ),
+        ),
+        ("DELETE", p)
+            if *p == format!("/deployments/{active_dev}")
+                || *p == format!("/deployments/{active_prod}") =>
+        {
+            Response {
+                status: 204,
+                content_type: "application/json".into(),
+                body: Vec::new(),
+            }
+        }
+        ("DELETE", p) if *p == format!("/agents/{AGENT_ID}") => Response {
+            status: 204,
+            content_type: "application/json".into(),
+            body: Vec::new(),
+        },
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let out = commands::delete(opts(&server.base_url, "deal-desk", false), true)
+        .await
+        .unwrap();
+    assert!(matches!(out, commands::DeleteOutput::Done { .. }));
+
+    let rec = server.recorded();
+    let flow: Vec<(String, String)> = rec
+        .iter()
+        .map(|request| (request.method.clone(), request.path.clone()))
+        .collect();
+    assert_eq!(
+        flow,
+        vec![
+            ("GET".to_string(), "/agents".to_string()),
+            (
+                "GET".to_string(),
+                format!("/deployments?agent_id={AGENT_ID}")
+            ),
+            ("DELETE".to_string(), format!("/deployments/{active_dev}")),
+            ("DELETE".to_string(), format!("/deployments/{active_prod}")),
+            ("DELETE".to_string(), format!("/agents/{AGENT_ID}")),
+        ]
+    );
+    assert!(
+        rec.iter()
+            .all(|request| request.header("x-api-key") == Some("k")),
+        "every lifecycle request must be authenticated"
+    );
+}
+
+#[tokio::test]
+async fn delete_handler_stops_when_ending_an_active_deployment_fails() {
+    let first = "deployment-active-first";
+    let failing = "deployment-active-failing";
+    let later = "deployment-active-later";
+    let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if *p == format!("/deployments?agent_id={AGENT_ID}") => Response::json(
+            200,
+            &format!(
+                r#"[{{"id":"{first}","environment":"dev","status":"active"}},{{"id":"{failing}","environment":"staging","status":"active"}},{{"id":"{later}","environment":"prod","status":"active"}}]"#
+            ),
+        ),
+        ("DELETE", p) if *p == format!("/deployments/{first}") => Response {
+            status: 204,
+            content_type: "application/json".into(),
+            body: Vec::new(),
+        },
+        ("DELETE", p) if *p == format!("/deployments/{failing}") => {
+            Response::json(500, r#"{"detail":"deployment teardown failed"}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let err = commands::delete(opts(&server.base_url, "deal-desk", false), true)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("500 Internal Server Error"),
+        "{err}"
+    );
+
+    let flow: Vec<(String, String)> = server
+        .recorded()
+        .iter()
+        .map(|request| (request.method.clone(), request.path.clone()))
+        .collect();
+    assert_eq!(
+        flow,
+        vec![
+            ("GET".to_string(), "/agents".to_string()),
+            (
+                "GET".to_string(),
+                format!("/deployments?agent_id={AGENT_ID}")
+            ),
+            ("DELETE".to_string(), format!("/deployments/{first}")),
+            ("DELETE".to_string(), format!("/deployments/{failing}")),
+        ],
+        "a failed deployment end must stop all later deletion requests"
+    );
+}
+
+#[tokio::test]
+async fn delete_handler_propagates_a_concurrent_deployment_conflict_without_retry() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => agent_list(),
+        ("GET", p) if *p == format!("/deployments?agent_id={AGENT_ID}") => {
+            Response::json(200, "[]")
+        }
+        ("DELETE", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(409, r#"{"detail":"active deployment exists"}"#)
+        }
+        other => panic!("unexpected request: {other:?}"),
+    });
+
+    let err = commands::delete(opts(&server.base_url, "deal-desk", false), true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("409 Conflict"), "{err}");
+
+    let flow: Vec<(String, String)> = server
+        .recorded()
+        .iter()
+        .map(|request| (request.method.clone(), request.path.clone()))
+        .collect();
+    assert_eq!(
+        flow,
+        vec![
+            ("GET".to_string(), "/agents".to_string()),
+            (
+                "GET".to_string(),
+                format!("/deployments?agent_id={AGENT_ID}")
+            ),
+            ("DELETE".to_string(), format!("/agents/{AGENT_ID}")),
+        ],
+        "the final conflict must not be retried or swallowed"
+    );
+}
+
+#[tokio::test]
+async fn delete_dry_run_returns_the_generic_lifecycle_plan_without_requests() {
+    let server = serve(|req| panic!("dry run must not request, got {} {}", req.method, req.path));
+
+    let out = commands::delete(opts(&server.base_url, "deal-desk", true), false)
+        .await
+        .unwrap();
+    match out {
+        commands::DeleteOutput::DryRun(plan) => assert_eq!(
+            plan.lines,
+            vec![
+                format!(
+                    "GET {}/agents  (would resolve agent {:?})",
+                    server.base_url, "deal-desk"
+                ),
+                format!("GET {}/deployments?agent_id=<id>", server.base_url),
+                format!(
+                    "DELETE {}/deployments/<id>  (for each active deployment)",
+                    server.base_url
+                ),
+                format!("DELETE {}/agents/<id>", server.base_url),
+            ]
+        ),
+        other => panic!("expected dry run output, got {other:?}"),
+    }
+    assert!(
+        server.recorded().is_empty(),
+        "delete dry run must make no request"
     );
 }
 

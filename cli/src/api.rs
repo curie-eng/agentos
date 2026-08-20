@@ -1339,6 +1339,19 @@ impl ApiClient {
             .context("decoding deployment list")
     }
 
+    /// End the deployment: `DELETE /deployments/{id}` (204 No Content on success).
+    pub async fn end_deployment(&self, deployment_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(format!("{}/deployments/{deployment_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /deployments/{id}")?;
+        Self::expect_ok(resp, "ending the deployment").await?;
+        Ok(())
+    }
+
     /// Read a version's authored text files (skills, manifest, eval cases):
     /// `GET /agents/{id}/versions/{version_id}/files`. The `approvals` read pulls
     /// the deployed bundle's manifest from here to recover its `approvalPolicy`

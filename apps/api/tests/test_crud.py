@@ -285,3 +285,141 @@ def test_delete_missing_agent_returns_404(
     missing = "00000000-0000-0000-0000-000000000000"
     resp = client.delete(f"/agents/{missing}", headers=auth_headers)
     assert resp.status_code == 404
+
+
+def _create_active_deployment(
+    client: Any, auth_headers: dict[str, str], *, name: str
+) -> tuple[str, str, str]:
+    agent_resp = client.post(
+        "/agents",
+        json={
+            "name": name,
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    )
+    assert agent_resp.status_code == 201, agent_resp.text
+    agent = agent_resp.json()
+
+    version_resp = client.post(
+        f"/agents/{agent['id']}/versions",
+        json={"version_label": "v1", "created_by": "bconn"},
+        headers=auth_headers,
+    )
+    assert version_resp.status_code == 201, version_resp.text
+    version = version_resp.json()
+
+    deployment_resp = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent["id"],
+            "version_id": version["id"],
+            "environment": "dev",
+        },
+        headers=auth_headers,
+    )
+    assert deployment_resp.status_code == 201, deployment_resp.text
+    deployment = deployment_resp.json()
+    assert deployment["status"] == "active"
+    return agent["id"], version["id"], deployment["id"]
+
+
+def test_end_deployment_marks_row_stopped_and_preserves_history(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, _, deployment_id = _create_active_deployment(
+        client, auth_headers, name="stop-history"
+    )
+
+    resp = client.delete(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert resp.status_code == 204, resp.text
+
+    got = client.get(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["id"] == deployment_id
+    assert got.json()["status"] == "stopped"
+
+    listed = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    )
+    assert listed.status_code == 200, listed.text
+    assert [deployment["id"] for deployment in listed.json()] == [deployment_id]
+    assert listed.json()[0]["status"] == "stopped"
+
+
+def test_end_deployment_is_idempotent(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    _, _, deployment_id = _create_active_deployment(
+        client, auth_headers, name="stop-idempotent"
+    )
+
+    first = client.delete(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert first.status_code == 204, first.text
+    second = client.delete(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert second.status_code == 204, second.text
+
+    got = client.get(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["status"] == "stopped"
+
+
+def test_end_missing_deployment_returns_404(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    missing = "00000000-0000-0000-0000-000000000000"
+    resp = client.delete(f"/deployments/{missing}", headers=auth_headers)
+    assert resp.status_code == 404, resp.text
+
+
+def test_end_deployment_requires_authentication(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    _, _, deployment_id = _create_active_deployment(
+        client, auth_headers, name="stop-auth"
+    )
+
+    resp = client.delete(f"/deployments/{deployment_id}")
+    assert resp.status_code == 401, resp.text
+
+    got = client.get(f"/deployments/{deployment_id}", headers=auth_headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["status"] == "active"
+
+
+def test_agent_delete_requires_every_deployment_to_be_stopped(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent_id, version_id, first_deployment_id = _create_active_deployment(
+        client, auth_headers, name="stop-before-delete"
+    )
+
+    first_stop = client.delete(
+        f"/deployments/{first_deployment_id}", headers=auth_headers
+    )
+    assert first_stop.status_code == 204, first_stop.text
+
+    redeploy_resp = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version_id,
+            "environment": "dev",
+        },
+        headers=auth_headers,
+    )
+    assert redeploy_resp.status_code == 201, redeploy_resp.text
+    redeployment_id = redeploy_resp.json()["id"]
+    assert redeploy_resp.json()["status"] == "active"
+
+    blocked_delete = client.delete(f"/agents/{agent_id}", headers=auth_headers)
+    assert blocked_delete.status_code == 409, blocked_delete.text
+
+    second_stop = client.delete(
+        f"/deployments/{redeployment_id}", headers=auth_headers
+    )
+    assert second_stop.status_code == 204, second_stop.text
+
+    delete = client.delete(f"/agents/{agent_id}", headers=auth_headers)
+    assert delete.status_code == 204, delete.text
+    assert client.get(f"/agents/{agent_id}", headers=auth_headers).status_code == 404
