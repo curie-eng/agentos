@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CHECKER = REPO_ROOT / "tools" / "fix-pin-ci" / "check.py"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 PR_TEMPLATE = REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
+VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
 PR_CONDITION = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
@@ -279,6 +280,115 @@ def test_verifier_exit_zero_requires_an_exact_pinned_marker(
 
     assert completed.returncode != 0
     assert call_log.exists(), "a valid declaration must reach curie"
+
+
+def test_changed_selected_python_test_is_pinned_by_real_pytest_junit_failure(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    test_path = repository / "apps" / "api" / "tests" / "test_pin.py"
+    source_path = repository / "apps" / "api" / "pin_fixture.py"
+    test_path.parent.mkdir(parents=True)
+    (repository / "pyproject.toml").write_text(
+        """[project]
+name = "pin-fixture"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+""",
+        encoding="utf-8",
+    )
+    for package in (
+        repository / "apps" / "__init__.py",
+        repository / "apps" / "api" / "__init__.py",
+        repository / "apps" / "api" / "tests" / "__init__.py",
+    ):
+        package.write_text("", encoding="utf-8")
+    source_path.write_text("def value():\n    return 1\n", encoding="utf-8")
+    test_path.write_text(
+        """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 1
+""",
+        encoding="utf-8",
+    )
+
+    git_command = [
+        "git",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]
+    for arguments in (
+        ["init", "-q"],
+        ["config", "user.name", "Curie Test"],
+        ["config", "user.email", "curie@example.com"],
+        ["add", "."],
+        ["commit", "-q", "-m", "Add Python fixture"],
+    ):
+        subprocess.run(
+            [*git_command, *arguments],
+            cwd=repository,
+            check=True,
+        )
+
+    source_path.write_text("def value():\n    return 2\n", encoding="utf-8")
+    test_path.write_text(
+        """from apps.api.pin_fixture import value
+
+
+def test_selected():
+    assert value() == 2
+""",
+        encoding="utf-8",
+    )
+    for arguments in (
+        ["add", "."],
+        ["commit", "-q", "-m", "Fix Python behavior"],
+    ):
+        subprocess.run(
+            [*git_command, *arguments],
+            cwd=repository,
+            check=True,
+        )
+    fix_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+
+    completed = subprocess.run(
+        [
+            "bash",
+            str(VERIFY_FIX_PIN),
+            fix_commit,
+            "apps/api/tests/test_pin.py::test_selected",
+        ],
+        cwd=repository,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+    )
+    shown = f"{completed.stdout}\n{completed.stderr}"
+
+    assert completed.returncode == 0, shown
+    assert "PINNED" in completed.stdout.splitlines(), shown
+    assert "1 failed" in shown, shown
 
 
 def test_committed_pull_request_template_skips_without_calling_curie(tmp_path: Path) -> None:
