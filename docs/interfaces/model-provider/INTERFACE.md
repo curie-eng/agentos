@@ -124,7 +124,12 @@ hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
   remains sealed until `--allow-egress-host` names one of the five lowercase exact
   providers, or the operator explicitly supplies `--allow-web-egress`. Unknown,
   mixed case, URL, and host literal provider names remain usage errors. Local Ollama
-  has no named remote egress entry.
+  has no named remote egress entry. During `cluster up`, an Anthropic or OpenRouter
+  credential shape from `CURIE_CREDENTIALS`, `--set agentSandbox.runner.credentials`,
+  or preserved release values is unambiguous, so an explicit named provider list must
+  include its matching provider or `cluster up` exits with a usage error before
+  mutation. This checks consistency only: it does not infer a provider or authorize
+  egress. Ambiguous credential shapes remain accepted with any known explicit provider.
 - **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
   for the `sk-ant-oat` prefix
   (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`), and it is already

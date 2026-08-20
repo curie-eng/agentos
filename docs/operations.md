@@ -86,7 +86,7 @@ curie cluster up
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
-| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. It checks only shape, not provider identity or liveness. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
+| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. It checks only shape and does not prove liveness. During `cluster up`, Anthropic and OpenRouter shapes are recognized only to check consistency with explicit named egress. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
 | `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
@@ -115,6 +115,14 @@ internet except `169.254.169.254`; narrow the CIDR to a specific destination for
 a tighter posture. A default route value (`0.0.0.0/0`, `::/0`, or any `/0`
 prefix) prints a distinct rail removal warning, since it removes the default
 deny rail for a prompt injectable sandbox.
+
+During `cluster up`, an unambiguous Anthropic or OpenRouter credential from
+`CURIE_CREDENTIALS`, `--set agentSandbox.runner.credentials`, or preserved
+release values requires an explicit `--allow-egress-host` list that includes the
+matching provider. Otherwise `cluster up` exits with a usage error before
+changing the cluster. This is a consistency check only: a credential never
+selects a provider or opens egress. Ambiguous credential shapes remain valid
+with any known explicit provider.
 
 You don't need to worry about ordering when using the CLI flags together --
 `cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
