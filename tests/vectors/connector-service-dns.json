@@ -1,0 +1,65 @@
+{
+  "comment": "Single source of truth for the connector object-name and Service-DNS derivation, which exists independently in two languages. Python owns it as connector_render.object_name / connector_render.service_dns (packages/plugin-format/src/plugin_format/connector_render.py); the Rust CLI owns a hand port because the same string is the Docker network alias a skill-tier and local-tier connector container is started under (ADR 0113), and the runner derives the URL it dials from the Python side. A mismatch leaves the runner dialing a DNS name no container owns, which surfaces as a connection timeout with nothing logged on either end. The two lanes cannot share code, so the derivation is frozen here: changing one language without changing this file fails that language's test. Read by packages/plugin-format/tests/test_connector_render.py and by the Rust alias test in cli/tests/connector_build_decl_vectors.rs. Same mechanism as tests/vectors/approval-action-ids.json. Both lanes reject unknown keys, so adding a field here without teaching both lanes fails both: a key one lane cannot see would otherwise pass vacuously. The corpus deliberately includes an over-63-character base name, two over-long names sharing their first 54 characters, and a truncation boundary that lands on a dash, because those are the three branches a hand port gets wrong.",
+  "vectors": [
+    {
+      "name": "short_name_is_used_verbatim",
+      "why": "A base name inside the 63 character DNS label limit is emitted unchanged, so the ordinary case pins the plain concatenation order release-agent-mcp-connector.",
+      "release": "acme-rel",
+      "agent": "acme-bot",
+      "connector": "tempo",
+      "namespace": "acme-ns",
+      "object_name": "acme-rel-acme-bot-mcp-tempo",
+      "service_dns": "acme-rel-acme-bot-mcp-tempo.acme-ns.svc.cluster.local"
+    },
+    {
+      "name": "agent_scoping_keeps_two_agents_apart",
+      "why": "Same release, same connector, different agent. Release scoped naming made these identical and one agent's Deployment silently overwrote the other's (#1116), so the two derivations must stay distinct in both languages.",
+      "release": "acme-rel",
+      "agent": "sre-prod",
+      "connector": "tempo",
+      "namespace": "acme-ns",
+      "object_name": "acme-rel-sre-prod-mcp-tempo",
+      "service_dns": "acme-rel-sre-prod-mcp-tempo.acme-ns.svc.cluster.local"
+    },
+    {
+      "name": "namespace_only_reaches_the_dns_suffix",
+      "why": "The namespace is not part of the object name; it appears only after the first dot. A port that folded it into the object name would still produce a plausible looking string.",
+      "release": "acme-rel",
+      "agent": "acme-bot",
+      "connector": "tempo",
+      "namespace": "acme-other-ns",
+      "object_name": "acme-rel-acme-bot-mcp-tempo",
+      "service_dns": "acme-rel-acme-bot-mcp-tempo.acme-other-ns.svc.cluster.local"
+    },
+    {
+      "name": "long_name_truncates_with_a_digest",
+      "why": "Base name is 80 characters, over the 63 character limit, so the truncation-with-digest branch runs. This is the branch a hand port is most likely to get wrong.",
+      "release": "acme-corp-platform-release",
+      "agent": "site-reliability-engineering-bot",
+      "connector": "kubernetes-write",
+      "namespace": "acme-ns",
+      "object_name": "acme-corp-platform-release-site-reliability-engineerin-a33177ed",
+      "service_dns": "acme-corp-platform-release-site-reliability-engineerin-a33177ed.acme-ns.svc.cluster.local"
+    },
+    {
+      "name": "long_names_sharing_a_prefix_stay_distinct",
+      "why": "Two over-long names whose first 54 characters are identical. Clipping alone would map both onto one object name, which is the collision the digest suffix exists to prevent.",
+      "release": "acme-corp-platform-release",
+      "agent": "site-reliability-engineering-bot",
+      "connector": "kubernetes-write-two",
+      "namespace": "acme-ns",
+      "object_name": "acme-corp-platform-release-site-reliability-engineerin-6ed3033d",
+      "service_dns": "acme-corp-platform-release-site-reliability-engineerin-6ed3033d.acme-ns.svc.cluster.local"
+    },
+    {
+      "name": "truncation_strips_a_trailing_dash",
+      "why": "The 54 character prefix of this base ends in a dash. A DNS label may not contain two adjacent dashes at that position and may not end in one, so the truncated prefix is right-stripped before the digest is appended. Omitting the strip yields a double dash and a name Kubernetes rejects at apply.",
+      "release": "acme-corp-platform-release",
+      "agent": "platform-observability-bot",
+      "connector": "kubernetes-write",
+      "namespace": "acme-ns",
+      "object_name": "acme-corp-platform-release-platform-observability-bot-396096ee",
+      "service_dns": "acme-corp-platform-release-platform-observability-bot-396096ee.acme-ns.svc.cluster.local"
+    }
+  ]
+}

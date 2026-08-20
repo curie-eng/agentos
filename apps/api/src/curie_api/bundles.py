@@ -25,6 +25,11 @@ from plugin_format import (
     safe_extract,
     validate_bundle,
 )
+from plugin_format.connector_lock import (
+    CONNECTOR_LOCK_FILE,
+    ConnectorLockFile,
+    validate_connector_lock,
+)
 from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
 from plugin_format.validate import DEPLOY_FILE
@@ -111,6 +116,25 @@ def read_connectors(root: Path) -> ConnectorsFile:
     parsed, errors = validate_connectors(safe_load_unique(path.read_text(encoding="utf-8")))
     if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
         return ConnectorsFile()
+    return parsed
+
+
+def read_connector_lock(root: Path) -> ConnectorLockFile | None:
+    """Parse a validated bundle's ``connectors.lock.yaml``, or None (ADR 0113).
+
+    None is not an error and is the common case: an ordinary ``image:`` bundle
+    carries no lock and never will. Safe to call only after ``validate_bundle``
+    has passed, exactly like ``read_connectors`` -- a malformed lock, a lockless
+    ``build:`` bundle, and a stale digest are all already rejected there, so this
+    cannot be the place a bad lock first surfaces.
+    """
+
+    path = bundle_root(root) / CONNECTOR_LOCK_FILE
+    if not path.is_file():
+        return None
+    parsed, errors = validate_connector_lock(safe_load_unique(path.read_text(encoding="utf-8")))
+    if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
+        return None
     return parsed
 
 

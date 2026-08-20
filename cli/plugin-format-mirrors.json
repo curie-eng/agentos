@@ -51,6 +51,31 @@
   ],
   "non_mirrors": [
     {
+      "struct": "ConnectorsFileDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorsFile, but plugin-format.schema.json carries no Connector* $defs (schema_export.py imports only from .models), so field-by-field comparison against the schema does not apply. The seam is frozen in tests/vectors/connector-build-decl.json and tests/vectors/connector-fields.json instead, read by both packages/plugin-format/tests/test_connectors.py and cli/tests/connector_build_decl_vectors.rs."
+    },
+    {
+      "struct": "ConnectorSpecDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorSpec; same missing Connector* $defs, same vector-frozen seam (tests/vectors/connector-build-decl.json, tests/vectors/connector-fields.json)."
+    },
+    {
+      "struct": "ConnectorBuildDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connectors.ConnectorBuild; same missing Connector* $defs, same vector-frozen seam (tests/vectors/connector-build-decl.json, tests/vectors/connector-fields.json)."
+    },
+    {
+      "struct": "ConnectorLockFileDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connector_lock.ConnectorLockFile; same missing Connector* $defs, frozen in tests/vectors/connector-lock.json and tests/vectors/connector-fields.json."
+    },
+    {
+      "struct": "ConnectorLockEntryDecl",
+      "file": "cli/src/connector_build.rs",
+      "reason": "Mirrors plugin_format.connector_lock.ConnectorLockEntry; same missing Connector* $defs, frozen in tests/vectors/connector-lock.json and tests/vectors/connector-fields.json."
+    },
+    {
       "struct": "CheckReport",
       "file": "cli/src/commands.rs",
       "reason": "Mirrors the frozen curie_runner.check report contract (parse_check_report), a different local contract entirely -- unrelated to plugin_format and out of scope for #701."

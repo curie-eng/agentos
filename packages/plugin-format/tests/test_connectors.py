@@ -35,6 +35,32 @@ def _codes(data: object) -> list[str]:
     return [c for c, _ in errors]
 
 
+# The cross-language corpora. Both live at the repository root because the Rust
+# CLI reads the same bytes; see each file's own `comment` for why the seam needs
+# freezing rather than a shared import.
+_VECTORS = Path(__file__).parents[3] / "tests" / "vectors"
+
+
+def _vector_file(name: str) -> dict:
+    return json.loads((_VECTORS / name).read_text(encoding="utf-8"))
+
+
+_BUILD_DECL = _vector_file("connector-build-decl.json")
+
+# Every key a vector may carry. Asserted, so a key added for the Rust lane alone
+# cannot pass vacuously here -- the failure mode the model-credential-forwarding
+# and approval-action-id vectors both guard the same way.
+_BUILD_DECL_KEYS = {
+    "name",
+    "why",
+    "document",
+    "expect",
+    "codes",
+    "resolved_dockerfile",
+    "fixture",
+}
+
+
 # --------------------------------------------------------------------------- #
 # Accepted shapes
 # --------------------------------------------------------------------------- #
@@ -383,3 +409,192 @@ def test_a_reserved_name_and_a_bad_shape_report_both() -> None:
     codes = _codes({"connectors": {"curie": {"secrets": ["T"]}}})
     assert "connectors.reserved_name" in codes
     assert "connectors.underspecified" in codes
+
+
+# --------------------------------------------------------------------------- #
+# The `build:` form: a bundle declares source, not a hand-pasted image -- ADR 0113
+# --------------------------------------------------------------------------- #
+def test_a_build_only_connector_is_accepted_and_is_hosted() -> None:
+    # Hosted-ness is about WHO RUNS THE PROCESS, not about whether the image ref
+    # has been resolved yet. Keeping `is_hosted` keyed to `image` would make a
+    # source-built connector look remote to `render`, `mcp_entry` and the
+    # runner all at once: no objects rendered, and `unhosted_mcp_entry` handing
+    # back a remote-form entry built from a `url` that is None.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "k8s-write": {
+                    "build": {
+                        "context": "connectors/k8s-write",
+                        "dockerfile": "Dockerfile",
+                        "platforms": ["linux/amd64", "linux/arm64"],
+                    },
+                    "env": {"K8S_WRITE_ALLOWLIST": "acme-ns/acme-api"},
+                    "secret_files": {"K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig"},
+                }
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    spec = parsed.connectors["k8s-write"]
+    assert spec.is_hosted
+    assert spec.image is None, "the digest lives in connectors.lock.yaml, never in the declaration"
+    assert spec.build is not None
+    assert spec.build.context == "connectors/k8s-write"
+    assert spec.build.platforms == ["linux/amd64", "linux/arm64"]
+
+
+def test_dockerfile_defaults_to_Dockerfile() -> None:
+    # The common case omits it. A reader that leaves the resolved path empty
+    # builds nothing, or builds whatever the daemon's own default happens to
+    # be, which is a different file in a different place.
+    parsed, errors = validate_connectors(
+        {
+            "connectors": {
+                "tempo": {"build": {"context": "connectors/tempo", "platforms": ["linux/amd64"]}}
+            }
+        }
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["tempo"].build is not None
+    assert parsed.connectors["tempo"].build.dockerfile == "Dockerfile"
+
+
+def test_platforms_has_no_default() -> None:
+    # Required rather than defaulted, because a silently single-arch build is
+    # the exact failure ADR 0113 names: it passes every declaration check and
+    # fails after apply as "no matching manifest for linux/arm64". A default
+    # would pick one arch on the author's behalf and never say so.
+    assert _codes({"connectors": {"tempo": {"build": {"context": "connectors/tempo"}}}}) != []
+
+
+@pytest.mark.parametrize("second", ["image", "url"])
+def test_build_beside_another_form_is_ambiguous(second: str) -> None:
+    # Two image sources, or an image source plus a claim that the process is
+    # already running elsewhere. Picking either silently ignores the other, and
+    # the one ignored is the one the author edited last.
+    value = "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1" if second == "image" else "https://mcp.acme.example.com/mcp"
+    codes = _codes(
+        {
+            "connectors": {
+                "k8s-write": {
+                    second: value,
+                    "build": {"context": "connectors/k8s-write", "platforms": ["linux/amd64"]},
+                }
+            }
+        }
+    )
+    assert "connectors.ambiguous" in codes
+
+
+def test_the_underspecified_message_names_the_build_form() -> None:
+    # An author who meant to declare source and mistyped the key is told the
+    # form exists. A message that still names only `image` and `url` sends them
+    # back to hand-building and pasting a digest, which is the workflow ADR 0113
+    # exists to delete.
+    _, errors = validate_connectors({"connectors": {"k8s-write": {"secrets": ["K8S_WRITE_TOKEN"]}}})
+    message = next(m for code, m in errors if code == "connectors.underspecified")
+    assert "`build`" in message
+
+
+def test_headers_are_rejected_on_a_build_connector_exactly_as_on_an_image_one() -> None:
+    # SIBLING PATH (AGENTS.md's parity-seam rule). The guard was keyed to
+    # `image`, and a `build:` connector is equally hosted, so without widening
+    # it to hosted-ness a built connector could declare `headers` and be
+    # accepted -- a remote-only field riding the build form, silently ignored by
+    # the renderer. Armed here through the build form ONLY, so reverting the
+    # guard to `spec.image and spec.headers` fails this test while the
+    # image-form test above still passes. That gap IS the seam.
+    build_form = _codes(
+        {
+            "connectors": {
+                "k8s-write": {
+                    "build": {"context": "connectors/k8s-write", "platforms": ["linux/amd64"]},
+                    "headers": {"Authorization": "Bearer ${ACME_TOKEN}"},
+                }
+            }
+        }
+    )
+    image_form = _codes(
+        {"connectors": {"k8s-write": {"image": "x:1", "headers": {"Authorization": "Bearer x"}}}}
+    )
+    assert "connectors.hosted_has_headers" in build_form
+    assert "connectors.hosted_has_headers" in image_form
+
+
+def test_an_unknown_key_inside_build_is_rejected_not_ignored() -> None:
+    # `target:` is a plausible thing to reach for and Curie models none of it.
+    # Silently dropping it means a build that produces the wrong stage while
+    # reporting success.
+    assert (
+        _codes(
+            {
+                "connectors": {
+                    "tempo": {
+                        "build": {
+                            "context": "connectors/tempo",
+                            "platforms": ["linux/amd64"],
+                            "target": "runtime",
+                        }
+                    }
+                }
+            }
+        )
+        != []
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The Python half of the frozen Python/Rust declaration seam
+# --------------------------------------------------------------------------- #
+def test_every_build_declaration_vector_declares_only_modelled_keys() -> None:
+    # A key added for the Rust lane alone would otherwise sit here unread, so
+    # the corpus would grow a field this suite silently ignores.
+    for vector in _BUILD_DECL["vectors"]:
+        extra = set(vector) - _BUILD_DECL_KEYS
+        assert not extra, f"{vector['name']}: unmodelled vector keys {sorted(extra)}"
+        assert vector["expect"] in {"accept", "reject"}
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [v for v in _BUILD_DECL["vectors"] if "fixture" not in v],
+    ids=lambda v: v["name"],
+)
+def test_build_declaration_vectors(vector: dict) -> None:
+    # Driven off tests/vectors/connector-build-decl.json rather than inline
+    # literals so the Rust reader in cli/src/connector_build.rs cannot diverge:
+    # changing an expectation here fails both suites, and changing one language
+    # without the vector fails that language. A vector carrying `fixture` is a
+    # filesystem case only the CLI's path resolver can see (a symlinked
+    # Dockerfile), so it is skipped here and materialized by the Rust suite.
+    parsed, errors = validate_connectors(vector["document"])
+    codes = [code for code, _ in errors]
+    if vector["expect"] == "accept":
+        assert errors == [], f"{vector['name']} must validate clean, got {codes}"
+        assert parsed is not None
+        for connector, dockerfile in vector.get("resolved_dockerfile", {}).items():
+            build = parsed.connectors[connector].build
+            assert build is not None
+            assert build.dockerfile == dockerfile
+    else:
+        assert parsed is None
+        # Subset, never equality: validate_connectors accumulates every problem
+        # in one pass so an author sees the whole file at once.
+        for expected in vector["codes"]:
+            assert expected in codes, f"{vector['name']} expected {expected}, got {codes}"
+
+
+def test_connector_declaration_field_names_match_the_frozen_vector() -> None:
+    # The gap review finding r2-1 named: plugin-format.schema.json carries no
+    # Connector* $defs, so `curie dev field-parity` compares nothing for the
+    # Rust mirrors and a new Python field would land with every gate green.
+    # Adding one without editing the vector fails here; editing the vector to
+    # make this pass then fails the Rust half until the mirror gains the field.
+    from plugin_format.connectors import ConnectorBuild, ConnectorSpec
+
+    fields = _vector_file("connector-fields.json")["models"]
+    assert set(ConnectorSpec.model_fields) == set(fields["ConnectorSpec"])
+    assert set(ConnectorBuild.model_fields) == set(fields["ConnectorBuild"])

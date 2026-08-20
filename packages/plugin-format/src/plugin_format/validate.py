@@ -13,12 +13,20 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from . import connector_lock
 from .approval_policy import (
     connector_server_names,
     connector_tool_prefix,
     declared_mcp_server_names,
     effective_tool_prefix,
     grantable_routes,
+)
+from .connector_lock import (
+    CONNECTOR_LOCK_FILE,
+    ConnectorLockFile,
+    resolve_context,
+    source_digest_of,
+    validate_connector_lock,
 )
 from .connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
 from .deploy_targets import validate_deploy_targets
@@ -91,6 +99,7 @@ def validate_bundle(path: str | Path) -> ValidationResult:
         _validate_secrets(manifest, c)
         _validate_scripts(root, c)
         _validate_connectors(root, c)
+        _validate_connector_lock(root, c)
         _validate_deploy_targets(root, c)
 
     return c.result()
@@ -156,6 +165,132 @@ def _validate_connectors(root: Path, c: _Collector) -> None:
         c.error(code, message, CONNECTORS_FILE)
     if parsed is not None:
         _reject_connector_name_collisions(root, parsed, c)
+
+
+def _read_connectors(root: Path) -> ConnectorsFile | None:
+    """The bundle's parsed ``connectors.yaml``, or None when it is absent or bad.
+
+    ``_validate_connectors`` has already reported whatever made it bad, so the
+    lock arm stays silent about a declaration it cannot trust rather than
+    reporting a second, confusing error about the same file.
+    """
+
+    path = root / CONNECTORS_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    parsed, errors = validate_connectors(data)
+    return None if errors else parsed
+
+
+def _validate_connector_lock(root: Path, c: _Collector) -> None:
+    """Validate ``connectors.lock.yaml`` and the bundle's builds against it (ADR 0113).
+
+    ``validate_bundle`` is the ONE gate a bundle passes through whatever entry
+    point it arrives by -- the CLI upload, the console's create-agent modal, and
+    the git push path all route through it -- so these rules live here and cover
+    all three with one implementation.
+
+    Delivery is deliberately NOT checked. ``curie local deploy`` legitimately
+    uploads a bundle carrying a ``local-daemon`` lock; the registry-only rule
+    belongs to the cluster deploy preflight, the only path that needs an
+    artifact a Kubernetes node can pull.
+    """
+
+    lock: ConnectorLockFile | None = None
+    path = root / CONNECTOR_LOCK_FILE
+    if path.is_file():
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            c.error(
+                "connectors.lock_unreadable",
+                f"{CONNECTOR_LOCK_FILE}: {exc}",
+                CONNECTOR_LOCK_FILE,
+            )
+            return
+        lock, errors = validate_connector_lock(data)
+        for code, message in errors:
+            c.error(code, message, CONNECTOR_LOCK_FILE)
+        if lock is None:
+            return
+
+    declared = _read_connectors(root)
+    if declared is None:
+        return
+
+    complete = True
+    for name, spec in sorted(declared.connectors.items()):
+        if spec.build is None:
+            continue
+        try:
+            # Resolved, not merely joined: `source_digest_of` hashes whatever
+            # tree this names, so a symlinked context would let a bundle pin
+            # bytes it does not contain -- and the CLI (`resolve_context` in
+            # cli/src/connector_build.rs) already refuses that before it builds.
+            # Intake accepting what the builder refuses is the seam this closes.
+            context = resolve_context(root, spec.build.context)
+        except ValueError as exc:
+            complete = False
+            c.error(
+                "connectors.build_context_escapes",
+                f"connectors.{name}: {exc}",
+                CONNECTORS_FILE,
+            )
+            continue
+        if not context.is_dir():
+            # Refused here rather than skipped: a bundle whose declared build
+            # input is not in it can never be built, and letting it through
+            # means the version is created, the deployment goes active, and the
+            # failure surfaces at render time far from its cause.
+            complete = False
+            c.error(
+                "connectors.build_context_missing",
+                f"connectors.{name}: `build.context` is {spec.build.context!r}, which this "
+                "bundle does not contain, so there is nothing to build or to hash. Add the "
+                "build context to the bundle or correct the path.",
+                CONNECTORS_FILE,
+            )
+            continue
+        entry = lock.connectors.get(name) if lock is not None else None
+        if entry is None:
+            complete = False
+            c.error(
+                "connectors.lock_missing",
+                f"connectors.{name}: declares `build:` but {CONNECTOR_LOCK_FILE} has no entry "
+                "for it, so nothing pins what would be deployed. Run `curie build --plugin-dir "
+                "<dir>` and commit the lock it writes.",
+                CONNECTOR_LOCK_FILE,
+            )
+            continue
+        # Pure hashing over the already-extracted tree: no docker, no registry,
+        # no network, so the API stays a pure renderer under ADR-0087. Without
+        # it a git push after a source or `platforms` edit activates the
+        # PREVIOUS digest and the deployed connector silently stops matching the
+        # reviewed source.
+        if source_digest_of(context, spec.build) != entry.source_digest:
+            complete = False
+            c.error(
+                "connectors.lock_stale",
+                f"connectors.{name}: {CONNECTOR_LOCK_FILE} records a source digest that no "
+                "longer matches this bundle's build input, so the recorded image was built "
+                "from something else. Rebuild it with `curie build --plugin-dir <dir>`.",
+                CONNECTOR_LOCK_FILE,
+            )
+
+    if complete and lock is not None:
+        # The last rule the model cannot express: an image that is not a digest
+        # of its delivery's shape. `apply_lock` owns that refusal, so intake
+        # asks it rather than carrying a second copy -- a hand-edited lock
+        # reaches here exactly as a generated one does, and a version whose
+        # connector can never render must not be stored.
+        try:
+            connector_lock.apply_lock(declared, lock, portable=False)
+        except ValueError as exc:
+            c.error("connectors.lock_invalid", f"{CONNECTOR_LOCK_FILE}: {exc}", CONNECTOR_LOCK_FILE)
 
 
 def _reject_connector_name_collisions(root: Path, parsed: ConnectorsFile, c: _Collector) -> None:

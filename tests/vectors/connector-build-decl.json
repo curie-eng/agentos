@@ -1,0 +1,312 @@
+{
+  "comment": "Single source of truth for the `build:` connector declaration (ADR 0113), which is read independently by two languages. Python owns it as ConnectorBuild / ConnectorSpec and validate_connectors (packages/plugin-format/src/plugin_format/connectors.py); the Rust CLI owns hand mirrors in cli/src/connector_build.rs because `curie build --plugin-dir` reads the same connectors.yaml before a bundle is ever uploaded, and packages/plugin-format/schema/plugin-format.schema.json carries no Connector* $defs, so the schema driven field-parity gate compares nothing for these structs. This file is the seam instead: changing one language without changing this file fails that language's test. Read by packages/plugin-format/tests/test_connectors.py and by cli/tests/connector_build_decl_vectors.rs. Same mechanism as tests/vectors/approval-action-ids.json. Both lanes reject unknown keys inside a vector, so adding a field here without teaching both lanes fails both.\n\nEach vector carries: `name`, `why`, `document` (the parsed connectors.yaml content, as JSON), `expect` (\"accept\" or \"reject\"), `codes` (the validate_connectors error codes that MUST appear when expect is \"reject\"; empty when expect is \"accept\"), and optionally `resolved_dockerfile` (the Dockerfile path the reader must resolve for the named connector, pinning the default) and `fixture` (a filesystem recipe only the Rust resolver can see). A vector carrying `fixture` is SKIPPED by the Python suite and materialized by the Rust suite: the escape it describes is a symlink, which a pure declaration validator cannot detect and which `curie build` must refuse before docker ever reads the file. `codes` is a subset assertion, never an equality assertion, because validate_connectors accumulates every problem in one pass so an author sees the whole file at once.",
+  "vectors": [
+    {
+      "name": "build_only_connector_is_accepted",
+      "why": "The whole point of ADR 0113: a bundle declares source, not an image reference an operator had to build and paste in by hand.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "dockerfile": "Dockerfile",
+              "platforms": ["linux/amd64", "linux/arm64"]
+            },
+            "env": { "K8S_WRITE_ALLOWLIST": "acme-ns/acme-api" },
+            "secret_files": { "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig" }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": [],
+      "resolved_dockerfile": { "k8s-write": "Dockerfile" }
+    },
+    {
+      "name": "dockerfile_defaults_to_Dockerfile",
+      "why": "The common case omits it. A reader that leaves the resolved path empty builds nothing, or builds whatever the daemon's own default happens to be, which is a different file in a different place.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": [],
+      "resolved_dockerfile": { "tempo": "Dockerfile" }
+    },
+    {
+      "name": "a_named_dockerfile_inside_the_context_is_accepted",
+      "why": "A context holding two Dockerfiles is legal; only escaping the context is not.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "dockerfile": "build/Dockerfile.tempo",
+              "platforms": ["linux/amd64", "linux/arm64"]
+            }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": [],
+      "resolved_dockerfile": { "tempo": "build/Dockerfile.tempo" }
+    },
+    {
+      "name": "build_and_image_together_are_ambiguous",
+      "why": "Two image sources on one connector. Picking either silently ignores the other, and the one ignored is the one the author edited last.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "image": "ghcr.io/acme-corp/acme-bot-k8s-write-mcp:v1",
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.ambiguous"]
+    },
+    {
+      "name": "build_and_url_together_are_ambiguous",
+      "why": "`url` says the process is already running elsewhere and `build` says Curie must produce and run it. It is unclear who owns the process, which is the same defect the image/url pair has always been rejected for.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "url": "https://mcp.acme.example.com/mcp",
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.ambiguous"]
+    },
+    {
+      "name": "none_of_the_three_forms_is_underspecified",
+      "why": "The message must now name all three forms. An author who meant to write `build:` and typed it wrong gets told the form exists.",
+      "document": {
+        "connectors": {
+          "k8s-write": { "secrets": ["K8S_WRITE_TOKEN"] }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.underspecified"]
+    },
+    {
+      "name": "build_with_headers_is_rejected",
+      "why": "SIBLING PATH. `headers` apply to a remote endpoint, and the existing guard keyed off `image`, so a build connector could carry them and be accepted. Armed through the build form only, so reverting the guard to `spec.image and spec.headers` fails this vector while the image form's own test still passes.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"]
+            },
+            "headers": { "Authorization": "Bearer ${ACME_TOKEN}" }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.hosted_has_headers"]
+    },
+    {
+      "name": "empty_platforms_is_rejected",
+      "why": "A silently single-arch build is the exact failure ADR 0113 names: it passes every declaration check and fails after apply as `no matching manifest for linux/arm64`.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": { "context": "connectors/tempo", "platforms": [] }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_no_platforms"]
+    },
+    {
+      "name": "a_malformed_platform_string_is_rejected",
+      "why": "`amd64` alone, or a typo like `linux/amd_64`, reaches buildx verbatim and fails there with a message about the daemon rather than about the bundle.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": ["linux/amd64", "nonsense"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_bad_platform"]
+    },
+    {
+      "name": "a_variant_qualified_platform_is_accepted",
+      "why": "`linux/arm/v7` is a real OCI platform string. Rejecting it would be a false positive that blocks a legitimate target.",
+      "document": {
+        "connectors": {
+          "tempo": {
+            "build": {
+              "context": "connectors/tempo",
+              "platforms": ["linux/amd64", "linux/arm/v7"]
+            }
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": [],
+      "resolved_dockerfile": { "tempo": "Dockerfile" }
+    },
+    {
+      "name": "an_absolute_context_is_rejected",
+      "why": "ADR 0113 requires the build context be constrained to the extracted bundle without accepting arbitrary host paths. An absolute context makes the operator's own machine the build context.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": { "context": "/etc", "platforms": ["linux/amd64"] }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_context_escapes"]
+    },
+    {
+      "name": "a_context_with_a_parent_traversal_is_rejected",
+      "why": "The same escape by relative path. `../..` normalizes outside the bundle root, so a bundle would cause a build to read files that are not part of it.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/../../secrets",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_context_escapes"]
+    },
+    {
+      "name": "an_empty_context_is_rejected",
+      "why": "An empty string normalizes to the bundle root on one reader and to the process working directory on another. Both are wrong and only one is obviously wrong.",
+      "document": {
+        "connectors": {
+          "k8s-write": { "build": { "context": "", "platforms": ["linux/amd64"] } }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_context_escapes"]
+    },
+    {
+      "name": "a_dockerfile_with_a_parent_traversal_is_rejected",
+      "why": "A Dockerfile can sit outside its context, so the context check alone does not cover it. `../../../etc/passwd` as a Dockerfile is read by the CLI before packing, which is before every other guard in the pipeline.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "dockerfile": "../../Dockerfile",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_dockerfile_escapes"]
+    },
+    {
+      "name": "an_absolute_dockerfile_is_rejected",
+      "why": "Same escape, stated absolutely. Both spellings must be refused or the check is decoration.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "dockerfile": "/etc/Dockerfile",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_dockerfile_escapes"]
+    },
+    {
+      "name": "a_symlinked_dockerfile_leaving_the_context_is_refused",
+      "why": "RUST ONLY, and the reason the Rust resolver canonicalizes rather than only matching text. The declared path is textually clean, so a pure declaration validator accepts it; only a filesystem resolver sees that connectors/k8s-write/Dockerfile is a symlink to a host file. `curie build` reads the Dockerfile BEFORE the bundle is packed, so cli/src/bundle.rs's symlink refusal never runs. resolve_dockerfile must refuse rather than dereference, matching the reason that packer guard exists.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "dockerfile": "Dockerfile",
+              "platforms": ["linux/amd64"]
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.build_dockerfile_escapes"],
+      "fixture": {
+        "outside_files": { "outside/Dockerfile": "FROM scratch\n" },
+        "bundle_files": { "connectors/k8s-write/server.py": "print('hi')\n" },
+        "bundle_symlinks": { "connectors/k8s-write/Dockerfile": "../../../outside/Dockerfile" }
+      }
+    },
+    {
+      "name": "an_unknown_key_inside_build_is_rejected",
+      "why": "The deny_unknown_fields proof for ConnectorBuild. `target:` is a plausible thing to reach for and Curie models none of it; silently dropping it means a build that produces the wrong stage while reporting success. Removing extra=\"forbid\" on the Python side or #[serde(deny_unknown_fields)] on the Rust side makes this vector pass, which is how the attribute is proved to be what catches it.",
+      "document": {
+        "connectors": {
+          "k8s-write": {
+            "build": {
+              "context": "connectors/k8s-write",
+              "platforms": ["linux/amd64"],
+              "target": "runtime"
+            }
+          }
+        }
+      },
+      "expect": "reject",
+      "codes": ["connectors.invalid"]
+    },
+    {
+      "name": "an_existing_image_connector_is_untouched",
+      "why": "REGRESSION. Every hosted connector bundle in the wild uses this form, and ADR 0113 requires the schema change be compatible. A three-way exclusion written as an if/elif chain is the natural way to break it.",
+      "document": {
+        "connectors": {
+          "grafana": {
+            "image": "ghcr.io/acme-corp/mcp-grafana:0.17.2",
+            "args": ["-t", "streamable-http", "-disable-write"],
+            "env": { "GRAFANA_URL": "https://grafana.example.com" },
+            "secrets": ["GRAFANA_SERVICE_ACCOUNT_TOKEN"]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    },
+    {
+      "name": "an_existing_url_connector_is_untouched",
+      "why": "REGRESSION, the other pre-existing form. A remote connector owned by its provider must keep validating exactly as it did before `build:` existed.",
+      "document": {
+        "connectors": {
+          "internal": {
+            "url": "https://mcp.acme.example.com/mcp",
+            "headers": { "Authorization": "Bearer ${INTERNAL_TOKEN}" },
+            "secrets": ["INTERNAL_TOKEN"]
+          }
+        }
+      },
+      "expect": "accept",
+      "codes": []
+    }
+  ]
+}

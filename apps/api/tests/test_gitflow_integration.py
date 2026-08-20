@@ -912,3 +912,135 @@ def test_a_scaffolded_deploy_yaml_reads_back_as_an_empty_map(tmp_path: Path) -> 
     targets = bundles.read_deploy_targets(tmp_path)
     assert targets is not None, "a present deploy.yaml must not read back as absent"
     assert targets.targets == {}
+
+
+# --------------------------------------------------------------------------- #
+# A source-built connector arriving by git push (ADR 0113)
+#
+# VERIFY ONLY: nothing in gitflow.py changes. The push path routes through
+# `bundles.extract_and_validate`, so the intake rules added to
+# `plugin_format.validate.py` cover it with no second implementation -- which is
+# the whole reason they live in `validate_bundle` rather than in the CLI upload
+# router (apps/api/CLAUDE.md: the validator is the ONE gate a bundle passes
+# through, whatever entry point it arrives by). These tests prove that rather
+# than assuming it, and they assert on the ABSENCE of the Version row, not on a
+# log line: `gitflow.py` creates the Version and stores the bundle only after
+# validation passes, so a rule that fired but did not block would still leave a
+# row behind.
+# --------------------------------------------------------------------------- #
+BUILT_CONNECTORS = (
+    "connectors:\n"
+    "  k8s-write:\n"
+    "    build:\n"
+    "      context: connectors/k8s-write\n"
+    "      platforms: [linux/amd64, linux/arm64]\n"
+)
+
+_BUILT_FILES = {
+    **VALID_FILES,
+    "connectors.yaml": BUILT_CONNECTORS,
+    "connectors/k8s-write/Dockerfile": "FROM scratch\nCOPY server.py /server.py\n",
+    "connectors/k8s-write/server.py": "print('acme')\n",
+}
+
+_REGISTRY_IMAGE = (
+    "ghcr.io/acme-corp/acme-bot-k8s-write-mcp@sha256:"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+
+def _lock_text(source_digest: str) -> str:
+    return (
+        "version: 1\n"
+        "connectors:\n"
+        "  k8s-write:\n"
+        f"    image: {_REGISTRY_IMAGE}\n"
+        "    delivery: registry\n"
+        "    platforms: [linux/amd64, linux/arm64]\n"
+        f"    source_digest: {source_digest}\n"
+    )
+
+
+def _source_digest(tmp_path: Path, files: dict[str, str]) -> str:
+    """Hash the build context exactly as the validator will after extraction."""
+
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    for rel, content in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    build = ConnectorBuild.model_validate(
+        {"context": "connectors/k8s-write", "platforms": ["linux/amd64", "linux/arm64"]}
+    )
+    return connector_lock.source_digest_of(tmp_path / "connectors" / "k8s-write", build)
+
+
+def test_a_git_push_of_a_locked_build_bundle_deploys(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    tmp_path: Path,
+) -> None:
+    # The control. Without it, a rule that rejected every build: bundle outright
+    # would pass both negatives below.
+    agent_id = _register_agent(client, auth_headers)
+    files = dict(_BUILT_FILES)
+    files["connectors.lock.yaml"] = _lock_text(_source_digest(tmp_path / "ctx", _BUILT_FILES))
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deployed"
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    assert [v["commit_sha"] for v in versions] == [sha]
+
+
+def test_a_git_push_of_a_lockless_build_bundle_creates_no_version(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, _BUILT_FILES)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert "connectors.lock_missing" in {e["code"] for e in body["errors"]}
+
+    # The row itself, not the response: this is what stops the deployment going
+    # active while the runner derives a hosted URL for a connector nobody built.
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+    assert (
+        client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers).json() == []
+    )
+
+
+def test_a_git_push_of_a_stale_build_bundle_creates_no_version(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+    tmp_path: Path,
+) -> None:
+    # The push path is the one an author uses without ever running `curie
+    # build`, so it is where a stale lock actually reaches production: the
+    # previous digest is activated and the deployed connector silently stops
+    # matching the reviewed source.
+    agent_id = _register_agent(client, auth_headers)
+    files = dict(_BUILT_FILES)
+    files["connectors.lock.yaml"] = _lock_text(_source_digest(tmp_path / "ctx", _BUILT_FILES))
+    files["connectors/k8s-write/server.py"] = "print('acme, but different')\n"
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, files)
+
+    resp = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert "connectors.lock_stale" in {e["code"] for e in body["errors"]}
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []

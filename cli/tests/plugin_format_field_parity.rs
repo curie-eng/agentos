@@ -163,6 +163,96 @@ fn spec_rs_has_no_plugin_format_field_parity_violations() {
 }
 
 #[test]
+fn connector_build_rs_has_no_plugin_format_field_parity_violations() {
+    // The third mirror site (ADR 0113). Without this per-file test the gate's
+    // `UndeclaredStruct` check never walks `cli/src/connector_build.rs` at all,
+    // and the `non_mirrors` entries `cli/plugin-format-mirrors.json` carries
+    // for its structs are decoration rather than enforcement: a new
+    // `Deserialize` mirror of a frozen connector shape could land undeclared.
+    //
+    // The FIELD comparison is deliberately a no-op for these structs today,
+    // because `plugin-format.schema.json` carries no `Connector*` `$defs`
+    // (`schema_export.py` imports only from `.models`), which is why they are
+    // declared as non_mirrors and why `tests/vectors/connector-fields.json`
+    // exists alongside this gate rather than being redundant with it. When the
+    // schema-export follow-up lands, those entries move to `mirrors` and this
+    // test starts comparing fields too, with no change here.
+    let src = repo_text("cli/src/connector_build.rs");
+    let schema = plugin_format_schema_as_components();
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/connector_build.rs");
+
+    let vs = violations(&src, &schema, &scoped);
+    assert!(
+        vs.is_empty(),
+        "cli/src/connector_build.rs has drifted from packages/plugin-format/schema/plugin-format.schema.json. \
+         Each entry below is fixed by either adding the field to the struct or declaring the \
+         omission (with a justification) in cli/plugin-format-mirrors.json:\n{vs:#?}"
+    );
+}
+
+#[test]
+fn every_connector_mirror_struct_is_declared_in_the_manifest() {
+    // The scenario the per-file test above is checked against, stated as its
+    // own assertion so a manifest mistake elsewhere cannot hide it: each of the
+    // connector declaration and lock mirrors must appear in exactly one of
+    // `mirrors` / `non_mirrors` for its file. Adding a scratch `Deserialize`
+    // struct to `cli/src/connector_build.rs` and leaving it undeclared must
+    // fail, which is how `curie dev field-parity` is proved to see this module.
+    let src = repo_text("cli/src/connector_build.rs");
+    let schema = plugin_format_schema_as_components();
+    let manifest = repo_json("cli/plugin-format-mirrors.json");
+    let scoped = manifest_for_file(&manifest, "cli/src/connector_build.rs");
+    let vs = violations(&src, &schema, &scoped);
+
+    for name in [
+        "ConnectorsFileDecl",
+        "ConnectorSpecDecl",
+        "ConnectorBuildDecl",
+        "ConnectorLockFileDecl",
+        "ConnectorLockEntryDecl",
+    ] {
+        assert!(
+            !has_undeclared_struct(&vs, name),
+            "{name} is a Deserialize mirror in cli/src/connector_build.rs with no \
+             mirrors/non_mirrors entry in cli/plugin-format-mirrors.json:\n{vs:#?}"
+        );
+        assert!(
+            src.contains(&format!("struct {name}")),
+            "{name} is declared in cli/plugin-format-mirrors.json but does not exist in \
+             cli/src/connector_build.rs -- a stale manifest entry hides a real drift"
+        );
+    }
+}
+
+#[test]
+fn every_connector_mirror_struct_denies_unknown_fields() {
+    // The runtime half of the tolerance gap review finding 9 named. The field
+    // vector catches a Python field that never reached the Rust mirror; this
+    // catches a real `connectors.yaml` or lock in the wild carrying a field the
+    // Rust side does not model, which without the attribute is silently dropped
+    // and the operator believes they declared something they did not.
+    let src = repo_text("cli/src/connector_build.rs");
+    for name in [
+        "ConnectorsFileDecl",
+        "ConnectorSpecDecl",
+        "ConnectorBuildDecl",
+        "ConnectorLockFileDecl",
+        "ConnectorLockEntryDecl",
+    ] {
+        let at = src
+            .find(&format!("struct {name}"))
+            .unwrap_or_else(|| panic!("{name} is defined in cli/src/connector_build.rs"));
+        let attrs = &src[at.saturating_sub(400)..at];
+        assert!(
+            attrs.contains("deny_unknown_fields"),
+            "{name} must carry #[serde(deny_unknown_fields)] so an unmodelled key is refused \
+             rather than dropped"
+        );
+    }
+}
+
+#[test]
 fn approval_gate_and_policy_mirrors_stay_fully_covered() {
     // The issue's named drift class hinges on ApprovalGate/ApprovalPolicy
     // never silently losing coverage across BOTH mirror sites (commands.rs's
