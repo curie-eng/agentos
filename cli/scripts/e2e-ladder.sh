@@ -1318,6 +1318,71 @@ assert_no_connector_containers() {
     echo "$label: no connector containers for a bundle that declares none (project $project)"
 }
 
+# The declared HOSTED connector names: the two-space-indented top-level keys
+# under `connectors:`, minus any declaration carrying a four-space `url:` or
+# `unhosted_url:` key -- the same predicate the real consumer applies
+# (connector_build.rs is_hosted), since a remote declaration deliberately
+# starts no container and must not be asserted as one. Nested maps sit at
+# four spaces and comment lines fail the name class, so this tolerant read
+# matches exactly the declaration keys without needing a YAML parser on the
+# runner.
+declared_connector_names() {
+    awk '
+        function flush() { if (name != "") print name }
+        /^  [A-Za-z0-9][A-Za-z0-9_-]*:/ {
+            flush()
+            name = $1
+            sub(/:.*/, "", name)
+            next
+        }
+        name != "" && /^    (url|unhosted_url):/ { name = "" }
+        END { flush() }
+    ' "$1"
+}
+
+# Whether the shared bundle copy declares hosted connectors, read off the
+# declaration itself. The default rungs used to hardcode "the stock bundle
+# declares none", which went stale the day examples/weather grew its
+# netpol-probe enforcement fixture: the assertion must track what THIS bundle
+# claims, not what the example used to be.
+bundle_declares_connectors() {
+    [[ -f "$WORKDIR/bundle/connectors.yaml" ]] \
+        && [[ -n "$(declared_connector_names "$WORKDIR/bundle/connectors.yaml")" ]]
+}
+
+# The dual of assert_no_connector_containers, for a bundle that DOES declare
+# hosted connectors: each declared name must be up as a container carrying its
+# identity label in this tier's project scope. Scoped by the same three labels
+# the reconciler selects on, so this asserts the exact containers the runner
+# would dial rather than any lookalike.
+assert_declared_connectors_hosted() {
+    local label="$1" project="$2" release="$3" agent="$4" connector object found
+    local -a declared=()
+    while IFS= read -r connector; do
+        declared+=("$connector")
+    done < <(declared_connector_names "$WORKDIR/bundle/connectors.yaml")
+    if [[ ${#declared[@]} -eq 0 ]]; then
+        echo "$label: connectors.yaml exists but no declared connector names could be read from it, so this assertion has nothing to check. Refusing the vacuous pass." >&2
+        return 1
+    fi
+    if [[ -z "$release" || -z "$agent" ]]; then
+        echo "$label: the tier reported an incomplete connector scope (release='$release' agent='$agent'), so no identity label can be derived." >&2
+        return 1
+    fi
+    for connector in "${declared[@]}"; do
+        object="$(connector_object_name "$release" "$agent" "$connector")" || return 1
+        found="$(docker ps --filter "label=$CONNECTOR_LABEL" \
+            --filter "label=curietech.ai/project=$project" \
+            --filter "label=curietech.ai/connector=$object" --format '{{.Names}}')"
+        if [[ -z "$found" ]]; then
+            echo "$label: the bundle declares connector '$connector' but no running container carries its identity label (curietech.ai/connector=$object) in project '$project'." >&2
+            docker ps --filter "label=$CONNECTOR_LABEL" --format '{{.Names}} {{.Label "curietech.ai/connector"}}' >&2 || true
+            return 1
+        fi
+        echo "$label: declared connector '$connector' is hosted as $found"
+    done
+}
+
 # The skill tier's connector leg, run by the ladder itself rather than inside
 # cli/scripts/e2e.sh: that script owns its own up/message/down cycle and has
 # torn everything down by the time it returns, so there is no moment in it at
@@ -1688,6 +1753,16 @@ rung_local() {
             "$(container_env_value "$worker" CURIE_RELEASE)" \
             "$agent_name" \
             "$(container_env_value "$worker" CURIE_NAMESPACE)"
+    elif bundle_declares_connectors; then
+        # The stock bundle declares hosted connectors (the weather bundle's
+        # netpol-probe enforcement fixture), so "declares none, starts none"
+        # is not this bundle's claim. Assert the dual instead: every declared
+        # connector is up under its identity label. `curie` is the compose
+        # project the CLI pins (cli/src/local.rs COMPOSE_PROJECT).
+        local worker
+        worker="$(local_worker_container)"
+        assert_declared_connectors_hosted "local" curie \
+            "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
         # `curie` is the compose project the CLI pins (cli/src/local.rs
         # COMPOSE_PROJECT), and the project this tier stamps on a connector
@@ -1886,6 +1961,14 @@ rung_local_release() {
             "$(container_env_value "$worker" CURIE_RELEASE)" \
             "$agent_name" \
             "$(container_env_value "$worker" CURIE_NAMESPACE)"
+    elif bundle_declares_connectors; then
+        # Same dual as rung 2, against the release compose file: a declaring
+        # bundle must host its connectors here too, since the generated file
+        # shares the pinned project name and the same delivery overlay.
+        local worker
+        worker="$(local_worker_container)"
+        assert_declared_connectors_hosted "local-release" curie \
+            "$(container_env_value "$worker" CURIE_RELEASE)" "$agent_name"
     else
         # Same compose project as rung 2: the release compose file the CLI
         # generates carries the same pinned project name.

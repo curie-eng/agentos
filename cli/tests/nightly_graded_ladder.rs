@@ -745,7 +745,17 @@ case "$*" in
         if [ -n "${STUB_FAKE_MODEL:-}" ]; then
             echo "CURIE_FAKE_MODEL=$STUB_FAKE_MODEL"
         fi
+        # The default local rungs read the connector scope off the same worker
+        # env: the stock weather bundle declares the netpol-probe fixture, so
+        # the dual assertion derives its identity label from this release.
+        echo "CURIE_RELEASE=curie"
         echo "PATH=/usr/local/bin:/usr/bin:/bin"
+        ;;
+    *"curietech.ai/connector=curie-weather-mcp-netpol-probe"*)
+        # The dual assertion's hosted read: the stock weather bundle declares
+        # the netpol-probe fixture, and this stubbed tier reports it running
+        # under exactly the identity label the reconciler stamps.
+        echo "curie-curie-weather-mcp-netpol-probe-1"
         ;;
     *"com.docker.compose.service=curie-worker"*)
         # Exactly one worker: the probe must refuse to guess when the scoping
