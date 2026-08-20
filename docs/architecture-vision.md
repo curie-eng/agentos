@@ -163,7 +163,11 @@ Kubernetes the chart's bundle-fetch init container fetches with the AWS CLI
 (`charts/curie/templates/agent-sandbox.yaml`), also pure S3 protocol.
 
 **Current adapter:** RustFS (Apache-2.0), deployed by the chart
-(`charts/curie/templates/rustfs.yaml`).
+(`charts/curie/templates/rustfs.yaml`) with the pinned image
+`rustfs/rustfs:1.0.0-beta.12`. This release is before general availability.
+RustFS's [feature status](https://github.com/rustfs/rustfs/blob/22b4ef9f0c24e22633a4eb62fb600f0d6675ee1d/README.md#feature--status)
+marks Lifecycle Management, Distributed Mode, and RustFS KMS as Under Testing.
+AWS S3 and Cloudflare R2 remain configuration only alternatives.
 
 **Swap:** AWS S3, Cloudflare R2, or any S3-compatible store is config only
 (endpoint, keys, region). GCS is a real decision: either rely on its
