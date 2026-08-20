@@ -177,7 +177,7 @@ async fn resolve_cluster_conn(
         Some(pf_cmd) => {
             let (child, effective_port) =
                 message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
-            (format!("http://localhost:{effective_port}"), Some(child))
+            (format!("http://127.0.0.1:{effective_port}"), Some(child))
         }
         None => {
             let url = api_url.expect("explicit url when no port-forward");
@@ -3063,7 +3063,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         // svc/<release>-api serves the platform API at ROOT, so the
                         // base URL has NO /api suffix (the /api in ADR-0024 was only
                         // because the request went through the UI pod).
-                        format!("http://localhost:{effective_port}")
+                        format!("http://127.0.0.1:{effective_port}")
                     }
                     None => {
                         _deploy_pf = None;

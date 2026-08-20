@@ -95,12 +95,14 @@ def proxy(client, backend_host, backend_port):
         client.close()
 
 if "port-forward" in args:
-    local_port = int(args[-1].split(":", 1)[0])
+    local_port, remote_port = args[-1].split(":", 1)
+    local_port = int(local_port)
     backend = urlparse(os.environ["CURIE_TEST_TUNNEL_BACKEND"])
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", local_port))
     listener.listen()
+    print(f"Forwarding from 127.0.0.1:{local_port} -> {remote_port}", flush=True)
     while True:
         client, _ = listener.accept()
         threading.Thread(
