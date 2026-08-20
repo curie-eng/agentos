@@ -73,6 +73,7 @@ from .types import (
     OperatingMode,
     SandboxError,
     SandboxView,
+    filter_agent_child_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -298,7 +299,7 @@ class DockerSandboxClient:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
-        env = dict(env or {})
+        env = filter_agent_child_env(env)
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
         args = [
             "run",

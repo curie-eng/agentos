@@ -11,10 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
+
+from aci_protocol import BootEnv
+from aci_protocol.service_config import API_KEY_ENV
+from plugin_format import is_reserved_boot_env_name
 
 # Substrate-neutral labels: every backend tags its managed objects with these
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they
@@ -22,6 +27,43 @@ from typing import Literal, Protocol
 MANAGED_BY_LABEL = "curietech.ai/managed-by"
 MANAGED_BY_VALUE = "curie-sandbox-substrate"
 THREAD_HASH_LABEL = "curietech.ai/thread-hash"
+
+HOST_APPLICATION_CREDENTIAL_ENV_NAMES: frozenset[str] = frozenset(
+    {
+        "POSTGRES_PASSWORD",
+        "DATABASE_URL",
+        "VALKEY_PASSWORD",
+        "SLACK_BOT_TOKEN",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        API_KEY_ENV,
+        "LANGFUSE_SECRET_KEY",
+        "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+    }
+)
+
+
+def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """Return a copied child environment without host application credentials."""
+
+    if env is None:
+        return {}
+    declared_connector_secret_names = {
+        name
+        for name in env.get(BootEnv.env_key("connector_secret_keys"), "").split(",")
+        if name
+    }
+    return {
+        name: value
+        for name, value in env.items()
+        if name not in HOST_APPLICATION_CREDENTIAL_ENV_NAMES
+        or (
+            name in declared_connector_secret_names
+            and not is_reserved_boot_env_name(name)
+        )
+    }
 
 
 class RouteState(StrEnum):
@@ -195,7 +237,14 @@ class SandboxClient(Protocol):
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Create a claim after excluding host credentials from the child environment.
+
+        Implementations must apply ``filter_agent_child_env`` before constructing
+        any agent child environment.
+        """
+
+        ...
 
     def get_claim(self, name: str) -> ClaimView | None: ...
 

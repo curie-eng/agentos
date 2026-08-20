@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from curie_worker.bundle_store import extract_bundle
 from curie_worker.sandbox.docker import (
     RUNNER_CONTAINER_PORT,
@@ -71,6 +73,77 @@ def test_create_claim_argv_carries_boot_env() -> None:
     assert "CURIE_FAKE_MODEL=1" in envs
     assert "OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:4318" in envs
     assert argv[-1] == "curie-runner"
+
+
+def test_create_claim_excludes_host_credentials_from_child_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    denied_names = {
+        "POSTGRES_PASSWORD",
+        "DATABASE_URL",
+        "VALKEY_PASSWORD",
+        "SLACK_BOT_TOKEN",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "CURIE_API_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+    }
+    for name in denied_names:
+        monkeypatch.setenv(name, "placeholder")
+    monkeypatch.setenv("CURIE_BUDGET", "{}")
+    monkeypatch.setenv("CURIE_CREDENTIALS", "placeholder")
+    monkeypatch.delenv("CURIE_BUNDLE_REF", raising=False)
+    monkeypatch.delenv("CURIE_FAKE_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("CURIE_CONNECTOR_SECRET_KEYS", raising=False)
+
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim("thread-credentials", pool="pool", env=os.environ)
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert denied_names.isdisjoint(child_env_names)
+    assert "CURIE_BUDGET" in child_env_names
+    assert "CURIE_CREDENTIALS" in child_env_names
+
+
+def test_create_claim_preserves_declared_connector_secret() -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-connector-secret",
+        pool="pool",
+        env={
+            "CURIE_CONNECTOR_SECRET_KEYS": "SLACK_BOT_TOKEN",
+            "SLACK_BOT_TOKEN": "placeholder",
+        },
+    )
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert {"CURIE_CONNECTOR_SECRET_KEYS", "SLACK_BOT_TOKEN"} <= child_env_names
+
+
+def test_create_claim_connector_marker_cannot_readmit_reserved_curie_credential() -> None:
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+    client.create_claim(
+        "thread-reserved-connector-secret",
+        pool="pool",
+        env={
+            "CURIE_CONNECTOR_SECRET_KEYS": "CURIE_SEALING_PRIVATE_KEY",
+            "CURIE_SEALING_PRIVATE_KEY": "placeholder",
+        },
+    )
+
+    child_env_names = {
+        entry.partition("=")[0] for entry in _flag_values(client.calls[0], "-e")
+    }
+    assert "CURIE_CONNECTOR_SECRET_KEYS" in child_env_names
+    assert "CURIE_SEALING_PRIVATE_KEY" not in child_env_names
 
 
 def test_create_claim_fetches_and_unwraps_bundle() -> None:
