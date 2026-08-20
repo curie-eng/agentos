@@ -133,10 +133,10 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
     );
 
     let version_request = &recorded[2];
-    let mut version_body: serde_json::Value =
+    let version_body: serde_json::Value =
         serde_json::from_slice(&version_request.body).expect("version body should be JSON");
     let deployment_request = &recorded[4];
-    let mut deployment_body: serde_json::Value =
+    let deployment_body: serde_json::Value =
         serde_json::from_slice(&deployment_request.body).expect("deployment body should be JSON");
 
     if let Some(commit_sha) = commit_sha {
@@ -158,26 +158,12 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
             })
         );
     } else {
-        if version_body
-            .get("commit_sha")
-            .is_some_and(serde_json::Value::is_null)
-        {
-            version_body.as_object_mut().unwrap().remove("commit_sha");
-        }
-        if deployment_body
-            .get("commit_sha")
-            .is_some_and(serde_json::Value::is_null)
-        {
-            deployment_body
-                .as_object_mut()
-                .unwrap()
-                .remove("commit_sha");
-        }
         assert_eq!(
             version_body,
             serde_json::json!({
                 "version_label": "0.1.0-1",
                 "created_by": std::env::var("USER").unwrap_or_else(|_| "curie-cli".to_string()),
+                "commit_sha": null,
             })
         );
         assert_eq!(
@@ -186,6 +172,7 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
                 "agent_id": AGENT_ID,
                 "version_id": VERSION_ID,
                 "environment": "dev",
+                "commit_sha": null,
             })
         );
     }
@@ -193,7 +180,7 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn command_deploy_uses_one_bundle_head_and_omits_sha_for_a_non_git_bundle() {
+async fn command_deploy_uses_one_bundle_head_and_null_sha_for_a_non_git_bundle() {
     let git = real_git();
     let bundle = tempfile::tempdir().unwrap();
     scaffold(bundle.path(), "deal-desk").unwrap();

@@ -306,12 +306,13 @@ async def create_version(
 
 
 async def get_version_by_commit(
-    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str
+    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str, created_by: str
 ) -> AgentVersion | None:
     version: AgentVersion | None = await session.scalar(
         select(AgentVersion).where(
             AgentVersion.agent_id == agent_id,
             AgentVersion.commit_sha == commit_sha,
+            AgentVersion.created_by == created_by,
         )
     )
     return version

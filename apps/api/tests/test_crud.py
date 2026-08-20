@@ -147,6 +147,7 @@ def test_version_and_deployment_persist_same_commit_sha(
     assert listed_deployments[0]["commit_sha"] == commit_sha
 
 
+# The eval trigger fallback requires deployment provenance to remain independent.
 def test_version_and_deployment_persist_distinct_commit_shas(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:

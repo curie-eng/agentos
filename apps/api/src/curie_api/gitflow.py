@@ -426,7 +426,9 @@ async def process_push(
         # correct and is what an unmatched branch already does.
         return WebhookResult(status="ignored")
 
-    version = await crud.get_version_by_commit(session, agent.id, after)
+    version = await crud.get_version_by_commit(
+        session, agent.id, after, created_by="git-flow"
+    )
     # Only a version whose bundle is actually stored may be reused for promote.
     # A row with bundle_ref still None is the residue of a prior attempt that
     # failed after the row committed; rebuild and store into it rather than
@@ -645,7 +647,9 @@ async def _sibling_bundle(
     for sibling in repo_agents:
         if sibling.id == agent_id:
             continue
-        existing = await crud.get_version_by_commit(session, sibling.id, commit_sha)
+        existing = await crud.get_version_by_commit(
+            session, sibling.id, commit_sha, created_by="git-flow"
+        )
         if existing is not None and existing.bundle_ref:
             return existing
     return None
