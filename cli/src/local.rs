@@ -472,7 +472,11 @@ pub async fn with_deploy_unreachable_hint<T>(result: Result<T>, api_url: &str) -
     match result {
         Err(err) if crate::exit::is_transient_reqwest(&err) => {
             if !uses_default_local_api(api_url) {
-                return Err(err.context(deploy_unreachable_hint(api_url, None)));
+                return Err(crate::exit::operator_context(
+                    err,
+                    deploy_unreachable_hint(api_url, None),
+                    None,
+                ));
             }
 
             let cmd = OpsCommand::new(
@@ -485,7 +489,7 @@ pub async fn with_deploy_unreachable_hint<T>(result: Result<T>, api_url: &str) -
                     "the platform API at {api_url} is unreachable, and Curie could not read local compose state. Run `curie local status`, then re-run."
                 ),
             };
-            Err(err.context(hint))
+            Err(crate::exit::operator_context(err, hint, None))
         }
         result => result,
     }
@@ -1646,10 +1650,15 @@ mod tests {
             .await
             .expect_err("port 1 must refuse the test connection");
 
-        let result: anyhow::Result<()> = Err(transient.into());
+        let result: anyhow::Result<()> = Err(crate::exit::operator_context(
+            transient.into(),
+            "the API request failed",
+            None,
+        ));
         let error = with_deploy_unreachable_hint(result, crate::message::DEFAULT_LOCAL_API_URL)
             .await
             .expect_err("the original deploy failure must remain an error");
+        let (normal_message, _) = crate::exit::present_error(&error);
         let rendered = format!("{error:#}");
         let invocations = std::fs::read_to_string(&log).expect("read docker invocation log");
 
@@ -1657,6 +1666,14 @@ mod tests {
             invocations.trim(),
             "compose -p curie ps",
             "diagnosis must inspect the running Curie project by name"
+        );
+        assert!(
+            normal_message.contains("local stack is still starting"),
+            "normal output must select the state aware compose diagnosis: {normal_message}"
+        );
+        assert!(
+            !normal_message.contains("the API request failed"),
+            "normal output must not select the inner generic context: {normal_message}"
         );
         assert!(
             rendered.contains("local stack is still starting"),
