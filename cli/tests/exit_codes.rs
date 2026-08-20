@@ -254,8 +254,12 @@ fn local_deploy_keeps_connection_causes_out_of_the_human_error() {
     );
     let error_line = single_line_with_prefix(&human_stderr, "Error: ");
     assert!(
-        error_line.contains("Start the local stack first with `curie local up`"),
-        "the human error must retain the remedy: {human_stderr}"
+        error_line.contains("Check that --api-url points to a reachable API"),
+        "the human error must retain the custom API remedy: {human_stderr}"
+    );
+    assert!(
+        !error_line.contains("curie local up"),
+        "a custom API failure must not tell the user to start the local stack: {human_stderr}"
     );
     assert_eq!(
         error_line.matches(UNREACHABLE_API_URL).count(),

@@ -33,6 +33,7 @@ from .config import Settings
 from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
 from .models import Agent, AgentVersion, Environment
+from .repo_full_name import InvalidRepoFullName, repo_url_path
 from .schemas import WebhookResult
 from .storage import ObjectStore
 
@@ -57,6 +58,10 @@ class GitFlowError(Exception):
 
 class CloneOriginMismatch(GitFlowError):
     """The payload's clone URL is not the registered repository's origin."""
+
+
+class CommitNotOnBranch(GitFlowError):
+    """The pushed commit is not reachable from the payload's deploy branch."""
 
 
 def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
@@ -96,7 +101,7 @@ def trusted_clone_url(repo_full_name: str, settings: Settings) -> str:
     only ever travel to the configured host (#1122).
     """
 
-    return f"{settings.github_clone_base.rstrip('/')}/{repo_full_name}.git"
+    return f"{settings.github_clone_base.rstrip('/')}/{repo_url_path(repo_full_name)}.git"
 
 
 def _origin_key(url: str) -> tuple[str, str, str, str, int | None, str, str, str]:
@@ -189,7 +194,9 @@ def _clone_credential_env(
     }
 
 
-def _git_failure_detail(exc: BaseException) -> str:
+def _git_failure_detail(
+    exc: BaseException | subprocess.CompletedProcess[bytes],
+) -> str:
     """git's stderr, which says *why* -- 'Repository not found' vs a timeout.
 
     The old message interpolated the exception, whose repr is the argv and an
@@ -213,6 +220,7 @@ def clone_and_archive(
     settings: Settings,
     *,
     repo_full_name: str,
+    ref: str,
     credentials: Any = None,
 ) -> bytes:
     """Mirror-clone the repo and return a tar of the tree at ``sha``.
@@ -256,6 +264,7 @@ def clone_and_archive(
     env = {
         **os.environ,
         "GIT_ALLOW_PROTOCOL": "file:https:http",
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         **_clone_credential_env(
             trusted_url, settings, repo_full_name=repo_full_name, credentials=credentials
@@ -288,6 +297,22 @@ def clone_and_archive(
                 env=env,
                 timeout=120,
             )
+            ancestry = subprocess.run(
+                ["git", "-C", tmp, "merge-base", "--is-ancestor", sha, ref],
+                check=False,
+                capture_output=True,
+                env=env,
+                timeout=120,
+            )
+            if ancestry.returncode == 1:
+                raise CommitNotOnBranch(
+                    f"commit {sha[:12]} is not reachable from {ref}"
+                )
+            if ancestry.returncode != 0:
+                raise GitFlowError(
+                    f"could not verify commit {sha[:12]} against {ref}: "
+                    f"{_git_failure_detail(ancestry)}"
+                )
             archived = subprocess.run(
                 ["git", "-C", tmp, "archive", "--format=tar", "--", sha],
                 check=True,
@@ -353,7 +378,9 @@ async def process_push(
     ref = payload.get("ref")
     after = payload.get("after")
     repo = payload.get("repository")
-    environment = environment_for_ref(ref if isinstance(ref, str) else None, settings)
+    if not isinstance(ref, str):
+        return WebhookResult(status="ignored")
+    environment = environment_for_ref(ref, settings)
     if environment is None:
         return WebhookResult(status="ignored")
     if not isinstance(after, str) or after == _ZERO_SHA or not _is_valid_sha(after):
@@ -393,11 +420,21 @@ async def process_push(
             after,
             settings,
             repo_full_name=trusted_repo_full_name,
+            ref=ref,
         )
         extension, content_type = deploy.validate_archive(archive, settings)
+    except InvalidRepoFullName as exc:
+        return WebhookResult(
+            status="rejected", errors=[{"code": "git.invalid_repository", "message": str(exc)}]
+        )
     except CloneOriginMismatch as exc:
         return WebhookResult(
             status="rejected", errors=[{"code": "git.origin_mismatch", "message": str(exc)}]
+        )
+    except CommitNotOnBranch as exc:
+        return WebhookResult(
+            status="rejected",
+            errors=[{"code": "git.commit_not_on_branch", "message": str(exc)}],
         )
     except GitFlowError as exc:
         return WebhookResult(
