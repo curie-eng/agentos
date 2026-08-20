@@ -27,10 +27,9 @@ Three properties worth stating, because each is a way this could go wrong:
 - **It polls per REPOSITORY, not per agent.** Several agents share one
   repository (ADR-0091), so per-agent polling would make N identical API calls
   and race N deploys of the same commit against each other.
-- **It never deploys a commit it has already deployed.** The check is the
-  ``commit_sha`` already recorded for that repository, so a restart does not
-  redeploy the current HEAD, and a webhook that already handled a push makes
-  the next poll a no-op.
+- **It never redeploys a commit already deployed by Git flow.** Only Git flow
+  authored versions establish this baseline. A CLI deployment at the same SHA
+  must not suppress the build, evaluation, and deployment owned by Git flow.
 - **One failing repository does not stop the others.** A repo whose credential
   has been revoked, or that has been deleted, must not silently halt polling
   for every other agent on the cluster.
@@ -48,6 +47,7 @@ from typing import Any, Protocol
 import httpx
 
 from .config import Settings
+from .models import GIT_FLOW_CREATED_BY
 
 logger = logging.getLogger(__name__)
 
@@ -245,10 +245,11 @@ class GitHubBranchTip:
         return str(sha) if isinstance(sha, str) else None
 
 
-# The last commit deployed per (repository, environment). Environment rather
-# than branch because that is what a Deployment records; the caller maps
-# environments back to branch names via Settings, the same mapping
-# `environment_for_ref` uses in the other direction.
+# The last Git flow authored commit deployed per (repository, environment).
+# Public CLI artifacts do not settle this baseline. Environment rather than
+# branch because that is what a Deployment records; the caller maps environments
+# back to branch names via Settings, the same mapping `environment_for_ref` uses
+# in the other direction.
 _DEPLOYED_SQL = """
 SELECT DISTINCT ON (a.repo_full_name, d.environment)
        a.repo_full_name AS repo_full_name,
@@ -259,7 +260,7 @@ JOIN {schema}.agents a ON a.id = d.agent_id
 JOIN {schema}.agent_versions v ON v.id = d.version_id
 WHERE a.repo_full_name IS NOT NULL
   AND d.commit_sha IS NOT NULL
-  AND v.created_by = 'git-flow'
+  AND v.created_by = :git_flow_created_by
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
@@ -363,7 +364,10 @@ class CommitPoller:
             ):
                 bindings.setdefault(str(repo), []).append(str(agent_name))
             deployed: dict[tuple[str, str], str] = {}
-            for repo, env, sha in await session.execute(text(_DEPLOYED_SQL.format(schema=schema))):
+            deployed_stmt = text(_DEPLOYED_SQL.format(schema=schema)).bindparams(
+                git_flow_created_by=GIT_FLOW_CREATED_BY
+            )
+            for repo, env, sha in await session.execute(deployed_stmt):
                 branch = branch_for_env.get(str(env))
                 if branch:
                     deployed[(str(repo), branch)] = str(sha)

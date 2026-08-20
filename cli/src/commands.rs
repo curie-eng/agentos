@@ -3531,15 +3531,37 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
-    let commit_sha = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
+    let git_status = tokio::process::Command::new("git")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            ".",
+        ])
         .current_dir(&plugin_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|sha| sha.trim().to_string())
-        .filter(|sha| !sha.is_empty());
+        .await
+        .ok();
+    let commit_sha = match git_status {
+        Some(output) if output.status.success() && output.stdout.is_empty() => {
+            tokio::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&plugin_dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .await
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|sha| sha.trim().to_string())
+                .filter(|sha| !sha.is_empty())
+        }
+        _ => None,
+    };
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
     // as TEXT and parsed server-side: one parser means the CLI and the

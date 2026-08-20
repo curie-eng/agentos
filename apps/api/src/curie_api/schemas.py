@@ -28,7 +28,7 @@ from pydantic import (
 )
 
 from .config import get_settings
-from .models import Environment
+from .models import GIT_FLOW_CREATED_BY, Environment
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -903,6 +903,13 @@ class VersionCreate(BaseModel):
     bundle_ref: str | None = None
     commit_sha: str | None = None
     created_by: str
+
+    @field_validator("created_by")
+    @classmethod
+    def reject_internal_provenance(cls, value: str) -> str:
+        if value == GIT_FLOW_CREATED_BY:
+            raise ValueError("created_by is reserved for internal Git flow versions")
+        return value
 
 
 class VersionOut(BaseModel):
