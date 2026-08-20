@@ -151,12 +151,15 @@ def test_a_job_never_steers_a_live_session(make_harness) -> None:
     async def go() -> None:
         async with make_harness() as h:
             h.runner.turn_active = True
+            event = _qevent(
+                "nightly digest", placeholder=None, source=TurnSource.CRON
+            )
 
-            with pytest.raises(ThreadBusyError):
-                await h.kernel.process_event(
-                    _qevent("nightly digest", placeholder=None, source=TurnSource.CRON)
-                )
+            for _ in range(5):
+                with pytest.raises(ThreadBusyError):
+                    await h.kernel.process_event(event)
 
+            assert h.sink.text_posts == [], "a deferred job left a booting notice"
             assert h.runner.steers == [], "a job steered a live session"
             assert h.runner.opened == [], "a job opened a turn beside a live one"
 
