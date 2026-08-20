@@ -52,3 +52,11 @@ async def get_deployment(
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     return DeploymentOut.model_validate(deployment)
+
+
+@router.delete("/{deployment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def end_deployment(deployment_id: uuid.UUID, session: SessionDep) -> None:
+    deployment = await crud.get_deployment(session, deployment_id)
+    if deployment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
+    await crud.end_deployment(session, deployment)

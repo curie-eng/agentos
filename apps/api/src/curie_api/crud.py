@@ -392,6 +392,11 @@ async def get_deployment(session: AsyncSession, deployment_id: uuid.UUID) -> Dep
     return await session.get(Deployment, deployment_id)
 
 
+async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
+    deployment.status = "stopped"
+    await session.commit()
+
+
 # -- approvals (#244, ADR-0010) -------------------------------------------------
 
 
@@ -903,4 +908,3 @@ async def revoke_console_session(
     await session.commit()
     await session.refresh(row)
     return row
-

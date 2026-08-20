@@ -4221,23 +4221,30 @@ impl crate::ui::CliOutput for DeleteOutput {
     }
 }
 
-/// `curie cluster delete <agent> --yes`: delete the agent
-/// (`DELETE /agents/{id}`). Destructive and irreversible, so it refuses without
-/// `--yes`, mirroring `cluster down`. `--dry-run` returns the plan and makes no
-/// request.
+/// `curie <tier> delete <agent> --yes`: end active deployments, then delete the
+/// agent. Destructive and irreversible, so it refuses without `--yes`.
+/// `--dry-run` returns the plan and makes no request.
 pub async fn delete(opts: AgentActionOpts, yes: bool) -> Result<DeleteOutput> {
     let ui = crate::ui::ui();
     if opts.dry_run {
         return Ok(DeleteOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![format!(
-                "DELETE {}/agents/<id>  (would resolve agent {:?} first)",
-                opts.api_url, opts.agent
-            )],
+            lines: vec![
+                format!(
+                    "GET {}/agents  (would resolve agent {:?})",
+                    opts.api_url, opts.agent
+                ),
+                format!("GET {}/deployments?agent_id=<id>", opts.api_url),
+                format!(
+                    "DELETE {}/deployments/<id>  (for each active deployment)",
+                    opts.api_url
+                ),
+                format!("DELETE {}/agents/<id>", opts.api_url),
+            ],
         }));
     }
     if !yes {
         return Err(crate::exit::CliError::usage(format!(
-            "`curie cluster delete {}` permanently deletes the agent; re-run with --yes to confirm",
+            "`curie ... delete {}` permanently deletes the agent; re-run with --yes to confirm",
             opts.agent
         ))
         .with_fix("re-run with --yes")
@@ -4246,6 +4253,16 @@ pub async fn delete(opts: AgentActionOpts, yes: bool) -> Result<DeleteOutput> {
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let cl = ui.checklist();
+    for deployment in client.list_deployments(&agent.id).await? {
+        if deployment.status == "active" {
+            let step = cl.step(&format!("ending deployment {}", deployment.id));
+            if let Err(err) = client.end_deployment(&deployment.id).await {
+                step.fail("failed");
+                return Err(err);
+            }
+            step.done("ended");
+        }
+    }
     let step = cl.step(&format!("deleting {}", agent.name));
     match client.delete_agent(&agent.id).await {
         Ok(()) => step.done("deleted"),

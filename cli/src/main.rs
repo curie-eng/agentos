@@ -1271,6 +1271,25 @@ enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Delete an agent via the local platform API.
+    Delete {
+        /// Agent name or id to delete.
+        agent: String,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Confirm this destructive action.
+        #[arg(long)]
+        yes: bool,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2564,6 +2583,24 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                     },
                     thread_key,
+                    yes,
+                )
+                .await?,
+            ),
+            LocalAction::Delete {
+                agent,
+                api_url,
+                api_key,
+                yes,
+                dry_run,
+            } => emit(
+                commands::delete(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
                     yes,
                 )
                 .await?,
