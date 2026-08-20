@@ -12,6 +12,7 @@ use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
 use crate::bundle::pack_tar_gz;
@@ -2389,8 +2390,13 @@ pub async fn send(
     url: Option<String>,
 ) -> Result<()> {
     let url = resolve_url(url)?;
+    let saved = state::load(Path::new(".")).unwrap_or(None);
+    let bundle_warning = editable_bundle_warning(saved.as_ref(), &url);
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
+    if let Some(warning) = bundle_warning {
+        ui.warn(&warning);
+    }
     let mut printer = TurnPrinter::default();
 
     // Under `--json`, answer tokens are suppressed on stdout (they route through
@@ -2509,6 +2515,31 @@ pub struct SkillMessageOutput {
     pub finalized: bool,
 }
 
+fn editable_bundle_warning(saved: Option<&state::RunnerState>, url: &str) -> Option<String> {
+    let saved = saved.filter(|saved| saved.base_url == url)?;
+    let recorded_digest = saved.bundle_digest.as_deref()?;
+    let archive = match pack_tar_gz(Path::new(&saved.plugin_dir)) {
+        Ok(archive) => archive,
+        Err(_) => {
+            return Some(
+                "could not compare the editable bundle with the running snapshot. Run `curie skill up --replace` after fixing the bundle."
+                    .to_string(),
+            );
+        }
+    };
+    let editable_digest: String = Sha256::digest(&archive)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if editable_digest == recorded_digest {
+        return None;
+    }
+    Some(
+        "editable bundle differs from the running snapshot. Run `curie skill up --replace` to load the changes."
+            .to_string(),
+    )
+}
+
 impl crate::ui::CliOutput for SkillMessageOutput {
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -2535,8 +2566,6 @@ pub async fn eval(
 ) -> Result<()> {
     let saved = state::load(Path::new("."))?;
     let state_plugin_dir = saved.as_ref().map(|s| PathBuf::from(s.plugin_dir.clone()));
-    let cases_path = resolve_cases_path(cases_path, Path::new("."), state_plugin_dir.as_deref())?;
-    let loaded = load_eval(&cases_path)?;
 
     // Model selection (#526): with `--model`, boot a transient runner per model,
     // run the suite against each, and report pass-rate per model -- the one
@@ -2544,6 +2573,14 @@ pub async fn eval(
     // manual `skill up --model X` + `skill eval` loop per model. Without it, the
     // default path drives the already-running runner (whatever model it booted).
     if !models.is_empty() {
+        let recorded_snapshot_dir = sweep_snapshot(saved.as_ref()).map(|(dir, _)| dir);
+        let cases_path = resolve_cases_path(
+            cases_path,
+            Path::new("."),
+            recorded_snapshot_dir.as_deref(),
+            state_plugin_dir.as_deref(),
+        )?;
+        let loaded = load_eval(&cases_path)?;
         return eval_sweep(
             &loaded.suite,
             loaded.trajectory.as_ref(),
@@ -2558,6 +2595,18 @@ pub async fn eval(
 
     let fake = drives_a_fake_runner(saved.as_ref(), url.as_deref());
     let url = resolve_url(url)?;
+    let recorded_snapshot_dir = saved
+        .as_ref()
+        .filter(|saved| saved.base_url == url)
+        .and_then(|saved| saved.bundle_snapshot_dir.as_ref())
+        .map(PathBuf::from);
+    let cases_path = resolve_cases_path(
+        cases_path,
+        Path::new("."),
+        recorded_snapshot_dir.as_deref(),
+        state_plugin_dir.as_deref(),
+    )?;
+    let loaded = load_eval(&cases_path)?;
     // #1087 AC2: the bundle this eval graded, on the machine surface, so an
     // agent can confirm it is the SAME digest `skill status`/`skill message`
     // report without reading a human note off stderr (docs/agents.md bans
@@ -3281,16 +3330,30 @@ impl crate::ui::CliOutput for EvalOutput<'_> {
 }
 
 /// Where the eval cases live: an explicit `--cases` wins; otherwise
-/// `evals/cases.json` in the current directory, falling back to the started
-/// runner's recorded bundle directory (so `curie skill eval` works from
-/// wherever `curie skill up` was run).
+/// `evals/cases.json` in the recorded running snapshot wins, then the current
+/// directory and, only when no snapshot is recorded, the started runner's
+/// recorded bundle directory (so `curie skill eval` works from wherever `curie
+/// skill up` was run).
 pub fn resolve_cases_path(
     explicit: Option<PathBuf>,
     cwd: &Path,
+    recorded_snapshot_dir: Option<&Path>,
     state_plugin_dir: Option<&Path>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
+    }
+    if let Some(snapshot_dir) = recorded_snapshot_dir {
+        let in_snapshot = snapshot_dir.join("evals/cases.json");
+        if in_snapshot.is_file() {
+            return Ok(in_snapshot);
+        }
+        return Err(crate::exit::CliError::usage(format!(
+            "no eval cases found in the running snapshot: {}. Run `curie skill up --replace` or pass --cases",
+            in_snapshot.display()
+        ))
+        .with_fix("run `curie skill up --replace` or pass --cases")
+        .into());
     }
     let local = cwd.join("evals/cases.json");
     if local.is_file() {
@@ -6266,13 +6329,33 @@ mod tests {
 
     #[test]
     fn explicit_cases_path_wins() {
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("evals")).unwrap();
+        std::fs::write(snapshot.path().join("evals/cases.json"), "[]").unwrap();
         let path = resolve_cases_path(
             Some(PathBuf::from("/x/cases.json")),
             std::path::Path::new("/nowhere"),
+            Some(snapshot.path()),
             None,
         )
         .unwrap();
         assert_eq!(path, PathBuf::from("/x/cases.json"));
+    }
+
+    #[test]
+    fn missing_recorded_snapshot_cases_do_not_fall_back_to_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
+        std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+
+        let err = resolve_cases_path(None, cwd.path(), Some(snapshot.path()), None).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("no eval cases found in the running snapshot"),
+            "{message}"
+        );
+        assert!(message.contains("--cases"), "{message}");
     }
 
     #[test]
@@ -6283,20 +6366,20 @@ mod tests {
         std::fs::write(bundle.path().join("evals/cases.json"), "[]").unwrap();
 
         // cwd has no cases: resolve into the bundle dir from the state file.
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, bundle.path().join("evals/cases.json"));
 
         // cwd cases take precedence once present.
         std::fs::create_dir_all(cwd.path().join("evals")).unwrap();
         std::fs::write(cwd.path().join("evals/cases.json"), "[]").unwrap();
-        let resolved = resolve_cases_path(None, cwd.path(), Some(bundle.path())).unwrap();
+        let resolved = resolve_cases_path(None, cwd.path(), None, Some(bundle.path())).unwrap();
         assert_eq!(resolved, cwd.path().join("evals/cases.json"));
     }
 
     #[test]
     fn errors_when_nothing_is_found() {
         let cwd = tempfile::tempdir().unwrap();
-        let err = resolve_cases_path(None, cwd.path(), None).unwrap_err();
+        let err = resolve_cases_path(None, cwd.path(), None, None).unwrap_err();
         assert!(err.to_string().contains("--cases"), "{err}");
     }
 
