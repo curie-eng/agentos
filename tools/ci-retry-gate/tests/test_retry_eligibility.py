@@ -149,10 +149,9 @@ NON_INVOCATION_HEADS = frozenset(
 )
 SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", "false"})
 
-# The one step in the repository that has the shape of a retry loop without
-# being one: a readiness poll. It waits for a service it did not build to start
-# answering, and it never re invokes a command whose failure would be a defect,
-# so a second iteration cannot bury anything. A readiness poll is not a retry.
+# The steps below have the shape of a retry loop without being retries. They are
+# readiness polls for external state, and they never re invoke repository code
+# or a mutation whose failure would be a defect. A readiness poll is not a retry.
 #
 # This is the ONLY escape from the closed world rule 4 draws around in `run:`
 # retry constructs. Every other step in every workflow must either be on
@@ -161,6 +160,9 @@ SHELL_KEYWORDS = frozenset({"do", "done", "fi", "then", "else", "esac", "true", 
 RUN_RETRY_EXEMPT: frozenset[tuple[str, str, str]] = frozenset(
     {
         ("ci.yaml", "python", "Wait for Langfuse to serve"),
+        # The raw CDN is eventually consistent after publication. This poll
+        # never reruns repository code or the Pages publication mutation.
+        ("chart-index.yaml", "publish-index", "Verify the public Helm consumer path"),
     }
 )
 
@@ -567,15 +569,14 @@ def test_rule_4_no_protected_step_carries_a_retry() -> None:
         "retry and it is closed world like the other two: either the step is an "
         "eligible acquisition, or it is not retrying:\n" + _render(unaccounted)
     )
-    # Positive exercise of `_run_retry_construct` against a real workflow step,
-    # and the only one in this file. `Wait for Langfuse to serve` is a loop
-    # keyword together with a sleep, so all this guards is the LOOP_KEYWORDS
-    # and SLEEP_CALL half of the helper: a typo in either would satisfy every
-    # rule above just as well as a clean repository.
+    # Positive exercise of `_run_retry_construct` against real workflow steps.
+    # Both readiness polls use a loop keyword together with a sleep, so all this
+    # guards is the LOOP_KEYWORDS and SLEEP_CALL half of the helper: a typo in
+    # either would satisfy every rule above just as well as a clean repository.
     #
     # It says nothing about COMMAND_SEPARATORS or NON_INVOCATION_HEADS. The
     # helper returns from the loop branch before the duplicate invocation
-    # splitter ever runs, so this exemption never exercises that branch at all.
+    # splitter ever runs, so these exemptions never exercise that branch at all.
     # The duplicate invocation branch is guarded instead by
     # test_run_retry_construct_detects_every_constructed_shape below, which
     # calls the helper directly on constructed `cmd || cmd` bodies and asserts
@@ -702,13 +703,12 @@ def test_run_retry_construct_detects_every_constructed_shape() -> None:
     """Direct unit test over `_run_retry_construct`, independent of any workflow file.
 
     Rule 4's closed world sweep only ever exercises the helper positively
-    through RUN_RETRY_EXEMPT, and that single exemption (`Wait for Langfuse to
-    serve`) is a loop keyword together with a sleep. It returns from the loop
-    branch before the duplicate invocation splitter ever runs, so the branch
-    that catches a hand rolled `cmd || cmd` retry with no loop and no sleep has
-    zero positive coverage anywhere in this file: setting COMMAND_SEPARATORS so
-    it never matches deletes `cmd || cmd` detection outright, and every rule
-    above still passes.
+    through RUN_RETRY_EXEMPT, whose readiness polls use a loop keyword together
+    with a sleep. They return from the loop branch before the duplicate
+    invocation splitter ever runs, so the branch that catches a hand rolled
+    `cmd || cmd` retry with no loop and no sleep has zero positive coverage
+    anywhere in this file: setting COMMAND_SEPARATORS so it never matches
+    deletes `cmd || cmd` detection outright, and every rule above still passes.
 
     This test builds `run:` bodies directly and calls the helper on each,
     asserting both directions: constructed retries must be found, and

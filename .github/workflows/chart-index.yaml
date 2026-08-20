@@ -161,34 +161,33 @@ jobs:
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header"
           export CR_TOKEN="$GH_TOKEN"
 
-          if git ls-remote --exit-code --heads origin refs/heads/gh-pages >/dev/null 2>&1; then
-            pages_dir="$(mktemp -d "$RUNNER_TEMP/curie-pages.XXXXXX")"
-            git fetch --force --no-tags origin refs/heads/gh-pages:refs/remotes/origin/gh-pages
-            git worktree add --detach "$pages_dir" origin/gh-pages
-            unrelated="$(find "$pages_dir" -mindepth 1 -maxdepth 1 \
-              ! -name .git ! -name index.yaml ! -name .nojekyll -print -quit)"
-            if [ -n "$unrelated" ]; then
-              echo "The gh-pages branch contains unrelated content at $unrelated" >&2
-              exit 1
-            fi
-            git worktree remove "$pages_dir"
-          else
+          if ! git ls-remote --exit-code --heads origin refs/heads/gh-pages >/dev/null 2>&1; then
             seed_dir="$(mktemp -d "$RUNNER_TEMP/curie-pages-seed.XXXXXX")"
             (
               cd "$seed_dir"
               git init
               git checkout --orphan gh-pages
-              git config user.name github-actions
-              git config user.email github-actions@users.noreply.github.com
               touch .nojekyll
               git add .nojekyll
-              git commit -m "Initialize Helm chart index"
+              git -c user.name=github-actions \
+                -c user.email=github-actions@users.noreply.github.com \
+                commit -m "Initialize Helm chart index"
               git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
               git push origin gh-pages
             )
-            git fetch --force --no-tags origin \
-              refs/heads/gh-pages:refs/remotes/origin/gh-pages
           fi
+
+          git fetch --force --no-tags origin \
+            refs/heads/gh-pages:refs/remotes/origin/gh-pages
+          pages_dir="$(mktemp -d "$RUNNER_TEMP/curie-pages.XXXXXX")"
+          git worktree add --detach "$pages_dir" origin/gh-pages
+          unrelated="$(find "$pages_dir" -mindepth 1 -maxdepth 1 \
+            ! -name .git ! -name index.yaml ! -name .nojekyll -print -quit)"
+          if [ -n "$unrelated" ]; then
+            echo "The gh-pages branch contains unrelated content at $unrelated" >&2
+            exit 1
+          fi
+          git worktree remove "$pages_dir"
 
           git config user.name github-actions
           git config user.email github-actions@users.noreply.github.com
