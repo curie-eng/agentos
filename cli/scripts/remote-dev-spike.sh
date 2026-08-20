@@ -399,8 +399,8 @@ mode_run() {
         die "$STATE_FILE already exists, so a previous spike was never torn down. Run \`curie dev remote-dev-spike down\` first."
     fi
     if (( LIVE )); then
-        if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]; then
-            die "--live needs a model credential. Export CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, or drop --live to run sealed against the fake model."
+        if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -z "${ANTHROPIC_API_KEY:-}" && -z "${CURIE_CREDENTIALS:-}" ]]; then
+            die "--live needs a model credential. Export CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, or CURIE_CREDENTIALS (an sk-or- key routes to OpenRouter; set CURIE_MODEL to pick the model), or drop --live to run sealed against the fake model."
         fi
     fi
     # A connect probe rather than `ss`/`lsof`, so the precheck needs no extra
