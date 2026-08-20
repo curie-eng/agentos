@@ -374,10 +374,10 @@ fn live_cluster_rung_runs_weather_cases_with_the_message_listen_host() {
 
 /// The cluster rung's eval must run in `--json` mode. The human table prints a
 /// reply only for a RED case, so a green would carry no evidence of HOW it was
-/// earned -- and the weather case is precisely the one that can go green
-/// dishonestly (#1602): its regex grades that a temperature figure is present,
-/// not that the agent fetched one. The json payload carries `output` for every
-/// case, pass included, which is what keeps the report-only grade auditable in
+/// earned. The weather case now requires the fetch capability through its
+/// trajectory sidecar; its regex grades answer formatting only and cannot pass
+/// the full case alone. The json payload carries `output` for every case, pass
+/// included, which is what keeps the report only grade auditable in
 /// the job log. Asserted for the cluster rung alone, since the sibling
 /// assertions above pin the other rungs to the plain table.
 ///
@@ -1422,9 +1422,10 @@ fn parity_fails_when_a_second_active_deployment_exists() {
 /// The inverse of the local/local-release assertions above, which pin those
 /// rungs to a bare `"$BIN" local eval ...` that `set -e` makes fatal. On the
 /// cluster rung the grade is REPORT ONLY (#1603): the eval still runs and still
-/// prints, but a red case must not fail the rung, because the weather case
-/// grades temperature PRESENCE and the cluster rung's provider-only egress makes
-/// presence a function of model phrasing rather than of a real fetch.
+/// prints, but a red case must not fail the rung while cluster fetch success is
+/// unproved. The trajectory sidecar records requested tool identity, not
+/// successful execution. The model routing defect in #1709 was fixed by #1715
+/// on main and awaits its forward merge to next.
 ///
 /// This is the successor of the #872 coverage (commit 1d266a73's third bullet),
 /// which asserted the ladder EXITED 42 on a red deployed evaluator. #1603

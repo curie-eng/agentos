@@ -4,16 +4,18 @@
 //! agent or makes a model call. It exercises the frozen graders (the same
 //! `curie::evals::Grader::grade` the runner path grades with) against
 //! controlled synthetic outputs to prove every committed case is falsifiable --
-//! i.e. that a plausibly-broken agent (#527) cannot pass it, and that the grader
-//! is not simply broken for everything.
+//! i.e. that a null agent cannot pass it, and that the grader is not simply
+//! broken for everything. Capability removal is the separate proof that a
+//! case requires its declared capability.
 //!
 //! Three controls, all offline and deterministic, all driven off the committed
 //! suites discovered on disk (so a new suite is covered with no edit here):
 //!
-//!   A. Negative (no-op agent): no committed case may green against a canned
+//!   A. Negative (null agent): no committed case may green against a canned
 //!      response that ignores the input -- the fake model's "all done" final and
 //!      a silent empty answer. A case that greens here calls no tool and reads no
-//!      input yet passes, which is exactly the unfalsifiable shape #527 forbids.
+//!      input yet passes. This control is useful but does not prove that removing
+//!      a required capability makes the case red.
 //!      The real-path form of this control (boot the fake runner, run
 //!      `curie skill eval`, assert the red rollup) lives in
 //!      `cli/scripts/eval-falsifiability.sh` and its CI job; this is the fast,
@@ -127,12 +129,13 @@ fn fixtures() -> Fixtures {
     serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixtures {path} must be valid JSON: {e}"))
 }
 
-/// Control A -- negative, no-op agent. No committed case may pass against a
+/// Control A -- negative, null agent. No committed case may pass against a
 /// response that ignores the input entirely. The fake model's final text is
 /// "all done"; a silent agent answers with nothing. Either passing a case means
-/// the case greens without any real work.
+/// the case greens without any real work. This control alone does not prove
+/// capability removal falsifiability.
 #[test]
-fn no_committed_case_passes_against_a_no_op_agent() {
+fn no_committed_case_passes_against_a_null_agent() {
     let broken_outputs = ["all done", ""];
     let mut offenders: Vec<String> = Vec::new();
     for (name, suite) in discover_suites() {
@@ -149,8 +152,8 @@ fn no_committed_case_passes_against_a_no_op_agent() {
     }
     assert!(
         offenders.is_empty(),
-        "these committed eval cases pass against a do-nothing agent, so they are \
-         unfalsifiable (#527); tighten or remove the grader:\n  {}",
+        "these committed eval cases pass against a null agent; the null agent \
+         control requires them to red, but it does not prove capability removal:\n  {}",
         offenders.join("\n  ")
     );
 }

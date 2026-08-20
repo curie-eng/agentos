@@ -990,8 +990,9 @@ mod tests {
         let suite = load_suite(&path).unwrap();
         assert_eq!(suite.cases.len(), 1);
         let case = &suite.cases[0];
-        // Falsifiable case (#527): a real answer must carry a temperature figure,
-        // and the loader ignores the documentation-only `note` key on the case.
+        // Answer matcher: a passing final answer must carry a temperature figure.
+        // The trajectory sidecar supplies the separate fetch capability proof.
+        // The loader ignores the documentation-only `note` key on the case.
         assert_eq!(case.id, "reports-a-temperature");
         assert_eq!(case.grader.kind, GraderKind::Regex);
         // #620: the pattern accepts the degree glyph AND the spelled-out unit, so
@@ -1002,7 +1003,7 @@ mod tests {
     }
 
     #[test]
-    fn weather_grader_accepts_glyph_and_spelled_unit_but_not_a_figureless_refusal() {
+    fn weather_answer_matcher_accepts_glyph_and_spelled_unit_but_not_a_figureless_refusal() {
         // #620: prove the committed pattern's behavior by EXECUTING the grader
         // (not by inspecting the string) against the acceptance strings. The glyph
         // and both spellings pass; a refusal that carries no figure fails.
