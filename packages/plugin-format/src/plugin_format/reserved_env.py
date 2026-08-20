@@ -23,10 +23,22 @@ credential keys) and ``apps/worker/src/curie_worker/binding.py`` (the
 ``CURIE_*`` boot keys). This module re-enumerates them so the policy is
 greppable from one place; ``apps/worker/tests/binding/test_reserved_boot_env_pin.py``
 is the completeness + cross-language drift pin that fails CI if a boot or
-credential key is added there but not covered here (or if the Helm list drifts).
+credential key is added there but not covered here (or if the Helm or Rust list
+drifts).
+
+``SECRET_NAME_RE`` rides here too. Every seam that consults the reserved fence
+also holds a connector secret name to an env-var SHAPE, so both halves of the
+name policy come from one import rather than a regex copied per validator.
 """
 
 from __future__ import annotations
+
+import re
+
+# The shape a connector secret name must have, wherever it is declared: the
+# value is delivered to the sandbox as an environment variable and consumed by
+# ``${VAR}`` expansion, so a name that is not env-var-shaped can never bind.
+SECRET_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 # The four runner ``sdk_auth`` credential keys that are NOT ``CURIE_``-prefixed.
 # These are the exact gap #457 closes. Together with ``_REDIRECT_CAPTURE_KEYS``

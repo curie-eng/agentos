@@ -1062,6 +1062,10 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         secret: opts.secret,
         secret_binding_supported: true,
         connect_hint,
+        // The third local-deploy caller (block B1-11): it must reach the same
+        // preflight `local deploy` does, or a source-built bundle uploads with
+        // no lock check.
+        tier: DeployTier::Local,
     })
     .await
 }
@@ -1564,19 +1568,24 @@ fn short_digest(digest: &str) -> String {
 }
 
 /// Release everything a boot that has already packed its snapshot leaves behind
-/// when it aborts: the ollama sidecar, the network `start` owns, and the
-/// snapshot itself.
+/// when it aborts: the ollama sidecar, the hosted connectors, the network
+/// `start` owns, the credentials it staged, and the snapshot itself.
 ///
 /// One definition for all three abort arms between the pack and a recorded
 /// state, because nothing else will ever collect these: no state was saved, so
 /// no `skill down` can find them (#1087). A fourth abort path added later gets
 /// the whole sequence by calling this rather than by remembering three lines.
 ///
+/// Order is load bearing: the connectors are attached to the owned network, and
+/// `docker network rm` fails while any container is still on it, so every
+/// connector goes before the network does (ADR 0113).
+///
 /// Every release is best effort and deliberately swallows its error: these run
 /// while a command is already failing for its own reason, and must not change
 /// the error it reports or the code it exits with.
 async fn release_boot_scaffolding(
     ollama_container: Option<&String>,
+    connector_containers: &[String],
     owned_network: Option<&String>,
     snapshot_dir: &Path,
     plugin_dir: &Path,
@@ -1584,9 +1593,17 @@ async fn release_boot_scaffolding(
     if let Some(ollama) = ollama_container {
         let _ = docker::remove_container(ollama).await;
     }
+    for connector in connector_containers {
+        let _ = docker::remove_container(connector).await;
+    }
     if let Some(net) = owned_network {
         let _ = docker::remove_network(net).await;
     }
+    // After the connectors, never before: a tree still bind-mounted into a
+    // running container cannot be wiped cleanly, the same ordering
+    // `connector_teardown_plan` holds. Resolved credentials must not outlive a
+    // boot that no `skill down` can find.
+    let _ = crate::connector_build::wipe_connector_secrets(plugin_dir);
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
 }
 
@@ -1797,7 +1814,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // below reports the MODEL credential alone -- a `--secret` name riding in
     // `passthrough_env` is not one, and counting it would let the panel claim a
     // credential for a runner that has none.
-    let (model_cred_names, passthrough_env) = {
+    let (model_cred_names, mut passthrough_env) = {
         let ambient_present = ambient_present_for(&docker_env);
         let model_cred_names = select_passthrough_env(
             fake_model,
@@ -1809,12 +1826,79 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         (model_cred_names, passthrough)
     };
 
+    // Hosted-connector preflights (ADR 0113) run BEFORE the snapshot is packed:
+    // the runner validates the packed snapshot, so a lock rewritten after
+    // packing would leave the runner refusing the stale copy it was handed
+    // while the source directory holds the fresh one.
+    let connector_decl = crate::connector_build::load(&plugin_dir)?;
+    let declares_hosted_connectors = connector_decl
+        .connectors
+        .values()
+        .any(|spec| spec.url.is_none() && spec.unhosted_url.is_none());
+    if declares_hosted_connectors {
+        // Fail closed on a missing credential BEFORE anything is created. It
+        // runs ahead of the rebuild below because there is no point spending
+        // minutes building images for a bring-up that will refuse, and ahead of
+        // the network and every container because a partial bring-up that then
+        // aborts leaks work this checks for up front instead.
+        if let Err(err) = refuse_missing_connector_secrets(&connector_decl) {
+            if let Some(ollama) = &ollama_container {
+                let _ = docker::remove_container(ollama).await;
+            }
+            if let Some(net) = &owned_network {
+                let _ = docker::remove_network(net).await;
+            }
+            return Err(err);
+        }
+        // ADR 0113's Decision 3, and its deliberate asymmetry: at the skill tier
+        // a missing or stale `connectors.lock.yaml` is REBUILT here, where the
+        // source and a Docker daemon are both within reach; at the cluster tier
+        // `lock_preflight` refuses instead. Without this, an edit to a connector's
+        // source silently brings up the previously locked image. A fresh lock
+        // computes no rebuild and issues no `docker build`, so the offline
+        // guarantee `cli/CLAUDE.md` makes for `skill up` still holds. It runs
+        // before the snapshot pack so the runner's copy carries the lock this
+        // writes, and before `start_skill_connectors`, which re-reads the lock
+        // from disk and so picks up whatever this wrote.
+        let stale = connectors_needing_rebuild(
+            &connector_decl,
+            crate::connector_build::load_lock(&plugin_dir)?.as_ref(),
+            &recompute_source_digests(&plugin_dir, &connector_decl)?,
+        );
+        if !stale.is_empty() {
+            // Not forced: a lock resolved to a pushed registry image is the
+            // operator's, and `write_lock` refuses to quietly downgrade it to a
+            // local-daemon one behind a `skill up`.
+            if let Err(err) = build_connectors(ConnectorBuildOpts {
+                plugin_dir: plugin_dir.clone(),
+                registry: None,
+                force: false,
+            })
+            .await
+            {
+                // A build is minutes long and fails for ordinary reasons (a bad
+                // Dockerfile, no daemon), so it releases what boot has created so
+                // far rather than leaving an ollama sidecar to collide with the
+                // operator's next attempt. No snapshot or connector container
+                // exists yet.
+                if let Some(ollama) = &ollama_container {
+                    let _ = docker::remove_container(ollama).await;
+                }
+                if let Some(net) = &owned_network {
+                    let _ = docker::remove_network(net).await;
+                }
+                return Err(err.context("rebuilding the bundle's connectors"));
+            }
+        }
+    }
+
     // #1087: the skill tier executes an immutable, content-addressed snapshot,
     // not the editable source -- matching what local and cluster already do. The
     // packer is the deploy path's packer, so the digest is the same one the API
     // records for this source. Placed AFTER the --replace teardown above so a
     // re-up of unchanged source (same digest, same directory) cannot have the
-    // snapshot it just created torn down again.
+    // snapshot it just created torn down again, and after the connector
+    // rebuild above so the packed bundle carries the lock the runner validates.
     let snapshot = match crate::bundle::snapshot(&plugin_dir) {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -1829,6 +1913,55 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             return Err(err.context("packaging the bundle snapshot for the runner"));
         }
     };
+
+    // Hosted connectors (ADR 0113). A bundle that declares none takes the
+    // existing hermetic path untouched; one that declares some gets a private
+    // network the runner and the connectors share, and the connector scope in
+    // the runner's boot env so `derive_mcp_servers` takes its normal path.
+    let mut connector_containers: Vec<String> = Vec::new();
+    let mut connector_network: Option<String> = None;
+    if declares_hosted_connectors {
+        let net = match &network {
+            Some(net) => net.clone(),
+            None => {
+                let net = format!("{}-net", opts.name);
+                if docker::create_network(&net).await? {
+                    owned_network = Some(net.clone());
+                }
+                net
+            }
+        };
+        let identity = crate::connector_build::ConnectorScope {
+            release: "curie".to_string(),
+            agent: plugin_name.clone(),
+            namespace: "default".to_string(),
+        };
+        match start_skill_connectors(&plugin_dir, &connector_decl, &identity, &net, &session_id)
+            .await
+        {
+            Ok(started) => connector_containers = started,
+            Err(err) => {
+                // Nothing is recorded yet, so this is the only chance to release
+                // whatever the partial bring-up created (#747).
+                let steps = docker::connector_teardown_plan(
+                    &session_id,
+                    owned_network.as_deref(),
+                    Some(&plugin_dir),
+                );
+                let _ = docker::run_connector_teardown(&steps).await;
+                if let Some(ollama) = &ollama_container {
+                    let _ = docker::remove_container(ollama).await;
+                }
+                return Err(err.context("starting the bundle's connectors"));
+            }
+        }
+        for (key, value) in crate::connector_build::connector_scope_env(&identity) {
+            passthrough_env.push(key.clone());
+            docker_env.push((key, value));
+        }
+        network = Some(net.clone());
+        connector_network = Some(net);
+    }
 
     let spec = StartSpec {
         image: opts.image.clone(),
@@ -1856,9 +1989,11 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         Ok(id) => id,
         Err(err) => {
             // Nothing recorded the snapshot, so no teardown will ever find it
-            // (#1087); release it here alongside the sidecar and the network.
+            // (#1087); release it here alongside the sidecar, the connectors,
+            // and the network.
             release_boot_scaffolding(
                 ollama_container.as_ref(),
+                &connector_containers,
                 owned_network.as_ref(),
                 &snapshot.dir,
                 &plugin_dir,
@@ -1889,6 +2024,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // chance to release it (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -1919,6 +2055,8 @@ pub async fn start(opts: StartOpts) -> Result<()> {
             model_base_url: model_base_url.clone(),
             bundle_digest: Some(snapshot.digest.clone()),
             bundle_snapshot_dir: Some(snapshot.dir.display().to_string()),
+            connector_containers: connector_containers.clone(),
+            connector_network: connector_network.clone(),
         },
     ) {
         let _ = docker::remove_container(&opts.name).await;
@@ -1927,6 +2065,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         // nothing behind (#1087).
         release_boot_scaffolding(
             ollama_container.as_ref(),
+            &connector_containers,
             owned_network.as_ref(),
             &snapshot.dir,
             &plugin_dir,
@@ -2257,6 +2396,19 @@ async fn stop_recorded(
         ui.note(&format!(
             "kept model-cache volume '{volume}' for fast re-up; remove it with 'docker volume rm {volume}'"
         ));
+    }
+    // Connector containers, then the staged credential tree (ADR 0113,
+    // block B1-8). Label-scoped, so a connector this bundle started is reaped
+    // even if the record is incomplete; the network is left to the owned-network
+    // branch below, which alone knows whether this boot created it.
+    let connector_problems = docker::run_connector_teardown(&docker::connector_teardown_plan(
+        &saved.session_id,
+        None,
+        Some(dir),
+    ))
+    .await;
+    for problem in connector_problems {
+        ui.warn(&problem);
     }
     if let Some(net) = &saved.network {
         match docker::remove_network(net).await {
@@ -3425,6 +3577,20 @@ pub struct DeployOpts {
     /// `curie local up` for local). Naming the fix turns a raw
     /// "Connection refused" into something the operator can act on.
     pub connect_hint: String,
+    /// Which tier this deploy targets. Explicit and without a `Default` impl on
+    /// purpose: `local deploy`, `cluster deploy` and `deploy_named` all reach
+    /// one `deploy()`, so the cluster-only connector checks have nothing to
+    /// select on without it, and a new caller must not silently inherit
+    /// `Local` and skip them.
+    pub tier: DeployTier,
+}
+
+/// The tier a deploy targets. Two variants, no default: the compiler enumerates
+/// every construction site when the field is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployTier {
+    Local,
+    Cluster,
 }
 
 /// The declared connector-secret NAMES not present in the operator's bound
@@ -3498,6 +3664,32 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         .canonicalize()
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
     let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
+
+    // Connector lock preflight (ADR 0113), before the bundle is packed so the
+    // failure names the operator's own directory rather than a temp path, and
+    // long before anything is applied. `opts.plugin_dir` (not the canonicalized
+    // copy) is the path they typed.
+    {
+        let decl = crate::connector_build::load(&plugin_dir)?;
+        if decl.connectors.values().any(|spec| spec.build.is_some()) {
+            let recomputed = recompute_source_digests(&plugin_dir, &decl)?;
+            let lock = crate::connector_build::load_lock(&plugin_dir)?;
+            lock_preflight(
+                &opts.plugin_dir,
+                &decl,
+                lock.as_ref(),
+                &recomputed,
+                opts.tier,
+            )?;
+            // What the REGISTRY answers for the locked digest, not what the lock
+            // claims about it, is what a node has to pull (see
+            // `registry_preflight`). Cluster only: no local deploy pulls this.
+            if opts.tier == DeployTier::Cluster {
+                run_registry_preflight(&decl, lock.as_ref()).await?;
+            }
+        }
+    }
+
     let label = opts
         .label
         .unwrap_or_else(|| format!("{manifest_version}-{}", unix_now()));
@@ -3715,6 +3907,27 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             }
         }
     };
+    // The local tier runs the bundle's connectors itself (ADR 0113). Reached by
+    // both local callers -- `local deploy` and `deploy-local` -- because both
+    // arrive here, so the shorthand cannot upload a source-built bundle and
+    // start no connector. The identity is the one the deploy RESOLVED, never
+    // re-read from plugin.json: `--agent`/`--target` can override it, and an
+    // alias built from the manifest name is one the runner never dials.
+    if opts.tier == DeployTier::Local {
+        let lock = crate::connector_build::load_lock(&plugin_dir)?.unwrap_or_else(|| {
+            crate::connector_build::ConnectorLockFileDecl {
+                version: crate::connector_build::LOCK_VERSION,
+                connectors: std::collections::BTreeMap::new(),
+            }
+        });
+        let identity = crate::connector_build::ConnectorScope {
+            release: "curie".to_string(),
+            agent: outcome.agent.name.clone(),
+            namespace: "default".to_string(),
+        };
+        bring_up_local(&plugin_dir, &lock, &identity, crate::local::COMPOSE_PROJECT).await?;
+    }
+
     Ok(DeployOutput {
         plugin_name,
         label,
@@ -6749,6 +6962,7 @@ mod tests {
             secret: vec![],
             secret_binding_supported: true,
             connect_hint: hint.to_string(),
+            tier: super::DeployTier::Local,
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
@@ -6821,6 +7035,7 @@ mod tests {
             secret: vec!["GH_TOKEN".to_string()],
             secret_binding_supported: true,
             connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Local,
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
@@ -6857,6 +7072,7 @@ mod tests {
             secret: vec![],
             secret_binding_supported: false,
             connect_hint: "UNREACHABLE-HINT-SENTINEL".to_string(),
+            tier: super::DeployTier::Cluster,
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
@@ -7783,6 +7999,8 @@ mod tests {
             model_base_url: None,
             bundle_digest: digest.map(str::to_string),
             bundle_snapshot_dir: snapshot_dir.map(str::to_string),
+            connector_containers: Vec::new(),
+            connector_network: None,
         }
     }
 
@@ -8073,6 +8291,41 @@ mod tests {
         assert_eq!(
             eval_mounts(&bundle),
             vec![format!("{}:/plugin:ro", bundle.dir().display())]
+        );
+    }
+
+    /// An aborted boot releases the credentials it staged, not just the
+    /// containers. Deleting the wipe from `release_boot_scaffolding` fails here.
+    ///
+    /// Nothing else will ever collect them: no state was recorded, so no `skill
+    /// down` can find the bundle (#1087). Driven with no sidecar, no connector
+    /// and no network so it reaches no Docker daemon -- what is under test is
+    /// the release list, not the removals.
+    #[tokio::test]
+    async fn an_aborted_boot_releases_the_staged_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::connector_build::stage_secret_file(
+            dir.path(),
+            "kubernetes",
+            "/secrets/kubeconfig",
+            "creds",
+        )
+        .unwrap();
+        let root = crate::connector_build::connector_secrets_root(dir.path());
+        assert!(root.exists());
+
+        super::release_boot_scaffolding(
+            None,
+            &[],
+            None,
+            &dir.path().join(".curie/snapshots/never-packed"),
+            dir.path(),
+        )
+        .await;
+
+        assert!(
+            !root.exists(),
+            "a resolved credential must not outlive the boot that staged it"
         );
     }
 }
@@ -8470,4 +8723,760 @@ mod overrides_tests {
             OverrideChange::Set("m".into())
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Connector source builds (ADR 0113): `curie build --plugin-dir`
+// ---------------------------------------------------------------------------
+
+/// One connector's resolved identity, as `curie build --plugin-dir` reports it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectorBuildRecord {
+    pub name: String,
+    pub image: String,
+    pub delivery: crate::connector_build::Delivery,
+    pub platforms: Vec<String>,
+    pub source_digest: String,
+}
+
+/// The `curie build --plugin-dir` receipt: one object, always, even when the
+/// bundle declares nothing to build. Empty stdout under `--json` is the #485
+/// failure -- an agent consumer cannot tell "nothing to build" from "the
+/// command produced nothing".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectorBuildOutput {
+    pub connectors: Vec<ConnectorBuildRecord>,
+}
+
+impl crate::ui::CliOutput for ConnectorBuildOutput {
+    fn to_json(&self) -> serde_json::Value {
+        // Delegated wholesale to the `Serialize` value rather than hand-picked
+        // field by field, so a record can never lose a field on the emit hop.
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({ "connectors": [] }))
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if self.connectors.is_empty() {
+            ui.note("this bundle declares no connectors to build");
+            return;
+        }
+        for record in &self.connectors {
+            ui.payload_plain(&format!("{} -> {}", record.name, record.image));
+        }
+    }
+}
+
+/// The flags `curie build --plugin-dir` carries.
+pub struct ConnectorBuildOpts {
+    pub plugin_dir: PathBuf,
+    /// `Some(ref)` pushes a multi-platform index there; `None` builds the host
+    /// platform into the local Docker daemon.
+    pub registry: Option<String>,
+    /// Replace a registry lock with a local-daemon one deliberately.
+    pub force: bool,
+}
+
+/// `curie build --plugin-dir <dir>`: build every connector the bundle declares
+/// from source and write `connectors.lock.yaml`.
+///
+/// Deliberately does NOT look for a repo checkout the way `build` does: a
+/// released binary building a bundle's connectors has none, and requiring one
+/// would make the whole feature source-only.
+pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuildOutput> {
+    use crate::connector_build as cb;
+
+    let plugin_dir = opts
+        .plugin_dir
+        .canonicalize()
+        .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
+    let decl = cb::load(&plugin_dir)?;
+    let buildable: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
+        .connectors
+        .iter()
+        .filter(|(_, spec)| spec.build.is_some())
+        .collect();
+    if buildable.is_empty() {
+        return Ok(ConnectorBuildOutput {
+            connectors: Vec::new(),
+        });
+    }
+    if !on_path("docker") {
+        bail!(
+            "Docker is not installed or not on PATH. Install Docker \
+             (https://docs.docker.com/get-docker/) and retry."
+        );
+    }
+    let (bundle_name, _version) = read_manifest(&plugin_dir)?;
+
+    // buildx writes its build result here; a private per-run directory rather
+    // than the bundle, so a metadata file never rides the upload. The system
+    // temp dir is shared with every other user on the box, so the directory is
+    // the owner's alone rather than the 0755 a default umask would give it.
+    let metadata_dir = std::env::temp_dir().join(format!("curie-build-{}", uuid::Uuid::new_v4()));
+    create_private_dir(&metadata_dir)
+        .with_context(|| format!("create {}", metadata_dir.display()))?;
+
+    let ui = crate::ui::ui();
+    let host = cb::host_platform();
+    let mut records = Vec::new();
+    let mut entries = std::collections::BTreeMap::new();
+    let mut failure = None;
+    for (connector, spec) in buildable {
+        let plan = match cb::build_plan(
+            &plugin_dir,
+            &bundle_name,
+            connector,
+            spec,
+            opts.registry.as_deref(),
+            &host,
+            &metadata_dir,
+        ) {
+            Ok(plan) => plan,
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
+        match run_one_connector_build(&plan, ui).await {
+            Ok(image) => {
+                entries.insert(
+                    connector.clone(),
+                    cb::ConnectorLockEntryDecl {
+                        image: image.clone(),
+                        delivery: plan.delivery,
+                        platforms: plan.platforms.clone(),
+                        source_digest: plan.source_digest.clone(),
+                    },
+                );
+                records.push(ConnectorBuildRecord {
+                    name: connector.clone(),
+                    image,
+                    delivery: plan.delivery,
+                    platforms: plan.platforms.clone(),
+                    source_digest: plan.source_digest,
+                });
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&metadata_dir);
+    if let Some(err) = failure {
+        // A build that could not run writes no lock: a partial lock would claim
+        // a resolved image for a connector that has none.
+        return Err(err);
+    }
+
+    cb::write_lock(
+        &plugin_dir,
+        &cb::ConnectorLockFileDecl {
+            version: cb::LOCK_VERSION,
+            connectors: entries,
+        },
+        opts.force,
+    )?;
+    Ok(ConnectorBuildOutput {
+        connectors: records,
+    })
+}
+
+/// Create a directory only its owner can enter, in one step.
+///
+/// The mode rides the create rather than a `set_permissions` after it: in a
+/// shared `/tmp` the window between the two is a window in which anyone can
+/// read what lands there, and buildx starts writing as soon as it is handed the
+/// path. Non-unix keeps the platform default, as the other cfg splits here do.
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// Run one connector's build and read back the immutable reference it produced.
+async fn run_one_connector_build(
+    plan: &crate::connector_build::ConnectorBuildPlan,
+    ui: &crate::ui::Ui,
+) -> Result<String> {
+    use crate::connector_build as cb;
+
+    let command = cb::build_argv(plan);
+    ui.note(&format!("=== {} ===", command.display()));
+    // Inherit stdio so the build log streams like a hand-run build.
+    let status = tokio::process::Command::new(&command.program)
+        .args(command.argv())
+        .status()
+        .await
+        .context("failed to invoke docker")?;
+    if !status.success() {
+        bail!("building connector '{}' failed ({status})", plan.connector);
+    }
+    match plan.delivery {
+        cb::Delivery::Registry => {
+            let metadata_file = plan
+                .metadata_file
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("a registry build records no metadata file"))?;
+            let raw = std::fs::read_to_string(metadata_file)
+                .with_context(|| format!("read {}", metadata_file.display()))?;
+            Ok(cb::digest_pinned_ref(
+                &plan.image_ref,
+                &cb::digest_from_metadata(&raw)?,
+            ))
+        }
+        cb::Delivery::LocalDaemon => {
+            let inspect = cb::image_inspect_argv(&plan.image_ref);
+            crate::docker::docker(&inspect.argv()).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The deploy-time lock preflight (ADR 0113)
+// ---------------------------------------------------------------------------
+
+/// The command that clears a missing or stale lock, as the operator would type
+/// it against their own bundle directory.
+fn rebuild_hint(plugin_dir: &Path, registry: bool) -> String {
+    if registry {
+        format!(
+            "run `curie build --plugin-dir {} --registry <ref>` and redeploy",
+            plugin_dir.display()
+        )
+    } else {
+        format!(
+            "run `curie build --plugin-dir {}` and redeploy",
+            plugin_dir.display()
+        )
+    }
+}
+
+/// Refuse a deploy whose `build:` connectors have no usable lock.
+///
+/// The CLI mirror of the platform's intake rule, run before the bundle is even
+/// packed so the operator gets a local failure naming their own directory
+/// instead of an upload rejection about a file nobody told them to make. A
+/// bundle with no `build:` connector is untouched.
+pub fn lock_preflight(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+    recomputed: &std::collections::BTreeMap<String, String>,
+    tier: DeployTier,
+) -> Result<()> {
+    use crate::connector_build::Delivery;
+
+    for (connector, spec) in &decl.connectors {
+        if spec.build.is_none() {
+            continue;
+        }
+        let Some(entry) = lock.and_then(|lock| lock.connectors.get(connector)) else {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "connectors.{connector} builds from source, but {} records no image for it. \
+                     Build it before deploying.",
+                    crate::connector_build::CONNECTOR_LOCK_FILE
+                ))
+                .with_fix(rebuild_hint(plugin_dir, false)),
+            ));
+        };
+        if let Some(fresh) = recomputed.get(connector) {
+            if &entry.source_digest != fresh {
+                return Err(anyhow::Error::from(
+                    crate::exit::CliError::usage(format!(
+                        "connectors.{connector} has changed since {} was written, so the locked \
+                         image no longer matches this source.",
+                        crate::connector_build::CONNECTOR_LOCK_FILE
+                    ))
+                    .with_fix(rebuild_hint(plugin_dir, false)),
+                ));
+            }
+        }
+        if tier == DeployTier::Cluster && entry.delivery == Delivery::LocalDaemon {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "connectors.{connector} is locked to an image in your local Docker daemon, \
+                     which no cluster node can pull. Push it to a registry first."
+                ))
+                .with_fix(rebuild_hint(plugin_dir, true)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ask the REGISTRY, by digest, for the raw manifest.
+///
+/// `--raw` matters: without it `imagetools inspect` pretty-prints, and a parser
+/// reading that output is reading a presentation format that has changed before.
+pub fn registry_manifest_argv(image: &str) -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "docker",
+        vec![
+            "buildx".into(),
+            "imagetools".into(),
+            "inspect".into(),
+            image.to_string(),
+            "--raw".into(),
+        ],
+    )
+}
+
+/// The architectures the cluster's own nodes report.
+pub fn node_architectures_argv() -> crate::ops::OpsCommand {
+    crate::connector_build::plain_command(
+        "kubectl",
+        vec![
+            "get".into(),
+            "nodes".into(),
+            "-o".into(),
+            "jsonpath={.items[*].status.nodeInfo.architecture}".into(),
+        ],
+    )
+}
+
+/// Parse that jsonpath's output: one space-separated word per node, duplicates
+/// being the common case.
+pub fn node_architectures(raw: &str) -> std::collections::BTreeSet<String> {
+    raw.split_whitespace().map(str::to_string).collect()
+}
+
+/// The platform set an OCI image index actually covers.
+///
+/// buildx's attestation manifests are `unknown/unknown` and are neither a
+/// platform the image covers nor a defect: a real multi-arch `--push` emits
+/// them alongside the real entries by default. A plain single-platform manifest
+/// has no `manifests` array at all and covers nothing the declaration promised.
+pub fn manifest_platforms(raw: &str) -> Result<std::collections::BTreeSet<String>> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).context("parse the registry manifest")?;
+    let Some(manifests) = parsed.get("manifests").and_then(|m| m.as_array()) else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    Ok(manifests
+        .iter()
+        .filter_map(|entry| {
+            let platform = entry.get("platform")?;
+            let os = platform.get("os")?.as_str()?;
+            let arch = platform.get("architecture")?.as_str()?;
+            (os != "unknown" && arch != "unknown").then(|| format!("{os}/{arch}"))
+        })
+        .collect())
+}
+
+/// Refuse a cluster deploy whose locked image is gone from the registry, or
+/// whose resolved index cannot run on every node.
+///
+/// The comparison is against the REGISTRY's answer, never the lock's declared
+/// platforms: a lock declaring two platforms while the push went out single-arch
+/// passes a declaration check and fails after apply as `no matching manifest`.
+pub fn registry_preflight(
+    image: &str,
+    inspect: std::result::Result<&str, String>,
+    node_architectures: &std::collections::BTreeSet<String>,
+    declared_platforms: &[String],
+) -> Result<()> {
+    let raw = match inspect {
+        Ok(raw) => raw,
+        Err(stderr) => {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "the registry could not resolve {image}: {}. The image the lock names is not \
+                     there, so no node could pull it.",
+                    stderr.trim()
+                ))
+                .with_fix(
+                    "rebuild and push it with `curie build --plugin-dir <dir> --registry <ref>`, \
+                     then redeploy",
+                ),
+            ));
+        }
+    };
+    let covered = manifest_platforms(raw).map_err(|err| {
+        anyhow::Error::from(
+            crate::exit::CliError::usage(format!(
+                "the registry's answer for {image} is not a manifest this build understands: {err}"
+            ))
+            .with_fix(
+                "rebuild and push it with `curie build --plugin-dir <dir> --registry <ref>`, \
+                 then redeploy",
+            ),
+        )
+    })?;
+    let missing: Vec<String> = node_architectures
+        .iter()
+        .filter(|arch| !covered.contains(&format!("linux/{arch}")))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow::Error::from(
+        crate::exit::CliError::usage(format!(
+            "{image} covers [{}] in the registry, but this cluster's nodes report [{}], so [{}] \
+             has no image to run. The lock declares [{}].",
+            covered.iter().cloned().collect::<Vec<_>>().join(", "),
+            node_architectures
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing.join(", "),
+            declared_platforms.join(", "),
+        ))
+        .with_fix(
+            "rebuild every architecture the nodes run with `curie build --plugin-dir <dir> \
+             --registry <ref>`, then redeploy",
+        ),
+    ))
+}
+
+/// The lock entries a cluster deploy has to ask the registry about: the entries
+/// of the `build:` connectors whose lock delivers through a registry.
+///
+/// Everything else is out of scope by construction -- an `image:` connector
+/// pulls a reference nobody here built, and a `local-daemon` build has already
+/// been refused by [`lock_preflight`] at this tier. An empty result is the
+/// common bundle, and it queries nothing.
+pub fn registry_preflight_targets<'a>(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&'a crate::connector_build::ConnectorLockFileDecl>,
+) -> Vec<&'a crate::connector_build::ConnectorLockEntryDecl> {
+    decl.connectors
+        .iter()
+        .filter(|(_, spec)| spec.build.is_some())
+        .filter_map(|(connector, _)| lock.and_then(|lock| lock.connectors.get(connector)))
+        .filter(|entry| entry.delivery == crate::connector_build::Delivery::Registry)
+        .collect()
+}
+
+/// The impure half of [`registry_preflight`]: query the registry and the
+/// cluster, then hand both answers to the decision.
+///
+/// The node architectures are read ONCE and shared across every connector --
+/// they are a property of the cluster, not of the image, so one `kubectl get
+/// nodes` covers a bundle building any number of connectors.
+async fn run_registry_preflight(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+) -> Result<()> {
+    let targets = registry_preflight_targets(decl, lock);
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let (ok, out, err) = crate::ops::run_capture(&node_architectures_argv()).await?;
+    if !ok {
+        return Err(anyhow::anyhow!("{}", err.trim()))
+            .context("read the architectures this cluster's nodes report");
+    }
+    let node_archs = node_architectures(&out);
+
+    for entry in targets {
+        let (ok, raw, err) = crate::ops::run_capture(&registry_manifest_argv(&entry.image)).await?;
+        let inspect = if ok { Ok(raw.as_str()) } else { Err(err) };
+        registry_preflight(&entry.image, inspect, &node_archs, &entry.platforms)?;
+    }
+    Ok(())
+}
+
+/// The recomputed `source_digest` of every `build:` connector in a bundle, for
+/// the preflight to compare the lock against.
+pub fn recompute_source_digests(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut digests = std::collections::BTreeMap::new();
+    for (connector, spec) in &decl.connectors {
+        let Some(build) = &spec.build else { continue };
+        let context = crate::connector_build::resolve_context(plugin_dir, &build.context)
+            .with_context(|| format!("connectors.{connector}"))?;
+        digests.insert(
+            connector.clone(),
+            crate::connector_build::source_digest_of(&context, build)
+                .with_context(|| format!("connectors.{connector}"))?,
+        );
+    }
+    Ok(digests)
+}
+
+/// The hosted `build:` connectors whose locked image no longer stands for this
+/// source: either the lock records nothing for them, or it records a different
+/// `source_digest` than the tree hashes to now.
+///
+/// The staleness test is `lock_preflight`'s, verbatim -- a missing lock entry
+/// and a digest mismatch are the two failures it refuses a deploy on, and a
+/// connector the recompute could not weigh in on is left alone by both. What
+/// differs is only what the caller does with the answer: the skill tier rebuilds
+/// (ADR 0113's Decision 3), the cluster tier refuses.
+///
+/// An `image:`-hosted connector has no source to be stale against, and one
+/// pointed at an already-running process with `unhosted_url` is not started
+/// here, so neither can put this bundle into a build.
+pub fn connectors_needing_rebuild(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: Option<&crate::connector_build::ConnectorLockFileDecl>,
+    recomputed: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut stale = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.build.is_none() || spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        let Some(entry) = lock.and_then(|lock| lock.connectors.get(connector)) else {
+            stale.push(connector.clone());
+            continue;
+        };
+        if let Some(fresh) = recomputed.get(connector) {
+            if &entry.source_digest != fresh {
+                stale.push(connector.clone());
+            }
+        }
+    }
+    stale
+}
+
+// ---------------------------------------------------------------------------
+// The local tier's connector bring-up
+// ---------------------------------------------------------------------------
+
+/// Reconcile this agent's connector containers against the deployed bundle, then
+/// generate the connector compose overlay and bring the declared set up.
+///
+/// One helper, both local deploy callers (`local deploy` and `deploy-local`), so
+/// the shorthand cannot upload a source-built bundle and start no connector.
+/// The RESOLVED identity is passed in rather than re-derived from `plugin.json`:
+/// `--agent`/`--target` can override the manifest's name, and a helper that read
+/// it again would alias the connectors under one identity while the runner
+/// dialed another.
+pub async fn bring_up_local(
+    plugin_dir: &Path,
+    lock: &crate::connector_build::ConnectorLockFileDecl,
+    identity: &crate::connector_build::ConnectorScope,
+    project: &str,
+) -> Result<()> {
+    use crate::connector_build as cb;
+
+    let decl = cb::load(plugin_dir)?;
+    let hosted: Vec<(&String, &cb::ConnectorSpecDecl)> = decl
+        .connectors
+        .iter()
+        .filter(|(_, spec)| spec.url.is_none() && spec.unhosted_url.is_none())
+        .collect();
+
+    // Fail closed BEFORE anything is reaped, staged, written, or started -- the
+    // same refusal `skill up` performs, which this path used to skip. A declared
+    // secret with no value here would otherwise be written into the overlay as a
+    // `${NAME}` nothing populates: compose warns, expands it to empty, and the
+    // connector comes up authenticating with nothing. It runs above the reap so
+    // a bundle that cannot come up does not first tear down the connectors that
+    // are serving.
+    refuse_missing_connector_secrets(&decl)?;
+
+    // Reconcile before starting: compose only ADDS the services the overlay
+    // names, so a connector this bundle version dropped or renamed would keep
+    // running -- serving the runner an MCP endpoint the bundle no longer
+    // declares. It is deliberately NOT `--remove-orphans` and not a
+    // project-label sweep: this compose project holds the api/worker stack and
+    // every other locally deployed agent's connectors, so the reap is scoped to
+    // this agent's own containers and, within those, to the names the new
+    // desired set does not contain. A zero-connector bundle reaches this with an
+    // empty desired set, which is how the last one gets removed.
+    let desired: std::collections::BTreeSet<String> = hosted
+        .iter()
+        .map(|(connector, _)| {
+            cb::object_name(&identity.release, &identity.agent, connector.as_str())
+        })
+        .collect();
+    for problem in docker::reap_undesired_connectors(project, &identity.agent, &desired).await {
+        crate::ui::ui().warn(&problem);
+    }
+
+    if hosted.is_empty() {
+        return Ok(());
+    }
+
+    let mut secret_values = std::collections::BTreeMap::new();
+    for (connector, spec) in &hosted {
+        for name in cb::declared_secret_names(spec) {
+            // The refusal above already proved every one of these resolves, so a
+            // gap here is reported as the missing credential it is rather than
+            // silently skipped.
+            let value = resolve_connector_secret(&name)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(&name)))?;
+            secret_values.insert(name, value);
+        }
+        // Credential files are staged where both emitters expect them, so the
+        // container finds bytes rather than an empty mount.
+        for (key, declared_path) in &spec.secret_files {
+            let value = resolve_connector_secret(key)?
+                .ok_or_else(|| cb::missing_secrets_error(std::slice::from_ref(key)))?;
+            cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
+        }
+    }
+
+    let overlay = cb::compose_overlay(lock, &decl, identity, project, plugin_dir)?;
+    let path = cb::compose_overlay_path(plugin_dir);
+    std::fs::create_dir_all(path.parent().expect("the overlay path has a parent"))?;
+    std::fs::write(
+        &path,
+        serde_norway::to_string(&overlay).context("serialize the connector compose overlay")?,
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+
+    // The values reach the containers through the compose child's environment,
+    // where `${NAME}` in the file above expands from -- never through the file,
+    // never through argv, and masked in anything printed.
+    let command = cb::compose_up_command(&path, project, &secret_values);
+    let (ok, _out, err) = crate::ops::run_capture(&command)
+        .await
+        .context("starting the bundle's connectors")?;
+    if !ok {
+        bail!("starting the bundle's connectors failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// Refuse the WHOLE bundle when a hosted connector declares a secret this box
+/// must not hand it, or has no value for -- before a network, a build, or a
+/// container exists. Both tiers' single pre-resolution gate, so a name the
+/// bundle must not own is refused here rather than at each caller.
+///
+/// Bring-up used to skip an unresolved secret silently: `skill up` reported
+/// success, the connector container exited 1 on its own missing-credential
+/// check, and the runner was left holding an MCP URL that connection-refused
+/// mid-turn. Between a silent connection-refused mid-turn and an actionable
+/// refusal at bring-up, the refusal is the correct behavior. Every gap across
+/// every hosted connector is collected first so one run names them all, and the
+/// check is resolve-only -- nothing is staged and no value is retained.
+fn refuse_missing_connector_secrets(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+) -> Result<()> {
+    // Ahead of every resolve below: a name the bundle must not own is refused
+    // before a single value is read, because reading it IS the exfiltration --
+    // the sweep below would resolve the operator's own model credential and
+    // report the declaration as satisfied.
+    crate::connector_build::refuse_reserved_secret_names(decl)?;
+    // Then, so a `from_secret` reference keeps its own, more specific refusal
+    // (`refuse_out_of_band_secrets` names all three ways forward) instead of
+    // being reported as an ordinary unset name by the sweep below.
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        crate::connector_build::refuse_out_of_band_secrets(connector, spec)?;
+    }
+    let mut missing = Vec::new();
+    for name in crate::connector_build::hosted_secret_names(decl) {
+        if resolve_connector_secret(&name)?.is_none() {
+            missing.push(name);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(crate::connector_build::missing_secrets_error(&missing))
+}
+
+/// One connector credential, from the environment first and the host vault
+/// second. Never printed.
+fn resolve_connector_secret(name: &str) -> Result<Option<String>> {
+    if let Some(value) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
+        return Ok(Some(value));
+    }
+    crate::secrets::get_value(name)
+}
+
+/// Which hosted connectors a skill-tier boot starts, each paired with the image
+/// it runs, in declaration order.
+///
+/// The selection is `connector_build::resolved_image`'s, which is also what the
+/// local tier's overlay emits -- one rule, so the two tiers cannot resolve the
+/// same declaration to two different images. Extracted as a pure seam for two
+/// reasons: it is decidable with no Docker daemon, and it leaves the starter
+/// below with no image of its own to compute. The inline lock-first copy it
+/// replaces is what let a stale lock entry hijack a connector whose declaration
+/// had since switched from `build:` to `image:`.
+///
+/// Every image is resolved before the first container starts, so a bundle
+/// missing one is refused whole rather than half-started.
+pub fn skill_connector_plan(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    lock: &crate::connector_build::ConnectorLockFileDecl,
+) -> Result<Vec<(String, String)>> {
+    let mut plan = Vec::new();
+    for (connector, spec) in &decl.connectors {
+        if spec.url.is_some() || spec.unhosted_url.is_some() {
+            continue;
+        }
+        plan.push((
+            connector.clone(),
+            crate::connector_build::resolved_image(connector, spec, lock)?,
+        ));
+    }
+    Ok(plan)
+}
+
+/// Start one container per hosted connector on the runner's private network.
+///
+/// Returns the container names so `skill down` reaps exactly what this boot
+/// created. Credentials are staged first, so each container finds bytes at its
+/// declared mount path rather than an empty file.
+async fn start_skill_connectors(
+    plugin_dir: &Path,
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    identity: &crate::connector_build::ConnectorScope,
+    network: &str,
+    project: &str,
+) -> Result<Vec<String>> {
+    use crate::connector_build as cb;
+
+    let lock = cb::load_lock(plugin_dir)?.unwrap_or_else(|| cb::ConnectorLockFileDecl {
+        version: cb::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+    });
+    let mut started = Vec::new();
+    for (connector, image) in skill_connector_plan(decl, &lock)? {
+        let connector = connector.as_str();
+        let spec = decl
+            .connectors
+            .get(connector)
+            .expect("the plan names only this declaration's own connectors");
+        cb::refuse_out_of_band_secrets(connector, spec)?;
+        let mut secret_values = std::collections::BTreeMap::new();
+        for name in cb::declared_secret_names(spec) {
+            if let Some(value) = resolve_connector_secret(&name)? {
+                secret_values.insert(name, value);
+            }
+        }
+        for (key, declared_path) in &spec.secret_files {
+            if let Some(value) = resolve_connector_secret(key)? {
+                cb::stage_secret_file(plugin_dir, connector, declared_path, &value)?;
+            }
+        }
+        let start = docker::ConnectorStartSpec::from_declaration(
+            connector,
+            spec,
+            &image,
+            identity,
+            network,
+            project,
+            plugin_dir,
+            &secret_values,
+        )?;
+        docker::docker_with_env(&start.run_args(), &start.docker_env)
+            .await
+            .with_context(|| format!("starting connector '{connector}'"))?;
+        started.push(start.container_name);
+    }
+    Ok(started)
 }

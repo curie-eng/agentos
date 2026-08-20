@@ -3927,7 +3927,7 @@ export const commandManifest = {
       "name": "deploy-local"
     },
     {
-      "about": "Build the runner image locally from `runner/Dockerfile` (source checkout only)",
+      "about": "Build the runner image, or an agent bundle's declared connectors",
       "args": [
         {
           "default_values": [
@@ -3939,10 +3939,38 @@ export const commandManifest = {
           "long": "tag",
           "positional": false,
           "required": false
+        },
+        {
+          "global": false,
+          "help": "Build the connectors this agent bundle declares",
+          "id": "plugin_dir",
+          "long": "plugin-dir",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp)",
+          "id": "registry",
+          "long": "registry",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Replace a registry lock with a local-daemon one deliberately",
+          "id": "force",
+          "long": "force",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
         }
       ],
       "hidden": false,
-      "long_about": "Build the runner image locally from `runner/Dockerfile` (source checkout only).\n\nRuns `docker build -f runner/Dockerfile -t <tag> .` from the repo root. A release binary pulls the pinned runner image from GHCR automatically and never needs this; it errors clearly if Docker is missing or there is no repo checkout.",
+      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.",
       "name": "build"
     },
     {

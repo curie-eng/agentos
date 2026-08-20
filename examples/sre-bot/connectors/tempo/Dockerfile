@@ -4,8 +4,10 @@
 # and then fails to pull on the node with "no matching manifest" -- which reads
 # as a registry problem rather than a build one.
 #
-#   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -t <your-registry>/sre-bot-tempo-mcp:v1 --push examples/sre-bot/connectors/tempo
+# Nothing here is run by hand. `build.platforms` in the bundle's connectors.yaml
+# names both architectures, and one
+# `curie build --plugin-dir <bundle> --registry <ref>` builds exactly what it
+# declares.
 FROM python:3.12-slim
 
 # uid 65532 (nonroot) matches the other connectors, so the same securityContext

@@ -413,11 +413,9 @@ fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<S
         }
     }
     if !missing.is_empty() {
-        return Err(crate::exit::usage(format!(
-            "connectors.yaml declares secret(s) with no value available: {}. Export each in the \
-             environment, or store it once with `curie secrets set <NAME>`.",
-            missing.join(", ")
-        )));
+        // One message, both tiers: `skill up` refuses the same gap with the same
+        // words via `connector_build::missing_secrets_error`.
+        return Err(crate::connector_build::missing_secrets_error(&missing));
     }
     Ok(values)
 }

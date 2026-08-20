@@ -313,16 +313,32 @@ enum Command {
         #[arg(long = "secret", value_name = "NAME")]
         secret: Vec<String>,
     },
-    /// Build the runner image locally from `runner/Dockerfile` (source checkout only).
+    /// Build the runner image, or an agent bundle's declared connectors.
     ///
-    /// Runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root. A
-    /// release binary pulls the pinned runner image from GHCR automatically and
-    /// never needs this; it errors clearly if Docker is missing or there is no
-    /// repo checkout.
+    /// With no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from
+    /// the repo root (source checkout only; a release binary pulls the pinned
+    /// runner image from GHCR automatically and never needs this).
+    ///
+    /// With `--plugin-dir <PATH>` it builds every connector that bundle's
+    /// `connectors.yaml` declares from source and writes `connectors.lock.yaml`
+    /// beside it. With `--registry <REF>` it builds every declared platform,
+    /// pushes, and records the registry manifest digest, which is what a cluster
+    /// deploy requires. Without `--registry` it builds the host platform only
+    /// into the local Docker daemon and records the local image id, which is
+    /// usable at the skill and local tiers and refused at cluster.
     Build {
         /// Image tag to build.
-        #[arg(long, default_value = docker::RUNNER_IMAGE)]
+        #[arg(long, default_value = docker::RUNNER_IMAGE, conflicts_with = "plugin_dir")]
         tag: String,
+        /// Build the connectors this agent bundle declares.
+        #[arg(long, value_name = "PATH")]
+        plugin_dir: Option<PathBuf>,
+        /// Push a multi-platform index to this registry (e.g. ghcr.io/acme-corp).
+        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        registry: Option<String>,
+        /// Replace a registry lock with a local-daemon one deliberately.
+        #[arg(long, requires = "plugin_dir")]
+        force: bool,
     },
     /// Bootstrap or update a dev checkout: install deps and build, start nothing (source checkout only).
     ///
@@ -2032,7 +2048,22 @@ async fn run(command: Option<Command>) -> Result<()> {
             from_spec,
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
-        Some(Command::Build { tag }) => commands::build(&tag).await,
+        Some(Command::Build {
+            tag,
+            plugin_dir,
+            registry,
+            force,
+        }) => match plugin_dir {
+            Some(plugin_dir) => emit(
+                commands::build_connectors(commands::ConnectorBuildOpts {
+                    plugin_dir,
+                    registry,
+                    force,
+                })
+                .await?,
+            ),
+            None => commands::build(&tag).await,
+        },
         Some(Command::Install { update }) => commands::install(update).await,
         Some(Command::Update { image }) => commands::update(image).await,
         Some(Command::Interactive) => curie::interactive::run().await,
@@ -2488,6 +2519,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         // declared-secrets policy gate (#464).
                         secret_binding_supported: true,
                         connect_hint: connect_hint.clone(),
+                        tier: commands::DeployTier::Local,
                     })
                     .await?,
                 )
@@ -3184,6 +3216,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         // with a `--secret <NAME>` remediation this tier lacks.
                         secret_binding_supported: false,
                         connect_hint: connect_hint.clone(),
+                        tier: commands::DeployTier::Cluster,
                     })
                     .await
                     {
@@ -3776,13 +3809,13 @@ mod tests {
     fn build_defaults_tag_and_accepts_override() {
         let cli = Cli::try_parse_from(["curie", "build"]).expect("build should parse");
         match cli.command {
-            Some(Command::Build { tag }) => assert_eq!(tag, "curie-runner"),
+            Some(Command::Build { tag, .. }) => assert_eq!(tag, "curie-runner"),
             _ => panic!("expected build command"),
         }
         let cli = Cli::try_parse_from(["curie", "build", "--tag", "my-runner:dev"])
             .expect("build --tag should parse");
         match cli.command {
-            Some(Command::Build { tag }) => assert_eq!(tag, "my-runner:dev"),
+            Some(Command::Build { tag, .. }) => assert_eq!(tag, "my-runner:dev"),
             _ => panic!("expected build command"),
         }
     }

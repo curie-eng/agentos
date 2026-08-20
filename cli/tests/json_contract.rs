@@ -840,9 +840,10 @@ fn eval_schema_gate_has_teeth() {
 use curie::api::{ApprovalRecord, MemoryEntry, Version};
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
-    CheckMatch, CheckReport, DeclaredServer, DeleteOutput, DeployOutput, KillOutput,
-    ListAgentsOutput, LocalAgentSummary, MemoryOutput, ResetThreadOutput, ResumeOutput,
-    SkillApprovalsOutput, SkillMessageOutput, SweepRow, VersionsOutput,
+    CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
+    DeleteOutput, DeployOutput, KillOutput, ListAgentsOutput, LocalAgentSummary, MemoryOutput,
+    ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, SkillMessageOutput, SweepRow,
+    VersionsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::local::{
@@ -1776,6 +1777,24 @@ fn cluster_down_output_validates_all_variants() {
         lines: vec!["helm uninstall".to_string()],
     });
     assert_valid("cluster-down.schema.json", &dry.to_json());
+}
+
+#[test]
+fn connector_build_output_validates_empty_and_populated() {
+    // Empty is a real emission, not an accident: `curie build` on a bundle
+    // declaring nothing to build still prints one object (#485).
+    let empty = ConnectorBuildOutput { connectors: vec![] };
+    assert_valid("build.schema.json", &empty.to_json());
+    let built = ConnectorBuildOutput {
+        connectors: vec![ConnectorBuildRecord {
+            name: "tempo".to_string(),
+            image: format!("ghcr.io/acme-corp/tempo@sha256:{}", "a".repeat(64)),
+            delivery: curie::connector_build::Delivery::Registry,
+            platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            source_digest: "b".repeat(64),
+        }],
+    };
+    assert_valid("build.schema.json", &built.to_json());
 }
 
 #[test]

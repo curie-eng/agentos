@@ -145,6 +145,54 @@ fn the_rust_reader_accepts_and_rejects_exactly_the_documents_python_does() {
 }
 
 #[test]
+fn a_connector_name_python_refuses_is_refused_at_load_by_the_rust_reader() {
+    // Parity is only half of it. `curie skill up` joins the connector name into
+    // a host path under `.curie/connector-secrets/`, so a name the CLI accepted
+    // without checking is a bundle-authored path component and `../../evil`
+    // writes a resolved credential outside the bundle. Checking at load is what
+    // makes every downstream join safe by construction.
+    let too_long = "t".repeat(41);
+    for name in [
+        "../../evil",
+        "Tempo",
+        "tempo_1",
+        "-tempo",
+        "tempo-",
+        "",
+        too_long.as_str(),
+    ] {
+        let document = format!("connectors:\n  \"{name}\":\n    image: ghcr.io/acme/x:1\n");
+        let error = connector_build::parse_connectors(&document)
+            .expect_err(&format!("{name:?} must be refused"));
+        assert!(
+            error.to_string().contains(name),
+            "the refusal must name the connector: {error}"
+        );
+    }
+
+    connector_build::parse_connectors("connectors:\n  tempo-1:\n    image: ghcr.io/acme/x:1\n")
+        .expect("an RFC 1123 label is still accepted");
+}
+
+#[test]
+fn a_lock_entry_carrying_a_refused_name_is_refused_too() {
+    // The lock is a second door onto the same names: `curie skill up` reads it
+    // to resolve the image and stages that connector's credentials, whether or
+    // not the declaration was re-read in the same process.
+    // The entry itself is well formed, so the NAME is the only thing left to
+    // refuse it -- a truncated digest here would green this test through the
+    // image-shape rule instead.
+    let document = "version: 1\nconnectors:\n  \"../../evil\":\n    \
+                    image: ghcr.io/acme/x@sha256:\
+                    0000000000000000000000000000000000000000000000000000000000000000\n    \
+                    delivery: registry\n    source_digest: sha256:bb\n";
+    assert!(
+        connector_build::parse_lock(document).is_err(),
+        "a name refused in connectors.yaml must be refused in the lock"
+    );
+}
+
+#[test]
 fn an_unknown_key_inside_a_build_block_is_refused_not_dropped() {
     // The `deny_unknown_fields` proof. Without the attribute the field is
     // silently dropped and `curie dev field-parity` stays green, which is
@@ -223,6 +271,24 @@ fn a_context_outside_the_bundle_is_refused() {
 
 // ─── connectors.lock.yaml ────────────────────────────────────────────────────
 
+/// The corpus vectors whose refusal is the IMAGE SHAPE rule -- Python's
+/// `_image_matches_delivery`, applied inside `apply_lock`.
+///
+/// Python can afford to refuse these one call later because nothing between
+/// `validate_connector_lock` and `apply_lock` runs an image. The CLI has no
+/// `apply_lock`: whatever `parse_lock` returns is what `curie skill up` starts
+/// and what a deploy ships, so the same rule has to fire at the read. Listing
+/// them by name rather than re-deriving the rule keeps this an independent
+/// oracle: a reader that stopped refusing one fails here, and a NEW shape
+/// vector added to the corpus fails here too until it is named, which is the
+/// direction that failure should point.
+const SHAPE_REFUSALS: &[&str] = &[
+    "a_tag_shaped_image_is_refused",
+    "a_truncated_digest_is_refused",
+    "an_uppercase_digest_is_refused",
+    "a_bare_digest_is_refused_for_registry_delivery",
+];
+
 #[test]
 fn the_rust_lock_reader_agrees_with_python_on_every_vector() {
     // `curie cluster deploy` preflights the lock locally so the operator gets
@@ -236,9 +302,21 @@ fn the_rust_lock_reader_agrees_with_python_on_every_vector() {
         }
         let document = serde_norway::to_string(&vector["lock"]).expect("serialize lock");
         let parsed = connector_build::parse_lock(&document);
-        match vector["expect"].as_str().expect("expect") {
-            // "raise" documents parse and are refused by apply_lock, which is
-            // the Python side's job; the Rust reader only has to accept them.
+        let expect = vector["expect"].as_str().expect("expect");
+        if expect == "raise" && SHAPE_REFUSALS.contains(&name_of(&vector)) {
+            assert!(
+                parsed.is_err(),
+                "{} records an image that is not a digest of its delivery's shape, which the \
+                 Rust reader refuses at the read",
+                name_of(&vector)
+            );
+            continue;
+        }
+        match expect {
+            // The remaining "raise" documents are well formed and refused by
+            // apply_lock for a reason only the DECLARATION can supply -- a
+            // local-daemon image at a portable tier, an entry the lock does not
+            // carry. That is the platform's job and this reader accepts them.
             "apply" | "raise" => assert!(
                 parsed.is_ok(),
                 "{} must parse on the Rust side",
@@ -268,6 +346,99 @@ fn an_unknown_key_in_a_lock_entry_is_refused_not_dropped() {
         connector_build::parse_lock(document).is_err(),
         "an unmodelled key in a lock entry must be refused, not dropped"
     );
+}
+
+/// One lock document carrying one entry, so a case varies only what it is about.
+fn lock_document(image: &str, delivery: &str) -> String {
+    format!(
+        "version: 1\nconnectors:\n  tempo:\n    image: {image}\n    delivery: {delivery}\n    \
+         platforms: [linux/amd64]\n    source_digest: sha256:{}\n",
+        "2".repeat(64)
+    )
+}
+
+const REGISTRY_DIGEST_IMAGE: &str = "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:\
+                                     0000000000000000000000000000000000000000000000000000000000000000";
+const LOCAL_DAEMON_IMAGE: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+#[test]
+fn a_registry_entry_carries_a_repository_digest_as_pythons_image_matches_delivery_requires() {
+    // `_image_matches_delivery` in packages/plugin-format/src/plugin_format/
+    // connector_lock.py: `[^@\s]+@sha256:[0-9a-f]{64}` for delivery `registry`.
+    // A tag is the case the rule exists for -- it can be repointed at a
+    // different artifact after review -- and the other three are the ways a
+    // substring check for `@sha256:` would pass while resolving to nothing.
+    connector_build::parse_lock(&lock_document(REGISTRY_DIGEST_IMAGE, "registry"))
+        .expect("a repository digest is the registry shape");
+
+    for image in [
+        "ghcr.io/acme-corp/acme-bot-tempo-mcp:v1",
+        "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:0000",
+        "ghcr.io/acme-corp/acme-bot-tempo-mcp@sha256:\
+         AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        LOCAL_DAEMON_IMAGE,
+    ] {
+        assert!(
+            connector_build::parse_lock(&lock_document(image, "registry")).is_err(),
+            "{image} is not a registry manifest digest and must be refused at the read"
+        );
+    }
+}
+
+#[test]
+fn a_local_daemon_entry_carries_a_bare_image_id_as_pythons_image_matches_delivery_requires() {
+    // The other half of the same rule: `sha256:[0-9a-f]{64}`, the id `docker
+    // image inspect --format {{.Id}}` reports. A repository reference means
+    // nothing to the local daemon, so delivery and shape must agree or the two
+    // fields are decoration.
+    connector_build::parse_lock(&lock_document(LOCAL_DAEMON_IMAGE, "local-daemon"))
+        .expect("a bare image id is the local-daemon shape");
+
+    for image in [
+        REGISTRY_DIGEST_IMAGE,
+        "curie-connector-sre-bot-tempo:build",
+        "sha256:1111",
+    ] {
+        assert!(
+            connector_build::parse_lock(&lock_document(image, "local-daemon")).is_err(),
+            "{image} is not a local image id and must be refused at the read"
+        );
+    }
+}
+
+#[test]
+fn a_refused_lock_image_names_the_connector_and_how_to_regenerate_the_lock() {
+    // The operator reading this failure edited or inherited a lock and has to
+    // know WHICH connector is wrong and what to run; a refusal that only says
+    // the file is malformed sends them reading YAML by eye.
+    let error = connector_build::parse_lock(&lock_document(
+        "ghcr.io/acme-corp/acme-bot-tempo-mcp:v1",
+        "registry",
+    ))
+    .expect_err("a tag must be refused");
+    let message = error.to_string();
+    assert!(message.contains("tempo"), "{message}");
+    assert!(
+        message.contains("ghcr.io/acme-corp/acme-bot-tempo-mcp:v1"),
+        "{message}"
+    );
+    assert!(message.contains("curie build --plugin-dir"), "{message}");
+}
+
+#[test]
+fn a_source_digest_shape_is_not_this_readers_to_judge_because_python_does_not_judge_it() {
+    // `ConnectorLockEntry.source_digest` is a plain `str` in Python, and
+    // staleness is decided by comparing it against a recomputed value, never by
+    // its shape. A reader that refused a short one here would refuse a document
+    // bundle intake accepts, which is the accept/reject parity this whole
+    // corpus exists to hold.
+    let document = format!(
+        "version: 1\nconnectors:\n  tempo:\n    image: {REGISTRY_DIGEST_IMAGE}\n    \
+         delivery: registry\n    platforms: [linux/amd64]\n    source_digest: sha256:bb\n"
+    );
+    connector_build::parse_lock(&document)
+        .expect("the source digest's shape is the platform's to judge, not this reader's");
 }
 
 // ─── The field-name corpus ───────────────────────────────────────────────────

@@ -580,6 +580,21 @@ services:
       - CURIE_FALSE_COMPLETION_CHECK=${CURIE_FALSE_COMPLETION_CHECK:-}
       - CURIE_DOCKER_NETWORK=${CURIE_DOCKER_NETWORK:-curie_runner}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      # config.py's connector_release/connector_namespace (CURIE_RELEASE /
+      # CURIE_NAMESPACE) both default empty, which was built for the cluster
+      # tier (#1118) where Helm supplies the real release name and namespace.
+      # There is no Helm release at local tier, so without these two a plain
+      # `curie local up` leaves both empty, binding.py emits no connector
+      # scope, and every hosted connector logs "declared but not exercisable
+      # in this tier" (#1093) even once its local container is running. These
+      # are the synthetic local-tier scope: the same release/namespace pair
+      # `connector_render.service_dns` uses to compute the Docker network
+      # alias the local connector container starts under, so the runner
+      # derives the identical name it would derive on cluster. The default
+      # here must match the CLI's local connector bring-up identity: release
+      # `curie` (cli/src/commands.rs), the same as `local::COMPOSE_PROJECT`.
+      - CURIE_RELEASE=${CURIE_RELEASE:-curie}
+      - CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}
     restart: unless-stopped
 
   # Optional real Slack ingress for local development.

@@ -230,24 +230,7 @@ self-approval.
 Read the four-layer table above before starting, and
 [`manifests/write-role.yaml`](manifests/write-role.yaml) before applying it.
 
-**1. Build and push the connector image.**
-
-There is no public image on purpose: the allowlist and the credential are yours,
-and so is the artifact. Build multi-arch -- a single-arch image passes CI and
-then fails to pull on a node of the other architecture with "no matching
-manifest", which reads as a registry problem.
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t <your-registry>/sre-bot-k8s-write-mcp:v1 --push \
-  examples/sre-bot/connectors/k8s-write
-```
-
-If your registry defaults new packages to private, flip this one to public or
-give the cluster a pull secret. An anonymous pull otherwise 403s and surfaces as
-`ImagePullBackOff`.
-
-**2. Create the write identity.**
+**1. Create the write identity.**
 
 Edit the namespace and the `resourceNames` list in
 [`manifests/write-role.yaml`](manifests/write-role.yaml) first -- one Deployment,
@@ -257,9 +240,9 @@ not a list, unless someone has actually asked for the second one. Then:
 kubectl apply -f examples/sre-bot/manifests/write-role.yaml
 ```
 
-**3. Assemble and store the write kubeconfig.**
+**2. Assemble and store the write kubeconfig.**
 
-Same shape as the read-only one, from the `sre-bot-writer-token` Secret step 2
+Same shape as the read-only one, from the `sre-bot-writer-token` Secret step 1
 minted. This must be a SEPARATE credential -- never the read-only connector's,
 which is deliberately unable to write. Use the namespace you set in
 `write-role.yaml`:
@@ -292,19 +275,56 @@ kubectl auth can-i --as=system:serviceaccount:"$NS":sre-bot-writer \
   delete deployments -n "$NS"                                 # NO
 ```
 
-**4. Turn the connector on.**
+**The credential comes before the connector, and that order is load-bearing.** A
+declared connector secret with no stored value fails the deploy, so a bundle
+that enables `k8s-write` before `K8S_WRITE_KUBECONFIG` exists cannot deploy at
+all. That is why this step sits ahead of the uncomment rather than beside it.
 
-Uncomment the `k8s-write:` block in [`connectors.yaml`](connectors.yaml), set
-`image:` to what you pushed, and set `K8S_WRITE_ALLOWLIST` to
-`<namespace>/<deployment>` -- the same pair you put in `resourceNames`. Stating
-the ceiling in two places is deliberate: a ceiling stated once is a ceiling that
-moves when someone edits the other place.
+**3. Turn the connector on.**
+
+Uncomment the `k8s-write:` block in [`connectors.yaml`](connectors.yaml) and set
+`K8S_WRITE_ALLOWLIST` to `<namespace>/<deployment>` -- the same pair you put in
+`resourceNames`. Stating the ceiling in two places is deliberate: a ceiling
+stated once is a ceiling that moves when someone edits the other place.
+
+There is no `image:` line to fill in. The block declares a `build:` -- the source
+directory and the platforms -- and step 4 resolves it to a digest.
+
+**4. Build the connector image.**
+
+```bash
+curie build --plugin-dir examples/sre-bot --registry <your-registry>
+```
+
+One command, after the uncomment rather than before it: `curie build` builds
+what the file currently declares, so a still-commented connector is not built.
+It builds every declared `build:` connector on every platform its `platforms:`
+line names, pushes them, and writes the resolved digests to
+`connectors.lock.yaml` beside `connectors.yaml`. The deploy renders those
+digests and nothing else, so the "pin it, never `:latest`" rule is enforced by
+the artifact rather than by remembering.
+
+There is no public image on purpose: the allowlist and the credential are yours,
+and so is the artifact. Multi-arch is not a flag you pass either -- the
+`platforms:` line in [`connectors.yaml`](connectors.yaml) carries it, because a
+single-arch image passes CI and then fails to pull on a node of the other
+architecture with "no matching manifest", which reads as a registry problem.
+
+If your registry defaults new packages to private, flip this one to public or
+give the cluster a pull secret. An anonymous pull otherwise 403s and surfaces as
+`ImagePullBackOff`.
+
+`connectors.lock.yaml` is gitignored in this example. It records your registry
+and the digests your build resolved, so it belongs to an install; the deploy
+packs it from your working tree.
 
 **5. Declare the approval gate.**
 
 Add this to `.claude-plugin/plugin.json`. It is not shipped, because bundle
 validation rejects a gate naming an undeclared connector -- so a gate for a
 commented-out connector would fail the build for everyone who never enables it.
+The consequence is that the gate travels with step 3's uncomment, in the same
+change: enabling the connector without it deploys an ungated write verb.
 
 ```json
   "approvalPolicy": {
@@ -450,9 +470,11 @@ platform-side per-target override is the proper fix and does not exist yet.
 **Tempo** adds distributed traces. `mcp-grafana` has no tool that speaks Tempo,
 so without this connector the bot can see the datasource and never read a span.
 It needs the Grafana connector on (it reuses the same token, reaching an endpoint
-mcp-grafana has no tool for) and an image you build from
-[`connectors/tempo/`](connectors/tempo/) -- same `docker buildx` shape as the
-write connector.
+mcp-grafana has no tool for) and its own image, built from
+[`connectors/tempo/`](connectors/tempo/) by the same
+`curie build --plugin-dir examples/sre-bot --registry <your-registry>` that
+builds the write connector. Uncomment both blocks and run it once; there is
+nothing extra to run for this one.
 
 Three off-the-shelf routes were measured and rejected before this connector was
 written; [`connectors/tempo/server.py`](connectors/tempo/server.py) records what

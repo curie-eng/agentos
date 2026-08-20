@@ -40,7 +40,7 @@ from .models import (
     SkillFrontmatter,
     TriggerDeclaration,
 )
-from .reserved_env import is_reserved_boot_env_name
+from .reserved_env import SECRET_NAME_RE, is_reserved_boot_env_name
 from .yaml_loader import DuplicateKeyError, safe_load_unique
 
 # The hooks field is a mapping of event name -> list of matcher entries. Reused
@@ -731,9 +731,6 @@ def _gate_not_namespaced_message(
     )
 
 
-_SECRET_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-
-
 def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
     """Validate the manifest ``secrets`` policy (deploy-time gate, ADR-0009 / #429).
 
@@ -753,7 +750,7 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
 
     for i, name in enumerate(declared):
         loc = f"plugin.json (secrets[{i}])"
-        if not isinstance(name, str) or not _SECRET_NAME_RE.match(name):
+        if not isinstance(name, str) or not SECRET_NAME_RE.match(name):
             c.error(
                 "secrets.name_invalid",
                 f"secret name {name!r} must be an env-var-style name "

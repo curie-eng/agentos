@@ -1,0 +1,84 @@
+# The parity ladder's connector fixture: `examples/sre-bot/connectors.yaml` with
+# every connector the example ships commented out turned ON (ADR 0113, #1690).
+#
+# WHY A CHECKED-IN WHOLE FILE rather than a scripted uncomment of the example.
+# `sed` against a comment block is fragile in exactly the direction that hides a
+# failure: the moment the example's comment formatting shifts, the uncomment
+# silently produces an EMPTY connector set, every rung hosts nothing, and the
+# ladder goes green having asserted nothing at all. A whole file cannot degrade
+# that way -- it either parses with three connectors or it fails loudly.
+#
+# WHY IT LIVES HERE and never under `examples/sre-bot/`. The shipped example is
+# read-only by default and stays that way (#1691): the write connector is a
+# deliberate opt-in with a credential and an approval route in front of it. This
+# is a test input, so it lives with the test.
+#
+# The ladder copies the example into a throwaway workdir and overwrites
+# `connectors.yaml` with this file, then applies the `approvalPolicy` gate the
+# example's README documents to the copy's `plugin.json`. The gate TRAVELS WITH
+# the connector: bundle validation rejects a gate naming an undeclared
+# connector, so a bundle enabling `k8s-write` without it would host an ungated
+# write verb, which contradicts the example's whole security shape.
+#
+# Every value here is a public-repo placeholder. The credentials the three
+# connectors declare are provisioned by the ladder into the scratch copy and the
+# rung's process env only -- never into the operator's secret store.
+connectors:
+  # Unchanged from the example except for `unhosted_url`, which is dropped
+  # below along with the other two: a connector declaring one is deliberately
+  # NOT hosted at the skill and local tiers (the operator is pointing at their
+  # own copy instead), and hosting parity is the only thing these rungs assert.
+  #
+  # If a future image of this server refuses to start without a reachable API
+  # server, give this one connector its `unhosted_url` back and drop
+  # K8S_READONLY_KUBECONFIG from the ladder's provisioning step: the built
+  # connectors below are the subject of the assertion, this one is the control
+  # that a plain `image:` connector hosts identically beside them.
+  kubernetes:
+    image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
+    args:
+      - --port
+      - "8000"
+      - --bind-address
+      - 0.0.0.0
+      - --read-only
+      - --toolsets
+      - core
+      - --disable-destructive
+      - --disable-multi-cluster
+      - --stateless
+      - --kubeconfig
+      - /secrets/kubeconfig
+    secret_files:
+      K8S_READONLY_KUBECONFIG: /secrets/kubeconfig
+
+  # The two `build:` connectors: no image reference anywhere, so every rung can
+  # only run what `curie build --plugin-dir` resolved and recorded in
+  # `connectors.lock.yaml`.
+  k8s-write:
+    build:
+      context: connectors/k8s-write
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # The connector refuses to start on an empty allowlist, so this is
+      # load-bearing for the rung and not decoration. A placeholder pair: the
+      # ladder never calls the write verb, which needs a second human actor.
+      K8S_WRITE_ALLOWLIST: acme-prod/acme-api
+    secret_files:
+      # A SEPARATE credential from the read-only one above, as the example
+      # requires. The ladder generates two distinct scratch kubeconfigs and
+      # never reuses one for both.
+      K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
+
+  tempo:
+    build:
+      context: connectors/tempo
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      GRAFANA_URL: https://grafana.example.com
+      TEMPO_DATASOURCE_UID: __Tempo__
+    secrets:
+      # The server refuses to start without it. The ladder supplies a
+      # rung-scoped placeholder: its tool call is an input-validation path that
+      # never reaches Grafana.
+      - GRAFANA_SERVICE_ACCOUNT_TOKEN
