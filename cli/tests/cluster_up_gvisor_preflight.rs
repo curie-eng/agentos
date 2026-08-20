@@ -13,6 +13,7 @@ const TARGET_RELEASE: &str = "target-release";
 const TARGET_NAMESPACE: &str = "target-namespace";
 const RENDERED_JOB: &str = "acme-runtime-preflight-gvisor";
 const RUNTIME_CLASS_REJECTION: &str = "Error creating: pods \"acme-runtime-preflight-gvisor-example\" is forbidden: pod rejected: RuntimeClass \"gvisor\" not found";
+const OPENROUTER_CREDENTIAL: &str = "sk-or-v1-PLACEHOLDER";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -46,10 +47,12 @@ struct Fixture {
     watch_pid: PathBuf,
     event_emitted: PathBuf,
     event_mode: String,
+    singleton_mode: String,
+    credential: String,
 }
 
 impl Fixture {
-    fn new(event_mode: &str) -> Self {
+    fn new(event_mode: &str, singleton_mode: &str, credential: &str) -> Self {
         let temp = tempfile::tempdir().expect("temporary directory");
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir).expect("create fake binary directory");
@@ -163,16 +166,18 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
     printf '%s\n' "$*" >> "$CURIE_TEST_UPGRADE_LOG"
     printf '%s\n' "$$" > "$CURIE_TEST_HELM_PID"
     gvisor_mode="auto"
+    fake_model="true"
     for argument in "$@"; do
         case "$argument" in
             security.gvisor.mode=*) gvisor_mode=${argument#*=} ;;
+            agentSandbox.runner.fakeModel=*) fake_model=${argument#*=} ;;
         esac
     done
     if [ -e "$CURIE_TEST_HELM_PENDING" ]; then
         printf '%s\n' 'Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress' >&2
         exit 1
     fi
-    if { [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; } && [ "$gvisor_mode" = "require" ]; then
+    if { [ "$CURIE_TEST_EVENT_MODE" = "matching" ] || [ "$CURIE_TEST_EVENT_MODE" = "fresh-namespace" ]; } && { [ "$gvisor_mode" = "require" ] || { [ "$gvisor_mode" = "auto" ] && [ "$fake_model" = "false" ]; }; }; then
         : > "$CURIE_TEST_HELM_PENDING"
         graceful_exit() {
             signal="$1"
@@ -222,8 +227,27 @@ if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
 fi
 
 if [ "$1" = "get" ] && [ "$2" = "priorityclass" ]; then
+    if [ "$CURIE_TEST_SINGLETON_MODE" = "foreign" ]; then
+        printf '{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"%s","labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"shared-owner","meta.helm.sh/release-namespace":"shared-owner-namespace"}}}\n' "$3"
+    fi
     exit 0
 fi
+
+case " $* " in
+    *" get deployment agent-sandbox-controller "*)
+        case " $* " in
+            *" -n agent-sandbox-system "*) ;;
+            *)
+                printf 'controller query was not scoped to agent-sandbox-system: %s\n' "$*" >&2
+                exit 64
+                ;;
+        esac
+        if [ "$CURIE_TEST_SINGLETON_MODE" = "foreign" ]; then
+            printf '%s\n' '{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"agent-sandbox-controller","labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"shared-controller","meta.helm.sh/release-namespace":"shared-owner-namespace"}}}'
+        fi
+        exit 0
+        ;;
+esac
 
 if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
     printf '%s\n' "$*" >> "$CURIE_TEST_EVENT_LOG"
@@ -344,6 +368,8 @@ exit 64
             watch_pid,
             event_emitted,
             event_mode: event_mode.to_string(),
+            singleton_mode: singleton_mode.to_string(),
+            credential: credential.to_string(),
         }
     }
 
@@ -367,16 +393,14 @@ exit 64
             TARGET_RELEASE,
             "--dev",
             "--no-expose",
-            "--fake-model",
-            "--set",
-            "security.gvisor.mode=require",
             "--set",
             "fullnameOverride=acme-runtime",
         ];
         args.extend_from_slice(extra);
 
         let started = Instant::now();
-        let output = Command::new(bin())
+        let mut command = Command::new(bin());
+        command
             .args(args)
             .env("PATH", path)
             .env("CI", "1")
@@ -395,12 +419,20 @@ exit 64
             .env("CURIE_TEST_WATCH_PID", &self.watch_pid)
             .env("CURIE_TEST_EVENT_EMITTED", &self.event_emitted)
             .env("CURIE_TEST_EVENT_MODE", &self.event_mode)
-            .env_remove("CURIE_CREDENTIALS")
+            .env("CURIE_TEST_SINGLETON_MODE", &self.singleton_mode)
+            .env(
+                "CURIE_TEST_PROVIDER_EGRESS_JSON",
+                r#"{"openrouter.ai":["1.1.1.1"],"api.anthropic.com":["8.8.8.8"]}"#,
+            )
             .env_remove("CURIE_MODEL_CREDENTIALS")
             .env_remove("CURIE_GITHUB_TOKEN")
-            .env_remove("CURIE_MODEL")
-            .output()
-            .expect("run curie cluster up");
+            .env_remove("CURIE_MODEL");
+        if self.credential.is_empty() {
+            command.env_remove("CURIE_CREDENTIALS");
+        } else {
+            command.env("CURIE_CREDENTIALS", &self.credential);
+        }
+        let output = command.output().expect("run curie cluster up");
         (output, started.elapsed())
     }
 
@@ -513,42 +545,66 @@ fn assert_process_stopped(pid_file: &Path, label: &str) {
     panic!("{label} process {pid} survived curie cluster up");
 }
 
+fn assert_inference_once(shown: &str, applied_override: &str) {
+    assert_eq!(
+        shown.matches(applied_override).count(),
+        1,
+        "the applied override must be disclosed exactly once: {applied_override}\n{shown}"
+    );
+}
+
 #[test]
-fn matching_runtimeclass_rejection_wins_before_helm_deadline() {
-    let fixture = Fixture::new("matching");
+fn bare_cluster_up_infers_all_detected_facts_and_retries_once() {
+    let fixture = Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL);
     let (output, elapsed) = fixture.run(&[]);
     let shown = stderr(&output);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "the RuntimeClass rejection must be a permanent runtime failure\nstdout:\n{}\nstderr:\n{shown}",
-        String::from_utf8_lossy(&output.stdout)
+    assert!(
+        output.status.success(),
+        "the bare command must converge on the detected cluster facts\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
         elapsed < Duration::from_secs(3),
         "the event must win well before the five second fake Helm deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
     );
     assert!(
-        shown.contains(RUNTIME_CLASS_REJECTION),
-        "the original Kubernetes rejection must be preserved:\n{shown}"
-    );
-    assert!(
         !shown.contains("stale-added") && !shown.contains("stale-modified"),
         "Events that existed before this install must be ignored even when modified:\n{shown}"
     );
-    assert!(
-        shown.contains("--set security.gvisor.mode=off"),
-        "the failure must name the explicit opt out:\n{shown}"
-    );
+    for applied in [
+        "--allow-egress-host openrouter",
+        "--set priorityClasses.platform.create=false",
+        "--set priorityClasses.sandbox.create=false",
+        "--set agentSandbox.controller.deploy=false",
+        "--set security.gvisor.mode=off",
+    ] {
+        assert_inference_once(&shown, applied);
+    }
     assert!(
         !shown.contains("DeadlineExceeded"),
         "the later Helm timeout must not become the diagnosis:\n{shown}"
     );
     assert_eq!(
         fixture.upgrade_count(),
-        1,
-        "helm upgrade --install must start exactly once"
+        2,
+        "the matching admission result permits exactly one retry"
+    );
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(
+        upgrades.contains("security.networkPolicy.allowedEgress[0].cidr=1.1.1.1/32"),
+        "the inferred OpenRouter route must reach Helm:\n{upgrades}"
+    );
+    assert!(
+        upgrades
+            .lines()
+            .last()
+            .is_some_and(|line| line.contains("security.gvisor.mode=off")),
+        "the retry must carry the inferred mode off value:\n{upgrades}"
+    );
+    assert!(
+        !shown.contains(OPENROUTER_CREDENTIAL),
+        "credential leaked: {shown}"
     );
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_graceful_helm_interruption();
@@ -557,8 +613,14 @@ fn matching_runtimeclass_rejection_wins_before_helm_deadline() {
 
 #[test]
 fn runtimeclass_document_before_job_still_observes_the_rendered_job() {
-    let fixture = Fixture::new("nonmatching");
-    let (output, _) = fixture.run(&["--set", "security.gvisor.installRuntimeClass=true"]);
+    let fixture = Fixture::new("nonmatching", "absent", "");
+    let (output, _) = fixture.run(&[
+        "--fake-model",
+        "--set",
+        "security.gvisor.mode=require",
+        "--set",
+        "security.gvisor.installRuntimeClass=true",
+    ]);
     assert!(
         output.status.success(),
         "a RuntimeClass document before the Job must not block the install\nstdout:\n{}\nstderr:\n{}",
@@ -572,33 +634,25 @@ fn runtimeclass_document_before_job_still_observes_the_rendered_job() {
 
 #[test]
 fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
-    let fixture = Fixture::new("fresh-namespace");
+    let fixture = Fixture::new("fresh-namespace", "absent", OPENROUTER_CREDENTIAL);
     let (output, elapsed) = fixture.run(&[]);
     let shown = stderr(&output);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a fresh namespace must preserve the RuntimeClass failure classification\nstdout:\n{}\nstderr:\n{shown}",
-        String::from_utf8_lossy(&output.stdout)
+    assert!(
+        output.status.success(),
+        "a fresh namespace must converge after the observed RuntimeClass rejection\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout),
     );
     assert!(
         elapsed < Duration::from_secs(3),
         "the post Helm namespace retry must still beat the fake deadline, elapsed {elapsed:?}\nstderr:\n{shown}"
     );
-    assert!(
-        shown.contains(RUNTIME_CLASS_REJECTION),
-        "the initial watch list must preserve the RuntimeClass rejection:\n{shown}"
-    );
-    assert!(
-        shown.contains("--set security.gvisor.mode=off"),
-        "the fresh namespace failure must retain the recovery:\n{shown}"
-    );
+    assert_inference_once(&shown, "--set security.gvisor.mode=off");
     assert!(
         !shown.contains("DeadlineExceeded"),
         "the Helm deadline must not replace the fresh namespace diagnosis:\n{shown}"
     );
-    assert_eq!(fixture.upgrade_count(), 1);
+    assert_eq!(fixture.upgrade_count(), 2);
     assert!(
         fixture.namespace_ready.is_file() && fixture.event_emitted.is_file(),
         "Helm must create the namespace and event before the retry observes them"
@@ -628,8 +682,8 @@ fn fresh_namespace_rejection_is_observed_after_helm_creates_the_namespace() {
 
 #[test]
 fn nonmatching_failedcreate_does_not_abort_successful_install() {
-    let fixture = Fixture::new("nonmatching");
-    let (output, _) = fixture.run(&[]);
+    let fixture = Fixture::new("nonmatching", "absent", "");
+    let (output, _) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=require"]);
     let shown = stderr(&output);
 
     assert!(
@@ -651,75 +705,78 @@ fn nonmatching_failedcreate_does_not_abort_successful_install() {
 }
 
 #[test]
-fn matching_runtimeclass_rejection_has_one_json_error() {
-    let fixture = Fixture::new("matching");
+fn bare_cluster_up_json_keeps_inferences_on_stderr_and_one_success_on_stdout() {
+    let fixture = Fixture::new("matching", "foreign", OPENROUTER_CREDENTIAL);
     let (output, elapsed) = fixture.run(&["--json"]);
+    let shown = stderr(&output);
 
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "the JSON path must preserve the permanent failure classification\nstderr:\n{}",
-        stderr(&output)
+    assert!(
+        output.status.success(),
+        "the JSON path must converge on detected facts\nstderr:\n{shown}"
     );
     assert!(
         elapsed < Duration::from_secs(3),
         "the JSON path must also beat the fake Helm deadline, elapsed {elapsed:?}"
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|error| panic!("--json must emit exactly one error object: {error}"));
+        .unwrap_or_else(|error| panic!("--json must emit exactly one success object: {error}"));
     assert!(
-        payload["error"]
-            .as_str()
-            .is_some_and(|error| error.contains(RUNTIME_CLASS_REJECTION)),
-        "the machine readable error must preserve the Kubernetes rejection: {payload}"
+        payload.get("error").is_none(),
+        "successful output must not retain the recovered rejection: {payload}"
     );
-    assert!(
-        payload["fix"]
-            .as_str()
-            .is_some_and(|fix| fix.contains("curie cluster up --set security.gvisor.mode=off")),
-        "the machine readable fix must name the explicit opt out: {payload}"
-    );
-    assert_eq!(fixture.upgrade_count(), 1);
+    for applied in [
+        "--allow-egress-host openrouter",
+        "--set priorityClasses.platform.create=false",
+        "--set priorityClasses.sandbox.create=false",
+        "--set agentSandbox.controller.deploy=false",
+        "--set security.gvisor.mode=off",
+    ] {
+        assert_inference_once(&shown, applied);
+    }
+    assert_eq!(fixture.upgrade_count(), 2);
     fixture.assert_event_was_observed_for_rendered_job();
     fixture.assert_graceful_helm_interruption();
     fixture.assert_children_stopped();
 }
 
 #[test]
-fn graceful_interruption_allows_the_mode_off_recovery_to_run_next() {
-    let fixture = Fixture::new("matching");
-    let (first, _) = fixture.run(&[]);
-    assert_eq!(
-        first.status.code(),
-        Some(1),
-        "the first install must observe the RuntimeClass rejection\nstderr:\n{}",
-        stderr(&first)
-    );
-    fixture.assert_graceful_helm_interruption();
+fn explicit_gvisor_mode_contradicting_admission_is_rejected_before_retry() {
+    for setting in ["security.gvisor.mode=auto", "security.gvisor.mode=require"] {
+        let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL);
+        let (output, elapsed) = fixture.run(&["--set", setting]);
+        let shown = stderr(&output);
 
-    let (recovery, _) = fixture.run(&["--set", "security.gvisor.mode=off"]);
-    assert!(
-        recovery.status.success(),
-        "the advertised mode off recovery must not be blocked by a pending Helm operation\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&recovery.stdout),
-        stderr(&recovery)
-    );
-    assert_eq!(
-        fixture.upgrade_count(),
-        2,
-        "the rejected install and its recovery must each invoke Helm once"
-    );
-    assert!(
-        !fixture.helm_pending.exists(),
-        "the successful recovery must leave no pending Helm operation"
-    );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{setting} contradicts the observed missing RuntimeClass\nstdout:\n{}\nstderr:\n{shown}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(elapsed < Duration::from_secs(3), "{setting}: {elapsed:?}");
+        assert_eq!(
+            fixture.upgrade_count(),
+            1,
+            "the explicit contradiction must stop before retry"
+        );
+        assert!(
+            shown.contains(RUNTIME_CLASS_REJECTION),
+            "{setting}: {shown}"
+        );
+        assert!(shown.contains(setting), "{setting}: {shown}");
+        assert!(
+            !shown.contains("--set security.gvisor.mode=off"),
+            "the explicit value must not be silently overridden: {shown}"
+        );
+        fixture.assert_graceful_helm_interruption();
+        fixture.assert_children_stopped();
+    }
 }
 
 #[test]
 fn fake_model_auto_and_mode_off_skip_the_event_observer() {
     for setting in ["security.gvisor.mode=auto", "security.gvisor.mode=off"] {
-        let fixture = Fixture::new("matching");
-        let (output, _) = fixture.run(&["--set", setting]);
+        let fixture = Fixture::new("matching", "absent", "");
+        let (output, _) = fixture.run(&["--fake-model", "--set", setting]);
         assert!(
             output.status.success(),
             "{setting} must proceed when Helm reports that the conditional template rendered nothing\nstdout:\n{}\nstderr:\n{}",
@@ -733,8 +790,8 @@ fn fake_model_auto_and_mode_off_skip_the_event_observer() {
 
 #[test]
 fn unavailable_event_watch_preserves_the_helm_result() {
-    let fixture = Fixture::new("watch-unavailable");
-    let (output, _) = fixture.run(&[]);
+    let fixture = Fixture::new("watch-unavailable", "absent", "");
+    let (output, _) = fixture.run(&["--fake-model", "--set", "security.gvisor.mode=require"]);
     assert!(
         output.status.success(),
         "an unavailable Event read must fall back to Helm's result\nstdout:\n{}\nstderr:\n{}",

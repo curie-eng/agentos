@@ -3,6 +3,7 @@
     {
       "name": "anthropic",
       "base_url": null,
+      "inferred_provider": "anthropic",
       "egress_hosts": ["api.anthropic.com"],
       "credential_examples": [
         "sk-ant-api03-PLACEHOLDER",
@@ -12,24 +13,28 @@
     {
       "name": "openrouter",
       "base_url": "https://openrouter.ai/api",
+      "inferred_provider": "openrouter",
       "egress_hosts": ["openrouter.ai"],
       "credential_examples": ["sk-or-v1-PLACEHOLDER"]
     },
     {
       "name": "zhipu",
       "base_url": "https://api.z.ai/api/anthropic",
+      "inferred_provider": null,
       "egress_hosts": ["api.z.ai"],
       "credential_examples": ["zhipu-id.PLACEHOLDER"]
     },
     {
       "name": "moonshot",
       "base_url": "https://api.moonshot.ai/anthropic",
+      "inferred_provider": null,
       "egress_hosts": ["api.moonshot.ai"],
       "credential_examples": ["sk-MOONSHOT-PLACEHOLDER"]
     },
     {
       "name": "deepseek",
       "base_url": "https://api.deepseek.com/anthropic",
+      "inferred_provider": null,
       "egress_hosts": ["api.deepseek.com"],
       "credential_examples": ["sk-DEEPSEEK-PLACEHOLDER"]
     }
