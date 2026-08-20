@@ -25,6 +25,7 @@ from .types import (
     OperatingMode,
     QuotaRejection,
     SandboxView,
+    filter_agent_child_env,
 )
 
 CORE_GROUP = "agents.x-k8s.io"
@@ -237,6 +238,7 @@ class KubernetesSandboxClient:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> None:
+        env = filter_agent_child_env(env)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
             "kind": "SandboxClaim",

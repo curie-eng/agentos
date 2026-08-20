@@ -10,6 +10,7 @@ named entries fails ``test_bundle_ref_targets_init_containers_by_name``.
 from __future__ import annotations
 
 import copy
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -129,6 +130,37 @@ def test_credential_is_never_written_to_the_claim() -> None:
     assert all("super-secret-token" not in e.get("value", "") for e in entries)
     # The rest of the boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
+
+
+def test_host_credentials_are_never_written_to_the_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    denied_names = {
+        "POSTGRES_PASSWORD",
+        "DATABASE_URL",
+        "VALKEY_PASSWORD",
+        "SLACK_BOT_TOKEN",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "CURIE_API_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "CURIE_ADAPTER_CREDENTIALS",
+        "CURIE_SEALING_PRIVATE_KEY",
+        "CURIE_SEALING_PREVIOUS_PRIVATE_KEY",
+    }
+    for name in denied_names:
+        monkeypatch.setenv(name, "placeholder")
+    monkeypatch.setenv("CURIE_BUDGET", "{}")
+    monkeypatch.setenv("CURIE_CREDENTIALS", "placeholder")
+    monkeypatch.delenv("CURIE_CONNECTOR_SECRET_KEYS", raising=False)
+
+    api = _FakeApi()
+    _client(api).create_claim("claim-credentials", pool="pool", env=os.environ)
+
+    claim_env_names = {entry["name"] for entry in _env_entries(api)}
+    assert denied_names.isdisjoint(claim_env_names)
+    assert "CURIE_BUDGET" in claim_env_names
+    assert "CURIE_CREDENTIALS" not in claim_env_names
 
 
 def test_runner_token_is_a_plaintext_env_entry_credential_excluded() -> None:
