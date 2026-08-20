@@ -4,9 +4,14 @@
 //! implementer adds it; that red state is the contract handoff.
 
 use curie::exit::{self, CliError, ExitClass};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Output};
 
 const SEAL_VALUE: &str = "placeholder-seal-value";
+const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
+const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
 
 fn run_seal(connector: &str, json: bool) -> Output {
     let keypair = curie::sealing::generate_keypair();
@@ -28,6 +33,81 @@ fn run_seal(connector: &str, json: bool) -> Output {
         .env("CURIE_TEST_SEAL_VALUE", SEAL_VALUE)
         .output()
         .expect("run curie seal")
+}
+
+fn run_unreachable_local_deploy(debug: bool) -> Output {
+    let dir = tempfile::tempdir().expect("create plugin directory");
+    curie::scaffold::scaffold(dir.path(), "test-agent").expect("scaffold plugin");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if debug {
+        command.arg("--debug");
+    }
+    command
+        .args(["local", "deploy", "--api-url", UNREACHABLE_API_URL])
+        .current_dir(dir.path())
+        .output()
+        .expect("run unreachable local deploy")
+}
+
+fn run_unreachable_local_versions(debug: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if debug {
+        command.arg("--debug");
+    }
+    command
+        .args([
+            "local",
+            "versions",
+            "acme-agent",
+            "--api-url",
+            UNREACHABLE_API_URL,
+        ])
+        .output()
+        .expect("run unreachable local versions")
+}
+
+fn run_skill_up_with_path(debug: bool, path: &Path, name: &str) -> Output {
+    let dir = tempfile::tempdir().expect("create plugin directory");
+    curie::scaffold::scaffold(dir.path(), "acme-agent").expect("scaffold plugin");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if debug {
+        command.arg("--debug");
+    }
+    command
+        .args(["skill", "up", "--fake-model", "--name", name])
+        .current_dir(dir.path())
+        .env("CURIE_CONFIG_DIR", dir.path().join("config"))
+        .env("PATH", path)
+        .output()
+        .expect("run skill up")
+}
+
+fn executable_docker_stub() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create executable directory");
+    let docker = dir.path().join("docker");
+    fs::write(
+        &docker,
+        format!("#!/bin/sh\nprintf '%s\\n' '{DOCKER_FAILURE_SENTINEL}' >&2\nexit 37\n"),
+    )
+    .expect("write docker stub");
+    let mut permissions = fs::metadata(&docker)
+        .expect("read docker stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&docker, permissions).expect("make docker stub executable");
+    dir
+}
+
+fn single_line_with_prefix<'a>(output: &'a str, prefix: &str) -> &'a str {
+    let mut matching = output.lines().filter(|line| line.starts_with(prefix));
+    let line = matching
+        .next()
+        .unwrap_or_else(|| panic!("output must contain one {prefix:?} line: {output}"));
+    assert!(
+        matching.next().is_none(),
+        "output must not repeat its {prefix:?} line: {output}"
+    );
+    line
 }
 
 #[test]
@@ -86,6 +166,189 @@ fn error_json_fix_is_null_for_plain_error() {
     let value = exit::error_json(&err);
     assert_eq!(value["error"], "kaboom");
     assert!(value["fix"].is_null());
+}
+
+#[test]
+fn local_deploy_keeps_connection_causes_out_of_the_human_error() {
+    let human = run_unreachable_local_deploy(false);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Transient.code()),
+        "unreachable local deploy must fail: {human_stderr}"
+    );
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("Start the local stack first with `curie local up`"),
+        "the human error must retain the remedy: {human_stderr}"
+    );
+    assert_eq!(
+        human_stderr.matches(UNREACHABLE_API_URL).count(),
+        1,
+        "the specific local deploy error must name the API URL once: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("GET /agents")
+            && !human_stderr.contains("error sending request for url")
+            && !human_stderr.contains("os error"),
+        "the human error must not expose the raw connection cause: {human_stderr}"
+    );
+
+    let debug = run_unreachable_local_deploy(true);
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Transient.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains("error sending request for url"),
+        "debug plumbing must retain the raw connection cause: {debug_stderr}"
+    );
+}
+
+#[test]
+fn local_versions_unreachable_has_operator_message_and_runnable_remedy() {
+    let human = run_unreachable_local_versions(false);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Transient.code()),
+        "an unreachable API must be transient: {human_stderr}"
+    );
+
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("the platform API") && error_line.contains("is unreachable"),
+        "the error must name the failed operator surface: {human_stderr}"
+    );
+    assert_eq!(
+        error_line.matches(UNREACHABLE_API_URL).count(),
+        1,
+        "the error line must name the configured API once: {human_stderr}"
+    );
+
+    let remedy = format!("curl -fsS {UNREACHABLE_API_URL}/health");
+    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
+    assert!(
+        fix_line.contains(&remedy),
+        "the remedy must contain a runnable health probe: {human_stderr}"
+    );
+    assert_eq!(
+        fix_line.matches(UNREACHABLE_API_URL).count(),
+        1,
+        "the remedy line must name the configured API once: {human_stderr}"
+    );
+    assert_eq!(
+        human_stderr.matches(UNREACHABLE_API_URL).count(),
+        2,
+        "normal output may name the API once in each relevant line: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("GET /agents")
+            && !human_stderr.contains("error sending request for url")
+            && !human_stderr.contains("os error"),
+        "normal output must hide the transport chain: {human_stderr}"
+    );
+
+    let debug = run_unreachable_local_versions(true);
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Transient.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains("GET /agents")
+            || debug_stderr.contains("error sending request for url"),
+        "debug plumbing must disclose the transport source: {debug_stderr}"
+    );
+}
+
+#[test]
+fn skill_up_without_docker_has_operator_message_and_runnable_remedy() {
+    let empty_path = tempfile::tempdir().expect("create empty executable directory");
+    let human = run_skill_up_with_path(
+        false,
+        empty_path.path(),
+        "acme-1655-docker-unavailable-human",
+    );
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Failure.code()),
+        "an unavailable Docker binary must be a failure: {human_stderr}"
+    );
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("Docker"),
+        "the error must name Docker in operator language: {human_stderr}"
+    );
+    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
+    assert!(
+        fix_line.contains("docker info"),
+        "the remedy must contain a runnable Docker probe: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("failed to invoke docker")
+            && !human_stderr.contains("No such file or directory")
+            && !human_stderr.contains("os error"),
+        "normal output must hide the process spawn source: {human_stderr}"
+    );
+
+    let debug = run_skill_up_with_path(
+        true,
+        empty_path.path(),
+        "acme-1655-docker-unavailable-debug",
+    );
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Failure.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains("failed to invoke docker"),
+        "debug plumbing must disclose the process spawn source: {debug_stderr}"
+    );
+}
+
+#[test]
+fn skill_up_docker_command_failure_has_operator_message_and_runnable_remedy() {
+    let stub = executable_docker_stub();
+    let human = run_skill_up_with_path(false, stub.path(), "acme-1655-docker-command-human");
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Failure.code()),
+        "a nonzero Docker command must be a failure: {human_stderr}"
+    );
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("Docker"),
+        "the error must name Docker in operator language: {human_stderr}"
+    );
+    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
+    assert!(
+        fix_line.contains("docker info"),
+        "the remedy must contain a runnable Docker probe: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains(DOCKER_FAILURE_SENTINEL),
+        "normal output must hide Docker stderr: {human_stderr}"
+    );
+
+    let debug = run_skill_up_with_path(true, stub.path(), "acme-1655-docker-command-debug");
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Failure.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains(DOCKER_FAILURE_SENTINEL),
+        "debug plumbing must disclose Docker stderr: {debug_stderr}"
+    );
 }
 
 #[test]
