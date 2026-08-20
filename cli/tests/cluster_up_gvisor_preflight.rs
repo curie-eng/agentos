@@ -226,6 +226,12 @@ if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     exit 0
 fi
 
+if [ "$1" = "label" ] && [ "$2" = "namespace" ] && [ "$3" = "target-namespace" ]; then
+    case " $* " in
+        *" --overwrite "*) exit 0 ;;
+    esac
+fi
+
 if [ "$1" = "get" ] && [ "$2" = "priorityclass" ]; then
     if [ "$CURIE_TEST_SINGLETON_MODE" = "foreign" ]; then
         printf '{"apiVersion":"scheduling.k8s.io/v1","kind":"PriorityClass","metadata":{"name":"%s","labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"shared-owner","meta.helm.sh/release-namespace":"shared-owner-namespace"}}}\n' "$3"

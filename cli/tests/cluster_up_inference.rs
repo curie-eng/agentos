@@ -349,7 +349,7 @@ fn inference_uses_the_effective_credential_precedence() {
     let output = final_helm_value.run(
         &[("CURIE_CREDENTIALS", OPENROUTER_CREDENTIAL)],
         VALID_RESOLVER,
-        &["--set-string", explicit_credential.as_str()],
+        &["--set", explicit_credential.as_str()],
     );
     assert_success(&final_helm_value, &output);
     assert!(final_helm_value.upgrade_log().contains("8.8.8.8/32"));

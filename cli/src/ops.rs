@@ -711,6 +711,20 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
     ))
 }
 
+/// Credential prefixes whose runtime routing selects one unambiguous provider.
+/// Keep this aligned with `runner/src/curie_runner/sdk_auth.py`: credentials
+/// outside these exact prefixes do not carry enough information to infer an
+/// egress destination.
+const CREDENTIAL_PREFIX_PROVIDERS: &[(&str, &str)] =
+    &[("sk-ant-", "anthropic"), ("sk-or-", "openrouter")];
+
+fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
+    CREDENTIAL_PREFIX_PROVIDERS
+        .iter()
+        .find(|(prefix, _)| credential.starts_with(prefix))
+        .map(|(_, provider)| *provider)
+}
+
 /// The canonical model providers `--allow-egress-host` accepts, each paired with
 /// the API hostname(s) its runner must reach, in the order shown in help and
 /// error text. The single source of truth for both the accepted-provider set and
@@ -1447,7 +1461,7 @@ fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
 
 /// Carry the runner configuration recorded by a prior real model install into
 /// a plain rerun. Explicit inputs replace their recorded family.
-fn resolve_preserved_runner_values(
+fn resolve_preserved_runner_identity_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
@@ -1469,7 +1483,14 @@ fn resolve_preserved_runner_values(
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
     }
+}
 
+fn resolve_preserved_runner_egress_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
     let egress_replaced = !opts.allow_egress_host.is_empty()
         || !opts.allow_web_egress.is_empty()
         || overridden
@@ -1495,8 +1516,9 @@ fn resolve_preserved_runner_values(
 ///
 /// The honest half of `curie diff`. `up` does a FULL upgrade, so a key present
 /// on the release but absent from `curie.yaml` is normally reset to the chart
-/// default -- except for the families [`resolve_preserved_values`] and
-/// [`resolve_preserved_runner_values`] re-supply, which survive untouched.
+/// default -- except for the families [`resolve_preserved_values`],
+/// [`resolve_preserved_runner_identity_values`], and
+/// [`resolve_preserved_runner_egress_values`] re-supply, which survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -2635,18 +2657,14 @@ fn resolve_github_token(
     }
 }
 
-/// Finish an already validated up plan with the one live values read and, when
-/// requested, resolved provider addresses. This is kept separate from command
-/// execution so apply and diff can compare the same completed values.
-pub(crate) fn complete_up_opts(
+fn complete_up_opts_without_runner_egress(
     mut opts: UpOpts,
     existing: Option<&serde_json::Value>,
     github_token: Option<&str>,
     clear_github_token: bool,
-    resolve_provider_egress: bool,
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
-    resolve_preserved_runner_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2657,6 +2675,23 @@ pub(crate) fn complete_up_opts(
     }
     opts.github_token =
         resolve_github_token(existing, &operator_sets, github_token, clear_github_token);
+    Ok(opts)
+}
+
+/// Finish an already validated up plan with the one live values read and, when
+/// requested, resolved provider addresses. This is kept separate from command
+/// execution so apply and diff can compare the same completed values.
+pub(crate) fn complete_up_opts(
+    opts: UpOpts,
+    existing: Option<&serde_json::Value>,
+    github_token: Option<&str>,
+    clear_github_token: bool,
+    resolve_provider_egress: bool,
+) -> Result<UpOpts> {
+    let mut opts =
+        complete_up_opts_without_runner_egress(opts, existing, github_token, clear_github_token)?;
+    let operator_sets = opts.operator_sets();
+    resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets);
     if resolve_provider_egress
         && !opts.allow_egress_host.is_empty()
         && opts.resolved_egress_cidrs.is_empty()
@@ -3064,6 +3099,112 @@ impl PriorityClassRole {
     }
 }
 
+const CONTROLLER_DEPLOYMENT_NAME: &str = "agent-sandbox-controller";
+const CONTROLLER_DEPLOYMENT_NAMESPACE: &str = "agent-sandbox-system";
+const CONTROLLER_DEPLOY_KEY: &str = "agentSandbox.controller.deploy";
+const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClusterUpInference {
+    Provider {
+        provider: &'static str,
+    },
+    PriorityClassReuse {
+        role: PriorityClassRole,
+        name: String,
+        owner_release: String,
+    },
+    ControllerReuse {
+        owner_release: String,
+    },
+    GvisorOff,
+}
+
+impl ClusterUpInference {
+    fn render(&self, ui: &crate::ui::Ui) {
+        match self {
+            Self::Provider { provider } => ui.note(&format!(
+                "inferred model provider from the bound credential prefix; applying `--allow-egress-host {provider}`"
+            )),
+            Self::PriorityClassReuse {
+                role,
+                name,
+                owner_release,
+            } => ui.note(&format!(
+                "inferred reuse of PriorityClass `{name}` from Helm release `{owner_release}`; applying `--set priorityClasses.{}.create=false`",
+                role.key()
+            )),
+            Self::ControllerReuse { owner_release } => ui.note(&format!(
+                "inferred reuse of `{CONTROLLER_DEPLOYMENT_NAME}` from Helm release `{owner_release}`; applying `--set {CONTROLLER_DEPLOY_KEY}=false`"
+            )),
+            Self::GvisorOff => ui.note(&format!(
+                "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set {GVISOR_MODE_KEY}=off`"
+            )),
+        }
+    }
+}
+
+fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
+    let in_lane = |sets: &'a [String]| {
+        operator_set_entries(sets)
+            .into_iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
+    };
+    in_lane(&opts.set_string).or_else(|| in_lane(&opts.set))
+}
+
+fn detected_provider_from_plan(opts: &UpOpts, plan: &UpValuePlan) -> Option<&'static str> {
+    if opts.fake_model || opts.local_model.is_some() {
+        return None;
+    }
+    plan.effective_values()
+        .get(MODEL_CREDENTIAL_KEY)
+        .and_then(|credential| provider_from_credential_prefix(credential))
+}
+
+fn provider_contradiction(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+    let Some(provider) = detected_provider_from_plan(opts, plan) else {
+        return Ok(());
+    };
+    if opts.allow_egress_host.is_empty()
+        || opts
+            .allow_egress_host
+            .iter()
+            .any(|declared| declared == provider)
+    {
+        return Ok(());
+    }
+    let declared = opts
+        .allow_egress_host
+        .iter()
+        .map(|value| format!("--allow-egress-host {value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fix =
+        format!("include `--allow-egress-host {provider}`, or remove the explicit provider list");
+    Err(crate::exit::CliError::usage(format!(
+        "the bound credential selects provider `{provider}`, but the explicit provider list `{declared}` omits it; {fix}"
+    ))
+    .with_fix(fix)
+    .into())
+}
+
+fn reconcile_provider_inference(
+    opts: &mut UpOpts,
+    plan: &UpValuePlan,
+) -> Result<Option<ClusterUpInference>> {
+    provider_contradiction(opts, plan)?;
+    let Some(provider) = detected_provider_from_plan(opts, plan) else {
+        return Ok(None);
+    };
+    if !opts.allow_egress_host.is_empty() {
+        return Ok(None);
+    }
+    opts.allow_egress_host.push(provider.to_string());
+    Ok(Some(ClusterUpInference::Provider { provider }))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PriorityClassOwner {
     release: String,
@@ -3285,28 +3426,23 @@ async fn priority_class_owner(name: &str) -> Result<PriorityClassOwnership> {
     })))
 }
 
-async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+async fn priority_class_observations(
+    opts: &UpOpts,
+    plan: &UpValuePlan,
+) -> Result<Vec<PriorityClassConflict>> {
     let rendered = rendered_priority_classes(&opts.chart, &opts.common, plan).await?;
-    let mut conflicts = Vec::new();
+    let mut observations = Vec::new();
     for (role, name) in rendered {
         let owner = match priority_class_owner(&name).await? {
             PriorityClassOwnership::Absent => continue,
             PriorityClassOwnership::Existing(owner) => owner,
         };
-        let conflicts_with_target = match owner.as_ref() {
-            None => true,
-            Some(owner) => {
-                owner.release != opts.common.release || owner.namespace != opts.common.namespace
-            }
-        };
-        if conflicts_with_target {
-            conflicts.push(PriorityClassConflict { role, name, owner });
-        }
+        observations.push(PriorityClassConflict { role, name, owner });
     }
-    if conflicts.is_empty() {
-        return Ok(());
-    }
+    Ok(observations)
+}
 
+fn priority_class_conflict_error(conflicts: Vec<PriorityClassConflict>) -> anyhow::Error {
     let mut message = String::from("PriorityClass ownership conflicts block installation:");
     for conflict in conflicts {
         if let Some(owner) = conflict.owner {
@@ -3331,7 +3467,240 @@ async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -
             conflict.role.key()
         ));
     }
-    Err(crate::exit::CliError::failure(message).into())
+    crate::exit::CliError::failure(message).into()
+}
+
+async fn preflight_priority_class_ownership(opts: &UpOpts, plan: &UpValuePlan) -> Result<()> {
+    let mut conflicts = Vec::new();
+    for observation in priority_class_observations(opts, plan).await? {
+        let PriorityClassConflict { role, name, owner } = observation;
+        let conflicts_with_target = match owner.as_ref() {
+            None => true,
+            Some(owner) => {
+                owner.release != opts.common.release || owner.namespace != opts.common.namespace
+            }
+        };
+        if conflicts_with_target {
+            conflicts.push(PriorityClassConflict { role, name, owner });
+        }
+    }
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    Err(priority_class_conflict_error(conflicts))
+}
+
+async fn reconcile_priority_class_ownership(
+    opts: &UpOpts,
+    plan: &mut UpValuePlan,
+) -> Result<Vec<ClusterUpInference>> {
+    let mut conflicts = Vec::new();
+    let mut inferred = Vec::new();
+    for observation in priority_class_observations(opts, plan).await? {
+        let PriorityClassConflict { role, name, owner } = observation;
+        let Some(owner) = owner else {
+            conflicts.push(PriorityClassConflict {
+                role,
+                name,
+                owner: None,
+            });
+            continue;
+        };
+        if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
+            continue;
+        }
+        let key = format!("priorityClasses.{}.create", role.key());
+        match final_operator_value(opts, &key) {
+            Some("true") => {
+                let assignment = format!("{key}=true");
+                let fix = format!("remove `--set {assignment}`, or pass `--set {key}=false`");
+                return Err(crate::exit::CliError::usage(format!(
+                    "PriorityClass `{name}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
+                    owner.release, owner.namespace
+                ))
+                .with_fix(fix)
+                .into());
+            }
+            Some(_) => {}
+            None => inferred.push(ClusterUpInference::PriorityClassReuse {
+                role,
+                name,
+                owner_release: owner.release,
+            }),
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(priority_class_conflict_error(conflicts));
+    }
+    for inference in &inferred {
+        if let ClusterUpInference::PriorityClassReuse { role, .. } = inference {
+            plan.set(format!("priorityClasses.{}.create", role.key()), "false");
+        }
+    }
+    Ok(inferred)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControllerOwnership {
+    Absent,
+    Existing(Option<PriorityClassOwner>),
+}
+
+fn controller_read_error(detail: impl std::fmt::Display, transient: bool) -> anyhow::Error {
+    let fix = "run `curie cluster status`".to_string();
+    let message = format!(
+        "could not inspect Deployment `{CONTROLLER_DEPLOYMENT_NAME}` in namespace `{CONTROLLER_DEPLOYMENT_NAMESPACE}`: {detail}; {fix}"
+    );
+    let error = if transient {
+        crate::exit::CliError::transient(message)
+    } else {
+        crate::exit::CliError::failure(message)
+    };
+    error.with_fix(fix).into()
+}
+
+fn controller_metadata_map<'a>(
+    metadata: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+    match metadata.get(field) {
+        None => Ok(None),
+        Some(serde_json::Value::Object(values)) => Ok(Some(values)),
+        Some(_) => Err(controller_read_error(
+            format!("kubectl returned invalid object JSON with nonobject metadata.{field}"),
+            false,
+        )),
+    }
+}
+
+fn controller_metadata_value<'a>(
+    values: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    match values.and_then(|values| values.get(key)) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(controller_read_error(
+            format!("kubectl returned invalid object JSON at metadata key `{key}`"),
+            false,
+        )),
+    }
+}
+
+async fn controller_owner() -> Result<ControllerOwnership> {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("deployment"),
+            plain(CONTROLLER_DEPLOYMENT_NAME),
+            plain("-n"),
+            plain(CONTROLLER_DEPLOYMENT_NAMESPACE),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&cmd).await?;
+    if !ok {
+        let missing_namespace = err.contains("NotFound")
+            && err.contains("namespaces")
+            && err.contains(CONTROLLER_DEPLOYMENT_NAMESPACE);
+        if missing_namespace {
+            return Ok(ControllerOwnership::Absent);
+        }
+        return Err(controller_read_error(
+            failure_reason(&err),
+            is_connectivity_failure(&err),
+        ));
+    }
+    if out.trim().is_empty() {
+        return Ok(ControllerOwnership::Absent);
+    }
+    let value: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|_| controller_read_error("kubectl returned invalid JSON", false))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| controller_read_error("kubectl returned invalid object JSON", false))?;
+    if object.get("kind").and_then(|value| value.as_str()) != Some("Deployment") {
+        return Err(controller_read_error(
+            "kubectl returned an object that is not a Deployment",
+            false,
+        ));
+    }
+    let metadata = object
+        .get("metadata")
+        .and_then(|metadata| metadata.as_object())
+        .ok_or_else(|| {
+            controller_read_error(
+                "kubectl returned invalid object JSON without metadata",
+                false,
+            )
+        })?;
+    if metadata.get("name").and_then(|value| value.as_str()) != Some(CONTROLLER_DEPLOYMENT_NAME) {
+        return Err(controller_read_error(
+            "kubectl returned invalid object JSON with another metadata.name",
+            false,
+        ));
+    }
+    let labels = controller_metadata_map(metadata, "labels")?;
+    if controller_metadata_value(labels, "app.kubernetes.io/managed-by")? != Some("Helm") {
+        return Ok(ControllerOwnership::Existing(None));
+    }
+    let annotations = controller_metadata_map(metadata, "annotations")?;
+    let Some(release) = controller_metadata_value(annotations, "meta.helm.sh/release-name")? else {
+        return Ok(ControllerOwnership::Existing(None));
+    };
+    let Some(namespace) = controller_metadata_value(annotations, "meta.helm.sh/release-namespace")?
+    else {
+        return Ok(ControllerOwnership::Existing(None));
+    };
+    Ok(ControllerOwnership::Existing(Some(PriorityClassOwner {
+        release: release.to_string(),
+        namespace: namespace.to_string(),
+    })))
+}
+
+async fn reconcile_controller_ownership(
+    opts: &UpOpts,
+    plan: &mut UpValuePlan,
+) -> Result<Option<ClusterUpInference>> {
+    let explicit = final_operator_value(opts, CONTROLLER_DEPLOY_KEY);
+    if explicit == Some("false") {
+        return Ok(None);
+    }
+    let owner = match controller_owner().await? {
+        ControllerOwnership::Absent => return Ok(None),
+        ControllerOwnership::Existing(Some(owner)) => owner,
+        ControllerOwnership::Existing(None) => {
+            return Err(controller_read_error(
+                "the Deployment exists without complete Helm ownership metadata",
+                false,
+            ));
+        }
+    };
+    if owner.release == opts.common.release && owner.namespace == opts.common.namespace {
+        return Ok(None);
+    }
+    if explicit == Some("true") {
+        let assignment = format!("{CONTROLLER_DEPLOY_KEY}=true");
+        let fix =
+            format!("remove `--set {assignment}`, or pass `--set {CONTROLLER_DEPLOY_KEY}=false`");
+        return Err(crate::exit::CliError::usage(format!(
+            "Deployment `{CONTROLLER_DEPLOYMENT_NAME}` is owned by Helm release `{}` in namespace `{}`, which contradicts explicit `{assignment}`; {fix}",
+            owner.release, owner.namespace
+        ))
+        .with_fix(fix)
+        .into());
+    }
+    if explicit.is_some() {
+        return Ok(None);
+    }
+    plan.set(CONTROLLER_DEPLOY_KEY, "false");
+    Ok(Some(ClusterUpInference::ControllerReuse {
+        owner_release: owner.release,
+    }))
 }
 
 fn up_commands_with_plan(o: &UpOpts, plan: &UpValuePlan) -> Vec<OpsCommand> {
@@ -4159,7 +4528,7 @@ fn gvisor_event_watch_line(
     let name = fields.next().unwrap_or_default();
     let reason = fields.next().unwrap_or_default();
     let message = fields.next().unwrap_or_default();
-    let missing_runtimeclass = message.contains("RuntimeClass") && message.contains("not found");
+    let missing_runtimeclass = message.contains("RuntimeClass \"gvisor\" not found");
     if kind == "Job"
         && event_namespace == namespace
         && name == job
@@ -4210,6 +4579,11 @@ enum GvisorInstallRace {
     RuntimeClassRejected(String),
 }
 
+enum GvisorInstallOutcome {
+    Installed,
+    RuntimeClassRejected(String),
+}
+
 async fn run_install_with_gvisor_observer(
     cl: &crate::ui::Checklist,
     label: &str,
@@ -4218,7 +4592,7 @@ async fn run_install_with_gvisor_observer(
     namespace: &str,
     job: &str,
     namespace_existed_before_install: bool,
-) -> Result<String> {
+) -> Result<GvisorInstallOutcome> {
     let ui = crate::ui::ui();
     ui.plumbing(&format!("+ {}", cmd.display()));
     let step = cl.step(label);
@@ -4332,7 +4706,10 @@ async fn run_install_with_gvisor_observer(
             }
             let captured = install.finish(status).await;
             match captured {
-                Ok((ok, out, err)) => finish_captured_step(step, ok_detail, cmd, ok, out, err),
+                Ok((ok, out, err)) => {
+                    finish_captured_step(step, ok_detail, cmd, ok, out, err)?;
+                    Ok(GvisorInstallOutcome::Installed)
+                }
                 Err(error) => {
                     step.fail("failed");
                     Err(error)
@@ -4345,12 +4722,7 @@ async fn run_install_with_gvisor_observer(
             }
             install.terminate().await;
             step.fail("failed");
-            let fix = "curie cluster up --set security.gvisor.mode=off";
-            Err(crate::exit::CliError::failure(format!(
-                "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
-            ))
-            .with_fix(fix)
-            .into())
+            Ok(GvisorInstallOutcome::RuntimeClassRejected(rejection))
         }
     }
 }
@@ -4425,12 +4797,18 @@ fn should_read_existing(dev: bool, dry_run: bool) -> bool {
     !dry_run
 }
 
+enum UpInferencePolicy {
+    Detect(Vec<ClusterUpInference>),
+    Disabled,
+}
+
 pub async fn up(
-    opts: UpOpts,
+    mut opts: UpOpts,
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
+    provider_contradiction(&opts, &up_value_plan(&opts))?;
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -4438,15 +4816,36 @@ pub async fn up(
     } else {
         None
     };
-    let opts = complete_up_opts(
+    opts = complete_up_opts_without_runner_egress(
         opts,
         existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
-        resolve_provider_egress,
     )?;
+    let completed_identity_plan = up_value_plan(&opts);
+    let mut inferences = Vec::new();
+    if let Some(inference) = reconcile_provider_inference(&mut opts, &completed_identity_plan)? {
+        inferences.push(inference);
+    }
+    let operator_sets = opts.operator_sets();
+    resolve_preserved_runner_egress_values(&mut opts, existing.as_ref(), &operator_sets);
+    if resolve_provider_egress
+        && !opts.allow_egress_host.is_empty()
+        && opts.resolved_egress_cidrs.is_empty()
+    {
+        opts.resolved_egress_cidrs =
+            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
+                .context("resolving named provider egress hosts")?;
+    }
     let value_plan = up_value_plan(&opts);
-    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+    run_prepared_up(
+        opts,
+        value_plan,
+        existing,
+        github_token.as_deref(),
+        UpInferencePolicy::Detect(inferences),
+    )
+    .await
 }
 
 /// Execute an up plan whose local validation and live completion already ran.
@@ -4459,16 +4858,31 @@ pub(crate) async fn up_prepared(
     github_token: Option<String>,
 ) -> Result<ClusterUpOutput> {
     validate_up_inputs(&opts, github_token.as_deref(), false)?;
-    run_prepared_up(opts, value_plan, existing, github_token.as_deref()).await
+    run_prepared_up(
+        opts,
+        value_plan,
+        existing,
+        github_token.as_deref(),
+        UpInferencePolicy::Disabled,
+    )
+    .await
 }
 
 async fn run_prepared_up(
     opts: UpOpts,
-    value_plan: UpValuePlan,
+    mut value_plan: UpValuePlan,
     existing: Option<serde_json::Value>,
     github_token: Option<&str>,
+    inference_policy: UpInferencePolicy,
 ) -> Result<ClusterUpOutput> {
     let ui = crate::ui::ui();
+    let (detect_facts, initial_inferences) = match inference_policy {
+        UpInferencePolicy::Detect(inferences) => (true, inferences),
+        UpInferencePolicy::Disabled => (false, Vec::new()),
+    };
+    for inference in &initial_inferences {
+        inference.render(ui);
+    }
     if !opts.dev {
         let operator_sets = opts.operator_sets();
         let preserved = resolve_preserved_values(existing.as_ref(), &operator_sets);
@@ -4706,14 +5120,24 @@ async fn run_prepared_up(
         .find_map(|(namespace, existed)| (namespace == &opts.common.namespace).then_some(*existed))
         .unwrap_or(false);
     require_on_path("helm")?;
-    preflight_priority_class_ownership(&opts, &value_plan).await?;
+    if detect_facts {
+        for inference in reconcile_priority_class_ownership(&opts, &mut value_plan).await? {
+            inference.render(ui);
+        }
+        if let Some(inference) = reconcile_controller_ownership(&opts, &mut value_plan).await? {
+            inference.render(ui);
+        }
+    } else {
+        preflight_priority_class_ownership(&opts, &value_plan).await?;
+    }
+    cmds = up_commands_with_plan(&opts, &value_plan);
     let gvisor_preflight_job =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     for cmd in &cmds {
         if let Some(job) = gvisor_preflight_job.as_deref() {
-            run_install_with_gvisor_observer(
+            let outcome = run_install_with_gvisor_observer(
                 &cl,
                 &label,
                 "installed",
@@ -4723,6 +5147,39 @@ async fn run_prepared_up(
                 release_namespace_existed_before_install,
             )
             .await?;
+            match outcome {
+                GvisorInstallOutcome::Installed => {}
+                GvisorInstallOutcome::RuntimeClassRejected(rejection) if detect_facts => {
+                    if let Some(mode @ ("auto" | "require")) =
+                        final_operator_value(&opts, GVISOR_MODE_KEY)
+                    {
+                        let assignment = format!("{GVISOR_MODE_KEY}={mode}");
+                        let fix = format!(
+                            "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
+                        );
+                        return Err(crate::exit::CliError::usage(format!(
+                            "explicit `{assignment}` contradicts the detected admission result `{rejection}`; {fix}"
+                        ))
+                        .with_fix(fix)
+                        .into());
+                    }
+                    value_plan.set(GVISOR_MODE_KEY, "off");
+                    ClusterUpInference::GvisorOff.render(ui);
+                    let retry = up_commands_with_plan(&opts, &value_plan)
+                        .into_iter()
+                        .next()
+                        .expect("cluster up always has one Helm command");
+                    run_step(&cl, &label, "installed", &retry).await?;
+                }
+                GvisorInstallOutcome::RuntimeClassRejected(rejection) => {
+                    let fix = "curie cluster up --set security.gvisor.mode=off";
+                    return Err(crate::exit::CliError::failure(format!(
+                        "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."
+                    ))
+                    .with_fix(fix)
+                    .into());
+                }
+            }
         } else {
             run_step(&cl, &label, "installed", cmd).await?;
         }
