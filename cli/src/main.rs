@@ -218,6 +218,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold a keyless first reply, using a saved or environment model credential when available.
+    Try {
+        /// Keep the standard scaffold in ./curie-demo for normal skill commands.
+        #[arg(long)]
+        keep: bool,
+    },
     /// Scaffold a new plugin bundle (Claude Code plugin shape).
     Init {
         /// Kebab-case plugin name (e.g. deal-desk). Omit when using --from-spec.
@@ -1981,6 +1987,11 @@ fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
 async fn run(command: Option<Command>) -> Result<()> {
     match command {
         None => curie::interactive::run().await,
+        Some(Command::Try { keep }) => {
+            let image =
+                artifacts::resolve_image(None, artifacts::Channel::current(), artifacts::version());
+            commands::try_first_run(keep, image).await
+        }
         Some(Command::Init {
             name,
             dir,
@@ -2133,14 +2144,21 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
-            SkillAction::Down { name } => commands::stop(name).await,
+            SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
             SkillAction::Message {
                 text,
                 user,
                 event_type,
                 url,
-            } => commands::send(&text, &user, event_type.into(), url).await,
+            } => {
+                let classified_failure =
+                    commands::send(&text, &user, event_type.into(), url).await?;
+                if classified_failure {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
             SkillAction::Eval {
                 cases,
                 url,

@@ -59,6 +59,25 @@
   "name": "curie",
   "subcommands": [
     {
+      "about": "Scaffold a keyless first reply, using a saved or environment model credential when available",
+      "args": [
+        {
+          "global": false,
+          "help": "Keep the standard scaffold in ./curie-demo for normal skill commands",
+          "id": "keep",
+          "long": "keep",
+          "positional": false,
+          "possible_values": [
+            "true",
+            "false"
+          ],
+          "required": false
+        }
+      ],
+      "hidden": false,
+      "name": "try"
+    },
+    {
       "about": "Scaffold a new plugin bundle (Claude Code plugin shape)",
       "args": [
         {

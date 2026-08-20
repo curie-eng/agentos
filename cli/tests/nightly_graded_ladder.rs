@@ -517,6 +517,32 @@ case "$*" in
     "--version")
         echo "curie test harness"
         ;;
+    "--json try")
+        # The keyless first run is deliberately disposable: its finalized fake
+        # reply is the only observable result, so no project may be retained
+        # in the caller's clean directory.
+        printf '%s\n' '{"status":"done","finalized":true,"reply":"all done"}'
+        ;;
+    "try")
+        # The credential-discovery E2E supplies a known-invalid credential.
+        # Name its source without ever expanding its value, and create neither
+        # a scaffold nor a runner before the rejection.
+        echo "error: discovered credential source ANTHROPIC_API_KEY was rejected" >&2
+        exit 1
+        ;;
+    "try --keep")
+        # Graduation keeps the standard plugin shape, then the normal skill
+        # commands below operate on this directory exactly as they do for a
+        # user-created project. A second graduation must refuse before writing
+        # the retained manifest.
+        if [ -e curie-demo/.claude-plugin/plugin.json ]; then
+            echo "error: curie-demo already exists" >&2
+            exit 1
+        fi
+        mkdir -p curie-demo/.claude-plugin
+        printf '%s\n' '{"name":"curie-demo"}' > curie-demo/.claude-plugin/plugin.json
+        echo "stub try all done"
+        ;;
     "--json cluster status")
         # The case-ids-only control's single injection point: after the local
         # rung deployed and before the cluster rung does, rewrite ONLY the case
@@ -548,6 +574,16 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         # sealed argv, so the sealed row is the honest answer to it.
         echo "  Model    fake (offline, no credential)"
         ;;
+    "skill up --fake-model")
+        # The graduated demo uses the unadorned normal command. It records a
+        # bundle digest and runner state so its status and teardown checks
+        # exercise the same state transition as a regular project.
+        mkdir -p .curie
+        printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        printf '%s\n' '{"runner":"stub"}' > .curie/runner.json
+        echo "stub: runner up"
+        echo "  Model    fake (offline, no credential)"
+        ;;
     "skill up --fake-model --plugin-dir "*" --name "*)
         # The #747 leftover-runner case: a taken container name must be a usage
         # refusal (exit 2) carrying the operator's own remedy, never docker's raw
@@ -563,7 +599,7 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         printf '{"bundle_digest":"%s"}\n' "$(cat "$STUB_STATE/skill_digest")"
         ;;
     "skill message "*)
-        echo "stub skill weather reply"
+        echo "stub skill all done reply"
         ;;
     "--json skill eval")
         # The bundle's OWN suite, read off the bundle e2e.sh cd'd into, because
@@ -585,6 +621,7 @@ print(json.dumps({
 }))' "$PWD/evals/cases.json"
         ;;
     "skill down")
+        rm -f .curie/runner.json
         echo "stub: runner down"
         ;;
     "skill down --name "*)
@@ -657,6 +694,13 @@ esac
         r#"#!/bin/sh
 set -u
 case "$*" in
+    "inspect curie-runner-local")
+        # The first-run credential check refuses to touch an existing shared
+        # local runner. Its harness begins with no such runner, while all
+        # other inspect shapes retain their existing configured behavior.
+        echo "stub docker: no such object: curie-runner-local" >&2
+        exit 1
+        ;;
     "inspect "*)
         # A failed env read, on its own knob: an inspect that dies (the worker
         # exited since the `docker ps`, or a daemon blip) prints nothing, which
