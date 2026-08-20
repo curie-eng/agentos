@@ -245,7 +245,7 @@ class GitHubBranchTip:
         return str(sha) if isinstance(sha, str) else None
 
 
-# The last Git flow authored commit deployed per (repository, environment).
+# The last Git flow authored version commit deployed per (repository, environment).
 # Public CLI artifacts do not settle this baseline. Environment rather than
 # branch because that is what a Deployment records; the caller maps environments
 # back to branch names via Settings, the same mapping `environment_for_ref` uses
@@ -254,7 +254,7 @@ _DEPLOYED_SQL = """
 SELECT DISTINCT ON (a.repo_full_name, d.environment)
        a.repo_full_name AS repo_full_name,
        d.environment    AS environment,
-       d.commit_sha     AS commit_sha
+       v.commit_sha     AS commit_sha
 FROM {schema}.deployments d
 JOIN {schema}.agents a ON a.id = d.agent_id
 JOIN {schema}.agent_versions v ON v.id = d.version_id

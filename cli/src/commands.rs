@@ -3536,6 +3536,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
+            "--ignored=matching",
             "--",
             ".",
         ])
