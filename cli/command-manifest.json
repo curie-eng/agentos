@@ -4161,7 +4161,7 @@
         }
       ],
       "hidden": false,
-      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.",
+      "long_about": "Converge a cluster to a `curie.yaml` installation file (ADR-0097).\n\nThe file states the whole intent, so `apply` never has to be told what it was told last time -- the gap behind the dropped-settings failures the `--set`/`--reuse-values` shape kept producing.\n\nA worked common installation is available at `examples/curie.yaml` in the Curie repository.",
       "name": "apply"
     },
     {

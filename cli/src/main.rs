@@ -429,6 +429,9 @@ enum Command {
     /// The file states the whole intent, so `apply` never has to be told what
     /// it was told last time -- the gap behind the dropped-settings failures
     /// the `--set`/`--reuse-values` shape kept producing.
+    ///
+    /// A worked common installation is available at `examples/curie.yaml` in
+    /// the Curie repository.
     Apply {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
