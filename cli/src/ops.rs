@@ -1677,6 +1677,336 @@ mod release_secret_name_tests {
 }
 
 #[cfg(test)]
+mod api_key_discovery_tests {
+    use super::*;
+
+    struct EnvRestore {
+        path: Option<std::ffi::OsString>,
+        requested: Option<std::ffi::OsString>,
+        requested_default: Option<std::ffi::OsString>,
+        all: Option<std::ffi::OsString>,
+        all_default: Option<std::ffi::OsString>,
+        all_forbidden: Option<std::ffi::OsString>,
+        log: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, previous) in [
+                ("PATH", &self.path),
+                ("CURIE_TEST_HELM_REQUESTED", &self.requested),
+                ("CURIE_TEST_HELM_REQUESTED_DEFAULT", &self.requested_default),
+                ("CURIE_TEST_HELM_ALL", &self.all),
+                ("CURIE_TEST_HELM_ALL_DEFAULT", &self.all_default),
+                ("CURIE_TEST_HELM_ALL_FORBIDDEN", &self.all_forbidden),
+                ("CURIE_TEST_HELM_LOG", &self.log),
+            ] {
+                match previous {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write fake cluster executable");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)
+            .expect("read fake cluster executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fake cluster executable runnable");
+    }
+
+    fn install_cluster_diagnosis_tools(tools: &std::path::Path) -> EnvRestore {
+        write_executable(
+            &tools.join("kubectl"),
+            r#"#!/bin/sh
+case "$*" in
+  *"get secret -l app.kubernetes.io/instance=curie"*)
+    printf '%s\n' 'curie-secrets'
+    ;;
+  *"get secret curie-secrets"*)
+    printf '%s\n' 'Error from server (NotFound): secrets "curie-secrets" not found' >&2
+    exit 1
+    ;;
+  *)
+    printf 'unexpected kubectl invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+        );
+        write_executable(
+            &tools.join("helm"),
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
+case "$*" in
+  *"-n curie"*)
+    case "$*" in
+      *"--all"*) printf '%s\n' "$CURIE_TEST_HELM_REQUESTED" ;;
+      *) printf '%s\n' "${CURIE_TEST_HELM_REQUESTED_DEFAULT:-$CURIE_TEST_HELM_REQUESTED}" ;;
+    esac
+    ;;
+  *)
+    if [ "${CURIE_TEST_HELM_ALL_FORBIDDEN:-}" = 1 ]; then
+      printf '%s\n' 'forbidden: cannot list releases across namespaces' >&2
+      exit 1
+    fi
+    case "$*" in
+      *"--all"*) printf '%s\n' "$CURIE_TEST_HELM_ALL" ;;
+      *) printf '%s\n' "${CURIE_TEST_HELM_ALL_DEFAULT:-$CURIE_TEST_HELM_ALL}" ;;
+    esac
+    ;;
+esac
+"#,
+        );
+
+        let restore = EnvRestore {
+            path: std::env::var_os("PATH"),
+            requested: std::env::var_os("CURIE_TEST_HELM_REQUESTED"),
+            requested_default: std::env::var_os("CURIE_TEST_HELM_REQUESTED_DEFAULT"),
+            all: std::env::var_os("CURIE_TEST_HELM_ALL"),
+            all_default: std::env::var_os("CURIE_TEST_HELM_ALL_DEFAULT"),
+            all_forbidden: std::env::var_os("CURIE_TEST_HELM_ALL_FORBIDDEN"),
+            log: std::env::var_os("CURIE_TEST_HELM_LOG"),
+        };
+        let mut path = vec![tools.to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::set_var("PATH", std::env::join_paths(path).expect("join test PATH"));
+        restore
+    }
+
+    fn assert_state_was_read(log: &std::path::Path) {
+        let invocations = std::fs::read_to_string(log).expect("read Helm invocation log");
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -n curie --all -o json"),
+            "the requested release state was not read: {invocations}"
+        );
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -A --all -o json"),
+            "the all namespace release state was not read: {invocations}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_failure_names_a_deployed_same_name_release_in_another_namespace() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"},{"name":"curie","namespace":"healthy","status":"deployed"}]"#,
+        );
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("an unreadable secret must not yield an API key");
+        let message = error.to_string();
+
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::ExitClass::Usage,
+            "release state guidance must preserve the command's usage exit"
+        );
+        assert!(
+            message.contains("failed"),
+            "missing requested state: {message}"
+        );
+        assert!(
+            message.contains("healthy"),
+            "missing deployed alternate namespace: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by supplying its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn api_key_failure_without_a_deployed_alternate_does_not_offer_a_key_remedy() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a failed release with no healthy alternate must fail");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("failed"),
+            "missing requested state: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by supplying its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn deployed_release_key_failure_does_not_require_all_namespace_access() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"deployed"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL", "[]");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("an unreadable secret must not yield an API key");
+        let message = error.to_string();
+
+        assert_eq!(
+            crate::exit::classify(&error).0,
+            crate::exit::ExitClass::Usage,
+            "a missing deployed release key remains a usage error"
+        );
+        assert!(
+            message.contains("--api-key"),
+            "missing flag remedy: {message}"
+        );
+        assert!(
+            message.contains("CURIE_API_KEY"),
+            "missing environment remedy: {message}"
+        );
+
+        let invocations = std::fs::read_to_string(&log).expect("read Helm invocation log");
+        assert!(
+            invocations
+                .lines()
+                .any(|line| line == "list -n curie --all -o json"),
+            "the requested release state was not read: {invocations}"
+        );
+        assert!(
+            !invocations
+                .lines()
+                .any(|line| line == "list -A --all -o json"),
+            "cluster wide Helm access is forbidden once the requested release is deployed: {invocations}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_upgrade_is_read_instead_of_reported_as_a_missing_release() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"pending-upgrade"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_REQUESTED_DEFAULT", "[]");
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL",
+            r#"[{"name":"curie","namespace":"curie","status":"pending-upgrade"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL_DEFAULT", "[]");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a pending release must not yield an API key");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("pending-upgrade"),
+            "pending Helm state was hidden: {message}"
+        );
+        assert!(
+            !message.contains("no deployed release named")
+                && !message.contains("deploy the release"),
+            "pending state was mistaken for a missing release: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a pending release cannot be repaired by configuring its key: {message}"
+        );
+        assert_state_was_read(&log);
+    }
+
+    #[tokio::test]
+    async fn failed_release_state_survives_a_forbidden_all_namespace_scan() {
+        let _lock = crate::PROCESS_ENV_LOCK
+            .lock()
+            .expect("lock test environment");
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var(
+            "CURIE_TEST_HELM_REQUESTED",
+            r#"[{"name":"curie","namespace":"curie","status":"failed"}]"#,
+        );
+        std::env::set_var("CURIE_TEST_HELM_ALL", "[]");
+        std::env::set_var("CURIE_TEST_HELM_ALL_FORBIDDEN", "1");
+
+        let error = discover_api_key("curie", "curie")
+            .await
+            .expect_err("a failed release must not yield an API key");
+        let message = error.to_string();
+        let (class, fix) = crate::exit::classify(&error);
+
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(
+            message.contains("failed"),
+            "known requested release state was discarded: {message}"
+        );
+        assert!(
+            !message.contains("could not inspect Helm state across namespaces"),
+            "the optional namespace scan replaced known state: {message}"
+        );
+        assert!(
+            !message.contains("--api-key") && !message.contains("CURIE_API_KEY"),
+            "a failed release cannot be repaired by configuring its key: {message}"
+        );
+        assert!(
+            fix.as_deref()
+                .is_some_and(|guidance| guidance.contains("curie cluster status")),
+            "missing cluster status guidance: {fix:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod sealing_preservation_tests {
     use super::*;
 
@@ -4091,6 +4421,73 @@ fn api_key_usage_err(msg: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
+/// A release-state failure while discovering an API key. The release cannot be
+/// authenticated until its state is known, so do not suggest an API key as a
+/// remedy for an unreadable Helm inspection.
+fn api_key_state_err(namespace: &str, release: &str, msg: impl Into<String>) -> anyhow::Error {
+    crate::exit::CliError::usage(msg)
+        .with_fix(format!(
+            "run `curie cluster status --namespace {namespace} --release {release}` and retry"
+        ))
+        .into()
+}
+
+fn helm_release_entries(output: &str) -> Result<Vec<serde_json::Value>> {
+    let releases: serde_json::Value =
+        serde_json::from_str(output.trim()).context("malformed Helm release list JSON")?;
+    releases
+        .as_array()
+        .cloned()
+        .context("malformed Helm release list JSON: expected an array")
+}
+
+/// Find the requested release's Helm status in a `helm list -o json` result.
+/// Missing releases are a valid result; malformed Helm output is not.
+fn helm_release_status(output: &str, release: &str) -> Result<Option<String>> {
+    let releases = helm_release_entries(output)?;
+    let Some(found) = releases
+        .iter()
+        .find(|entry| entry.get("name").and_then(|name| name.as_str()) == Some(release))
+    else {
+        return Ok(None);
+    };
+    found
+        .get("status")
+        .and_then(|status| status.as_str())
+        .map(|status| Some(status.to_string()))
+        .context("malformed Helm release list JSON: release has no status")
+}
+
+/// Find a deployed release with the requested name in another namespace.
+/// The all-namespace Helm listing makes a same-name alternate explicit rather
+/// than guessing that a credential override can repair a failed release.
+fn deployed_release_namespace(
+    output: &str,
+    release: &str,
+    requested_namespace: &str,
+) -> Result<Option<String>> {
+    let releases = helm_release_entries(output)?;
+
+    for entry in releases {
+        if entry.get("name").and_then(|name| name.as_str()) != Some(release)
+            || !entry
+                .get("status")
+                .and_then(|status| status.as_str())
+                .is_some_and(|status| status.eq_ignore_ascii_case("deployed"))
+        {
+            continue;
+        }
+        let namespace = entry
+            .get("namespace")
+            .and_then(|namespace| namespace.as_str())
+            .context("malformed Helm release list JSON: deployed release has no namespace")?;
+        if namespace != requested_namespace {
+            return Ok(Some(namespace.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Discover a Helm release's platform API key by reading it out of the chart
 /// Secret (`<release>-secrets`, data key `apiKey`), decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). The
@@ -4100,14 +4497,104 @@ fn api_key_usage_err(msg: impl Into<String>) -> anyhow::Error {
 /// wins (the caller only reaches here when neither was supplied). The value is
 /// never printed — it flows straight into the `X-API-Key` header.
 pub async fn discover_api_key(namespace: &str, release: &str) -> Result<String> {
-    read_release_secret(namespace, release, "apiKey")
+    if let Some(api_key) = read_release_secret(namespace, release, "apiKey").await {
+        return Ok(api_key);
+    }
+
+    let requested_cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("list"),
+            plain("-n"),
+            plain(namespace),
+            plain("--all"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let (requested_ok, requested_output, requested_error) = run_capture(&requested_cmd)
         .await
-        .ok_or_else(|| {
-            api_key_usage_err(format!(
-                "could not read the API key from the chart Secret for release {release} in namespace {namespace}; \
-                 pass --api-key or set CURIE_API_KEY to the release's api.apiKey"
-            ))
-        })
+        .map_err(|error| {
+            api_key_state_err(
+                namespace,
+                release,
+                format!("could not inspect Helm state for release {release} in namespace {namespace}: {error}"),
+            )
+        })?;
+    if !requested_ok {
+        return Err(api_key_state_err(
+            namespace,
+            release,
+            format!(
+                "could not inspect Helm state for release {release} in namespace {namespace}: {}",
+                failure_reason(&requested_error)
+            ),
+        ));
+    }
+    let requested_status = helm_release_status(&requested_output, release).map_err(|error| {
+        api_key_state_err(
+            namespace,
+            release,
+            format!("could not inspect Helm state for release {release} in namespace {namespace}: {error}"),
+        )
+    })?;
+
+    if requested_status
+        .as_deref()
+        .is_some_and(|status| status.eq_ignore_ascii_case("deployed"))
+    {
+        return Err(api_key_usage_err(format!(
+            "release {release} in namespace {namespace} is deployed, but its chart Secret API key could not be read; \
+             pass --api-key or set CURIE_API_KEY to the release's api.apiKey"
+        )));
+    }
+
+    let all_cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("list"),
+            plain("-A"),
+            plain("--all"),
+            plain("-o"),
+            plain("json"),
+        ],
+    );
+    let deployed_alternate = match run_capture(&all_cmd).await {
+        Ok((true, all_output, _)) => {
+            deployed_release_namespace(&all_output, release, namespace).unwrap_or(None)
+        }
+        _ => None,
+    };
+
+    let status_command =
+        format!("`curie cluster status --namespace {namespace} --release {release}`");
+    let (message, fix) = match (requested_status, deployed_alternate) {
+        (Some(status), Some(alternate_namespace)) => (
+            format!(
+                "release {release} in namespace {namespace} is {status}, not deployed; a deployed release named {release} is available in namespace {alternate_namespace}. Inspect the failed release with {status_command} or retry this command with `--namespace {alternate_namespace}`"
+            ),
+            format!("retry this command with `--namespace {alternate_namespace}`"),
+        ),
+        (Some(status), None) => (
+            format!(
+                "release {release} in namespace {namespace} is {status}, not deployed; inspect its state with {status_command}"
+            ),
+            format!("run {status_command} and repair or redeploy the release"),
+        ),
+        (None, Some(alternate_namespace)) => (
+            format!(
+                "no release named {release} was found in namespace {namespace}; a deployed release with that name is available in namespace {alternate_namespace}. Retry this command with `--namespace {alternate_namespace}`"
+            ),
+            format!("retry this command with `--namespace {alternate_namespace}`"),
+        ),
+        (None, None) => (
+            format!(
+                "no deployed release named {release} was found in namespace {namespace}; inspect the target with {status_command}"
+            ),
+            format!("run {status_command} and deploy the release before retrying"),
+        ),
+    };
+    Err(crate::exit::CliError::usage(message).with_fix(fix).into())
 }
 
 /// A usage error (exit 2) whose fix hint points the operator at

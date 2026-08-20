@@ -2457,28 +2457,25 @@ async fn run(command: Option<Command>) -> Result<()> {
                 label,
                 secret,
             } => {
-                let connect_hint = format!(
-                    "the platform API at {api_url} is unreachable. Start the local stack first with `curie local up`, then re-run (or pass --api-url if your API is elsewhere)."
-                );
-                emit(
-                    commands::deploy(DeployOpts {
-                        plugin_dir,
-                        agent,
-                        target,
-                        api_url,
-                        api_key,
-                        slack_channel,
-                        repo,
-                        env,
-                        label,
-                        secret,
-                        // `local deploy` offers `--secret`, so enforce the
-                        // declared-secrets policy gate (#464).
-                        secret_binding_supported: true,
-                        connect_hint: connect_hint.clone(),
-                    })
-                    .await?,
-                )
+                let local_api_url = api_url.clone();
+                let result = commands::deploy(DeployOpts {
+                    plugin_dir,
+                    agent,
+                    target,
+                    api_url,
+                    api_key,
+                    slack_channel,
+                    repo,
+                    env,
+                    label,
+                    secret,
+                    // `local deploy` offers `--secret`, so enforce the
+                    // declared-secrets policy gate (#464).
+                    secret_binding_supported: true,
+                    connect_hint: "the platform API is unreachable.".to_string(),
+                })
+                .await;
+                emit(local::with_deploy_unreachable_hint(result, &local_api_url).await?)
             }
             LocalAction::Versions { target } => emit(commands::versions(target.into()).await?),
             LocalAction::Memory { target } => emit(commands::memory(target.into()).await?),

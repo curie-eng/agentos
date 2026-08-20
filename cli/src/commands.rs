@@ -968,18 +968,14 @@ fn resolve_agent_folder(folder: &str) -> Result<std::path::PathBuf> {
 /// for that tier.
 pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployOutput> {
     let plugin_dir = resolve_agent_folder(folder)?;
-    let connect_hint = format!(
-        "the platform API at {} is unreachable. Start the local stack first with `curie local \
-         up`, then re-run (or pass --api-url if your API is elsewhere).",
-        opts.api_url
-    );
-    deploy(DeployOpts {
+    let api_url = opts.api_url.clone();
+    let result = deploy(DeployOpts {
         plugin_dir,
         // deploy_named is the multi-agent-folder path: the folder IS the agent
         // identity there, so there is nothing to override.
         agent: None,
         target: None,
-        api_url: opts.api_url,
+        api_url,
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
@@ -987,9 +983,10 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         label: opts.label,
         secret: opts.secret,
         secret_binding_supported: true,
-        connect_hint,
+        connect_hint: "the platform API is unreachable.".to_string(),
     })
-    .await
+    .await;
+    crate::local::with_deploy_unreachable_hint(result, &opts.api_url).await
 }
 
 /// The `curie deploy-local <folder>` flags, mirroring `local deploy`'s minus
@@ -6605,7 +6602,12 @@ mod tests {
     async fn deploy_names_the_remediation_when_api_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
         crate::scaffold::scaffold(dir.path(), "test-agent").unwrap();
-        let hint = "kubectl -n curie port-forward svc/curie-api 8000:8000";
+        // Exercise local state guidance with its default URL while port 1 below
+        // remains the deterministic connection refusal target.
+        let hint = crate::local::deploy_unreachable_hint(
+            crate::message::DEFAULT_LOCAL_API_URL,
+            Some("curie-api-1   curie-api:dev   curie-api   Up 8 seconds (health: starting)"),
+        );
         let opts = super::DeployOpts {
             agent: None,
             target: None,
@@ -6619,13 +6621,21 @@ mod tests {
             label: Some("v0".to_string()),
             secret: vec![],
             secret_binding_supported: true,
-            connect_hint: hint.to_string(),
+            connect_hint: hint.clone(),
         };
         let err = super::deploy(opts).await.unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
-            rendered.contains(hint),
-            "hint missing from error: {rendered}"
+            rendered.contains("local stack is still starting"),
+            "the connection error must retain the state aware recovery: {rendered}"
+        );
+        assert!(
+            rendered.contains("curie local status"),
+            "the connection error must direct the operator to inspect local state: {rendered}"
+        );
+        assert!(
+            !rendered.contains("curie local up"),
+            "a starting stack must not be told to start again: {rendered}"
         );
     }
 
