@@ -72,6 +72,24 @@ Two things to know:
   will not start on an older distro. The ones named for a full Rust target
   triple (`curie-<target>-<sha>`) are the portable pair.
 
+### `curie apply`
+
+Copy [`examples/curie.yaml`](../examples/curie.yaml) into your repository as
+`curie.yaml` and customize it. Credential fields contain credential names, not
+secret values.
+Before either command, provide values for `ANTHROPIC_API_KEY`,
+`SLACK_APP_TOKEN`, and `SLACK_BOT_TOKEN` in the environment or store them with
+`curie secrets set <NAME>`.
+
+Preview the installation, then apply it:
+
+```bash
+curie apply --dry-run
+curie apply
+```
+
+Use `curie cluster up` below for flag driven installs.
+
 ### `curie cluster up`
 
 Installs (or upgrades) Curie's Helm chart onto the cluster you're pointed at:
