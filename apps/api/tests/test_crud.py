@@ -170,6 +170,46 @@ def test_public_version_create_rejects_git_flow_provenance(
     assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
 
 
+def test_version_and_deployment_create_reject_blank_commit_sha(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "commit_sha_guard",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+
+    for value in ("", "   "):
+        response = client.post(
+            f"/agents/{agent_id}/versions",
+            json={"version_label": "invalid", "created_by": "bconn", "commit_sha": value},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422, response.text
+
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "valid", "created_by": "bconn"},
+        headers=auth_headers,
+    ).json()
+    for value in ("", "   "):
+        response = client.post(
+            "/deployments",
+            json={
+                "agent_id": agent_id,
+                "version_id": version["id"],
+                "environment": "dev",
+                "commit_sha": value,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 422, response.text
+
+
 # The eval trigger fallback requires deployment provenance to remain independent.
 def test_version_and_deployment_persist_distinct_commit_shas(
     client: Any, auth_headers: dict[str, str], clean_db: None

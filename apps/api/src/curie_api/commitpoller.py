@@ -259,7 +259,7 @@ FROM {schema}.deployments d
 JOIN {schema}.agents a ON a.id = d.agent_id
 JOIN {schema}.agent_versions v ON v.id = d.version_id
 WHERE a.repo_full_name IS NOT NULL
-  AND d.commit_sha IS NOT NULL
+  AND v.commit_sha IS NOT NULL
   AND v.created_by = :git_flow_created_by
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """

@@ -14,7 +14,7 @@ use curie_aci_protocol::{Budget, EventType, OutboundEvent, SessionStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ApiClient, BudgetConfig, ChannelOutcome};
-use crate::bundle::pack_tar_gz;
+use crate::bundle::{git_status_is_clean_for_pack, pack_tar_gz};
 use crate::docker::{self, CheckSpec, StartSpec};
 use crate::evals::{
     graded_answer, load_eval, outcome_label, rollup_line, score_turn, turn_completed, CaseOutcome,
@@ -3535,6 +3535,8 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         .args([
             "status",
             "--porcelain=v1",
+            "-z",
+            "--no-renames",
             "--untracked-files=all",
             "--ignored=matching",
             "--",
@@ -3547,7 +3549,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         .await
         .ok();
     let commit_sha = match git_status {
-        Some(output) if output.status.success() && output.stdout.is_empty() => {
+        Some(output)
+            if output.status.success()
+                && git_status_is_clean_for_pack(&plugin_dir, &output.stdout) =>
+        {
             tokio::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(&plugin_dir)

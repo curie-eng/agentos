@@ -123,6 +123,14 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
     return _validate
 
 
+def _validate_optional_commit_sha(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError("commit_sha must not be empty; omit it when unavailable")
+    return value.strip()
+
+
 _validate_thinking_override = _nullable_override_validator(
     "thinking", "a value like 'disabled', 'adaptive' or 'enabled:2000'"
 )
@@ -904,6 +912,8 @@ class VersionCreate(BaseModel):
     commit_sha: str | None = None
     created_by: str
 
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
+
     @field_validator("created_by")
     @classmethod
     def reject_internal_provenance(cls, value: str) -> str:
@@ -1014,6 +1024,8 @@ class DeploymentCreate(BaseModel):
     environment: Environment
     commit_sha: str | None = None
     status: str = "active"
+
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
 
 
 class DeploymentOut(BaseModel):

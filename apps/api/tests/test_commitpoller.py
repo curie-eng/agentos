@@ -219,7 +219,7 @@ async def test_a_cli_deployment_at_the_branch_tip_does_not_suppress_git_flow(
 async def test_a_git_flow_deployment_at_the_branch_tip_settles_the_poll_baseline(
     clean_db: None, monkeypatch
 ) -> None:
-    """The matching Git flow deployment is the poller's durable baseline."""
+    """The Git flow version is durable even without a deployment SHA copy."""
 
     from curie_api import gitflow
     from curie_api.commitpoller import CommitPoller
@@ -249,7 +249,7 @@ async def test_a_git_flow_deployment_at_the_branch_tip_settles_the_poll_baseline
                     agent_id=agent.id,
                     version_id=version.id,
                     environment=Environment.dev,
-                    commit_sha=sha,
+                    commit_sha=None,
                 )
             )
             await session.commit()

@@ -187,7 +187,17 @@ async fn command_deploy_uses_head_only_for_a_clean_git_bundle_and_null_sha_other
     let git = real_git();
     let bundle = tempfile::tempdir().unwrap();
     scaffold(bundle.path(), "deal-desk").unwrap();
-    std::fs::write(bundle.path().join(".gitignore"), "ignored-packed.txt\n").unwrap();
+    std::fs::write(
+        bundle.path().join(".gitignore"),
+        ".curie/\nignored-packed.txt\n",
+    )
+    .unwrap();
+    std::fs::create_dir(bundle.path().join(".curie")).unwrap();
+    std::fs::write(
+        bundle.path().join(".curie/runner.json"),
+        "ignored runtime state\n",
+    )
+    .unwrap();
     run_git(&git, bundle.path(), &["init", "--quiet"]);
     run_git(&git, bundle.path(), &["add", "."]);
     run_git(
@@ -249,6 +259,16 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
     assert_eq!(lookup_count.trim(), "1", "HEAD must be resolved once");
     assert_command_deploy_wire(&git_server, Some(&bundle_head));
 
+    let tracked_path = bundle.path().join(".claude-plugin/plugin.json");
+    let tracked_content = std::fs::read_to_string(&tracked_path).unwrap();
+    std::fs::write(&tracked_path, format!("{tracked_content}\n")).unwrap();
+    let tracked_dirty_server = serve(|req| route(&req.method, &req.path));
+    let tracked_dirty_outcome = run_command_deploy(&tracked_dirty_server, bundle.path()).await;
+
+    assert_eq!(tracked_dirty_outcome.bundle_sha256, "deadbeef");
+    assert_command_deploy_wire(&tracked_dirty_server, None);
+
+    std::fs::write(&tracked_path, tracked_content).unwrap();
     std::fs::write(bundle.path().join("uncommitted.txt"), "dirty bundle\n").unwrap();
     let dirty_server = serve(|req| route(&req.method, &req.path));
     let dirty_outcome = run_command_deploy(&dirty_server, bundle.path()).await;
