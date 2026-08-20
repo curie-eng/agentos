@@ -165,6 +165,11 @@ curie cluster down
 only what it created -- other things on the cluster are untouched,
 including pre-existing namespaces and the Agent Sandbox CRDs.
 
+A release is identified by its name AND the namespace it was installed
+into, so if you run a second install of Curie on the same cluster (which
+normally means two releases sharing the default name `curie` in different
+namespaces), tearing one down never touches the other's namespaces.
+
 It's also safe to re-run if something goes wrong. If the underlying
 uninstall fails (say, a brief Kubernetes API-server hiccup), teardown doesn't just
 stop -- it keeps going and cleans up whatever it safely can, so you're not

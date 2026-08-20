@@ -3196,11 +3196,28 @@ pub(crate) fn nodes_cmd() -> OpsCommand {
 
 /// `helm uninstall` then a namespace sweep of only the namespaces THIS release
 /// created (runtime sandboxes, PVCs and job pods Helm does not own). #707: the
-/// sweep is scoped by the release ownership label `up` stamped
-/// (`curietech.ai/created-by=<release>`) rather than a hardcoded namespace pair,
-/// so a pre-existing (unlabeled) namespace is never deleted. `--ignore-not-found`
-/// keeps a partial teardown re-runnable and the label selector tolerates zero
-/// matches. CRDs are never targeted (retention is by-construction).
+/// sweep is scoped by the ownership labels `up` stamped rather than a hardcoded
+/// namespace pair, so a pre-existing (unlabeled) namespace is never deleted.
+/// `--ignore-not-found` keeps a partial teardown re-runnable and the label
+/// selector tolerates zero matches. CRDs are never targeted (retention is
+/// by-construction).
+///
+/// #1654: the selector is the CONJUNCTION of both ownership labels
+/// (`curietech.ai/created-by=<release>,curietech.ai/created-in=<namespace>`),
+/// because a release name alone is not an identity on a shared cluster. Two
+/// independent installs normally both take the default release name `curie`
+/// while living in different install namespaces, so a `created-by`-only
+/// selector matched the OTHER install's namespaces and one `cluster down`
+/// deleted them (observed live: `agent-sandbox-system` stamped
+/// `created-by=curie` but annotated `meta.helm.sh/release-namespace: curie-other`,
+/// i.e. owned by a different release, swept anyway). The identity is therefore
+/// the PAIR (release name, install namespace), and both terms are required.
+///
+/// A namespace stamped by an older CLI carries only `created-by` and so does
+/// NOT match this selector: that is deliberate. The sweep fails safe toward
+/// retention rather than deleting a namespace whose owner cannot be
+/// established; there is no fallback selector, since a fallback is exactly the
+/// cross-release delete #1654 reports.
 pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
     vec![
         OpsCommand::new(
@@ -3218,7 +3235,10 @@ pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
                 plain("delete"),
                 plain("namespace"),
                 plain("-l"),
-                plain(format!("curietech.ai/created-by={}", o.release)),
+                plain(format!(
+                    "curietech.ai/created-by={},curietech.ai/created-in={}",
+                    o.release, o.namespace
+                )),
                 plain("--ignore-not-found"),
             ],
         ),
@@ -3528,14 +3548,31 @@ fn teardown_result(
 }
 
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
-/// records THIS release as the creator of `o.namespace`, but ONLY when `up`
-/// actually created the namespace (`namespace_existed == false`); an empty vec
-/// when the namespace pre-existed, so a namespace `up` merely adopted is never
-/// stamped and therefore never swept by a later `down`. A release-scoped label
-/// (not a per-invocation run-id) is what lets a separate `down` invocation match
-/// what `up` created. `--overwrite` keeps a re-run idempotent, so an `up`
-/// interrupted after create but before stamp fails safe toward retention.
-fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsCommand> {
+/// records THIS release as the creator of the target namespace `o.namespace`
+/// (callers retarget `o` with `ns_common`, so this is the namespace being
+/// labelled, NOT the release's install namespace), but ONLY when `up` actually
+/// created it (`namespace_existed == false`); an empty vec when the namespace
+/// pre-existed, so a namespace `up` merely adopted is never stamped and
+/// therefore never swept by a later `down`. A release-scoped label (not a
+/// per-invocation run-id) is what lets a separate `down` invocation match what
+/// `up` created. `--overwrite` keeps a re-run idempotent, so an `up` interrupted
+/// after create but before stamp fails safe toward retention.
+///
+/// #1654: the stamp carries TWO labels,
+/// `curietech.ai/created-by=<release>` plus
+/// `curietech.ai/created-in=<release_namespace>`, written in a single
+/// `kubectl label` invocation so the step and checklist accounting is
+/// unchanged. `release_namespace` is passed explicitly rather than read off
+/// `o.namespace`, which the `ns_common` retarget has already pointed at the
+/// namespace being labelled rather than at the install namespace. See
+/// `down_commands` for why the PAIR (release name, install namespace) is the
+/// identity and why a namespace stamped by an older, single-label CLI is
+/// deliberately left unswept.
+fn ownership_label_commands(
+    o: &CommonOpts,
+    release_namespace: &str,
+    namespace_existed: bool,
+) -> Vec<OpsCommand> {
     if namespace_existed {
         return Vec::new();
     }
@@ -3546,6 +3583,7 @@ fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsC
             plain("namespace"),
             plain(&o.namespace),
             plain(format!("curietech.ai/created-by={}", o.release)),
+            plain(format!("curietech.ai/created-in={release_namespace}")),
             plain("--overwrite"),
         ],
     )]
@@ -4380,7 +4418,11 @@ async fn run_prepared_up(
         if opts.common.dry_run {
             // existed_before is provably false on this branch (set above).
             let common = ns_common(&opts.common, &ns, true);
-            cmds.extend(ownership_label_commands(&common, false));
+            cmds.extend(ownership_label_commands(
+                &common,
+                &opts.common.namespace,
+                false,
+            ));
         }
         ownership_candidates.push((ns, existed_before));
     }
@@ -4469,7 +4511,7 @@ async fn run_prepared_up(
             continue;
         }
         let common = ns_common(&opts.common, ns, false);
-        for cmd in ownership_label_commands(&common, false) {
+        for cmd in ownership_label_commands(&common, &opts.common.namespace, false) {
             run_step(&cl, &label, "installed", &cmd).await?;
         }
     }
@@ -4676,13 +4718,13 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         }));
     }
     ui.warn(&format!(
-        "this uninstalls release '{0}' and deletes the namespaces it created (labeled curietech.ai/created-by={0}), leaving any pre-existing namespaces untouched",
-        opts.common.release
+        "this uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach), leaving any pre-existing namespaces untouched",
+        opts.common.release, opts.common.namespace
     ));
     if !opts.yes
         && !confirm(&format!(
-            "This uninstalls release '{0}' and deletes the namespaces it created (labeled curietech.ai/created-by={0}). Continue? [y/N] ",
-            opts.common.release
+            "This uninstalls release '{0}' in namespace '{1}' and deletes only the namespaces that release created (labeled curietech.ai/created-by={0} AND curietech.ai/created-in={1}, so a namespace another release created is out of reach). Continue? [y/N] ",
+            opts.common.release, opts.common.namespace
         ))?
     {
         return Ok(ClusterDownOutput::Aborted);
@@ -6521,10 +6563,12 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].display(), "helm uninstall prod-release -n agent-ns");
         let sweep = cmds[1].display();
-        // Label-selector-scoped delete keyed on THIS release's ownership label.
+        // Label-selector-scoped delete keyed on THIS release's ownership labels.
+        // #1654: the selector is the conjunction of release name AND install
+        // namespace, so it cannot reach another release's namespaces.
         assert_eq!(
             sweep,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
         );
         // Negative case: the pre-existing shared namespace is no longer an
         // unconditional delete target (that would strand pre-existing state).
@@ -6555,7 +6599,8 @@ mod tests {
     // SYMBOL: a pure builder that gates the ownership stamp on the
     // pre-existence probe result:
     //
-    //   fn ownership_label_commands(o: &CommonOpts, namespace_existed: bool) -> Vec<OpsCommand>
+    //   fn ownership_label_commands(o: &CommonOpts, release_namespace: &str,
+    //                               namespace_existed: bool) -> Vec<OpsCommand>
     //
     // It returns the `kubectl label namespace` stamp step ONLY when `up` created
     // the namespace (namespace_existed == false); an empty vec when the namespace
@@ -6563,22 +6608,138 @@ mod tests {
     // existing/fresh split), keeping this builder pure and unit-testable.
     #[test]
     fn up_stamps_ownership_label_when_namespace_created() {
-        let cmds = ownership_label_commands(&common_distinct_release(), false);
+        let cmds = ownership_label_commands(&common_distinct_release(), "install-ns", false);
         assert_eq!(cmds.len(), 1);
-        // namespace arg is the namespace; the label VALUE is the release.
+        // namespace arg is the TARGET namespace; the created-by label VALUE is
+        // the release, and the #1654 created-in label VALUE is the release's
+        // INSTALL namespace (distinct from the target here, so neither value can
+        // be satisfied by the other).
         assert_eq!(
             cmds[0].display(),
-            "kubectl label namespace agent-ns curietech.ai/created-by=prod-release --overwrite"
+            "kubectl label namespace agent-ns curietech.ai/created-by=prod-release curietech.ai/created-in=install-ns --overwrite"
         );
     }
 
     #[test]
     fn up_does_not_stamp_ownership_label_when_namespace_preexisting() {
-        let cmds = ownership_label_commands(&common_distinct_release(), true);
+        let cmds = ownership_label_commands(&common_distinct_release(), "install-ns", true);
         assert!(
             cmds.is_empty(),
             "a pre-existing namespace must not be stamped (would adopt then delete pre-existing state): {:?}",
             cmds.iter().map(OpsCommand::display).collect::<Vec<_>>()
+        );
+    }
+
+    /// Parse a `kubectl label namespace <ns> k=v [k=v ...] --overwrite` stamp
+    /// into the label map it would actually set on that namespace.
+    fn parse_stamped_labels(cmd: &OpsCommand) -> std::collections::BTreeMap<String, String> {
+        let line = cmd.display();
+        let mut parts = line.split_whitespace();
+        assert_eq!(parts.next(), Some("kubectl"), "{line}");
+        assert_eq!(parts.next(), Some("label"), "{line}");
+        assert_eq!(parts.next(), Some("namespace"), "{line}");
+        parts.next().expect("the target namespace arg");
+        parts
+            .take_while(|tok| !tok.starts_with("--"))
+            .map(|tok| {
+                let (k, v) = tok.split_once('=').unwrap_or_else(|| {
+                    panic!("every stamped label must be key=value, got {tok:?}: {line}")
+                });
+                (k.to_string(), v.to_string())
+            })
+            .collect()
+    }
+
+    /// Parse the `-l` selector out of a `kubectl delete namespace -l <sel>
+    /// --ignore-not-found` sweep into the `key=value` terms it REQUIRES (a
+    /// comma-joined kubectl selector is a conjunction: all terms must match).
+    fn parse_selector_terms(cmd: &OpsCommand) -> Vec<(String, String)> {
+        let line = cmd.display();
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let at = toks.iter().position(|t| *t == "-l").expect("a -l selector");
+        toks[at + 1]
+            .split(',')
+            .map(|term| {
+                let (k, v) = term.split_once('=').unwrap_or_else(|| {
+                    panic!("every selector term must be key=value, got {term:?}: {line}")
+                });
+                (k.to_string(), v.to_string())
+            })
+            .collect()
+    }
+
+    /// Whether a sweep selector's required terms are all satisfied by the labels
+    /// a namespace actually carries, i.e. whether that sweep would delete it.
+    fn selector_matches(
+        terms: &[(String, String)],
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        terms
+            .iter()
+            .all(|(k, v)| labels.get(k).map(String::as_str) == Some(v.as_str()))
+    }
+
+    // #1654 cross-release teardown scope. Two independent Curie installs on one
+    // cluster normally BOTH take the default release name `curie` and differ
+    // only in their install namespace, so a sweep selector keyed on the release
+    // name alone matched the OTHER install's namespaces and deleted them
+    // (observed live: `agent-sandbox-system` stamped `created-by=curie` while
+    // annotated `meta.helm.sh/release-namespace: curie-other`, swept by an
+    // unrelated release's `cluster down`, killing a running bot).
+    //
+    // Modeled BEHAVIORALLY rather than by string comparison: stamp release B's
+    // namespace, build release A's sweep selector, then evaluate that selector
+    // against those labels the way kubectl would. A FAILURE on the first
+    // assertion means release A's teardown can delete a namespace release B
+    // created -- the #1654 defect itself, which is what dropping `created-in`
+    // from either the stamp or the selector reintroduces. The second assertion
+    // is the anti-vacuity control: a selector that matched nothing at all would
+    // also pass the first one, so release A must still sweep its OWN namespace.
+    #[test]
+    fn down_selector_never_matches_another_releases_namespace() {
+        // Release B: name `curie`, installed into `curie-other`, and it created
+        // the shared-looking `agent-sandbox-system`.
+        let b = CommonOpts {
+            namespace: "curie-other".into(),
+            release: "curie".into(),
+            dry_run: false,
+        };
+        let b_stamp = ownership_label_commands(
+            &ns_common(&b, "agent-sandbox-system", false),
+            &b.namespace,
+            false,
+        );
+        assert_eq!(b_stamp.len(), 1);
+        let b_labels = parse_stamped_labels(&b_stamp[0]);
+
+        // Release A: the SAME release name, installed into a different
+        // namespace. Its teardown sweep must not reach release B's namespace.
+        let a = CommonOpts {
+            namespace: "curie-a".into(),
+            release: "curie".into(),
+            dry_run: false,
+        };
+        let a_sweep = down_commands(&a);
+        let a_terms = parse_selector_terms(&a_sweep[1]);
+        assert!(
+            !selector_matches(&a_terms, &b_labels),
+            "release A's sweep selector {a_terms:?} must NOT match release B's namespace labels \
+             {b_labels:?}; matching means one install's `cluster down` deletes another live \
+             install's namespaces (#1654)"
+        );
+
+        // Anti-vacuity: release A must still sweep a namespace A itself created.
+        let a_stamp = ownership_label_commands(
+            &ns_common(&a, "agent-sandbox-system", false),
+            &a.namespace,
+            false,
+        );
+        assert_eq!(a_stamp.len(), 1);
+        let a_labels = parse_stamped_labels(&a_stamp[0]);
+        assert!(
+            selector_matches(&a_terms, &a_labels),
+            "release A's sweep selector {a_terms:?} must still match its OWN stamp {a_labels:?}; \
+             a selector that matches nothing is not a fix"
         );
     }
 
@@ -6658,12 +6819,12 @@ mod tests {
         let cmd = resume_command(&[TeardownStep::NamespaceSweep], &o);
         assert_eq!(
             cmd,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
         );
         // #707 ownership-scope invariant: the sweep stays keyed on THIS release's
         // label and is never widened to an unconditional namespace delete.
         assert!(
-            cmd.contains("curietech.ai/created-by=prod-release"),
+            cmd.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{cmd}"
         );
         assert!(
@@ -6698,7 +6859,7 @@ mod tests {
         );
         let helm_cmd = "helm uninstall prod-release -n agent-ns";
         let sweep_cmd =
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release --ignore-not-found";
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
         assert_eq!(
             cmd,
             format!(
@@ -6730,7 +6891,7 @@ mod tests {
         );
         // The sweep half stays label-scoped even when combined with helm.
         assert!(
-            cmd.contains("curietech.ai/created-by=prod-release"),
+            cmd.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{cmd}"
         );
         assert!(cmd.contains("--ignore-not-found"), "{cmd}");
@@ -7020,14 +7181,14 @@ mod tests {
         // P1: the resume command is IN the human Display message, not only the fix.
         let shown = err.to_string();
         assert!(
-            shown.contains("curietech.ai/created-by=prod-release"),
+            shown.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "the human message must carry the label-scoped resume command: {shown}"
         );
 
         // --json path: the fix carries the same label-scoped resume command.
         let fix = fix.expect("a fail-forward teardown carries a resume command");
         assert!(
-            fix.contains("curietech.ai/created-by=prod-release"),
+            fix.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "fix must carry the label-scoped resume command: {fix}"
         );
     }
@@ -7159,7 +7320,7 @@ mod tests {
         // Fail-forward still surfaces the resume command in message and fix.
         let shown = err.to_string();
         assert!(
-            shown.contains("curietech.ai/created-by=prod-release"),
+            shown.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "even a permanent failure surfaces the label-scoped resume command: {shown}"
         );
         // Codex P2: the permanent-failure message must surface the underlying
@@ -7171,7 +7332,7 @@ mod tests {
         );
         let fix = fix.expect("a fail-forward teardown carries a resume command");
         assert!(
-            fix.contains("curietech.ai/created-by=prod-release"),
+            fix.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
             "{fix}"
         );
     }
