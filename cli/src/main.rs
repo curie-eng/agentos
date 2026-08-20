@@ -83,7 +83,7 @@ struct ClusterConn {
     #[arg(long, env = "CURIE_API_KEY")]
     api_key: Option<String>,
     /// Kubernetes namespace of the release. Default: curie.
-    #[arg(long, default_value = "curie")]
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
     namespace: String,
     /// Helm release name. Default: curie.
     #[arg(long, default_value = "curie")]
@@ -1309,7 +1309,7 @@ enum ClusterAction {
     /// credential and named egress.
     Up {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1382,7 +1382,7 @@ enum ClusterAction {
     /// kubectl delete namespace). The agents.x-k8s.io CRDs are left in place.
     Down {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1428,7 +1428,7 @@ enum ClusterAction {
         #[arg(long, value_parser = ["export", "import"])]
         phase: Option<String>,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1452,7 +1452,7 @@ enum ClusterAction {
     /// Report release health and access URLs (read-only: helm status + kubectl).
     Status {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1464,7 +1464,7 @@ enum ClusterAction {
     /// Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1504,7 +1504,7 @@ enum ClusterAction {
         )]
         bot_token: String,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1532,7 +1532,7 @@ enum ClusterAction {
         #[arg(long)]
         disconnect: bool,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
         #[arg(long, default_value = "curie")]
@@ -1563,7 +1563,7 @@ enum ClusterAction {
         #[arg(long = "continue")]
         r#continue: bool,
         /// Kubernetes namespace of the release. Default: curie.
-        #[arg(long)]
+        #[arg(long, env = "CURIE_NAMESPACE")]
         namespace: Option<String>,
         /// Helm release name. Default: curie.
         #[arg(long)]
@@ -1630,7 +1630,7 @@ enum ClusterAction {
         #[arg(long)]
         channel: Option<String>,
         /// Kubernetes namespace of the release. Default: curie.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name. Default: curie.
         #[arg(long, default_value = "curie")]
@@ -1722,7 +1722,7 @@ enum ClusterAction {
         #[arg(long, env = "CURIE_API_URL")]
         api_url: Option<String>,
         /// Kubernetes namespace of the release (for the port-forward + key discovery). Default: curie.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name (for the port-forward + key discovery). Default: curie.
         #[arg(long, default_value = "curie")]

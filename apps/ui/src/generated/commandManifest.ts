@@ -1952,6 +1952,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2094,6 +2095,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2159,6 +2161,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2232,6 +2235,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2273,6 +2277,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2374,6 +2379,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2468,6 +2474,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace",
               "id": "namespace",
@@ -2549,6 +2556,7 @@ export const commandManifest = {
               "required": false
             },
             {
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -2701,6 +2709,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -2902,6 +2911,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release (for the port-forward + key discovery). Default: curie",
               "id": "namespace",
@@ -3009,6 +3019,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3087,6 +3098,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3193,6 +3205,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3268,6 +3281,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3342,6 +3356,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3420,6 +3435,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3498,6 +3514,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3563,6 +3580,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",
@@ -3628,6 +3646,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
+              "env": "CURIE_NAMESPACE",
               "global": false,
               "help": "Kubernetes namespace of the release. Default: curie",
               "id": "namespace",

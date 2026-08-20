@@ -18,6 +18,69 @@ fn output_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr)
 }
 
+fn live_command_manifest() -> serde_json::Value {
+    let output = Command::new(bin())
+        .arg("schema")
+        .output()
+        .expect("run curie schema");
+    assert!(
+        output.status.success(),
+        "curie schema failed\n{}",
+        output_text(&output)
+    );
+    serde_json::from_slice(&output.stdout).expect("curie schema emits JSON")
+}
+
+fn cluster_status_plan(env_namespace: &str, flag_namespace: Option<&str>) -> Vec<String> {
+    let mut command = Command::new(bin());
+    command
+        .arg("--json")
+        .args(["cluster", "status", "--dry-run"])
+        .env("CURIE_NAMESPACE", env_namespace);
+    if let Some(namespace) = flag_namespace {
+        command.args(["--namespace", namespace]);
+    }
+    let output = command.output().expect("run curie cluster status dry run");
+    assert!(
+        output.status.success(),
+        "curie cluster status dry run failed\n{}",
+        output_text(&output)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status dry run emits JSON");
+    value["plan"]
+        .as_array()
+        .expect("status dry run includes a plan")
+        .iter()
+        .map(|line| {
+            line.as_str()
+                .expect("status plan entries are strings")
+                .to_string()
+        })
+        .collect()
+}
+
+fn assert_status_plan_namespace(plan: &[String], namespace: &str) {
+    let namespaced: Vec<_> = plan.iter().filter(|line| line.contains(" -n ")).collect();
+    assert!(
+        !namespaced.is_empty(),
+        "status plan must include namespace aware commands: {plan:?}"
+    );
+    let expected = format!(" -n {namespace}");
+    assert!(
+        namespaced.iter().all(|line| line.contains(&expected)),
+        "every namespace aware command must use {namespace}: {plan:?}"
+    );
+    assert!(
+        namespaced.iter().any(|line| line.starts_with("helm ")),
+        "the Helm status command must use {namespace}: {plan:?}"
+    );
+    assert!(
+        namespaced.iter().any(|line| line.starts_with("kubectl ")),
+        "the kubectl status commands must use {namespace}: {plan:?}"
+    );
+}
+
 fn help_lists_subcommand(text: &str, name: &str) -> bool {
     text.lines().any(|line| {
         let line = line.trim_start();
@@ -224,6 +287,58 @@ fn command_manifest_matches_committed_artifact() {
         generated, committed,
         "cli/command-manifest.json is stale; regenerate with \
          `cargo run -- schema > cli/command-manifest.json`"
+    );
+}
+
+#[test]
+fn cluster_namespace_env_reaches_every_cluster_verb() {
+    let manifest = live_command_manifest();
+    let cluster = manifest["subcommands"]
+        .as_array()
+        .expect("manifest has top level subcommands")
+        .iter()
+        .find(|command| command["name"] == "cluster")
+        .expect("manifest has the cluster command");
+    let subcommands = cluster["subcommands"]
+        .as_array()
+        .expect("cluster has subcommands");
+    assert!(
+        !subcommands.is_empty(),
+        "cluster namespace coverage must not be vacuous"
+    );
+
+    for subcommand in subcommands {
+        let name = subcommand["name"]
+            .as_str()
+            .expect("cluster subcommand has a name");
+        let namespace_args: Vec<_> = subcommand["args"]
+            .as_array()
+            .expect("cluster subcommand has arguments")
+            .iter()
+            .filter(|arg| arg["id"] == "namespace")
+            .collect();
+        assert_eq!(
+            namespace_args.len(),
+            1,
+            "cluster {name} must expose exactly one namespace argument"
+        );
+        assert_eq!(
+            namespace_args[0]["env"], "CURIE_NAMESPACE",
+            "cluster {name} must read CURIE_NAMESPACE"
+        );
+    }
+}
+
+#[test]
+fn cluster_namespace_flag_wins_over_environment() {
+    let env_plan = cluster_status_plan("env-namespace", None);
+    assert_status_plan_namespace(&env_plan, "env-namespace");
+
+    let flag_plan = cluster_status_plan("env-namespace", Some("flag-namespace"));
+    assert_status_plan_namespace(&flag_plan, "flag-namespace");
+    assert!(
+        flag_plan.iter().all(|line| !line.contains("env-namespace")),
+        "the environment namespace must not survive an explicit flag: {flag_plan:?}"
     );
 }
 
