@@ -14,15 +14,19 @@ here is a test-only code branch.
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import os
 import subprocess
+import tarfile
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+import redis
+from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api import bundles, crud
 from curie_api.config import get_settings
 from curie_test_support.scaffold import scaffolded_deploy_yaml
@@ -338,6 +342,79 @@ def test_partial_version_is_rebuilt_not_reused(
     assert len(versions) == 1
     assert versions[0]["commit_sha"] == sha
     assert versions[0]["bundle_ref"] is not None
+
+
+def test_dev_push_does_not_reuse_a_cli_bundle_with_the_same_commit_sha(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """A git push must build its own artifact and fan out its normal eval."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+
+    cli_version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={
+            "version_label": "cli-working-tree",
+            "created_by": "cli",
+            "commit_sha": sha,
+        },
+        headers=auth_headers,
+    )
+    assert cli_version.status_code == 201, cli_version.text
+    cli_version_id = cli_version.json()["id"]
+
+    cli_files = {
+        **VALID_FILES,
+        "skills/alpha/SKILL.md": "---\nname: alpha\ndescription: cli working tree\n---\n",
+    }
+    cli_archive = io.BytesIO()
+    with tarfile.open(fileobj=cli_archive, mode="w:gz") as archive:
+        for rel, content in cli_files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"cli-working-tree/{rel}")
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    upload = client.put(
+        f"/agents/{agent_id}/versions/{cli_version_id}/bundle",
+        files={"file": ("cli-working-tree.tar.gz", cli_archive.getvalue())},
+        headers=auth_headers,
+    )
+    assert upload.status_code == 201, upload.text
+    cli_bundle_ref = upload.json()["bundle_ref"]
+
+    response = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url))
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "deployed"
+
+    versions = client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json()
+    git_versions = [version for version in versions if version["created_by"] == "git-flow"]
+    assert len(git_versions) == 1, versions
+    git_version = git_versions[0]
+    assert git_version["id"] != cli_version_id
+    assert git_version["bundle_ref"] != cli_bundle_ref
+
+    stored = client.get(
+        f"/agents/{agent_id}/versions/{git_version['id']}/bundle", headers=auth_headers
+    )
+    assert stored.status_code == 200, stored.text
+    assert stored.content != cli_archive.getvalue()
+
+    stream = redis.from_url(get_settings().valkey_dsn())
+    try:
+        eval_jobs = [
+            json.loads(fields[STREAM_PAYLOAD_FIELD.encode()])
+            for _id, fields in stream.xrevrange("curie:evals", count=200)
+            if json.loads(fields[STREAM_PAYLOAD_FIELD.encode()]).get("agent_id") == agent_id
+        ]
+    finally:
+        stream.close()
+    assert len(eval_jobs) == 1, eval_jobs
+    assert eval_jobs[0]["version_id"] == git_version["id"]
+    assert eval_jobs[0]["sha"] == sha
 
 
 def test_invalid_signature_is_401(
