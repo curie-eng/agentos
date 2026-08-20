@@ -26,23 +26,29 @@ def run_script(step: dict) -> str:
 
 
 class TestChartIndexWorkflowContract:
-    def test_only_published_releases_and_the_narrow_next_bootstrap_trigger_it(self):
+    def test_successful_stable_release_runs_and_the_next_bootstrap_trigger_it(self):
         workflow = load_yaml(WORKFLOW_PATH)
         trigger = workflow["on"]
         job = next(iter(workflow["jobs"].values()))
 
-        assert set(trigger) == {"release", "push"}
-        assert trigger["release"] == {"types": ["published"]}
+        assert set(trigger) == {"workflow_run", "push"}
+        assert trigger["workflow_run"] == {
+            "workflows": ["Release images and binaries"],
+            "types": ["completed"],
+        }
         assert trigger["push"]["branches"] == ["next"]
         assert len(trigger["push"]["paths"]) == 2
         assert set(trigger["push"]["paths"]) == {
             ".github/workflows/chart-index.yaml",
             "cr.yaml",
         }
-        assert job["if"] == (
-            "github.event_name != 'release' || "
-            "github.event.release.prerelease == false"
-        )
+        condition = " ".join(job["if"].split())
+        assert "github.event_name == 'push'" in condition
+        assert "github.event_name == 'workflow_run'" in condition
+        assert "github.event.workflow_run.conclusion == 'success'" in condition
+        assert "github.event.workflow_run.event == 'push'" in condition
+        assert "startsWith(github.event.workflow_run.head_branch, 'v')" in condition
+        assert "!contains(github.event.workflow_run.head_branch, '-')" in condition
 
     def test_next_bootstrap_selects_the_latest_stable_release(self):
         workflow = load_yaml(WORKFLOW_PATH)
@@ -54,6 +60,8 @@ class TestChartIndexWorkflowContract:
 
         assert 'repos/$GITHUB_REPOSITORY/releases/latest' in resolve_script
         assert "Chart.yaml" not in resolve_script
+        assert "GITHUB_EVENT_PATH" not in resolve_script
+        assert "workflow_run.head_branch" not in resolve_script
         assert re.search(
             r"\^v\(0\|\[1-9\]\[0-9\]\*\)\\\."
             r"\(0\|\[1-9\]\[0-9\]\*\)\\\."

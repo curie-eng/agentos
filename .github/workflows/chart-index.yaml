@@ -1,8 +1,9 @@
 name: Publish Helm chart index
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [Release images and binaries]
+    types: [completed]
   push:
     branches: [next]
     paths:
@@ -18,7 +19,13 @@ concurrency:
 jobs:
   publish-index:
     name: Verify the release and publish its chart index
-    if: github.event_name != 'release' || github.event.release.prerelease == false
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v') &&
+      !contains(github.event.workflow_run.head_branch, '-'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -37,11 +44,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
-            release_tag="$(jq -r '.release.tag_name' "$GITHUB_EVENT_PATH")"
-          else
-            release_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          fi
+          release_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
           if ! [[ "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "The release tag is invalid" >&2
             exit 1
