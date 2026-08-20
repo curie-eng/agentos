@@ -361,6 +361,12 @@ persist_source() {{
     cat "$migration_source"
 }}
 case "$verb $object" in
+'get deployment')
+    case "$all" in
+        'get deployment agent-sandbox-controller -n agent-sandbox-system --ignore-not-found -o json') : ;;
+        *) unexpected ;;
+    esac
+    ;;
 'get priorityclass')
     # Empty stdout with exit 0 is kubectl --ignore-not-found for an absent class.
     :

@@ -180,24 +180,35 @@ fn guide_json_emits_pure_structured_data_on_stdout() {
 }
 
 #[test]
-fn guide_documents_gvisor_fail_closed_opt_out() {
-    // AC (#363): a real-model `cluster up` on a no-runsc cluster fails closed under
-    // the default gVisor mode; the opt-out and its preflight symptom must both be
-    // discoverable in the primer -- in the Markdown default and the --json variant.
+fn guide_documents_cluster_up_gvisor_inference_and_fail_closed_contradictions() {
+    // AC (#1662, ADR 0114): a real-model `cluster up` may infer gVisor off only
+    // from the exact admission symptom, retry once, and keep every other failure
+    // closed. Explicit auto or require modes contradict that detected result.
     let md = out_str(&run(&["guide"]));
     let json = out_str(&run(&["guide", "--json"]));
     for (label, text) in [("markdown", &md), ("json", &json)] {
         assert!(
             text.contains("security.gvisor.mode=off"),
-            "{label} primer missing the gVisor opt-out `security.gvisor.mode=off`\n{text}"
+            "{label} primer missing the inferred override `security.gvisor.mode=off`\n{text}"
         );
         assert!(
-            text.contains("curie-preflight-gvisor"),
-            "{label} primer missing the preflight symptom `curie-preflight-gvisor`\n{text}"
+            text.contains("curie-preflight-gvisor")
+                && text.contains("RuntimeClass gvisor is not found"),
+            "{label} primer missing the exact admission symptom\n{text}"
         );
         assert!(
-            text.contains("running runner pods on the host kernel"),
-            "{label} primer missing the Landmine detail `running runner pods on the host kernel`\n{text}"
+            text.contains("retries once"),
+            "{label} primer missing the one retry limit\n{text}"
+        );
+        assert!(
+            text.contains("Other failures remain closed"),
+            "{label} primer missing the fail closed behavior for other failures\n{text}"
+        );
+        assert!(
+            text.contains(
+                "Explicit auto or require modes contradict the detected result and are errors"
+            ),
+            "{label} primer missing the explicit mode contradiction error\n{text}"
         );
     }
 }

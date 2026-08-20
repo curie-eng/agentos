@@ -55,13 +55,20 @@ _PROVIDER_REGISTRY_KEYS = frozenset(
     {"providers", "unknown_provider_names", "rejected_credential_examples"}
 )
 _PROVIDER_ROW_KEYS = frozenset(
-    {"name", "base_url", "egress_hosts", "credential_examples"}
+    {
+        "name",
+        "base_url",
+        "inferred_provider",
+        "egress_hosts",
+        "credential_examples",
+    }
 )
 
 
 class _ProviderRow(TypedDict):
     name: str
     base_url: str | None
+    inferred_provider: str | None
     egress_hosts: list[str]
     credential_examples: list[str]
 
@@ -87,6 +94,9 @@ def _load_provider_registry(raw: str | None = None) -> _ProviderRegistryDocument
         assert set(provider) == _PROVIDER_ROW_KEYS
         assert isinstance(provider["name"], str)
         assert provider["base_url"] is None or isinstance(provider["base_url"], str)
+        assert provider["inferred_provider"] is None or isinstance(
+            provider["inferred_provider"], str
+        )
         assert isinstance(provider["egress_hosts"], list)
         assert provider["egress_hosts"]
         assert all(isinstance(host, str) and host for host in provider["egress_hosts"])
@@ -287,6 +297,30 @@ def test_provider_registry_matches_runner_authority() -> None:
 
     assert not set(registry["unknown_provider_names"]) & set(by_name)
 
+
+def test_provider_registry_inferred_prefixes_match_runtime_routing() -> None:
+    registry = _load_provider_registry()
+
+    for provider in registry["providers"]:
+        for credential in provider["credential_examples"]:
+            env = {CREDENTIALS_ENV: credential}
+            try:
+                resolve_model_credential(env)
+            except UnsupportedCredentialError:
+                routed_provider = None
+            else:
+                if env.get(BASE_URL_ENV) == OPENROUTER_BASE_URL:
+                    routed_provider = "openrouter"
+                elif credential.startswith("sk-ant-"):
+                    routed_provider = "anthropic"
+                else:
+                    routed_provider = None
+
+            assert routed_provider == provider["inferred_provider"], (
+                provider["name"],
+                credential,
+                routed_provider,
+            )
 
 @pytest.mark.parametrize(
     "base_url",

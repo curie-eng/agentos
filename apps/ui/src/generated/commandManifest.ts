@@ -1867,7 +1867,7 @@ export const commandManifest = {
       "name": "cluster",
       "subcommands": [
         {
-          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. A real model is still unreachable behind the fail-closed sandbox until you open its egress with --allow-egress-host <provider> (or --allow-web-egress <CIDR> for a raw range). Zhipu, Moonshot, and DeepSeek also require their matching base URL in worker runtime configuration, in addition to a credential and named egress",
+          "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. Existing singleton resources are reused only from complete Helm ownership metadata. An exact admission result that the gvisor RuntimeClass is absent applies security.gvisor.mode=off and retries once. Every inferred value is printed",
           "args": [
             {
               "default_values": [
@@ -1937,7 +1937,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
+              "help": "Explicitly open runner egress to a named model provider's API host(s), resolved to narrow host routes at install time (repeatable). An sk-ant- or sk-or- credential infers anthropic or openrouter when this flag is absent. An explicit list that omits the detected provider is an error. One of: anthropic, openrouter, zhipu, moonshot, deepseek. Provider native Zhipu, Moonshot, and DeepSeek also need their matching worker runtime base URL; a credential plus egress alone does not reach them. For a raw CIDR, use --allow-web-egress",
               "id": "allow_egress_host",
               "long": "allow-egress-host",
               "positional": false,
@@ -1945,7 +1945,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to the provider egress; omit to stay fully sealed",
+              "help": "Open runner egress to a declared destination for skill web access, repeatable CIDR, TCP 443. Additive to provider egress. Omit to keep general web egress sealed",
               "id": "allow_web_egress",
               "long": "allow-web-egress",
               "positional": false,
