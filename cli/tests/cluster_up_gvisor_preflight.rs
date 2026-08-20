@@ -234,8 +234,12 @@ if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
 fi
 
 if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
-    printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
-    exit 0
+    if [ "$3" = "-n" ] && [ "$4" = "target-namespace" ] && [ "$5" = "-o" ] && [ "$6" = "json" ]; then
+        printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+        exit 0
+    fi
+    printf 'unexpected StatefulSet query: %s\n' "$*" >&2
+    exit 64
 fi
 
 if [ "$1" = "label" ] && [ "$2" = "namespace" ] && [ "$3" = "target-namespace" ]; then
