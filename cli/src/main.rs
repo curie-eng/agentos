@@ -175,8 +175,9 @@ async fn resolve_cluster_conn(
         message::API_REMOTE_PORT,
     ) {
         Some(pf_cmd) => {
-            let child = message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
-            (format!("http://localhost:{local_port}"), Some(child))
+            let (child, effective_port) =
+                message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
+            (format!("http://localhost:{effective_port}"), Some(child))
         }
         None => {
             let url = api_url.expect("explicit url when no port-forward");
@@ -1601,10 +1602,10 @@ enum ClusterAction {
         #[arg(long)]
         listen_host: Option<String>,
         /// Port the stub binds (0.0.0.0); the worker posts here.
-        #[arg(long, default_value_t = message::DEFAULT_LISTEN_PORT)]
+        #[arg(long, default_value_t = 0)]
         listen_port: u16,
         /// Local port the Valkey port-forward binds.
-        #[arg(long, default_value_t = message::DEFAULT_VALKEY_LOCAL_PORT)]
+        #[arg(long, default_value_t = 0)]
         valkey_local_port: u16,
         /// Valkey password. Omit to read the release's own password from its
         /// chart Secret. Prefer the CURIE_VALKEY_PASSWORD env var over passing
@@ -1618,7 +1619,7 @@ enum ClusterAction {
         )]
         valkey_password: Option<String>,
         /// Local port the API port-forward binds (default-channel lookup).
-        #[arg(long, default_value_t = message::DEFAULT_API_LOCAL_PORT)]
+        #[arg(long, default_value_t = 0)]
         api_local_port: u16,
         /// Platform API key for the default-channel lookup. Omit to read the
         /// release's own key from its chart Secret.
@@ -3052,13 +3053,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     message::API_REMOTE_PORT,
                 ) {
                     Some(pf_cmd) => {
-                        _deploy_pf = Some(
-                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?,
-                        );
+                        let (deploy_pf, effective_port) =
+                            message::start_port_forward(&pf_cmd, local_port, "deploy api").await?;
+                        _deploy_pf = Some(deploy_pf);
                         // svc/<release>-api serves the platform API at ROOT, so the
                         // base URL has NO /api suffix (the /api in ADR-0024 was only
                         // because the request went through the UI pod).
-                        format!("http://localhost:{local_port}")
+                        format!("http://localhost:{effective_port}")
                     }
                     None => {
                         _deploy_pf = None;

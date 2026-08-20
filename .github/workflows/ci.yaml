@@ -856,7 +856,8 @@ jobs:
   # deploy`/`cluster message` self-plumb kubectl port-forwards and read the
   # release's UI `/api` NodePort. The hard leg is POD->HOST: the in-cluster
   # worker must POST its reply back to the host-bound Slack stub that `cluster
-  # message` binds on 0.0.0.0:8155 on THIS runner. `cluster message`
+  # message` binds on 0.0.0.0 with a kernel assigned ephemeral port on THIS
+  # runner. `cluster message`
   # auto-detects the host to advertise from the kubeconfig API-server address,
   # but a kind cluster's API server is bound on loopback (127.0.0.1:<port>), so
   # auto-detection yields 127.0.0.1 -- which an in-cluster pod cannot route to.
@@ -1114,9 +1115,10 @@ jobs:
       # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
       # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
       # presence would trip the `cluster message` reply-hijack guard).
-      # worker.slackTrustedOrigins is a CI-only widening that lets the worker
-      # answer the host-side reply stub (port = STUB_PORT in
-      # cli/scripts/e2e-ladder.sh); the chart default stays empty and fail-closed.
+      # worker.slackTrustedOrigins is a CI only widening that lets the worker
+      # answer the host side reply stub on any kernel assigned port on this
+      # host. The portless origin is intentional because `cluster message`
+      # requests an ephemeral port; the chart default stays empty and fail closed.
       - name: Install the platform (curie cluster up)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -1128,7 +1130,7 @@ jobs:
             --fake-model \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \

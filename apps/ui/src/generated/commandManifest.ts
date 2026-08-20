@@ -2503,7 +2503,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
               "help": "Port the stub binds (0.0.0.0); the worker posts here",
@@ -2514,7 +2514,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
               "help": "Local port the Valkey port-forward binds",
@@ -2534,7 +2534,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
               "help": "Local port the API port-forward binds (default-channel lookup)",
