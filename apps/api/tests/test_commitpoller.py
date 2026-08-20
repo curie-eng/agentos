@@ -215,6 +215,67 @@ async def test_a_cli_deployment_at_the_branch_tip_does_not_suppress_git_flow(
     assert [payload["after"] for payload in pushes] == [sha]
 
 
+@pytest.mark.anyio
+async def test_a_git_flow_deployment_at_the_branch_tip_settles_the_poll_baseline(
+    clean_db: None, monkeypatch
+) -> None:
+    """The matching Git flow deployment is the poller's durable baseline."""
+
+    from curie_api import gitflow
+    from curie_api.commitpoller import CommitPoller
+    from curie_api.config import Settings
+    from curie_api.models import Agent, AgentVersion, Deployment, Environment
+    from curie_api.schemas import WebhookResult
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    sha = "branch-tip"
+    engine = create_async_engine(get_settings().database_url)
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with sessionmaker() as session:
+            agent = Agent(name="poller-git-flow-baseline", repo_full_name=REPO)
+            session.add(agent)
+            await session.flush()
+            version = AgentVersion(
+                agent_id=agent.id,
+                version_label="git-flow-branch-tip",
+                created_by="git-flow",
+                commit_sha=sha,
+            )
+            session.add(version)
+            await session.flush()
+            session.add(
+                Deployment(
+                    agent_id=agent.id,
+                    version_id=version.id,
+                    environment=Environment.dev,
+                    commit_sha=sha,
+                )
+            )
+            await session.commit()
+
+        pushes: list[dict] = []
+
+        async def capture(session, store, settings, eval_queue, payload):
+            pushes.append(payload)
+            return WebhookResult(status="deployed")
+
+        monkeypatch.setattr(gitflow, "process_push", capture)
+        poller = CommitPoller(
+            session_factory=sessionmaker,
+            store=object(),
+            settings=Settings(github_clone_base="https://github.com"),
+            eval_queue=object(),
+            tips=Tips({(REPO, "dev"): sha, (REPO, "main"): None}),
+            interval_seconds=60,
+        )
+        await poller.poll_once()
+    finally:
+        await engine.dispose()
+
+    assert pushes == []
+
+
 @pytest.mark.parametrize("branches", [(), ("dev",), ("dev", "main")])
 def test_no_targets_or_no_branches_is_quiet(branches: tuple[str, ...]) -> None:
     tips = Tips({})

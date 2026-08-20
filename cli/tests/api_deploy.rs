@@ -23,6 +23,9 @@ const VERSION_ID: &str = "22222222-2222-2222-2222-222222222222";
 const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 
 #[cfg(unix)]
+static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(unix)]
 struct GitEnvGuard {
     path: Option<OsString>,
     real_git: Option<OsString>,
@@ -180,7 +183,7 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn command_deploy_uses_one_bundle_head_and_null_sha_for_a_non_git_bundle() {
+async fn command_deploy_uses_head_only_for_a_clean_git_bundle_and_null_sha_otherwise() {
     let git = real_git();
     let bundle = tempfile::tempdir().unwrap();
     scaffold(bundle.path(), "deal-desk").unwrap();
@@ -215,14 +218,16 @@ async fn command_deploy_uses_one_bundle_head_and_null_sha_for_a_non_git_bundle()
         &wrapper,
         r#"#!/bin/sh
 count=0
-if [ -f "$CURIE_TEST_GIT_COUNT" ]; then
-  count=$(cat "$CURIE_TEST_GIT_COUNT")
-fi
-count=$((count + 1))
-printf '%s\n' "$count" > "$CURIE_TEST_GIT_COUNT"
-if [ "$count" -gt 1 ]; then
-  printf '%s\n' '0000000000000000000000000000000000000000'
-  exit 0
+if [ "$#" -eq 2 ] && [ "$1" = 'rev-parse' ] && [ "$2" = 'HEAD' ]; then
+  if [ -f "$CURIE_TEST_GIT_COUNT" ]; then
+    count=$(cat "$CURIE_TEST_GIT_COUNT")
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$CURIE_TEST_GIT_COUNT"
+  if [ "$count" -gt 1 ]; then
+    printf '%s\n' '0000000000000000000000000000000000000000'
+    exit 0
+  fi
 fi
 exec "$CURIE_TEST_REAL_GIT" "$@"
 "#,
@@ -232,16 +237,25 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions).unwrap();
     let count_file = wrapper_dir.path().join("git-count");
+    let _path_env = PATH_ENV_LOCK.lock().await;
     let git_env = GitEnvGuard::install(&git, &count_file, wrapper_dir.path());
 
     let git_server = serve(|req| route(&req.method, &req.path));
     let git_outcome = run_command_deploy(&git_server, bundle.path()).await;
     let lookup_count = std::fs::read_to_string(&count_file).unwrap();
-    drop(git_env);
 
     assert_eq!(git_outcome.bundle_sha256, "deadbeef");
     assert_eq!(lookup_count.trim(), "1", "HEAD must be resolved once");
     assert_command_deploy_wire(&git_server, Some(&bundle_head));
+
+    std::fs::write(bundle.path().join("uncommitted.txt"), "dirty bundle\n").unwrap();
+    let dirty_server = serve(|req| route(&req.method, &req.path));
+    let dirty_outcome = run_command_deploy(&dirty_server, bundle.path()).await;
+
+    assert_eq!(dirty_outcome.bundle_sha256, "deadbeef");
+    assert_command_deploy_wire(&dirty_server, None);
+
+    drop(git_env);
 
     let non_git_bundle = tempfile::tempdir().unwrap();
     scaffold(non_git_bundle.path(), "deal-desk").unwrap();
