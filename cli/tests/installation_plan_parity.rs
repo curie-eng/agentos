@@ -543,6 +543,7 @@ exit 0
             .env("CURIE_TEST_CALL_LOG", &self.log)
             .env("CURIE_TEST_MIGRATION_STATE", &self.migration_state)
             .env("CURIE_TEST_LAST_EXEC_SCRIPT", &self.last_exec_script)
+            .env("CURIE_CONFIG_DIR", self.temp.path().join("config"))
             .env_remove("CURIE_TEST_KUBECTL_STS")
             .env_remove("CURIE_TEST_KUBECTL_STS_AFTER_UPGRADE")
             .env_remove("CURIE_TEST_KUBECTL_FAIL")

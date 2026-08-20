@@ -32,6 +32,10 @@ pub struct LocalCommsOpts {
     /// `fake_model_env_override` as `up_command` so `local comms` never
     /// silently downgrades a live stack back to the fake model.
     pub model_mode: ModelMode,
+    /// Model credentials resolved with the same precedence as `local up`.
+    pub model_credentials: Vec<(String, String)>,
+    /// Explicit provider model id to preserve from `local up`.
+    pub model: Option<String>,
     /// Whether the stack was brought up with `local up --minimal` (the `core`
     /// profile, no otel-collector). Same parity obligation as `model_mode`: the
     /// worker-restarting commands below apply the same
@@ -81,6 +85,9 @@ pub fn disconnect_commands(opts: &CommsOpts) -> Vec<OpsCommand> {
 pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
     let mut env = vec![("SLACK_API_BASE_URL".into(), String::new())];
     env.extend(fake_model_env_override(o.model_mode));
+    if let Some(model) = &o.model {
+        env.push(("CURIE_MODEL".into(), model.clone()));
+    }
     env.extend(otel_endpoint_env_override(o.minimal));
     vec![OpsCommand::new(
         "docker",
@@ -100,10 +107,14 @@ pub fn local_connect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         ],
     )
     .with_env(env)
-    .with_secret_env(vec![
-        ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
-        ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
-    ])]
+    .with_secret_env({
+        let mut secret_env = vec![
+            ("SLACK_APP_TOKEN".into(), o.app_token.clone()),
+            ("SLACK_BOT_TOKEN".into(), o.bot_token.clone()),
+        ];
+        secret_env.extend(o.model_credentials.clone());
+        secret_env
+    })]
 }
 
 pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
@@ -112,6 +123,9 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
         ("SLACK_BOT_TOKEN".into(), LOCAL_SLACK_STUB_BOT_TOKEN.into()),
     ];
     worker_env.extend(fake_model_env_override(o.model_mode));
+    if let Some(model) = &o.model {
+        worker_env.push(("CURIE_MODEL".into(), model.clone()));
+    }
     worker_env.extend(otel_endpoint_env_override(o.minimal));
     vec![
         OpsCommand::new(
@@ -142,7 +156,8 @@ pub fn local_disconnect_commands(o: &LocalCommsOpts) -> Vec<OpsCommand> {
                 plain("curie-worker"),
             ],
         )
-        .with_env(worker_env),
+        .with_env(worker_env)
+        .with_secret_env(o.model_credentials.clone()),
     ]
 }
 
@@ -612,6 +627,8 @@ mod tests {
             },
             disconnect,
             model_mode: mode,
+            model_credentials: vec![],
+            model: None,
             minimal,
         }
     }
@@ -625,6 +642,8 @@ mod tests {
             bot_token: "xoxb-1-secretsecret".into(),
             disconnect: false,
             model_mode: ModelMode::DefaultFake,
+            model_credentials: vec![],
+            model: None,
             minimal: false,
         });
         assert_eq!(cmds.len(), 1);

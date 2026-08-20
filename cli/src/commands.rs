@@ -1395,7 +1395,7 @@ pub(crate) fn env_credential_present(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.is_empty())
 }
 
-fn secret_store_env(name: &str) -> Result<Option<(String, String)>> {
+pub(crate) fn secret_store_env(name: &str) -> Result<Option<(String, String)>> {
     if env_credential_present(name) {
         return Ok(None);
     }
@@ -1423,9 +1423,12 @@ fn ambient_present_for(docker_env: &[(String, String)]) -> impl Fn(&str) -> bool
     move |name| std::env::var_os(name).is_some() || stored_env_contains(docker_env, name)
 }
 
-fn load_model_credentials_from_secret_store() -> Result<Vec<(String, String)>> {
+pub(crate) fn load_model_credentials_from_secret_store() -> Result<Vec<(String, String)>> {
     // Prefer an explicitly BYO Curie credential when saved, otherwise hydrate
     // the SDK credential names in the same order `select_passthrough_env` uses.
+    if env_credential_present("CURIE_CREDENTIALS") {
+        return Ok(Vec::new());
+    }
     if let Some(pair) = secret_store_env("CURIE_CREDENTIALS")? {
         return Ok(vec![pair]);
     }

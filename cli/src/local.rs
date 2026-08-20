@@ -248,6 +248,8 @@ pub struct LocalRebuildOpts {
     pub common: LocalOpts,
     /// The compose service to rebuild + recreate, e.g. `curie-worker`.
     pub service: String,
+    /// Explicit provider model id to preserve from `local up`.
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +267,10 @@ fn compose(file: &str, tail: &[&str]) -> OpsCommand {
 
 /// `docker compose --profile <core|full> [--profile local-model] [--profile slack] -f <file> up -d --wait`.
 pub fn up_command(o: &LocalOpts) -> OpsCommand {
+    up_command_with_model(o, None)
+}
+
+fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
     let profile = if o.minimal { "core" } else { "full" };
     let mut args = vec![plain("compose"), plain("--profile"), plain(profile)];
     if o.local_model.is_some() {
@@ -310,7 +316,12 @@ pub fn up_command(o: &LocalOpts) -> OpsCommand {
         // compose goes live, matching `skill up`. FakePinnedDespiteCredential
         // and DefaultFake inject nothing, so compose's
         // `${CURIE_FAKE_MODEL:-1}` default stands for those two modes.
-        fake_model_env_override(o.model_mode).into_iter().collect()
+        let mut env: Vec<(String, String)> =
+            fake_model_env_override(o.model_mode).into_iter().collect();
+        if let Some(model) = model {
+            env.push(("CURIE_MODEL".into(), model.to_string()));
+        }
+        env
     };
     // Delegate to `otel_endpoint_env_override`, the single source of truth for
     // the `core`-profile collector suppression. This sits AFTER the branch
@@ -336,7 +347,7 @@ pub fn up_command(o: &LocalOpts) -> OpsCommand {
 /// cost a debugging session getting a real agent working locally. `--no-deps`
 /// keeps the blast radius to the one named service; `--build` picks up a local
 /// code change before recreating.
-pub fn rebuild_command(o: &LocalOpts, service: &str) -> OpsCommand {
+pub fn rebuild_command(o: &LocalOpts, service: &str, model: Option<&str>) -> OpsCommand {
     let profile = if o.minimal { "core" } else { "full" };
     let mut args = vec![plain("compose"), plain("--profile"), plain(profile)];
     if o.local_model.is_some() {
@@ -376,7 +387,12 @@ pub fn rebuild_command(o: &LocalOpts, service: &str) -> OpsCommand {
             ("COMPOSE_PROJECT_NAME".into(), "curie".into()),
         ]
     } else {
-        fake_model_env_override(o.model_mode).into_iter().collect()
+        let mut env: Vec<(String, String)> =
+            fake_model_env_override(o.model_mode).into_iter().collect();
+        if let Some(model) = model {
+            env.push(("CURIE_MODEL".into(), model.to_string()));
+        }
+        env
     };
     env.extend(otel_endpoint_env_override(o.minimal));
     if !env.is_empty() {
@@ -469,43 +485,78 @@ impl crate::ui::CliOutput for LocalUpOutput {
     }
 }
 
-/// Apply the opt-in bundle `.env` plan (#749, ADR-0070) to a worker-starting
-/// verb's options, in place: fold a file-only model credential into the model
-/// mode so the stack boots live exactly as a shell credential would, emit a
-/// per-credential "loaded from --env-file" note, and return the credentials to
-/// attach as masked `secret_env` (never argv/logs). Shared by `local up` and
-/// `local rebuild` so a targeted rebuild comes back with the SAME
-/// credential/model-mode wiring the original `up` resolved from identical
-/// inputs (shell env + the same `--env-file`), rather than the fake-model revert
-/// #853 describes. A `None` env_file leaves the shell-resolved mode untouched
-/// and returns no credentials.
-fn apply_env_file_plan(o: &mut LocalOpts, ui: &crate::ui::Ui) -> Result<Vec<(String, String)>> {
-    // A name exported in the shell always wins; only a name absent from the
-    // shell is taken from the file. A `.env`-only credential still flips the
-    // stack live, so the model mode is recomputed with the file credential
-    // folded in.
-    let (env_creds, env_file_mode) = load_env_file_up_plan(o.env_file.as_deref())?;
-    if o.env_file.is_some() {
-        o.model_mode = env_file_mode;
-        for (name, _) in &env_creds {
+/// Resolve model credentials for a worker starting local verb. Private storage
+/// follows the shell and precedes the optional bundle `.env` file. Values are
+/// returned as masked `secret_env`, and every source contributes to the model
+/// mode decision. Shared by `local up` and `local rebuild` so both paths keep
+/// identical credential behavior.
+pub fn apply_credential_plan(
+    o: &mut LocalOpts,
+    ui: &crate::ui::Ui,
+) -> Result<Vec<(String, String)>> {
+    let explicit_fake_model = std::env::var("CURIE_FAKE_MODEL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let shell_has_credential = CREDENTIAL_ENV_VARS
+        .iter()
+        .any(|name| crate::commands::env_credential_present(name));
+    // A saved provider credential is an implicit input. Do not even open
+    // private storage when the operator explicitly selected the fake model or
+    // a local model, because neither path can use that credential. An explicit
+    // --env-file remains opt-in and retains its existing behavior below.
+    let skip_private_store = o.local_model.is_some()
+        || explicit_fake_model
+            .as_deref()
+            .is_some_and(fake_model_is_truthy);
+    let mut resolved = if skip_private_store {
+        Vec::new()
+    } else {
+        match crate::commands::load_model_credentials_from_secret_store() {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                ui.warn(&format!(
+                    "Saved model credentials could not be read; continuing without them: {error}"
+                ));
+                Vec::new()
+            }
+        }
+    };
+    if let Some(path) = o.env_file.as_deref() {
+        let parsed = crate::commands::parse_credential_env_file(path)?;
+        let (from_file, model_mode) = resolve_env_file_up_plan(
+            &parsed,
+            &|name| {
+                crate::commands::env_credential_present(name)
+                    || resolved
+                        .iter()
+                        .any(|(resolved_name, _)| resolved_name == name)
+            },
+            explicit_fake_model.as_deref(),
+            shell_has_credential || !resolved.is_empty(),
+        );
+        for (name, _) in &from_file {
             ui.note(&format!(
                 "{name}: loaded from --env-file {} for this run",
-                o.env_file
-                    .as_deref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
+                path.display()
             ));
         }
+        resolved.extend(from_file);
+        o.model_mode = model_mode;
+    } else {
+        o.model_mode = resolve_model_mode(
+            explicit_fake_model.as_deref(),
+            shell_has_credential || !resolved.is_empty(),
+        );
     }
-    Ok(env_creds)
+    Ok(resolved)
 }
 
-pub async fn up(mut o: LocalOpts) -> Result<LocalUpOutput> {
+pub async fn up(mut o: LocalOpts, model: Option<String>) -> Result<LocalUpOutput> {
     let ui = crate::ui::ui();
     // #749/ADR-0070: an opt-in bundle `.env` is the LOWEST-priority model
     // credential source, injected into the compose child as masked `secret_env`.
-    let env_creds = apply_env_file_plan(&mut o, ui)?;
-    let mut cmd = up_command(&o);
+    let env_creds = apply_credential_plan(&mut o, ui)?;
+    let mut cmd = up_command_with_model(&o, model.as_deref());
     if !env_creds.is_empty() {
         cmd = cmd.with_secret_env(env_creds);
     }
@@ -531,15 +582,15 @@ pub async fn up(mut o: LocalOpts) -> Result<LocalUpOutput> {
     }
     let cl = ui.checklist();
     run_step(&cl, "starting dev stack", "up", &cmd).await?;
-    // `--local-model` is its own live path (routes to ollama); the shell-credential
-    // parity note only applies when no local model was requested.
+    // `--local-model` is its own live path (routes to ollama); the resolved
+    // credential parity note only applies when no local model was requested.
     if o.local_model.is_none() {
         match o.model_mode {
             ModelMode::LiveFromCredential => ui.note(
-                "Running the LIVE model: a credential is set in your shell (parity with `curie skill up`). Set CURIE_FAKE_MODEL=1 to force the offline fake model.",
+                "Running the LIVE model: a credential is available for this run (parity with `curie skill up`). Set CURIE_FAKE_MODEL=1 to force the offline fake model.",
             ),
             ModelMode::FakePinnedDespiteCredential => ui.warn(
-                "Running the FAKE model despite a credential in your shell: CURIE_FAKE_MODEL is pinned on. Unset it or set CURIE_FAKE_MODEL=0 to go live.",
+                "Running the FAKE model despite an available credential: CURIE_FAKE_MODEL is pinned on. Unset it or set CURIE_FAKE_MODEL=0 to go live.",
             ),
             ModelMode::DefaultFake => ui.note(
                 "Running the fake model (no credential set). Provide a credential (ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / CURIE_CREDENTIALS) or --local-model to go live.",
@@ -595,13 +646,13 @@ impl crate::ui::CliOutput for LocalRebuildOutput {
                 ui.note(&format!("Rebuilt and recreated `{service}`."));
                 match model_mode {
                     ModelMode::LiveFromCredential => ui.note(
-                        "Came back up on the LIVE model: a credential is set in your shell.",
+                        "Came back up on the LIVE model: a credential is available for this run.",
                     ),
                     ModelMode::FakePinnedDespiteCredential => ui.warn(
-                        "Came back up on the FAKE model despite a credential in your shell: CURIE_FAKE_MODEL is pinned on.",
+                        "Came back up on the FAKE model despite an available credential: CURIE_FAKE_MODEL is pinned on.",
                     ),
                     ModelMode::DefaultFake => ui.note(
-                        "Came back up on the fake model (no credential set in this shell).",
+                        "Came back up on the fake model (no credential available for this run).",
                     ),
                 }
             }
@@ -626,8 +677,8 @@ pub async fn rebuild(mut o: LocalRebuildOpts) -> Result<LocalRebuildOutput> {
     // The same opt-in bundle `.env` plan `local up` applies: fold a file-only
     // credential into the model mode and inject it as masked `secret_env`, so
     // the resolved plan matches `up`'s for identical inputs (#853).
-    let env_creds = apply_env_file_plan(&mut o.common, ui)?;
-    let mut cmd = rebuild_command(&o.common, &o.service);
+    let env_creds = apply_credential_plan(&mut o.common, ui)?;
+    let mut cmd = rebuild_command(&o.common, &o.service, o.model.as_deref());
     if !env_creds.is_empty() {
         cmd = cmd.with_secret_env(env_creds);
     }
@@ -965,7 +1016,7 @@ mod tests {
     /// lands as the final token.
     #[test]
     fn rebuild_command_targets_one_service() {
-        let cmd = rebuild_command(&opts(DEFAULT_COMPOSE_FILE), "curie-worker");
+        let cmd = rebuild_command(&opts(DEFAULT_COMPOSE_FILE), "curie-worker", None);
         let display = cmd.display();
         assert!(display.contains("up -d --build --force-recreate --no-deps curie-worker"));
         assert!(!display.contains("--wait"));
@@ -979,15 +1030,28 @@ mod tests {
     fn rebuild_command_carries_live_model_parity() {
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.model_mode = ModelMode::LiveFromCredential;
-        let cmd = rebuild_command(&o, "curie-worker");
+        let cmd = rebuild_command(&o, "curie-worker", None);
         assert!(cmd
             .env
             .contains(&(String::from("CURIE_FAKE_MODEL"), String::from("0"))));
     }
 
     #[test]
+    fn rebuild_command_carries_explicit_model_parity() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.model_mode = ModelMode::LiveFromCredential;
+        let up = up_command_with_model(&o, Some("z-ai/glm-5.2"));
+        let rebuilt = rebuild_command(&o, "curie-worker", Some("z-ai/glm-5.2"));
+
+        assert_eq!(up.env, rebuilt.env, "rebuild model env drifted from up");
+        assert!(rebuilt
+            .env
+            .contains(&(String::from("CURIE_MODEL"), String::from("z-ai/glm-5.2"))));
+    }
+
+    #[test]
     fn rebuild_command_default_fake_injects_nothing() {
-        let cmd = rebuild_command(&opts(DEFAULT_COMPOSE_FILE), "curie-worker");
+        let cmd = rebuild_command(&opts(DEFAULT_COMPOSE_FILE), "curie-worker", None);
         assert!(cmd.env.is_empty(), "env={:?}", cmd.env);
     }
 
@@ -996,6 +1060,7 @@ mod tests {
         let cmd = rebuild_command(
             &opts_with_local_model(DEFAULT_COMPOSE_FILE, "qwen3:4b"),
             "curie-worker",
+            None,
         );
         assert!(cmd
             .env
@@ -1009,7 +1074,7 @@ mod tests {
     fn rebuild_command_minimal_suppresses_otel_endpoint() {
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.minimal = true;
-        let cmd = rebuild_command(&o, "curie-worker");
+        let cmd = rebuild_command(&o, "curie-worker", None);
         assert!(cmd
             .env
             .contains(&(String::from("OTEL_EXPORTER_OTLP_ENDPOINT"), String::new())));
@@ -1020,7 +1085,7 @@ mod tests {
     fn rebuild_command_respects_slack_profile() {
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.slack = true;
-        let display = rebuild_command(&o, "curie-dispatcher").display();
+        let display = rebuild_command(&o, "curie-dispatcher", None).display();
         assert!(display.contains("--profile slack"));
     }
 
@@ -1115,7 +1180,7 @@ mod tests {
     /// identical model/credential wiring, so the rebuilt service comes back LIVE
     /// rather than reverting to compose's fake default. Asserted on the resolved
     /// plan (the env and secret_env of the built command), not on flag presence.
-    /// Both verbs share `apply_env_file_plan`, so identical inputs cannot diverge.
+    /// Both verbs share `apply_credential_plan`, so identical inputs cannot diverge.
     #[test]
     fn rebuild_matches_up_env_file_wiring() {
         let secret = "sk-ant-fromfile";
@@ -1126,7 +1191,7 @@ mod tests {
         let creds = vec![("ANTHROPIC_API_KEY".to_string(), secret.to_string())];
 
         let up = up_command(&o).with_secret_env(creds.clone());
-        let rebuilt = rebuild_command(&o, "curie-worker").with_secret_env(creds.clone());
+        let rebuilt = rebuild_command(&o, "curie-worker", None).with_secret_env(creds.clone());
 
         // The live-model flip is present on both, and the plain env + masked
         // credential wiring match exactly across the two verbs.
@@ -1153,7 +1218,7 @@ mod tests {
         let secret = "sk-ant-supersecretvalue";
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.model_mode = ModelMode::LiveFromCredential;
-        let cmd = rebuild_command(&o, "curie-worker")
+        let cmd = rebuild_command(&o, "curie-worker", None)
             .with_secret_env(vec![("ANTHROPIC_API_KEY".to_string(), secret.to_string())]);
         let display = cmd.display();
         assert!(

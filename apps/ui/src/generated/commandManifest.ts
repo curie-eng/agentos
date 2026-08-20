@@ -644,6 +644,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Model id, forwarded as CURIE_MODEL. Omit for the SDK default. Setting it makes token usage attributable in Langfuse traces",
+              "id": "model",
+              "long": "model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Run the named model through local Ollama",
               "id": "local_model",
               "long": "local-model",
@@ -732,6 +740,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Model id, forwarded as CURIE_MODEL. Omit for the SDK default. Match the explicit model used by `local up`",
+              "id": "model",
+              "long": "model",
+              "positional": false,
               "required": false
             },
             {
@@ -888,6 +904,15 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "env": "CURIE_MODEL",
+              "global": false,
+              "help": "Match the explicit model used by `local up`. Defaults from CURIE_MODEL",
+              "id": "model",
+              "long": "model",
+              "positional": false,
               "required": false
             },
             {
@@ -2001,6 +2026,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Model id, forwarded as CURIE_MODEL. Omit for the SDK default. Setting it makes token usage attributable in Langfuse traces",
+              "id": "model",
+              "long": "model",
+              "positional": false,
               "required": false
             },
             {
