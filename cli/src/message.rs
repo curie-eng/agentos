@@ -2838,17 +2838,6 @@ fn trajectory_matrix_report(
                 matrix_row.case_id
             );
         }
-        if cell
-            .model
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            bail!(
-                "stream filtered trajectory result for case {:?} has no resolved model",
-                matrix_row.case_id
-            );
-        }
         let case_count = cell.case_count.context(format!(
             "stream filtered trajectory result for case {:?} has no case count",
             matrix_row.case_id
