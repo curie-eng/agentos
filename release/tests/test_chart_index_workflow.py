@@ -144,6 +144,29 @@ class TestChartIndexWorkflowContract:
         assert "index.yaml" in ownership_guard
         assert re.search(r"\b(?:find|ls|git\s+ls-files)\b", ownership_guard)
 
+    def test_absent_pages_seed_is_pushed_before_indexing(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        publication_script = next(
+            run_script(step)
+            for step in workflow_steps(workflow)
+            if re.search(r"\bcr\s+index\b", run_script(step))
+        )
+
+        orphan = re.search(
+            r"git\s+(?:checkout|switch)\s+--orphan\s+gh-pages\b",
+            publication_script,
+        )
+        seed_push = re.search(
+            r"git\s+push\s+origin\s+gh-pages\b",
+            publication_script,
+        )
+        index = re.search(r"\bcr\s+index\b", publication_script)
+
+        assert orphan is not None
+        assert seed_push is not None
+        assert index is not None
+        assert orphan.start() < seed_push.start() < index.start()
+
     def test_chart_releaser_cli_is_checksum_verified_before_it_can_run(self):
         workflow = load_yaml(WORKFLOW_PATH)
         steps = workflow_steps(workflow)
