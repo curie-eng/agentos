@@ -431,6 +431,161 @@ impl crate::ui::CliOutput for InitOutput {
     }
 }
 
+/// Scaffold and drive the existing local skill path for one first reply.
+pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
+    const DEMO_NAME: &str = "curie-demo";
+    const DEMO_PROMPT: &str = "hello, are you there?";
+
+    let ui = crate::ui::ui();
+    let dir = if keep {
+        PathBuf::from(DEMO_NAME)
+    } else {
+        std::env::temp_dir().join(format!("curie-try-{}", uuid::Uuid::new_v4()))
+    };
+
+    if let Err(err) = scaffold(&dir, DEMO_NAME) {
+        if !keep && dir.exists() {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove incomplete demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    ui.note(&format!("scaffolded demo at {}", dir.display()));
+
+    let mut credential_name = None;
+    let mut discovery_error = None;
+    for name in MODEL_CREDENTIAL_ENV_NAMES {
+        if env_credential_present(name) {
+            credential_name = Some(name);
+            break;
+        }
+        match crate::secrets::is_saved(name) {
+            Ok(true) => {
+                credential_name = Some(name);
+                break;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                discovery_error = Some(err);
+                break;
+            }
+        }
+    }
+    if let Some(err) = discovery_error {
+        if !keep {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove temporary demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+    let fake_model = credential_name.is_none();
+    if let Some(name) = credential_name {
+        ui.note(&format!("using discovered model credential {name}"));
+    } else {
+        ui.note("no model credential found; using the scripted fake model");
+    }
+
+    let started = start(StartOpts {
+        plugin_dir: dir.clone(),
+        image,
+        port: DEFAULT_PORT,
+        name: docker::RUNNER_CONTAINER_LOCAL.to_string(),
+        fake_model,
+        network: None,
+        otel_endpoint: None,
+        budget: DEFAULT_BUDGET.to_string(),
+        model: None,
+        local_model: None,
+        pull_model: false,
+        secret: Vec::new(),
+        env_file: None,
+        replace: false,
+    })
+    .await;
+    if let Err(err) = started {
+        if !keep {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                ui.warn(&format!(
+                    "could not remove temporary demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            }
+        }
+        return Err(err);
+    }
+
+    let message = send(
+        DEMO_PROMPT,
+        crate::message::DEFAULT_USER,
+        EventType::Message,
+        Some(format!("http://localhost:{DEFAULT_PORT}")),
+    )
+    .await;
+    let teardown = stop(None, &dir).await;
+
+    let classified_failure = match message {
+        Ok(classified_failure) => classified_failure,
+        Err(message_err) => {
+            if let Err(cleanup_err) = &teardown {
+                ui.warn(&format!(
+                    "could not tear down the demo at {}: {cleanup_err}",
+                    dir.display()
+                ));
+            } else if !keep {
+                if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+                    ui.warn(&format!(
+                        "could not remove temporary demo at {}: {cleanup_err}",
+                        dir.display()
+                    ));
+                }
+            }
+            return Err(message_err);
+        }
+    };
+
+    if let Err(cleanup_err) = teardown {
+        ui.failure(&format!(
+            "could not tear down the demo at {}: {cleanup_err}",
+            dir.display()
+        ));
+        ui.note(&format!(
+            "recover with: cd {} && curie skill down",
+            dir.display()
+        ));
+        std::process::exit(1);
+    }
+
+    if keep {
+        let next = if fake_model {
+            "cd curie-demo && curie skill up --fake-model"
+        } else {
+            "cd curie-demo && curie skill up"
+        };
+        ui.note(&format!("kept ./curie-demo; next: {next}"));
+    } else if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
+        ui.failure(&format!(
+            "could not remove temporary demo at {}: {cleanup_err}",
+            dir.display()
+        ));
+        std::process::exit(1);
+    } else {
+        ui.note(&format!("removed temporary demo at {}", dir.display()));
+    }
+
+    if classified_failure {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// `curie build`: build the runner image locally from the repo's Dockerfile.
 /// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
 /// run from the repo root. Errors clearly when Docker is missing or when run
@@ -1996,8 +2151,7 @@ async fn remove_container_tolerating_absence(
     Ok(())
 }
 
-pub async fn stop(name: Option<String>) -> Result<()> {
-    let dir = Path::new(".");
+pub async fn stop(name: Option<String>, dir: &Path) -> Result<()> {
     let ui = crate::ui::ui();
     let saved = state::load(dir)?;
     let recorded = saved.as_ref().map(|s| s.container_name.clone());
@@ -2305,7 +2459,7 @@ pub async fn send(
     user: &str,
     event_type: EventType,
     url: Option<String>,
-) -> Result<()> {
+) -> Result<bool> {
     let url = resolve_url(url)?;
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
@@ -2397,10 +2551,7 @@ pub async fn send(
                 status: status_str(status).to_string(),
                 finalized: true,
             });
-            if *status == SessionStatus::ClassifiedFailure {
-                std::process::exit(1);
-            }
-            return Ok(());
+            return Ok(*status == SessionStatus::ClassifiedFailure);
         }
         // Close the streamed answer on stdout only if the last thing written was
         // un-terminated token text; if a note already added its own newline (or
@@ -2410,11 +2561,9 @@ pub async fn send(
             ui.print_tokens("\n");
         }
         ui.note(&format!("-- final ({})", status_str(status)));
-        if *status == SessionStatus::ClassifiedFailure {
-            std::process::exit(1);
-        }
+        return Ok(*status == SessionStatus::ClassifiedFailure);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Output of `skill message` under `--json`: the full buffered reply plus the

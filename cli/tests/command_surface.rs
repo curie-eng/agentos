@@ -48,6 +48,7 @@ fn process_help_routes_positive_forms() {
         &["cluster", "message"],
         &["cluster", "eval"],
         &["cluster", "deploy"],
+        &["try"],
         &["init"],
         &["interactive"],
         &["secrets", "set"],
@@ -118,6 +119,7 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
         "skill",
         "local",
         "cluster",
+        "try",
         "init",
         "interactive",
         "secrets",
@@ -254,6 +256,24 @@ fn help_flags(args: &[&str]) -> std::collections::BTreeSet<String> {
         .filter(|token| token.starts_with("--") && token.len() > 2)
         .map(|token| token.trim_end_matches(',').to_string())
         .collect()
+}
+
+#[test]
+fn process_try_help_lists_only_keep_beyond_global_flags() {
+    let top_level = output_text(&run_help(&[]));
+    assert!(
+        help_lists_subcommand(&top_level, "try"),
+        "top level help must list try\n{top_level}"
+    );
+
+    let global_flags = help_flags(&[]);
+    let try_flags = help_flags(&["try"]);
+    let command_flags: Vec<_> = try_flags.difference(&global_flags).cloned().collect();
+    assert_eq!(
+        command_flags,
+        vec!["--keep".to_string()],
+        "try must expose --keep as its only command specific flag"
+    );
 }
 
 /// The agent-target verbs share one `AgentTarget<T>` whose only per-tier

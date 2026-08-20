@@ -16,6 +16,10 @@ it.
 
 New here? [`Quickstart`](#quickstart) gets you a first agent reply in a few minutes.
 
+Run `curie try` for a first reply without configured credentials or prompts. Run
+`curie try --keep` to retain the standard bundle at `./curie-demo` for normal
+`curie skill` commands. The [`Quickstart`](#quickstart) covers the full parity ladder.
+
 Join the [Curie Discord community](https://discord.gg/YZASub2d5B) to connect with other builders.
 
 ## Why your agent breaks when it leaves your laptop
