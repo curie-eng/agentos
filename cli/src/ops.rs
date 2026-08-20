@@ -1490,7 +1490,7 @@ fn resolve_preserved_runner_egress_values(
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
     provider_was_inferred: bool,
-) -> usize {
+) -> (usize, BTreeSet<String>) {
     let overridden = operator_set_keys(operator_sets);
     let egress_replaced = (!opts.allow_egress_host.is_empty() && !provider_was_inferred)
         || !opts.allow_web_egress.is_empty()
@@ -1498,7 +1498,7 @@ fn resolve_preserved_runner_egress_values(
             .iter()
             .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
     if egress_replaced {
-        return 0;
+        return (0, BTreeSet::new());
     }
 
     let mut recorded = BTreeMap::new();
@@ -1517,13 +1517,21 @@ fn resolve_preserved_runner_egress_values(
         })
         .max()
         .map_or(0, |index| index + 1);
+    let recorded_cidrs = recorded
+        .iter()
+        .filter_map(|(key, value)| {
+            let suffix = key.strip_prefix(ALLOWED_EGRESS_KEY)?.strip_prefix('[')?;
+            let (index, field) = suffix.split_once(']')?;
+            (index.parse::<usize>().is_ok() && field == ".cidr").then(|| value.clone())
+        })
+        .collect();
     opts.set.extend(
         recorded
             .into_iter()
             .filter(|(key, _)| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY))
             .map(|(key, value)| format!("{key}={value}")),
     );
-    next_index
+    (next_index, recorded_cidrs)
 }
 
 fn resolve_provider_egress_for_up(opts: &mut UpOpts, resolve: bool) -> Result<()> {
@@ -1535,9 +1543,17 @@ fn resolve_provider_egress_for_up(opts: &mut UpOpts, resolve: bool) -> Result<()
     Ok(())
 }
 
-fn reindex_inferred_provider_egress(opts: &mut UpOpts, start_index: usize) {
+fn reindex_inferred_provider_egress(
+    opts: &mut UpOpts,
+    start_index: usize,
+    recorded_cidrs: &BTreeSet<String>,
+) {
     let resolved = std::mem::take(&mut opts.resolved_egress_cidrs);
-    for (offset, cidr) in resolved.into_iter().enumerate() {
+    for (offset, cidr) in resolved
+        .into_iter()
+        .filter(|cidr| !recorded_cidrs.contains(cidr))
+        .enumerate()
+    {
         let index = start_index + offset;
         opts.set
             .push(format!("{ALLOWED_EGRESS_KEY}[{index}].cidr={cidr}"));
@@ -4861,15 +4877,20 @@ pub async fn up(
         inferences.push(inference);
     }
     let operator_sets = opts.operator_sets();
-    let next_preserved_egress_index = resolve_preserved_runner_egress_values(
-        &mut opts,
-        existing.as_ref(),
-        &operator_sets,
-        provider_was_inferred,
-    );
+    let (next_preserved_egress_index, recorded_egress_cidrs) =
+        resolve_preserved_runner_egress_values(
+            &mut opts,
+            existing.as_ref(),
+            &operator_sets,
+            provider_was_inferred,
+        );
     resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
     if provider_was_inferred && next_preserved_egress_index > 0 {
-        reindex_inferred_provider_egress(&mut opts, next_preserved_egress_index);
+        reindex_inferred_provider_egress(
+            &mut opts,
+            next_preserved_egress_index,
+            &recorded_egress_cidrs,
+        );
     }
     let value_plan = up_value_plan(&opts);
     run_prepared_up(

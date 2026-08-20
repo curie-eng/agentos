@@ -233,6 +233,15 @@ fn recognized_credential_prefixes_infer_provider_egress() {
             fixture.upgrade_log().contains(cidr),
             "the inferred {provider} route must reach Helm"
         );
+        let upgrade = fixture.upgrade_log();
+        assert!(
+            upgrade.contains("security.networkPolicy.allowedEgress[0].ports[0].protocol=TCP"),
+            "the inferred {provider} route must use TCP: {upgrade}"
+        );
+        assert!(
+            upgrade.contains("security.networkPolicy.allowedEgress[0].ports[0].port=443"),
+            "the inferred {provider} route must use port 443: {upgrade}"
+        );
         assert!(
             !shown.contains("sandbox is sealed"),
             "inferred provider egress must remove the sealed warning: {shown}"
@@ -266,6 +275,49 @@ fn inferred_provider_refresh_preserves_recorded_web_egress() {
     assert!(
         upgrade.contains("security.networkPolicy.allowedEgress[1].cidr=1.1.1.1/32"),
         "the refreshed provider route must use a noncolliding index: {upgrade}"
+    );
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[1].ports[0].protocol=TCP"),
+        "the refreshed provider route must use TCP: {upgrade}"
+    );
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[1].ports[0].port=443"),
+        "the refreshed provider route must use port 443: {upgrade}"
+    );
+    assert_inference_once(&stderr(&output), "--allow-egress-host openrouter");
+}
+
+#[test]
+fn repeated_bare_up_does_not_duplicate_the_recorded_inferred_provider_route() {
+    let fixture = Fixture::new(
+        r#"{
+          "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
+          "security":{"networkPolicy":{"allowedEgress":[
+            {"cidr":"1.1.1.1/32","ports":[{"protocol":"TCP","port":443}]},
+            {"cidr":"203.0.113.0/24","ports":[{"protocol":"TCP","port":443}]}
+          ]}}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    let upgrade = fixture.upgrade_log();
+    assert_eq!(
+        upgrade.matches("1.1.1.1/32").count(),
+        1,
+        "the recorded provider route must not accumulate on a bare rerun: {upgrade}"
+    );
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[0].cidr=1.1.1.1/32"),
+        "the recorded provider route must retain its index: {upgrade}"
+    );
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[1].cidr=203.0.113.0/24"),
+        "the recorded web route must survive: {upgrade}"
+    );
+    assert!(
+        !upgrade.contains("security.networkPolicy.allowedEgress[2]"),
+        "the repeated run must not append another route: {upgrade}"
     );
     assert_inference_once(&stderr(&output), "--allow-egress-host openrouter");
 }
@@ -314,7 +366,7 @@ fn preserved_credential_contradiction_fails_after_the_values_read() {
         "the resolver ran: {shown}"
     );
     assert!(
-        !shown.contains(OPENROUTER_CREDENTIAL),
+        !shown.contains("sk-or-v1-PLACEHOLDER"),
         "credential leaked: {shown}"
     );
     assert!(

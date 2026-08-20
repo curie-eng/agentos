@@ -88,10 +88,10 @@ fn every_supported_provider_passes_credential_and_egress_checks() {
         }
 
         if let Some(inferred) = &provider.inferred_provider {
-            assert!(
-                names.contains(inferred.as_str()),
-                "{} points to unknown inferred provider {inferred}",
-                provider.name
+            assert_eq!(
+                inferred, &provider.name,
+                "{} must infer its own provider name",
+                provider.name,
             );
         }
 
