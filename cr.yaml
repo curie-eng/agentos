@@ -1,0 +1,5 @@
+owner: curie-eng
+git-repo: curie
+pages-branch: gh-pages
+release-name-template: "v{{ .Version }}"
+package-path: .cr-release-packages
