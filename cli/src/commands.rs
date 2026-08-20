@@ -1539,9 +1539,13 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         opts.replace,
     );
     if recorded_plan == RecordedStatePlan::Refuse {
+        let recorded_name = &recorded_runner
+            .as_ref()
+            .expect("a refusal requires a recorded runner")
+            .container_name;
         return Err(crate::exit::usage(format!(
-            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first",
-            plugin_dir.display()
+            "a local runner is already recorded in {}/.curie/runner.json; run 'curie skill down' there first, or rerun 'curie skill up --replace --name {recorded_name}' to replace it",
+            plugin_dir.display(),
         )));
     }
 
