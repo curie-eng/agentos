@@ -1016,6 +1016,11 @@ fn delete_output_json_shape_is_pinned() {
 #[test]
 fn deploy_output_json_shape_is_pinned() {
     use curie::commands::DeployOutput;
+
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("data/deploy-provider-wire.json"))
+            .expect("cli/tests/data/deploy-provider-wire.json must contain valid JSON");
+
     assert_eq!(
         DeployOutput {
             plugin_name: "weather".to_string(),
@@ -1025,7 +1030,7 @@ fn deploy_output_json_shape_is_pinned() {
             agent_id: "agt_1".to_string(),
             version_label: "v1-123".to_string(),
             version_id: "ver_1".to_string(),
-            channel: "unchanged (C123)".to_string(),
+            channel: "unchanged (C0EXAMPLE1)".to_string(),
             bundle_ref: "bundles/abc.tar.gz".to_string(),
             bundle_sha256: "deadbeef00".to_string(),
             bundle_size_bytes: 4096,
@@ -1034,16 +1039,7 @@ fn deploy_output_json_shape_is_pinned() {
             deployment_status: "active".to_string(),
         }
         .to_json(),
-        json!({
-            "plugin": "weather",
-            "label": "v1-123",
-            "environment": "dev",
-            "agent": {"name": "weather", "id": "agt_1"},
-            "version": {"label": "v1-123", "id": "ver_1"},
-            "channel": "unchanged (C123)",
-            "bundle": {"ref": "bundles/abc.tar.gz", "sha256": "deadbeef00", "size_bytes": 4096},
-            "deployment": {"id": "dep_1", "environment": "dev", "status": "active"},
-        })
+        expected
     );
 }
 
