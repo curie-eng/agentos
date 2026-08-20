@@ -5,13 +5,265 @@ mod support;
 
 use curie::api::{ApiClient, ChannelOutcome, DeployOutcome};
 use curie::bundle::pack_tar_gz;
+use curie::commands::{self, DeployOpts};
 use curie::scaffold::scaffold;
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
 use support::{serve, MockServer, Response};
 
 const AGENT_ID: &str = "11111111-1111-1111-1111-111111111111";
 const AGENT_NAME: &str = "deal-desk";
 const VERSION_ID: &str = "22222222-2222-2222-2222-222222222222";
 const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
+
+#[cfg(unix)]
+struct GitEnvGuard {
+    path: Option<OsString>,
+    real_git: Option<OsString>,
+    count_file: Option<OsString>,
+}
+
+#[cfg(unix)]
+impl GitEnvGuard {
+    fn install(real_git: &Path, count_file: &Path, wrapper_dir: &Path) -> Self {
+        let guard = Self {
+            path: std::env::var_os("PATH"),
+            real_git: std::env::var_os("CURIE_TEST_REAL_GIT"),
+            count_file: std::env::var_os("CURIE_TEST_GIT_COUNT"),
+        };
+        let original_path = guard.path.clone().unwrap_or_default();
+        let paths =
+            std::iter::once(wrapper_dir.to_path_buf()).chain(std::env::split_paths(&original_path));
+        std::env::set_var("PATH", std::env::join_paths(paths).expect("join PATH"));
+        std::env::set_var("CURIE_TEST_REAL_GIT", real_git);
+        std::env::set_var("CURIE_TEST_GIT_COUNT", count_file);
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GitEnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in [
+            ("PATH", self.path.take()),
+            ("CURIE_TEST_REAL_GIT", self.real_git.take()),
+            ("CURIE_TEST_GIT_COUNT", self.count_file.take()),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn real_git() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("git"))
+        .find(|path| path.is_file())
+        .expect("git should be on PATH")
+        .canonicalize()
+        .expect("canonicalize git")
+}
+
+#[cfg(unix)]
+fn run_git(git: &Path, cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new(git)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output should be UTF 8")
+        .trim()
+        .to_string()
+}
+
+#[cfg(unix)]
+async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands::DeployOutput {
+    commands::deploy(DeployOpts {
+        agent: None,
+        target: None,
+        plugin_dir: plugin_dir.to_path_buf(),
+        api_url: server.base_url.clone(),
+        api_key: "test-key".to_string(),
+        slack_channel: Some("#local-dev".to_string()),
+        repo: None,
+        env: None,
+        label: Some("0.1.0-1".to_string()),
+        secret: vec![],
+        secret_binding_supported: true,
+        connect_hint: "mock API should be reachable".to_string(),
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
+    let recorded = server.recorded();
+    let flow: Vec<(String, String)> = recorded
+        .iter()
+        .map(|request| (request.method.clone(), request.path.clone()))
+        .collect();
+    assert_eq!(
+        flow,
+        vec![
+            ("GET".to_string(), "/agents".to_string()),
+            ("POST".to_string(), "/agents".to_string()),
+            ("POST".to_string(), format!("/agents/{AGENT_ID}/versions"),),
+            (
+                "PUT".to_string(),
+                format!("/agents/{AGENT_ID}/versions/{VERSION_ID}/bundle"),
+            ),
+            ("POST".to_string(), "/deployments".to_string()),
+        ]
+    );
+
+    let version_request = &recorded[2];
+    let mut version_body: serde_json::Value =
+        serde_json::from_slice(&version_request.body).expect("version body should be JSON");
+    let deployment_request = &recorded[4];
+    let mut deployment_body: serde_json::Value =
+        serde_json::from_slice(&deployment_request.body).expect("deployment body should be JSON");
+
+    if let Some(commit_sha) = commit_sha {
+        assert_eq!(
+            version_body,
+            serde_json::json!({
+                "version_label": "0.1.0-1",
+                "created_by": std::env::var("USER").unwrap_or_else(|_| "curie-cli".to_string()),
+                "commit_sha": commit_sha,
+            })
+        );
+        assert_eq!(
+            deployment_body,
+            serde_json::json!({
+                "agent_id": AGENT_ID,
+                "version_id": VERSION_ID,
+                "environment": "dev",
+                "commit_sha": commit_sha,
+            })
+        );
+    } else {
+        if version_body
+            .get("commit_sha")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            version_body.as_object_mut().unwrap().remove("commit_sha");
+        }
+        if deployment_body
+            .get("commit_sha")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            deployment_body
+                .as_object_mut()
+                .unwrap()
+                .remove("commit_sha");
+        }
+        assert_eq!(
+            version_body,
+            serde_json::json!({
+                "version_label": "0.1.0-1",
+                "created_by": std::env::var("USER").unwrap_or_else(|_| "curie-cli".to_string()),
+            })
+        );
+        assert_eq!(
+            deployment_body,
+            serde_json::json!({
+                "agent_id": AGENT_ID,
+                "version_id": VERSION_ID,
+                "environment": "dev",
+            })
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn command_deploy_uses_one_bundle_head_and_omits_sha_for_a_non_git_bundle() {
+    let git = real_git();
+    let bundle = tempfile::tempdir().unwrap();
+    scaffold(bundle.path(), "deal-desk").unwrap();
+    run_git(&git, bundle.path(), &["init", "--quiet"]);
+    run_git(&git, bundle.path(), &["add", "."]);
+    run_git(
+        &git,
+        bundle.path(),
+        &[
+            "-c",
+            "user.name=Curie Test",
+            "-c",
+            "user.email=curie@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial bundle",
+        ],
+    );
+    let bundle_head = run_git(&git, bundle.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(bundle_head.len(), 40, "expected a full commit SHA");
+    let outer_head = run_git(
+        &git,
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &["rev-parse", "HEAD"],
+    );
+    assert_ne!(bundle_head, outer_head, "fixture must have its own commit");
+
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let wrapper = wrapper_dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+count=0
+if [ -f "$CURIE_TEST_GIT_COUNT" ]; then
+  count=$(cat "$CURIE_TEST_GIT_COUNT")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$CURIE_TEST_GIT_COUNT"
+if [ "$count" -gt 1 ]; then
+  printf '%s\n' '0000000000000000000000000000000000000000'
+  exit 0
+fi
+exec "$CURIE_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).unwrap();
+    let count_file = wrapper_dir.path().join("git-count");
+    let git_env = GitEnvGuard::install(&git, &count_file, wrapper_dir.path());
+
+    let git_server = serve(|req| route(&req.method, &req.path));
+    let git_outcome = run_command_deploy(&git_server, bundle.path()).await;
+    let lookup_count = std::fs::read_to_string(&count_file).unwrap();
+    drop(git_env);
+
+    assert_eq!(git_outcome.bundle_sha256, "deadbeef");
+    assert_eq!(lookup_count.trim(), "1", "HEAD must be resolved once");
+    assert_command_deploy_wire(&git_server, Some(&bundle_head));
+
+    let non_git_bundle = tempfile::tempdir().unwrap();
+    scaffold(non_git_bundle.path(), "deal-desk").unwrap();
+    let non_git_server = serve(|req| route(&req.method, &req.path));
+    let non_git_outcome = run_command_deploy(&non_git_server, non_git_bundle.path()).await;
+
+    assert_eq!(non_git_outcome.bundle_sha256, "deadbeef");
+    assert_command_deploy_wire(&non_git_server, None);
+}
 
 fn route(method: &str, path: &str) -> Response {
     match (method, path) {
@@ -64,6 +316,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
             "dev",
             archive,
             &std::collections::BTreeMap::new(),
+            None,
             None,
         )
         .await
@@ -236,6 +489,7 @@ async fn run_deploy(
             archive,
             &std::collections::BTreeMap::new(),
             repo,
+            None,
         )
         .await
         .unwrap()
