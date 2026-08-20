@@ -3531,6 +3531,15 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    let commit_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&plugin_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty());
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     // Resolve a declared target, if one was named (ADR-0089). The file is sent
     // as TEXT and parsed server-side: one parser means the CLI and the
@@ -3616,6 +3625,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             archive,
             &secrets,
             opts.repo.as_deref(),
+            commit_sha.as_deref(),
         )
         .await
     {

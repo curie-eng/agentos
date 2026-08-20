@@ -901,6 +901,7 @@ class EvalCaseOut(BaseModel):
 class VersionCreate(BaseModel):
     version_label: str
     bundle_ref: str | None = None
+    commit_sha: str | None = None
     created_by: str
 
 
@@ -1004,6 +1005,7 @@ class DeploymentCreate(BaseModel):
     agent_id: uuid.UUID
     version_id: uuid.UUID
     environment: Environment
+    commit_sha: str | None = None
     status: str = "active"
 
 

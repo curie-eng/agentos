@@ -99,7 +99,7 @@ async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands:
         plugin_dir: plugin_dir.to_path_buf(),
         api_url: server.base_url.clone(),
         api_key: "test-key".to_string(),
-        slack_channel: Some("#local-dev".to_string()),
+        slack_channel: Some("C0EXAMPLE1".to_string()),
         repo: None,
         env: None,
         label: Some("0.1.0-1".to_string()),

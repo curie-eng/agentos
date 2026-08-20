@@ -787,12 +787,17 @@ impl ApiClient {
         agent_id: &str,
         version_label: &str,
         created_by: &str,
+        commit_sha: Option<&str>,
     ) -> Result<Version> {
         let resp = self
             .http
             .post(format!("{}/agents/{agent_id}/versions", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({"version_label": version_label, "created_by": created_by}))
+            .json(&json!({
+                "version_label": version_label,
+                "created_by": created_by,
+                "commit_sha": commit_sha,
+            }))
             .send()
             .await
             .context("POST /agents/{id}/versions")?;
@@ -837,6 +842,7 @@ impl ApiClient {
         agent_id: &str,
         version_id: &str,
         environment: &str,
+        commit_sha: Option<&str>,
     ) -> Result<Deployment> {
         let resp = self
             .http
@@ -846,6 +852,7 @@ impl ApiClient {
                 "agent_id": agent_id,
                 "version_id": version_id,
                 "environment": environment,
+                "commit_sha": commit_sha,
             }))
             .send()
             .await
@@ -870,6 +877,7 @@ impl ApiClient {
         archive: Vec<u8>,
         secrets: &std::collections::BTreeMap<String, String>,
         repo_full_name: Option<&str>,
+        commit_sha: Option<&str>,
     ) -> Result<DeployOutcome> {
         let (agent, channel, repo_note) = self
             .resolve_agent(agent_name, slack_channel, repo_full_name)
@@ -881,11 +889,11 @@ impl ApiClient {
             self.update_agent_secrets(&agent.id, secrets).await?;
         }
         let version = self
-            .create_version(&agent.id, version_label, created_by)
+            .create_version(&agent.id, version_label, created_by, commit_sha)
             .await?;
         let bundle = self.upload_bundle(&agent.id, &version.id, archive).await?;
         let deployment = self
-            .create_deployment(&agent.id, &version.id, environment)
+            .create_deployment(&agent.id, &version.id, environment, commit_sha)
             .await?;
         Ok(DeployOutcome {
             agent,

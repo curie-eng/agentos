@@ -1239,6 +1239,17 @@
             "title": "Agent Id",
             "type": "string"
           },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
           "environment": {
             "$ref": "#/components/schemas/Environment"
           },
@@ -2803,6 +2814,17 @@
               }
             ],
             "title": "Bundle Ref"
+          },
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
           },
           "created_by": {
             "title": "Created By",

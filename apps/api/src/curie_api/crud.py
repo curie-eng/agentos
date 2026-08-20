@@ -300,6 +300,7 @@ async def create_version(
         agent_id,
         version_label=data.version_label,
         created_by=data.created_by,
+        commit_sha=data.commit_sha,
         bundle_ref=data.bundle_ref,
     )
 
@@ -352,6 +353,7 @@ async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> De
         agent_id=data.agent_id,
         version_id=data.version_id,
         environment=data.environment,
+        commit_sha=data.commit_sha,
         status=data.status,
     )
 
@@ -903,4 +905,3 @@ async def revoke_console_session(
     await session.commit()
     await session.refresh(row)
     return row
-
