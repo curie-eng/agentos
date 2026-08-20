@@ -4,13 +4,13 @@ All sections are prepared only. Nothing in this file has been submitted.
 
 ## Shared context
 
-Curie is an Apache 2.0, open source, self hosted delivery platform for production AI agents. It lets authors build Claude Code format plugin bundles containing skills, tools, and MCP configuration, then run the same immutable bundle at skill, local Docker Compose, and Kubernetes cluster tiers. Curie is an MCP host, not an MCP server. Its repository is https://github.com/curie-eng/curie. Released CLI binaries support Linux x86 64, Linux arm64, and macOS Apple silicon. Its implementation languages are Python, Rust, and TypeScript.
+Curie is an Apache 2.0, open source, self hosted delivery platform for production AI agents. It lets authors build Claude Code format plugin bundles containing skills, tools, and MCP configuration, then run the same immutable bundle at skill, local Docker Compose, and Kubernetes cluster tiers. Curie is an MCP host, not an MCP server. Its repository is https://github.com/curie-eng/curie. Released CLI binaries support Linux x86_64, Linux arm64, and macOS Apple silicon. Its implementation languages are Python, Rust, and TypeScript.
 
-These free discoverability surfaces are not evidence of adoption. Three MCP servers merged into a 92,281 star awesome list on 2026 07 29 had 0, 0, and 10 stars sixteen days later.
+These free discoverability surfaces are not evidence of adoption. Three MCP servers merged into a 92,281 star awesome list on 2026-07-29 had 0, 0, and 10 stars sixteen days later.
 
 ## hesreallyhim/awesome-claude-code
 
-Prepared only. Do not submit without Brian's decision.
+Prepared only. Do not submit without maintainer approval.
 
 Destination: https://github.com/hesreallyhim/awesome-claude-code/issues/new?template=recommend-resource.yml
 
@@ -39,7 +39,7 @@ Complete the required checklist as follows:
 
 ## punkpeye/awesome-mcp-clients
 
-Prepared only. Do not submit without Brian's decision.
+Prepared only. Do not submit without maintainer approval.
 
 Destination: https://github.com/punkpeye/awesome-mcp-clients/compare
 
@@ -53,7 +53,7 @@ Mechanism: fork https://github.com/punkpeye/awesome-mcp-clients, create a branch
   <tr><td>Website</td><td><a href="https://github.com/curie-eng/curie">github.com/curie-eng/curie</a></td></tr>
   <tr><td>License</td><td>Apache 2.0</td></tr>
   <tr><td>Type</td><td>MCP host</td></tr>
-  <tr><td>Platforms</td><td>Linux x86 64, Linux arm64, macOS Apple silicon</td></tr>
+  <tr><td>Platforms</td><td>Linux x86_64, Linux arm64, macOS Apple silicon</td></tr>
   <tr><td>Pricing</td><td>Free and open source</td></tr>
   <tr><td>Programming Languages</td><td>Python, Rust, TypeScript</td></tr>
 </table>
@@ -69,11 +69,11 @@ Add Curie MCP host
 
 ## openalternative.co
 
-Prepared only. Do not submit without Brian's decision.
+Prepared only. Do not submit without maintainer approval.
 
 Destination: https://openalternative.co/submit
 
-Mechanism: sign in with an authorized email magic link, Google account, or GitHub account. The public route redirects to https://openalternative.co/auth/login?next=/submit. Field labels inside the authenticated submission dashboard remain unverified until Brian signs in, so map this content into the displayed fields without inventing labels.
+Mechanism: sign in with an authorized email magic link, Google account, or GitHub account. The public route redirects to https://openalternative.co/auth/login?next=/submit. Field labels inside the authenticated submission dashboard remain unverified until a maintainer signs in, so map this content into the displayed fields without inventing labels.
 
 Ready to paste content pack:
 
@@ -84,6 +84,6 @@ License: Apache 2.0
 Pricing: Free and open source
 Positioning: Self hosted delivery platform for production AI agents.
 Description: Curie lets teams author Claude Code format plugin bundles with skills, tools, and MCP configuration, then run the same immutable bundle locally through Docker Compose and in production on Kubernetes. It provides a CLI, traces, evals, budgets, and git driven deploys.
-Platforms: Linux x86 64, Linux arm64, macOS Apple silicon, Docker Compose, Kubernetes
+Platforms: Linux x86_64, Linux arm64, macOS Apple silicon, Docker Compose, Kubernetes
 Implementation languages: Python, Rust, TypeScript
 ```

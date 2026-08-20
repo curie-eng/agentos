@@ -18,10 +18,12 @@ concurrency:
 jobs:
   publish-index:
     name: Verify the release and publish its chart index
+    if: github.event_name != 'release' || github.event.release.prerelease == false
     runs-on: ubuntu-latest
     permissions:
       contents: write
       attestations: read
+      checks: read
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -31,19 +33,23 @@ jobs:
 
       - name: Resolve the published release
         id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "release" ]; then
             release_tag="$(jq -r '.release.tag_name' "$GITHUB_EVENT_PATH")"
           else
-            chart_version="$(awk '$1 == "version:" { print $2; exit }' charts/curie/Chart.yaml)"
-            release_tag="v${chart_version}"
+            release_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
           fi
-          if ! [[ "$release_tag" =~ ^v[0-9] ]]; then
+          if ! [[ "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "The release tag is invalid" >&2
             exit 1
           fi
-          git fetch --force --no-tags origin "refs/tags/${release_tag}:refs/tags/${release_tag}"
+          git fetch --force --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/heads/next:refs/remotes/origin/next \
+            "refs/tags/${release_tag}:refs/tags/${release_tag}"
           release_commit="$(git rev-list -n 1 "$release_tag")"
           if [ -z "$release_commit" ]; then
             echo "The release commit could not be resolved" >&2
@@ -53,34 +59,53 @@ jobs:
           echo "version=${release_tag#v}" >> "$GITHUB_OUTPUT"
           echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
 
+      - name: Authorize the release commit with the reviewed gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git checkout origin/main -- release/
+          python3 release/authorize.py "$RELEASE_COMMIT" \
+            --repo "$GITHUB_REPOSITORY" \
+            --reviewed-ref origin/main \
+            --reviewed-ref origin/next
+
       - name: Download every release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          gh release download "${{ steps.release.outputs.tag }}" \
+          gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" --dir dist
 
       - name: Verify the closed world release asset set
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           python3 release/integrity.py verify \
-            --dist dist --version "${{ steps.release.outputs.version }}"
+            --dist dist --version "$RELEASE_VERSION"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Verify the checksum manifest signature
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           cosign verify-blob \
             --bundle dist/checksums.txt.sigstore.json \
-            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/${{ steps.release.outputs.tag }}" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/${RELEASE_TAG}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             dist/checksums.txt
 
       - name: Verify every asset provenance statement
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
         run: |
           set -euo pipefail
           for asset in dist/*; do
@@ -88,15 +113,17 @@ jobs:
             gh attestation verify "$asset" \
               --repo "$GITHUB_REPOSITORY" \
               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yaml" \
-              --source-ref "refs/tags/${{ steps.release.outputs.tag }}" \
-              --source-digest "${{ steps.release.outputs.commit }}"
+              --source-ref "refs/tags/${RELEASE_TAG}" \
+              --source-digest "$RELEASE_COMMIT"
           done
 
       - name: Stage the exact verified chart archive
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           chart_asset="$(awk '$2 ~ /^curie-.+\.tgz$/ { print $2 }' dist/checksums.txt)"
-          if [ "$chart_asset" != "curie-${{ steps.release.outputs.version }}.tgz" ]; then
+          if [ "$chart_asset" != "curie-${RELEASE_VERSION}.tgz" ]; then
             echo "The checksum manifest does not name exactly one expected chart archive" >&2
             exit 1
           fi
@@ -108,16 +135,11 @@ jobs:
           set -euo pipefail
           tool_dir="$(mktemp -d "$RUNNER_TEMP/chart-releaser.XXXXXX")"
           archive="chart-releaser_1.7.0_linux_amd64.tar.gz"
+          expected_sha256="121a16d4e38b348decb977b8257d4bddab3323681c1819bab4870603138087cf"
           curl -fsSLo "$tool_dir/$archive" "https://github.com/helm/chart-releaser/releases/download/v1.7.0/chart-releaser_1.7.0_linux_amd64.tar.gz"
-          curl -fsSLo "$tool_dir/checksums.txt" "https://github.com/helm/chart-releaser/releases/download/v1.7.0/checksums.txt"
           (
             cd "$tool_dir"
-            checksum_line="$(grep " $archive" checksums.txt)"
-            if [ -z "$checksum_line" ]; then
-              echo "The chart releaser checksum is absent" >&2
-              exit 1
-            fi
-            printf '%s\n' "$checksum_line" | sha256sum --check
+            printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check
             tar -xzf "$archive"
           )
           mkdir -p "$RUNNER_TEMP/bin"
@@ -130,6 +152,7 @@ jobs:
         run: |
           set -euo pipefail
           auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth_header"
           export GIT_CONFIG_COUNT=1
           export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header"
@@ -160,6 +183,43 @@ jobs:
               git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
               git push origin gh-pages
             )
+            git fetch --force --no-tags origin \
+              refs/heads/gh-pages:refs/remotes/origin/gh-pages
           fi
 
+          git config user.name github-actions
+          git config user.email github-actions@users.noreply.github.com
           cr index --config cr.yaml --push
+
+      - name: Verify the public Helm consumer path
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          repository_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages"
+          helm_home="$(mktemp -d "$RUNNER_TEMP/curie-helm.XXXXXX")"
+          pull_dir="$helm_home/pull"
+          export HELM_CONFIG_HOME="$helm_home/config"
+          export HELM_CACHE_HOME="$helm_home/cache"
+          export HELM_DATA_HOME="$helm_home/data"
+          mkdir -p "$HELM_CONFIG_HOME" "$HELM_CACHE_HOME" "$HELM_DATA_HOME" "$pull_dir"
+
+          for attempt in $(seq 1 12); do
+            if helm repo add curie "$repository_url" --force-update \
+              && helm repo update curie; then
+              search_output="$(helm search repo curie/curie \
+                --versions --version "$RELEASE_VERSION")"
+              if printf '%s\n' "$search_output" | awk -v expected="$RELEASE_VERSION" \
+                '$1 == "curie/curie" && $2 == expected { found=1 } END { exit !found }' \
+                && helm pull curie/curie --version "$RELEASE_VERSION" \
+                  --destination "$pull_dir" \
+                && test -f "$pull_dir/curie-${RELEASE_VERSION}.tgz"; then
+                printf '%s\n' "$search_output"
+                exit 0
+              fi
+            fi
+            echo "The public index is not current on attempt $attempt of 12" >&2
+            sleep 10
+          done
+          echo "The public Helm consumer path did not expose the release" >&2
+          exit 1

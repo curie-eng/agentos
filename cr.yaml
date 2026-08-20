@@ -1,6 +1,5 @@
 owner: curie-eng
 git-repo: curie
 pages-branch: gh-pages
-charts-repo: https://raw.githubusercontent.com/curie-eng/curie/gh-pages
 release-name-template: "v{{ .Version }}"
 package-path: .cr-release-packages

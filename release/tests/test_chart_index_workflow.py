@@ -8,6 +8,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "chart-index.yaml"
 CONFIG_PATH = REPO_ROOT / "cr.yaml"
+GITIGNORE_PATH = REPO_ROOT / ".gitignore"
 
 
 def load_yaml(path: Path) -> dict:
@@ -28,6 +29,7 @@ class TestChartIndexWorkflowContract:
     def test_only_published_releases_and_the_narrow_next_bootstrap_trigger_it(self):
         workflow = load_yaml(WORKFLOW_PATH)
         trigger = workflow["on"]
+        job = next(iter(workflow["jobs"].values()))
 
         assert set(trigger) == {"release", "push"}
         assert trigger["release"] == {"types": ["published"]}
@@ -37,6 +39,27 @@ class TestChartIndexWorkflowContract:
             ".github/workflows/chart-index.yaml",
             "cr.yaml",
         }
+        assert job["if"] == (
+            "github.event_name != 'release' || "
+            "github.event.release.prerelease == false"
+        )
+
+    def test_next_bootstrap_selects_the_latest_stable_release(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        resolve_script = next(
+            run_script(step)
+            for step in workflow_steps(workflow)
+            if step.get("id") == "release"
+        )
+
+        assert 'repos/$GITHUB_REPOSITORY/releases/latest' in resolve_script
+        assert "Chart.yaml" not in resolve_script
+        assert re.search(
+            r"\^v\(0\|\[1-9\]\[0-9\]\*\)\\\."
+            r"\(0\|\[1-9\]\[0-9\]\*\)\\\."
+            r"\(0\|\[1-9\]\[0-9\]\*\)\$",
+            resolve_script,
+        )
 
     def test_write_permission_is_job_scoped_and_checkout_cannot_reuse_it(self):
         workflow = load_yaml(WORKFLOW_PATH)
@@ -52,6 +75,7 @@ class TestChartIndexWorkflowContract:
         assert writers[0]["permissions"] == {
             "contents": "write",
             "attestations": "read",
+            "checks": "read",
         }
         assert {
             name
@@ -91,6 +115,7 @@ class TestChartIndexWorkflowContract:
             return matches[0]
 
         download = index_of(r"\bgh\s+release\s+download\b")
+        authorization = index_of(r"release/authorize\.py\b")
         closed_world = index_of(r"release/integrity\.py\s+verify\b")
         signature = index_of(r"\bcosign\s+verify-blob\b")
         provenance = index_of(r"\bgh\s+attestation\s+verify\b")
@@ -118,11 +143,45 @@ class TestChartIndexWorkflowContract:
             )
         ]
         assert mutations
-        assert download < closed_world < signature < provenance < min(mutations)
+        assert authorization < download < closed_world < signature < provenance
+        assert provenance < min(mutations)
+
+        authorization_script = run_script(steps[authorization])
+        assert re.search(
+            r"git\s+checkout\s+origin/main\s+--\s+release/",
+            authorization_script,
+        )
+        assert "--reviewed-ref origin/main" in authorization_script
+        assert "--reviewed-ref origin/next" in authorization_script
+
+        resolve_script = run_script(
+            next(step for step in steps if step.get("id") == "release")
+        )
+        assert "refs/heads/main:refs/remotes/origin/main" in resolve_script
+        assert "refs/heads/next:refs/remotes/origin/next" in resolve_script
 
         download_script = run_script(steps[download])
         assert "--pattern" not in download_script
         assert "--archive" not in download_script
+
+    def test_release_outputs_are_passed_to_shell_through_the_environment(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        steps = workflow_steps(workflow)
+
+        assert all(
+            "${{ steps.release.outputs" not in run_script(step) for step in steps
+        )
+        output_environment = {
+            name
+            for step in steps
+            for name, value in step.get("env", {}).items()
+            if "steps.release.outputs" in value
+        }
+        assert output_environment == {
+            "RELEASE_TAG",
+            "RELEASE_VERSION",
+            "RELEASE_COMMIT",
+        }
 
     def test_only_an_absent_pages_branch_can_be_initialized(self):
         workflow = load_yaml(WORKFLOW_PATH)
@@ -165,9 +224,16 @@ class TestChartIndexWorkflowContract:
         assert orphan is not None
         assert seed_push is not None
         assert index is not None
-        assert orphan.start() < seed_push.start() < index.start()
+        tracking_fetch = re.search(
+            r"git\s+fetch\b.*?refs/heads/gh-pages:refs/remotes/origin/gh-pages",
+            publication_script[seed_push.end() :],
+            re.DOTALL,
+        )
+        assert tracking_fetch is not None
+        tracking_position = seed_push.end() + tracking_fetch.start()
+        assert orphan.start() < seed_push.start() < tracking_position < index.start()
 
-    def test_chart_releaser_cli_is_checksum_verified_before_it_can_run(self):
+    def test_chart_releaser_cli_is_literal_digest_verified_before_it_can_run(self):
         workflow = load_yaml(WORKFLOW_PATH)
         steps = workflow_steps(workflow)
         scripts = [run_script(step) for step in steps]
@@ -181,11 +247,8 @@ class TestChartIndexWorkflowContract:
             r"chart-releaser_1\.7\.0_linux_amd64\.tar\.gz",
             all_runs,
         )
-        assert re.search(
-            r"https://github\.com/helm/chart-releaser/releases/download/v1\.7\.0/"
-            r"checksums\.txt",
-            all_runs,
-        )
+        assert "121a16d4e38b348decb977b8257d4bddab3323681c1819bab4870603138087cf" in all_runs
+        assert "chart-releaser/releases/download/v1.7.0/checksums.txt" not in all_runs
 
         def command_position(pattern: str) -> tuple[int, int]:
             for index, script in enumerate(scripts):
@@ -200,7 +263,7 @@ class TestChartIndexWorkflowContract:
         assert checksum < extract < execute
 
         checksum_script = scripts[checksum[0]]
-        assert "checksums.txt" in checksum_script
+        assert "expected_sha256" in checksum_script
         assert "chart-releaser_1.7.0_linux_amd64.tar.gz" in checksum_script
 
         index_line = next(
@@ -213,6 +276,44 @@ class TestChartIndexWorkflowContract:
         assert re.search(r"\s--push(?:\s|$)", index_line)
         assert len(re.findall(r"\bcr\s+index\b", all_runs)) == 1
         assert not re.search(r"\bcr\s+(?:package|upload)\b", all_runs)
+
+    def test_git_authentication_is_masked_before_index_publication(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        publication_script = next(
+            run_script(step)
+            for step in workflow_steps(workflow)
+            if re.search(r"\bcr\s+index\b", run_script(step))
+        )
+
+        auth_header = publication_script.index("auth_header=")
+        mask = publication_script.index("::add-mask::$auth_header")
+        credential = publication_script.index("GIT_CONFIG_VALUE_0")
+        index = publication_script.index("cr index")
+
+        assert auth_header < mask < credential < index
+
+    def test_public_consumer_path_proves_the_exact_release_after_publication(self):
+        workflow = load_yaml(WORKFLOW_PATH)
+        steps = workflow_steps(workflow)
+        publication = next(
+            index
+            for index, step in enumerate(steps)
+            if re.search(r"\bcr\s+index\b", run_script(step))
+        )
+        consumer = next(
+            index
+            for index, step in enumerate(steps)
+            if re.search(r"\bhelm\s+repo\s+add\b", run_script(step))
+        )
+        consumer_script = run_script(steps[consumer])
+
+        assert publication < consumer
+        assert "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages" in consumer_script
+        assert re.search(r"\bhelm\s+repo\s+update\b", consumer_script)
+        assert re.search(r"\bhelm\s+search\s+repo\s+curie/curie\b", consumer_script)
+        assert re.search(r"\bhelm\s+pull\s+curie/curie\b", consumer_script)
+        assert consumer_script.count('"$RELEASE_VERSION"') >= 3
+        assert re.search(r"\bfor\s+attempt\s+in\b", consumer_script)
 
     def test_exact_verified_chart_is_the_only_input_to_indexing(self):
         workflow = load_yaml(WORKFLOW_PATH)
@@ -238,6 +339,7 @@ class TestChartIndexWorkflowContract:
             and ".cr-release-packages" in script
         ]
         assert len(staging) == 1
+        package_path = load_yaml(CONFIG_PATH)["package-path"]
         chart_selection = re.search(
             r"(?P<variable>[A-Za-z_][A-Za-z0-9_]*)=[\"']?\$\("
             r"(?P<selector>.*?checksums\.txt.*?)\)[\"']?",
@@ -251,7 +353,7 @@ class TestChartIndexWorkflowContract:
         variable = re.escape(chart_selection.group("variable"))
         assert re.search(
             rf"\bcp\s+[\"']?dist/\$\{{?{variable}\}}?[\"']?\s+"
-            r"[\"']?\.cr-release-packages(?:/|[\"'])",
+            rf"[\"']?{re.escape(package_path)}(?:/|[\"'])",
             staging[0],
         )
 
@@ -272,7 +374,11 @@ class TestChartReleaserConfigContract:
         assert config["owner"] == "curie-eng"
         assert config["git-repo"] == "curie"
         assert config["pages-branch"] == "gh-pages"
-        assert config["charts-repo"] == (
-            "https://raw.githubusercontent.com/curie-eng/curie/gh-pages"
-        )
         assert config["release-name-template"] == "v{{ .Version }}"
+        assert config["package-path"] == ".cr-release-packages"
+        assert "charts-repo" not in config
+
+    def test_local_chart_releaser_packages_are_ignored(self):
+        ignored = GITIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+
+        assert ".cr-release-packages/" in ignored

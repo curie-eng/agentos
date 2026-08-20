@@ -26,6 +26,11 @@ helm search repo curie/curie --versions
 helm install curie curie/curie --namespace curie --create-namespace
 ```
 
+The Helm index supplies discovery and download metadata only. It does not
+verify the release signature or provenance. Follow the
+[release verification instructions](../../docs/release-verification.md) when
+you need that stronger guarantee.
+
 ## Install from a source checkout
 
 The defaults are the flagship path: GHCR (GitHub Container Registry) images, the runner substrate and its
