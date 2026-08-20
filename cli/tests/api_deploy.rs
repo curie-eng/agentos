@@ -187,6 +187,7 @@ async fn command_deploy_uses_head_only_for_a_clean_git_bundle_and_null_sha_other
     let git = real_git();
     let bundle = tempfile::tempdir().unwrap();
     scaffold(bundle.path(), "deal-desk").unwrap();
+    std::fs::write(bundle.path().join(".gitignore"), "ignored-packed.txt\n").unwrap();
     run_git(&git, bundle.path(), &["init", "--quiet"]);
     run_git(&git, bundle.path(), &["add", "."]);
     run_git(
@@ -254,6 +255,18 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
 
     assert_eq!(dirty_outcome.bundle_sha256, "deadbeef");
     assert_command_deploy_wire(&dirty_server, None);
+
+    std::fs::remove_file(bundle.path().join("uncommitted.txt")).unwrap();
+    std::fs::write(
+        bundle.path().join("ignored-packed.txt"),
+        "ignored but packed\n",
+    )
+    .unwrap();
+    let ignored_server = serve(|req| route(&req.method, &req.path));
+    let ignored_outcome = run_command_deploy(&ignored_server, bundle.path()).await;
+
+    assert_eq!(ignored_outcome.bundle_sha256, "deadbeef");
+    assert_command_deploy_wire(&ignored_server, None);
 
     drop(git_env);
 
