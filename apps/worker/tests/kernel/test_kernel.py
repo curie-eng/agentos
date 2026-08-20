@@ -1025,6 +1025,7 @@ def test_kernel_delivers_claim_token_as_bearer_header(make_harness) -> None:
 
 _MULTI_DELTA = [
     TextDelta(text="a"),
+    ToolNote(text="checking", tool="ExampleTool"),
     TextDelta(text="b"),
     TextDelta(text="c"),
     Final(text="abc final", status=DONE),
@@ -1034,7 +1035,7 @@ _MULTI_DELTA = [
 def test_no_edit_streaming_edits_placeholder_once(make_harness) -> None:
     async def go() -> None:
         async with make_harness(slack_no_edit_streaming=True) as h:
-            # Text frames arrive, but no edit mode updates only the final.
+            # Text and tool frames arrive, but no edit mode updates only the final.
             h.runner.default_script = list(_MULTI_DELTA)
             await h.kernel.process_event(_qevent("go"))
 
