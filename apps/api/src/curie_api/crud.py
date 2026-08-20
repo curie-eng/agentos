@@ -300,17 +300,19 @@ async def create_version(
         agent_id,
         version_label=data.version_label,
         created_by=data.created_by,
+        commit_sha=data.commit_sha,
         bundle_ref=data.bundle_ref,
     )
 
 
 async def get_version_by_commit(
-    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str
+    session: AsyncSession, agent_id: uuid.UUID, commit_sha: str, created_by: str
 ) -> AgentVersion | None:
     version: AgentVersion | None = await session.scalar(
         select(AgentVersion).where(
             AgentVersion.agent_id == agent_id,
             AgentVersion.commit_sha == commit_sha,
+            AgentVersion.created_by == created_by,
         )
     )
     return version
@@ -352,6 +354,7 @@ async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> De
         agent_id=data.agent_id,
         version_id=data.version_id,
         environment=data.environment,
+        commit_sha=data.commit_sha,
         status=data.status,
     )
 

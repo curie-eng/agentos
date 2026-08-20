@@ -16,6 +16,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import SCHEMA, Base
 
+GIT_FLOW_CREATED_BY = "git-flow"
+
 
 class Environment(enum.StrEnum):
     prod = "prod"
@@ -418,4 +420,3 @@ class ConsoleSession(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)
     revoked_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
-

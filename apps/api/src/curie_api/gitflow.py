@@ -32,7 +32,7 @@ from . import bundles, crud, deploy
 from .config import Settings
 from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
-from .models import Agent, AgentVersion, Environment
+from .models import GIT_FLOW_CREATED_BY, Agent, AgentVersion, Environment
 from .schemas import WebhookResult
 from .storage import ObjectStore
 
@@ -426,7 +426,9 @@ async def process_push(
         # correct and is what an unmatched branch already does.
         return WebhookResult(status="ignored")
 
-    version = await crud.get_version_by_commit(session, agent.id, after)
+    version = await crud.get_version_by_commit(
+        session, agent.id, after, created_by=GIT_FLOW_CREATED_BY
+    )
     # Only a version whose bundle is actually stored may be reused for promote.
     # A row with bundle_ref still None is the residue of a prior attempt that
     # failed after the row committed; rebuild and store into it rather than
@@ -440,15 +442,16 @@ async def process_push(
                 session,
                 agent.id,
                 version_label=after[:12],
-                created_by="git-flow",
+                created_by=GIT_FLOW_CREATED_BY,
                 commit_sha=after,
             )
         # Bundle-once, bind-many (ADR-0091). A sibling agent in this repository
-        # may already hold this exact commit -- the dev push that ran minutes
-        # ago. Reuse its stored object rather than uploading the same bytes
-        # again: prod then promotes not merely an identical artifact but the
-        # SAME one, which is what makes "promote what you validated" a property
-        # of the schema rather than of discipline.
+        # may already hold this exact Git flow authored commit from the dev push
+        # that ran minutes ago. Only that provenance may be reused for promote.
+        # Reuse its stored object rather than uploading the same bytes again:
+        # prod then promotes not merely an identical artifact but the SAME one,
+        # which is what makes "promote what you validated" a property of the
+        # schema rather than of discipline.
         sibling = await _sibling_bundle(session, repo_agents, agent.id, after)
         if sibling is not None:
             version = await crud.attach_bundle(
@@ -645,7 +648,9 @@ async def _sibling_bundle(
     for sibling in repo_agents:
         if sibling.id == agent_id:
             continue
-        existing = await crud.get_version_by_commit(session, sibling.id, commit_sha)
+        existing = await crud.get_version_by_commit(
+            session, sibling.id, commit_sha, created_by=GIT_FLOW_CREATED_BY
+        )
         if existing is not None and existing.bundle_ref:
             return existing
     return None

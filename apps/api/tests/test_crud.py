@@ -48,6 +48,7 @@ def test_full_round_trip(
     version = resp.json()
     version_id = version["id"]
     assert version["bundle_ref"] is None
+    assert version["commit_sha"] is None
     assert version["agent_id"] == agent_id
 
     # deploy to dev
@@ -65,6 +66,7 @@ def test_full_round_trip(
     deployment_id = deployment["id"]
     assert deployment["environment"] == "dev"
     assert deployment["status"] == "active"
+    assert deployment["commit_sha"] is None
 
     # list + get every resource
     listed_agents = client.get("/agents", headers=auth_headers).json()
@@ -78,17 +80,186 @@ def test_full_round_trip(
         f"/agents/{agent_id}/versions", headers=auth_headers
     ).json()
     assert [v["id"] for v in listed_versions] == [version_id]
+    assert listed_versions[0]["commit_sha"] is None
 
     listed_deployments = client.get(
         "/deployments", params={"agent_id": agent_id}, headers=auth_headers
     ).json()
     assert [d["id"] for d in listed_deployments] == [deployment_id]
+    assert listed_deployments[0]["commit_sha"] is None
 
     got_deployment = client.get(
         f"/deployments/{deployment_id}", headers=auth_headers
     )
     assert got_deployment.status_code == 200
     assert got_deployment.json()["version_id"] == version_id
+    assert got_deployment.json()["commit_sha"] is None
+
+
+def test_version_and_deployment_persist_same_commit_sha(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    commit_sha = "0123456789abcdef0123456789abcdef01234567"
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "commit_same",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+
+    version_resp = client.post(
+        f"/agents/{agent_id}/versions",
+        json={
+            "version_label": "v1",
+            "created_by": "bconn",
+            "commit_sha": commit_sha,
+        },
+        headers=auth_headers,
+    )
+    assert version_resp.status_code == 201, version_resp.text
+    version = version_resp.json()
+    assert version["commit_sha"] == commit_sha
+
+    deployment_resp = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version["id"],
+            "environment": "dev",
+            "commit_sha": commit_sha,
+        },
+        headers=auth_headers,
+    )
+    assert deployment_resp.status_code == 201, deployment_resp.text
+    deployment = deployment_resp.json()
+    assert deployment["commit_sha"] == commit_sha
+
+    listed_versions = client.get(
+        f"/agents/{agent_id}/versions", headers=auth_headers
+    ).json()
+    assert listed_versions[0]["commit_sha"] == commit_sha
+    listed_deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert listed_deployments[0]["commit_sha"] == commit_sha
+
+
+def test_public_version_create_rejects_git_flow_provenance(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "provenance_guard",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+
+    version_resp = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v1", "created_by": "git-flow"},
+        headers=auth_headers,
+    )
+
+    assert version_resp.status_code == 422, version_resp.text
+    assert client.get(f"/agents/{agent_id}/versions", headers=auth_headers).json() == []
+
+
+def test_version_and_deployment_create_reject_blank_commit_sha(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "commit_sha_guard",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+
+    for value in ("", "   "):
+        response = client.post(
+            f"/agents/{agent_id}/versions",
+            json={"version_label": "invalid", "created_by": "bconn", "commit_sha": value},
+            headers=auth_headers,
+        )
+        assert response.status_code == 422, response.text
+
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "valid", "created_by": "bconn"},
+        headers=auth_headers,
+    ).json()
+    for value in ("", "   "):
+        response = client.post(
+            "/deployments",
+            json={
+                "agent_id": agent_id,
+                "version_id": version["id"],
+                "environment": "dev",
+                "commit_sha": value,
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 422, response.text
+
+
+# The eval trigger fallback requires deployment provenance to remain independent.
+def test_version_and_deployment_persist_distinct_commit_shas(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    version_sha = "0123456789abcdef0123456789abcdef01234567"
+    deployment_sha = "89abcdef0123456789abcdef0123456789abcdef"
+    agent = client.post(
+        "/agents",
+        json={
+            "name": "commit_distinct",
+            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+        },
+        headers=auth_headers,
+    ).json()
+    agent_id = agent["id"]
+
+    version_resp = client.post(
+        f"/agents/{agent_id}/versions",
+        json={
+            "version_label": "v1",
+            "created_by": "bconn",
+            "commit_sha": version_sha,
+        },
+        headers=auth_headers,
+    )
+    assert version_resp.status_code == 201, version_resp.text
+    version = version_resp.json()
+
+    deployment_resp = client.post(
+        "/deployments",
+        json={
+            "agent_id": agent_id,
+            "version_id": version["id"],
+            "environment": "dev",
+            "commit_sha": deployment_sha,
+        },
+        headers=auth_headers,
+    )
+    assert deployment_resp.status_code == 201, deployment_resp.text
+    deployment = deployment_resp.json()
+
+    listed_versions = client.get(
+        f"/agents/{agent_id}/versions", headers=auth_headers
+    ).json()
+    assert listed_versions[0]["commit_sha"] == version_sha
+    got_deployment = client.get(
+        f"/deployments/{deployment['id']}", headers=auth_headers
+    )
+    assert got_deployment.status_code == 200, got_deployment.text
+    assert got_deployment.json()["commit_sha"] == deployment_sha
 
 
 def test_missing_agent_returns_404(

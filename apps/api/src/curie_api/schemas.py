@@ -28,7 +28,7 @@ from pydantic import (
 )
 
 from .config import get_settings
-from .models import Environment
+from .models import GIT_FLOW_CREATED_BY, Environment
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -121,6 +121,14 @@ def _nullable_override_validator(field: str, examples: str) -> Callable[[str | N
         return value.strip()
 
     return _validate
+
+
+def _validate_optional_commit_sha(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError("commit_sha must not be empty; omit it when unavailable")
+    return value.strip()
 
 
 _validate_thinking_override = _nullable_override_validator(
@@ -901,7 +909,17 @@ class EvalCaseOut(BaseModel):
 class VersionCreate(BaseModel):
     version_label: str
     bundle_ref: str | None = None
+    commit_sha: str | None = None
     created_by: str
+
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
+
+    @field_validator("created_by")
+    @classmethod
+    def reject_internal_provenance(cls, value: str) -> str:
+        if value == GIT_FLOW_CREATED_BY:
+            raise ValueError("created_by is reserved for internal Git flow versions")
+        return value
 
 
 class VersionOut(BaseModel):
@@ -1004,7 +1022,10 @@ class DeploymentCreate(BaseModel):
     agent_id: uuid.UUID
     version_id: uuid.UUID
     environment: Environment
+    commit_sha: str | None = None
     status: str = "active"
+
+    _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
 
 
 class DeploymentOut(BaseModel):
