@@ -185,24 +185,19 @@ fn assert_command_deploy_wire(server: &MockServer, commit_sha: Option<&str>) {
 #[tokio::test]
 async fn command_deploy_uses_head_only_for_a_clean_git_bundle_and_null_sha_otherwise() {
     let git = real_git();
-    let bundle = tempfile::tempdir().unwrap();
-    scaffold(bundle.path(), "deal-desk").unwrap();
-    std::fs::write(
-        bundle.path().join(".gitignore"),
-        ".curie/\nignored-packed.txt\n",
-    )
-    .unwrap();
-    std::fs::create_dir(bundle.path().join(".curie")).unwrap();
-    std::fs::write(
-        bundle.path().join(".curie/runner.json"),
-        "ignored runtime state\n",
-    )
-    .unwrap();
-    run_git(&git, bundle.path(), &["init", "--quiet"]);
-    run_git(&git, bundle.path(), &["add", "."]);
+    let repo = tempfile::tempdir().unwrap();
+    let bundle = repo.path().join("nested/deal-desk");
+    std::fs::create_dir_all(&bundle).unwrap();
+    scaffold(&bundle, "deal-desk").unwrap();
+    std::fs::write(bundle.join(".gitignore"), ".curie/\nignored-packed.txt\n").unwrap();
+    std::fs::write(bundle.join(".curieignore"), "# committed exclusions\n").unwrap();
+    std::fs::create_dir(bundle.join(".curie")).unwrap();
+    std::fs::write(bundle.join(".curie/runner.json"), "ignored runtime state\n").unwrap();
+    run_git(&git, repo.path(), &["init", "--quiet"]);
+    run_git(&git, repo.path(), &["add", "."]);
     run_git(
         &git,
-        bundle.path(),
+        repo.path(),
         &[
             "-c",
             "user.name=Curie Test",
@@ -214,7 +209,7 @@ async fn command_deploy_uses_head_only_for_a_clean_git_bundle_and_null_sha_other
             "Initial bundle",
         ],
     );
-    let bundle_head = run_git(&git, bundle.path(), &["rev-parse", "HEAD"]);
+    let bundle_head = run_git(&git, repo.path(), &["rev-parse", "HEAD"]);
     assert_eq!(bundle_head.len(), 40, "expected a full commit SHA");
     let outer_head = run_git(
         &git,
@@ -252,41 +247,45 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
     let git_env = GitEnvGuard::install(&git, &count_file, wrapper_dir.path());
 
     let git_server = serve(|req| route(&req.method, &req.path));
-    let git_outcome = run_command_deploy(&git_server, bundle.path()).await;
+    let git_outcome = run_command_deploy(&git_server, &bundle).await;
     let lookup_count = std::fs::read_to_string(&count_file).unwrap();
 
     assert_eq!(git_outcome.bundle_sha256, "deadbeef");
     assert_eq!(lookup_count.trim(), "1", "HEAD must be resolved once");
     assert_command_deploy_wire(&git_server, Some(&bundle_head));
 
-    let tracked_path = bundle.path().join(".claude-plugin/plugin.json");
+    let tracked_path = bundle.join(".claude-plugin/plugin.json");
     let tracked_content = std::fs::read_to_string(&tracked_path).unwrap();
     std::fs::write(&tracked_path, format!("{tracked_content}\n")).unwrap();
     let tracked_dirty_server = serve(|req| route(&req.method, &req.path));
-    let tracked_dirty_outcome = run_command_deploy(&tracked_dirty_server, bundle.path()).await;
+    let tracked_dirty_outcome = run_command_deploy(&tracked_dirty_server, &bundle).await;
 
     assert_eq!(tracked_dirty_outcome.bundle_sha256, "deadbeef");
     assert_command_deploy_wire(&tracked_dirty_server, None);
 
     std::fs::write(&tracked_path, tracked_content).unwrap();
-    std::fs::write(bundle.path().join("uncommitted.txt"), "dirty bundle\n").unwrap();
+    std::fs::write(bundle.join("uncommitted.txt"), "dirty bundle\n").unwrap();
     let dirty_server = serve(|req| route(&req.method, &req.path));
-    let dirty_outcome = run_command_deploy(&dirty_server, bundle.path()).await;
+    let dirty_outcome = run_command_deploy(&dirty_server, &bundle).await;
 
     assert_eq!(dirty_outcome.bundle_sha256, "deadbeef");
     assert_command_deploy_wire(&dirty_server, None);
 
-    std::fs::remove_file(bundle.path().join("uncommitted.txt")).unwrap();
-    std::fs::write(
-        bundle.path().join("ignored-packed.txt"),
-        "ignored but packed\n",
-    )
-    .unwrap();
+    std::fs::remove_file(bundle.join("uncommitted.txt")).unwrap();
+    std::fs::write(bundle.join("ignored-packed.txt"), "ignored but packed\n").unwrap();
     let ignored_server = serve(|req| route(&req.method, &req.path));
-    let ignored_outcome = run_command_deploy(&ignored_server, bundle.path()).await;
+    let ignored_outcome = run_command_deploy(&ignored_server, &bundle).await;
 
     assert_eq!(ignored_outcome.bundle_sha256, "deadbeef");
     assert_command_deploy_wire(&ignored_server, None);
+
+    std::fs::remove_file(bundle.join("ignored-packed.txt")).unwrap();
+    std::fs::write(bundle.join(".curieignore"), "generated-output/\n").unwrap();
+    let exclusions_dirty_server = serve(|req| route(&req.method, &req.path));
+    let exclusions_dirty_outcome = run_command_deploy(&exclusions_dirty_server, &bundle).await;
+
+    assert_eq!(exclusions_dirty_outcome.bundle_sha256, "deadbeef");
+    assert_command_deploy_wire(&exclusions_dirty_server, None);
 
     drop(git_env);
 

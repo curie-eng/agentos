@@ -3531,6 +3531,17 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         validate_channel_binding("slack", channel)?;
     }
     let archive = pack_tar_gz(&plugin_dir)?;
+    let git_prefix = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(&plugin_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|prefix| PathBuf::from(prefix.trim_end_matches(['\r', '\n'])));
     let git_status = tokio::process::Command::new("git")
         .args([
             "status",
@@ -3548,10 +3559,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         .output()
         .await
         .ok();
-    let commit_sha = match git_status {
-        Some(output)
+    let commit_sha = match (git_prefix, git_status) {
+        (Some(prefix), Some(output))
             if output.status.success()
-                && git_status_is_clean_for_pack(&plugin_dir, &output.stdout) =>
+                && git_status_is_clean_for_pack(&plugin_dir, &prefix, &output.stdout) =>
         {
             tokio::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])

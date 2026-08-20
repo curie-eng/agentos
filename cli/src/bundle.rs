@@ -101,16 +101,20 @@ impl Exclusions {
     }
 
     fn is_excluded(&self, rel: &Path) -> bool {
-        let name = rel.file_name().unwrap_or_default();
-        self.names.iter().any(|n| name == std::ffi::OsStr::new(n))
-            || self.paths.iter().any(|p| rel == p)
+        rel.components().any(|component| match component {
+            Component::Normal(name) => self
+                .names
+                .iter()
+                .any(|excluded| name == std::ffi::OsStr::new(excluded)),
+            _ => false,
+        }) || self.paths.iter().any(|path| rel.starts_with(path))
     }
 }
 
 /// Whether porcelain v1 `-z` output contains no change that can affect the
 /// packed bundle. Changes under excluded workstation directories are harmless;
 /// the exclusion file itself is not, because changing it changes what is packed.
-pub(crate) fn git_status_is_clean_for_pack(root: &Path, status: &[u8]) -> bool {
+pub(crate) fn git_status_is_clean_for_pack(root: &Path, repo_prefix: &Path, status: &[u8]) -> bool {
     let Ok(exclusions) = Exclusions::load(root) else {
         return false;
     };
@@ -122,6 +126,7 @@ pub(crate) fn git_status_is_clean_for_pack(root: &Path, status: &[u8]) -> bool {
                 .get(3..)
                 .and_then(|path| std::str::from_utf8(path).ok())
                 .map(Path::new)
+                .and_then(|path| path.strip_prefix(repo_prefix).ok())
             else {
                 return false;
             };
