@@ -1307,13 +1307,11 @@ class Kernel:
         # the critical section. Fires once per attempt (retries re-affirm it).
         # Suppressed under no-edit streaming: that mode's contract is exactly one
         # chat.update (the final edit), so it opts out of the pre-boot edit too.
-        if not self._config.slack_no_edit_streaming:
+        # A placeholderless job must route first. Otherwise every busy redelivery
+        # posts a notice for a turn that never started.
+        defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
+        if not self._config.slack_no_edit_streaming and not defer_job_booting:
             try:
-                # Through the adopting helper, not a bare ``_reply``: on a
-                # placeholder-less turn this booting notice is the delivery that
-                # CREATES the message, and the stream that follows has to edit it.
-                # A bare reply here would post the notice, leave no ref behind, and
-                # the first delta would post a second message beside it.
                 await self._reply_for(qevent, route, self._config.booting_text)
             except Exception:
                 logger.warning("booting-state update failed for %s", qevent.event_id)
@@ -1367,6 +1365,14 @@ class Kernel:
             logger.warning("turn start failed for %s: %r", qevent.event_id, exc)
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         release_order()
+
+        if not self._config.slack_no_edit_streaming and defer_job_booting:
+            try:
+                # Routing succeeded, so this delivery owns a real turn. Adopt the
+                # minted ref before streaming so every later update edits it.
+                await self._reply_for(qevent, route, self._config.booting_text)
+            except Exception:
+                logger.warning("booting-state update failed for %s", qevent.event_id)
 
         if routed.canned_reply is not None:
             # An enabled greeting/help pack matched a provably-fresh thread under
