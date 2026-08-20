@@ -10,18 +10,21 @@
 # WHAT SHIPS ON, AND WHAT SHIPS OFF
 # ---------------------------------------------------------------------------
 #
-#   kubernetes    ON.  Read-only cluster access. The only connector you need to
-#                      make this bot useful, and the only one with no external
-#                      dependency beyond the cluster itself.
-#   k8s-write     OFF. One gated write verb. Needs a second credential, an
-#                      approval route, and one `curie build` to turn the source
-#                      in `connectors/k8s-write/` into a pinned image. See
-#                      README.md, "Level up: the gated write path".
-#   grafana       ON. Logs, metrics, alerts and profiles from the bundled stack.
-#   tempo         ON. Distributed traces from the bundled stack.
+#   kubernetes    ON.       Read-only cluster access. The only connector you
+#                           need to make this bot useful, and the only one with
+#                           no external dependency beyond the cluster itself.
+#   k8s-write     DECLARED. One gated write verb. Its source build and exact
+#                           approval gate ship together, but its separate
+#                           K8S_WRITE_KUBECONFIG does not. Without that secret,
+#                           bring-up refuses cleanly before any connector starts,
+#                           so read-only operation remains the default. See
+#                           README.md, "Level up: the gated write path".
+#   grafana       ON.       Logs, metrics, alerts and profiles from the bundled
+#                           observability stack.
+#   tempo         ON.       Distributed traces from the bundled stack.
 #
-# The optional write connector remains commented out because it needs separate
-# credentials and an approval route.
+# Removing a declared connector removes its tools. Remove any matching approval
+# gate in the same change so the bundle remains valid.
 connectors:
   # Read-only Kubernetes: the questions metrics cannot answer. What the
   # scheduler actually said, what a crashed container logged, what a manifest
@@ -121,7 +124,7 @@ connectors:
       K8S_READONLY_KUBECONFIG: /secrets/kubeconfig
 
 # ---------------------------------------------------------------------------
-# THE GATED WRITE CONNECTOR -- SHIPS OFF. Uncomment to enable.
+# THE GATED WRITE CONNECTOR -- DECLARED, WITH ITS CREDENTIAL ABSENT BY DEFAULT.
 #
 # What it is: a purpose-built server exposing exactly ONE tool,
 # `restart_deployment`, behind a Curie approval gate. Calling it pauses the
@@ -134,29 +137,26 @@ connectors:
 # exposes one tool, so there is no second thing for a gate to miss. Source and
 # full reasoning: connectors/k8s-write/server.py.
 #
-# ENABLING IT IS NOT JUST UNCOMMENTING. You must:
+# The connector declaration and its gate in `.claude-plugin/plugin.json` ship
+# together. That closes the unsafe intermediate state where the tool exists but
+# its gate does not. It does NOT grant a write path by itself. Before bring-up:
 #
 #   1. Apply `manifests/write-role.yaml` (after editing its namespace and
 #      `resourceNames`) and store the resulting kubeconfig as
-#      K8S_WRITE_KUBECONFIG. This comes FIRST: a declared connector secret with
-#      no stored value fails the deploy, so the credential exists before the
-#      connector does.
-#   2. Set `K8S_WRITE_ALLOWLIST` below to the one `namespace/deployment` this
-#      bot may roll.
-#   3. Build the image:
+#      K8S_WRITE_KUBECONFIG.
+#   2. Replace the K8S_WRITE_ALLOWLIST placeholder below with the one
+#      `namespace/deployment` this bot may roll.
+#   3. Build and deploy the declared source:
 #
 #          curie build --plugin-dir examples/sre-bot --registry <your-registry>
 #
-#      That builds every connector this file declares a `build:` for, on every
-#      platform it names, pushes them, and records the resolved digests in
-#      `connectors.lock.yaml`. There is no public image for this on purpose --
-#      the allowlist and the credential are yours, and so is the artifact -- and
-#      no `image:` line to edit: the digest lives in the lock, never here.
-#   4. Add the approval gate to `.claude-plugin/plugin.json`. It is NOT shipped:
-#      bundle validation rejects a gate that names an undeclared connector, so a
-#      gate for a commented-out connector would fail the build for everyone who
-#      never enables this. The gate therefore travels WITH this uncomment, in
-#      the same change; README.md carries the exact JSON.
+#      That builds every connector with a `build:` declaration for every named
+#      platform and records the resolved digests in `connectors.lock.yaml`.
+#      There is no `image:` line to edit: the digest lives in the lock.
+#
+# The missing separate kubeconfig is load-bearing. An untouched bring-up
+# refuses before either connector starts instead of silently running a writer
+# with the read credential or an unreviewed target.
 #
 # Full walkthrough: README.md, "Level up: the gated write path".
 #
@@ -168,42 +168,38 @@ connectors:
 # the prefixed form; following it yields a gate that validates, deploys, and
 # never fires.
 #
-#   k8s-write:
-#     # Where the image comes FROM, instead of what it is. `curie build` builds
-#     # this context and records the digest it resolved in
-#     # `connectors.lock.yaml`; the deploy renders that digest and nothing else,
-#     # so the pinning note on `kubernetes` above -- which is not theoretical --
-#     # is satisfied by construction here rather than by remembering to type an
-#     # immutable tag.
-#     #
-#     # `platforms` is required rather than defaulted, because a silently
-#     # single-arch image builds clean, passes CI, and then fails to pull on a
-#     # node of the other architecture as "no matching manifest".
-#     #
-#     # PACKAGE VISIBILITY, if you push to a registry that has the concept: a
-#     # newly published package is often PRIVATE by default, and an anonymous
-#     # node pull then gets a 403 that surfaces as ImagePullBackOff rather than
-#     # as a permissions error. That trap is about the registry you pushed to,
-#     # so it survives the change of who does the building. Verify with an
-#     # anonymous manifest fetch before blaming the cluster.
-#     build:
-#       context: connectors/k8s-write
-#       platforms: [linux/amd64, linux/arm64]
-#     unhosted_url: ${K8S_WRITE_MCP_URL}
-#     env:
-#       # Defence in depth alongside the Role's `resourceNames`. A ceiling
-#       # stated in one place only is a ceiling that moves when someone edits
-#       # the other place. Format is `namespace/deployment`, comma-separated.
-#       # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
-#       # permitted -- a missing config fails closed.
-#       K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
-#     # A SEPARATE kubeconfig from the read-only one, bound to the
-#     # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
-#     # exactly the named Deployments. Never the read-only connector's
-#     # credential -- that one is deliberately unable to write, and reusing it
-#     # here would mean widening it.
-#     secret_files:
-#       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
+  k8s-write:
+    # Where the image comes FROM, instead of what it is. `curie build` builds
+    # this context and records the digest it resolved in
+    # `connectors.lock.yaml`; the deploy renders that digest and nothing else,
+    # so the pinning note on `kubernetes` above, which is not theoretical, is
+    # satisfied by construction here rather than by remembering to type an
+    # immutable tag.
+    #
+    # `platforms` is required rather than defaulted, because a silently
+    # single-arch image builds clean, passes CI, and then fails to pull on a
+    # node of the other architecture as "no matching manifest".
+    build:
+      context: connectors/k8s-write
+      platforms: [linux/amd64, linux/arm64]
+    # Deliberately no `unhosted_url`: skill and local runs host this connector,
+    # so they exercise the separate secret requirement instead of silently
+    # dialing an operator-supplied copy. Re-run `curie build --plugin-dir`
+    # after source or declaration changes so the lock matches what is hosted.
+    env:
+      # Defence in depth alongside the Role's `resourceNames`. A ceiling
+      # stated in one place only is a ceiling that moves when someone edits
+      # the other place. Format is `namespace/deployment`, comma-separated.
+      # EMPTY MEANS THE CONNECTOR REFUSES TO START, not that everything is
+      # permitted -- a missing config fails closed.
+      K8S_WRITE_ALLOWLIST: <namespace>/<deployment>
+    # A SEPARATE kubeconfig from the read-only one, bound to the
+    # ServiceAccount in manifests/write-role.yaml: one namespace, get+patch on
+    # exactly the named Deployments. Never the read-only connector's
+    # credential -- that one is deliberately unable to write, and reusing it
+    # here would mean widening it.
+    secret_files:
+      K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
 
   grafana:
@@ -233,7 +229,6 @@ connectors:
       - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
         from_secret: curie-grafana-connector
         key: GRAFANA_SERVICE_ACCOUNT_TOKEN
-
   tempo:
     build:
       context: connectors/tempo
