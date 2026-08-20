@@ -141,6 +141,10 @@ if [ "$1" = get ] && [ "$2" = values ]; then
 fi
 if [ "$1" = template ]; then
     case " $* " in
+        *" --show-only templates/preflight-gvisor.yaml "*)
+            printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
+            exit 1
+            ;;
         *" --show-only templates/priorityclass.yaml "*)
             case " $* " in
                 *" --set priorityClasses.sandbox.create=false "*)

@@ -323,8 +323,12 @@ pub fn primer() -> Primer {
                 fix: "The stack is down. Run `curie local up`, then retry.",
             },
             Recovery {
-                symptom: "`curie cluster up` hangs ~2 min then dies with `job curie-preflight-gvisor failed: DeadlineExceeded`",
+                symptom: "`curie cluster up` fails immediately when `curie-preflight-gvisor` reports `FailedCreate`: `RuntimeClass \"gvisor\" not found`",
                 fix: "A real-model install on a cluster with no `runsc` RuntimeClass fails closed under `security.gvisor.mode=auto`. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
+            },
+            Recovery {
+                symptom: "`curie cluster up` hangs ~2 min then dies with `job curie-preflight-gvisor failed: DeadlineExceeded`",
+                fix: "The Kubernetes Event watch was unavailable, so Helm reported the later deadline. A real-model install on a cluster with no `runsc` RuntimeClass still fails closed. Opt out with `curie cluster up --set security.gvisor.mode=off`, or use `--fake-model`, or install runsc on the nodes.",
             },
             Recovery {
                 symptom: "\"(no response)\" or an empty reply",
