@@ -1489,27 +1489,65 @@ fn resolve_preserved_runner_egress_values(
     opts: &mut UpOpts,
     existing: Option<&serde_json::Value>,
     operator_sets: &[String],
-) {
+    provider_was_inferred: bool,
+) -> usize {
     let overridden = operator_set_keys(operator_sets);
-    let egress_replaced = !opts.allow_egress_host.is_empty()
+    let egress_replaced = (!opts.allow_egress_host.is_empty() && !provider_was_inferred)
         || !opts.allow_web_egress.is_empty()
         || overridden
             .iter()
             .any(|key| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY));
     if egress_replaced {
-        return;
+        return 0;
     }
 
     let mut recorded = BTreeMap::new();
     if let Some(values) = existing {
         crate::installation::flatten_values(values, "", &mut recorded);
     }
+    let next_index = recorded
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(ALLOWED_EGRESS_KEY)?
+                .strip_prefix('[')?
+                .split_once(']')?
+                .0
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |index| index + 1);
     opts.set.extend(
         recorded
             .into_iter()
             .filter(|(key, _)| key_is_or_descends_from(key, ALLOWED_EGRESS_KEY))
             .map(|(key, value)| format!("{key}={value}")),
     );
+    next_index
+}
+
+fn resolve_provider_egress_for_up(opts: &mut UpOpts, resolve: bool) -> Result<()> {
+    if resolve && !opts.allow_egress_host.is_empty() && opts.resolved_egress_cidrs.is_empty() {
+        opts.resolved_egress_cidrs =
+            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
+                .context("resolving named provider egress hosts")?;
+    }
+    Ok(())
+}
+
+fn reindex_inferred_provider_egress(opts: &mut UpOpts, start_index: usize) {
+    let resolved = std::mem::take(&mut opts.resolved_egress_cidrs);
+    for (offset, cidr) in resolved.into_iter().enumerate() {
+        let index = start_index + offset;
+        opts.set
+            .push(format!("{ALLOWED_EGRESS_KEY}[{index}].cidr={cidr}"));
+        opts.set.push(format!(
+            "{ALLOWED_EGRESS_KEY}[{index}].ports[0].protocol=TCP"
+        ));
+        opts.set.push(format!(
+            "{ALLOWED_EGRESS_KEY}[{index}].ports[0].port={EGRESS_TCP_PORT}"
+        ));
+    }
 }
 
 /// Does a plain `cluster up` carry this key forward when nothing re-passes it?
@@ -2691,15 +2729,8 @@ pub(crate) fn complete_up_opts(
     let mut opts =
         complete_up_opts_without_runner_egress(opts, existing, github_token, clear_github_token)?;
     let operator_sets = opts.operator_sets();
-    resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets);
-    if resolve_provider_egress
-        && !opts.allow_egress_host.is_empty()
-        && opts.resolved_egress_cidrs.is_empty()
-    {
-        opts.resolved_egress_cidrs =
-            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
-                .context("resolving named provider egress hosts")?;
-    }
+    resolve_preserved_runner_egress_values(&mut opts, existing, &operator_sets, false);
+    resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
     Ok(opts)
 }
 
@@ -4824,18 +4855,21 @@ pub async fn up(
     )?;
     let completed_identity_plan = up_value_plan(&opts);
     let mut inferences = Vec::new();
-    if let Some(inference) = reconcile_provider_inference(&mut opts, &completed_identity_plan)? {
+    let provider_inference = reconcile_provider_inference(&mut opts, &completed_identity_plan)?;
+    let provider_was_inferred = provider_inference.is_some();
+    if let Some(inference) = provider_inference {
         inferences.push(inference);
     }
     let operator_sets = opts.operator_sets();
-    resolve_preserved_runner_egress_values(&mut opts, existing.as_ref(), &operator_sets);
-    if resolve_provider_egress
-        && !opts.allow_egress_host.is_empty()
-        && opts.resolved_egress_cidrs.is_empty()
-    {
-        opts.resolved_egress_cidrs =
-            resolve_provider_egress_cidrs_for_current_environment(&opts.allow_egress_host)
-                .context("resolving named provider egress hosts")?;
+    let next_preserved_egress_index = resolve_preserved_runner_egress_values(
+        &mut opts,
+        existing.as_ref(),
+        &operator_sets,
+        provider_was_inferred,
+    );
+    resolve_provider_egress_for_up(&mut opts, resolve_provider_egress)?;
+    if provider_was_inferred && next_preserved_egress_index > 0 {
+        reindex_inferred_provider_egress(&mut opts, next_preserved_egress_index);
     }
     let value_plan = up_value_plan(&opts);
     run_prepared_up(
@@ -6557,6 +6591,38 @@ mod tests {
             namespace: "curie".into(),
             release: "curie".into(),
             dry_run: false,
+        }
+    }
+
+    #[test]
+    fn credential_prefix_inference_matches_the_shared_provider_registry() {
+        #[derive(serde::Deserialize)]
+        struct Registry {
+            providers: Vec<Provider>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Provider {
+            name: String,
+            inferred_provider: Option<String>,
+            credential_examples: Vec<String>,
+        }
+
+        let registry: Registry = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/vectors/model-provider-registry.json"
+        )))
+        .expect("parse provider registry");
+
+        for provider in registry.providers {
+            for credential in provider.credential_examples {
+                assert_eq!(
+                    provider_from_credential_prefix(&credential),
+                    provider.inferred_provider.as_deref(),
+                    "credential example for {}",
+                    provider.name
+                );
+            }
         }
     }
 

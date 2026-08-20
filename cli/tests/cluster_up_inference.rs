@@ -245,6 +245,32 @@ fn recognized_credential_prefixes_infer_provider_egress() {
 }
 
 #[test]
+fn inferred_provider_refresh_preserves_recorded_web_egress() {
+    let fixture = Fixture::new(
+        r#"{
+          "agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}},
+          "security":{"networkPolicy":{"allowedEgress":[{
+            "cidr":"203.0.113.0/24",
+            "ports":[{"protocol":"TCP","port":443}]
+          }]}}
+        }"#,
+    );
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    let upgrade = fixture.upgrade_log();
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[0].cidr=203.0.113.0/24"),
+        "the recorded web route must survive the inferred provider refresh: {upgrade}"
+    );
+    assert!(
+        upgrade.contains("security.networkPolicy.allowedEgress[1].cidr=1.1.1.1/32"),
+        "the refreshed provider route must use a noncolliding index: {upgrade}"
+    );
+    assert_inference_once(&stderr(&output), "--allow-egress-host openrouter");
+}
+
+#[test]
 fn explicit_provider_list_containing_the_detected_provider_wins_silently() {
     let fixture = Fixture::new("");
     let output = fixture.run(
@@ -267,6 +293,40 @@ fn explicit_provider_list_containing_the_detected_provider_wins_silently() {
     let upgrade = fixture.upgrade_log();
     assert!(upgrade.contains("1.1.1.1/32"), "{upgrade}");
     assert!(upgrade.contains("8.8.8.8/32"), "{upgrade}");
+}
+
+#[test]
+fn preserved_credential_contradiction_fails_after_the_values_read() {
+    let fixture =
+        Fixture::new(r#"{"agentSandbox":{"runner":{"credentials":"sk-or-v1-PLACEHOLDER"}}}"#);
+    let output = fixture.run(
+        &[],
+        "not resolver JSON",
+        &["--allow-egress-host", "anthropic"],
+    );
+    let shown = all_output(&output);
+
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert!(shown.contains("openrouter"), "{shown}");
+    assert!(shown.contains("--allow-egress-host anthropic"), "{shown}");
+    assert!(
+        !shown.contains("resolver JSON"),
+        "the resolver ran: {shown}"
+    );
+    assert!(
+        !shown.contains(OPENROUTER_CREDENTIAL),
+        "credential leaked: {shown}"
+    );
+    assert!(
+        fixture.helm_log().contains("get values"),
+        "the preserved credential must come from the live values read: {}",
+        fixture.helm_log()
+    );
+    assert_eq!(
+        fixture.upgrade_count(),
+        0,
+        "the contradiction must stop before installation"
+    );
 }
 
 #[test]

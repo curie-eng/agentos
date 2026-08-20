@@ -37,6 +37,7 @@ fn write_exec(dir: &Path, name: &str, body: &str) {
 struct Fixture {
     _temp: tempfile::TempDir,
     bin_dir: PathBuf,
+    plan_file: PathBuf,
     upgrade_log: PathBuf,
     event_log: PathBuf,
     helm_pid: PathBuf,
@@ -56,6 +57,12 @@ impl Fixture {
         let temp = tempfile::tempdir().expect("temporary directory");
         let bin_dir = temp.path().join("bin");
         fs::create_dir(&bin_dir).expect("create fake binary directory");
+        let plan_file = temp.path().join("curie.yaml");
+        fs::write(
+            &plan_file,
+            "version: 1\ninstall:\n  namespace: target-namespace\n  release: target-release\ncredentials:\n  model: CURIE_CREDENTIALS\nset:\n  fullnameOverride: acme-runtime\n  security.gvisor.mode: require\n",
+        )
+        .expect("write prepared apply plan");
         let upgrade_log = temp.path().join("upgrades.log");
         let event_log = temp.path().join("event-queries.log");
         let helm_pid = temp.path().join("helm.pid");
@@ -226,6 +233,11 @@ if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     exit 0
 fi
 
+if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
+    printf '%s\n' '{"apiVersion":"v1","kind":"List","items":[]}'
+    exit 0
+fi
+
 if [ "$1" = "label" ] && [ "$2" = "namespace" ] && [ "$3" = "target-namespace" ]; then
     case " $* " in
         *" --overwrite "*) exit 0 ;;
@@ -364,6 +376,7 @@ exit 64
         Self {
             _temp: temp,
             bin_dir,
+            plan_file,
             upgrade_log,
             event_log,
             helm_pid,
@@ -380,12 +393,6 @@ exit 64
     }
 
     fn run(&self, extra: &[&str]) -> (Output, Duration) {
-        let mut paths = vec![self.bin_dir.clone()];
-        if let Some(current) = std::env::var_os("PATH") {
-            paths.extend(std::env::split_paths(&current));
-        }
-        let path = std::env::join_paths(paths).expect("join PATH");
-
         let mut args = vec![
             "--color",
             "never",
@@ -403,6 +410,27 @@ exit 64
             "fullnameOverride=acme-runtime",
         ];
         args.extend_from_slice(extra);
+        self.run_args(&args)
+    }
+
+    fn run_apply(&self) -> (Output, Duration) {
+        self.run_args(&[
+            "--color",
+            "never",
+            "apply",
+            "--file",
+            self.plan_file.to_str().expect("UTF 8 plan path"),
+            "--chart",
+            chart(),
+        ])
+    }
+
+    fn run_args(&self, args: &[&str]) -> (Output, Duration) {
+        let mut paths = vec![self.bin_dir.clone()];
+        if let Some(current) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&current));
+        }
+        let path = std::env::join_paths(paths).expect("join PATH");
 
         let started = Instant::now();
         let mut command = Command::new(bin());
@@ -438,7 +466,7 @@ exit 64
         } else {
             command.env("CURIE_CREDENTIALS", &self.credential);
         }
-        let output = command.output().expect("run curie cluster up");
+        let output = command.output().expect("run curie command");
         (output, started.elapsed())
     }
 
@@ -776,6 +804,33 @@ fn explicit_gvisor_mode_contradicting_admission_is_rejected_before_retry() {
         fixture.assert_graceful_helm_interruption();
         fixture.assert_children_stopped();
     }
+}
+
+#[test]
+fn prepared_apply_keeps_the_exact_gvisor_rejection_fail_closed() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL);
+    let (output, elapsed) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "prepared apply must fail closed\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(elapsed < Duration::from_secs(3), "{elapsed:?}: {shown}");
+    assert!(shown.contains(RUNTIME_CLASS_REJECTION), "{shown}");
+    assert!(
+        shown.contains("curie cluster up --set security.gvisor.mode=off"),
+        "prepared apply must retain the explicit recovery: {shown}"
+    );
+    assert!(
+        !shown.contains("inferred that the cluster has no"),
+        "prepared apply must not infer a posture: {shown}"
+    );
+    assert_eq!(fixture.upgrade_count(), 1, "prepared apply must not retry");
+    fixture.assert_graceful_helm_interruption();
+    fixture.assert_children_stopped();
 }
 
 #[test]
