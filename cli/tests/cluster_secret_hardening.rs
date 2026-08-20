@@ -136,6 +136,13 @@ if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     exit 0
 fi
 
+if [ "$1" = "get" ] && [ "$2" = "deployment" ] &&
+   [ "$3" = "agent-sandbox-controller" ] && [ "$4" = "-n" ] &&
+   [ "$5" = "agent-sandbox-system" ] && [ "$6" = "--ignore-not-found" ] &&
+   [ "$7" = "-o" ] && [ "$8" = "json" ] && [ -z "$9" ]; then
+    exit 0
+fi
+
 if [ "$1" = "get" ] && [ "$2" = "statefulset" ]; then
     printf '%s\n' '{"apiVersion":"v1","items":[],"kind":"List","metadata":{}}'
     exit 0
