@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "chart-index.yaml"
 CONFIG_PATH = REPO_ROOT / "cr.yaml"
@@ -50,7 +49,15 @@ class TestChartIndexWorkflowContract:
             if (job.get("permissions") or {}).get("contents") == "write"
         ]
         assert len(jobs) == len(writers) == 1
-        assert writers[0]["permissions"] == {"contents": "write"}
+        assert writers[0]["permissions"] == {
+            "contents": "write",
+            "attestations": "read",
+        }
+        assert {
+            name
+            for name, access in writers[0]["permissions"].items()
+            if access == "write"
+        } == {"contents"}
 
         checkouts = [
             step
@@ -242,5 +249,7 @@ class TestChartReleaserConfigContract:
         assert config["owner"] == "curie-eng"
         assert config["git-repo"] == "curie"
         assert config["pages-branch"] == "gh-pages"
-        assert config["charts-repo"] == "https://curie-eng.github.io/curie"
+        assert config["charts-repo"] == (
+            "https://raw.githubusercontent.com/curie-eng/curie/gh-pages"
+        )
         assert config["release-name-template"] == "v{{ .Version }}"

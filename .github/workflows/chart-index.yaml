@@ -1,0 +1,165 @@
+name: Publish Helm chart index
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [next]
+    paths:
+      - .github/workflows/chart-index.yaml
+      - cr.yaml
+
+permissions: {}
+
+concurrency:
+  group: helm-chart-index
+  cancel-in-progress: false
+
+jobs:
+  publish-index:
+    name: Verify the release and publish its chart index
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the published release
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            release_tag="$(jq -r '.release.tag_name' "$GITHUB_EVENT_PATH")"
+          else
+            chart_version="$(awk '$1 == "version:" { print $2; exit }' charts/curie/Chart.yaml)"
+            release_tag="v${chart_version}"
+          fi
+          if ! [[ "$release_tag" =~ ^v[0-9] ]]; then
+            echo "The release tag is invalid" >&2
+            exit 1
+          fi
+          git fetch --force --no-tags origin "refs/tags/${release_tag}:refs/tags/${release_tag}"
+          release_commit="$(git rev-list -n 1 "$release_tag")"
+          if [ -z "$release_commit" ]; then
+            echo "The release commit could not be resolved" >&2
+            exit 1
+          fi
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=${release_tag#v}" >> "$GITHUB_OUTPUT"
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Download every release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" --dir dist
+
+      - name: Verify the closed world release asset set
+        run: |
+          python3 release/integrity.py verify \
+            --dist dist --version "${{ steps.release.outputs.version }}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify the checksum manifest signature
+        run: |
+          cosign verify-blob \
+            --bundle dist/checksums.txt.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yaml@refs/tags/${{ steps.release.outputs.tag }}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            dist/checksums.txt
+
+      - name: Verify every asset provenance statement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for asset in dist/*; do
+            echo "== $asset"
+            gh attestation verify "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yaml" \
+              --source-ref "refs/tags/${{ steps.release.outputs.tag }}" \
+              --source-digest "${{ steps.release.outputs.commit }}"
+          done
+
+      - name: Stage the exact verified chart archive
+        run: |
+          set -euo pipefail
+          chart_asset="$(awk '$2 ~ /^curie-.+\.tgz$/ { print $2 }' dist/checksums.txt)"
+          if [ "$chart_asset" != "curie-${{ steps.release.outputs.version }}.tgz" ]; then
+            echo "The checksum manifest does not name exactly one expected chart archive" >&2
+            exit 1
+          fi
+          mkdir -p .cr-release-packages
+          cp "dist/${chart_asset}" ".cr-release-packages/"
+
+      - name: Install the verified chart releaser CLI
+        run: |
+          set -euo pipefail
+          tool_dir="$(mktemp -d "$RUNNER_TEMP/chart-releaser.XXXXXX")"
+          archive="chart-releaser_1.7.0_linux_amd64.tar.gz"
+          curl -fsSLo "$tool_dir/$archive" "https://github.com/helm/chart-releaser/releases/download/v1.7.0/chart-releaser_1.7.0_linux_amd64.tar.gz"
+          curl -fsSLo "$tool_dir/checksums.txt" "https://github.com/helm/chart-releaser/releases/download/v1.7.0/checksums.txt"
+          (
+            cd "$tool_dir"
+            checksum_line="$(grep " $archive" checksums.txt)"
+            if [ -z "$checksum_line" ]; then
+              echo "The chart releaser checksum is absent" >&2
+              exit 1
+            fi
+            printf '%s\n' "$checksum_line" | sha256sum --check
+            tar -xzf "$archive"
+          )
+          mkdir -p "$RUNNER_TEMP/bin"
+          install -m 0755 "$tool_dir/cr" "$RUNNER_TEMP/bin/cr"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Guard the Pages branch and publish the index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header"
+          export CR_TOKEN="$GH_TOKEN"
+
+          if git ls-remote --exit-code --heads origin refs/heads/gh-pages >/dev/null 2>&1; then
+            pages_dir="$(mktemp -d "$RUNNER_TEMP/curie-pages.XXXXXX")"
+            git fetch --force --no-tags origin refs/heads/gh-pages:refs/remotes/origin/gh-pages
+            git worktree add --detach "$pages_dir" origin/gh-pages
+            unrelated="$(find "$pages_dir" -mindepth 1 -maxdepth 1 \
+              ! -name .git ! -name index.yaml ! -name .nojekyll -print -quit)"
+            if [ -n "$unrelated" ]; then
+              echo "The gh-pages branch contains unrelated content at $unrelated" >&2
+              exit 1
+            fi
+            git worktree remove "$pages_dir"
+          else
+            seed_dir="$(mktemp -d "$RUNNER_TEMP/curie-pages-seed.XXXXXX")"
+            (
+              cd "$seed_dir"
+              git init
+              git checkout --orphan gh-pages
+              git config user.name github-actions
+              git config user.email github-actions@users.noreply.github.com
+              touch .nojekyll
+              git add .nojekyll
+              git commit -m "Initialize Helm chart index"
+              git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+              git push origin gh-pages
+            )
+          fi
+
+          cr index --config cr.yaml --push

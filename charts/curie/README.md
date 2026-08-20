@@ -14,7 +14,19 @@ the single-node footprint controllable and avoids the Bitnami-catalog
 (`bitnamilegacy/*`) instability. It still follows the Langfuse chart *idiom*:
 every backing store is toggle-gated with a single-block bring-your-own surface.
 
-## Install
+## Install a released chart
+
+Add the public chart repository, refresh its index, and confirm the available
+Curie versions before installing:
+
+```bash
+helm repo add curie https://raw.githubusercontent.com/curie-eng/curie/gh-pages
+helm repo update
+helm search repo curie/curie --versions
+helm install curie curie/curie --namespace curie --create-namespace
+```
+
+## Install from a source checkout
 
 The defaults are the flagship path: GHCR (GitHub Container Registry) images, the runner substrate and its
 controller on, a modest single-node footprint, and graceful degradation when the
