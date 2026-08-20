@@ -313,15 +313,27 @@ class TestChartIndexWorkflowContract:
             for index, step in enumerate(steps)
             if re.search(r"\bhelm\s+repo\s+add\b", run_script(step))
         )
+        helm_setup = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith("azure/setup-helm@")
+        )
         consumer_script = run_script(steps[consumer])
 
-        assert publication < consumer
+        assert steps[helm_setup]["uses"] == (
+            "azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310"
+        )
+        assert publication < helm_setup < consumer
         assert "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/gh-pages" in consumer_script
         assert re.search(r"\bhelm\s+repo\s+update\b", consumer_script)
         assert re.search(r"\bhelm\s+search\s+repo\s+curie/curie\b", consumer_script)
         assert re.search(r"\bhelm\s+pull\s+curie/curie\b", consumer_script)
         assert consumer_script.count('"$RELEASE_VERSION"') >= 3
-        assert re.search(r"\bfor\s+attempt\s+in\b", consumer_script)
+        attempts = re.search(r"\bseq\s+1\s+(\d+)\b", consumer_script)
+        delay = re.search(r"\bsleep\s+(\d+)\b", consumer_script)
+        assert attempts is not None
+        assert delay is not None
+        assert int(attempts.group(1)) * int(delay.group(1)) > 300
 
     def test_exact_verified_chart_is_the_only_input_to_indexing(self):
         workflow = load_yaml(WORKFLOW_PATH)
