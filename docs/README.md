@@ -6,6 +6,7 @@ git history (`git log -- docs/`).
 
 ## Living documentation
 
+* [`agent-install.md`](agent-install.md): an unattended release install, verification, and result reporting procedure for a coding agent.
 - [`agents.md`](agents.md): the verification contract for an agent driving
   Curie. The exact commands that prove an outcome, what to automate versus what
   to ask a human for, and the rule that a file existing or a string appearing in
