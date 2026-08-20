@@ -256,7 +256,10 @@ SELECT DISTINCT ON (a.repo_full_name, d.environment)
        d.commit_sha     AS commit_sha
 FROM {schema}.deployments d
 JOIN {schema}.agents a ON a.id = d.agent_id
-WHERE a.repo_full_name IS NOT NULL AND d.commit_sha IS NOT NULL
+JOIN {schema}.agent_versions v ON v.id = d.version_id
+WHERE a.repo_full_name IS NOT NULL
+  AND d.commit_sha IS NOT NULL
+  AND v.created_by = 'git-flow'
 ORDER BY a.repo_full_name, d.environment, d.deployed_at DESC
 """
 
