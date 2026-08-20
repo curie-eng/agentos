@@ -1997,8 +1997,9 @@ async fn main() {
     ui::init(Ui::from_process(cli.color, cli.debug, cli.quiet, cli.json));
     // main never returns Err (which would give anyhow's default exit 1 and skip
     // classification). Run the command, then map any error to a semantic exit
-    // code: the JSON payload goes to stdout under --json, else the human error
-    // to stderr (matching anyhow's default), and the class picks the exit code.
+    // code: the JSON payload goes to stdout under --json. Otherwise the human
+    // presentation goes to stderr, debug receives the full cause chain, and the
+    // class picks the exit code.
     if let Err(err) = run(cli.command).await {
         let (class, _fix) = curie::exit::classify(&err);
         if ui::ui().json() {
@@ -2006,7 +2007,12 @@ async fn main() {
                 .unwrap_or_else(|| curie::exit::error_json(&err));
             ui::ui().emit_json(&payload);
         } else {
-            eprintln!("Error: {err:#}");
+            let (message, remedy) = curie::exit::present_error(&err);
+            eprintln!("Error: {message}");
+            if let Some(remedy) = remedy {
+                eprintln!("Fix: {remedy}");
+            }
+            ui::ui().plumbing(&format!("{err:#}"));
         }
         std::process::exit(class.code());
     }

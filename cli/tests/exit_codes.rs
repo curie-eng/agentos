@@ -11,6 +11,8 @@ use std::process::{Command, Output};
 
 const SEAL_VALUE: &str = "placeholder-seal-value";
 const UNREACHABLE_API_URL: &str = "http://127.0.0.1:1";
+const INVALID_API_URL: &str = "localhost:8000";
+const INVALID_RUNNER_URL: &str = "localhost:8787";
 const DOCKER_FAILURE_SENTINEL: &str = "curie-1655-docker-command-failure";
 
 fn run_seal(connector: &str, json: bool) -> Output {
@@ -66,6 +68,37 @@ fn run_unreachable_local_versions(debug: bool) -> Output {
         .expect("run unreachable local versions")
 }
 
+fn run_invalid_local_versions(debug: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if debug {
+        command.arg("--debug");
+    }
+    command
+        .args([
+            "local",
+            "versions",
+            "acme-agent",
+            "--api-url",
+            INVALID_API_URL,
+        ])
+        .output()
+        .expect("run local versions with an invalid API URL")
+}
+
+fn run_invalid_runner_message(debug: bool) -> Output {
+    let dir = tempfile::tempdir().expect("create runner state directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    if debug {
+        command.arg("--debug");
+    }
+    command
+        .args(["skill", "message", "hello", "--url", INVALID_RUNNER_URL])
+        .current_dir(dir.path())
+        .env("CURIE_CONFIG_DIR", dir.path().join("config"))
+        .output()
+        .expect("run skill message with an invalid runner URL")
+}
+
 fn run_skill_up_with_path(debug: bool, path: &Path, name: &str) -> Output {
     let dir = tempfile::tempdir().expect("create plugin directory");
     curie::scaffold::scaffold(dir.path(), "acme-agent").expect("scaffold plugin");
@@ -95,6 +128,29 @@ fn executable_docker_stub() -> tempfile::TempDir {
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&docker, permissions).expect("make docker stub executable");
+    dir
+}
+
+fn executable_docker_lost_race_stub(container_name: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("create executable directory");
+    let docker = dir.path().join("docker");
+    fs::write(
+        &docker,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               ps) exit 0 ;;\n\
+               run) printf '%s\\n' 'docker: Error response from daemon: Conflict. The container name \"/{container_name}\" is already in use by container \"9f2c\".' >&2; exit 125 ;;\n\
+               *) printf '%s\\n' 'unexpected docker command' >&2; exit 93 ;;\n\
+             esac\n"
+        ),
+    )
+    .expect("write Docker race stub");
+    let mut permissions = fs::metadata(&docker)
+        .expect("read Docker race stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&docker, permissions).expect("make Docker race stub executable");
     dir
 }
 
@@ -142,6 +198,25 @@ fn classify_plain_anyhow_is_failure_with_no_fix() {
 }
 
 #[test]
+fn untyped_layered_error_presents_outer_context_and_keeps_debug_chain() {
+    let err = anyhow::anyhow!("raw transport detail").context("loading operator configuration");
+
+    let (message, fix) = exit::present_error(&err);
+    assert_eq!(message, "loading operator configuration");
+    assert_eq!(fix, None);
+    assert!(
+        !message.contains("raw transport detail"),
+        "normal presentation must hide the inner cause: {message}"
+    );
+
+    let debug = format!("{err:#}");
+    assert!(
+        debug.contains("loading operator configuration") && debug.contains("raw transport detail"),
+        "debug formatting must retain the complete cause chain: {debug}"
+    );
+}
+
+#[test]
 fn classify_finds_clierror_through_context_wrapping() {
     // A tagged CliError buried under an anyhow context layer must still be
     // discovered by walking the error chain: class + fix survive wrapping.
@@ -183,7 +258,7 @@ fn local_deploy_keeps_connection_causes_out_of_the_human_error() {
         "the human error must retain the remedy: {human_stderr}"
     );
     assert_eq!(
-        human_stderr.matches(UNREACHABLE_API_URL).count(),
+        error_line.matches(UNREACHABLE_API_URL).count(),
         1,
         "the specific local deploy error must name the API URL once: {human_stderr}"
     );
@@ -266,6 +341,96 @@ fn local_versions_unreachable_has_operator_message_and_runnable_remedy() {
 }
 
 #[test]
+fn local_versions_invalid_url_has_operator_message_and_hides_builder_detail() {
+    let human = run_invalid_local_versions(false);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Failure.code()),
+        "an invalid API URL must be a failure: {human_stderr}"
+    );
+
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("platform API") && error_line.contains(INVALID_API_URL),
+        "the error must name the API surface and configured URL: {human_stderr}"
+    );
+    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
+    assert!(
+        fix_line.len() > "Fix: ".len(),
+        "the invalid URL must carry an operator remedy: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("GET /agents")
+            && !human_stderr.contains("builder error")
+            && !human_stderr.contains("relative URL without a base"),
+        "normal output must hide request builder detail: {human_stderr}"
+    );
+
+    let debug = run_invalid_local_versions(true);
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Failure.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains("GET /agents")
+            && debug_stderr.contains(
+                "builder error for url (localhost:8000/agents): URL scheme is not allowed"
+            ),
+        "debug plumbing must retain the request builder cause: {debug_stderr}"
+    );
+}
+
+#[test]
+fn skill_message_invalid_url_has_runner_message_and_absolute_url_remedy() {
+    let human = run_invalid_runner_message(false);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Failure.code()),
+        "an invalid runner URL must be a failure: {human_stderr}"
+    );
+
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("runner") && error_line.contains(INVALID_RUNNER_URL),
+        "the error must name the runner surface and configured URL: {human_stderr}"
+    );
+    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
+    assert!(
+        fix_line.contains("http://localhost:8787") || fix_line.contains("https://localhost:8787"),
+        "the remedy must provide an absolute runner URL: {human_stderr}"
+    );
+    assert!(
+        !fix_line.contains("curie skill status"),
+        "an invalid URL must not suggest probing that same URL: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("POST localhost:8787/v1/event")
+            && !human_stderr.contains("builder error")
+            && !human_stderr.contains("relative URL without a base"),
+        "normal output must hide runner request detail: {human_stderr}"
+    );
+
+    let debug = run_invalid_runner_message(true);
+    let debug_stderr = String::from_utf8_lossy(&debug.stderr);
+    assert_eq!(
+        debug.status.code(),
+        Some(ExitClass::Failure.code()),
+        "debug must preserve the semantic exit code: {debug_stderr}"
+    );
+    assert!(
+        debug_stderr.contains(
+            "POST localhost:8787/v1/event: builder error for url \
+             (localhost:8787/v1/event): URL scheme is not allowed"
+        ),
+        "debug plumbing must retain the runner request cause: {debug_stderr}"
+    );
+}
+
+#[test]
 fn skill_up_without_docker_has_operator_message_and_runnable_remedy() {
     let empty_path = tempfile::tempdir().expect("create empty executable directory");
     let human = run_skill_up_with_path(
@@ -314,7 +479,7 @@ fn skill_up_without_docker_has_operator_message_and_runnable_remedy() {
 }
 
 #[test]
-fn skill_up_docker_command_failure_has_operator_message_and_runnable_remedy() {
+fn skill_up_docker_command_failure_keeps_the_command_diagnosis() {
     let stub = executable_docker_stub();
     let human = run_skill_up_with_path(false, stub.path(), "acme-1655-docker-command-human");
     let human_stderr = String::from_utf8_lossy(&human.stderr);
@@ -325,17 +490,13 @@ fn skill_up_docker_command_failure_has_operator_message_and_runnable_remedy() {
     );
     let error_line = single_line_with_prefix(&human_stderr, "Error: ");
     assert!(
-        error_line.contains("Docker"),
-        "the error must name Docker in operator language: {human_stderr}"
-    );
-    let fix_line = single_line_with_prefix(&human_stderr, "Fix: ");
-    assert!(
-        fix_line.contains("docker info"),
-        "the remedy must contain a runnable Docker probe: {human_stderr}"
+        error_line.contains("docker ps failed") && error_line.contains(DOCKER_FAILURE_SENTINEL),
+        "the error must retain Docker's command diagnosis: {human_stderr}"
     );
     assert!(
-        !human_stderr.contains(DOCKER_FAILURE_SENTINEL),
-        "normal output must hide Docker stderr: {human_stderr}"
+        !human_stderr.contains("docker info")
+            && !human_stderr.lines().any(|line| line.starts_with("Fix: ")),
+        "a nonzero Docker command must not suggest a daemon probe: {human_stderr}"
     );
 
     let debug = run_skill_up_with_path(true, stub.path(), "acme-1655-docker-command-debug");
@@ -348,6 +509,33 @@ fn skill_up_docker_command_failure_has_operator_message_and_runnable_remedy() {
     assert!(
         debug_stderr.contains(DOCKER_FAILURE_SENTINEL),
         "debug plumbing must disclose Docker stderr: {debug_stderr}"
+    );
+}
+
+#[test]
+fn skill_up_lost_name_race_keeps_the_specialized_replacement_remedy() {
+    let container_name = "acme-1655-docker-name-race";
+    let stub = executable_docker_lost_race_stub(container_name);
+    let human = run_skill_up_with_path(false, stub.path(), container_name);
+    let human_stderr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        human.status.code(),
+        Some(ExitClass::Usage.code()),
+        "a lost container name race must be a usage error: {human_stderr}"
+    );
+
+    let error_line = single_line_with_prefix(&human_stderr, "Error: ");
+    assert!(
+        error_line.contains("container name conflict")
+            && error_line.contains("--replace")
+            && error_line.contains(&format!("curie skill down --name {container_name}")),
+        "the race must retain its specific replacement remedies: {human_stderr}"
+    );
+    assert!(
+        !human_stderr.contains("already in use by container")
+            && !human_stderr.contains("exit status: 125")
+            && !human_stderr.contains("docker info"),
+        "the race remedy must replace the raw Docker diagnosis: {human_stderr}"
     );
 }
 
