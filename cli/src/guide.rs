@@ -320,7 +320,7 @@ pub fn primer() -> Primer {
         recovery: vec![
             Recovery {
                 symptom: "\"platform API ... unreachable\" on a local deploy or message",
-                fix: "The stack is down. Run `curie local up`, then retry.",
+                fix: "Check the API URL and follow the local status guidance. Run `curie local up` only if local services are absent, then retry.",
             },
             Recovery {
                 symptom: "`curie cluster up` fails immediately when `curie-preflight-gvisor` reports `FailedCreate`: `RuntimeClass \"gvisor\" not found`",

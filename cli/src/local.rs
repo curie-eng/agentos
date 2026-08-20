@@ -1660,6 +1660,7 @@ mod tests {
             .expect_err("the original deploy failure must remain an error");
         let (normal_message, _) = crate::exit::present_error(&error);
         let rendered = format!("{error:#}");
+        let (presented, _) = crate::exit::present_error(&error);
         let invocations = std::fs::read_to_string(&log).expect("read docker invocation log");
 
         assert_eq!(
@@ -1686,6 +1687,18 @@ mod tests {
         assert!(
             !rendered.contains("curie local up"),
             "a starting stack must not be told to start again: {rendered}"
+        );
+        assert!(
+            presented.contains("local stack is still starting"),
+            "presented error lost the starting state: {presented}"
+        );
+        assert!(
+            presented.contains("curie local status"),
+            "presented error lost the state inspection guidance: {presented}"
+        );
+        assert!(
+            !presented.contains("curie local up"),
+            "presented error must not tell a starting stack to start again: {presented}"
         );
     }
 
