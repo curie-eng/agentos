@@ -115,11 +115,11 @@ def _configured_origins(origins: Sequence[str]) -> set[_TrustedOrigin]:
 
     An entry that names a PORT keeps it and is matched exactly. An entry that
     omits the port (``http://host.docker.internal``) carries ``None``, which
-    trusts any port on that scheme+host: the CLI's stub binds an EPHEMERAL port
-    on `curie chat` and on ``cluster message --listen-port 0``, so there is no
-    port an operator could write down in advance. It is a dev affordance and
-    nothing else -- it widens trust to every port on a named host, so it belongs
-    on a loopback or docker-host name, never in production.
+    trusts any port on that scheme and host. The CLI stub uses an EPHEMERAL
+    callback port by default for ``cluster message``, so an operator must use a
+    portless origin such as ``http://10.0.0.7`` for a LAN or kind callback host
+    to admit the kernel assigned port. This is dev only because it trusts every
+    port on that exact host. Leave the override empty in production.
     """
     configured: set[_TrustedOrigin] = set()
     for raw in origins:

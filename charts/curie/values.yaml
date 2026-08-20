@@ -893,12 +893,12 @@ worker:
   # Slack) is the only endpoint the worker will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
-  # DEV ONLY. It exists for `curie cluster message`, whose throwaway stub binds a
-  # host and port the single slackApiBaseUrl cannot also name -- and, with
-  # `--listen-port 0`, an EPHEMERAL port. An entry that omits the port
-  # (http://host.docker.internal) therefore trusts ANY port on that host, so
-  # setting one on a real deployment widens where the platform bot token can go.
-  # A LAN-host dev setup (`--listen-host <ip>`) must name that host here itself.
+  # DEV ONLY. `curie cluster message` uses an EPHEMERAL callback port by
+  # default. To trust a LAN or kind callback host, set a portless origin such as
+  # `http://10.0.0.7` or `http://host.docker.internal`; omitting the port admits
+  # the kernel assigned port. This trusts ANY port on that exact host, so it can
+  # widen where the platform bot token can go and belongs only in development.
+  # The empty default above remains the fail closed production posture.
   # Rendered only when non-empty.
   slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->

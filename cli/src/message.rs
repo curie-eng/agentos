@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use curie_aci_protocol::QueuedTurn;
 use redis::aio::MultiplexedConnection;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::api::{Agent, ApiClient};
 use crate::chat::{
@@ -825,25 +826,64 @@ fn detect_local_ip(host: &str, port: u16) -> Option<std::net::IpAddr> {
 }
 
 /// Spawn a `kubectl port-forward` child (killed on drop via `kill_on_drop`) and
-/// block until its local port accepts TCP, so callers can use it immediately.
+/// block until its effective local port accepts TCP, so callers can use it
+/// immediately. The returned port is the requested value unless kubectl assigns
+/// one for a zero request.
 pub async fn start_port_forward(
     cmd: &OpsCommand,
     local_port: u16,
     label: &str,
-) -> Result<tokio::process::Child> {
+) -> Result<(tokio::process::Child, u16)> {
     crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
     let mut child = tokio::process::Command::new(&cmd.program)
         .args(cmd.argv())
         .kill_on_drop(true)
-        .stdout(Stdio::null())
+        .stdout(if local_port == 0 {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawning `{}` (is kubectl on PATH?)", cmd.program))?;
-    wait_for_tcp(local_port, Duration::from_secs(15))
+    let timeout = Duration::from_secs(15);
+    let deadline = Instant::now() + timeout;
+    let effective_port = if local_port == 0 {
+        let stdout = child
+            .stdout
+            .take()
+            .context("capturing kubectl output for an assigned local port")?;
+        let mut lines = BufReader::new(stdout).lines();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let assigned = tokio::time::timeout(remaining, async {
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .context("reading kubectl forwarding readiness")?
+                    .context("kubectl exited before reporting an assigned local port")?;
+                if let Some(port) = parse_forwarded_port(&line)? {
+                    return Ok::<u16, anyhow::Error>(port);
+                }
+            }
+        })
         .await
-        .with_context(|| format!("the {label} port-forward never opened localhost:{local_port}"))?;
+        .with_context(|| format!("the {label} port forward never reported an assigned port"))??;
+        std::mem::drop(tokio::spawn(async move {
+            while matches!(lines.next_line().await, Ok(Some(_))) {}
+        }));
+        assigned
+    } else {
+        local_port
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    wait_for_tcp(effective_port, remaining)
+        .await
+        .with_context(|| {
+            format!("the {label} port-forward never opened localhost:{effective_port}")
+        })?;
     // The port accepting TCP is not proof WE bound it. If another process was
-    // already listening on localhost:{local_port}, kubectl could not bind, so it
+    // already listening on localhost:{effective_port}, kubectl could not bind, so it
     // exited, and the socket that just answered is the squatter's -- a caller
     // that then posts a discovered key would leak it to that process. If the
     // child has already exited by the time TCP connects, it never held the port;
@@ -851,11 +891,28 @@ pub async fn start_port_forward(
     // stays race-tolerant: only a definitely-exited child trips the guard).
     if child.try_wait()?.is_some() {
         bail!(
-            "the {label} port-forward exited immediately; localhost:{local_port} is already in \
+            "the {label} port-forward exited immediately; localhost:{effective_port} is already in \
              use by another process. Free that port or stop the conflicting process, then retry."
         );
     }
-    Ok(child)
+    Ok((child, effective_port))
+}
+
+fn parse_forwarded_port(line: &str) -> Result<Option<u16>> {
+    let Some(readiness) = line.strip_prefix("Forwarding from ") else {
+        return Ok(None);
+    };
+    let (source, _) = readiness
+        .split_once(" -> ")
+        .context("kubectl reported malformed forwarding readiness")?;
+    let port = source
+        .parse::<std::net::SocketAddr>()
+        .context("kubectl reported an invalid assigned local address")?
+        .port();
+    if port == 0 {
+        bail!("kubectl reported zero as its assigned local port");
+    }
+    Ok(Some(port))
 }
 
 /// Poll-connect to `localhost:port` until it accepts or the timeout elapses.
@@ -1627,7 +1684,7 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
     match opts.channel.as_deref() {
         Some(channel) => Ok((channel.to_string(), None)),
         None => {
-            let _api_pf = start_port_forward(
+            let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
                     &opts.release,
@@ -1639,10 +1696,7 @@ async fn resolve_cluster_channel(opts: &MessageOpts) -> Result<(String, Option<S
                 "api",
             )
             .await?;
-            let api = ApiClient::new(
-                &format!("http://localhost:{}", opts.api_local_port),
-                &opts.api_key,
-            )?;
+            let api = ApiClient::new(&format!("http://localhost:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -1665,7 +1719,7 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     let ui = crate::ui::ui();
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -1711,7 +1765,7 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
 
     let valkey_url = format!(
         "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        opts.valkey_password, valkey_local_port
     );
     let mut conn = connect(&valkey_url).await?;
     enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &bot_token)
@@ -1769,7 +1823,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     ));
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -1794,7 +1848,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // same worker keeps replying to real Slack.
     let valkey_url = format!(
         "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        opts.valkey_password, valkey_local_port
     );
     let mut conn = connect(&valkey_url).await?;
     let (channel, thread_ts, placeholder_ts) =
@@ -2539,7 +2593,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         (ApiClient::new(&base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
-        let pf = start_port_forward(
+        let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
                 &opts.release,
@@ -2551,7 +2605,7 @@ async fn eval_sweep(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
             "api",
         )
         .await?;
-        let base = format!("http://localhost:{}", opts.api_local_port);
+        let base = format!("http://localhost:{api_local_port}");
         (ApiClient::new(&base, &opts.api_key)?, Some(pf))
     };
 
@@ -2685,7 +2739,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         (ApiClient::new(&api_base, &opts.api_key)?, None)
     } else {
         require_on_path("kubectl")?;
-        let pf = start_port_forward(
+        let (pf, api_local_port) = start_port_forward(
             &port_forward_command(
                 &opts.namespace,
                 &opts.release,
@@ -2697,7 +2751,11 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
             "api",
         )
         .await?;
-        (ApiClient::new(&api_base, &opts.api_key)?, Some(pf))
+        let effective_api_base = format!("http://localhost:{api_local_port}");
+        (
+            ApiClient::new(&effective_api_base, &opts.api_key)?,
+            Some(pf),
+        )
     };
 
     let agents = api
@@ -3019,7 +3077,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ));
 
     // Valkey port-forward for the enqueue, kept alive for the whole eval loop.
-    let _valkey_pf = start_port_forward(
+    let (_valkey_pf, valkey_local_port) = start_port_forward(
         &port_forward_command(
             &opts.namespace,
             &opts.release,
@@ -3035,7 +3093,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     let channel = match opts.channel.as_deref() {
         Some(channel) => channel.to_string(),
         None => {
-            let _api_pf = start_port_forward(
+            let (_api_pf, api_local_port) = start_port_forward(
                 &port_forward_command(
                     &opts.namespace,
                     &opts.release,
@@ -3047,10 +3105,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
                 "api",
             )
             .await?;
-            let api = ApiClient::new(
-                &format!("http://localhost:{}", opts.api_local_port),
-                &opts.api_key,
-            )?;
+            let api = ApiClient::new(&format!("http://localhost:{api_local_port}"), &opts.api_key)?;
             let agents = api
                 .list_agents()
                 .await
@@ -3062,7 +3117,7 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
 
     let valkey_url = format!(
         "redis://:{}@localhost:{}",
-        opts.valkey_password, opts.valkey_local_port
+        opts.valkey_password, valkey_local_port
     );
     let mut conn = connect(&valkey_url).await?;
 

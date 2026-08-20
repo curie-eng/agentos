@@ -388,10 +388,10 @@ jobs:
       # runsc on kind nodes -- a real-model install fails closed without this),
       # and drop the dispatcher (no Slack; its presence would trip the
       # `cluster message` reply-hijack guard). The secret travels in env, never
-      # on argv. worker.slackTrustedOrigins is a CI-only widening that lets the
-      # worker answer the host-side reply stub (port = STUB_PORT in
-      # cli/scripts/e2e-ladder.sh); the chart default stays empty and
-      # fail-closed.
+      # on argv. worker.slackTrustedOrigins is a CI only widening that lets the
+      # worker answer the host side reply stub on any kernel assigned port on
+      # this host. The portless origin is intentional because `cluster message`
+      # requests an ephemeral port; the chart default stays empty and fail closed.
       - name: Install the platform (curie cluster up, graded)
         env:
           CURIE_BIN: cli/target/release/curie
@@ -405,7 +405,7 @@ jobs:
             --allow-egress-host openrouter \
             --set security.gvisor.mode=off \
             --set dispatcher.deploy=false \
-            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}:8155" \
+            --set worker.slackTrustedOrigins="http://${CURIE_E2E_LISTEN_HOST}" \
             --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
             --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
             --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
