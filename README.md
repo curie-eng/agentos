@@ -170,7 +170,7 @@ minikube start
 Then:
 
 ```bash
-curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
+curie cluster up
 curie cluster deploy --plugin-dir . --repo <owner>/<name>
 curie cluster message "hello, are you there?"
 ```
@@ -182,12 +182,13 @@ the agent is first created and cannot be changed afterwards, so substitute your 
 before running it: getting it wrong means deleting the agent and recreating it. See
 [`cli/README.md`](cli/README.md) for the lifecycle verbs.
 
-`--set security.gvisor.mode=off` skips gVisor's extra kernel isolation, which a real-model install
-otherwise requires and minikube doesn't ship by default - drop it on a cluster that has `runsc`
-installed. 
-
-`--allow-egress-host` opens the model call; a credential alone doesn't, since the cluster sandbox is
-fail-closed by default (skill/local aren't).
+Plain `cluster up` infers Anthropic or OpenRouter egress from an unambiguous
+credential prefix. On minikube, the first admission attempt reports that its
+`gvisor` RuntimeClass is absent, so Curie applies
+`security.gvisor.mode=off` and retries once. Each inference is printed with the
+equivalent override. Ambiguous credential shapes still need an explicit
+`--allow-egress-host`, and explicit values that contradict detected facts are
+errors.
 
 See [`docs/operations.md`](docs/operations.md#installing-and-inspecting-the-curie-platform-on-the-cluster) for cluster prerequisites and the full egress model.
 

@@ -119,13 +119,15 @@ committed shared vector in `tests/vectors/model-provider-registry.json` pins the
 contract by projecting runner base URLs into CLI credential shapes and exact egress
 hosts for Anthropic, OpenRouter, Zhipu, Moonshot, and DeepSeek.
 
-- **Credential validation is not egress authorization.** A recognized credential
-  shape can be saved without selecting a provider or opening a route. The sandbox
-  remains sealed until `--allow-egress-host` names one of the five lowercase exact
-  providers, or the operator explicitly supplies `--allow-web-egress`. Unknown,
-  mixed case, URL, and host literal provider names remain usage errors. Local Ollama
-  has no named remote egress entry.
-- **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
+1. **Credential validation and egress authorization remain distinct.** The
+  unambiguous `sk-ant-` and `sk-or-` prefixes let direct `cluster up` infer one
+  named provider route when no provider flag is present. Other recognized
+  credential shapes can be saved without selecting a provider or opening a
+  route. An explicit provider list that omits the provider selected by either
+  unambiguous prefix is a usage error. Unknown, mixed case, URL, and host literal
+  provider names remain usage errors. Local Ollama has no named remote egress
+  entry.
+2. **Two mirrors of the non-forwardable-credential rule.** The runner is the authority
   for the `sk-ant-oat` prefix
   (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`), and it is already
   declared per harness rather than hardcoded

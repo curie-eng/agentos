@@ -18,7 +18,7 @@ Targets, see the target comparison table in the
 |---|---|
 | `kubectl` and `helm` on PATH | Every `cluster` verb wraps one or both of them. |
 | A reachable cluster | Every verb talks to the cluster's Kubernetes API server directly -- there's nothing to install onto or inspect without one. The chart's own preflights additionally need the `agents.x-k8s.io` Agent Sandbox CRDs (Custom Resource Definitions) installable and a NetworkPolicy-enforcing CNI (Container Network Interface) already present; see `charts/curie/README.md`. |
-| `runsc` (gVisor) on every node -- **real models only** | Real-model installs refuse to start without it, as a safety measure against running a live model in a less-isolated sandbox. Skip the check with `--set security.gvisor.mode=off` if your cluster doesn't have it. Fake-model installs don't need it. |
+| `runsc` (gVisor) on every node for full kernel isolation | A real model first installs with gVisor enabled. If admission reports exactly that the `gvisor` RuntimeClass is absent, plain `cluster up` applies `security.gvisor.mode=off` and retries once. Other preflight failures remain closed. Fake model installs do not need it. |
 
 **For testing**, pick between **k3s**, **kind**, and **minikube** based on
 your host and how disposable the cluster needs to be. A single-node **k3s**
@@ -104,11 +104,11 @@ curie cluster up
 | `-f <compose>` | Override a resolved local-dev artifact path. |
 | `--image <ref>` | Override a resolved image reference. |
 | `--no-expose` | Keep the UI and Langfuse ClusterIP-only instead of exposing them on node ports. |
-| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. It checks only shape, not provider identity or liveness. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
+| `CURIE_CREDENTIALS` (alias `CURIE_MODEL_CREDENTIALS`) | A real model credential. The interactive check accepts Anthropic `sk-ant-`, OpenRouter `sk-or-`, Zhipu `id.secret`, and bare `sk-` shapes for Moonshot or DeepSeek. The first two prefixes select one provider and infer its egress when no provider flag is present. Other shapes do not identify a provider. Present credentials install live through masked `--set` machinery, so `--dry-run` never prints them. An absent credential uses fake mode on a fresh install and preserves the recorded model configuration on a rerun. |
 | `--fake-model` | Explicitly downgrade to fake mode, even when a credential is present or a rerun has recorded live model configuration. |
 | `--github-token <token>` (or `CURIE_GITHUB_TOKEN`) | The Curie API's own GitHub credential, for cloning a PRIVATE repo during a git-flow bundle deploy and for posting the eval commit status. Goes to helm through a private mode-0600 values file, never a command-line argument, so it never appears in the helm command, the printed plan, or that plan's JSON. Prefer the environment variable: a token typed after the flag still sits in `curie`'s own argv, so it still reaches your shell history and `ps`. Omitting both on a later `cluster up` preserves whatever the release already has. Errors if combined with `--set api.githubToken=`. |
 | `--clear-github-token` | Remove the stored GitHub credential. Not a revocation: the running API keeps the old token until its pod restarts (`cluster up` prints the restart command), and the token itself stays valid at GitHub until you revoke it there. |
-| `--allow-egress-host <provider>` (repeatable) | Open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact; any other provider name is rejected. |
+| `--allow-egress-host <provider>` (repeatable) | Explicitly open runner egress on TCP 443 to one named model provider: `anthropic`, `openrouter`, `zhipu`, `moonshot`, or `deepseek`. Names are lowercase exact. An explicit list must include the provider detected from an `sk-ant-` or `sk-or-` credential. |
 | `--allow-web-egress <CIDR>` (repeatable) | Open runner egress on TCP 443 to an arbitrary CIDR (Classless Inter-Domain Routing block) -- for skill/tool web access, or a provider not covered above. |
 
 A downloaded release binary needs no repo checkout; the chart resolves from
@@ -119,14 +119,16 @@ their matching documented `CURIE_MODEL_BASE_URL` in worker runtime configuration
 as well as a credential and their named egress entry. Their credential shapes do
 not identify the provider: the base URL selects it.
 
-**Egress is sealed by default.** A model credential alone opens no egress:
-the sandbox stays fail-closed until you open its provider egress with one of
-the two flags above. Neither flag bakes provider IPs into the binary --
-only hostnames are resolved (to narrow `/32`+`/128` host routes) at install
-time, because provider/CDN IPs rotate; re-run `up` to re-resolve if calls
-start failing. Credential shape validation does not select a provider or open a
-route. The named provider allowlist admits only the five documented lowercase
-names above; unknown names stay denied. `--allow-web-egress` is for agents whose
+**Ambiguous egress stays sealed.** An effective credential beginning `sk-ant-`
+or `sk-or-` selects Anthropic or OpenRouter and plain `cluster up` infers the
+matching named egress. Other credential shapes do not identify one provider,
+so the sandbox stays fail closed until the operator opens its provider or web
+egress. An explicit provider list that omits a detected provider is a usage
+error. Neither flag bakes provider IPs into the binary. Only hostnames are
+resolved to narrow `/32` and `/128` host routes at install time because
+provider and CDN IPs rotate. Re-run `up` to resolve them again if calls start
+failing. The named provider allowlist admits only the five documented lowercase
+names above. Unknown names stay denied. `--allow-web-egress` is for agents whose
 skills need open web access, such as search or weather lookup, beyond the named
 model providers. `curie cluster up --allow-web-egress 0.0.0.0/0` opens the
 internet except `169.254.169.254`; narrow the CIDR to a specific destination for
@@ -138,6 +140,22 @@ You don't need to worry about ordering when using the CLI flags together --
 `cluster up` composes `--allow-egress-host` and `--allow-web-egress` into
 one list automatically, with named-provider entries first and web-egress
 CIDRs after.
+
+**Cluster facts are inferred only when they are complete.** Direct
+`curie cluster up` inspects the two PriorityClasses and the
+`agent-sandbox-controller` Deployment. When complete Helm ownership metadata
+names another release, Curie applies the matching creation or deployment value
+as false. Missing, malformed, unreadable, or incomplete ownership does not
+authorize reuse and blocks the install. An explicit true value that contradicts
+the detected owner is a usage error.
+
+The first gVisor preflight keeps the chart default. Only the exact admission
+result `RuntimeClass "gvisor" not found` authorizes
+`security.gvisor.mode=off` and one retry. An explicit `auto` or `require` mode
+contradicts that result and errors. Other admission failures and an unavailable
+event watch remain closed. Curie prints one standard error line for every
+inference, including the equivalent override. Prepared `apply` and `diff`
+paths do not infer live cluster facts.
 
 ### `curie cluster status`
 
@@ -475,8 +493,9 @@ next operator.
   agent-sandbox CRDs, but the vendored controller is gated behind
   `agentSandbox.controller.deploy`. A cluster that has the CRDs but no
   controller silently never binds claims, so a first install must set
-  `agentSandbox.controller.deploy=true` unless the cluster already runs the
-  controller.
+  `agentSandbox.controller.deploy=true`. Plain `cluster up` preserves that
+  default when the controller is absent and infers false only when the existing
+  Deployment has complete Helm ownership metadata.
 - **gVisor stays off without runsc on the node.** Use the
   `values-e2e-nogvisor` overlay on nodes without `runsc`. All other
   security rails were verified ON in the first fresh-cluster install:
