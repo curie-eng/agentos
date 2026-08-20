@@ -218,6 +218,93 @@ fn skill_eval_uses_tool_order_instead_of_the_final_answer() {
 }
 
 #[test]
+fn weather_case_fails_when_fetch_capability_is_removed() {
+    let weather_evals = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/weather/evals");
+    let cases_path = weather_evals.join("cases.json");
+    let cases = std::fs::read(&cases_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", cases_path.display()));
+    let suite: serde_json::Value = serde_json::from_slice(&cases)
+        .unwrap_or_else(|error| panic!("parse {}: {error}", cases_path.display()));
+    let weather_case = suite["cases"]
+        .as_array()
+        .and_then(|cases| {
+            cases
+                .iter()
+                .find(|case| case["id"] == "reports-a-temperature")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing reports-a-temperature case in {}",
+                cases_path.display()
+            )
+        });
+    let case_id = weather_case["id"]
+        .as_str()
+        .expect("weather case id")
+        .to_string();
+    let input = weather_case["input"]
+        .as_str()
+        .expect("weather case input")
+        .to_string();
+
+    let trajectory_path = weather_evals.join("trajectory.json");
+    let trajectory: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&trajectory_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", trajectory_path.display())),
+    )
+    .unwrap_or_else(|error| panic!("parse {}: {error}", trajectory_path.display()));
+    let specs = trajectory["specs"].clone();
+
+    let (complete_bundle, _cases_path) = write_bundle(&cases, specs.clone());
+    let complete_server = runner(
+        BTreeMap::from([(
+            input.clone(),
+            vec!["WebSearch".to_string(), "WebFetch".to_string()],
+        )]),
+        BTreeMap::from([(input.clone(), "68 degrees Fahrenheit".to_string())]),
+    );
+    let complete = skill_eval(complete_bundle.path(), &complete_server);
+    assert!(
+        complete.status.success(),
+        "the committed weather case must pass with search and fetch\n{}",
+        output_text(&complete)
+    );
+    let complete_body = parsed_output(&complete);
+    assert_eq!(
+        case_result(&complete_body, &case_id)["passed"],
+        true,
+        "{complete_body}"
+    );
+
+    let (without_fetch_bundle, _cases_path) = write_bundle(&cases, specs);
+    let without_fetch_server = runner(
+        BTreeMap::from([(input.clone(), vec!["WebSearch".to_string()])]),
+        BTreeMap::from([(input, "68 degrees Fahrenheit".to_string())]),
+    );
+    let without_fetch = skill_eval(without_fetch_bundle.path(), &without_fetch_server);
+    assert!(
+        !without_fetch.status.success(),
+        "the committed weather case must fail when fetch is unavailable\n{}",
+        output_text(&without_fetch)
+    );
+    let without_fetch_body = parsed_output(&without_fetch);
+    assert_eq!(
+        case_result(&without_fetch_body, &case_id)["passed"],
+        false,
+        "{without_fetch_body}"
+    );
+    assert!(
+        case_result(&without_fetch_body, &case_id)["detail"]
+            .as_str()
+            .is_some_and(|detail| {
+                detail.contains("expected=['WebSearch', 'WebFetch']")
+                    && detail.contains("observed=['WebSearch']")
+            }),
+        "the failure must explain that the fetch capability was absent: {without_fetch_body}"
+    );
+}
+
+#[test]
 fn skill_eval_replays_the_shared_five_mode_trajectory_vectors() {
     let vectors = vectors().vectors;
     let modes = vectors
