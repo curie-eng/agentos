@@ -824,6 +824,10 @@ enum LocalAction {
         /// Bring up only the 7 core services (skip Langfuse/ClickHouse/OTel/UI).
         #[arg(long)]
         minimal: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Setting it makes token usage attributable in Langfuse traces.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Run the named model through local Ollama.
         #[arg(
             long,
@@ -870,6 +874,10 @@ enum LocalAction {
         /// Match how `local up` brought the stack up (core-only vs full).
         #[arg(long)]
         minimal: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Match the explicit model used by `local up`.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Match how `local up` brought the stack up (--local-model, if used).
         #[arg(
             long,
@@ -926,6 +934,9 @@ enum LocalAction {
         /// The stack runs only the 7 core services (skip Langfuse/ClickHouse/OTel/UI). Must match how `local up` brought it up.
         #[arg(long)]
         minimal: bool,
+        /// Match the explicit model used by `local up`. Defaults from CURIE_MODEL.
+        #[arg(long, env = "CURIE_MODEL")]
+        model: Option<String>,
         /// Slack app token. Defaults from SLACK_APP_TOKEN.
         #[arg(
             long,
@@ -1324,6 +1335,10 @@ enum ClusterAction {
         /// is set (dev/CI escape hatch); suppresses the fake-model warning.
         #[arg(long)]
         fake_model: bool,
+        /// Model id, forwarded as CURIE_MODEL. Omit for the SDK default.
+        /// Setting it makes token usage attributable in Langfuse traces.
+        #[arg(long, conflicts_with = "local_model")]
+        model: Option<String>,
         /// Run the named model through the chart inference deployment.
         #[arg(
             long,
@@ -2201,6 +2216,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 file,
                 dry_run,
                 minimal,
+                model,
                 local_model,
                 pull_model,
                 slack,
@@ -2208,16 +2224,19 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 let file = resolve_compose_file(file, dry_run).await?;
                 emit(
-                    local::up(LocalOpts {
-                        file,
-                        dry_run,
-                        minimal,
-                        local_model,
-                        pull_model,
-                        slack,
-                        model_mode: local::model_mode_from_env(),
-                        env_file,
-                    })
+                    local::up(
+                        LocalOpts {
+                            file,
+                            dry_run,
+                            minimal,
+                            local_model,
+                            pull_model,
+                            slack,
+                            model_mode: local::model_mode_from_env(),
+                            env_file,
+                        },
+                        model,
+                    )
                     .await?,
                 )
             }
@@ -2226,6 +2245,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 file,
                 dry_run,
                 minimal,
+                model,
                 local_model,
                 slack,
                 env_file,
@@ -2244,6 +2264,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             env_file,
                         },
                         service,
+                        model,
                     })
                     .await?,
                 )
@@ -2293,6 +2314,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 slack,
                 disconnect,
                 minimal,
+                model,
                 app_token,
                 bot_token,
                 file,
@@ -2308,6 +2330,18 @@ async fn run(command: Option<Command>) -> Result<()> {
                     comms::resolve_local_slack_token("SLACK_APP_TOKEN", &app_token, disconnect)?;
                 let bot_token =
                     comms::resolve_local_slack_token("SLACK_BOT_TOKEN", &bot_token, disconnect)?;
+                let mut model_opts = LocalOpts {
+                    file: resolved_file.clone(),
+                    dry_run,
+                    minimal,
+                    local_model: None,
+                    pull_model: false,
+                    slack: true,
+                    model_mode: local::model_mode_from_env(),
+                    env_file: None,
+                };
+                let model_credentials =
+                    local::apply_credential_plan(&mut model_opts, crate::ui::ui())?;
                 emit(
                     comms::local_comms(LocalCommsOpts {
                         file: resolved_file,
@@ -2315,7 +2349,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                         app_token,
                         bot_token,
                         disconnect,
-                        model_mode: local::model_mode_from_env(),
+                        model_mode: model_opts.model_mode,
+                        model_credentials,
+                        model,
                         minimal,
                     })
                     .await?,
@@ -2613,6 +2649,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 chart,
                 no_expose,
                 fake_model,
+                model,
                 local_model,
                 allow_egress_host,
                 allow_web_egress,
@@ -2630,10 +2667,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                     std::path::Path::new("charts/curie").is_dir(),
                 )?;
                 let chart = materialize_artifact(resolved, dry_run, "chart").await?;
-                let credentials = if local_model.is_some() {
+                let credentials = if fake_model || local_model.is_some() {
                     None
                 } else {
-                    ops::resolve_up_credentials(fake_model, ops::model_credential_env())
+                    ops::resolve_up_credentials(fake_model, ops::model_credential_env()?)
                 };
                 emit(
                     ops::up(
@@ -2659,7 +2696,9 @@ async fn run(command: Option<Command>) -> Result<()> {
                             // Default `agentSandbox.runner.model` from the shell
                             // `CURIE_MODEL` (None when unset/empty) for cross-tier
                             // parity with `local up` (#361).
-                            model: std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty()),
+                            model: model.or_else(|| {
+                                std::env::var("CURIE_MODEL").ok().filter(|s| !s.is_empty())
+                            }),
                             // Populated by ops::up (generate on fresh install / reuse on
                             // upgrade); empty here so the pure builder starts clean.
                             secrets: vec![],

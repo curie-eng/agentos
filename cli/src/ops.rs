@@ -383,13 +383,14 @@ pub fn resolve_up_credentials(fake_model: bool, env_value: Option<String>) -> Op
 /// uses everywhere. The CLI's historical `CURIE_MODEL_CREDENTIALS` is accepted
 /// as a deprecated alias for one release, with a warning naming the replacement,
 /// so an operator who set the one name for `skill up` isn't met with a silent
-/// no-op at `cluster up` (#496). Returns None when neither is set non-empty.
-pub fn model_credential_env() -> Option<String> {
+/// no-op at `cluster up` (#496). Private storage is the final fallback. Returns
+/// None when no source has a nonempty value.
+pub fn model_credential_env() -> Result<Option<String>> {
     if let Some(value) = std::env::var("CURIE_CREDENTIALS")
         .ok()
         .filter(|v| !v.is_empty())
     {
-        return Some(value);
+        return Ok(Some(value));
     }
     if let Some(value) = std::env::var("CURIE_MODEL_CREDENTIALS")
         .ok()
@@ -399,9 +400,17 @@ pub fn model_credential_env() -> Option<String> {
             "warning: CURIE_MODEL_CREDENTIALS is deprecated and will be removed in a future \
              release; set CURIE_CREDENTIALS instead."
         );
-        return Some(value);
+        return Ok(Some(value));
     }
-    None
+    match crate::commands::secret_store_env("CURIE_CREDENTIALS") {
+        Ok(stored) => Ok(stored.map(|(_, value)| value)),
+        Err(error) => {
+            crate::ui::ui().warn(&format!(
+                "Saved model credentials could not be read; continuing without them: {error}"
+            ));
+            Ok(None)
+        }
+    }
 }
 
 /// The helm value key that pins the sandbox runner model in the chart.
