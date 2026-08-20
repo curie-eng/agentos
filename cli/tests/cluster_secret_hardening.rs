@@ -35,11 +35,9 @@ const BRACE_LIST_EXPRESSION: &str =
 const BRACE_LIST_MASKED: &str = "connector.accessTokens={ghp-BRA***";
 const SHORT_SECRET_EXPRESSION: &str = "connector.auth=abc";
 const UNMATCHED_BRACE_GITHUB_SECRET: &str = "ghp-Y";
-const UNMATCHED_BRACE_EXPRESSION: &str =
-    "worker.note=literal{brace,api.githubToken=ghp-Y";
+const UNMATCHED_BRACE_EXPRESSION: &str = "worker.note=literal{brace,api.githubToken=ghp-Y";
 const UNCLOSED_LIST_GITHUB_SECRET: &str = "ghp-X";
-const UNCLOSED_LIST_EXPRESSION: &str =
-    "worker.note={literal,api.githubToken=ghp-X";
+const UNCLOSED_LIST_EXPRESSION: &str = "worker.note={literal,api.githubToken=ghp-X";
 
 const MODEL_CREDENTIAL: &str = "sk-ant-PLACEHOLDER-SIGNAL-1137";
 const GITHUB_CREDENTIAL: &str = "ghp-PLACEHOLDER-SIGNAL-1137";

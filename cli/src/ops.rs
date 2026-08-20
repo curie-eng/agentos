@@ -11,9 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Stdio;
-use std::time::Duration;
 #[cfg(unix)]
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
