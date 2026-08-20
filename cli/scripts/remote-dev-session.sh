@@ -13,7 +13,7 @@
 #       [--plugin-dir <dir>] [--timeout-secs <n>]
 #   curie dev remote-dev-session turn "<instruction>"
 #   curie dev remote-dev-session status
-#   curie dev remote-dev-session finish [--branch <name>] [--push] [--pr]
+#   curie dev remote-dev-session finish [--branch <name>] [--cluster | --push | --pr]
 #   curie dev remote-dev-session down
 #
 # Cluster access comes from the caller's KUBECONFIG and current context. This
@@ -47,6 +47,7 @@ RUNNER_CONTAINER="runner"
 # The claim can lag the turn by a couple of seconds, so the after-snapshot is
 # retried rather than read once.
 POD_WAIT_SECS=60
+JOB_WAIT_SECS=300
 
 BIN=""
 
@@ -59,6 +60,7 @@ TASK=""
 PLUGIN_DIR=""
 TIMEOUT_SECS="240"
 BRANCH=""
+CLUSTER=0
 PUSH=0
 PR=0
 FORCE=0
@@ -80,7 +82,7 @@ usage:
       --repo-url <url> --task "<text>" [--plugin-dir <dir>] [--timeout-secs <n>]
   remote-dev-session turn "<instruction>"
   remote-dev-session status
-  remote-dev-session finish [--branch <name>] [--push] [--pr]
+  remote-dev-session finish [--branch <name>] [--cluster | --push | --pr]
   remote-dev-session down [--force]
 USAGE
 }
@@ -177,11 +179,15 @@ case "$MODE" in
                 --branch)
                     [[ $# -ge 2 ]] || usage_die "--branch needs a value"
                     BRANCH="$2"; shift 2 ;;
+                --cluster) CLUSTER=1; shift ;;
                 --push) PUSH=1; shift ;;
                 --pr) PUSH=1; PR=1; shift ;;
                 *) usage_die "unknown argument '$1' for verb 'finish'" ;;
             esac
         done
+        if (( CLUSTER && (PUSH || PR) )); then
+            usage_die "--cluster cannot be combined with --push or --pr"
+        fi
         ;;
 esac
 
@@ -518,6 +524,209 @@ verb_status() {
 
 # ================================================================== verb: finish
 
+verb_finish_cluster() {
+    local diff="$1"
+    local REPO_PATH ID RESOURCE_NAME RUNNER_IMAGE
+
+    # The existence check has no capture, so the token stays off host storage.
+    if ! kubectl get secret curie-secrets -n "$NAMESPACE" \
+        -o jsonpath='{.data.githubToken}' 2>/dev/null | grep . >/dev/null; then
+        die "the release has no GitHub token; set it with CURIE_GITHUB""_TOKEN=... curie cluster up --github-token or patch curie-secrets."
+    fi
+
+    # State's repo_url is the REDACTED form, so a private repo's URL carries a
+    # literal ***@ userinfo. It is not part of the repository path; strip it.
+    [[ "$REPO_URL" =~ ^https://([^/@]+@)?github\.com/ ]] \
+        || die "in-cluster publication only supports github.com https URLs."
+    REPO_PATH="$(printf '%s' "$REPO_URL" | sed -E 's#^https://([^/@]+@)?github\.com/##')"
+    REPO_PATH="${REPO_PATH%.git}"
+
+    if [[ -z "$BRANCH" ]]; then
+        BRANCH="task/remote-dev-session-$(printf '%s' "$THREAD" | tr -c 'A-Za-z0-9._-' '-')"
+    fi
+
+    ID="$(printf '%s' "$THREAD" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-')"
+    RESOURCE_NAME="remote-dev-publish-$ID"
+    RESOURCE_NAME="${RESOURCE_NAME:0:63}"
+    while [[ "$RESOURCE_NAME" == *- ]]; do
+        RESOURCE_NAME="${RESOURCE_NAME%-}"
+    done
+
+    RUNNER_IMAGE="$(kubectl get pod -n "$NAMESPACE" "$POD" \
+        -o jsonpath='{.spec.containers[?(@.name=="runner")].image}' 2>/dev/null || true)"
+    [[ -n "$RUNNER_IMAGE" ]] \
+        || die "claimed sandbox pod $POD has no runner image to use for in-cluster publication."
+
+    local publish_dir patch_bytes
+    local LC_ALL=C
+    publish_dir="$(mktemp -d /tmp/curie-remote-dev-session-publish.XXXXXX)"
+    printf '%s\n' "$diff" > "$publish_dir/session.patch"
+    patch_bytes=$(( ${#diff} + 1 ))
+    if (( patch_bytes > 900000 )); then
+        rm -rf "$publish_dir"
+        die "the session patch exceeds 900000 bytes; ConfigMaps have a 1MiB limit, so in-cluster publication cannot safely carry it."
+    fi
+
+    # Clone and push logs are redacted inside the Job before kubectl can return them.
+    cat > "$publish_dir/publish.sh" <<'PUBLISH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+redact() { sed -E 's#([a-z+]+://)[^/@[:space:]]+@#\1***@#g'; }
+
+export HOME=/tmp/publish-home
+mkdir -p "$HOME"
+git config --global user.name "Brian Conn"
+git config --global user.email "bcconn2112@gmail.com"
+git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_PATH}.git" /tmp/publish-repo 2>&1 | redact >&2
+cd /tmp/publish-repo
+BASE="$(git symbolic-ref --short HEAD)"
+git checkout -b "$BRANCH"
+git apply /publish/session.patch
+git add -A
+git commit \
+    -m "Remote dev session changes" \
+    -m "Produced over ${TURNS} remote development session turn(s)."
+git push -u origin HEAD 2>&1 | redact >&2
+
+python3 - "$BASE" <<'PY'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+repo_path = os.environ["REPO_PATH"]
+title = "Remote dev session changes"
+body = f"Produced over {os.environ['TURNS']} remote development session turn(s)."
+payload = json.dumps(
+    {
+        "title": title,
+        "head": os.environ["BRANCH"],
+        "base": sys.argv[1],
+        "body": body,
+    }
+).encode("utf-8")
+request = urllib.request.Request(
+    f"https://api.github.com/repos/{repo_path}/pulls",
+    data=payload,
+    method="POST",
+    headers={
+        "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "curie-remote-dev-session",
+    },
+)
+try:
+    with urllib.request.urlopen(request) as response:
+        result = json.load(response)
+except urllib.error.HTTPError as error:
+    print(error.read().decode("utf-8", errors="replace"), file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"CURIE_PR_URL={result['html_url']}")
+PY
+PUBLISH
+
+    say "=== upload publication inputs to ConfigMap $RESOURCE_NAME ==="
+    if ! kubectl create configmap "$RESOURCE_NAME" -n "$NAMESPACE" \
+        --from-file="$publish_dir" >/dev/null; then
+        rm -rf "$publish_dir"
+        die "could not create publication ConfigMap $RESOURCE_NAME."
+    fi
+    if ! kubectl label configmap "$RESOURCE_NAME" -n "$NAMESPACE" \
+        app.kubernetes.io/managed-by=curie-remote-dev-session --overwrite >/dev/null; then
+        rm -rf "$publish_dir"
+        die "could not label publication ConfigMap $RESOURCE_NAME."
+    fi
+    rm -rf "$publish_dir"
+
+    local name_json image_json repo_path_json branch_json turns_json
+    name_json="$(jq -Rn --arg value "$RESOURCE_NAME" '$value')"
+    image_json="$(jq -Rn --arg value "$RUNNER_IMAGE" '$value')"
+    repo_path_json="$(jq -Rn --arg value "$REPO_PATH" '$value')"
+    branch_json="$(jq -Rn --arg value "$BRANCH" '$value')"
+    turns_json="$(jq -Rn --arg value "$TURNS" '$value')"
+
+    say "=== create publication Job $RESOURCE_NAME ==="
+    # No retries: push and pull request creation are not safely repeatable.
+    kubectl apply -n "$NAMESPACE" -f - >/dev/null <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: $name_json
+  labels:
+    app.kubernetes.io/managed-by: curie-remote-dev-session
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: curie-remote-dev-session
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: publish
+          image: $image_json
+          command: ["bash", "/publish/publish.sh"]
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: curie-secrets
+                  key: githubToken
+            - name: REPO_PATH
+              value: $repo_path_json
+            - name: BRANCH
+              value: $branch_json
+            - name: TURNS
+              value: $turns_json
+          volumeMounts:
+            - name: publish
+              mountPath: /publish
+              readOnly: true
+      volumes:
+        - name: publish
+          configMap:
+            name: $name_json
+EOF
+
+    local waited=0 succeeded failed logs pr_url
+    while :; do
+        succeeded="$(kubectl get job "$RESOURCE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
+        failed="$(kubectl get job "$RESOURCE_NAME" -n "$NAMESPACE" \
+            -o jsonpath='{.status.failed}' 2>/dev/null || true)"
+        if [[ -n "$succeeded" && "$succeeded" != "0" ]]; then
+            break
+        fi
+        if [[ -n "$failed" && "$failed" != "0" ]]; then
+            kubectl logs -n "$NAMESPACE" "job/$RESOURCE_NAME" >&2 || true
+            die "in-cluster publication Job $RESOURCE_NAME failed."
+        fi
+        if (( waited >= JOB_WAIT_SECS )); then
+            kubectl logs -n "$NAMESPACE" "job/$RESOURCE_NAME" >&2 || true
+            die "in-cluster publication Job $RESOURCE_NAME did not finish within ${JOB_WAIT_SECS}s."
+        fi
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+
+    logs="$(kubectl logs -n "$NAMESPACE" "job/$RESOURCE_NAME" 2>&1 || true)"
+    printf '%s\n' "$logs" >&2
+    pr_url="$(printf '%s\n' "$logs" | sed -n 's/^CURIE_PR_URL=//p' | tail -n1)"
+    [[ -n "$pr_url" ]] \
+        || die "in-cluster publication Job $RESOURCE_NAME succeeded without reporting a pull request URL."
+
+    jq -n \
+        --arg branch "$BRANCH" \
+        --arg job "$RESOURCE_NAME" \
+        --arg pr_url "$pr_url" \
+        '{branch: $branch, job: $job, pr_url: $pr_url,
+          pushed: true, cluster: true}'
+}
+
 verb_finish() {
     if (( PR )); then
         require_tools gh
@@ -537,6 +746,11 @@ verb_finish() {
     diff="$(kexec git -C "$SANDBOX_REPO" diff --cached --binary)"
     kexec git -C "$SANDBOX_REPO" reset -q
     [[ -n "$diff" ]] || die "the sandbox checkout has no changes at all (tracked or new), so there is nothing to carry out of this session."
+
+    if (( CLUSTER )); then
+        verb_finish_cluster "$diff"
+        return
+    fi
 
     local parent workdir patch_file
     parent="$(mktemp -d /tmp/curie-remote-dev-session-finish.XXXXXX)"
@@ -622,8 +836,10 @@ verb_down() {
     # and the sandbox pod all belong to the platform (the worker's sandbox
     # substrate claims and reaps a pod per thread), and a session command that
     # uninstalled them would take down work it does not own. `down` removes only
-    # what this script itself created on the host.
+    # what this script itself created for the session.
+    local cleanup_namespace=""
     if [[ -f "$STATE_FILE" ]]; then
+        cleanup_namespace="$(jq -r '.namespace // ""' "$STATE_FILE")"
         # Unpushed finish workdirs hold the ONLY copy of their branch; without
         # --force, refuse rather than destroy them.
         local unpushed
@@ -642,6 +858,12 @@ verb_down() {
         done <<< "$dirs"
     else
         say "no session state at $STATE_FILE; nothing recorded to clean up."
+    fi
+    if [[ -n "$cleanup_namespace" ]]; then
+        say "removing in-cluster publication Jobs and ConfigMaps from namespace $cleanup_namespace"
+        kubectl delete jobs,configmaps -n "$cleanup_namespace" \
+            -l app.kubernetes.io/managed-by=curie-remote-dev-session \
+            --ignore-not-found >/dev/null || true
     fi
     rm -rf "$STATE_DIR"
     say "the sandbox pod and the cluster release are left alone; they are the platform's."
