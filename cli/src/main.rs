@@ -1400,8 +1400,12 @@ enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Uninstall the release and sweep its runtime namespaces (helm uninstall +
-    /// kubectl delete namespace). The agents.x-k8s.io CRDs are left in place.
+    /// Uninstall the release and sweep its runtime namespaces, running helm
+    /// uninstall followed by kubectl delete namespace. The namespace delete
+    /// is scoped to namespaces this release created, matched by both its
+    /// release name and install namespace, so another release's namespaces
+    /// on the same cluster are never touched. Pre-existing namespaces and
+    /// the agents.x-k8s.io CRDs are left in place.
     Down {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie")]
