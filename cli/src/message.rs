@@ -2225,8 +2225,12 @@ pub fn eval_dry_run_lines(opts: &EvalOpts, suite_name: &str, case_count: usize) 
 /// wins, else `evals/cases.json` in the cwd, then the recorded bundle dir.
 fn resolve_eval(explicit: Option<PathBuf>) -> Result<LoadedEval> {
     let state_plugin_dir = crate::state::load(Path::new("."))?.map(|s| PathBuf::from(s.plugin_dir));
-    let path =
-        crate::commands::resolve_cases_path(explicit, Path::new("."), state_plugin_dir.as_deref())?;
+    let path = crate::commands::resolve_cases_path(
+        explicit,
+        Path::new("."),
+        None,
+        state_plugin_dir.as_deref(),
+    )?;
     crate::evals::load_eval(&path)
 }
 
