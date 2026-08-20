@@ -637,15 +637,19 @@ these forms:
 3. `charts/curie/ci/name.sh` for a chart check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
-non test files in a disposable worktree, then runs the selector again. `PINNED`
-is printed and exits successfully for any nonzero selector result after a clean
-reversal, including compile or import failures. `UNPINNED` is
-printed and exits nonzero when it remains green.
+non test files in a disposable worktree, then runs the selector again. It prints
+`PINNED` and exits successfully only when the changed selected test node owns the
+failure after a clean reversal. For Python, the selected pytest testcase must
+carry the sole JUnit failure element. For Rust, the exact selected test must fail
+at runtime, or a compile error must point inside the changed selected function.
+Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when the
+selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
 without classified test files or product files, selectors outside the three
 forms or not changed by the reference, a red baseline, and reverse patch
-conflicts. Inline tests in product files are not inferred.
+conflicts. It also refuses unrelated collection, import, compile, setup, and
+teardown failures. Inline tests in product files are not inferred.
 
 ### Building the runner image from source
 
