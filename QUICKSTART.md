@@ -2,7 +2,9 @@
 
 Welcome. This gets you a first agent reply in about a minute — no credentials,
 no cluster, no Slack. It runs the `skill` target only: just the runner
-container on your host Docker daemon, talking straight to the agent. For the
+container on your host Docker daemon, talking straight to the agent. Here,
+`skill` names the runner only tier. The authored skill artifact lives at
+`skills/<name>/SKILL.md`. For the
 full tour across all three tiers through to production, see the
 [README Quickstart](README.md#quickstart); this doc goes deeper on the `skill`
 path itself — configuring a real model, alternate providers, and example

@@ -5,6 +5,8 @@ Curie is a harness that runs the same immutable bundle and the same eval suite
 (the bundle's own `evals/cases.json` and optional `evals/trajectory.json`)
 across three tiers, skill, local, and cluster, so an agent that worked locally
 does not silently break once deployed.
+Here, `skill` names the runner only tier. An authored bundle skill is the
+artifact at `skills/<name>/SKILL.md`.
 Its CLI's primary user is a coding agent driven by a developer, and this file is
 the contract that agent works to.
 

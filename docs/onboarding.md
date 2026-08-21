@@ -41,8 +41,10 @@ run, so only source builds need this.
 ## Pick a Target
 
 The three targets (`skill`, `local`, `cluster`) and when to reach for each are
-described in the [README target guide](../README.md#which-target-do-i-want). For
-onboarding, start with `skill` for the fastest proof a bundle answers, then move
+described in the [README target guide](../README.md#which-target-do-i-want).
+For onboarding, `skill` names the runner only tier; an authored bundle skill is
+the artifact at `skills/<name>/SKILL.md`. Start with `skill` for the fastest
+proof a bundle answers, then move
 to `local` for ticket verification — it puts the full platform in front of the
 runner with no Slack or Kubernetes. `curie init` scaffolds a bundle and
 targets no environment.

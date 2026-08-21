@@ -215,6 +215,31 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
     }
 }
 
+#[test]
+fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
+    let output = run_help(&["skill"]);
+    assert!(
+        output.status.success(),
+        "expected success for skill help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    let distinction =
+        "`skill` names that tier, not a bundle skill artifact at `skills/<name>/SKILL.md`.";
+    assert!(
+        text.contains(distinction),
+        "skill help must clearly distinguish its runner tier from the bundle artifact\n{text}"
+    );
+    assert!(
+        text.contains("Subcommands: `skill <up|down|status|message|eval|approvals>`"),
+        "skill help must introduce its subcommand list separately\n{text}"
+    );
+    assert!(
+        !text.contains("skills/<name>/SKILL.md`: `skill <up|down|status|message|eval|approvals>"),
+        "skill help must not attach the subcommand list to the artifact distinction\n{text}"
+    );
+}
+
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
 /// Claude-Code-compatibility gate (see the bundle-format seam doc). If the verb
 /// stops being reachable, the gate is still in CI but nobody can run it locally

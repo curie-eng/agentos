@@ -148,6 +148,33 @@ fn guide_prints_primer_to_stdout() {
 }
 
 #[test]
+fn guide_distinguishes_skill_tier_from_bundle_artifact() {
+    let markdown = run(&["guide"]);
+    assert!(
+        markdown.status.success(),
+        "curie guide failed:\n{}",
+        err_str(&markdown)
+    );
+    let json = run(&["guide", "--json"]);
+    assert!(
+        json.status.success(),
+        "curie guide --json failed:\n{}",
+        err_str(&json)
+    );
+
+    let markdown = out_str(&markdown);
+    let json = out_str(&json);
+    for (surface, text) in [("markdown", &markdown), ("json", &json)] {
+        for fact in ["runner only tier", "skills/<name>/SKILL.md"] {
+            assert!(
+                text.contains(fact),
+                "{surface} guide must distinguish its runner tier from the bundle artifact with `{fact}`\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
 fn guide_json_emits_pure_structured_data_on_stdout() {
     let out = run(&["guide", "--json"]);
     assert!(
