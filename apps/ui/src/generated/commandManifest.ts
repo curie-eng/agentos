@@ -119,7 +119,7 @@ export const commandManifest = {
       "name": "init"
     },
     {
-      "about": "Work with a local runner session for a plugin bundle: `skill <up|down|status|message|eval|approvals>`. `versions` and `memory` are answered here too, reporting that this tier has neither",
+      "about": "Work with the runner only tier for a plugin bundle. `skill` names that tier, not a bundle skill artifact at `skills/<name>/SKILL.md`. Subcommands: `skill <up|down|status|message|eval|approvals>`. `versions` and `memory` are answered here too, reporting that this tier has neither",
       "hidden": false,
       "name": "skill",
       "subcommands": [

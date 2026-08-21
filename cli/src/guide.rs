@@ -180,6 +180,11 @@ pub fn primer() -> Primer {
         ],
         decision_logic: vec![
             Decision {
+                question: "skill tier vs bundle skill artifact",
+                answer: "The `skill` command names the runner only tier. A bundle skill is an \
+                         artifact at `skills/<name>/SKILL.md`.",
+            },
+            Decision {
                 question: "skill vs local vs cluster",
                 answer: "skill is the runner only (offline, no platform, no Slack) -- the tightest \
                          loop. local puts the full platform in front of the identical runner via \
