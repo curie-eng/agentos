@@ -31,9 +31,19 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-web") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       containers:
         - name: langfuse-web
           image: "{{ .Values.langfuse.image.web }}:{{ .Values.langfuse.image.tag }}"
@@ -116,9 +126,19 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-worker") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       containers:
         - name: langfuse-worker
           image: "{{ .Values.langfuse.image.worker }}:{{ .Values.langfuse.image.tag }}"

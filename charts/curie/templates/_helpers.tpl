@@ -43,6 +43,33 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{- define "curie.placement.labels" -}}
+{{- with .podLabels }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "curie.placement.annotations" -}}
+{{- with .annotations }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "curie.placement.spec" -}}
+{{- with .nodeSelector }}
+nodeSelector:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .tolerations }}
+tolerations:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .affinity }}
+affinity:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
 {{/* Secret name that carries all credential material. */}}
 {{- define "curie.secretName" -}}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}

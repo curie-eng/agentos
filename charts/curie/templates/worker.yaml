@@ -101,6 +101,9 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         # Roll the workers when the per-adapter egress credentials change
         # (ADR-0096 D4.2). They arrive as env from the chart Secret, and env is
         # read once at boot, so a `helm upgrade` that rotates a compromised
@@ -112,9 +115,15 @@ spec:
         # on any unrelated credential change in it.
         checksum/adapter-credentials: {{ .Values.worker.adapterCredentials | toJson | sha256sum }}
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       {{- if .Values.worker.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-worker
