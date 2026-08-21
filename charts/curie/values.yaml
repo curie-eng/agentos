@@ -694,6 +694,13 @@ api:
   service:
     type: ClusterIP
     port: 8000
+    # Pinned NodePort used when service.type is set to NodePort. Empty lets
+    # Kubernetes allocate one from 30000-32767, but
+    # an auto-allocated port changes on every helm install/upgrade, breaking
+    # any URL or `curie deploy --api-url` that hardcodes a port. The default
+    # pins it so a down/up cycle keeps the same URL. Override or set to "" to
+    # restore auto-allocation.
+    nodePort: 30081
   # TLS for the API (issue #1238). Off by default because it cannot be
   # defaulted honestly -- it needs an ingress controller, a hostname, and a
   # certificate source, none of which the chart can invent. Rendering an

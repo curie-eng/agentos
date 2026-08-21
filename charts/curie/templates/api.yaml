@@ -14,6 +14,9 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: 8000
+      {{- if and (eq .Values.api.service.type "NodePort") .Values.api.service.nodePort }}
+      nodePort: {{ .Values.api.service.nodePort }}
+      {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
