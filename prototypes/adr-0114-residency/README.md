@@ -25,8 +25,16 @@ the same cluster is undisturbed.
 
 Contention is a Deployment of busy-loop pods that request `200m` each, matching
 what ClickHouse requests, against the runner's and bundle containers' `50m`. That
-4:1 request ratio is the amplifier the chart names: under contention the kernel
-divides CPU in proportion to requests, not limits.
+request gap is the amplifier the chart names: under contention the kernel divides
+CPU in proportion to requests, not limits.
+
+**On the recorded ratio.** The cast in `docs/demo/` says "4:1", because that is
+what the script printed when it was recorded, and the recording is left alone
+rather than edited to say something it did not say. The figure is wrong: 4:1 is
+the ratio of the declared millicores, while the kernel divides by `cpu.weight`,
+and read off a live node that is **11 for 50m against 29 for 200m, so 2.6:1**.
+The conversion has a positive intercept, which compresses it. The script's label
+has been corrected for future runs; the ADR carries the measured mapping.
 
 ## Results (2026-08-20, two full runs)
 

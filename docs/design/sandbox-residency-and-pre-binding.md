@@ -153,13 +153,30 @@ Seams touched: `charts/curie/templates/agent-sandbox.yaml` (init containers),
 
 ### W2 -- Right-sized requests and a turn-plane priority class (decision 6)
 
-**Removes the 4:1 starvation amplifier. No new interfaces.**
+**Shrinks the starvation amplifier and hardens the timeouts on the claim path.
+No new interfaces. Must land after W1 and W3, not before.**
 
 CPU requests on the runner, `bundle-fetch`, and `bundle-extract` are 50m each
 against a measured 0.43m idle and ~90m active. Memory request is 192Mi against a
 measured ~505 MiB. Both should come from measurement, with ADR-0059 decision 6's
 operator override preserved. The `PriorityClass` extends ADR-0059 decision 5 to a
 second axis: turn plane over insight plane.
+
+**The ordering constraint is the important part of this workstream.**
+`requests.cpu` is simultaneously the scheduler's reservation and, as `cpu.weight`,
+the kernel's contention share. Measured on the live node: 50m becomes weight 11,
+200m becomes weight 29, so a sandbox takes 27.5% against ClickHouse rather than
+the 20% the millicore ratio implies. Lowering the request toward the measured idle
+need therefore *shrinks the share the sandbox wins in a fight*. Done first, in
+isolation, it makes the incident more likely. It is safe only once W1 and W3 have
+taken the deadline-bound CPU work off the claim path, at which point the pool
+refill has no deadline to miss and the bind that remains needs almost no CPU.
+
+Also in this workstream: every absolute timeout on the claim path gets sized
+against a starved node. `claimTimeoutSeconds` is the obvious one; the runner's
+readiness probe (`periodSeconds: 2`, `timeoutSeconds: 2`, `failureThreshold: 30`)
+is the one that hides, because `_claim_fresh` waits on it and each spurious exec
+timeout adds a period to the claim.
 
 This is the cheapest workstream and the one most likely to be mistaken for the
 whole fix. It is not: it makes starvation less likely without removing the

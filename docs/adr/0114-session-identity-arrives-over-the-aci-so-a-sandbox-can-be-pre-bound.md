@@ -126,20 +126,25 @@ The chart also names the amplifier:
 Confirmed against the live release: the `curie-runner` SandboxTemplate requests
 `cpu: 50m` for the runner, `bundle-fetch`, and `bundle-extract` alike, while
 ClickHouse requests `cpu: 200m` and may burst to a full core. **The critical
-path holds one quarter of the CPU share of the observability database it is
-being observed by.**
+path holds a smaller share of the CPU than the observability database it is being
+observed by.** Read off the live node, the weights the kernel actually divides by
+are 11 for a 50m sandbox and 29 for ClickHouse, so the sandbox takes 27.5% when
+the two contend. The evidence section below has the full mapping and the reason
+the declared 4x difference in millicores compresses to 2.6x in weight.
 
 The general shape of the defect is this: **an absolute wall-clock deadline sits
 on the path with the smallest relative resource share in the cluster.** The
 deadline is a fixed 90 seconds; the share is proportional and can be divided
-away by any neighbour that requests more. Measured 17.39s multiplied by a 4:1
-starvation lands near 70 seconds, against a 90-second ceiling -- which is the
-recorded incident, reconstructible by arithmetic from a measured baseline.
-Tightening the neighbour is symptom treatment; it was tried twice and the
-second attempt only halved the blast radius.
+away by any neighbour that requests more. Tightening the neighbour is symptom
+treatment; it was tried twice and the second attempt only halved the blast
+radius.
 
-Making the bind sub-second removes the deadline from reach instead. A 0.5s bind
-starved 4:1 is 2 seconds.
+How far a given share stretches a 17.39s boot is not something to derive on
+paper, because the boot is a mix of CPU work, I/O waits, and scheduling rather
+than a single CPU-bound stretch. It was measured instead: under a reproduced
+saturation the same claim crossed the 90-second deadline at 91.02s and was still
+not ready at 110s. Making the bind sub-second removes the deadline from reach
+instead, and that was measured too, at 7.86s under the identical load.
 
 ## Decision
 
@@ -204,10 +209,21 @@ already-bundle-loaded runner.
    ADR-0003's rehydrate-from-history remains the correctness contract for a
    resumed thread; this decision only makes the release affordable.
 
-6. **The critical path declares a real resource share.** Runner and bundle
-   containers request from measurement rather than convention, and the turn
-   plane carries a `PriorityClass` above the observability plane, extending
-   ADR-0059 decision 5's platform-over-sandbox ranking to a second axis.
+6. **The critical path declares a real resource share, and the timeouts on it
+   survive starvation.** Runner and bundle containers request from measurement
+   rather than convention, and the turn plane carries a `PriorityClass` above the
+   observability plane, extending ADR-0059 decision 5's platform-over-sandbox
+   ranking to a second axis. Every absolute timeout the claim path waits on --
+   `claimTimeoutSeconds` and the runner's own readiness probe alike -- is sized
+   against a starved node rather than a quiet one, because a timeout that only
+   holds when nothing else is running is not a timeout, it is an assumption.
+
+   **This decision is ordered after decisions 1 through 4, not independent of
+   them.** `requests.cpu` is both the scheduler's reservation and the kernel's
+   contention weight, so lowering it toward the measured idle need also shrinks
+   the share the sandbox gets in a fight. That is safe only once the
+   deadline-bound CPU work has left the claim path. Applied first, in isolation,
+   it makes the recorded incident more likely rather than less.
 
 **The residency invariant** (what we test and review to): a conversation that
 is not currently being served holds no sandbox, and a conversation that becomes
@@ -422,6 +438,103 @@ Decision 3 is what makes it real: raising the pool ships one open ACI endpoint p
 warm pod inside the cluster network. That is why decision 2's per-pod token is a
 requirement of this ADR rather than an implementation detail of it.
 
+### Tuning the request cannot win, because of where the pod sits in the tree
+
+The declared-versus-measured table above invites an obvious move: the runner
+requests 50m and needs 0.43m at idle, so lower it. That move is wrong on its own,
+and the reason is worth recording because it is the same reason the incident
+happened.
+
+`requests.cpu` decides two unrelated things at once. It is the amount the
+scheduler reserves, which sets density, and it is the weight the kernel divides
+contested CPU by, which sets resilience. A low-duty-cycle, latency-sensitive
+workload wants opposite values for the two, and Kubernetes has no field that
+separates them.
+
+Read from the live node, the weights are not a metaphor. `requests.cpu` lands in
+`cpu.weight`, and `limits.cpu` lands in `cpu.max`:
+
+| pod | `requests.cpu` | `cpu.weight` | `limits.cpu` | `cpu.max` |
+| --- | --- | --- | --- | --- |
+| prewarm | 10m | 4 | 50m | `5000 100000` |
+| valkey (same request as a sandbox) | 50m | 11 | 250m | |
+| api / worker / postgres | 100m | 17 | | |
+| langfuse-web | 150m | 24 | | |
+| clickhouse | 200m | 29 | 1 | `100000 100000` |
+
+So a sandbox contends at weight 11 against ClickHouse's 29. **That is 2.6:1, not
+the 4:1 the declared millicores suggest** -- the conversion has a positive
+intercept, so a 4x difference in request compresses to 2.6x in weight. An earlier
+draft of this ADR quoted the millicore ratio; the weight ratio is what the kernel
+divides by.
+
+The tree matters more than the ratio:
+
+```
+/sys/fs/cgroup/kubepods            weight=469
+├── burstable                      weight=68     <- all 16 running pods
+│   ├── clickhouse   29
+│   ├── valkey       11            <- a sandbox sits here too
+│   └── ...
+└── besteffort                     weight=1
+   (Guaranteed pods sit directly under kubepods, as siblings of burstable)
+```
+
+A Burstable pod competes twice: against its siblings inside the slice, and then
+the slice competes above. A Guaranteed pod competes once, at the top, against the
+**entire** burstable slice as a single opponent. Guaranteed is therefore not a
+bigger number, it is a different position -- and it is unreachable here, because
+it requires `requests.cpu == limits.cpu`. At `limits.cpu: 1` that reserves a core
+per sandbox and the namespace `requests.cpu: 4` quota caps concurrency at four,
+worse than today's eight; at 200m it hard-throttles a legitimately busy agent,
+which decision 6 of ADR-0059 exists to prevent.
+
+**The conclusion is that no setting of these knobs is correct while
+deadline-bound CPU work sits on the claim path.** Decisions 1 through 4 remove
+that work: pool refill runs on a background schedule with no deadline, so its
+share becomes a throughput question rather than a correctness one, and the bind
+that remains inside the deadline costs almost no CPU. Only then is a small
+request right for both of its jobs at once. **The ordering is load-bearing:
+lowering the request before the boot leaves the critical path makes the incident
+more likely, not less.**
+
+### The same defect appears on probe timeouts, and there it kills
+
+The shape this ADR is about -- an absolute timeout on a proportionally starved
+path -- is not unique to `claimTimeoutSeconds`. It is also in the probes, and
+measured while testing the arms above.
+
+**On the claim path, and therefore in scope here.** The runner's readiness probe
+is what `_claim_fresh` waits for, and it is configured
+`periodSeconds: 2`, `timeoutSeconds: 2`, `failureThreshold: 30`. A probe that
+answers in milliseconds on a quiet node can exceed a 2s exec timeout on a starved
+one, and every spurious failure adds a period to the claim. The wall-clock
+deadline the claim races is therefore partly made of probe timeouts, which starve
+in exactly the same proportion as the boot they are measuring.
+
+**On the data tier, and therefore not in scope here.** Postgres declares:
+
+```yaml
+livenessProbe:
+  exec: ["sh", "-c", "pg_isready -U postgres"]
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  # timeoutSeconds   unset -> Kubernetes default 1
+  # failureThreshold unset -> Kubernetes default 3
+```
+
+The **readiness** probe on the same container sets `timeoutSeconds: 5` and
+`failureThreshold: 12` explicitly. The **liveness** probe, the one that kills, is
+left on defaults: three consecutive `pg_isready` invocations that each fail to
+complete inside one second restart the database. It is an exec probe, so each
+attempt forks a shell and runs a binary inside the container, which is not
+something a starved node completes in a second.
+
+Observed directly on a starved node: `curie-postgres-0` at **9 restarts**, each
+with `lastState.terminated.reason=Completed` and `exitCode=0`, its log reading
+`received fast shutdown request`. A healthy database, killed by its own liveness
+probe, nine times, while nothing was wrong with it.
+
 ### A third, tighter density cap surfaced while testing
 
 The failed with-env claim reported:
@@ -544,6 +657,15 @@ counts it, which decision 6 is what fixes.
   nightly graded parity ladder ([ADR-0081](0081-nightly-graded-parity-ladder.md))
   depends on it. Moving it off-node is a real decision with a functional
   dependency attached, and it is not this one.
+
+- **The data tier's liveness probes.** The Postgres finding above is the same
+  defect as this ADR's, but on a different path and with a worse outcome, and it
+  belongs to the data-tier availability record that
+  [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md) already carved out
+  and declined to write. That record now has a second reason to exist: the single
+  unreplicated replica it worries about is also killed by its own liveness probe
+  under starvation, so replication and probe sizing are one decision, not two.
+  Fixing it is a one-line-per-probe change and deliberately not bundled here.
 
 - **The runner image's composition.** 980 MB locally, of which Curie's own code
   is about 1.5 MB; the remainder is a Python virtualenv, a Node runtime, and a

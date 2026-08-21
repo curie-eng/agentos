@@ -64,7 +64,7 @@ def contend(on, replicas=18):
     if on:
         apply(burner(replicas))
         print(f"      {C['y']}{replicas} neighbours requesting 200m each; "
-              f"critical path requests 50m. 4:1.{C['x']}")
+              f"critical path requests 50m (weight 29 vs 11).{C['x']}")
         t0 = time.monotonic()
         while time.monotonic() - t0 < 120:
             r = kc("get", "deploy", "probe-burner", "-o", "jsonpath={.status.readyReplicas}")
