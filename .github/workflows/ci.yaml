@@ -5,6 +5,7 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next]
+    types: [opened, synchronize, reopened, edited]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -23,6 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
       # third-party dependency (a tool binary, an image, a registry session, a
@@ -122,8 +124,8 @@ jobs:
       # The committed-lock test only proves the lock matches the current wire; it
       # passes even if the lock was regenerated without a version bump. Compare
       # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. The shallow checkout has no base ref, so fetch it depth=1; a missing
-      # or empty base lock (base predates the lock) skips cleanly (exit 0), and
+      # CI. Fetch the base ref at depth 1 to keep this comparison focused; a
+      # missing or empty base lock (base predates the lock) skips cleanly (exit 0), and
       # only a genuine unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
@@ -132,6 +134,23 @@ jobs:
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
       - name: Pytest
         run: uv run pytest -q
+      - name: Build the current curie binary for fix pin verification
+        if: github.event_name == 'pull_request'
+        run: cargo build --release --locked --manifest-path cli/Cargo.toml
+      - name: Install Helm for fix pin verification
+        if: github.event_name == 'pull_request'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.16.4
+      - name: Require declared fixes to be pinned by a changed test
+        if: github.event_name == 'pull_request'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/cli/target
+        run: >-
+          python3 tools/fix-pin-ci/check.py
+          --event "$GITHUB_EVENT_PATH"
+          --curie cli/target/release/curie
+          --ref HEAD
       - name: Dump dev stack logs on failure
         if: failure()
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
