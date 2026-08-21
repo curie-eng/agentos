@@ -198,11 +198,21 @@ Seams touched: `charts/curie/templates/agent-sandbox.yaml`,
 
 **The enabling change, and the only one that needs an ACI version.**
 
-`CURIE_SESSION_ID`, `CURIE_HISTORY_REF`, and the runner token move out of
-`SandboxClaim.spec.env` and into a request against a bound runner, joining
-`/v1/event`, `/v1/steer`, `/v1/interrupt`, and `/v1/reset` on the existing
-server. The substrate's `claim()` and `resume()` stop building a boot-env overlay
-and start making one ACI call after the bind.
+`CURIE_SESSION_ID` and `CURIE_HISTORY_REF` move out of `SandboxClaim.spec.env`
+and become **optional fields on the `Event` frame** the worker already posts to
+`/v1/event`. No new endpoint: the frame already carries `user`, `ts`, and `type`,
+so session identity joins the same shape, and an additive field is the one ACI
+change that a pre-existing runner ignores instead of refusing.
+
+The runner token stays pod env. A pre-warmed pod cannot receive a token minted at
+claim time, so the pool mints one per pod and **the worker resolves the bound
+pod's token through the Kubernetes API at bind time** rather than generating it.
+The worker already reads those pods; the token's exposure is unchanged. Per-pod,
+not per-pool, or one compromised sandbox could authenticate as its siblings.
+
+The substrate's `claim()` and `resume()` therefore stop building a session boot-env
+overlay and start (a) reading the bound pod's token and (b) putting the session
+fields on the turn they were already sending.
 
 Constraints this must respect:
 
@@ -213,9 +223,14 @@ Constraints this must respect:
 - **ADR-0003's resume contract.** Rehydrate-from-history remains how a resumed
   thread recovers. This changes the *delivery* of the history ref, not the
   contract.
-- **ADR-0036's reader policy.** A minor version with a compatibility window,
-  and the skew surfaces at session start rather than at boot. Worth noting that
-  ACI skew already fails late today -- an 0.2.7 CLI against an 0.4.1 runner boots
+- **ADR-0036's reader policy.** Additive fields, so a runner that predates them
+  ignores them rather than refusing the frame. The dangerous direction is the
+  other one: a runner expecting session identity on the frame, paired with a
+  worker still injecting it as pod env, boots and then serves a turn with no
+  session identity at all. That is a silent wrong answer, so **roll the runner
+  first and the worker last**, and have the runner fall back to boot env whenever
+  the fields are absent for the whole compatibility window. Worth noting that ACI
+  skew already fails late today -- an 0.2.7 CLI against an 0.4.1 runner boots
   cleanly and fails on the first message.
 - **The runner token.** Minting it per claim is what makes it die with the
   claim. Delivering it over the ACI means the bind itself must be authenticated
@@ -263,9 +278,11 @@ What the recording does **not** show, and should not be read as showing:
 
 ## Open questions
 
-- **How is a bind authenticated** if the runner token no longer arrives as pod
-  env? This gates W4 and has no answer yet. It is now the only thing between the
-  measured 0.19s bind and a usable one.
+- ~~**How is a bind authenticated** if the runner token no longer arrives as pod
+  env?~~ **Answered:** the token stays pod env, minted per pool pod at creation,
+  and the worker resolves it from the bound pod through the Kubernetes API instead
+  of minting it. What remains is to confirm it end to end: read a bound pod's
+  token and drive a real turn on it.
 - **What does the cold path cost when it is not quota-blocked?** The with-env arm
   of the pre-bind test failed on `curie-sandbox-quota` rather than completing, so
   its wall clock is unmeasured; only its behaviour (create its own sandbox rather

@@ -155,12 +155,30 @@ already-bundle-loaded runner.
    sandboxes of the same version are interchangeable before a conversation
    claims one.
 
-2. **Session-scoped state arrives over the ACI.** `CURIE_SESSION_ID`,
-   `CURIE_HISTORY_REF`, and the per-claim runner token stop being pod env and
-   become an ACI request against a bound runner, alongside the existing
-   `/v1/event`, `/v1/steer`, `/v1/interrupt`, and `/v1/reset`. This is the
-   load-bearing half: while capability is decided by pod env, a pre-warmed pod
-   cannot be useful, and no amount of pool tuning changes that.
+2. **Session-scoped state arrives with the turn, not with the pod.**
+   `CURIE_SESSION_ID` and `CURIE_HISTORY_REF` stop being pod env and become
+   **optional fields on the ACI `Event` frame** the worker already posts to
+   `/v1/event`. This is the load-bearing half: while capability is decided by pod
+   env, a pre-warmed pod cannot be useful, and no amount of pool tuning changes
+   that.
+
+   Carrying them on the existing frame rather than adding a session-lifecycle
+   endpoint is deliberate. The frame already carries per-turn identity (`user`,
+   `ts`, `type`), so session identity belongs to the same shape; the change is
+   additive, which under [ADR-0036](0036-aci-semver-and-reader-policy.md)'s
+   reader policy means a runner that predates the fields ignores them and keeps
+   working, so there is no new surface to authenticate, route, or gate. An
+   earlier draft of this ADR proposed a `POST /v1/session` endpoint; it was
+   rejected during review for buying the same thing at a higher price.
+
+   **The runner token stays pod env, and the worker reads it instead of minting
+   it.** A pre-warmed pod cannot be handed a token that is minted when a
+   conversation claims it, so the pool mints one per pod at creation and the
+   worker resolves the bound pod's token through the Kubernetes API at bind time.
+   The worker already holds the RBAC to read those pods, and the token's exposure
+   is unchanged from today, where it is pod env as well. Per-pod rather than
+   per-pool matters: a shared pool token would let one compromised sandbox
+   authenticate as its siblings.
 
 3. **The warm pool is keyed by deployed version, not generic.** The platform
    already knows exactly which versions are in force -- `curie.deployments`
@@ -418,13 +436,17 @@ counts it, which decision 6 is what fixes.
   incidents is removed rather than mitigated, and `claimTimeoutSeconds` becomes
   a backstop instead of a live constraint.
 
-- **The ACI gains a session-lifecycle surface, and that is the expensive part of
-  this decision.** ADR-0005 freezes the ACI and
+- **The ACI gains two optional fields, which is the cheapest shape this change
+  has.** ADR-0005 freezes the ACI and
   [ADR-0036](0036-aci-semver-and-reader-policy.md) governs how it may change;
-  this is a minor version with a compatibility window, and the reader policy
-  means a worker and a runner will disagree across the boundary until both roll.
-  A version skew here surfaces at session start, not at boot, which is the same
-  late-failure shape that makes ACI skew hard to triage today.
+  this is a minor version, and because the fields are additive a runner that
+  predates them ignores them rather than refusing the frame. The skew that
+  remains is the opposite direction: a runner expecting session identity on the
+  frame, paired with a worker that still injects it as pod env, boots and then
+  serves a turn with no session identity at all. That is a silent wrong answer
+  rather than a loud failure, so the rollout order is worker-last, and the
+  runner must treat absent fields as "fall back to boot env" for the whole
+  compatibility window.
 
 - Pool count becomes a managed resource proportional to active deployments, and
   `git push` is the deploy, so a high-churn repository churns pools. This needs
