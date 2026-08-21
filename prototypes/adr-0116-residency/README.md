@@ -1,7 +1,7 @@
-# PT-0114: does pre-binding remove the claim deadline?
+# PT-0116: does pre-binding remove the claim deadline?
 
 Throwaway spike behind
-[ADR-0114](../../docs/adr/0114-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md).
+[ADR-0116](../../docs/adr/0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md).
 Not shipped code, not maintained, and it implements none of the ADR's decisions:
 it only measures whether the pre-bind path is reachable at all, and what it costs
 when the node is starved.
@@ -41,7 +41,7 @@ has been corrected for future runs; the ADR carries the measured mapping.
 |                       | quiet node | under contention |
 | --------------------- | ---------- | ---------------- |
 | today (cold create)   | 4.72s      | **never ready**  |
-| pre-bound (ADR-0114)  | **0.17s**  | 7.79s            |
+| pre-bound (ADR-0116)  | **0.17s**  | 7.79s            |
 
 Run 1 measured 4.66s / timed out / 0.14s / 7.86s. Arm B crossed 90s at 91.02s and
 was still not ready when the harness gave up at 110s.

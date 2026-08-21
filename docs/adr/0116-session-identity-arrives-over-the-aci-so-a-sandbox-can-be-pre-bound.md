@@ -1,4 +1,4 @@
-# 114. Session identity arrives over the ACI so a sandbox can be pre-bound
+# 116. Session identity arrives over the ACI so a sandbox can be pre-bound
 
 Date: 2026-08-20
 
@@ -368,7 +368,7 @@ dedicated cluster with a controlled neighbour rather than a hoped-for ClickHouse
 burst. The neighbour is a Deployment of busy-loop pods requesting `200m` each,
 which is what ClickHouse requests, against the runner and bundle containers'
 `50m`. Two full runs, and the harness and its recording are in
-[`prototypes/adr-0114-residency/`](../../prototypes/adr-0114-residency/):
+[`prototypes/adr-0116-residency/`](../../prototypes/adr-0116-residency/):
 
 |                      | quiet node | under contention |
 | -------------------- | ---------- | ---------------- |

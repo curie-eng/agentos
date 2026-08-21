@@ -1,7 +1,7 @@
 # Design pass: sandbox residency and pre-binding
 
 > Status: **Design / measurement pass** behind
-> [ADR-0114](../adr/0114-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)
+> [ADR-0116](../adr/0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md)
 > (Draft). This document carries the measurement method, the seams each decision
 > touches, and a staged plan. **No implementation is committed here, and a Draft
 > ADR does not authorize one** ([ADR-0085](../adr/0085-acceptance-not-implementation-authorizes-an-adr.md),
@@ -30,7 +30,7 @@ would absorb the boot is architecturally unreachable.
 
 ## What was measured, and how to re-measure it
 
-Every number in ADR-0114 came from the commands below. They are recorded here so
+Every number in ADR-0116 came from the commands below. They are recorded here so
 a reviewer can reproduce them rather than trust them. Nothing here is a fixture:
 the cluster figures are from a real `curie-0.7.0` release on minikube
 (12 CPU / 7.75 GiB), the process figures from cgroup v2 accounting inside a live
@@ -123,7 +123,7 @@ figure taken under `--fake-model` should be discarded.
 
 ## The four workstreams
 
-Decision 2 of ADR-0114 is the only one that is load-bearing on its own; the other
+Decision 2 of ADR-0116 is the only one that is load-bearing on its own; the other
 three are independently shippable and each stands up without the ADR being
 accepted. They are ordered by risk, not by value.
 
@@ -136,7 +136,7 @@ shapes, and the choice is a real one:
 
 - A DaemonSet-populated, digest-keyed, read-only host path the sandbox mounts.
   Cheap to build, but introduces a cross-tenant shared surface beneath
-  ADR-0008's per-tenant compute boundary -- which ADR-0114 explicitly declines to
+  ADR-0008's per-tenant compute boundary -- which ADR-0116 explicitly declines to
   decide, so this shape needs its own ADR.
 - A thin OCI layer per version, built at deploy time, letting the kubelet's
   existing image cache do the deduplication. No new trust surface, and it reuses
@@ -269,9 +269,9 @@ cache-cold and a scaffolded bundle already re-sends 20,875 input tokens per turn
 
 The claim that matters is not "faster". It is that **the deadline stops being
 reachable**. That is what the recording shows, in
-[`docs/demo/adr-0114-residency.gif`](../demo/adr-0114-residency.gif) (the raw
+[`docs/demo/adr-0116-residency.gif`](../demo/adr-0116-residency.gif) (the raw
 asciicast is beside it, and the harness is in
-[`prototypes/adr-0114-residency/`](../../prototypes/adr-0114-residency/)):
+[`prototypes/adr-0116-residency/`](../../prototypes/adr-0116-residency/)):
 
 |                      | quiet node | under contention |
 | -------------------- | ---------- | ---------------- |
@@ -331,7 +331,7 @@ What the recording does **not** show, and should not be read as showing:
   ever multiplex sessions in one Claude Code child? The measured 259.5 MiB child
   is per-session today; whether it must be is unmeasured, and it is the only
   path to a memory win larger than 1.25x.
-- **Does the node-local bundle cache need its own ADR?** ADR-0114 says it does
+- **Does the node-local bundle cache need its own ADR?** ADR-0116 says it does
   not decide the shared-surface question. W1's OCI-layer recommendation is
   chosen partly to avoid needing that decision at all.
 - ~~**gVisor overhead is unmeasured.**~~ **Measured.** On containerd with the

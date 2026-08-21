@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ADR-0114 demo: what a cold sandbox create costs, and what removes it."""
+"""ADR-0116 demo: what a cold sandbox create costs, and what removes it."""
 import json, os, subprocess, sys, time, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from probe import kc, apply, time_claim, burner, C, NS
@@ -26,7 +26,7 @@ def make_version_keyed_pool():
     raw = kc("get", "sandboxtemplate", "curie-runner", "-o", "json")
     t = json.loads(raw)
     t["metadata"] = {"name": VK_TEMPLATE, "namespace": NS,
-                     "labels": {"probe.curietech.ai/adr": "0114"}}
+                     "labels": {"probe.curietech.ai/adr": "0116"}}
     def setenv(c, k, v):
         for e in c.setdefault("env", []):
             if e.get("name") == k:
@@ -46,7 +46,7 @@ def make_version_keyed_pool():
     apply(t)
     apply({"apiVersion": "extensions.agents.x-k8s.io/v1beta1", "kind": "SandboxWarmPool",
            "metadata": {"name": VK_POOL, "namespace": NS,
-                        "labels": {"probe.curietech.ai/adr": "0114"}},
+                        "labels": {"probe.curietech.ai/adr": "0116"}},
            "spec": {"replicas": 2, "updateStrategy": {"type": "OnReplenish"},
                     "sandboxTemplateRef": {"name": VK_TEMPLATE}}})
     t0 = time.monotonic()
@@ -86,7 +86,7 @@ def contend(on, replicas=18):
         time.sleep(5)
 
 def main():
-    print(f"{C['b']}=== ADR-0114: sandbox residency and pre-binding ==={C['x']}")
+    print(f"{C['b']}=== ADR-0116: sandbox residency and pre-binding ==={C['x']}")
     print(f"{C['d']}A Curie turn costs 2-9% of one core; almost all of a turn is waiting on the model.")
     print(f"What costs real time is STARTING a conversation, and a hard 90s deadline sits on it.")
     print(f"This cluster: fake model, no observability stack, 6,961-byte bundle, gVisor off.{C['x']}")
@@ -115,7 +115,7 @@ def main():
     print(f"  {'':22}{'quiet node':>14}{'under contention':>20}")
     def f(v): return f"{v:.2f}s" if v else "timed out"
     print(f"  {'today (cold create)':22}{f(R.get('A')):>14}{f(R.get('B')):>20}")
-    print(f"  {'pre-bound (ADR-0114)':22}{f(R.get('C')):>14}{f(R.get('D')):>20}")
+    print(f"  {'pre-bound (ADR-0116)':22}{f(R.get('C')):>14}{f(R.get('D')):>20}")
     if R.get("A") and R.get("C"):
         print(f"\n  {C['g']}{R['A']/R['C']:.0f}x faster on a quiet node{C['x']}")
     if R.get("D"):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ADR-0114 measurement harness. Times the claim -> ready path for each arm."""
+"""ADR-0116 measurement harness. Times the claim -> ready path for each arm."""
 import json, os, subprocess, sys, time
 
 NS = "curie"
@@ -37,7 +37,7 @@ def apply(obj):
 def claim(name, pool, env=None):
     o = {"apiVersion": "extensions.agents.x-k8s.io/v1beta1", "kind": "SandboxClaim",
          "metadata": {"name": name, "namespace": NS,
-                      "labels": {"probe.curietech.ai/adr": "0114"}},
+                      "labels": {"probe.curietech.ai/adr": "0116"}},
          "spec": {"warmPoolRef": {"name": pool}}}
     if env:
         o["spec"]["env"] = env
@@ -93,7 +93,7 @@ def burner(replicas, cpu_request="200m"):
     Reproduces the incident's share ratio (200m vs the runner's 50m) under contention."""
     return {"apiVersion": "apps/v1", "kind": "Deployment",
             "metadata": {"name": "probe-burner", "namespace": NS,
-                         "labels": {"probe.curietech.ai/adr": "0114"}},
+                         "labels": {"probe.curietech.ai/adr": "0116"}},
             "spec": {"replicas": replicas,
                      "selector": {"matchLabels": {"app": "probe-burner"}},
                      "template": {"metadata": {"labels": {"app": "probe-burner"}},
