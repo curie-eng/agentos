@@ -367,22 +367,23 @@ async fn await_reply_observes_matching_live_updates_but_returns_only_the_final_e
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn local_message_renders_the_interim_update_before_the_terminal_reply() {
+async fn run_local_message_terminal(debug: bool) -> Option<String> {
     if support::valkey_url() != support::DEFAULT_VALKEY_URL {
-        eprintln!("skipping local message terminal test: the command uses compose Valkey defaults");
-        return;
+        eprintln!(
+            "skipping local_message_transport_narration_is_debug_only: the command uses compose Valkey defaults"
+        );
+        return None;
     }
-    let Some(mut conn) =
-        valkey_or_skip("local_message_renders_the_interim_update_before_the_terminal_reply").await
+    let Some(mut conn) = valkey_or_skip("local_message_transport_narration_is_debug_only").await
     else {
-        return;
+        return None;
     };
     let stream = unique_stream("curie:test:resume:");
     let workspace = tempfile::tempdir().expect("create isolated command directory");
     let capture_path = workspace.path().join("terminal.log");
+    let debug_flag = if debug { "--debug " } else { "" };
     let shell_command = format!(
-        "exec {} local message --color never --channel C-SIM-x --stream {} --timeout-secs 8 'show live progress'",
+        "exec {} {debug_flag}local message --color never --channel C-SIM-x --stream {} --timeout-secs 8 'show live progress'",
         bin(), stream
     );
     let mut child = Command::new("script")
@@ -505,6 +506,35 @@ async fn local_message_renders_the_interim_update_before_the_terminal_reply() {
         !capture.contains(wrong_text),
         "the terminal never renders another placeholder"
     );
+    Some(capture)
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn local_message_transport_narration_is_debug_only() {
+    let Some(default_capture) = run_local_message_terminal(false).await else {
+        return;
+    };
+    let debug_capture = run_local_message_terminal(true)
+        .await
+        .expect("the debug run uses the same reachable Valkey as the default run");
+
+    let transport_lines = [
+        "slack stub listening; the worker posts to",
+        "routing to channel C-SIM-x",
+        "enqueued EvSIM-",
+        "waiting up to 8s for the worker to finalize the turn...",
+    ];
+    for line in transport_lines {
+        assert!(
+            !default_capture.contains(line),
+            "default output must hide transport narration {line:?}: {default_capture}"
+        );
+        assert!(
+            debug_capture.contains(line),
+            "--debug output must include transport narration {line:?}: {debug_capture}"
+        );
+    }
 }
 
 /// Route-bound approval (#766): when the approval route is bound to a channel

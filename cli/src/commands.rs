@@ -527,6 +527,7 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
         crate::message::DEFAULT_USER,
         EventType::Message,
         Some(format!("http://localhost:{DEFAULT_PORT}")),
+        true,
     )
     .await;
     let teardown = stop(None, &dir).await;
@@ -2614,11 +2615,19 @@ pub async fn send(
     user: &str,
     event_type: EventType,
     url: Option<String>,
+    r#continue: bool,
 ) -> Result<bool> {
     let url = resolve_url(url)?;
     let client = RunnerClient::new(&url)?;
     let ui = crate::ui::ui();
     let mut printer = TurnPrinter::default();
+
+    if !r#continue {
+        client
+            .reset()
+            .await
+            .context("resetting the runner conversation before message")?;
+    }
 
     // Under `--json`, answer tokens are suppressed on stdout (they route through
     // `ui.answer`), so a streamed turn would exit 0 with empty stdout (#485).

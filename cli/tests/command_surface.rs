@@ -291,6 +291,51 @@ fn command_manifest_matches_committed_artifact() {
 }
 
 #[test]
+fn message_tiers_share_the_conversation_flag_and_default() {
+    let manifest = live_command_manifest();
+    let mut contracts = Vec::new();
+
+    for tier in ["skill", "local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .expect("manifest has top level subcommands")
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap_or_else(|| panic!("manifest has the {tier} tier"));
+        let message = tier_command["subcommands"]
+            .as_array()
+            .expect("tier has subcommands")
+            .iter()
+            .find(|command| command["name"] == "message")
+            .unwrap_or_else(|| panic!("{tier} has the message verb"));
+        let conversation = message["args"]
+            .as_array()
+            .expect("message has arguments")
+            .iter()
+            .find(|arg| arg["id"] == "continue")
+            .unwrap_or_else(|| panic!("{tier} message exposes --continue"));
+
+        contracts.push(serde_json::json!({
+            "id": conversation["id"],
+            "long": conversation["long"],
+            "positional": conversation["positional"],
+            "required": conversation["required"],
+            "possible_values": conversation["possible_values"],
+            "default_values": conversation["default_values"],
+        }));
+    }
+
+    assert!(
+        contracts.windows(2).all(|pair| pair[0] == pair[1]),
+        "skill, local, and cluster message must share conversation flag semantics: {contracts:?}"
+    );
+    assert!(
+        contracts[0]["default_values"].is_null(),
+        "message must start a fresh conversation unless --continue is present"
+    );
+}
+
+#[test]
 fn cluster_namespace_env_reaches_every_cluster_verb() {
     let manifest = live_command_manifest();
     let cluster = manifest["subcommands"]

@@ -514,6 +514,18 @@
               "long": "url",
               "positional": false,
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Reuse the runner's current conversation instead of starting fresh",
+              "id": "continue",
+              "long": "continue",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
             }
           ],
           "hidden": false,
@@ -4140,6 +4152,11 @@
           "about": "Assert every declared `emits` projection in `cli/api-mirrors.json` -- a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal -- covers that struct's fields (#699, one hop downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`). Offline, no credential",
           "hidden": false,
           "name": "emit-parity"
+        },
+        {
+          "about": "Assert sibling CLI verbs expose matching conversation controls across the skill, local, and cluster tiers (#1666, `bash cli/scripts/check-verb-parity.sh`). Offline, no credential",
+          "hidden": false,
+          "name": "verb-parity"
         },
         {
           "about": "Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/). Refuses when a schema changed shape without a version bump",
