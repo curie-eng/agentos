@@ -38,6 +38,7 @@ const KUBECONFIG_SECRET_KEY: &str = "K8S_READONLY_KUBECONFIG";
 const TEMPO_IMAGE_REPOSITORY: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo";
 const TEMPO_IMAGE_TAG: &str = "0.8.0";
 const TEMPO_TAGGED_IMAGE: &str = "ghcr.io/curie-eng/curie-sre-bot-tempo:0.8.0";
+const RUNTIME_PLUGIN_DESCRIPTION: &str = "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors. It omits the source bundle's gated write connector and approval policy; enable that path only through the documented explicit build and deploy flow.";
 const OCI_INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_INDEX_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 
@@ -1076,27 +1077,11 @@ impl EmbeddedWorkspace {
         }
         for (name, contents) in BUNDLE_FILES {
             if *name == "connectors.yaml" {
-                let source = std::str::from_utf8(contents)
-                    .context("embedded SRE bot connectors.yaml is not UTF-8")?;
-                let mut declaration: serde_json::Value = serde_norway::from_str(source)
-                    .context("parsing embedded SRE bot connectors.yaml")?;
-                let tempo = declaration
-                    .get_mut("connectors")
-                    .and_then(|connectors| connectors.get_mut("tempo"))
-                    .and_then(serde_json::Value::as_object_mut)
-                    .context("embedded SRE bot must declare connectors.tempo")?;
-                if tempo.remove("build").is_none() || tempo.contains_key("image") {
-                    bail!(
-                        "embedded SRE bot Tempo connector must declare one build source and no image before immutable resolution"
-                    );
-                }
-                tempo.insert(
-                    "image".to_string(),
-                    serde_json::Value::String(format!("{TEMPO_IMAGE_REPOSITORY}@{tempo_digest}")),
-                );
-                let pinned = serde_norway::to_string(&declaration)
-                    .context("serializing the immutable SRE bot connector declaration")?;
-                workspace.write(&Path::new("bundle").join(name), pinned.as_bytes())?;
+                let runtime = runtime_connector_declaration(contents, tempo_digest)?;
+                workspace.write(&Path::new("bundle").join(name), &runtime)?;
+            } else if *name == ".claude-plugin/plugin.json" {
+                let runtime = runtime_plugin_manifest(contents)?;
+                workspace.write(&Path::new("bundle").join(name), &runtime)?;
             } else {
                 workspace.write(&Path::new("bundle").join(name), contents)?;
             }
@@ -1120,6 +1105,60 @@ impl EmbeddedWorkspace {
     fn bundle_dir(&self) -> PathBuf {
         self.root.join("bundle")
     }
+}
+
+fn runtime_connector_declaration(source: &[u8], tempo_digest: &str) -> Result<Vec<u8>> {
+    let source =
+        std::str::from_utf8(source).context("embedded SRE bot connectors.yaml is not UTF-8")?;
+    let mut declaration: serde_json::Value =
+        serde_norway::from_str(source).context("parsing embedded SRE bot connectors.yaml")?;
+    let connectors = declaration
+        .get_mut("connectors")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("embedded SRE bot must declare connectors")?;
+    if connectors.remove("k8s-write").is_none() {
+        bail!("embedded SRE bot must declare connectors.k8s-write");
+    }
+    let tempo = connectors
+        .get_mut("tempo")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("embedded SRE bot must declare connectors.tempo")?;
+    if tempo.remove("build").is_none() || tempo.contains_key("image") {
+        bail!(
+            "embedded SRE bot Tempo connector must declare one build source and no image before immutable resolution"
+        );
+    }
+    tempo.insert(
+        "image".to_string(),
+        serde_json::Value::String(format!("{TEMPO_IMAGE_REPOSITORY}@{tempo_digest}")),
+    );
+    serde_norway::to_string(&declaration)
+        .map(String::into_bytes)
+        .context("serializing the immutable SRE bot connector declaration")
+}
+
+fn runtime_plugin_manifest(source: &[u8]) -> Result<Vec<u8>> {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
+    let expected_policy = serde_json::json!({
+        "gates": [{
+            "gate": "mcp__k8s-write__restart_deployment",
+            "route": "sre-approvals"
+        }]
+    });
+    if manifest.get("approvalPolicy") != Some(&expected_policy) {
+        bail!("embedded SRE bot must declare the exact k8s-write approval gate");
+    }
+    let manifest = manifest
+        .as_object_mut()
+        .context("embedded SRE bot plugin.json must be an object")?;
+    manifest.remove("approvalPolicy");
+    manifest.insert(
+        "description".to_string(),
+        serde_json::Value::String(RUNTIME_PLUGIN_DESCRIPTION.to_string()),
+    );
+    serde_json::to_vec_pretty(&manifest)
+        .context("serializing the read only SRE bot plugin manifest")
 }
 
 impl Drop for EmbeddedWorkspace {
@@ -1429,5 +1468,79 @@ mod tests {
         assert_eq!(parse_memory_quantity("1343488Ki").unwrap(), 1312 * MIB);
         assert_eq!(parse_memory_quantity("500M").unwrap(), 500_000_000);
         assert_eq!(parse_memory_quantity("1e6").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn runtime_connector_transform_requires_the_declared_write_connector() {
+        let source = b"connectors:\n  tempo:\n    build:\n      context: connectors/tempo\n      platforms: [linux/amd64]\n";
+        let error = runtime_connector_declaration(source, "sha256:fixture")
+            .expect_err("missing k8s-write must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("must declare connectors.k8s-write"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn runtime_plugin_transform_requires_the_exact_write_gate_policy() {
+        let exact_gate = serde_json::json!({
+            "gate": "mcp__k8s-write__restart_deployment",
+            "route": "sre-approvals"
+        });
+        let cases = [
+            (
+                "missing approval policy",
+                serde_json::json!({"name": "sre-bot", "description": "source"}),
+            ),
+            (
+                "renamed gate",
+                serde_json::json!({
+                    "name": "sre-bot",
+                    "description": "source",
+                    "approvalPolicy": {"gates": [{
+                        "gate": "mcp__k8s-write__rollout_restart",
+                        "route": "sre-approvals"
+                    }]}
+                }),
+            ),
+            (
+                "additional gate",
+                serde_json::json!({
+                    "name": "sre-bot",
+                    "description": "source",
+                    "approvalPolicy": {"gates": [
+                        exact_gate.clone(),
+                        {"gate": "mcp__other__write", "route": "sre-approvals"}
+                    ]}
+                }),
+            ),
+            (
+                "different route",
+                serde_json::json!({
+                    "name": "sre-bot",
+                    "description": "source",
+                    "approvalPolicy": {"gates": [{
+                        "gate": "mcp__k8s-write__restart_deployment",
+                        "route": "other-approvals"
+                    }]}
+                }),
+            ),
+        ];
+
+        for (case, manifest) in cases {
+            let source = serde_json::to_vec(&manifest).expect("serialize fixture manifest");
+            let error = match runtime_plugin_manifest(&source) {
+                Ok(_) => panic!("{case} must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("must declare the exact k8s-write approval gate"),
+                "unexpected error for {case}: {error:#}"
+            );
+        }
     }
 }

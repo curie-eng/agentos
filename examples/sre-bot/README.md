@@ -16,21 +16,20 @@ What you get back: a one-line verdict first ("Nothing looks broken." / "Yes --
 `api` is throwing 500s"), then the evidence, then a link so you can look
 yourself.
 
-**Out of the box it cannot change anything.** Every shipped tool is
-`readOnlyHint`. Kubernetes access uses a ServiceAccount that cannot read
-Secrets or delete anything, and Grafana access uses the Viewer role. There is no
-write tool, so there is nothing to gate, so no approval policy is declared at
-all.
+**Read-only operation remains the default.** The Kubernetes read connector is
+on. The one write connector and its exact approval gate ship declared together,
+so the tool cannot be enabled without its gate. Its separate
+`K8S_WRITE_KUBECONFIG` does not ship, so an untouched bring-up refuses cleanly
+before any connector starts instead of silently acquiring write access.
 
-**One write verb ships in the box, switched off.** Enabling it takes a few
-deliberate steps and gives the bot exactly one thing it can change: rolling a
-single named Deployment, behind a human approval card. See
+Completing the deliberate setup gives the bot exactly one thing it can change:
+rolling one allowlisted Deployment behind a human approval card. See
 [Level up: the gated write path](#level-up-the-gated-write-path).
 
 This is the repo's most complete example bundle. It is a real bot, generalised:
-a skill, four connectors (three on, one off), the RBAC to stand it up, a
-purpose-built write connector with its source and tests, deploy targets, and a
-falsifiable eval suite.
+a skill, four declared connectors (Kubernetes read, gated write, Grafana and
+Tempo), the RBAC to stand it up, connector source and tests, deploy targets, and
+a falsifiable eval suite.
 
 ---
 
@@ -87,8 +86,11 @@ On a clean Kubernetes cluster, run one command:
 curie example sre-bot install --observability
 ```
 
-This installs the bot and its self referential observability stack. It requires
-no values files, connector edits, or supplied credentials.
+This installs the bot and its self referential observability stack with no
+values files. The installer makes a read only runtime copy of the checked in
+bundle by removing the write connector and its matching approval gate together.
+The declared write path remains in the source bundle for the explicit Level up
+build and deploy flow below.
 
 ---
 
@@ -121,14 +123,24 @@ Every call pauses the turn and posts an approval card, **and the person who
 asked can never be the person who approves** -- the platform blocks
 self-approval.
 
+The connector source declaration and the exact
+`mcp__k8s-write__restart_deployment` gate already ship together. There is no
+connector block to uncomment and no gate snippet to add. The remaining work is
+to scope the identity and allowlist, store the separate credential, then build
+and deploy from the declaration.
+
 Read the four-layer table above before starting, and
 [`manifests/write-role.yaml`](manifests/write-role.yaml) before applying it.
 
-**1. Create the write identity.**
+**1. Scope and create the write identity.**
 
 Edit the namespace and the `resourceNames` list in
 [`manifests/write-role.yaml`](manifests/write-role.yaml) first -- one Deployment,
-not a list, unless someone has actually asked for the second one. Then:
+not a list, unless someone has actually asked for the second one. Replace
+`<namespace>/<deployment>` under `K8S_WRITE_ALLOWLIST` in
+[`connectors.yaml`](connectors.yaml) with the same pair. Stating the ceiling in
+two places is deliberate: a ceiling stated once is a ceiling that moves when
+someone edits the other place. Then:
 
 ```bash
 kubectl apply -f examples/sre-bot/manifests/write-role.yaml
@@ -169,83 +181,32 @@ kubectl auth can-i --as=system:serviceaccount:"$NS":sre-bot-writer \
   delete deployments -n "$NS"                                 # NO
 ```
 
-**The credential comes before the connector, and that order is load-bearing.** A
-declared connector secret with no stored value fails the deploy, so a bundle
-that enables `k8s-write` before `K8S_WRITE_KUBECONFIG` exists cannot deploy at
-all. That is why this step sits ahead of the uncomment rather than beside it.
+**The credential comes before bring-up, and that order is load-bearing.** The
+declared `secret_files` entry has no bundled value. Without a stored
+`K8S_WRITE_KUBECONFIG`, bring-up refuses cleanly before any connector starts.
+The writer can never fall back to the read-only connector's credential.
 
-**3. Turn the connector on.**
-
-Uncomment the `k8s-write:` block in [`connectors.yaml`](connectors.yaml) and set
-`K8S_WRITE_ALLOWLIST` to `<namespace>/<deployment>` -- the same pair you put in
-`resourceNames`. Stating the ceiling in two places is deliberate: a ceiling
-stated once is a ceiling that moves when someone edits the other place.
-
-There is no `image:` line to fill in. The block declares a `build:` -- the source
-directory and the platforms -- and step 4 resolves it to a digest.
-
-**4. Build the connector image.**
+**3. Build the connector image.**
 
 ```bash
-curie build --plugin-dir examples/sre-bot --registry <your-registry>
+curie build --plugin-dir examples/sre-bot --registry <registry-reference>
 ```
 
-One command, after the uncomment rather than before it: `curie build` builds
-what the file currently declares, so a still-commented connector is not built.
-It builds every declared `build:` connector on every platform its `platforms:`
-line names, pushes them, and writes the resolved digests to
-`connectors.lock.yaml` beside `connectors.yaml`. The deploy renders those
-digests and nothing else, so the "pin it, never `:latest`" rule is enforced by
-the artifact rather than by remembering.
+The declaration builds `connectors/k8s-write` for `linux/amd64` and
+`linux/arm64` and writes its resolved digest to `connectors.lock.yaml`. This one
+command replaces the old manual image build and push ceremony. The exact
+approval gate is already versioned in the plugin manifest. There is no image
+line, connector uncomment, or gate edit in the bring-up path.
 
-There is no public image on purpose: the allowlist and the credential are yours,
-and so is the artifact. Multi-arch is not a flag you pass either -- the
-`platforms:` line in [`connectors.yaml`](connectors.yaml) carries it, because a
-single-arch image passes CI and then fails to pull on a node of the other
-architecture with "no matching manifest", which reads as a registry problem.
-
-If your registry defaults new packages to private, flip this one to public or
-give the cluster a pull secret. An anonymous pull otherwise 403s and surfaces as
-`ImagePullBackOff`.
-
-`connectors.lock.yaml` is gitignored in this example. It records your registry
-and the digests your build resolved, so it belongs to an install; the deploy
-packs it from your working tree.
-
-**5. Declare the approval gate.**
-
-Add this to `.claude-plugin/plugin.json`. It is not shipped, because bundle
-validation rejects a gate naming an undeclared connector -- so a gate for a
-commented-out connector would fail the build for everyone who never enables it.
-The consequence is that the gate travels with step 3's uncomment, in the same
-change: enabling the connector without it deploys an ungated write verb.
-
-```json
-  "approvalPolicy": {
-    "gates": [
-      {
-        "gate": "mcp__k8s-write__restart_deployment",
-        "route": "sre-approvals"
-      }
-    ]
-  }
-```
-
-**THE TOOL NAME IS NOT WHAT THE ERROR MESSAGE TELLS YOU.** It is
-`mcp__k8s-write__restart_deployment`, NOT
-`mcp__plugin_sre-bot_k8s-write__restart_deployment`. Curie connectors are
-platform-supplied servers, named like `mcp__curie__request_approval` with no
-plugin infix; only bundle-loaded MCP servers take the `plugin_<bundle>_` form.
-The deploy error advises the prefixed form. Following it yields a gate that
-validates, deploys, and never fires.
-
-**6. Redeploy.**
+**4. Deploy the bundle.**
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
 ```
 
-**7. Bind the route, or the card has nowhere to post.**
+The deploy renders only the digest from `connectors.lock.yaml`.
+
+**5. Bind the route, or the card has nowhere to post.**
 
 ```bash
 curie cluster approvals sre-bot --route sre-approvals=C0EXAMPLE1
@@ -260,7 +221,7 @@ escalating rather than routing the card` and no card will appear.
 the whole map, so name every route you want on every invocation. Passing one
 route to add it silently drops the others.
 
-**8. Approve one.**
+**6. Request one restart, approve it as a second actor, and verify the rollout.**
 
 In Slack, someone other than the requester clicks the card. Self-approval is
 blocked by the platform, which in a one-person workspace is a dead end for a
@@ -291,6 +252,17 @@ curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> --ac
 `--as` must not name the requester. Raise `--timeout-secs` further if a human is
 doing the deciding rather than you in the next terminal.
 
+The resumed reply must verify with Kubernetes reads: new pods, their ages, and
+relevant events. A successful write response proves only that the patch was
+accepted. Independently wait for the rollout before calling the exercise done:
+
+```bash
+kubectl rollout status deployment/<deployment> -n "$NS"
+```
+
+Also request a restart for a different Deployment. The connector must reject it
+as outside `K8S_WRITE_ALLOWLIST`; no approval can widen that ceiling.
+
 ### Turning it off in a hurry
 
 **Kill the credential, not the pod.** The RoleBinding is the one thing Curie
@@ -305,9 +277,11 @@ still call it, but the API server refuses every patch with a 403 -- so the
 failure lands where you want it, at the credential, and the connector reports it
 honestly rather than pretending to have rolled something.
 
-Then remove it properly: comment the `k8s-write` block in
-[`connectors.yaml`](connectors.yaml) and redeploy. The connector disappears and
-so does the tool.
+Then remove it properly: remove the `k8s-write` declaration in
+[`connectors.yaml`](connectors.yaml) and its exact gate in
+`.claude-plugin/plugin.json` in the same change, then redeploy. The connector and
+tool disappear, while the bundle stays valid because no gate names an absent
+connector.
 
 ```bash
 curie cluster deploy --plugin-dir examples/sre-bot
@@ -486,13 +460,13 @@ in the environment section so the bot can say which one it hit.
 
 | Path | What it is |
 |---|---|
-| `.claude-plugin/plugin.json` | Identity, starter prompts. No `approvalPolicy`; see the optional write section |
+| `.claude-plugin/plugin.json` | Identity, starter prompts, and the exact write approval gate |
 | `skills/sre-bot/SKILL.md` | The persona and answering rules -- **the main thing to edit** |
-| `connectors.yaml` | What the bot needs running; Curie derives the Kubernetes |
+| `connectors.yaml` | Kubernetes read, gated write, Grafana and Tempo declarations |
 | `deploy.yaml` | Named deploy targets: which agent, which environment, which channel |
 | `evals/cases.json` | The falsifiable test suite / promotion gate |
 | `manifests/read-access.yaml` | The read-only ServiceAccount, ClusterRole and token |
-| `manifests/write-role.yaml` | The write identity, for the optional write path |
+| `manifests/write-role.yaml` | The write identity, for the gated write path |
 | `connectors/k8s-write/` | Source, Dockerfile and tests for the one-tool write connector |
 | `connectors/tempo/` | Source, Dockerfile and tests for the traces connector |
 

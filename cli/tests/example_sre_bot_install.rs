@@ -1219,6 +1219,25 @@ fn successful_install_uploads_only_the_resolved_tempo_index_digest() {
         declaration["connectors"]["tempo"].get("build").is_none(),
         "the uploaded runtime declaration must not ask the cluster deploy path to build Tempo"
     );
+    assert!(
+        declaration["connectors"].get("k8s-write").is_none(),
+        "the credential free installer must omit the gated write connector from its runtime bundle"
+    );
+
+    let plugin: Value = serde_json::from_slice(&uploaded_bundle_file(
+        &fixture,
+        ".claude-plugin/plugin.json",
+    ))
+    .expect("uploaded plugin manifest must remain valid JSON");
+    assert!(
+        plugin.get("approvalPolicy").is_none(),
+        "the runtime bundle must remove the write gate with its omitted connector"
+    );
+    assert_eq!(
+        plugin["description"],
+        "SRE triage assistant for plain English production health and Kubernetes questions in Slack. This installer deploys read only Kubernetes, Grafana, and Tempo connectors. It omits the source bundle's gated write connector and approval policy; enable that path only through the documented explicit build and deploy flow.",
+        "the runtime manifest must describe the installer bundle's read only surface"
+    );
 
     // GitHub documents anonymous public GHCR pulls, and the Distribution token
     // specification defines the service and repository pull scope exchange:

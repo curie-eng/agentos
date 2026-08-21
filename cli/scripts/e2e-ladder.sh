@@ -834,33 +834,12 @@ YAML
     done
 }
 
-# Turn the example's commented-out connectors on in ONE scratch copy, and give
-# the copy the approval gate that must travel with them.
-#
-# The gate is applied here rather than shipped as a second fixture file so it
-# cannot drift from the committed plugin.json it patches: bundle validation
-# rejects a gate naming an undeclared connector, so the two changes are one
-# change, and a fixture pair could be edited apart.
+# Copy the connector fixture into each scratch bundle. The shipped manifest
+# already carries the approval gate for the declared write connector.
 prepare_connector_bundle() {
     local dir="$1"
     cp "$CONNECTOR_FIXTURE" "$dir/connectors.yaml"
-    python3 -c '
-import json, sys
-path = sys.argv[1]
-with open(path) as fh:
-    manifest = json.load(fh)
-# The exact block examples/sre-bot/README.md documents at "Declare the approval
-# gate". The tool name carries no plugin infix, deliberately: a Curie connector
-# is a platform-supplied server, so the prefixed form the deploy error advises
-# validates, deploys and never fires.
-manifest["approvalPolicy"] = {
-    "gates": [{"gate": "mcp__k8s-write__restart_deployment", "route": "sre-approvals"}]
-}
-with open(path, "w") as fh:
-    json.dump(manifest, fh, indent=2)
-    fh.write("\n")
-' "$dir/.claude-plugin/plugin.json"
-    echo "connector fixture applied to $dir (connectors.yaml + the approvalPolicy gate that travels with it)"
+    echo "connector fixture applied to $dir (connectors.yaml)"
 }
 
 # One build before the first rung, so every rung consumes the same lock and the

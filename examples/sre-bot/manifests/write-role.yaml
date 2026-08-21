@@ -2,9 +2,9 @@
 #
 #     kubectl apply -f examples/sre-bot/manifests/write-role.yaml
 #
-# ONLY NEEDED IF YOU ENABLE THE WRITE PATH. The shipped bundle has the
-# `k8s-write` connector commented out, so applying this on its own grants a
-# credential nothing uses. Apply it as step 2 of README.md's
+# ONLY NEEDED FOR THE WRITE PATH. The shipped bundle declares the gated
+# `k8s-write` connector, but without `K8S_WRITE_KUBECONFIG` bring-up refuses
+# before any connector starts. Apply this as step 2 of README.md's
 # "Level up: the gated write path".
 #
 # EDIT TWO THINGS BEFORE APPLYING: the namespace (four occurrences) and the
