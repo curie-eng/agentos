@@ -87,6 +87,9 @@ Set `base=next` when your worktree targets `next`.
     sleep 3
   done
   curl -fsS http://localhost:23000/api/public/health >/dev/null
+git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
+  uv run python scripts/check-released-upgrade.py --self-test
+  uv run python scripts/check-released-upgrade.py
   (cd apps/api && uv run alembic upgrade head)
   git fetch --no-tags --depth=1 origin "$base" || true
   git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true

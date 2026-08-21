@@ -23,6 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
       # third-party dependency (a tool binary, an image, a registry session, a
@@ -111,6 +112,10 @@ jobs:
             sleep 3
           done
           echo "Langfuse did not become ready within 180s"; exit 1
+      - name: Released database upgrade gate
+        run: |
+          uv run python scripts/check-released-upgrade.py --self-test
+          uv run python scripts/check-released-upgrade.py
       # The apps/api suite provisions a throwaway migrated DB per run, but the
       # worker binding integration tests dial the shared default database and
       # assume the curie schema already exists (as it does on a dev box).
@@ -122,9 +127,9 @@ jobs:
       # The committed-lock test only proves the lock matches the current wire; it
       # passes even if the lock was regenerated without a version bump. Compare
       # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. The shallow checkout has no base ref, so fetch it depth=1; a missing
-      # or empty base lock (base predates the lock) skips cleanly (exit 0), and
-      # only a genuine unbumped wire change vs an existing base lock exits 1.
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
