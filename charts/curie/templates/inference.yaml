@@ -47,9 +47,19 @@ spec:
   template:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "inference") | nindent 8 }}
+      {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       volumes:
         - name: ollama-data
           {{- if .Values.inference.persistence.enabled }}
