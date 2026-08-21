@@ -322,6 +322,36 @@ per claim.
   behavioural difference is demonstrated, and a clean timing of that arm is
   outstanding.
 
+### The deadline arm, measured under controlled contention
+
+The claim that pre-binding removes the deadline from reach was tested on a second,
+dedicated cluster with a controlled neighbour rather than a hoped-for ClickHouse
+burst. The neighbour is a Deployment of busy-loop pods requesting `200m` each,
+which is what ClickHouse requests, against the runner and bundle containers'
+`50m`. Two full runs, and the harness and its recording are in
+[`prototypes/adr-0114-residency/`](../../prototypes/adr-0114-residency/):
+
+|                      | quiet node | under contention |
+| -------------------- | ---------- | ---------------- |
+| today (cold create)  | 4.72s      | **never ready**  |
+| pre-bound            | **0.17s**  | 7.79s            |
+
+Under contention today's path crossed `claimTimeoutSeconds` at 91.02s and was
+still not ready when the harness stopped at 110s. In production the worker gives
+up at 90s, and three of those escalate as an opaque `runner-error` -- the recorded
+incident, reproduced on demand rather than waited for.
+
+The pre-bound arm under the same contention took 7.79s. It degrades, and by a
+large factor, but 7.79s against a 90-second ceiling is the point: **the deadline
+stops being reachable.** That is the residency invariant holding under the exact
+condition that broke it twice.
+
+The cold baseline is cluster-shaped and this cluster is generous to it: fake
+model, no observability stack resident, a 6,961-byte bundle, gVisor off, so 4-5s
+is its floor against the 17.39s measured on the real-model install above. The
+column that carries the argument is the second one, where the shape of the
+failure does not depend on the baseline.
+
 ### A third, tighter density cap surfaced while testing
 
 The failed with-env claim reported:

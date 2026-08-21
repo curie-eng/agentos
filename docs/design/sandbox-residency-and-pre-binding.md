@@ -233,21 +233,33 @@ a values change, and it is safe **only** once a re-bind is sub-second -- before
 that it trades a compute saving for a token bill, because a resumed thread is
 cache-cold and a scaffolded bundle already re-sends 20,875 input tokens per turn.
 
-## What a demo has to show
+## The demo, recorded
 
 The claim that matters is not "faster". It is that **the deadline stops being
-reachable**. A convincing demonstration shows, side by side:
+reachable**. That is what the recording shows, in
+[`docs/demo/adr-0114-residency.gif`](../demo/adr-0114-residency.gif) (the raw
+asciicast is beside it, and the harness is in
+[`prototypes/adr-0114-residency/`](../../prototypes/adr-0114-residency/)):
 
-1. Today's claim-to-ready wall clock on a quiet node (~17s), then the same
-   measurement with a competing CPU load that reproduces the incident's 4:1
-   share, pushing it toward the 90-second ceiling.
-2. The same two runs after W1-W4, where the second is indistinguishable from the
-   first because a bind is not a boot.
-3. Pod count dropping to zero while a thread stays answerable, with the next
-   message answered in under a second.
+|                      | quiet node | under contention |
+| -------------------- | ---------- | ---------------- |
+| today (cold create)  | 4.72s      | **never ready**  |
+| pre-bound            | **0.17s**  | 7.79s            |
 
-The third is the one that reads as a product capability rather than an
-optimisation.
+Contention is a Deployment of busy-loop pods requesting `200m` each against the
+critical path's `50m`, which is the ratio the chart names as the amplifier. Under
+it, today's path crossed 90s at 91.02s and never became ready; the pre-bound path
+took 7.79s. Two full runs agreed.
+
+What the recording does **not** show, and should not be read as showing:
+
+- The ACI change. Arms C and D pass no env at all, which is why they bind. The
+  ADR's decision 2 is what would let a real conversation do the same.
+- A cold-path number under contention. Arm B is reported as never ready, because
+  the crossing is the result and the tail is not interesting.
+- Pod count dropping to zero while a thread stays answerable. That is the arm
+  that would read as a product capability rather than an optimisation, and it
+  needs decision 2 first.
 
 ## Open questions
 
