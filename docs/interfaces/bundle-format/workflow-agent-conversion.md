@@ -52,7 +52,7 @@ to overwrite anything that already exists:
 
 ```
 deal-desk/
-  .claude-plugin/plugin.json   # manifest: {name, description, version}
+  .claude-plugin/plugin.json   # manifest: {name, description, systemPrompt, version}
   skills/deal-desk/SKILL.md     # skill with YAML frontmatter
   .mcp.json                     # { "mcpServers": {} }
   evals/cases.json              # { name, cases: [{id, input, grader}] }
