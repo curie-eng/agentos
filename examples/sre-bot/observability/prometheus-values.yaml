@@ -1,0 +1,39 @@
+alertmanager:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+configmapReload:
+  prometheus:
+    enabled: false
+kube-state-metrics:
+  enabled: true
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+prometheus-node-exporter:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+server:
+  retention: 7d
+  retentionSize: 3GB
+  global:
+    scrape_interval: 60s
+    evaluation_interval: 60s
+  persistentVolume:
+    enabled: true
+    size: 8Gi
+    storageClass: local-path
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 1Gi

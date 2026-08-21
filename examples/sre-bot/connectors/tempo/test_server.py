@@ -40,7 +40,7 @@ def _load(**env):
         "GRAFANA_SERVICE_ACCOUNT_TOKEN": "glsa_test",
     }
     base.update(env)
-    for k in ("GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN", "TEMPO_DATASOURCE_UID"):
+    for k in ("GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN"):
         os.environ.pop(k, None)
     os.environ.update({k: v for k, v in base.items() if v is not None})
 
@@ -54,52 +54,88 @@ def _load(**env):
     return module
 
 
+def _with_one_tempo(monkeypatch, srv, proxy_get, uid="tempo-prod"):
+    """Route Grafana datasource discovery, then delegate the Tempo proxy call."""
+
+    def fake_get(url, *args, **kwargs):
+        if url == "https://grafana.example.com/api/datasources":
+            return httpx.Response(200, json=[{"name": "Tempo", "uid": uid}])
+        return proxy_get(url, *args, **kwargs)
+
+    monkeypatch.setattr(srv.httpx, "get", fake_get)
+
+
 # --------------------------------------------------------------------------- #
 # The URL. Getting this wrong yields 404s that look like "no traces".
 # --------------------------------------------------------------------------- #
-def test_requests_go_through_grafanas_datasource_proxy(monkeypatch):
+def test_discovers_tempo_then_returns_a_curie_span_through_grafanas_proxy(monkeypatch):
     srv = _load()
-    seen = {}
+    seen = []
+    payload = {
+        "batches": [
+            {
+                "resource": {"service.name": "curie-worker"},
+                "spans": [{"name": "curie.run", "traceId": "curie-trace"}],
+            }
+        ]
+    }
 
     def fake_get(url, params=None, headers=None, timeout=None):
-        seen["url"] = url
-        seen["params"] = params
-        seen["auth"] = headers.get("Authorization")
-        return httpx.Response(200, json={"traces": []})
+        seen.append((url, params, headers))
+        if url == "https://grafana.example.com/api/datasources":
+            return httpx.Response(
+                200,
+                json=[
+                    {"name": "Loki", "uid": "loki"},
+                    {"name": "Tempo", "uid": "tempo/prod arm64"},
+                ],
+            )
+        return httpx.Response(200, json=payload)
 
     monkeypatch.setattr(srv.httpx, "get", fake_get)
-    srv.search_traces("{duration > 500ms}")
-    assert seen["url"] == (
-        "https://grafana.example.com/api/datasources/proxy/uid/__Tempo__/api/search"
-    )
-    # The token goes to Grafana and nowhere else. It must never be a query
-    # parameter, where it would land in Grafana's access log.
-    assert seen["auth"] == "Bearer glsa_test"
-    assert "token" not in str(seen["params"]).lower()
+    assert srv.get_trace("curie/trace id") == payload
+    assert [call[0] for call in seen] == [
+        "https://grafana.example.com/api/datasources",
+        (
+            "https://grafana.example.com/api/datasources/proxy/uid/"
+            "tempo%2Fprod%20arm64/api/traces/curie%2Ftrace%20id"
+        ),
+    ]
+    assert all(headers["Authorization"] == "Bearer glsa_test" for _, _, headers in seen)
+    assert all("token" not in str(params).lower() for _, params, _ in seen)
 
 
-def test_datasource_uid_is_configurable(monkeypatch):
-    srv = _load(TEMPO_DATASOURCE_UID="tempo-prod")
-    seen = {}
+@pytest.mark.parametrize(
+    "datasources",
+    [
+        [],
+        [
+            {"name": "Tempo", "uid": "tempo-a"},
+            {"name": "Tempo", "uid": "tempo-b"},
+        ],
+    ],
+)
+def test_zero_or_duplicate_tempo_datasources_refuse_before_proxy(monkeypatch, datasources):
+    srv = _load()
+    seen = []
 
-    # NOT `seen.setdefault(...) or Response(...)`: setdefault returns the
-    # stored value, which is truthy, so `or` short-circuits and the fake
-    # returns a dict where a Response belongs.
-    def fake_get(url, **kw):
-        seen["url"] = url
-        return httpx.Response(200, json={})
+    def fake_get(url, **kwargs):
+        seen.append(url)
+        assert url == "https://grafana.example.com/api/datasources"
+        return httpx.Response(200, json=datasources)
 
     monkeypatch.setattr(srv.httpx, "get", fake_get)
-    srv.list_trace_tags()
-    assert "/uid/tempo-prod/" in seen["url"]
+    result = srv.list_trace_tags()
+    assert isinstance(result, str)
+    assert "exactly one" in result
+    assert "Tempo" in result
+    assert seen == ["https://grafana.example.com/api/datasources"]
 
 
 # --------------------------------------------------------------------------- #
 # Limits. An uncapped trace fetch is a context-window denial of service.
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "asked,expected", [(99, 50), (0, 1), (-5, 1), (10, 10), ("7", 7)]
-)
+@pytest.mark.parametrize("asked,expected", [(99, 50), (0, 1), (-5, 1), (10, 10), ("7", 7)])
 def test_limit_is_clamped(monkeypatch, asked, expected):
     srv = _load()
     seen = {}
@@ -108,7 +144,7 @@ def test_limit_is_clamped(monkeypatch, asked, expected):
         seen["p"] = params
         return httpx.Response(200, json={})
 
-    monkeypatch.setattr(srv.httpx, "get", fake_get)
+    _with_one_tempo(monkeypatch, srv, fake_get)
     srv.search_traces("{}", limit=asked)
     assert seen["p"]["limit"] == expected
 
@@ -122,14 +158,16 @@ def test_limit_is_clamped(monkeypatch, asked, expected):
     [
         (403, "refused"),
         (401, "refused"),
-        (404, "TEMPO_DATASOURCE_UID"),
+        (404, "Tempo"),
         (500, "500"),
     ],
 )
 def test_http_errors_become_readable_strings(monkeypatch, status, must_contain):
     srv = _load()
-    monkeypatch.setattr(
-        srv.httpx, "get", lambda *a, **kw: httpx.Response(status, text="boom")
+    _with_one_tempo(
+        monkeypatch,
+        srv,
+        lambda *a, **kw: httpx.Response(status, text="boom"),
     )
     out = srv.search_traces("{}")
     assert isinstance(out, str)
@@ -151,9 +189,9 @@ def test_oversized_body_is_refused_by_content_length(monkeypatch):
     # path must refuse without materialising the megabytes it is refusing.
     srv = _load()
     oversized = str(srv.MAX_RESPONSE_BYTES + 1)
-    monkeypatch.setattr(
-        srv.httpx,
-        "get",
+    _with_one_tempo(
+        monkeypatch,
+        srv,
         lambda *a, **kw: httpx.Response(
             200, json={"ok": True}, headers={"content-length": oversized}
         ),
@@ -174,7 +212,7 @@ def test_oversized_body_is_refused_when_content_length_is_absent(monkeypatch):
     big = {"spans": ["x" * 1000] * ((srv.MAX_RESPONSE_BYTES // 1000) + 20)}
     resp = httpx.Response(200, json=big)
     del resp.headers["content-length"]
-    monkeypatch.setattr(srv.httpx, "get", lambda *a, **kw: resp)
+    _with_one_tempo(monkeypatch, srv, lambda *a, **kw: resp)
     out = srv.get_trace("abc123")
     assert isinstance(out, str)
     assert "cap" in out
@@ -185,7 +223,7 @@ def test_a_normal_sized_trace_is_still_returned(monkeypatch):
     # the refusal would pass with the cap set to zero.
     srv = _load()
     payload = {"batches": [{"spans": [{"name": "GET /health"}]}]}
-    monkeypatch.setattr(srv.httpx, "get", lambda *a, **kw: httpx.Response(200, json=payload))
+    _with_one_tempo(monkeypatch, srv, lambda *a, **kw: httpx.Response(200, json=payload))
     assert srv.get_trace("abc123") == payload
 
 
@@ -194,9 +232,9 @@ def test_search_results_are_capped_too(monkeypatch):
     # covered -- a wide TraceQL search can also return more than the ceiling.
     srv = _load()
     oversized = str(srv.MAX_RESPONSE_BYTES + 1)
-    monkeypatch.setattr(
-        srv.httpx,
-        "get",
+    _with_one_tempo(
+        monkeypatch,
+        srv,
         lambda *a, **kw: httpx.Response(
             200, json={"traces": []}, headers={"content-length": oversized}
         ),
@@ -207,7 +245,7 @@ def test_search_results_are_capped_too(monkeypatch):
 def test_auth_failure_says_it_will_not_fix_itself(monkeypatch):
     # Without this the agent retries a 403 three times and reports a timeout.
     srv = _load()
-    monkeypatch.setattr(srv.httpx, "get", lambda *a, **kw: httpx.Response(403))
+    _with_one_tempo(monkeypatch, srv, lambda *a, **kw: httpx.Response(403))
     assert "not fix itself" in srv.search_traces("{}")
 
 
@@ -217,7 +255,7 @@ def test_timeout_is_not_an_exception(monkeypatch):
     def boom(*a, **kw):
         raise httpx.TimeoutException("too slow")
 
-    monkeypatch.setattr(srv.httpx, "get", boom)
+    _with_one_tempo(monkeypatch, srv, boom)
     out = srv.search_traces("{}")
     assert isinstance(out, str) and "did not respond" in out
 
@@ -228,7 +266,7 @@ def test_transport_error_does_not_leak_the_token(monkeypatch):
     def boom(*a, **kw):
         raise httpx.ConnectError("connection refused")
 
-    monkeypatch.setattr(srv.httpx, "get", boom)
+    _with_one_tempo(monkeypatch, srv, boom)
     out = srv.search_traces("{}")
     assert "glsa_test" not in out
 

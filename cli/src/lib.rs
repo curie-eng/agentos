@@ -19,6 +19,7 @@ pub mod docker;
 pub mod doctor;
 pub mod eval_init;
 pub mod evals;
+pub mod examples;
 pub mod exit;
 pub mod github_app;
 pub mod guide;

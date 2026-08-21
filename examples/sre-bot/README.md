@@ -17,10 +17,10 @@ What you get back: a one-line verdict first ("Nothing looks broken." / "Yes --
 yourself.
 
 **Out of the box it cannot change anything.** Every shipped tool is
-`readOnlyHint`, and the credential behind them is a ServiceAccount that cannot
-read Secrets and cannot delete anything. There is no write tool, so there is
-nothing to gate, so no approval policy is declared at all -- the safest
-configuration is the absence of configuration.
+`readOnlyHint`. Kubernetes access uses a ServiceAccount that cannot read
+Secrets or delete anything, and Grafana access uses the Viewer role. There is no
+write tool, so there is nothing to gate, so no approval policy is declared at
+all.
 
 **One write verb ships in the box, switched off.** Enabling it takes a few
 deliberate steps and gives the bot exactly one thing it can change: rolling a
@@ -28,7 +28,7 @@ single named Deployment, behind a human approval card. See
 [Level up: the gated write path](#level-up-the-gated-write-path).
 
 This is the repo's most complete example bundle. It is a real bot, generalised:
-a skill, four connectors (one on, three off), the RBAC to stand it up, a
+a skill, four connectors (three on, one off), the RBAC to stand it up, a
 purpose-built write connector with its source and tests, deploy targets, and a
 falsifiable eval suite.
 
@@ -81,100 +81,14 @@ code execution across it.
 
 ## Quick deploy
 
-Needs a Kubernetes cluster, `kubectl` pointed at it, and this repo checked out.
-The short version lives in
-[QUICKSTART.md](../../QUICKSTART.md#deploy-your-own-sre-bot); this is the same
-path with the reasoning attached.
-
-**1. Bring up the platform.**
+On a clean Kubernetes cluster, run one command:
 
 ```bash
-export CURIE_CREDENTIALS=sk-ant-...
-curie cluster up --allow-egress-host anthropic --set security.gvisor.mode=off
+curie example sre-bot install --observability
 ```
 
-`--allow-egress-host` opens the model call: the cluster sandbox is fail-closed by
-default, so a credential alone is not enough. Drop
-`--set security.gvisor.mode=off` on a cluster that has `runsc` installed.
-
-**This step is first because it creates the `curie` namespace**, and step 2
-installs a ServiceAccount and a token Secret into it. Run step 2 on a fresh
-cluster and the apply PARTIALLY fails in a way that reads like success: the
-cluster-scoped ClusterRole and ClusterRoleBinding are created and print
-`created`, the two namespaced objects are not, and `kubectl` exits 1.
-
-**2. Create the read-only identity.**
-
-```bash
-kubectl apply -f examples/sre-bot/manifests/read-access.yaml
-```
-
-Read that file before you apply it -- it explains why it enumerates permissions
-instead of binding the built-in `view` role, and why `configmaps` is in the list
-and `secrets` is not. Then prove it is genuinely read-only:
-
-```bash
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader list pods -A       # yes
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader get secrets -A     # NO
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader delete pods -A     # NO
-kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-reader create pods/exec -A  # NO
-```
-
-**Three `no`s are the passing result.** A `yes` on secrets means the binding
-picked up something broader -- fix the role, not the connector flags.
-
-**3. Assemble the kubeconfig and store it.**
-
-The connector authenticates from a kubeconfig FILE (`secret_files:` in
-`connectors.yaml`), not an env var, so it needs a complete config -- server URL,
-CA, token. Inside the cluster the API server is always reachable at
-`https://kubernetes.default.svc`:
-
-```bash
-kubectl -n curie get secret sre-bot-reader-token \
-  -o jsonpath='{.data.token}' | base64 -d > /tmp/sre-token
-CA=$(kubectl -n curie get secret sre-bot-reader-token -o jsonpath='{.data.ca\.crt}')
-
-cat > /tmp/sre-bot.kubeconfig <<YAML
-apiVersion: v1
-kind: Config
-clusters: [{name: prod, cluster: {server: https://kubernetes.default.svc, certificate-authority-data: $CA}}]
-users: [{name: sre-bot-reader, user: {token: $(cat /tmp/sre-token)}}]
-contexts: [{name: prod, context: {cluster: prod, user: sre-bot-reader}}]
-current-context: prod
-YAML
-
-export K8S_READONLY_KUBECONFIG="$(cat /tmp/sre-bot.kubeconfig)"
-curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG
-shred -u /tmp/sre-bot.kubeconfig /tmp/sre-token 2>/dev/null || rm -f /tmp/sre-bot.kubeconfig /tmp/sre-token
-```
-
-`curie secrets set` has no stdin form -- `--from-env` is how a multi-line value
-gets in. It writes to Curie's own storage on this machine; the value never
-enters this repository, and it does NOT yet exist in the cluster (step 4 puts it
-there).
-
-Reaching a DIFFERENT cluster from the one Curie runs on? Use that cluster's
-external API endpoint and its CA instead of `kubernetes.default.svc`, and check
-the sandbox egress allowlist can express the route before minting anything.
-
-**4. Deploy the bundle.**
-
-```bash
-curie cluster deploy --plugin-dir examples/sre-bot
-```
-
-This is the step that provisions the secret from step 3 into the namespace.
-Nothing else does -- not `curie secrets set`, and not a git-flow push. **The
-connector CrashLoops with `references non-existent secret key` if you skip it**,
-and the worker logs the reason plainly: `connector credentials are
-operator-supplied and not yet provisioned in this namespace`.
-
-**5. Ask it something.**
-
-```bash
-curie cluster message "Is any pod crashlooping right now?"
-```
+This installs the bot and its self referential observability stack. It requires
+no values files, connector edits, or supplied credentials.
 
 ---
 
@@ -188,7 +102,7 @@ export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
 curie cluster comms --slack
 
-curie cluster deploy --plugin-dir examples/sre-bot --slack-channel C0EXAMPLE1
+curie example sre-bot install --observability --slack-channel C0EXAMPLE1
 ```
 
 Then invite the bot to the channel and `@mention` it.
@@ -197,26 +111,6 @@ Then invite the bot to the channel and `@mention` it.
 binds nothing and the deploy still reports success -- the bot simply goes silent
 with nothing in any log to explain it. Right-click the channel in Slack -> View
 channel details -> the ID is at the bottom, starting with `C`.
-
-`deploy.yaml` is the better home for that ID once you have more than one
-environment. It declares named targets -- a dev agent in a dev channel, a prod
-agent in a prod channel -- so the routing is a reviewable diff rather than a flag
-somebody typed:
-
-```bash
-curie cluster deploy --plugin-dir examples/sre-bot --target prod
-curie cluster deploy --plugin-dir examples/sre-bot --all-targets
-```
-
-The bundle is IDENTICAL across targets; only the binding differs. That is what
-lets prod promote the exact artifact dev validated.
-
-**[`deploy.yaml`](deploy.yaml) is read only when you pass `--target` or
-`--all-targets`.** A plain `curie cluster deploy --plugin-dir examples/sre-bot`
-ignores it: the agent name comes from `plugin.json` and the binding is the CLI's
-own stub channel. So the documentation IDs shipped in that file are inert on the
-golden path, and you replace them at the point you start naming targets, not
-before.
 
 ---
 
@@ -446,42 +340,6 @@ you wanted.
 
 ---
 
-## Optional: Grafana and traces
-
-Both ship commented out in [`connectors.yaml`](connectors.yaml).
-
-**Grafana** adds logs, metrics, alerts, on-call schedules, profiles, and the
-ability to run the query behind a dashboard panel. It costs one credential: a
-service account with the **Viewer** role, which is the real read-only
-enforcement -- the `-disable-*` flags are defense in depth.
-
-```bash
-export GRAFANA_TOKEN=glsa_...
-curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN --from-env GRAFANA_TOKEN
-```
-
-Then uncomment the block and set `GRAFANA_URL`. **That is the one line to edit
-per install**, and it cannot be a placeholder: Curie substitutes exactly four
-`${CURIE_*}` names in connector `args`/`env`, all derived from the Service it
-creates, and rejects any other `${...}` at validation. None of them carries
-per-environment configuration, so a second environment must edit that line. A
-platform-side per-target override is the proper fix and does not exist yet.
-
-**Tempo** adds distributed traces. `mcp-grafana` has no tool that speaks Tempo,
-so without this connector the bot can see the datasource and never read a span.
-It needs the Grafana connector on (it reuses the same token, reaching an endpoint
-mcp-grafana has no tool for) and its own image, built from
-[`connectors/tempo/`](connectors/tempo/) by the same
-`curie build --plugin-dir examples/sre-bot --registry <your-registry>` that
-builds the write connector. Uncomment both blocks and run it once; there is
-nothing extra to run for this one.
-
-Three off-the-shelf routes were measured and rejected before this connector was
-written; [`connectors/tempo/server.py`](connectors/tempo/server.py) records what
-each one actually returned, including `run_panel_query` refusing tempo outright.
-
----
-
 ## Make it yours
 
 **`SKILL.md` is the brain.** Tone, what it checks first, its defaults, its hard
@@ -628,7 +486,7 @@ in the environment section so the bot can say which one it hit.
 
 | Path | What it is |
 |---|---|
-| `.claude-plugin/plugin.json` | Identity, starter prompts. No `approvalPolicy` -- see step 5 above |
+| `.claude-plugin/plugin.json` | Identity, starter prompts. No `approvalPolicy`; see the optional write section |
 | `skills/sre-bot/SKILL.md` | The persona and answering rules -- **the main thing to edit** |
 | `connectors.yaml` | What the bot needs running; Curie derives the Kubernetes |
 | `deploy.yaml` | Named deploy targets: which agent, which environment, which channel |

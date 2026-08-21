@@ -59,7 +59,8 @@ fn placeholder(id: &str) -> &'static str {
 
 /// Every LEAF verb path (e.g. `["cluster", "kill"]`) whose `args` include an arg
 /// with `"id": "dry_run"`, paired with the argv fragment of its required-arg
-/// placeholders (positional value, or `--<long>` + value for a required flag).
+/// placeholders. Required boolean switches contribute only `--<long>`; value
+/// options and positionals also contribute their placeholder value.
 fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
     let mut out = Vec::new();
     fn args_of(node: &serde_json::Value) -> &[serde_json::Value] {
@@ -112,7 +113,17 @@ fn dry_run_verbs() -> Vec<(Vec<String>, Vec<String>)> {
                             .and_then(|l| l.as_str())
                             .expect("required non-positional arg has a --long");
                         required.push(format!("--{long}"));
-                        required.push(placeholder(id).to_string());
+                        let boolean_switch = a
+                            .get("possible_values")
+                            .and_then(|values| values.as_array())
+                            .is_some_and(|values| {
+                                values.len() == 2
+                                    && values.iter().any(|value| value == "true")
+                                    && values.iter().any(|value| value == "false")
+                            });
+                        if !boolean_switch {
+                            required.push(placeholder(id).to_string());
+                        }
                     }
                 }
                 out.push((path, required));
