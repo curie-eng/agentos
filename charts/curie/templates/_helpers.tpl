@@ -240,6 +240,12 @@ true
 {{- end -}}
 
 {{- define "curie.otelCollector.config" -}}
+{{- $builtInExporters := dict "otlphttp/langfuse" true "debug" true -}}
+{{- range $exporter := .Values.otelCollector.extraPipelineExporters }}
+{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) }}
+{{- fail (printf "otelCollector.extraPipelineExporters references undefined exporter %q. Add it under otelCollector.extraExporters." $exporter) }}
+{{- end }}
+{{- end }}
 # Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
 # forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
 # silently unsupported), so the collector is the adapter. Langfuse appends
@@ -260,6 +266,9 @@ exporters:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
   debug:
     verbosity: normal
+{{- with .Values.otelCollector.extraExporters }}
+{{ toYaml . | nindent 2 }}
+{{- end }}
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -272,7 +281,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/langfuse, debug]
+      exporters: [otlphttp/langfuse, debug{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
 {{/* ---- Default-credential gate (issue #198) ----

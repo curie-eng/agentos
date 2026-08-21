@@ -493,6 +493,11 @@ otelCollector:
   # CreateContainerConfigError. Setting it to the published dev header trips
   # security.checkDefaultCredentials.
   otlpAuthHeader: ""
+  # Additional collector exporter definitions rendered verbatim under exporters.
+  extraExporters: {}
+  # Exporter names appended in order to the traces pipeline. Each name must
+  # identify an exporter configured above or in extraExporters.
+  extraPipelineExporters: []
   service:
     grpcPort: 4317
     httpPort: 4318

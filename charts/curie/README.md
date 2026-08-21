@@ -150,6 +150,27 @@ App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
 straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
 `:4318` (HTTP). The collector forwards to Langfuse over HTTP.
 
+Additional trace destinations are configured through
+`otelCollector.extraExporters`, a map of exporter names to collector exporter
+configuration, and `otelCollector.extraPipelineExporters`, an ordered list of
+those names. The map is rendered under `exporters` and the list is appended to
+the traces pipeline; built-in `otlphttp/langfuse` and `debug` exporters may
+also be named. Helm fails with the missing exporter name if a pipeline entry is
+undefined. For example, this adds a Tempo exporter:
+
+```yaml
+otelCollector:
+  extraExporters:
+    otlp/tempo:
+      endpoint: tempo:4317
+      tls:
+        insecure: true
+  extraPipelineExporters: [otlp/tempo]
+```
+
+Changes to either value roll the collector Deployment through its config
+checksum, so the configured pipeline is applied on `helm upgrade`.
+
 ## Components
 
 | Component | Image | Notes |
