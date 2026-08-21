@@ -29,8 +29,9 @@ fn agent_json(name: &str, repo: Option<&str>) -> Value {
     let mut agent = json!({
         "id": format!("agent-{name}"),
         "name": name,
-        "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
-        "created_at": "2026-08-23T00:00:00Z"
+        "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
+        "created_at": "2026-08-23T00:00:00Z",
+        "memory": false
     });
     if let Some(repo) = repo {
         agent["repo_full_name"] = json!(repo);
@@ -216,7 +217,7 @@ esac
 fn target_agent(name: &str, repo: Option<&str>, channel: &str) -> Value {
     let mut value = agent_json(name, repo);
     value["id"] = json!(format!("agent-{name}"));
-    value["channel"]["address"] = json!(channel);
+    value["channels"][0]["address"] = json!(channel);
     value
 }
 
