@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::process::Command;
+
 use curie::runner::RunnerClient;
 use curie_aci_protocol::{EventType, OutboundEvent, SessionStatus, PROTOCOL_VERSION};
 use support::{serve, Response};
@@ -25,6 +27,51 @@ fn happy_turn() -> Vec<String> {
             "type": "final", "version": PROTOCOL_VERSION, "text": "all done", "status": "done"
         })),
     ]
+}
+
+#[test]
+fn skill_message_resets_by_default_and_preserves_on_continue() {
+    for preserve in [false, true] {
+        let server = serve(|request| match request.path.as_str() {
+            "/v1/reset" => Response::json(200, "{}"),
+            "/v1/event" => Response::ndjson(&happy_turn()),
+            path => panic!("unexpected runner request: {path}"),
+        });
+        let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+        command.args([
+            "--json",
+            "skill",
+            "message",
+            "hi there",
+            "--url",
+            &server.base_url,
+        ]);
+        if preserve {
+            command.arg("--continue");
+        }
+
+        let output = command.output().expect("run curie skill message");
+        assert!(
+            output.status.success(),
+            "skill message failed with preserve={preserve}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let requests: Vec<_> = server
+            .recorded()
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect();
+        let expected = if preserve {
+            vec!["POST /v1/event"]
+        } else {
+            vec!["POST /v1/reset", "POST /v1/event"]
+        };
+        assert_eq!(
+            requests, expected,
+            "skill message must start fresh unless --continue is present"
+        );
+    }
 }
 
 #[tokio::test]

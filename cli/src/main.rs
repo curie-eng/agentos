@@ -559,6 +559,10 @@ enum DevAction {
     /// downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`).
     /// Offline, no credential.
     EmitParity,
+    /// Assert sibling CLI verbs expose matching conversation controls across
+    /// the skill, local, and cluster tiers (#1666,
+    /// `bash cli/scripts/check-verb-parity.sh`). Offline, no credential.
+    VerbParity,
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
@@ -783,6 +787,9 @@ enum SkillAction {
         /// Runner base URL (defaults to the started runner, then localhost).
         #[arg(long)]
         url: Option<String>,
+        /// Reuse the runner's current conversation instead of starting fresh.
+        #[arg(long = "continue")]
+        r#continue: bool,
     },
     /// Run the bundle's eval cases through the local runner.
     Eval {
@@ -2103,6 +2110,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             DevAction::EmitParity => {
                 commands::dev_script("cli/scripts/check-emit-parity.sh", &[]).await
             }
+            DevAction::VerbParity => {
+                commands::dev_script("cli/scripts/check-verb-parity.sh", &[]).await
+            }
             DevAction::SchemaBaseline => {
                 commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
             }
@@ -2217,9 +2227,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 user,
                 event_type,
                 url,
+                r#continue,
             } => {
                 let classified_failure =
-                    commands::send(&text, &user, event_type.into(), url).await?;
+                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
                 if classified_failure {
                     std::process::exit(1);
                 }
