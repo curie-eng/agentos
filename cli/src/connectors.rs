@@ -397,15 +397,21 @@ pub async fn discover_app_name(namespace: &str, release: &str) -> Result<String>
 /// Fails naming every gap at once rather than one per run. A connector that
 /// starts without its credential does not fail at apply -- it comes up and
 /// returns 401s to the agent, which reads as "the tool is broken".
-fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+fn resolve_secret_values(
+    keys: &[String],
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut values = std::collections::BTreeMap::new();
     let mut missing = Vec::new();
     for k in keys {
-        match std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(k)?)
-        {
+        let value = match overrides.get(k) {
+            Some(value) => (!value.is_empty()).then(|| value.clone()),
+            None => std::env::var(k)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .or(crate::secrets::get_value(k)?),
+        };
+        match value {
             Some(v) => {
                 values.insert(k.clone(), v);
             }
@@ -431,6 +437,7 @@ pub async fn sync(
     owned_secret_keys: &[String],
     namespace: &str,
     agent_name: &str,
+    secret_overrides: &std::collections::BTreeMap<String, String>,
 ) -> Result<ConnectorSync> {
     let ui = crate::ui::ui();
     let mut objects = Vec::new();
@@ -440,7 +447,7 @@ pub async fn sync(
             objects.push(render_secret(
                 &secret_name,
                 namespace,
-                &resolve_secret_values(&keys)?,
+                &resolve_secret_values(&keys, secret_overrides)?,
             ));
         }
     }
@@ -479,4 +486,45 @@ pub async fn sync(
         ));
     }
     Ok(sync)
+}
+
+/// Render and reconcile the connectors declared by one deployed version.
+///
+/// The API owns rendering and the CLI owns applying under the operator's
+/// kubectl identity. Callers must always state their locally owned secret
+/// overrides explicitly, including the normal deploy path's empty map.
+pub async fn sync_deployed_version(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    deployed: &crate::commands::DeployOutput,
+    secret_overrides: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let app_name = discover_app_name(namespace, release).await?;
+    let client = crate::api::ApiClient::new(api_url, api_key)?;
+    let rendered = client
+        .version_connectors(
+            &deployed.agent_id,
+            &deployed.version_id,
+            release,
+            namespace,
+            &app_name,
+        )
+        .await?;
+    let synced = sync(
+        &rendered.manifests,
+        &rendered.mcp_entries,
+        &rendered.owned_secret_name,
+        &rendered.owned_secret_keys,
+        namespace,
+        &deployed.agent_name,
+        secret_overrides,
+    )
+    .await?;
+    let ui = crate::ui::ui();
+    for (name, url) in &synced.urls {
+        ui.note(&format!("connector {name}: {url}"));
+    }
+    Ok(())
 }

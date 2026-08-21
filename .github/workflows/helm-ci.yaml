@@ -13,6 +13,7 @@ on:
     branches: [main, next]
     paths:
       - "charts/curie/**"
+      - "examples/sre-bot/observability/**"
       - ".github/workflows/helm-ci.yaml"
       # The object-store web-identity gate below EXECUTES these repository
       # files, so a change to one of them can break the gate without touching
@@ -139,6 +140,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
+
+      - name: helm render assertions (SRE bot observability stack)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/observability-stack-assertions.sh
 
       # Prove the collector's Langfuse credential and the Secret that carries it
       # stay the same decision (issue #1563): under `langfuse.existingSecret` the

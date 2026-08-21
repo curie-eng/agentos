@@ -62,11 +62,6 @@ log = logging.getLogger("tempo-mcp")
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "").rstrip("/")
 TOKEN = os.environ.get("GRAFANA_SERVICE_ACCOUNT_TOKEN", "")
-# `__Tempo__` is the uid a provisioned Tempo datasource commonly carries, and it
-# is stable once provisioned -- but it is an env var rather than a constant so a
-# second install does not need a code change. Find yours with the grafana
-# connector's `list_datasources` before assuming this default fits.
-DS_UID = os.environ.get("TEMPO_DATASOURCE_UID", "__Tempo__")
 TIMEOUT = float(os.environ.get("TEMPO_TIMEOUT_SECONDS", "30"))
 
 # Tempo will happily stream a very large trace. The sandbox pays for that in
@@ -121,12 +116,60 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
 
     if not GRAFANA_URL or not TOKEN:
         return "not configured: GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN must both be set"
-    url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(DS_UID)}{path}"
+    headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+    try:
+        discovery = httpx.get(
+            f"{GRAFANA_URL}/api/datasources",
+            headers=headers,
+            timeout=TIMEOUT,
+        )
+    except httpx.TimeoutException:
+        return f"Grafana did not respond within {TIMEOUT:g}s while finding Tempo."
+    except httpx.HTTPError as exc:
+        return f"could not reach Grafana while finding Tempo: {exc}"
+
+    if discovery.status_code in (401, 403):
+        return (
+            f"Grafana refused datasource discovery ({discovery.status_code}). The service "
+            "account token is missing or lacks datasource access. This will not fix itself "
+            "on retry."
+        )
+    if discovery.status_code >= 400:
+        return (
+            f"Grafana datasource discovery returned {discovery.status_code}: "
+            f"{discovery.text[:300]}"
+        )
+
+    try:
+        datasources = discovery.json()
+    except ValueError:
+        return f"Grafana datasource discovery returned non JSON: {discovery.text[:300]}"
+    matches = [
+        datasource
+        for datasource in datasources
+        if isinstance(datasource, dict) and datasource.get("name") == "Tempo"
+    ]
+    if len(matches) != 1:
+        return (
+            "expected exactly one Grafana datasource named Tempo, "
+            f"found {len(matches)}. Refusing to proxy the request."
+        )
+    datasource_uid = matches[0].get("uid")
+    if not isinstance(datasource_uid, str) or not datasource_uid:
+        return (
+            "the Grafana datasource named Tempo has no usable uid. "
+            "Refusing to proxy the request."
+        )
+
+    url = (
+        f"{GRAFANA_URL}/api/datasources/proxy/uid/"
+        f"{quote(datasource_uid, safe='')}{path}"
+    )
     try:
         r = httpx.get(
             url,
             params=params or {},
-            headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"},
+            headers=headers,
             timeout=TIMEOUT,
         )
     except httpx.TimeoutException:
@@ -141,10 +184,7 @@ def _proxy(path: str, params: dict[str, Any] | None = None) -> Any:
             "missing or lacks access to the Tempo datasource. This will not fix itself on retry."
         )
     if r.status_code == 404:
-        return (
-            f"no such Tempo endpoint or datasource uid {DS_UID!r} ({r.status_code}). "
-            "Check TEMPO_DATASOURCE_UID."
-        )
+        return f"Grafana could not proxy the Tempo request ({r.status_code})."
     if r.status_code >= 400:
         return f"Tempo returned {r.status_code}: {r.text[:300]}"
 
@@ -234,7 +274,7 @@ def get_trace(trace_id: str) -> Any:
     trace_id = trace_id.strip()
     if not trace_id:
         return "trace_id is required -- get one from search_traces"
-    return _proxy(f"/api/traces/{quote(trace_id)}")
+    return _proxy(f"/api/traces/{quote(trace_id, safe='')}")
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -258,7 +298,7 @@ def list_trace_tag_values(tag: str) -> Any:
     tag = tag.strip()
     if not tag:
         return "tag is required, e.g. resource.service.name"
-    return _proxy(f"/api/v2/search/tag/{quote(tag)}/values")
+    return _proxy(f"/api/v2/search/tag/{quote(tag, safe='')}/values")
 
 
 def main() -> int:
@@ -271,7 +311,7 @@ def main() -> int:
         # Kubernetes and is useless to the agent.
         log.error("refusing to start: missing %s", ", ".join(missing))
         return 1
-    log.info("tempo connector -> %s (datasource %s)", GRAFANA_URL, DS_UID)
+    log.info("tempo connector connected to %s", GRAFANA_URL)
     mcp.run(transport="streamable-http")
     return 0
 

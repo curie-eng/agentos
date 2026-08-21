@@ -17,14 +17,11 @@
 #                      approval route, and one `curie build` to turn the source
 #                      in `connectors/k8s-write/` into a pinned image. See
 #                      README.md, "Level up: the gated write path".
-#   grafana       OFF. Logs, metrics, alerts, profiles. Needs a Grafana and a
-#                      Viewer service-account token.
-#   tempo         OFF. Distributed traces. Needs Grafana, plus the same
-#                      `curie build` the write connector needs.
+#   grafana       ON. Logs, metrics, alerts and profiles from the bundled stack.
+#   tempo         ON. Distributed traces from the bundled stack.
 #
-# Turning one on is uncommenting its block and supplying its secret. Turning one
-# off is commenting it back out -- the connector disappears and so do its tools,
-# which is the fastest honest way to remove a capability.
+# The optional write connector remains commented out because it needs separate
+# credentials and an approval route.
 connectors:
   # Read-only Kubernetes: the questions metrics cannot answer. What the
   # scheduler actually said, what a crashed container logged, what a manifest
@@ -63,7 +60,7 @@ connectors:
     # v0.0.66 verified directly: carries --port/--bind-address/--read-only/
     # --disable-destructive/--disable-multi-cluster/--stateless/--kubeconfig,
     # and publishes both amd64 and arm64.
-    image: ghcr.io/containers/kubernetes-mcp-server:v0.0.66
+    image: ghcr.io/containers/kubernetes-mcp-server@sha256:6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423
     args:
       - --port
       - "8000"
@@ -209,125 +206,42 @@ connectors:
 #       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# GRAFANA -- SHIPS OFF. Uncomment if you have a Grafana.
-#
-# Adds logs (Loki), metrics (Prometheus), alerts, on-call schedules, profiles,
-# and the ability to run the query behind a dashboard panel. That is a large
-# capability jump and it costs exactly one credential: a service-account token
-# with the **Viewer** role.
-#
-# THE VIEWER ROLE IS THE REAL READ-ONLY ENFORCEMENT. The `-disable-*` flags
-# below are defense in depth: a write returns 403 server-side regardless. But
-# the agent is prompt-injectable, so write-shaped tools should never reach its
-# context at all -- it cannot be talked into calling a tool it cannot see.
-#
-# Store the token before deploying:
-#
-#     curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN
-#
-#   grafana:
-#     image: docker.io/grafana/mcp-grafana:1.0.0
-#     args:
-#       - -t
-#       - streamable-http
-#       - -address
-#       - 0.0.0.0:8000
-#       # Curie names the Service, so Curie supplies every name the sandbox may
-#       # dial. Hardcoding these was wrong the moment one bundle served both a
-#       # dev and a prod agent: the names are agent-scoped and differ per agent.
-#       - -allowed-hosts
-#       - ${CURIE_ALLOWED_HOSTS}
-#       # `-enabled-tools` REPLACES the default category list rather than
-#       # extending it, so the default list is repeated VERBATIM here and the
-#       # additions are appended. Naming only the categories you want silently
-#       # drops the rest -- that is how `suggest_loki_alloy_label_config`
-#       # vanished in a first attempt.
-#       #
-#       # `cloudwatch` is OFF in the upstream default list, so it has to be
-#       # named explicitly. Before enabling it, check what identity your
-#       # CloudWatch datasource authenticates as and confirm that identity is
-#       # strictly read-only: the Viewer role does NOT constrain what a
-#       # datasource query can do, because querying datasources is exactly what
-#       # Viewer is for.
-#       #
-#       # `runpanelquery` is the useful addition: it executes the query BEHIND a
-#       # dashboard panel, so "what does the API latency panel actually say
-#       # right now" stops requiring the agent to reconstruct a query it can
-#       # already see. `examples` returns Grafana's own sample queries. Both are
-#       # reads.
-#       - -enabled-tools
-#       - search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples
-#       # The load-bearing one: removes create/update/delete across every group
-#       # in a single flag.
-#       - -disable-write
-#       # grafana_api_request is a generic passthrough to ANY Grafana API
-#       # endpoint. It defeats per-group tool scoping by construction, so it
-#       # goes even though the token would still reject a mutation.
-#       - -disable-api
-#       - -disable-plugin
-#       - -disable-provisioning
-#       - -disable-snapshot
-#       - -disable-admin
-#       - -disable-incident
-#       - -disable-proxied
-#       - -disable-rendering
-#     unhosted_url: ${GRAFANA_MCP_URL}
-#     env:
-#       # ***** THE ONE LINE TO EDIT PER INSTALL. *****
-#       #
-#       # This cannot be a placeholder today. Curie substitutes exactly four
-#       # names in `args`/`env` -- ${CURIE_ALLOWED_HOSTS}, ${CURIE_CONNECTOR_HOST},
-#       # ${CURIE_CONNECTOR_PORT}, ${CURIE_CONNECTOR_URL} -- all derived from the
-#       # Service Curie itself creates, and any other ${...} is rejected at
-#       # validation as `connectors.unknown_placeholder`. None of them carries
-#       # per-environment configuration, and `deploy.yaml` targets bind an agent
-#       # and a channel, not connector env.
-#       #
-#       # So the identical-bundle promise ("only the binding differs") does not
-#       # hold for this value: a second environment must edit this line. Fixing
-#       # it properly needs a platform-side per-target override (ADR-0089
-#       # shape); until that exists, treat this as the one line to change.
-#       GRAFANA_URL: https://grafana.example.com
-#     # NAME only. The value is resolved at deploy time and written to a
-#     # per-agent Kubernetes Secret; it never appears in this repository.
-#     secrets:
-#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
-# ---------------------------------------------------------------------------
+  grafana:
+    image: docker.io/grafana/mcp-grafana@sha256:5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241
+    args:
+      - -t
+      - streamable-http
+      - -address
+      - 0.0.0.0:8000
+      - -allowed-hosts
+      - ${CURIE_ALLOWED_HOSTS}
+      - -enabled-tools
+      - search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning,cloudwatch,runpanelquery,examples
+      - -disable-write
+      - -disable-api
+      - -disable-plugin
+      - -disable-provisioning
+      - -disable-snapshot
+      - -disable-admin
+      - -disable-incident
+      - -disable-proxied
+      - -disable-rendering
+    unhosted_url: ${GRAFANA_MCP_URL}
+    env:
+      GRAFANA_URL: http://grafana.observability.svc.cluster.local
+    secrets:
+      - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+        from_secret: curie-grafana-connector
+        key: GRAFANA_SERVICE_ACCOUNT_TOKEN
 
-# ---------------------------------------------------------------------------
-# TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF, and needs `grafana` on as well.
-#
-# `mcp-grafana` has no tool that speaks Tempo, so without this the bot can see
-# the datasource in `list_datasources` and never read a span. Three off-the-shelf
-# routes were measured and rejected first -- `proxied`, Sift, and
-# `run_panel_query`, the last of which refuses tempo outright. See
-# connectors/tempo/server.py for what each one actually returned.
-#
-# It holds the SAME Grafana token as the grafana connector and talks to the same
-# Grafana, just to an endpoint mcp-grafana has no tool for: the datasource
-# proxy. So this adds a capability without adding a credential.
-#
-# NO PUBLIC IMAGE, and nothing to build by hand: the `build:` block below is
-# built by the same `curie build --plugin-dir examples/sre-bot --registry
-# <your-registry>` that builds the write connector. What that resolves to is a
-# digest, recorded in `connectors.lock.yaml` and rendered verbatim -- which is
-# the point, because a floating `:latest` already cost this connector a
-# CrashLoopBackOff once, when the flags verified at check time were not the
-# flags present at pull time. A digest cannot be repointed after review.
-#
-#   tempo:
-#     build:
-#       context: connectors/tempo
-#       platforms: [linux/amd64, linux/arm64]
-#     unhosted_url: ${TEMPO_MCP_URL}
-#     env:
-#       # Same install-specific line as the grafana block above, same reason.
-#       GRAFANA_URL: https://grafana.example.com
-#       # The Tempo datasource's uid. `__Tempo__` is the server's default and is
-#       # what a provisioned datasource commonly carries; confirm yours with the
-#       # grafana connector's `list_datasources` rather than assuming.
-#       TEMPO_DATASOURCE_UID: __Tempo__
-#     secrets:
-#       - GRAFANA_SERVICE_ACCOUNT_TOKEN
-# ---------------------------------------------------------------------------
+  tempo:
+    build:
+      context: connectors/tempo
+      platforms: [linux/amd64, linux/arm64]
+    unhosted_url: ${TEMPO_MCP_URL}
+    env:
+      GRAFANA_URL: http://grafana.observability.svc.cluster.local
+    secrets:
+      - name: GRAFANA_SERVICE_ACCOUNT_TOKEN
+        from_secret: curie-grafana-connector
+        key: GRAFANA_SERVICE_ACCOUNT_TOKEN

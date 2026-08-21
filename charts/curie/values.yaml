@@ -518,6 +518,48 @@ otelCollector:
     seccompProfile:
       type: RuntimeDefault
 
+# Grafana service account token bridge for the self observing SRE bot example.
+# The regular Secret stays in the Curie namespace. The updater runs beside
+# Grafana so it can mount the installer managed admin Secret, while its
+# Role can read and patch only the named connector Secret.
+grafanaConnector:
+  enabled: false
+  url: http://grafana.observability.svc.cluster.local
+  namespace: observability
+  adminSecretName: grafana-admin
+  adminUserKey: admin-user
+  adminPasswordKey: admin-password
+  serviceAccountName: curie-sre-bot
+  tokenName: curie-sre-bot
+  secretName: curie-grafana-connector
+  secretKey: GRAFANA_SERVICE_ACCOUNT_TOKEN
+  restartDeploymentNames: []
+  updater:
+    image: python:3.12-alpine@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31
+    readinessAttempts: 36
+    readinessIntervalSeconds: 5
+    activeDeadlineSeconds: 280
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { cpu: 100m, memory: 64Mi }
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      fsGroup: 65532
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65532
+      runAsGroup: 65532
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+      seccompProfile:
+        type: RuntimeDefault
+
 # ---------------------------------------------------------------------------
 # First-party app services (A4). The control plane the runner fleet serves:
 #   - api        FastAPI control-plane REST API (agents/versions/deployments,

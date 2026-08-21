@@ -19,6 +19,8 @@ import json
 import os
 from pathlib import Path
 
+import yaml
+
 EXAMPLES = Path(__file__).resolve().parents[1]
 
 # A string that ends in one of these is a reference to a script shipped inside
@@ -83,3 +85,48 @@ def test_example_mcp_server_script_args_are_cwd_independent() -> None:
     assert not violations, "cwd-dependent MCP server script args found:\n" + "\n".join(
         violations
     )
+
+
+def test_sre_bot_observability_connectors_ship_self_configured() -> None:
+    path = EXAMPLES / "sre-bot" / "connectors.yaml"
+    raw = path.read_text()
+    connectors = yaml.safe_load(raw)["connectors"]
+
+    kubernetes = connectors["kubernetes"]
+    grafana = connectors["grafana"]
+    tempo = connectors["tempo"]
+    expected_url = "http://grafana.observability.svc.cluster.local"
+    expected_token_ref = {
+        "name": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+        "from_secret": "curie-grafana-connector",
+        "key": "GRAFANA_SERVICE_ACCOUNT_TOKEN",
+    }
+
+    assert (
+        kubernetes["image"]
+        == "ghcr.io/containers/kubernetes-mcp-server@sha256:"
+        "6d650f4bd6ac303ad82713c997e73a2d001602f9bf17392c9b9a0e30e29c6423"
+    )
+    assert (
+        grafana["image"]
+        == "docker.io/grafana/mcp-grafana@sha256:"
+        "5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241"
+    )
+    assert tempo["build"] == {
+        "context": "connectors/tempo",
+        "platforms": ["linux/amd64", "linux/arm64"],
+    }
+    assert "image" not in tempo
+    assert grafana["env"]["GRAFANA_URL"] == expected_url
+    assert tempo["env"] == {"GRAFANA_URL": expected_url}
+    assert grafana["secrets"] == [expected_token_ref]
+    assert tempo["secrets"] == [expected_token_ref]
+    assert "build" not in kubernetes
+    assert "build" not in grafana
+
+    assert "__Tempo__" not in raw
+    assert "https://grafana.example.com" not in raw
+    assert "THE ONE LINE TO EDIT PER INSTALL" not in raw
+    assert "curie secrets set GRAFANA_SERVICE_ACCOUNT_TOKEN" not in raw
+    assert "GRAFANA -- SHIPS OFF" not in raw
+    assert "TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF" not in raw

@@ -76,7 +76,6 @@ connectors:
       platforms: [linux/amd64, linux/arm64]
     env:
       GRAFANA_URL: https://grafana.example.com
-      TEMPO_DATASOURCE_UID: __Tempo__
     secrets:
       # The server refuses to start without it. The ladder supplies a
       # rung-scoped placeholder: its tool call is an input-validation path that

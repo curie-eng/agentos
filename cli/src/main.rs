@@ -4,6 +4,7 @@
 //! platform API. Task I1; contracts are frozen in packages/aci-protocol and
 //! packages/plugin-format.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -101,47 +102,6 @@ struct ClusterAgentTarget {
     conn: ClusterConn,
     #[arg(long)]
     dry_run: bool,
-}
-
-/// Stand up the connectors this version declares, and prune what it dropped.
-///
-/// Split across the two components on purpose (ADR-0086): the API RENDERS the
-/// Kubernetes objects -- a pure function of the bundle, so it needs no cluster
-/// access and keeps its read-only RBAC on the service that receives internet
-/// webhooks -- and the CLI APPLIES them under the operator's own kubectl
-/// credentials, where cluster-write authority already lived.
-///
-/// A bundle with no `connectors.yaml` still reaches the prune: that is the case
-/// where a connector was REMOVED, and leaving it running with a credential
-/// mounted and nothing referencing it is the leak nobody notices.
-async fn sync_connectors(
-    api_url: &str,
-    api_key: &str,
-    namespace: &str,
-    release: &str,
-    agent_id: &str,
-    agent_name: &str,
-    version_id: &str,
-) -> anyhow::Result<()> {
-    let app_name = curie::connectors::discover_app_name(namespace, release).await?;
-    let client = curie::api::ApiClient::new(api_url, api_key)?;
-    let rendered = client
-        .version_connectors(agent_id, version_id, release, namespace, &app_name)
-        .await?;
-    let synced = curie::connectors::sync(
-        &rendered.manifests,
-        &rendered.mcp_entries,
-        &rendered.owned_secret_name,
-        &rendered.owned_secret_keys,
-        namespace,
-        agent_name,
-    )
-    .await?;
-    let ui = curie::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
-    Ok(())
 }
 
 /// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
@@ -260,6 +220,11 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Install a complete first party example workflow.
+    Example {
+        #[command(subcommand)]
+        action: ExampleAction,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -511,6 +476,31 @@ enum Command {
         /// Path to the installation file.
         #[arg(short = 'f', long = "file", default_value = "curie.yaml")]
         file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExampleAction {
+    /// Install the self referential SRE bot example.
+    SreBot {
+        #[command(subcommand)]
+        action: SreBotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SreBotAction {
+    /// Install Curie, its observability stack, and the SRE bot bundle.
+    Install {
+        /// Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack.
+        #[arg(long, required = true)]
+        observability: bool,
+        /// Print the ordered plan without mutating the cluster.
+        #[arg(long)]
+        dry_run: bool,
+        /// Bind the installed bot to this Slack channel.
+        #[arg(long, value_name = "CHANNEL")]
+        slack_channel: Option<String>,
     },
 }
 
@@ -2056,6 +2046,26 @@ async fn run(command: Option<Command>) -> Result<()> {
             from_spec,
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
+        Some(Command::Example {
+            action:
+                ExampleAction::SreBot {
+                    action:
+                        SreBotAction::Install {
+                            observability,
+                            dry_run,
+                            slack_channel,
+                        },
+                },
+        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+            observability,
+            dry_run,
+            slack_channel,
+        })
+        .await?
+        {
+            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+        },
         Some(Command::Build {
             tag,
             plugin_dir,
@@ -3254,14 +3264,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
                     // secret delivery #440 tracks.
-                    if let Err(err) = sync_connectors(
+                    if let Err(err) = curie::connectors::sync_deployed_version(
                         &api_url,
                         &api_key,
                         &namespace,
                         &release,
-                        &deployed.agent_id,
-                        &deployed.agent_name,
-                        &deployed.version_id,
+                        &deployed,
+                        &BTreeMap::new(),
                     )
                     .await
                     {

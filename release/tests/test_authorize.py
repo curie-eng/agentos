@@ -916,6 +916,66 @@ jobs:
 
 
 class TestReleaseWorkflowContract:
+    def test_sre_bot_tempo_connector_builds_in_ordinary_ci(self):
+        workflow = yaml.load(CI_YAML.read_text(), Loader=yaml.BaseLoader)
+        image_job = workflow["jobs"]["images"]
+        tempo_rows = [
+            row
+            for row in image_job["strategy"]["matrix"]["include"]
+            if row.get("name") == "sre-bot-tempo"
+        ]
+        assert tempo_rows == [
+            {
+                "name": "sre-bot-tempo",
+                "context": "examples/sre-bot/connectors/tempo",
+                "dockerfile": "examples/sre-bot/connectors/tempo/Dockerfile",
+            }
+        ]
+        build_step = next(
+            step for step in image_job["steps"] if step.get("name") == "Build (no push)"
+        )
+        assert build_step["with"]["context"] == "${{ matrix.context }}"
+        assert "Build sre-bot-tempo image (no push)" in authorize_module.REQUIRED_CHECK_NAMES
+
+    def test_observability_stack_assertions_run_in_helm_ci(self):
+        workflow = yaml.load(HELM_CI_YAML.read_text(), Loader=yaml.BaseLoader)
+        chart_steps = workflow["jobs"]["helm"]["steps"]
+        matching = [
+            step
+            for step in chart_steps
+            if "observability-stack-assertions.sh" in step.get("run", "")
+        ]
+        assert len(matching) == 1
+
+    def test_sre_bot_tempo_connector_is_a_first_party_release_image(self):
+        workflow = yaml.load(RELEASE_YAML.read_text(), Loader=yaml.BaseLoader)
+        build_matrix = workflow["jobs"]["build"]["strategy"]["matrix"]
+        merge_matrix = workflow["jobs"]["merge"]["strategy"]["matrix"]
+
+        assert "sre-bot-tempo" in build_matrix["name"]
+        assert "sre-bot-tempo" in merge_matrix["name"]
+        tempo_rows = [
+            row
+            for row in build_matrix["include"]
+            if row.get("name") == "sre-bot-tempo"
+        ]
+        assert tempo_rows == [
+            {
+                "name": "sre-bot-tempo",
+                "context": "examples/sre-bot/connectors/tempo",
+                "dockerfile": "examples/sre-bot/connectors/tempo/Dockerfile",
+            }
+        ]
+        build_step = next(
+            step
+            for step in workflow["jobs"]["build"]["steps"]
+            if step.get("name") == "Build and push by digest"
+        )
+        assert build_step["with"]["context"] == "${{ matrix.context }}"
+        tempo_context = REPO_ROOT / tempo_rows[0]["context"]
+        assert (tempo_context / "requirements.txt").is_file()
+        assert (tempo_context / "server.py").is_file()
+
     def test_release_branch_sources_are_anchored_and_wired_to_authorization(self):
         source = RELEASE_YAML.read_text()
         workflow = yaml.load(source, Loader=yaml.BaseLoader)
@@ -1047,6 +1107,7 @@ class TestHelmCiWorkflowTriggers:
         # credential fix) must still match this filter or the gate never runs.
         assert triggers["pull_request"]["paths"] == [
             "charts/curie/**",
+            "examples/sre-bot/observability/**",
             ".github/workflows/helm-ci.yaml",
             "packages/aci-protocol/src/aci_protocol/s3.py",
             "apps/api/src/curie_api/config.py",

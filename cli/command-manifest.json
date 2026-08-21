@@ -3849,6 +3849,59 @@
       ]
     },
     {
+      "about": "Install a complete first party example workflow",
+      "hidden": false,
+      "name": "example",
+      "subcommands": [
+        {
+          "about": "Install the self referential SRE bot example",
+          "hidden": false,
+          "name": "sre-bot",
+          "subcommands": [
+            {
+              "about": "Install Curie, its observability stack, and the SRE bot bundle",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack",
+                  "id": "observability",
+                  "long": "observability",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Print the ordered plan without mutating the cluster",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Bind the installed bot to this Slack channel",
+                  "id": "slack_channel",
+                  "long": "slack-channel",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "install"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "about": "List locally-authored agent bundles under `agents/` (source checkout only) -- a personal, gitignored directory (sibling of `examples/`) for in-progress agent projects ready to hand to `deploy-local`. Empty, not an error, when the directory doesn't exist",
       "hidden": false,
       "name": "list-agents"

@@ -1,0 +1,599 @@
+{{- if .Values.grafanaConnector.enabled }}
+{{- $secretName := required "grafanaConnector.secretName is required" .Values.grafanaConnector.secretName -}}
+{{- $secretKey := .Values.grafanaConnector.secretKey | default "GRAFANA_SERVICE_ACCOUNT_TOKEN" -}}
+{{- $grafanaNamespace := required "grafanaConnector.namespace is required" .Values.grafanaConnector.namespace -}}
+{{- $grafanaURL := required "grafanaConnector.url is required" .Values.grafanaConnector.url -}}
+{{- $restartDeploymentNames := .Values.grafanaConnector.restartDeploymentNames -}}
+{{- $hookName := printf "%s-grafana-token-updater" (include "curie.fullname" .) -}}
+{{- $cleanupName := printf "%s-grafana-token-cleanup" (include "curie.fullname" .) -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+type: Opaque
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $grafanaNamespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $secretName | quote }}]
+    verbs: ["get", "patch", "update"]
+{{- if $restartDeploymentNames }}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames:
+      {{- toYaml $restartDeploymentNames | nindent 6 }}
+    verbs: ["get", "patch"]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $hookName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $hookName }}
+    namespace: {{ $grafanaNamespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $hookName }}
+  namespace: {{ $grafanaNamespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.grafanaConnector.updater.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "grafana-token-updater") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $hookName }}
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
+      containers:
+        - name: grafana-token-updater
+          image: {{ .Values.grafanaConnector.updater.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.grafanaConnector.updater.containerSecurityContext | nindent 12 }}
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: GRAFANA_URL
+              value: {{ $grafanaURL | quote }}
+            - name: GRAFANA_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.grafanaConnector.serviceAccountName | quote }}
+            - name: GRAFANA_TOKEN_NAME
+              value: {{ .Values.grafanaConnector.tokenName | quote }}
+            - name: TOKEN_SECRET_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: TOKEN_SECRET_NAME
+              value: {{ $secretName | quote }}
+            - name: TOKEN_SECRET_KEY
+              value: {{ $secretKey | quote }}
+            - name: CONNECTOR_DEPLOYMENTS
+              value: {{ join "," $restartDeploymentNames | quote }}
+            - name: READINESS_ATTEMPTS
+              value: {{ .Values.grafanaConnector.updater.readinessAttempts | quote }}
+            - name: READINESS_INTERVAL_SECONDS
+              value: {{ .Values.grafanaConnector.updater.readinessIntervalSeconds | quote }}
+          command:
+            - python3
+            - -c
+            - |
+              import base64
+              import json
+              import os
+              import ssl
+              import time
+              import urllib.error
+              import urllib.parse
+              import urllib.request
+
+              grafana_url = os.environ["GRAFANA_URL"].rstrip("/")
+              account_name = os.environ["GRAFANA_SERVICE_ACCOUNT_NAME"]
+              token_name = os.environ["GRAFANA_TOKEN_NAME"]
+              secret_namespace = os.environ["TOKEN_SECRET_NAMESPACE"]
+              secret_name = os.environ["TOKEN_SECRET_NAME"]
+              secret_key = os.environ["TOKEN_SECRET_KEY"]
+              connector_deployments = [
+                  name
+                  for name in os.environ["CONNECTOR_DEPLOYMENTS"].split(",")
+                  if name
+              ]
+
+              def read_file(path):
+                  with open(path, encoding="utf-8") as handle:
+                      return handle.read().strip()
+
+              def grafana_request(
+                  path, method="GET", payload=None, bearer=None, basic=None, timeout=5
+              ):
+                  headers = {"Accept": "application/json"}
+                  if payload is not None:
+                      headers["Content-Type"] = "application/json"
+                  if bearer:
+                      headers["Authorization"] = "Bearer " + bearer
+                  elif basic:
+                      encoded = base64.b64encode((basic[0] + ":" + basic[1]).encode()).decode()
+                      headers["Authorization"] = "Basic " + encoded
+                  request = urllib.request.Request(
+                      grafana_url + path,
+                      data=None if payload is None else json.dumps(payload).encode(),
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return response.status, response.read()
+                  except urllib.error.HTTPError as error:
+                      return error.code, b""
+                  except urllib.error.URLError:
+                      return 0, b""
+
+              kube_host = os.environ["KUBERNETES_SERVICE_HOST"]
+              kube_port = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+              kube_base = "https://" + kube_host + ":" + kube_port
+              kube_token = read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
+              kube_context = ssl.create_default_context(
+                  cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+              )
+              encoded_namespace = urllib.parse.quote(secret_namespace, safe="")
+              encoded_secret = urllib.parse.quote(secret_name, safe="")
+              secret_path = f"/api/v1/namespaces/{encoded_namespace}/secrets/{encoded_secret}"
+
+              def kubernetes_request(path, method="GET", payload=None):
+                  headers = {
+                      "Accept": "application/json",
+                      "Authorization": "Bearer " + kube_token,
+                  }
+                  if payload is not None:
+                      headers["Content-Type"] = "application/merge-patch+json"
+                  request = urllib.request.Request(
+                      kube_base + path,
+                      data=None if payload is None else json.dumps(payload).encode(),
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(
+                          request, context=kube_context, timeout=5
+                      ) as response:
+                          return response.status, json.loads(response.read() or b"{}")
+                  except urllib.error.HTTPError as error:
+                      return error.code, {}
+
+              def patch_token_secret(new_token):
+                  status, _ = kubernetes_request(
+                      secret_path,
+                      method="PATCH",
+                      payload={
+                          "data": {
+                              secret_key: base64.b64encode(new_token.encode()).decode()
+                          }
+                      },
+                  )
+                  if status != 200:
+                      raise RuntimeError(
+                          f"Kubernetes Secret request returned HTTP {status}"
+                      )
+
+              def deployment_ready(deployment, generation, replicas):
+                  status = deployment.get("status", {})
+                  return (
+                      status.get("observedGeneration", 0) >= generation
+                      and status.get("updatedReplicas", 0) == replicas
+                      and status.get("readyReplicas", 0) == replicas
+                      and status.get("availableReplicas", 0) == replicas
+                      and status.get("unavailableReplicas", 0) == 0
+                  )
+
+              def restart_connector_deployments():
+                  pending = []
+                  rotation = str(time.time_ns())
+                  for deployment_name in connector_deployments:
+                      encoded_name = urllib.parse.quote(deployment_name, safe="")
+                      deployment_path = f"/apis/apps/v1/namespaces/{encoded_namespace}/deployments/{encoded_name}"
+                      status, current = kubernetes_request(deployment_path)
+                      if status == 404:
+                          continue
+                      if status != 200:
+                          raise RuntimeError(
+                              f"Kubernetes Deployment request returned HTTP {status}"
+                          )
+                      status, changed = kubernetes_request(
+                          deployment_path,
+                          method="PATCH",
+                          payload={
+                              "spec": {
+                                  "template": {
+                                      "metadata": {
+                                          "annotations": {
+                                              "curie.dev/grafana-token-rotation": rotation
+                                          }
+                                      }
+                                  }
+                              }
+                          },
+                      )
+                      if status != 200:
+                          raise RuntimeError(
+                              f"Kubernetes Deployment restart returned HTTP {status}"
+                          )
+                      generation = changed.get("metadata", {}).get("generation")
+                      replicas = changed.get("spec", {}).get("replicas", 1)
+                      if not isinstance(generation, int) or not isinstance(replicas, int):
+                          raise RuntimeError("Kubernetes Deployment restart response was incomplete")
+                      pending.append((deployment_name, deployment_path, generation, replicas))
+
+                  for deployment_name, deployment_path, generation, replicas in pending:
+                      for attempt in range(1, attempts + 1):
+                          status, deployment = kubernetes_request(deployment_path)
+                          if status == 200 and deployment_ready(
+                              deployment, generation, replicas
+                          ):
+                              break
+                          if status not in (200,):
+                              raise RuntimeError(
+                                  f"Kubernetes Deployment rollout request returned HTTP {status}"
+                              )
+                          if attempt == attempts:
+                              raise RuntimeError(
+                                  f"Connector Deployment {deployment_name} did not complete token rotation"
+                              )
+                          time.sleep(interval)
+
+              attempts = int(os.environ["READINESS_ATTEMPTS"])
+              interval = int(os.environ["READINESS_INTERVAL_SECONDS"])
+              for attempt in range(1, attempts + 1):
+                  status, _ = grafana_request("/api/health", timeout=2)
+                  if status == 200:
+                      break
+                  if attempt == attempts:
+                      raise RuntimeError(
+                          f"Grafana was not ready after {attempts} attempts"
+                      )
+                  time.sleep(interval)
+
+              secret_status, _ = kubernetes_request(secret_path)
+              if secret_status != 200:
+                  raise RuntimeError(
+                      f"Kubernetes Secret request returned HTTP {secret_status}"
+                  )
+
+              admin_user = read_file("/var/run/grafana-admin/user")
+              admin_password = read_file("/var/run/grafana-admin/password")
+              admin = (admin_user, admin_password)
+              query = urllib.parse.quote(account_name, safe="")
+              status, body = grafana_request(
+                  "/api/serviceaccounts/search?perpage=100&page=1&query=" + query,
+                  basic=admin,
+              )
+              if status != 200:
+                  raise RuntimeError(
+                      f"Grafana service account search returned HTTP {status}"
+                  )
+              accounts = [
+                  item
+                  for item in json.loads(body).get("serviceAccounts", [])
+                  if item.get("name") == account_name
+              ]
+              if len(accounts) > 1:
+                  raise RuntimeError(
+                      "Grafana returned duplicate service accounts for the configured name"
+                  )
+              if accounts:
+                  account = accounts[0]
+                  account_id = account["id"]
+                  if account.get("role") != "Viewer":
+                      status, _ = grafana_request(
+                          f"/api/serviceaccounts/{account_id}",
+                          method="PATCH",
+                          payload={"role": "Viewer"},
+                          basic=admin,
+                      )
+                      if status != 200:
+                          raise RuntimeError(
+                              f"Grafana service account Viewer restoration returned HTTP {status}"
+                          )
+              else:
+                  status, body = grafana_request(
+                      "/api/serviceaccounts",
+                      method="POST",
+                      payload={"name": account_name, "role": "Viewer"},
+                      basic=admin,
+                  )
+                  if status not in (200, 201):
+                      raise RuntimeError(
+                          f"Grafana service account creation returned HTTP {status}"
+                      )
+                  account_id = json.loads(body)["id"]
+
+              # API contract:
+              # https://grafana.com/docs/grafana/latest/developer-resources/api-reference/http-api/api-legacy/serviceaccount/
+              tokens_path = f"/api/serviceaccounts/{account_id}/tokens"
+              status, body = grafana_request(tokens_path, basic=admin)
+              if status != 200:
+                  raise RuntimeError(
+                      f"Grafana service account token listing returned HTTP {status}"
+                  )
+              token_records = json.loads(body)
+              if not isinstance(token_records, list):
+                  raise RuntimeError("Grafana service account token listing was not a list")
+              token_prefix = token_name + "-"
+
+              def delete_token(token_id):
+                  status, _ = grafana_request(
+                      f"{tokens_path}/{token_id}", method="DELETE", basic=admin
+                  )
+                  if status not in (200, 404):
+                      raise RuntimeError(
+                          f"Grafana service account token deletion returned HTTP {status}"
+                      )
+
+              status, body = grafana_request(
+                  tokens_path,
+                  method="POST",
+                  payload={"name": token_prefix + str(int(time.time()))},
+                  basic=admin,
+              )
+              if status not in (200, 201):
+                  raise RuntimeError(
+                      f"Grafana token creation returned HTTP {status}"
+                  )
+              created_token = json.loads(body)
+              new_token = created_token.get("key", "")
+              new_token_id = created_token.get("id")
+              if not new_token:
+                  if new_token_id is not None:
+                      delete_token(new_token_id)
+                  raise RuntimeError("Grafana token creation returned no key")
+              if new_token_id is None:
+                  raise RuntimeError("Grafana token creation returned no id")
+              try:
+                  patch_token_secret(new_token)
+              except Exception:
+                  delete_token(new_token_id)
+                  raise
+              restart_connector_deployments()
+              for token_record in token_records:
+                  if not str(token_record.get("name", "")).startswith(token_prefix):
+                      continue
+                  stale_token_id = token_record.get("id")
+                  if stale_token_id is None:
+                      raise RuntimeError("Grafana service account token had no id")
+                  if stale_token_id != new_token_id:
+                      delete_token(stale_token_id)
+              print("Grafana connector token was rotated and stored")
+          resources:
+            {{- toYaml .Values.grafanaConnector.updater.resources | nindent 12 }}
+          volumeMounts:
+            - name: grafana-admin
+              mountPath: /var/run/grafana-admin
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: grafana-admin
+          secret:
+            secretName: {{ .Values.grafanaConnector.adminSecretName }}
+            items:
+              - key: {{ .Values.grafanaConnector.adminUserKey }}
+                path: user
+              - key: {{ .Values.grafanaConnector.adminPasswordKey }}
+                path: password
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $cleanupName }}
+  namespace: {{ $grafanaNamespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-delete
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.grafanaConnector.updater.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "curie.labels" . | nindent 8 }}
+        {{- include "curie.selectorLabels" (dict "root" . "component" "grafana-token-cleanup") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.grafanaConnector.updater.podSecurityContext | nindent 8 }}
+      containers:
+        - name: grafana-token-cleanup
+          image: {{ .Values.grafanaConnector.updater.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.grafanaConnector.updater.containerSecurityContext | nindent 12 }}
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: GRAFANA_URL
+              value: {{ $grafanaURL | quote }}
+            - name: GRAFANA_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.grafanaConnector.serviceAccountName | quote }}
+            - name: GRAFANA_TOKEN_NAME
+              value: {{ .Values.grafanaConnector.tokenName | quote }}
+            - name: READINESS_ATTEMPTS
+              value: {{ .Values.grafanaConnector.updater.readinessAttempts | quote }}
+            - name: READINESS_INTERVAL_SECONDS
+              value: {{ .Values.grafanaConnector.updater.readinessIntervalSeconds | quote }}
+          command:
+            - python3
+            - -c
+            - |
+              import base64
+              import json
+              import os
+              import time
+              import urllib.error
+              import urllib.parse
+              import urllib.request
+
+              grafana_url = os.environ["GRAFANA_URL"].rstrip("/")
+              account_name = os.environ["GRAFANA_SERVICE_ACCOUNT_NAME"]
+              token_prefix = os.environ["GRAFANA_TOKEN_NAME"] + "-"
+
+              def read_file(path):
+                  with open(path, encoding="utf-8") as handle:
+                      return handle.read().strip()
+
+              admin = (
+                  read_file("/var/run/grafana-admin/user"),
+                  read_file("/var/run/grafana-admin/password"),
+              )
+
+              def grafana_request(path, method="GET", basic=None, timeout=5):
+                  headers = {"Accept": "application/json"}
+                  if basic:
+                      encoded = base64.b64encode((basic[0] + ":" + basic[1]).encode()).decode()
+                      headers["Authorization"] = "Basic " + encoded
+                  request = urllib.request.Request(
+                      grafana_url + path,
+                      headers=headers,
+                      method=method,
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return response.status, response.read()
+                  except urllib.error.HTTPError as error:
+                      return error.code, b""
+                  except urllib.error.URLError:
+                      return 0, b""
+
+              attempts = int(os.environ["READINESS_ATTEMPTS"])
+              interval = int(os.environ["READINESS_INTERVAL_SECONDS"])
+              for attempt in range(1, attempts + 1):
+                  status, _ = grafana_request("/api/health", timeout=2)
+                  if status == 200:
+                      break
+                  if attempt == attempts:
+                      raise RuntimeError(
+                          f"Grafana was not ready for token cleanup after {attempts} attempts"
+                      )
+                  time.sleep(interval)
+
+              query = urllib.parse.quote(account_name, safe="")
+              status, body = grafana_request(
+                  "/api/serviceaccounts/search?perpage=100&page=1&query=" + query,
+                  basic=admin,
+              )
+              if status != 200:
+                  raise RuntimeError(
+                      f"Grafana service account search returned HTTP {status}"
+                  )
+              accounts = [
+                  item
+                  for item in json.loads(body).get("serviceAccounts", [])
+                  if item.get("name") == account_name
+              ]
+              if len(accounts) > 1:
+                  raise RuntimeError(
+                      "Grafana returned duplicate service accounts for the configured name"
+                  )
+              if not accounts:
+                  print("Grafana connector service account does not exist; no tokens to revoke")
+                  raise SystemExit(0)
+
+              account_id = accounts[0]["id"]
+              tokens_path = f"/api/serviceaccounts/{account_id}/tokens"
+              status, body = grafana_request(tokens_path, basic=admin)
+              if status != 200:
+                  raise RuntimeError(
+                      f"Grafana service account token listing returned HTTP {status}"
+                  )
+              token_records = json.loads(body)
+              if not isinstance(token_records, list):
+                  raise RuntimeError("Grafana service account token listing was not a list")
+
+              revoked = 0
+              for token_record in token_records:
+                  if not str(token_record.get("name", "")).startswith(token_prefix):
+                      continue
+                  token_id = token_record.get("id")
+                  if token_id is None:
+                      raise RuntimeError("Grafana service account token had no id")
+                  status, _ = grafana_request(
+                      f"{tokens_path}/{token_id}", method="DELETE", basic=admin
+                  )
+                  if status not in (200, 404):
+                      raise RuntimeError(
+                          f"Grafana service account token deletion returned HTTP {status}"
+                      )
+                  revoked += 1
+              print(f"Grafana connector token cleanup revoked {revoked} managed token(s)")
+          resources:
+            {{- toYaml .Values.grafanaConnector.updater.resources | nindent 12 }}
+          volumeMounts:
+            - name: grafana-admin
+              mountPath: /var/run/grafana-admin
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: grafana-admin
+          secret:
+            secretName: {{ .Values.grafanaConnector.adminSecretName }}
+            items:
+              - key: {{ .Values.grafanaConnector.adminUserKey }}
+                path: user
+              - key: {{ .Values.grafanaConnector.adminPasswordKey }}
+                path: password
+        - name: tmp
+          emptyDir: {}
+{{- end }}
