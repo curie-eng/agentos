@@ -98,6 +98,10 @@ fn scaffolds_the_full_bundle_from_a_valid_spec() {
         manifest["description"],
         "Prices and reviews deal desk requests."
     );
+    assert_eq!(
+        manifest["systemPrompt"],
+        "You are the deal-desk agent. Help users with deal-desk requests."
+    );
 
     // 5. .gitignore ignores local workstation state.
     let gitignore = std::fs::read_to_string(out.join(".gitignore")).unwrap();
