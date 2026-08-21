@@ -1451,12 +1451,83 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
             .strip_prefix(parent)
             .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
+}
+
+fn escape_helm_set_string_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | ',' | '{' | '}') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_brace_list = false;
+    let mut escaped = false;
+    let mut has_equals = false;
+    let mut at_value_start = false;
+
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            at_value_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '=' if !has_equals => {
+                has_equals = true;
+                at_value_start = true;
+            }
+            '{' if at_value_start => {
+                in_brace_list = true;
+                at_value_start = false;
+            }
+            '}' if in_brace_list => in_brace_list = false,
+            ',' if !in_brace_list => {
+                parts.push(&expression[start..index]);
+                start = index + ch.len_utf8();
+                has_equals = false;
+                at_value_start = false;
+            }
+            _ => at_value_start = false,
+        }
+    }
+    parts.push(&expression[start..]);
+
+    parts
+        .into_iter()
+        .filter_map(operator_set_entry)
+        .map(|(key, value)| {
+            let mut decoded = String::with_capacity(value.len());
+            let mut chars = value.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        decoded.push(next);
+                    } else {
+                        decoded.push(ch);
+                    }
+                } else {
+                    decoded.push(ch);
+                }
+            }
+            (key.trim().to_string(), decoded)
+        })
+        .collect()
 }
 
 /// Carry the runner configuration recorded by a prior real model install into
@@ -1483,6 +1554,33 @@ fn resolve_preserved_runner_identity_values(
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
     }
+}
+
+/// Carry the worker environment recorded by a prior install into a plain rerun.
+/// Explicit inputs replace the recorded family.
+fn resolve_preserved_worker_extra_env_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    if overridden
+        .iter()
+        .any(|key| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+    {
+        return;
+    }
+
+    let mut recorded = BTreeMap::new();
+    if let Some(values) = existing {
+        crate::installation::flatten_values(values, "", &mut recorded);
+    }
+    opts.set_string.extend(
+        recorded
+            .into_iter()
+            .filter(|(key, _)| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+            .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(&value))),
+    );
 }
 
 fn resolve_preserved_runner_egress_values(
@@ -2719,6 +2817,7 @@ fn complete_up_opts_without_runner_egress(
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2934,10 +3033,17 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = operator_set_entries(std::slice::from_ref(&expression))
-            .into_iter()
-            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
-            .collect();
+        let effective = if expression
+            .split_once('=')
+            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
+        {
+            helm_set_string_entries(&expression)
+        } else {
+            operator_set_entries(std::slice::from_ref(&expression))
+                .into_iter()
+                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+                .collect()
+        };
         self.entries.push(PlannedHelmValues::Set {
             flag: HelmSetFlag::SetString,
             expression,
@@ -6672,6 +6778,169 @@ mod tests {
             line,
             "helm upgrade --install curie charts/curie -n curie --create-namespace \
              --set ui.service.type=NodePort --set langfuse.web.service.type=NodePort"
+        );
+    }
+
+    #[test]
+    fn plain_up_re_supplies_recorded_worker_extra_env_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [
+                    {
+                        "name": "PROVIDER_BASE_URL",
+                        "value": "https://provider.example.com/v1"
+                    },
+                    {
+                        "name": "FALLBACK_BASE_URL",
+                        "value": "https://fallback.example.com/v1"
+                    }
+                ]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: false,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "worker.extraEnv[0].name=PROVIDER_BASE_URL",
+            "worker.extraEnv[0].value=https://provider.example.com/v1",
+            "worker.extraEnv[1].name=FALLBACK_BASE_URL",
+            "worker.extraEnv[1].value=https://fallback.example.com/v1",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded worker extraEnv leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    #[test]
+    fn explicit_worker_extra_env_leaves_override_the_recorded_family() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "RECORDED_PROVIDER_BASE_URL",
+                    "value": "https://recorded.example.com/v1"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![
+                    "worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL".into(),
+                    "worker.extraEnv[0].value=https://operator.example.com/v1".into(),
+                ],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL"),
+            "the explicit worker extraEnv name must reach Helm: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].value=https://operator.example.com/v1"),
+            "the explicit worker extraEnv value must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("RECORDED_PROVIDER_BASE_URL")
+                && !argv.contains("https://recorded.example.com/v1"),
+            "explicit worker extraEnv input must suppress the recorded family: {argv}"
+        );
+    }
+
+    #[test]
+    fn plain_up_escapes_commas_in_recorded_worker_extra_env_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "NO_PROXY",
+                    "value": "10.0.0.0/8,localhost"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.extraEnv[0].value"),
+            Some(&"10.0.0.0/8,localhost".to_string()),
+            "the escaped Helm expression must retain the recorded semantic value"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
+            "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
         );
     }
 
