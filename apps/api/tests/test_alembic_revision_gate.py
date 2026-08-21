@@ -71,6 +71,78 @@ def test_duplicate_numeric_filename_prefix_fails_before_graph_validation(
     assert "0001_collision.py" in result.stderr
 
 
+def test_unrecognized_migration_filename_fails_before_graph_validation(
+    tmp_path: Path,
+) -> None:
+    _write_revision(tmp_path, "custom_base.py", "self_cycle", "self_cycle")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stderr
+    assert "unrecognized migration filename" in result.stderr.lower()
+    assert "custom_base.py" in result.stderr
+    assert "expected exactly one alembic head" not in result.stderr.lower()
+
+
+def test_non_migration_files_are_ignored_when_valid_migration_passes(
+    tmp_path: Path,
+) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    versions = tmp_path / "versions"
+    (versions / "__init__.py").write_text("", encoding="utf-8")
+    (versions / "migration-notes.txt").write_text("notes", encoding="utf-8")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "base" in result.stdout
+
+
+def test_one_letter_suffixed_revision_in_valid_chain_passes(tmp_path: Path) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    _write_revision(tmp_path, "0001a_reconcile.py", "reconciled", "base")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "reconciled" in result.stdout
+
+
+def test_duplicate_identical_suffixed_revision_tokens_fail(tmp_path: Path) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    _write_revision(tmp_path, "0001a_first.py", "first", "base")
+    _write_revision(tmp_path, "0001a_second.py", "second", "base")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stderr
+    assert "duplicate numeric revision" in result.stderr.lower()
+    assert "0001a" in result.stderr
+    assert "0001a_first.py" in result.stderr
+    assert "0001a_second.py" in result.stderr
+
+
+def test_different_suffixed_revision_tokens_are_distinct(tmp_path: Path) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    _write_revision(tmp_path, "0001a_reconcile.py", "reconciled", "base")
+    _write_revision(tmp_path, "0001b_followup.py", "followup", "reconciled")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "followup" in result.stdout
+
+
+def test_multi_letter_suffixed_revision_filename_is_rejected(tmp_path: Path) -> None:
+    _write_revision(tmp_path, "0001ab_bad.py", "bad", None)
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stderr
+    assert "unrecognized migration filename" in result.stderr.lower()
+    assert "0001ab_bad.py" in result.stderr
+
+
 def test_unique_numbered_sibling_revisions_fail_with_both_heads(tmp_path: Path) -> None:
     _write_revision(tmp_path, "0001_base.py", "base", None)
     _write_revision(tmp_path, "0002_left.py", "left_branch", "base")
@@ -114,3 +186,57 @@ def test_python_ci_job_runs_exact_gate_before_dev_stack() -> None:
         index for index, step in enumerate(steps) if step.get("name") == "Start dev stack"
     )
     assert gate_index < stack_index
+
+
+def test_python_ci_runs_released_upgrade_after_stack_ready_and_before_fresh_install(
+) -> None:
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
+    steps = workflow["jobs"]["python"]["steps"]
+
+    checkout_steps = [
+        step for step in steps if step.get("uses") == "actions/checkout@v7"
+    ]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0]["with"]["fetch-depth"] == 0
+
+    released_upgrade_steps = [
+        step for step in steps if step.get("name") == "Released database upgrade gate"
+    ]
+    assert len(released_upgrade_steps) == 1
+    released_upgrade_step = released_upgrade_steps[0]
+    released_upgrade_commands = [
+        line.strip()
+        for line in released_upgrade_step["run"].splitlines()
+        if line.strip().startswith("uv run python scripts/check-released-upgrade.py")
+    ]
+    assert released_upgrade_commands == [
+        "uv run python scripts/check-released-upgrade.py --self-test",
+        "uv run python scripts/check-released-upgrade.py",
+    ]
+
+    stack_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Start dev stack"
+    )
+    readiness_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Wait for Langfuse to serve"
+    )
+    released_upgrade_index = steps.index(released_upgrade_step)
+    fresh_install_steps = [
+        step for step in steps if step.get("name") == "Migrate the shared database"
+    ]
+    assert len(fresh_install_steps) == 1
+    assert fresh_install_steps[0]["run"] == "uv run alembic upgrade head"
+    fresh_install_index = steps.index(fresh_install_steps[0])
+
+    assert stack_index < readiness_index < released_upgrade_index < fresh_install_index
+
+
+def test_baseline_main_fetch_uses_a_fully_qualified_refspec() -> None:
+    instructions = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    safe_command = "git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main"
+    unsafe_command = "git fetch --force --tags origin main:refs/remotes/origin/main"
+
+    assert safe_command in instructions
+    assert unsafe_command not in instructions
