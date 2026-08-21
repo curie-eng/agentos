@@ -401,11 +401,7 @@ fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<S
     let mut values = std::collections::BTreeMap::new();
     let mut missing = Vec::new();
     for k in keys {
-        match std::env::var(k)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(k)?)
-        {
+        match crate::secrets::resolve_env_or_saved(k)? {
             Some(v) => {
                 values.insert(k.clone(), v);
             }
@@ -422,49 +418,79 @@ fn resolve_secret_values(keys: &[String]) -> Result<std::collections::BTreeMap<S
     Ok(values)
 }
 
-/// Apply an agent's declared connectors, and prune what it no longer declares.
-///
-/// Called after the bundle is deployed, so the objects exist before the next
-/// turn reaches for them.
-pub async fn sync(
+/// An agent's fully resolved connector synchronization plan.
+pub struct PreparedConnectorSync {
+    namespace: String,
+    agent_name: String,
+    keep: Vec<String>,
+    apply_document: Option<String>,
+    result: ConnectorSync,
+}
+
+/// Resolve and render an agent's connector objects without writing to kubectl.
+pub fn prepare(
     manifests: &[Value],
     mcp_entries: &std::collections::BTreeMap<String, Value>,
     owned_secret_name: &str,
     owned_secret_keys: &[String],
     namespace: &str,
     agent_name: &str,
-) -> Result<ConnectorSync> {
-    let ui = crate::ui::ui();
+) -> Result<PreparedConnectorSync> {
     let mut objects = Vec::new();
 
     if let Some((secret_name, keys)) = owned_secret(owned_secret_name, owned_secret_keys) {
-        if !keys.is_empty() {
-            objects.push(render_secret(
-                &secret_name,
-                namespace,
-                &resolve_secret_values(&keys)?,
-            ));
-        }
+        objects.push(render_secret(
+            &secret_name,
+            namespace,
+            &resolve_secret_values(&keys)?,
+        ));
     }
     objects.extend_from_slice(manifests);
 
-    let mut sync = ConnectorSync::default();
+    let mut result = ConnectorSync::default();
     for (name, entry) in mcp_entries {
         if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
-            sync.urls.insert(name.clone(), url.to_string());
+            result.urls.insert(name.clone(), url.to_string());
         }
     }
 
     let labelled = label_objects(&objects, agent_name);
     let keep = object_names(&labelled);
+    let apply_document = if labelled.is_empty() {
+        None
+    } else {
+        Some(as_list_document(&labelled)?)
+    };
 
-    if !labelled.is_empty() {
-        let doc = as_list_document(&labelled)?;
-        let (ok, _out, err) = run(&apply_args(namespace), Some(&doc)).await?;
+    Ok(PreparedConnectorSync {
+        namespace: namespace.to_string(),
+        agent_name: agent_name.to_string(),
+        keep,
+        apply_document,
+        result,
+    })
+}
+
+/// Apply a prepared connector plan, and prune what it no longer declares.
+///
+/// Called after the bundle is deployed, so the objects exist before the next
+/// turn reaches for them.
+pub async fn sync(prepared: PreparedConnectorSync) -> Result<ConnectorSync> {
+    let ui = crate::ui::ui();
+    let PreparedConnectorSync {
+        namespace,
+        agent_name,
+        keep,
+        apply_document,
+        mut result,
+    } = prepared;
+
+    if let Some(doc) = apply_document {
+        let (ok, _out, err) = run(&apply_args(&namespace), Some(&doc)).await?;
         if !ok {
             anyhow::bail!("applying connectors failed: {}", err.trim());
         }
-        sync.applied = keep.clone();
+        result.applied = keep.clone();
         ui.note(&format!(
             "connectors: applied {} object(s) for {agent_name}",
             keep.len()
@@ -473,12 +499,12 @@ pub async fn sync(
 
     // Runs even with nothing declared -- that is the case where a connector was
     // REMOVED, and the whole reason this is not a bare `kubectl apply`.
-    let (ok, _out, err) = run(&prune_args(namespace, agent_name, &keep), None).await?;
+    let (ok, _out, err) = run(&prune_args(&namespace, &agent_name, &keep), None).await?;
     if !ok {
         ui.warn(&format!(
             "connectors: pruning stale objects for {agent_name} failed: {}",
             err.trim()
         ));
     }
-    Ok(sync)
+    Ok(result)
 }
