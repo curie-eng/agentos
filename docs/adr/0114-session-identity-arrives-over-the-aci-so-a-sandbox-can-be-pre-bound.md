@@ -171,10 +171,15 @@ already-bundle-loaded runner.
    earlier draft of this ADR proposed a `POST /v1/session` endpoint; it was
    rejected during review for buying the same thing at a higher price.
 
-   **The runner token stays pod env, and the worker reads it instead of minting
-   it.** A pre-warmed pod cannot be handed a token that is minted when a
-   conversation claims it, so the pool mints one per pod at creation and the
-   worker resolves the bound pod's token through the Kubernetes API at bind time.
+   **The runner token stays pod env, the pool mints it, and the worker reads it
+   instead of minting it.** A pre-warmed pod cannot be handed a token that is
+   minted when a conversation claims it, so the pool mints one per pod at creation
+   and the worker resolves the bound pod's token through the Kubernetes API at
+   bind time. This is a **requirement, not a convenience**: a pool pod today
+   carries no token, and a runner with no token configured passes its gated paths
+   through, which was confirmed by an unauthenticated `POST /v1/event` returning
+   200 against a bound pool pod. Raising the pool without minting a token ships an
+   open ACI endpoint per warm pod.
    The worker already holds the RBAC to read those pods, and the token's exposure
    is unchanged from today, where it is pod env as well. Per-pod rather than
    per-pool matters: a shared pool token would let one compromised sandbox
@@ -370,6 +375,53 @@ is its floor against the 17.39s measured on the real-model install above. The
 column that carries the argument is the second one, where the shape of the
 failure does not depend on the baseline.
 
+### gVisor does not touch the bind, and a warm pod is unauthenticated
+
+Two things the earlier arms could not answer were measured on a third cluster,
+this one on containerd with minikube's `gvisor` addon enabled and the chart
+installed at `security.gvisor.mode=require`, so `RuntimeClass gvisor` (handler
+`runsc`) is what sandbox pods actually run under and the chart's own gVisor
+preflight passed.
+
+|                     | gVisor off (docker runtime) | gVisor required (containerd) |
+| ------------------- | --------------------------- | ---------------------------- |
+| cold create         | 4.72s                       | 7.06s                        |
+| pre-bound bind      | 0.17s                       | **0.18s**                    |
+
+**gVisor costs the boot and leaves the bind alone.** That is the expected shape:
+`runsc` intercepts syscalls, so it taxes booting and running a process, while a
+bind is a control-plane operation plus a readiness check against a process that
+is already up. It also means the argument for pre-binding is *stronger* under the
+production default, not weaker, because the cost it removes is the one gVisor
+inflates. The two clusters differ in container runtime as well, so 4.72 to 7.06
+is not a clean gVisor-only delta; the column that matters is the second row,
+where the number does not move.
+
+The sub-second bind has now been measured four times across three clusters:
+0.19s, 0.196s, 0.17s, 0.18s.
+
+**A pre-warmed pod exposes an unauthenticated ACI.** The runner gates
+`/v1/event`, `/v1/steer`, `/v1/interrupt`, and `/v1/reset` on a bearer token, and
+that token is minted per claim by the worker and injected through
+`SandboxClaim.spec.env`. A pool pod is created by the pool controller from the
+template, so it receives the template's baked env and **no token at all** -- and
+the runner's documented behaviour with no token configured is to pass the gated
+paths through. Confirmed directly against a bound pool pod:
+
+```
+POST /v1/event, no Authorization header
+-> HTTP 200 ACCEPTED WITHOUT AUTH
+```
+
+The turn then failed at the model boundary on a deliberately bogus credential,
+which is its own confirmation: **a pre-bound pod does serve ACI turns**, up to the
+model call, with no further work. But it serves them to anyone who can reach it.
+
+Today this is latent, because `warmPool.replicas` is 0 and no warm pod exists.
+Decision 3 is what makes it real: raising the pool ships one open ACI endpoint per
+warm pod inside the cluster network. That is why decision 2's per-pod token is a
+requirement of this ADR rather than an implementation detail of it.
+
 ### A third, tighter density cap surfaced while testing
 
 The failed with-env claim reported:
@@ -469,6 +521,11 @@ counts it, which decision 6 is what fixes.
   ceiling in place while raising density means the namespace quota, not the node,
   becomes the first thing a busy release hits, and it does so at eight sandboxes
   on the shipped numbers.
+
+- **Decision 3 cannot land before decision 2's per-pod token.** Shipping a warm
+  pool while pool pods carry no runner token would expose an unauthenticated ACI
+  on every warm pod, which is a reachability regression rather than the
+  performance change this ADR is arguing for. The ordering is not a preference.
 
 - Nothing here changes what a sandbox may *reach*. ADR-0006's rails and
   ADR-0008's tenant boundary are untouched, and a pre-bound runner is bound to

@@ -279,14 +279,32 @@ What the recording does **not** show, and should not be read as showing:
 ## Open questions
 
 - ~~**How is a bind authenticated** if the runner token no longer arrives as pod
-  env?~~ **Answered:** the token stays pod env, minted per pool pod at creation,
-  and the worker resolves it from the bound pod through the Kubernetes API instead
-  of minting it. What remains is to confirm it end to end: read a bound pod's
-  token and drive a real turn on it.
+  env?~~ **Answered and confirmed.** The token stays pod env, minted per pool pod
+  at creation, and the worker resolves it from the bound pod through the Kubernetes
+  API instead of minting it. Confirming it turned up the reason it is mandatory: a
+  pool pod today carries **no** token, and an unauthenticated `POST /v1/event`
+  against a bound pool pod returned **200**. W3 therefore cannot ship before this
+  part of W4, or every warm pod is an open ACI endpoint. The same probe confirmed
+  the other half for free: a pre-bound pod does serve ACI turns, failing only at
+  the model call.
 - **What does the cold path cost when it is not quota-blocked?** The with-env arm
   of the pre-bind test failed on `curie-sandbox-quota` rather than completing, so
   its wall clock is unmeasured; only its behaviour (create its own sandbox rather
   than bind a pool pod) is established.
+- **Can the platform manage the pool set?** Not prototyped. The shape is already
+  in the repo: [ADR-0090](../adr/0090-a-reconciler-applies-connectors-so-agent-repos-need-no-cli.md)'s
+  connector reconciler converges Kubernetes objects toward what the database says
+  should exist, on an interval, and a pool-per-in-force-deployment reconciler is
+  the same loop over a different object. Treated as low risk on that precedent
+  rather than measured, which is a judgement and should be read as one.
+
+- **Can a real in-cluster model reach a host-local Ollama?** No, by design, and
+  this is worth recording because it looks like a configuration mistake. The
+  agent-sandbox controller's default NetworkPolicy allows public internet **minus
+  RFC1918**, so a model served from the host's private address is unreachable from
+  a sandbox whatever credential is set. The real-model turn figures in the ADR come
+  from the `skill` tier, where no such policy applies.
+
 - **Should the CPU limit move with the request?** ADR-0059 decision 4's quota
   counts `limits.cpu`, and at the shipped `limits.cpu: 1` per sandbox the
   namespace admits eight concurrent sandboxes while its `pods` allowance is 50
@@ -299,6 +317,11 @@ What the recording does **not** show, and should not be read as showing:
 - **Does the node-local bundle cache need its own ADR?** ADR-0114 says it does
   not decide the shared-surface question. W1's OCI-layer recommendation is
   chosen partly to avoid needing that decision at all.
-- **gVisor overhead is unmeasured.** All figures here were taken with
-  `security.gvisor.mode=off`, which is not the production default. Pre-binding
-  removes gVisor's cost from the boot path but not from the turn.
+- ~~**gVisor overhead is unmeasured.**~~ **Measured.** On containerd with the
+  `gvisor` addon and `security.gvisor.mode=require`, so sandbox pods really run
+  under `RuntimeClass gvisor` / `runsc`: cold create 7.06s against 4.72s with
+  gVisor off, and the pre-bound bind **0.18s against 0.17s**. gVisor taxes the
+  boot and leaves the bind alone, which makes the case for pre-binding stronger
+  under the production default rather than weaker. The two clusters differ in
+  container runtime too, so the cold-create delta is not gVisor-only; the bind row
+  is the one that matters, and it does not move.
