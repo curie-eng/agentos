@@ -156,10 +156,16 @@ if (( ${#mismatched[@]} > 0 )); then
   exit 1
 fi
 
-for name in "${changed[@]}"; do
+# `${a[@]+"${a[@]}"}` rather than a bare `"${a[@]}"`: expanding an EMPTY array
+# under `set -u` is an "unbound variable" error until bash 4.4, and macOS ships
+# 3.2. Only ONE of these two lists has to be non-empty to get here (the both-empty
+# case exited above), so the ordinary refresh -- a schema edited, none deleted --
+# left baseline_only empty, copied the changed files, and only THEN aborted on the
+# second loop, leaving a half-applied baseline behind a bogus error.
+for name in ${changed[@]+"${changed[@]}"}; do
   cp "$schema_dir/$name" "$baseline_dir/$name"
 done
-for name in "${baseline_only[@]}"; do
+for name in ${baseline_only[@]+"${baseline_only[@]}"}; do
   rm -- "$baseline_dir/$name"
 done
 

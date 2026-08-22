@@ -39,9 +39,25 @@ vendored file stays a static .Files.Get (not tpl-ed) and this value-dependent
 patch lives in the template layer alongside the #66 RBAC patch below.
 */}}
 {{- $controllerManifest := .Files.Get "files/agent-sandbox/controller.yaml" }}
-{{- with .Values.priorityClasses.platform.name }}
-{{- $controllerManifest = $controllerManifest | replace "      serviceAccountName: agent-sandbox-controller" (printf "      serviceAccountName: agent-sandbox-controller\n      priorityClassName: %s" .) }}
+{{- $controllerMetadataAnchor := "    metadata:\n      labels:\n        app: agent-sandbox-controller" }}
+{{- $controllerMetadata := "    metadata:\n      labels:" }}
+{{- with (include "curie.placement.labels" .Values.placement.controller) }}
+{{- $controllerMetadata = printf "%s\n%s" $controllerMetadata (indent 8 .) }}
 {{- end }}
+{{- $controllerMetadata = printf "%s\n        app: agent-sandbox-controller" $controllerMetadata }}
+{{- with (include "curie.placement.annotations" .Values.placement.controller) }}
+{{- $controllerMetadata = printf "%s\n      annotations:\n%s" $controllerMetadata (indent 8 .) }}
+{{- end }}
+{{- $controllerManifest = $controllerManifest | replace $controllerMetadataAnchor $controllerMetadata }}
+{{- $controllerServiceAccount := "      serviceAccountName: agent-sandbox-controller" }}
+{{- $controllerPodFields := $controllerServiceAccount }}
+{{- with .Values.priorityClasses.platform.name }}
+{{- $controllerPodFields = printf "%s\n      priorityClassName: %s" $controllerPodFields . }}
+{{- end }}
+{{- with (include "curie.placement.spec" .Values.placement.controller) }}
+{{- $controllerPodFields = printf "%s\n%s" $controllerPodFields (indent 6 .) }}
+{{- end }}
+{{- $controllerManifest = $controllerManifest | replace $controllerServiceAccount $controllerPodFields }}
 {{ $controllerManifest }}
 ---
 {{/*
@@ -172,11 +188,21 @@ spec:
   podTemplate:
     metadata:
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.sandbox) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 8 }}
         {{- if $agent }}
         curietech.ai/agent: {{ $agent | quote }}
         {{- end }}
+      {{- with (include "curie.placement.annotations" .Values.placement.sandbox) }}
+      annotations:
+        {{- . | nindent 8 }}
+      {{- end }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.sandbox) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       {{- if $runner.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-runner
       automountServiceAccountToken: {{ $runner.serviceAccount.automountToken }}

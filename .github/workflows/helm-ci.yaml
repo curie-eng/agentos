@@ -102,6 +102,13 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/render-assertions.sh
 
+      # Prove the API Service keeps a stable NodePort when enabled, allows an
+      # override, and omits the field for ClusterIP or explicit auto allocation.
+      - name: helm render assertions (api service NodePort)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/api-service-nodeport-assertions.sh
+
       # Prove the BYO-model LiteLLM sidecar (issue #253) is off by default,
       # renders fully when its values flag is enabled, and yields to local
       # inference. Runs the chart-owned assertion script.

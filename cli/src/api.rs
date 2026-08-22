@@ -435,6 +435,15 @@ pub struct BudgetConfig {
     pub max_usd_per_day: Option<f64>,
 }
 
+/// Artifacts prepared before deployment activation.
+pub struct PreparedDeployOutcome {
+    pub(crate) agent: Agent,
+    pub(crate) version: Version,
+    pub(crate) bundle: Bundle,
+    pub(crate) channel: ChannelOutcome,
+    pub(crate) repo_note: Option<String>,
+}
+
 /// The artifacts a deploy produces, for the summary printout.
 pub struct DeployOutcome {
     pub agent: Agent,
@@ -937,6 +946,58 @@ impl ApiClient {
             .context("decoding created deployment")
     }
 
+    /// Prepare a deploy through bundle upload without creating its deployment.
+    #[allow(clippy::too_many_arguments)] // one cohesive deploy call; a struct would not clarify it
+    pub async fn prepare_deploy(
+        &self,
+        agent_name: &str,
+        slack_channel: Option<&str>,
+        version_label: &str,
+        created_by: &str,
+        archive: Vec<u8>,
+        secrets: &std::collections::BTreeMap<String, String>,
+        repo_full_name: Option<&str>,
+    ) -> Result<PreparedDeployOutcome> {
+        let (agent, channel, repo_note) = self
+            .resolve_agent(agent_name, slack_channel, repo_full_name)
+            .await?;
+        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
+        // a freshly created agent and a redeploy that rotates a value; an empty
+        // map leaves the agent's current secrets untouched.
+        if !secrets.is_empty() {
+            self.update_agent_secrets(&agent.id, secrets).await?;
+        }
+        let version = self
+            .create_version(&agent.id, version_label, created_by)
+            .await?;
+        let bundle = self.upload_bundle(&agent.id, &version.id, archive).await?;
+        Ok(PreparedDeployOutcome {
+            agent,
+            version,
+            bundle,
+            channel,
+            repo_note,
+        })
+    }
+
+    pub async fn activate_deploy(
+        &self,
+        prepared: PreparedDeployOutcome,
+        environment: &str,
+    ) -> Result<DeployOutcome> {
+        let deployment = self
+            .create_deployment(&prepared.agent.id, &prepared.version.id, environment)
+            .await?;
+        Ok(DeployOutcome {
+            agent: prepared.agent,
+            version: prepared.version,
+            bundle: prepared.bundle,
+            deployment,
+            channel: prepared.channel,
+            repo_note: prepared.repo_note,
+        })
+    }
+
     /// The full deploy flow: resolve agent (create or channel-reconcile),
     /// version, bundle, deployment.
     #[allow(clippy::too_many_arguments)] // one cohesive deploy call; a struct would not clarify it
@@ -951,30 +1012,18 @@ impl ApiClient {
         secrets: &std::collections::BTreeMap<String, String>,
         repo_full_name: Option<&str>,
     ) -> Result<DeployOutcome> {
-        let (agent, channel, repo_note) = self
-            .resolve_agent(agent_name, slack_channel, repo_full_name)
+        let prepared = self
+            .prepare_deploy(
+                agent_name,
+                slack_channel,
+                version_label,
+                created_by,
+                archive,
+                secrets,
+                repo_full_name,
+            )
             .await?;
-        // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
-        // a freshly created agent and a redeploy that rotates a value; an empty
-        // map leaves the agent's current secrets untouched.
-        if !secrets.is_empty() {
-            self.update_agent_secrets(&agent.id, secrets).await?;
-        }
-        let version = self
-            .create_version(&agent.id, version_label, created_by)
-            .await?;
-        let bundle = self.upload_bundle(&agent.id, &version.id, archive).await?;
-        let deployment = self
-            .create_deployment(&agent.id, &version.id, environment)
-            .await?;
-        Ok(DeployOutcome {
-            agent,
-            version,
-            bundle,
-            deployment,
-            channel,
-            repo_note,
-        })
+        self.activate_deploy(prepared, environment).await
     }
 
     /// Resolve an agent identifier (its `name`, or its `id`) to the full record

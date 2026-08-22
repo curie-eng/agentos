@@ -6,7 +6,7 @@ from pathlib import Path
 
 from alembic.script import ScriptDirectory
 
-FILENAME_PATTERN = re.compile(r"^(\d+)_.*\.py$")
+FILENAME_PATTERN = re.compile(r"^(\d+[a-z]?)_.+\.py$")
 DEFAULT_SCRIPT_LOCATION = (
     Path(__file__).resolve().parents[1] / "apps" / "api" / "alembic"
 )
@@ -42,14 +42,21 @@ def main() -> int:
         )
         return 1
 
-    filenames_by_number: dict[str, list[str]] = defaultdict(list)
+    filenames_by_token: dict[str, list[str]] = defaultdict(list)
+    unrecognized_filenames: list[str] = []
     try:
         for path in versions.iterdir():
-            if not path.is_file():
+            if (
+                not path.is_file()
+                or path.suffix != ".py"
+                or path.name == "__init__.py"
+            ):
                 continue
             match = FILENAME_PATTERN.fullmatch(path.name)
-            if match is not None:
-                filenames_by_number[match.group(1)].append(path.name)
+            if match is None:
+                unrecognized_filenames.append(path.name)
+                continue
+            filenames_by_token[match.group(1)].append(path.name)
     except OSError as exc:
         print(
             f"Alembic revision gate failed: could not scan versions directory "
@@ -58,24 +65,39 @@ def main() -> int:
         )
         return 1
 
+    if unrecognized_filenames:
+        print(
+            "Alembic revision gate failed: unrecognized migration filenames "
+            "found:",
+            file=sys.stderr,
+        )
+        for filename in sorted(unrecognized_filenames):
+            print(f"  {filename}", file=sys.stderr)
+        print(
+            "Name every migration <digits><optional lowercase letter>_"
+            "<description>.py.",
+            file=sys.stderr,
+        )
+        return 1
+
     duplicates = {
-        number: sorted(filenames)
-        for number, filenames in filenames_by_number.items()
+        token: sorted(filenames)
+        for token, filenames in filenames_by_token.items()
         if len(filenames) > 1
     }
     if duplicates:
         print(
-            "Alembic revision gate failed: duplicate numeric revision "
-            "filename tokens found:",
+            "Alembic revision gate failed: duplicate numeric revision or "
+            "suffixed revision filename tokens found:",
             file=sys.stderr,
         )
-        for number in sorted(duplicates):
+        for token in sorted(duplicates):
             print(
-                f"  {number}: {', '.join(duplicates[number])}",
+                f"  {token}: {', '.join(duplicates[token])}",
                 file=sys.stderr,
             )
         print(
-            "Rename migrations so every leading numeric token is unique.",
+            "Rename migrations so every leading revision token is unique.",
             file=sys.stderr,
         )
         return 1

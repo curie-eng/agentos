@@ -56,19 +56,42 @@ KEYS=(
   apiKey
   githubWebhookSecret
 )
-declare -A DEFAULTS=(
-  [postgresPassword]="postgres"
-  [valkeyPassword]="valkeypass"
-  [clickhousePassword]="clickhouse"
-  [rustfsSecretKey]="rustfssecret"
-  [langfuseSalt]="dev-salt-change-me"
-  [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
-  [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
-  [langfuseInitProjectSecretKey]="sk-lf-curie-dev"
-  [langfuseInitUserPassword]="curie-dev-password"
-  [apiKey]="curie-dev-key"
-  [githubWebhookSecret]="dev-webhook-secret"
-)
+# The published dev default for each of those keys. A `case` lookup rather than
+# `declare -A`: associative arrays are bash 4+, and macOS ships bash 3.2 (the
+# last GPLv2 release) as /bin/bash, which `#!/usr/bin/env bash` finds unless the
+# contributor installed a newer one. Under `set -u` the unsupported `declare -A`
+# made the first key look like an unbound variable, so `curie dev chart-check`
+# failed on every stock Mac with "postgresPassword: unbound variable" -- an error
+# that named nothing real and pointed at no fix. The other twenty-one assertion
+# scripts already run on 3.2; this was the only one that did not.
+default_for() {
+  case "$1" in
+    postgresPassword)             printf '%s\n' "postgres" ;;
+    valkeyPassword)               printf '%s\n' "valkeypass" ;;
+    clickhousePassword)           printf '%s\n' "clickhouse" ;;
+    rustfsSecretKey)              printf '%s\n' "rustfssecret" ;;
+    langfuseSalt)                 printf '%s\n' "dev-salt-change-me" ;;
+    langfuseEncryptionKey)        printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" ;;
+    langfuseNextauthSecret)       printf '%s\n' "dev-nextauth-secret-change-me" ;;
+    langfuseInitProjectSecretKey) printf '%s\n' "sk-lf-curie-dev" ;;
+    langfuseInitUserPassword)     printf '%s\n' "curie-dev-password" ;;
+    apiKey)                       printf '%s\n' "curie-dev-key" ;;
+    githubWebhookSecret)          printf '%s\n' "dev-webhook-secret" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove the lookup is total over KEYS here, at startup, rather than relying on a
+# failure at the point of use. `default_for` is called inside a command
+# substitution, where a nonzero exit cannot abort the script the way the old
+# `set -u` array miss did -- and one call site sits under `||`, which suspends
+# `set -e` for the whole function body. Checking up front keeps the old property
+# that a key with no published default is a hard error, not a silent empty
+# string that makes the generation detector pass by accident.
+for key in "${KEYS[@]}"; do
+  default_for "$key" >/dev/null \
+    || { echo "FAIL: default_for() has no published default for key '$key'" >&2; exit 1; }
+done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -106,7 +129,7 @@ check_generated_key() {
   # $1 = rendered Secret, $2 = key, $3 = render label
   local out="$1" key="$2" label="$3" val def
   val="$(read_key "$out" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" == "$def" ]]; then
     echo "$label still emits the published dev default for '$key' (value == '$def'); expected a generated value." >&2
     return 1
@@ -156,7 +179,7 @@ echo "  ok: langfuseEncryptionKey is 64 lowercase-hex chars"
 echo "=== Assertion 3: dev overlay keeps the deterministic published defaults ==="
 for key in "${KEYS[@]}"; do
   val="$(read_key "$DEV" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" != "$def" ]]; then
     fail "dev overlay must keep the published default for '$key'; expected '$def', got '$val'."
   fi
@@ -759,6 +782,316 @@ if check_github_token_empty "$GHT_MUTANT_RENDER" "mutant (githubToken via curie.
 fi
 echo "  ok: a generated githubToken is rejected (the assert can fail)"
 
+echo "=== Placement assertion 1: every rendered pod surface receives its placement class ==="
+PLACEMENT_VALUES="$TMP/placement-values.yaml"
+cat > "$PLACEMENT_VALUES" <<'YAMLEOF'
+placement:
+  platform:
+    podLabels:
+      example.com/fargate-profile: platform
+    annotations:
+      example.com/placement: platform
+    nodeSelector:
+      example.com/node-class: platform
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: platform
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [platform]
+  data:
+    podLabels:
+      example.com/fargate-profile: data
+    annotations:
+      example.com/placement: data
+    nodeSelector:
+      example.com/node-class: data
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: data
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [data]
+  sandbox:
+    podLabels:
+      example.com/fargate-profile: sandbox
+    annotations:
+      example.com/placement: sandbox
+    nodeSelector:
+      example.com/node-class: sandbox
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: sandbox
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [sandbox]
+  hooks:
+    podLabels:
+      example.com/fargate-profile: hooks
+    annotations:
+      example.com/placement: hooks
+    nodeSelector:
+      example.com/node-class: hooks
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: hooks
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [hooks]
+  controller:
+    podLabels:
+      example.com/fargate-profile: controller
+    annotations:
+      example.com/placement: controller
+    nodeSelector:
+      example.com/node-class: controller
+    tolerations:
+      - key: example.com/dedicated
+        operator: Equal
+        value: controller
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: example.com/node-class
+                  operator: In
+                  values: [controller]
+YAMLEOF
+
+PLACEMENT_CHECK="$TMP/check_placement.py"
+cat > "$PLACEMENT_CHECK" <<'PYEOF'
+"""Assert placement classes on every chart rendered pod surface.
+
+argv: <rendered-dir> <populated|default|platform-only>
+Exits 0 on pass, 1 naming the missing, extra, or mismatched surface on failure.
+"""
+import pathlib
+import sys
+
+import yaml
+
+rendered, mode = sys.argv[1], sys.argv[2]
+prefix = "placement-render-curie"
+
+expected = {
+    ("Deployment", f"{prefix}-api"): "platform",
+    ("Deployment", f"{prefix}-dispatcher"): "platform",
+    ("Deployment", f"{prefix}-worker"): "platform",
+    ("Deployment", f"{prefix}-ui"): "platform",
+    ("Deployment", f"{prefix}-inference"): "platform",
+    ("Deployment", f"{prefix}-otel-collector"): "platform",
+    ("Deployment", f"{prefix}-langfuse-web"): "platform",
+    ("Deployment", f"{prefix}-langfuse-worker"): "platform",
+    ("StatefulSet", f"{prefix}-postgres"): "data",
+    ("StatefulSet", f"{prefix}-valkey"): "data",
+    ("StatefulSet", f"{prefix}-clickhouse"): "data",
+    ("StatefulSet", f"{prefix}-rustfs"): "data",
+    ("SandboxTemplate", f"{prefix}-runner"): "sandbox",
+    ("DaemonSet", f"{prefix}-runner-prewarm"): "sandbox",
+    ("Job", f"{prefix}-rustfs-init"): "hooks",
+    ("Job", f"{prefix}-preflight-avx"): "hooks",
+    ("Job", f"{prefix}-preflight-gvisor"): "hooks",
+    ("Job", f"{prefix}-preflight-controller"): "hooks",
+    ("Job", f"{prefix}-netpol-probe"): "hooks",
+    ("Job", f"{prefix}-security-probe"): "hooks",
+    ("Job", f"{prefix}-langfuse-model-pricing"): "hooks",
+    ("Pod", f"{prefix}-security-probe-hardening"): "hooks",
+    ("Deployment", "agent-sandbox-controller"): "controller",
+}
+
+
+def pod_surface(doc):
+    kind = doc.get("kind")
+    if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
+        return doc.get("spec", {}).get("template", {}) or {}
+    if kind == "Pod":
+        return {"metadata": doc.get("metadata", {}) or {}, "spec": doc.get("spec", {}) or {}}
+    if kind == "SandboxTemplate":
+        return doc.get("spec", {}).get("podTemplate", {}) or {}
+    return None
+
+
+surfaces = {}
+for path in sorted(pathlib.Path(rendered).rglob("*.yaml")):
+    for doc in yaml.safe_load_all(path.read_text()):
+        if not isinstance(doc, dict):
+            continue
+        surface = pod_surface(doc)
+        if surface is None:
+            continue
+        key = (doc.get("kind"), doc.get("metadata", {}).get("name"))
+        if key in surfaces:
+            sys.stderr.write(f"duplicate rendered pod surface {key!r}\n")
+            sys.exit(1)
+        surfaces[key] = surface
+
+missing = sorted(set(expected) - set(surfaces))
+unexpected = sorted(set(surfaces) - set(expected))
+if missing or unexpected:
+    if missing:
+        sys.stderr.write(f"render is missing expected pod surfaces: {missing!r}\n")
+    if unexpected:
+        sys.stderr.write(f"render has unclassified pod surfaces: {unexpected!r}\n")
+    sys.exit(1)
+
+
+def wanted_placement(class_name):
+    return {
+        "label": class_name,
+        "annotation": class_name,
+        "nodeSelector": {"example.com/node-class": class_name},
+        "tolerations": [{
+            "key": "example.com/dedicated",
+            "operator": "Equal",
+            "value": class_name,
+            "effect": "NoSchedule",
+        }],
+        "affinity": {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [{
+                        "matchExpressions": [{
+                            "key": "example.com/node-class",
+                            "operator": "In",
+                            "values": [class_name],
+                        }],
+                    }],
+                },
+            },
+        },
+    }
+
+
+def assert_populated(key, surface, class_name):
+    metadata = surface.get("metadata", {}) or {}
+    spec = surface.get("spec", {}) or {}
+    labels = metadata.get("labels", {}) or {}
+    annotations = metadata.get("annotations", {}) or {}
+    want = wanted_placement(class_name)
+    got = {
+        "label": labels.get("example.com/fargate-profile"),
+        "annotation": annotations.get("example.com/placement"),
+        "nodeSelector": spec.get("nodeSelector"),
+        "tolerations": spec.get("tolerations"),
+        "affinity": spec.get("affinity"),
+    }
+    if got != want:
+        sys.stderr.write(
+            f"pod surface {key!r} has placement {got!r}, expected class "
+            f"{class_name!r} with placement {want!r}\n"
+        )
+        sys.exit(1)
+
+
+if mode == "populated":
+    for key, class_name in expected.items():
+        assert_populated(key, surfaces[key], class_name)
+    print(f"  ok: all {len(expected)} pod surfaces carry their exact populated placement class")
+elif mode == "default":
+    for key, surface in surfaces.items():
+        metadata = surface.get("metadata", {}) or {}
+        labels = metadata.get("labels", {}) or {}
+        annotations = metadata.get("annotations", {}) or {}
+        spec = surface.get("spec", {}) or {}
+        if "example.com/fargate-profile" in labels:
+            sys.stderr.write(f"default pod surface {key!r} unexpectedly has the placement marker label\n")
+            sys.exit(1)
+        if "example.com/placement" in annotations:
+            sys.stderr.write(f"default pod surface {key!r} unexpectedly has the placement marker annotation\n")
+            sys.exit(1)
+        present = [field for field in ("nodeSelector", "tolerations", "affinity") if field in spec]
+        if present:
+            sys.stderr.write(
+                f"default pod surface {key!r} unexpectedly has placement fields {present!r}\n"
+            )
+            sys.exit(1)
+    print(f"  ok: all {len(expected)} pod surfaces omit placement markers and scheduling fields by default")
+elif mode == "platform-only":
+    marker = "example.com/fargate-profile"
+    for key, class_name in expected.items():
+        labels = surfaces[key].get("metadata", {}).get("labels", {}) or {}
+        got = labels.get(marker)
+        if class_name == "platform" and got != "platform":
+            sys.stderr.write(
+                f"platform pod surface {key!r} has {marker}={got!r}, expected 'platform'\n"
+            )
+            sys.exit(1)
+        if class_name != "platform" and marker in labels:
+            sys.stderr.write(
+                f"unselected {class_name} pod surface {key!r} leaked platform marker {got!r}\n"
+            )
+            sys.exit(1)
+    print("  ok: the platform marker reaches only platform pods and is absent from data, sandbox, hooks, and controller pods")
+else:
+    sys.stderr.write(f"unknown placement check mode {mode!r}\n")
+    sys.exit(2)
+PYEOF
+
+# Enable every conditional pod surface so the expected inventory is exhaustive.
+PLACEMENT_HELM_ARGS=(
+  --set dispatcher.slack.appToken=xapp-placement-render
+  --set dispatcher.slack.botToken=xoxb-placement-render
+  --set inference.deploy=true
+  --set security.gvisor.mode=require
+)
+
+PLACEMENT_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_OUT" \
+  -f "$PLACEMENT_VALUES" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_OUT" populated \
+  || fail "populated placement classes did not reach every exact rendered pod surface."
+
+echo "=== Placement assertion 2: empty placement defaults preserve all pod surfaces ==="
+PLACEMENT_DEFAULT_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_DEFAULT_OUT" \
+  "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_DEFAULT_OUT" default \
+  || fail "empty placement defaults changed rendered pod metadata or scheduling fields."
+
+echo "=== Placement assertion 3: a platform-only marker does not leak across classes ==="
+PLACEMENT_PLATFORM_ONLY="$TMP/placement-platform-only.yaml"
+cat > "$PLACEMENT_PLATFORM_ONLY" <<'YAMLEOF'
+placement:
+  platform:
+    podLabels:
+      example.com/fargate-profile: platform
+YAMLEOF
+PLACEMENT_PLATFORM_ONLY_OUT="$(mktemp -d -p "$TMP")"
+helm template placement-render "$CHART" --output-dir "$PLACEMENT_PLATFORM_ONLY_OUT" \
+  -f "$PLACEMENT_PLATFORM_ONLY" "${PLACEMENT_HELM_ARGS[@]}" > /dev/null
+python3 "$PLACEMENT_CHECK" "$PLACEMENT_PLATFORM_ONLY_OUT" platform-only \
+  || fail "the platform-only marker was absent from a platform pod or leaked into another placement class."
+
 echo "=== Assertion 12c: worker API URL and key wiring (#1529, #1578) ==="
 WORKER_API_CHECK="$TMP/check_worker_api.py"
 cat > "$WORKER_API_CHECK" <<'PYEOF'
@@ -854,7 +1187,11 @@ assert_worker_api() {
   [[ -f "$manifest" ]] || fail "$name: worker.yaml did not render"
   [[ -f "$secret_manifest" ]] || fail "$name: secrets.yaml did not render"
   local error
-  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" "${key_args[@]}" 2>&1)"; then
+  # `${a[@]+"${a[@]}"}` rather than a bare `"${key_args[@]}"`: expanding an EMPTY
+  # array under `set -u` is an "unbound variable" error until bash 4.4, and macOS
+  # ships 3.2. key_args is empty for every non-operator key source, which is most
+  # of the call sites below.
+  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" ${key_args[@]+"${key_args[@]}"} 2>&1)"; then
     fail "$name: $error"
   fi
 }
@@ -950,4 +1287,4 @@ print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}"
 PYEOF
 
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; and the security probe uses the configured RustFS port in DATATIER_TARGETS."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; and the security probe uses the configured RustFS port in DATATIER_TARGETS."

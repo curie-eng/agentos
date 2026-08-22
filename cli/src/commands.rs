@@ -3485,7 +3485,32 @@ pub fn normalize_deploy_api_key(api_key: Option<String>) -> Option<String> {
     api_key.filter(|k| !k.trim().is_empty())
 }
 
-pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+pub struct PreparedDeploy {
+    client: ApiClient,
+    outcome: crate::api::PreparedDeployOutcome,
+    plugin_name: String,
+    label: String,
+    env: String,
+    requested_repo: Option<String>,
+    connect_hint: String,
+    step: crate::ui::Step,
+}
+
+impl PreparedDeploy {
+    pub fn agent_id(&self) -> &str {
+        &self.outcome.agent.id
+    }
+
+    pub fn agent_name(&self) -> &str {
+        &self.outcome.agent.name
+    }
+
+    pub fn version_id(&self) -> &str {
+        &self.outcome.version.id
+    }
+}
+
+pub async fn prepare_deploy(opts: DeployOpts) -> Result<PreparedDeploy> {
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -3565,10 +3590,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // the sandbox (ADR-0009, #429). The value never appears in argv.
     let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for name in &opts.secret {
-        let value = std::env::var(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or(crate::secrets::get_value(name)?);
+        let value = crate::secrets::resolve_env_or_saved(name)?;
         match value {
             Some(v) => {
                 secrets.insert(name.clone(), v);
@@ -3601,28 +3623,62 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     let cl = ui.checklist();
     let step = cl.step(&format!("deploying {plugin_name} as {agent_name}"));
     let outcome = match client
-        .deploy(
+        .prepare_deploy(
             &agent_name,
             opts.slack_channel
                 .as_deref()
                 .or_else(|| resolved.as_ref().and_then(|r| r.slack_channel.as_deref())),
             &label,
             &created_by,
-            env,
             archive,
             &secrets,
             opts.repo.as_deref(),
         )
         .await
     {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            step.fail("failed");
+            if crate::exit::is_transient_reqwest(&err) {
+                return Err(crate::exit::operator_context(err, opts.connect_hint, None));
+            }
+            return Err(err);
+        }
+    };
+
+    Ok(PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env: env.to_string(),
+        requested_repo: opts.repo,
+        connect_hint: opts.connect_hint,
+        step,
+    })
+}
+
+pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
+    let ui = crate::ui::ui();
+    let PreparedDeploy {
+        client,
+        outcome,
+        plugin_name,
+        label,
+        env,
+        requested_repo,
+        connect_hint,
+        step,
+    } = prepared;
+    let outcome = match client.activate_deploy(outcome, &env).await {
         Ok(outcome) => {
-            step.done(env);
+            step.done(&env);
             outcome
         }
         Err(err) => {
             step.fail("failed");
             if crate::exit::is_transient_reqwest(&err) {
-                return Err(crate::exit::operator_context(err, opts.connect_hint, None));
+                return Err(crate::exit::operator_context(err, connect_hint, None));
             }
             return Err(err);
         }
@@ -3638,8 +3694,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // which repository's pushes deploy this agent produced no output at all.
     // The value read here is the one the API stored, not the one asked for, so
     // a bind the platform dropped falls to the warning above instead (#1212).
-    let bound_repo = opts
-        .repo
+    let bound_repo = requested_repo
         .as_deref()
         .filter(|want| outcome.agent.repo_full_name.as_deref() == Some(*want));
     if let Some(repo) = bound_repo {
@@ -3662,7 +3717,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     Ok(DeployOutput {
         plugin_name,
         label,
-        env: env.to_string(),
+        env,
         agent_name: outcome.agent.name,
         agent_id: outcome.agent.id,
         version_label: outcome.version.version_label,
@@ -3675,6 +3730,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
         deployment_environment: outcome.deployment.environment,
         deployment_status: outcome.deployment.status,
     })
+}
+
+pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
+    deploy_prepared(prepare_deploy(opts).await?).await
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment

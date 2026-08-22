@@ -11,17 +11,19 @@
 # and that dir sat on the `bundles` emptyDir the untrusted `runner` container
 # also mounts. The acceptance criterion is a RUNTIME exec:
 #   kubectl exec <sandbox> -c runner -- find /bundles -name config.json   # empty
-# This harness makes that check one command.
+# This harness makes that check and the API Service NodePort contract one
+# command.
 #
 # THE PATTERN (reusable -- this is NOT a #56 one-off)
 # ---------------------------------------------------
 # 1. Install a trimmed chart slice on k8scratch with RustFS and agent sandbox.
-# 2. Seed a real bundle object into RustFS.
-# 3. Render the SandboxTemplate.spec.podTemplate into a BOUND sandbox Pod
+# 2. Assert the API Service pinned and auto allocated NodePort cases.
+# 3. Seed a real bundle object into RustFS.
+# 4. Render the SandboxTemplate.spec.podTemplate into a BOUND sandbox Pod
 #    (CURIE_BUNDLE_REF pointing at the seeded object) and apply it -- so the
 #    real bundle-fetch/bundle-extract init containers actually run.
-# 4. Wait for the init pair to complete and the runner container to be Running.
-# 5. `kubectl exec` into the runner and ASSERT on what it can see.
+# 5. Wait for the init pair to complete and the runner container to be Running.
+# 6. `kubectl exec` into the runner and ASSERT on what it can see.
 #
 # HOW TO ADD ANOTHER RUNTIME ASSERTION
 # ------------------------------------
@@ -40,7 +42,7 @@ RELEASE="e2eharness"
 CHART="charts/curie"
 KEEP=0
 FORCE=0
-RUNNER_IMAGE=""
+RUNNER_IMAGE="${CURIE_CHART_E2E_RUNNER_IMAGE:-}"
 EXPECT_VULNERABLE=0
 POD_NAME="e2e-bound-sandbox"
 BUNDLE_REF="e2e/probe.tgz"
@@ -49,10 +51,11 @@ usage() {
   cat <<'EOF'
 Usage: scripts/chart-runtime-e2e.sh [options]
 
-Stands up a trimmed Curie chart slice on the k8scratch cluster, seeds a real
-bundle into RustFS, renders a bound agent-sandbox Pod, runs its bundle-fetch/
-extract init containers, and execs the runner to assert the #56 credential is
-NOT readable off the shared bundle volume (and the bundle really was provisioned).
+Stands up a trimmed Curie chart slice on the k8scratch cluster, proves the API
+Service pinned and auto allocated NodePort cases, seeds a real bundle into
+RustFS, renders a bound agent-sandbox Pod, runs its bundle-fetch/extract init
+containers, and execs the runner to assert the #56 credential is NOT readable
+off the shared bundle volume (and the bundle really was provisioned).
 
 Options:
   --namespace <ns>       Namespace to use (default: curie-e2eharness)
@@ -69,6 +72,11 @@ Options:
   --keep                 Skip teardown (leave namespace + release for debugging).
   --force                Allow running against a non-k8scratch kube context.
   --help                 Show this help.
+
+Environment:
+  CURIE_CHART_E2E_RUNNER_IMAGE
+                         Runner image fallback for callers that cannot forward
+                         flags. --runner-image takes precedence when supplied.
 EOF
 }
 
@@ -104,6 +112,9 @@ else
 fi
 SANDBOX_TEMPLATE="$FULLNAME-runner"
 RUSTFS_SVC="$FULLNAME-rustfs"
+API_SERVICE="$FULLNAME-api"
+PLATFORM_PRIORITY_CLASS="$FULLNAME-platform"
+SANDBOX_PRIORITY_CLASS="$FULLNAME-sandbox"
 SECRET_NAME="$FULLNAME-secrets"
 RUSTFS_BUCKET="curie-bundles"
 RUSTFS_ACCESS_KEY="rustfs"
@@ -147,7 +158,11 @@ teardown() {
     return $rc
   fi
   banner "TEARDOWN"
+  [[ -n "${JSON_DIR:-}" ]] && rm -rf "$JSON_DIR"
   helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
+  kubectl delete priorityclass \
+    "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
+    --ignore-not-found --wait=true >/dev/null 2>&1 || true
   # Only ever delete a namespace THIS script created (carries the ownership label).
   if ns_is_owned "$NAMESPACE"; then
     kubectl delete ns "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
@@ -220,10 +235,30 @@ def bind_ref(container):
             e["name"] = "CURIE_BUNDLE_REF"
             e["value"] = bundle_ref
 
+# The runner reads CURIE_PLUGIN_DIR, which the SandboxTemplate bakes as
+# `/unused` for an unbound warm pod (the worker overrides it per claim). Binding
+# only CURIE_BUNDLE_REF therefore fetched and extracted the bundle into
+# /bundles/current -- both init logs proved it -- and then booted the runner
+# pointed at `/unused`, where it exits 1 on PluginBundleError one second later.
+# The wait loop reported that as "did not reach (init Completed + runner
+# Running) within 180s", which reads like a slow node, so the assertion below
+# could never pass. Point the runner at the extracted bundle too.
+def bind_plugin_dir(container, mount="/bundles/current"):
+    env = container.setdefault("env", [])
+    for e in env:
+        if e.get("name") == "CURIE_PLUGIN_DIR":
+            e.clear()
+            e["name"] = "CURIE_PLUGIN_DIR"
+            e["value"] = mount
+            return
+    env.append({"name": "CURIE_PLUGIN_DIR", "value": mount})
+
 for c in spec.get("initContainers", []):
     bind_ref(c)
 for c in spec.get("containers", []):
     bind_ref(c)
+    if c.get("name") == "runner":
+        bind_plugin_dir(c)
 
 # Use the default ServiceAccount (avoids a missing-SA scheduling failure).
 spec.pop("serviceAccountName", None)
@@ -293,6 +328,14 @@ print("yes" if (init_ok and runner_running) else "no")
       kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
       echo "--- bundle-extract logs"
       kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
+      # The runner's own logs, which this block used to omit. When the runner is
+      # the container that failed -- the common case, since the init pair either
+      # completes or fails loudly -- its log is the only place the real reason
+      # appears, and without it the timeout above is the entire diagnosis.
+      echo "--- runner logs"
+      kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner 2>/dev/null \
+        || kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner --previous 2>/dev/null \
+        || true
       fail "bound sandbox did not reach (init Completed + runner Running) within ${timeout}s"
     fi
     sleep "$interval"
@@ -364,6 +407,9 @@ if kubectl get ns "$NAMESPACE" >/dev/null 2>&1; then
   if ns_is_owned "$NAMESPACE"; then
     banner "namespace $NAMESPACE already exists (harness-owned) -- cleaning up before run"
     helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
+    kubectl delete priorityclass \
+      "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
     kubectl delete ns "$NAMESPACE" --wait=true --timeout=120s >/dev/null 2>&1 || true
   else
     fail "namespace $NAMESPACE already exists and is NOT owned by this harness (missing label ${OWNED_LABEL}=true). Remove it manually or pick another --namespace."
@@ -375,17 +421,39 @@ fi
 create_owned_ns "$NAMESPACE"
 
 banner "INSTALL trimmed chart"
+CHART_VALUES=(
+  -f "$CHART_PATH/values-e2e-nogvisor.yaml"
+  -f "$CHART_PATH/values-e2e-harness.yaml"
+  --set api.deploy=true
+  --set api.replicas=0
+  --set api.service.type=NodePort
+  # The shared scratch cluster may already allocate the chart's public default.
+  --set api.service.nodePort=30181
+  # PriorityClasses are cluster scoped. Give this release unique names and let
+  # the chart create them so the harness never borrows another release's state.
+  --set priorityClasses.platform.create=true
+  --set-string priorityClasses.platform.name="$PLATFORM_PRIORITY_CLASS"
+  --set priorityClasses.sandbox.create=true
+  --set-string priorityClasses.sandbox.name="$SANDBOX_PRIORITY_CLASS"
+  # The trimmed overlay disables these backing stores. The zero-replica API
+  # still renders their environment, so satisfy the chart's BYO-host guards
+  # without creating reachable dependencies.
+  --set-string postgres.host=postgres.example.com
+  --set-string valkey.host=valkey.example.com
+)
 install_chart() {
   helm install "$RELEASE" "$CHART_PATH" \
     -n "$NAMESPACE" --no-hooks \
-    -f "$CHART_PATH/values-e2e-nogvisor.yaml" \
-    -f "$CHART_PATH/values-e2e-harness.yaml"
+    "${CHART_VALUES[@]}"
 }
 # k8scratch is shared and slightly flaky: a spurious "namespaces not found" at
 # install is usually API churn, so retry ONCE before failing.
 if ! install_chart; then
   echo "helm install failed once (likely transient API churn on shared node); retrying in 5s..."
   sleep 5
+  kubectl delete priorityclass \
+    "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
+    --ignore-not-found --wait=true >/dev/null 2>&1 || true
   # Recreate the labeled namespace before retrying; only ever delete our own.
   if ns_is_owned "$NAMESPACE"; then
     kubectl delete ns "$NAMESPACE" --wait=true --timeout=60s >/dev/null 2>&1 || true
@@ -395,7 +463,117 @@ if ! install_chart; then
 fi
 
 # --------------------------------------------------------------------------
-# 2. Wait for RustFS Running. Gate on the pod, not Helm release status.
+# 2. Assert the API Service pinned NodePort, then restore auto allocation.
+# --------------------------------------------------------------------------
+banner "ASSERT API Service pinned NodePort"
+API_SERVICE_JSON="$(kubectl get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
+python3 - "$API_SERVICE_JSON" <<'PY' || exit 1
+import json
+import sys
+
+service = json.loads(sys.argv[1])
+service_type = service.get("spec", {}).get("type")
+ports = [port for port in service.get("spec", {}).get("ports", []) if port.get("name") == "http"]
+if service_type != "NodePort":
+    print(f"FAIL: live API Service type {service_type!r}, expected 'NodePort'", file=sys.stderr)
+    sys.exit(1)
+if len(ports) != 1:
+    print(f"FAIL: live API Service has {len(ports)} http ports, expected 1", file=sys.stderr)
+    sys.exit(1)
+node_port = ports[0].get("nodePort")
+if node_port != 30181:
+    print(f"FAIL: live API Service nodePort {node_port!r}, expected 30181", file=sys.stderr)
+    sys.exit(1)
+print("live API Service: type=NodePort nodePort=30181")
+PY
+
+banner "UPGRADE API Service to auto allocated NodePort"
+helm upgrade "$RELEASE" "$CHART_PATH" \
+  -n "$NAMESPACE" --no-hooks \
+  "${CHART_VALUES[@]}" \
+  --set-string api.service.nodePort=
+
+STORED_VALUES_JSON="$(helm get values "$RELEASE" -n "$NAMESPACE" -o json)"
+python3 - "$STORED_VALUES_JSON" <<'PY' || exit 1
+import json
+import sys
+
+values = json.loads(sys.argv[1])
+service = values.get("api", {}).get("service", {})
+if "nodePort" not in service or service["nodePort"] != "":
+    print(
+        f"FAIL: stored api.service.nodePort is {service.get('nodePort')!r}, expected an explicit empty string",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print('stored override: api.service.nodePort=""')
+PY
+
+API_SERVICE_MANIFEST="$(helm get manifest "$RELEASE" -n "$NAMESPACE" | awk -v name="$API_SERVICE" '
+  BEGIN { RS = "---" }
+  {
+    is_service = 0
+    has_name = 0
+    line_count = split($0, lines, "\n")
+    for (i = 1; i <= line_count; i++) {
+      line = lines[i]
+      if (line ~ /^[[:space:]]*kind:[[:space:]]*Service[[:space:]]*$/) {
+        is_service = 1
+      }
+      candidate = line
+      if (sub(/^[[:space:]]*name:[[:space:]]*/, "", candidate)) {
+        sub(/[[:space:]]*$/, "", candidate)
+        if (candidate == name) {
+          has_name = 1
+        }
+      }
+    }
+    if (is_service && has_name) {
+      print
+      found = 1
+      exit
+    }
+  }
+  END { if (!found) exit 1 }
+')" || fail "API Service is absent from the stored release manifest"
+if grep -q '^[[:space:]]*nodePort:' <<<"$API_SERVICE_MANIFEST"; then
+  fail "stored release manifest renders nodePort after the empty override"
+fi
+echo "stored release manifest: API Service nodePort omitted"
+
+kubectl delete service "$API_SERVICE" -n "$NAMESPACE" --wait=true
+if kubectl get service "$API_SERVICE" -n "$NAMESPACE" >/dev/null 2>&1; then
+  fail "API Service still exists after deletion"
+fi
+echo "live API Service deleted before auto allocation proof"
+
+printf '%s\n' "$API_SERVICE_MANIFEST" | kubectl create -n "$NAMESPACE" -f -
+API_SERVICE_JSON="$(kubectl get service "$API_SERVICE" -n "$NAMESPACE" -o json)"
+python3 - "$API_SERVICE_JSON" <<'PY' || exit 1
+import json
+import sys
+
+service = json.loads(sys.argv[1])
+service_type = service.get("spec", {}).get("type")
+ports = [port for port in service.get("spec", {}).get("ports", []) if port.get("name") == "http"]
+if service_type != "NodePort":
+    print(f"FAIL: live API Service type {service_type!r}, expected 'NodePort'", file=sys.stderr)
+    sys.exit(1)
+if len(ports) != 1:
+    print(f"FAIL: live API Service has {len(ports)} http ports, expected 1", file=sys.stderr)
+    sys.exit(1)
+node_port = ports[0].get("nodePort")
+if not isinstance(node_port, int) or not 30000 <= node_port <= 32767:
+    print(
+        f"FAIL: live auto allocated API Service nodePort {node_port!r} is outside 30000 through 32767",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print(f"live API Service auto allocated nodePort={node_port}")
+PY
+
+# --------------------------------------------------------------------------
+# 3. Wait for RustFS Running. Gate on the pod, not Helm release status.
 # --------------------------------------------------------------------------
 banner "WAIT RustFS Running"
 if ! kubectl wait --for=condition=Ready pod \
@@ -407,7 +585,7 @@ if ! kubectl wait --for=condition=Ready pod \
 fi
 
 # --------------------------------------------------------------------------
-# 3. Seed a real bundle into RustFS
+# 4. Seed a real bundle into RustFS
 # --------------------------------------------------------------------------
 banner "SEED bundle into RustFS"
 # Build a VALID tar.gz (bundle-extract runs `set -eu; tar -xzf`, so a malformed
@@ -418,7 +596,13 @@ cat > "$SEED_DIR/myplugin/.claude-plugin/plugin.json" <<'JSON'
 {"name":"e2e-probe","version":"0.0.0"}
 JSON
 tar -czf "$SEED_DIR/probe.tgz" -C "$SEED_DIR" myplugin
-PROBE_B64="$(base64 -w0 "$SEED_DIR/probe.tgz" 2>/dev/null || base64 "$SEED_DIR/probe.tgz" | tr -d '\n')"
+# `base64 < file | tr -d '\n'` rather than GNU's `base64 -w0 file`: BSD base64
+# (macOS) rejects both the `-w` flag and a bare filename operand -- it wants
+# `-i file` -- so the previous `-w0` form fell through to a fallback that failed
+# just as hard with `base64: invalid argument <path>`, blocking this script on a
+# Mac at the seed step. Reading from stdin and stripping newlines here is the
+# form both userlands accept, and `binaryData` below needs the single line.
+PROBE_B64="$(base64 < "$SEED_DIR/probe.tgz" | tr -d '\n')"
 
 # ConfigMap carrying the archive plus a one shot AWS CLI Job that creates the
 # bucket and uploads the object using path addressing.
@@ -488,7 +672,7 @@ fi
 echo "bundle seeded: $BUNDLE_REF"
 
 # --------------------------------------------------------------------------
-# 4. Render + apply the bound sandbox Pod
+# 5. Render + apply the bound sandbox Pod
 # --------------------------------------------------------------------------
 banner "RENDER bound sandbox Pod from SandboxTemplate $SANDBOX_TEMPLATE"
 if [[ -n "$RUNNER_IMAGE" ]]; then
@@ -496,9 +680,18 @@ if [[ -n "$RUNNER_IMAGE" ]]; then
 else
   echo "runner image: real (from SandboxTemplate)"
 fi
-TEMPLATE_JSON="$(mktemp /tmp/e2e-sandboxtemplate.XXXXXX.json)"
+# One temp DIRECTORY rather than two temp files whose templates carry a suffix
+# after the X's. BSD mktemp only substitutes X's at the END of the template, so
+# `mktemp /tmp/e2e-sandboxtemplate.XXXXXX.json` on macOS creates a file named
+# literally `e2e-sandboxtemplate.XXXXXX.json`: no randomization, a predictable
+# /tmp path, and a second run of this script fails for the life of the machine
+# with `mkstemp failed ...: File exists`. `mktemp -d` with the X's last is
+# portable, keeps the .json names the kubectl calls below read better with, and
+# gives teardown one thing to remove.
+JSON_DIR="$(mktemp -d /tmp/e2e-json.XXXXXX)"
+TEMPLATE_JSON="$JSON_DIR/sandboxtemplate.json"
 kubectl get sandboxtemplate "$SANDBOX_TEMPLATE" -n "$NAMESPACE" -o json > "$TEMPLATE_JSON"
-POD_JSON="$(mktemp /tmp/e2e-bound-pod.XXXXXX.json)"
+POD_JSON="$JSON_DIR/bound-pod.json"
 build_bound_pod "$TEMPLATE_JSON" > "$POD_JSON"
 kubectl apply -n "$NAMESPACE" -f "$POD_JSON"
 
@@ -507,7 +700,7 @@ wait_for_init_complete
 echo "bound sandbox ready: init containers Completed, runner Running"
 
 # --------------------------------------------------------------------------
-# 5. Assertions
+# 6. Assertions
 # --------------------------------------------------------------------------
 banner "ASSERT runtime security (#56)"
 run_assertions
@@ -522,7 +715,7 @@ else
   echo "mode: default (expect secure)"
 fi
 if [[ "$RESULT" == "PASS" ]]; then
-  echo "PASS"
+  echo "PASS: API Service NodePort and runtime security assertions"
   exit 0
 else
   echo "FAIL"
