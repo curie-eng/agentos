@@ -278,13 +278,24 @@ happened on. Turning "you need a real cluster" into "two cores is enough" moves
 Curie from an infrastructure commitment to a thing someone tries on a spare box,
 which is the difference between an evaluation and an install.
 
-**It converts isolation from a cost centre into a free property.** Curie's
-strongest security claim is one sandbox per conversation with hard rails
-(ADR-0006, ADR-0008), and its most expensive property is the same sentence. The
-cost is not the isolation -- an idle runner is 0.043% of a core -- it is the
-17-second boot and the 59 idle minutes. Remove those and the per-conversation
-sandbox becomes cheaper than pooling conversations would have been, so the
-strongest isolation posture and the best economics stop being a trade.
+**It stops the correctness model from costing what it costs.** A sandbox per
+conversation is not, in this repository's records, a security boundary. It falls
+out of [ADR-0013](0013-concurrency-and-delivery-model.md)'s **one live session per
+thread**, which is a routing CAS on a Valkey lock and exists to stop duplicate
+side effects; the security boundary is the tenant, per
+[ADR-0008](0008-multi-tenancy.md)'s namespace-per-tenant compute, whose stated
+reason is "untrusted, prompt-injectable code that holds customer credentials" and
+which says nothing about threads. An earlier draft of this section called the
+per-conversation sandbox Curie's strongest security claim; that was this ADR
+inventing a rationale the repository does not assert, and it is corrected here
+because it matters for what may and may not be traded away.
+
+What that reframes: the expensive thing is a *correctness* invariant, not a
+security one, and it is expensive for reasons that have nothing to do with
+either. The cost is not the separation -- an idle runner is 0.043% of a core --
+it is the 17-second boot and the 59 idle minutes. Remove those and the
+correctness model stops being the reason capacity is scarce, without anyone
+having to argue about weakening it.
 
 **Under the hosted multi-tenant future ADR-0008 anticipates, residency is
 gross margin.** Idle sandboxes are the dominant unit cost of a hosted Curie,
@@ -751,6 +762,36 @@ Two things this measurement understates, both in the same direction:
   which is not, and three attempts of it is the opaque `runner-error` this ADR
   opens with. The failure mode is not that throughput is low; it is that the
   conversation is dropped.
+
+### A released pod is destroyed, not handed to the next conversation
+
+Decision 5 releases a sandbox as soon as a conversation goes quiet, which is a
+new opportunity for a pod that served one conversation to serve another. Holding
+for an hour never had that opportunity, so it was checked rather than assumed:
+bind, write a marker inside the pod, release, bind again, look for the marker.
+
+```
+conversation A bound  pod=iso-pool-44nb6  uid=0dc8eb2b
+marker written inside A: curie-iso-marker-A
+A released
+A's pod destroyed after release: True (4s)
+conversation B bound  pod=iso-pool-9dc79  uid=6d959e0c
+
+same pod name as A : no
+same pod UID as A  : no
+A's marker visible : no
+```
+
+**A pod serves at most one conversation and is destroyed on release**, in four
+seconds, and the pool replaces it with a fresh one. So the separation that falls
+out of ADR-0013's one-live-session-per-thread survives releasing aggressively; it
+is not something short residency trades away.
+
+What this decision *does* change on that axis is two things, both recorded
+elsewhere in this ADR rather than hidden here: a warm pool pod carries no runner
+token until decision 2 mints one, which is why decision 3 cannot land first; and
+decision 4's node-local bundle cache is a new shared surface that this ADR
+explicitly declines to decide.
 
 ### A third, tighter density cap surfaced while testing
 
