@@ -643,6 +643,90 @@ Correctness held in every regime: 60 of 60 conversations returned a terminal
 frame, no failures, no deadline crossings. What varied was only how long the
 claim took.
 
+#### That comparison measured the wrong baseline
+
+The arms above are not "before and after". **Both released the claim as soon as
+the turn returned**, so both already ran with a residency of effectively zero.
+The shipped default is `routeTtlSeconds: 3600`. So the cold arm was not the
+product's behaviour; it was an already-optimised baseline that happens to isolate
+one variable, the claim path, and it isolates it well. It just is not what a
+deployment does today.
+
+Against the shipped default the binding constraint is not the claim at all, it is
+the quota divided by the residency. Eight sandbox slots, each held for the hour
+after its last message, is **eight one-shot conversations per hour**, and the
+chart says what happens next:
+
+> At the 3600s default that sandbox holds a slot for the remaining ~59 minutes,
+> and with `agentSandbox.warmPool.replicas: 0` every new thread cold-creates
+> alongside it. On a small node enough of them accumulate that a cold create
+> stops fitting inside `claimTimeoutSeconds`, and the turn escalates as an opaque
+> `runner-error`.
+
+**The failure this ADR opens with is that sentence.** It is not a burst problem;
+it is idle accumulation. Slots fill with conversations nobody is talking to, and
+the next real one cannot get a sandbox.
+
+Which reorders what this decision buys:
+
+| | bound by | measured or arithmetic |
+| --- | --- | --- |
+| shipped today | quota / residency: 8 slots at 3600s | **8 per hour**, arithmetic from the defaults |
+| with short residency | claim path: 8 slots turning over | **48.3 per minute**, the cold arm above |
+| with short residency and pre-binding | refill rate | **46.7 per minute**, the pre-bound arm above |
+
+So the capacity gain is roughly **two orders of magnitude**, and it comes from
+**decision 5**, not from pre-binding. Pre-binding's contribution is that it makes
+decision 5 affordable: shortening residency without a cheap re-bind trades a
+compute saving for a token bill, since a resumed thread is cache-cold and a
+scaffolded bundle already re-sends 20,875 input tokens per turn.
+
+The earlier reading -- "pre-binding buys latency and not throughput" -- is true of
+the comparison as run and false as a summary of the decision. Stated correctly:
+**pre-binding does not raise capacity directly; it removes the reason capacity is
+being spent on idleness.** What remains genuinely unimproved is a simultaneous
+burst larger than the pool, which the three regimes above do measure, and which
+was never the failure mode this ADR set out to fix.
+
+#### The residency claim, measured
+
+Rather than leave that as arithmetic, it was run. Fourteen one-shot
+conversations, one arriving every 3 seconds, against the shipped 8-slot quota,
+each counted only on a terminal ACI frame. The only difference between the arms
+is whether a conversation keeps its sandbox after its turn: 45 seconds, which is
+`routeTtlSeconds` scaled down by 80, against releasing immediately.
+
+| | served | **blocked by quota** | throughput |
+| --- | --- | --- | --- |
+| holds its sandbox 45s | 14/14 | **6** | **6.9 / min** |
+| releases at end of turn | 14/14 | **0** | **18.8 / min** |
+
+The claim latencies are the whole story:
+
+```
+holding:   1-8    4.5 - 7.2s     took the eight slots immediately
+          12-14   ~25.4s         waited
+           9-11   ~45.5s         waited out a full residency window
+releasing: 1-14   4.8 - 6.4s     uniform, nothing waited
+```
+
+**The quota wall appears only when the sandbox is held.** Six of fourteen
+conversations hit `exceeded quota: curie-sandbox-quota` in the holding arm and
+none did when the slot was released, which is the mechanism this section
+predicted, observed directly rather than inferred.
+
+Two things this measurement understates, both in the same direction:
+
+- **The hold was 45 seconds, not 3600.** At the shipped TTL a slot frees once an
+  hour, so the eight of them serve **8 conversations per hour** against the 18.8
+  per minute measured with immediate release. The measured 2.7x is the scaled
+  figure; the shipped ratio is roughly **140x**.
+- **Everything eventually succeeded here because the wait fit.** A 45-second wait
+  is inside `claimTimeoutSeconds: 90`. At a 3600-second hold the wait is an hour,
+  which is not, and three attempts of it is the opaque `runner-error` this ADR
+  opens with. The failure mode is not that throughput is low; it is that the
+  conversation is dropped.
+
 ### A third, tighter density cap surfaced while testing
 
 The failed with-env claim reported:

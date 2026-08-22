@@ -102,3 +102,23 @@ on throughput (46.7 against 48.3 conversations per minute) and had a worse tail
 were served sub-second. Sized at or above the burst, or fed arrivals slower than
 the refill, every claim came in under 0.22s. Pool depth against arrival rate is
 the whole variable.
+
+## Residency harness (`capacity_lib.py`, `capacity_run.py`)
+
+Answers the question the load harness above got wrong by measuring the wrong
+baseline: on the shipped defaults, is capacity decided by the claim path or by
+residency? Fourteen one-shot conversations, one arriving every 3s, against the
+shipped 8-slot quota; the only difference between arms is whether a conversation
+keeps its sandbox after the turn.
+
+```bash
+export BUNDLE_REF=bundles/<agent-id>/<version-id>.tar.gz
+export CAP_CONTEXT=curie-cap            # asserted; refuses any other context
+N=14 HOLD=45 INTERVAL=3 python3 capacity_run.py
+```
+
+Results in `capacity-results.json`. Measured: holding the sandbox 45s served 6.9
+conversations per minute with **6 of 14 blocked by `exceeded quota`**; releasing
+at end of turn served 18.8 per minute with **none** blocked. `HOLD` is
+`routeTtlSeconds` scaled down by 80, so the shipped ratio is far wider than the
+2.7x this prints.
