@@ -610,7 +610,16 @@ enum DevAction {
     /// exec-assert the runner's view -- the one-command way to satisfy a
     /// chart/sandbox runtime acceptance criterion static checks cannot (#199,
     /// `bash scripts/chart-runtime-e2e.sh`).
-    ChartRuntimeE2e,
+    ChartRuntimeE2e {
+        /// Allow running against a kube context other than `k8scratch`.
+        ///
+        /// The script refuses a non-`k8scratch` context and names `--force` as
+        /// the override. Without this passthrough that override was unreachable
+        /// from the `curie` surface, so a contributor whose scratch context has
+        /// another name could not run this gate the documented way at all.
+        #[arg(long)]
+        force: bool,
+    },
     /// Lint the interface catalog docs (`bash scripts/check-docs.sh`).
     DocsLint,
     /// Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`).
@@ -2124,8 +2133,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 commands::dev_e2e_ci_selection(&path, base.as_deref(), head.as_deref(), push).await
             }
-            DevAction::ChartRuntimeE2e => {
-                commands::dev_script("scripts/chart-runtime-e2e.sh", &[]).await
+            DevAction::ChartRuntimeE2e { force } => {
+                let args: &[&str] = if force { &["--force"] } else { &[] };
+                commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -4121,7 +4131,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
-                action: DevAction::ChartRuntimeE2e
+                action: DevAction::ChartRuntimeE2e { force: false }
+            })
+        ));
+        // The script's context guard names `--force` as its only override, so the
+        // flag has to survive the `curie dev` hop or the guard is unoverridable
+        // through the documented entry point.
+        let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
+            .expect("dev chart-runtime-e2e --force should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::ChartRuntimeE2e { force: true }
             })
         ));
     }
