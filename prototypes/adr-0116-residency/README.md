@@ -122,3 +122,22 @@ conversations per minute with **6 of 14 blocked by `exceeded quota`**; releasing
 at end of turn served 18.8 per minute with **none** blocked. `HOLD` is
 `routeTtlSeconds` scaled down by 80, so the shipped ratio is far wider than the
 2.7x this prints.
+
+## Demo (`demo_run.py`)
+
+Drives the recording in `docs/demo/`. Five acts on one cluster: a cold create on
+a quiet node, the same claim under reproduced contention, a version-keyed pool
+warming, an env-free claim binding, and then the capacity arm -- fourteen
+one-shot conversations into an 8-slot quota, held versus released.
+
+```bash
+export BUNDLE_REF=bundles/<agent-id>/<version-id>.tar.gz
+export DEMO_CONTEXT=curie-demo2 CAP_CONTEXT=curie-demo2   # both asserted
+python3 demo_run.py
+```
+
+Recorded run (`demo-results.json`): cold create 7.12s quiet and 63.50s under
+contention, pre-bound 0.16s and 1.41s; holding a sandbox 45s served 12 of 14 with
+10 blocked by quota at 0.2/min, releasing served 14 of 14 with none blocked at
+19.2/min. Two conversations were dropped outright in the holding arm, which is
+the failure this ADR is about rather than a slow one.

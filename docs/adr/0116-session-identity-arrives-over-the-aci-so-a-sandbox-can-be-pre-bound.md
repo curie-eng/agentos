@@ -203,11 +203,36 @@ already-bundle-loaded runner.
    the per-pod critical path in favour of a node-local, digest-keyed,
    read-only cache. The `aws-cli` container leaves the boot path with them.
 
-5. **Residency becomes short because re-binding is cheap.** With a sub-second
-   bind, `routeTtlSeconds` stops being the term that decides how many sandboxes
-   exist. An idle thread releases its runner and re-binds on its next message.
+5. **Residency becomes short because re-binding is cheap, and its length is
+   derived from the prompt cache TTL rather than chosen.** With a sub-second bind,
+   `routeTtlSeconds` stops being the term that decides how many sandboxes exist.
+   An idle thread releases its runner and re-binds on its next message.
    ADR-0003's rehydrate-from-history remains the correctness contract for a
    resumed thread; this decision only makes the release affordable.
+
+   **A cheap re-bind fixes the latency of a resume and not its token cost.** A
+   pre-bound pod is a *fresh* runner with no transcript, so a returning thread
+   still rehydrates, and ADR-0003 records that a rehydrate is cache-cold. Measured
+   here: 20,875 input tokens per turn on a *scaffolded* bundle, before any
+   conversation history is replayed on top. So residency is not a quantity to
+   drive toward zero. It has a natural ceiling and a natural floor:
+
+   - **Past the prompt cache TTL, holding buys nothing on tokens.** The cache is
+     gone whether the sandbox is held or not, so every second beyond it spends a
+     quota slot for the avoided rehydration overhead alone.
+   - **Below the TTL, releasing throws away a real saving.** ADR-0003 measured
+     `cache_read_input_tokens = 16045` inside one claim, exactly the value the
+     first call created.
+
+   So the target is **on the order of the cache TTL**, which makes today's 3600s
+   wrong in a second way this ADR had not named: it is not merely wasteful of
+   slots, it is far longer than the window in which holding pays for itself.
+
+   The trade also depends on traffic shape, and the shape favours releasing. The
+   chart's own note is that triage traffic is mostly one-shot, and a one-shot
+   conversation has no second turn, so there is no cache to lose and short
+   residency costs it nothing. A long multi-turn thread is where releasing trades
+   tokens for slots, and that is the case an adaptive value should protect.
 
 6. **The critical path declares a real resource share, and the timeouts on it
    survive starvation.** Runner and bundle containers request from measurement
@@ -827,6 +852,34 @@ counts it, which decision 6 is what fixes.
   becomes the first thing a busy release hits, and it does so at eight sandboxes
   on the shipped numbers.
 
+- **There is a way to keep the prompt cache without holding the sandbox, and it
+  is worth a decision of its own.** Anthropic's prompt cache is server-side and
+  keyed by the request prefix, not by the process that sends it, so a *different*
+  runner reconstructing the *same* prefix hits it. Today a resumed thread cannot,
+  for two reasons visible in
+  [`runner/.../history.py`](../../runner/src/curie_runner/history.py): the
+  transcript is delivered as a **boot-prompt preamble** rather than as message
+  history, and it is **truncated to roughly 16 KB**. Both change the prefix, so
+  every resume is a miss.
+
+  Rehydrating as message history with a stable prefix instead would decouple
+  caching from residency entirely: slots could be released aggressively and a
+  returning thread would still hit the cache, within the TTL. That is a change to
+  ADR-0003's rehydrate delivery and to ADR-0029's design, so it belongs in its own
+  record rather than inside decision 5, and it needs the measurements above first.
+  It is called out here because it is the answer to decision 5's main objection,
+  and because the 16 KB bound exists for a reason -- something else has to bound
+  the prompt if the truncation goes.
+
+- **The token cost of a resume is the largest axis this ADR has not measured.**
+  Every figure here for turn cost came from a fake model or a local Ollama, so the
+  input-token side of decision 5 is arithmetic on one measured number (20,875 per
+  turn on a trivial bundle) rather than an observed bill. Three things need a real
+  credential before decision 5's value is set: what a rehydrate actually costs
+  against a warm follow-up, what effective cache TTL the harness's requests carry,
+  and how the replayed transcript grows with conversation length. Choosing
+  `routeTtlSeconds` without them is guessing, and the guess is currently 3600.
+
 - **Pool depth becomes an operational parameter with a sharp edge.** Sized at or
   above the burst, every conversation binds sub-second. Sized below it, the
   surplus conversations cold-create anyway and the tail is worse than having no
@@ -845,6 +898,11 @@ counts it, which decision 6 is what fixes.
   exactly one conversation for the life of that binding.
 
 ## Out of scope
+
+- **An adaptive residency policy.** Decision 5 sets the *shape* of the answer,
+  bounded above by the cache TTL, but a per-thread policy that holds a chatty
+  conversation longer than a one-shot one is a separate decision and wants the
+  measurements above first.
 
 - **The worker's concurrency ceiling.** `max_concurrency` is hardcoded at 16 per
   replica in [`consumer.py`](../../apps/worker/src/curie_worker/consumer.py).
