@@ -158,6 +158,7 @@ teardown() {
     return $rc
   fi
   banner "TEARDOWN"
+  [[ -n "${JSON_DIR:-}" ]] && rm -rf "$JSON_DIR"
   helm uninstall "$RELEASE" -n "$NAMESPACE" --no-hooks >/dev/null 2>&1 || true
   kubectl delete priorityclass \
     "$PLATFORM_PRIORITY_CLASS" "$SANDBOX_PRIORITY_CLASS" \
@@ -234,10 +235,30 @@ def bind_ref(container):
             e["name"] = "CURIE_BUNDLE_REF"
             e["value"] = bundle_ref
 
+# The runner reads CURIE_PLUGIN_DIR, which the SandboxTemplate bakes as
+# `/unused` for an unbound warm pod (the worker overrides it per claim). Binding
+# only CURIE_BUNDLE_REF therefore fetched and extracted the bundle into
+# /bundles/current -- both init logs proved it -- and then booted the runner
+# pointed at `/unused`, where it exits 1 on PluginBundleError one second later.
+# The wait loop reported that as "did not reach (init Completed + runner
+# Running) within 180s", which reads like a slow node, so the assertion below
+# could never pass. Point the runner at the extracted bundle too.
+def bind_plugin_dir(container, mount="/bundles/current"):
+    env = container.setdefault("env", [])
+    for e in env:
+        if e.get("name") == "CURIE_PLUGIN_DIR":
+            e.clear()
+            e["name"] = "CURIE_PLUGIN_DIR"
+            e["value"] = mount
+            return
+    env.append({"name": "CURIE_PLUGIN_DIR", "value": mount})
+
 for c in spec.get("initContainers", []):
     bind_ref(c)
 for c in spec.get("containers", []):
     bind_ref(c)
+    if c.get("name") == "runner":
+        bind_plugin_dir(c)
 
 # Use the default ServiceAccount (avoids a missing-SA scheduling failure).
 spec.pop("serviceAccountName", None)
@@ -307,6 +328,14 @@ print("yes" if (init_ok and runner_running) else "no")
       kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-fetch || true
       echo "--- bundle-extract logs"
       kubectl logs "$POD_NAME" -n "$NAMESPACE" -c bundle-extract || true
+      # The runner's own logs, which this block used to omit. When the runner is
+      # the container that failed -- the common case, since the init pair either
+      # completes or fails loudly -- its log is the only place the real reason
+      # appears, and without it the timeout above is the entire diagnosis.
+      echo "--- runner logs"
+      kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner 2>/dev/null \
+        || kubectl logs "$POD_NAME" -n "$NAMESPACE" -c runner --previous 2>/dev/null \
+        || true
       fail "bound sandbox did not reach (init Completed + runner Running) within ${timeout}s"
     fi
     sleep "$interval"
@@ -651,9 +680,18 @@ if [[ -n "$RUNNER_IMAGE" ]]; then
 else
   echo "runner image: real (from SandboxTemplate)"
 fi
-TEMPLATE_JSON="$(mktemp /tmp/e2e-sandboxtemplate.XXXXXX.json)"
+# One temp DIRECTORY rather than two temp files whose templates carry a suffix
+# after the X's. BSD mktemp only substitutes X's at the END of the template, so
+# `mktemp /tmp/e2e-sandboxtemplate.XXXXXX.json` on macOS creates a file named
+# literally `e2e-sandboxtemplate.XXXXXX.json`: no randomization, a predictable
+# /tmp path, and a second run of this script fails for the life of the machine
+# with `mkstemp failed ...: File exists`. `mktemp -d` with the X's last is
+# portable, keeps the .json names the kubectl calls below read better with, and
+# gives teardown one thing to remove.
+JSON_DIR="$(mktemp -d /tmp/e2e-json.XXXXXX)"
+TEMPLATE_JSON="$JSON_DIR/sandboxtemplate.json"
 kubectl get sandboxtemplate "$SANDBOX_TEMPLATE" -n "$NAMESPACE" -o json > "$TEMPLATE_JSON"
-POD_JSON="$(mktemp /tmp/e2e-bound-pod.XXXXXX.json)"
+POD_JSON="$JSON_DIR/bound-pod.json"
 build_bound_pod "$TEMPLATE_JSON" > "$POD_JSON"
 kubectl apply -n "$NAMESPACE" -f "$POD_JSON"
 
