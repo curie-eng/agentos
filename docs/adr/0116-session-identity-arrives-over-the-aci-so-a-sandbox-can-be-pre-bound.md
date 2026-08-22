@@ -331,6 +331,64 @@ while the measured idle need is two orders of magnitude smaller.
 **Reproduced failures**: `PluginBundleError: invalid plugin bundle at /unused`,
 twice, exactly as the chart's warm-pool comment predicts.
 
+**And a third time, by the repository's own end-to-end harness.** This is the
+strongest evidence in this ADR that the coupling is a trap rather than a
+curiosity, because nobody was testing for it.
+
+`scripts/chart-runtime-e2e.sh` builds a "bound sandbox" pod from the shipped
+SandboxTemplate and asserts it reaches *init containers Completed, runner
+Running*. Its binding step replaces `CURIE_BUNDLE_REF` in every container that
+declares it, and nothing else. So the init pair does its job perfectly -- the
+seeded object is fetched and extracted, and the harness prints both logs proving
+it:
+
+```
+download: s3://curie-bundles/e2e/probe.tgz to ../bundles/.bundle-archive
+extracted bundle 'e2e/probe.tgz' into /bundles/current
+```
+
+and then the runner boots with the template's baked `CURIE_PLUGIN_DIR=/unused`
+and exits 1 one second later. Observed on the pod:
+
+```
+runner:
+  State:      Terminated
+    Reason:   Error
+    Exit Code: 1
+    Started:  22:19:26
+    Finished: 22:19:27
+  Environment:
+    CURIE_PLUGIN_DIR:   /unused
+```
+
+**The bundle is in `/bundles/current` and the runner is told to look at
+`/unused`.** That is decision 1 and decision 3 of this ADR stated as a bug
+report, written independently by whoever built the harness.
+
+Two things compound it, and both are the same shape as the incident this ADR
+opens with. The harness reports the failure as `bound sandbox did not reach
+(init Completed + runner Running) within 180s`, which reads like a slow node.
+And it prints `bundle-fetch` and `bundle-extract` logs on failure but **not the
+runner's**, so the actual `PluginBundleError` never appears in the output at all.
+A correct diagnosis requires describing the pod by hand.
+
+Adding a nine-line `CURIE_PLUGIN_DIR` binding for the runner container made the
+same harness pass end to end on the same cluster, including its runtime security
+assertions:
+
+```
+bound sandbox ready: init containers Completed, runner Running
+    /bundles/current/.claude-plugin/plugin.json
+PASS: API Service NodePort and runtime security assertions
+```
+
+So the defect is confirmed by construction in both directions: present when the
+plugin dir is left at the template's default, absent when it is bound. This is
+filed separately from this ADR, since fixing a test harness is not an
+architectural decision -- but it is why decision 1's split between
+version-scoped and session-scoped environment is worth making explicit rather
+than leaving to each caller to remember.
+
 ### The pre-bind path, measured directly
 
 Decisions 1 and 3 were tested rather than assumed, on the same release, against
