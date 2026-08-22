@@ -208,6 +208,22 @@ env entry did exactly that. So W3 delivers the sub-second bind only for claims
 that carry nothing, which is precisely what W4 makes possible. This ordering is
 the single most important thing to carry out of this document.
 
+**Pool depth is the whole variable, and it was load tested.** 60 one-shot
+conversations on the shipped 8-slot quota, each counted only on a terminal ACI
+frame:
+
+| regime | claim p50 | claim p95 | throughput vs cold path |
+| --- | --- | --- | --- |
+| burst (24) exceeds pool (3) | 6.22s | 11.40s | **1.0x** |
+| pool (4) >= burst (4) | 0.21s | 0.22s | 4 in 0.4s |
+| arrivals 9s apart, pool 3 | 0.14s | 0.18s | all sub-second |
+
+A refill is the same cold create the claim used to do inline, so **pre-binding
+prepays a boot rather than removing one**. Under a burst that empties the pool
+the throughput is identical and the tail is worse, because the pool's pods hold
+quota slots that bound sandboxes could have used. W3 therefore ships with a
+sizing story or it makes the tail worse than doing nothing.
+
 Seams touched: `charts/curie/templates/agent-sandbox.yaml`,
 `apps/worker/src/curie_worker/sandbox/substrate.py`, the deployment reconciler.
 
@@ -321,6 +337,12 @@ What the recording does **not** show, and should not be read as showing:
   RFC1918**, so a model served from the host's private address is unreachable from
   a sandbox whatever credential is set. The real-model turn figures in the ADR come
   from the `skill` tier, where no such policy applies.
+
+- **What signal should size the pool?** Depth at or above the arrival burst gives
+  every conversation a sub-second claim; depth below it gives the surplus a cold
+  create and a worse tail than no pool at all. Both were measured. An autoscaler
+  keyed on recent arrival rate per version is the obvious answer and is not
+  designed here.
 
 - **Should the CPU limit move with the request?** ADR-0059 decision 4's quota
   counts `limits.cpu`, and at the shipped `limits.cpu: 1` per sandbox the

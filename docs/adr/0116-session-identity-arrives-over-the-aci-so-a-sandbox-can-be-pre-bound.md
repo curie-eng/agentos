@@ -227,7 +227,12 @@ already-bundle-loaded runner.
 
 **The residency invariant** (what we test and review to): a conversation that
 is not currently being served holds no sandbox, and a conversation that becomes
-active binds one in under a second on a quiet node.
+active binds one in under a second on a quiet node **whenever a warm pod of its
+version is available**. The qualifier is load-bearing: measured under a burst
+that empties the pool, the claim behind it is a cold create again and throughput
+is unchanged. Pool depth against arrival rate is what keeps the invariant true,
+and sizing it is an operator obligation this decision creates rather than
+removes.
 
 ## Business case
 
@@ -535,6 +540,51 @@ with `lastState.terminated.reason=Completed` and `exitCode=0`, its log reading
 `received fast shutdown request`. A healthy database, killed by its own liveness
 probe, nine times, while nothing was wrong with it.
 
+### Under sustained load, pre-binding buys latency and not throughput
+
+The sub-second bind above is a single claim finding a warm pod waiting. Whether
+one is waiting is a capacity question, and it was tested rather than assumed:
+60 one-shot conversations across three regimes, each conversation counted only
+when a real ACI turn came back with a terminal frame, on the shipped 8-slot
+namespace quota.
+
+| regime | setup | claim p50 | claim p95 | throughput |
+| --- | --- | --- | --- | --- |
+| burst exceeds pool depth | 24 conversations, pool 3, 5 concurrent | 6.22s | **11.40s** | **1.0x** |
+| pool depth >= burst | 4 conversations, pool 4 | **0.21s** | 0.22s | 4 in 0.4s |
+| arrivals below refill rate | 8 conversations, 9s apart, pool 3 | **0.14s** | 0.18s | all sub-second |
+
+The cold-create arm on the same cluster ran 24 conversations at p50 5.25s and
+p95 7.56s, 48.3 per minute. **Pre-binding matched it at 46.7 per minute.** In the
+first regime only the first three conversations were served sub-second, one per
+warm pod; every claim after that waited on a refill, and a refill is the same
+cold create the claim used to do inline.
+
+**So the total work is unchanged.** Pre-binding does not remove a boot, it
+prepays one. What it removes is the boot from the conversation's critical path
+and, with it, from the 90-second deadline. That is the availability fix this ADR
+argues for, and it is worth having on its own. It is not a capacity fix, and this
+ADR should not be read as claiming one.
+
+**The claims elsewhere in this document are scoped accordingly.** "0.18s" and
+"the deadline is no longer reachable" hold *while a warm pod is available*. When
+a burst empties the pool, the claim behind it is a cold create and the deadline
+is reachable again, exactly as before. Pool depth is therefore not a tuning
+detail; it is what decides whether the availability property holds under a given
+arrival pattern.
+
+**And a pool that is too shallow for the load is worse than none.** In the first
+regime the pre-bound arm's p95 was 11.40s against the cold path's 7.56s. Two
+reasons, both structural: the three pool pods hold three of the eight quota
+slots, so the same concurrency has less room for bound sandboxes; and once the
+pool is empty, refills queue against each other and against live sandboxes for
+the same node and the same quota. Spending budget on a pool that cannot cover the
+burst buys a worse tail.
+
+Correctness held in every regime: 60 of 60 conversations returned a terminal
+frame, no failures, no deadline crossings. What varied was only how long the
+claim took.
+
 ### A third, tighter density cap surfaced while testing
 
 The failed with-env claim reported:
@@ -634,6 +684,14 @@ counts it, which decision 6 is what fixes.
   ceiling in place while raising density means the namespace quota, not the node,
   becomes the first thing a busy release hits, and it does so at eight sandboxes
   on the shipped numbers.
+
+- **Pool depth becomes an operational parameter with a sharp edge.** Sized at or
+  above the burst, every conversation binds sub-second. Sized below it, the
+  surplus conversations cold-create anyway and the tail is worse than having no
+  pool, because the pool's own pods hold quota slots that bound sandboxes could
+  have used. Measured: p95 11.40s with a pool of three against 7.56s with none,
+  on the same 24-conversation burst. An autoscaling signal for pool depth is the
+  obvious follow-up and is not part of this decision.
 
 - **Decision 3 cannot land before decision 2's per-pod token.** Shipping a warm
   pool while pool pods carry no runner token would expose an unauthenticated ACI

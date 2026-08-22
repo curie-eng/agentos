@@ -77,3 +77,28 @@ agg demo.cast demo.gif --speed 3 --idle-time-limit 1.5 --font-size 15
 - A clean cold-path wall clock under contention. Arm B is reported as "never
   ready" rather than a number, because the point is the crossing, not the tail.
 - Anything about gVisor. `security.gvisor.mode=off` throughout.
+
+## Load harness (`load_lib.py`, `load_run.py`, `load_isolate.py`)
+
+`load_run.py` runs one-shot conversation throughput for both arms under the same
+namespace quota. `load_isolate.py` separates the two regimes the first run
+conflated. A conversation counts only when a real ACI turn came back with a
+terminal frame, so a pod that goes ready and never answers is a failure, not a
+pass.
+
+```bash
+export BUNDLE_REF=bundles/<agent-id>/<version-id>.tar.gz
+export LOAD_CONTEXT=curie-load          # asserted; refuses any other context
+N=24 CONC=5 POOLR=3 python3 load_run.py
+python3 load_isolate.py
+```
+
+Results in `load-results.json` and `load-isolate-results.json`.
+
+The headline is a negative one and it is the reason these files are kept: with a
+pool of three against a 24-conversation burst, pre-binding matched the cold path
+on throughput (46.7 against 48.3 conversations per minute) and had a worse tail
+(p95 11.40s against 7.56s). Only the first three conversations, one per warm pod,
+were served sub-second. Sized at or above the burst, or fed arrivals slower than
+the refill, every claim came in under 0.22s. Pool depth against arrival rate is
+the whole variable.
