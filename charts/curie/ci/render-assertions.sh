@@ -56,19 +56,42 @@ KEYS=(
   apiKey
   githubWebhookSecret
 )
-declare -A DEFAULTS=(
-  [postgresPassword]="postgres"
-  [valkeyPassword]="valkeypass"
-  [clickhousePassword]="clickhouse"
-  [rustfsSecretKey]="rustfssecret"
-  [langfuseSalt]="dev-salt-change-me"
-  [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
-  [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
-  [langfuseInitProjectSecretKey]="sk-lf-curie-dev"
-  [langfuseInitUserPassword]="curie-dev-password"
-  [apiKey]="curie-dev-key"
-  [githubWebhookSecret]="dev-webhook-secret"
-)
+# The published dev default for each of those keys. A `case` lookup rather than
+# `declare -A`: associative arrays are bash 4+, and macOS ships bash 3.2 (the
+# last GPLv2 release) as /bin/bash, which `#!/usr/bin/env bash` finds unless the
+# contributor installed a newer one. Under `set -u` the unsupported `declare -A`
+# made the first key look like an unbound variable, so `curie dev chart-check`
+# failed on every stock Mac with "postgresPassword: unbound variable" -- an error
+# that named nothing real and pointed at no fix. The other twenty-one assertion
+# scripts already run on 3.2; this was the only one that did not.
+default_for() {
+  case "$1" in
+    postgresPassword)             printf '%s\n' "postgres" ;;
+    valkeyPassword)               printf '%s\n' "valkeypass" ;;
+    clickhousePassword)           printf '%s\n' "clickhouse" ;;
+    rustfsSecretKey)              printf '%s\n' "rustfssecret" ;;
+    langfuseSalt)                 printf '%s\n' "dev-salt-change-me" ;;
+    langfuseEncryptionKey)        printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" ;;
+    langfuseNextauthSecret)       printf '%s\n' "dev-nextauth-secret-change-me" ;;
+    langfuseInitProjectSecretKey) printf '%s\n' "sk-lf-curie-dev" ;;
+    langfuseInitUserPassword)     printf '%s\n' "curie-dev-password" ;;
+    apiKey)                       printf '%s\n' "curie-dev-key" ;;
+    githubWebhookSecret)          printf '%s\n' "dev-webhook-secret" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove the lookup is total over KEYS here, at startup, rather than relying on a
+# failure at the point of use. `default_for` is called inside a command
+# substitution, where a nonzero exit cannot abort the script the way the old
+# `set -u` array miss did -- and one call site sits under `||`, which suspends
+# `set -e` for the whole function body. Checking up front keeps the old property
+# that a key with no published default is a hard error, not a silent empty
+# string that makes the generation detector pass by accident.
+for key in "${KEYS[@]}"; do
+  default_for "$key" >/dev/null \
+    || { echo "FAIL: default_for() has no published default for key '$key'" >&2; exit 1; }
+done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -106,7 +129,7 @@ check_generated_key() {
   # $1 = rendered Secret, $2 = key, $3 = render label
   local out="$1" key="$2" label="$3" val def
   val="$(read_key "$out" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" == "$def" ]]; then
     echo "$label still emits the published dev default for '$key' (value == '$def'); expected a generated value." >&2
     return 1
@@ -156,7 +179,7 @@ echo "  ok: langfuseEncryptionKey is 64 lowercase-hex chars"
 echo "=== Assertion 3: dev overlay keeps the deterministic published defaults ==="
 for key in "${KEYS[@]}"; do
   val="$(read_key "$DEV" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" != "$def" ]]; then
     fail "dev overlay must keep the published default for '$key'; expected '$def', got '$val'."
   fi
@@ -1164,7 +1187,11 @@ assert_worker_api() {
   [[ -f "$manifest" ]] || fail "$name: worker.yaml did not render"
   [[ -f "$secret_manifest" ]] || fail "$name: secrets.yaml did not render"
   local error
-  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" "${key_args[@]}" 2>&1)"; then
+  # `${a[@]+"${a[@]}"}` rather than a bare `"${key_args[@]}"`: expanding an EMPTY
+  # array under `set -u` is an "unbound variable" error until bash 4.4, and macOS
+  # ships 3.2. key_args is empty for every non-operator key source, which is most
+  # of the call sites below.
+  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" ${key_args[@]+"${key_args[@]}"} 2>&1)"; then
     fail "$name: $error"
   fi
 }
