@@ -160,6 +160,105 @@ to overclaim here.
   sandboxes on the shipped numbers regardless, and ADR-0116's out-of-scope note
   on that stands.
 
+## Spike evidence (measured 2026-08-22)
+
+This decision was spiked before being proposed, on a cluster running containerd
+2.2.1 with minikube's `gvisor` addon, `runsc release-20260817.0`, the chart
+installed at `security.gvisor.mode=require`, and a real bundle-loaded runner
+sandbox. Five paths were tried. **The cheap half is confirmed cheap and the
+expensive half is confirmed unreachable**, which is the opposite balance from the
+projection above.
+
+| path | result |
+| --- | --- |
+| `runsc checkpoint` on the runner container | **47 ms**, 59 MB image, container still `running` afterwards with `-leave-running` |
+| `runsc checkpoint` on the pod sandbox | **38 ms**, 59 MB image |
+| `runsc restore` of the runner sub-container, out of band | **refused by design** |
+| `runsc restore` of the pod sandbox, out of band | **sandbox fails to start** |
+| `crictl checkpoint` (the CRI `CheckpointContainer` path) | **routes to CRIU, not to `runsc`** |
+
+### Checkpointing is already cheap, and cheaper than this ADR assumed
+
+**38 to 47 milliseconds, and a 59 MB image.** The consequences section below
+originally projected "roughly 505 MiB" from the runner's measured cgroup
+footprint; that was wrong by an order of magnitude, because most of that 505 MiB
+is file-backed page cache (272.4 MiB measured) which a checkpoint does not need
+to carry, and much of the remaining anonymous memory is untouched. `runsc` also
+ships `-compression` and `-exclude-committed-zero-pages`, neither of which was
+used for these numbers.
+
+`-leave-running` works: the container was `running` immediately after the
+checkpoint returned. Without it the container is destroyed, and on a live pod the
+kubelet then restarts it -- observed, `restarts: 1` and a fresh container id. So a
+golden checkpoint can be taken either on a dedicated build pod or, if wanted,
+against a live one without disturbing it. Decision 1's "produced once at deploy
+time" stands and is now cheap rather than merely justified.
+
+### Restore is the entire cost, and there is no path to it today
+
+Three distinct failures, each with a precise cause:
+
+**A sub-container cannot be restored on its own.**
+
+```
+starting sub-container [python -m curie_runner]:
+sandbox is not being restored, cannot restore subcontainer: state=started
+```
+
+In gVisor a Kubernetes pod is one sandbox hosting several sub-containers, `pause`
+and `runner` here, sharing a single sandbox process -- observed as two `runsc
+list` entries with the same PID. **The checkpoint and restore unit is therefore
+the pod sandbox, not the runner container.**
+
+**A sandbox restored out of band does not come up.**
+
+```
+cannot create sandbox: cannot read client sync file:
+waiting for sandbox to start: EOF
+```
+
+Restoring needs the environment containerd builds around a sandbox -- network
+namespace, mounts, the rootfs at its expected path -- and `runsc restore` given
+only an image and a preserved `config.json` does not reconstruct it. Related and
+found the same way: the original OCI bundle directory is **deleted** when
+containerd reaps a destroyed container, so a checkpoint image is not
+self-sufficient. Its OCI spec has to be preserved deliberately alongside it.
+
+**The CRI path that exists does not cover gVisor.**
+
+```
+CRIU binary not found or too old (<31600) ...
+exec: "criu": executable file not found in $PATH
+```
+
+containerd 2.2.1 implements `CheckpointContainer`, but its implementation assumes
+a runc plus CRIU stack and does not delegate to `runsc checkpoint`. So the
+obvious integration point is present in name and absent in substance for this
+runtime.
+
+### What that does to the shape of this decision
+
+The projection above -- "a restore skips 13.46 of 17.39 seconds, leaving a floor
+near 3.9s" -- is **unmeasured and remains so**, because no restore completed. It
+should be read as the value of the prize, not as a result.
+
+The work is therefore not "checkpoint at deploy, restore on refill". It is
+**build sandbox-level restore integration**, and that is a substantially larger
+undertaking with two plausible owners:
+
+- **The Agent Sandbox controller**, reconstructing a pod's sandbox environment and
+  then handing off to `runsc restore`. It already owns sandbox and warm-pool
+  lifecycle, so it is the natural place, but it means this decision depends on an
+  upstream component Curie adopts rather than builds (ADR-0007).
+- **containerd**, routing `CheckpointContainer` and a restore path to `runsc` for
+  the gVisor runtime handler. Cleanest long term, entirely outside this
+  repository.
+
+Neither is a change Curie can make alone, which is the single most important
+thing this spike establishes. Decision 3's boot fallback is consequently not a
+safety net for an unlikely failure; **it is the behaviour of the system until one
+of those two integrations exists.**
+
 ## Alternatives considered
 
 - **Restore on demand, with no warm pool.** Rejected. At a projected ~3.9s it is
@@ -205,20 +304,27 @@ to overclaim here.
   makes that answer available -- ship the version without a checkpoint and refill
   by booting -- but it must be a deliberate degraded state and not a silent one.
 
-- **Checkpoints are large and per-version.** A booted runner measures roughly
-  505 MiB in its cgroup, of which 233.9 MiB is private anonymous memory. Storage
-  is per in-force version, on the same object store as bundles, and decision 5's
-  garbage collection is load-bearing rather than tidy-up: a repository that
-  deploys often would otherwise accumulate half-gigabyte images indefinitely.
+- **Checkpoints are smaller than expected, which weakens a worry rather than
+  removing it.** Measured at **59 MB** uncompressed and without
+  `-exclude-committed-zero-pages`, not the ~505 MiB a cgroup footprint suggests.
+  Storage is still per in-force version on the same object store as bundles, and
+  decision 5's garbage collection still matters for a repository that deploys
+  often, but it is tens of megabytes per version rather than hundreds.
 
 - **The credential exclusion in decision 2 is the security-critical part of this
   ADR.** Getting it wrong writes a live model credential to an object store. It
   needs a test that asserts absence, not a review that asserts intent.
 
 - **This adds a dependency on `runsc` checkpoint/restore behaviour**, which the
-  project does not otherwise rely on. Decision 3's fallback bounds the blast
-  radius to "refills are slow again", which is today's behaviour, so the downside
-  is bounded by the status quo rather than by an outage.
+  project does not otherwise rely on, and the spike found that half of it does not
+  exist yet. Checkpointing works today at 38 to 47 ms. Restoring has no
+  integration path in containerd 2.2.1 for the gVisor handler, so until either the
+  Agent Sandbox controller or containerd provides one, decision 3's fallback is
+  the steady state and this ADR buys nothing operationally. Decision 3 is what
+  keeps that from being a regression: the fallback is exactly today's behaviour.
+  **This ADR should not be accepted as implementable work on its current
+  evidence; it should be accepted, if at all, as the decision to pursue that
+  integration.**
 
 - **The eval plane gains a new axis.** Two runners of the same version can now
   reach ready by two different paths, boot and restore, and
