@@ -567,7 +567,13 @@ cat > "$SEED_DIR/myplugin/.claude-plugin/plugin.json" <<'JSON'
 {"name":"e2e-probe","version":"0.0.0"}
 JSON
 tar -czf "$SEED_DIR/probe.tgz" -C "$SEED_DIR" myplugin
-PROBE_B64="$(base64 -w0 "$SEED_DIR/probe.tgz" 2>/dev/null || base64 "$SEED_DIR/probe.tgz" | tr -d '\n')"
+# `base64 < file | tr -d '\n'` rather than GNU's `base64 -w0 file`: BSD base64
+# (macOS) rejects both the `-w` flag and a bare filename operand -- it wants
+# `-i file` -- so the previous `-w0` form fell through to a fallback that failed
+# just as hard with `base64: invalid argument <path>`, blocking this script on a
+# Mac at the seed step. Reading from stdin and stripping newlines here is the
+# form both userlands accept, and `binaryData` below needs the single line.
+PROBE_B64="$(base64 < "$SEED_DIR/probe.tgz" | tr -d '\n')"
 
 # ConfigMap carrying the archive plus a one shot AWS CLI Job that creates the
 # bucket and uploads the object using path addressing.
