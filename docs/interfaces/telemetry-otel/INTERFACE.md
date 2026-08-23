@@ -66,7 +66,7 @@ contract is:
   (`packages/telemetry/src/curie_telemetry/bootstrap.py::TelemetryRuntime.shutdown`)
   share a hard two-second ceiling and detach only the handlers that runtime installed.
 - **Trace Context crosses transports, not domain models.** Dispatcher and API producer
-  spans inject only a W3C `traceparent`/optional `tracestate` carrier into Valkey Stream
+  spans inject only a W3C `traceparent` carrier into Valkey Stream
   metadata beside the unchanged `QueuedTurn` payload. The worker consumer extracts it,
   and `RunnerClient._request`
   (`apps/worker/src/curie_worker/runner_client.py::RunnerClient._request`) injects the

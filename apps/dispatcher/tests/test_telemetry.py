@@ -180,7 +180,10 @@ def test_message_claim_placeholder_xadd_order_producer_parentage_and_curated_log
 
     assert stream_id
     assert order == ["claim", "placeholder", "xadd"]
-    emit.assert_called_once_with(logger, "dispatcher.turn.enqueued")
+    emit.assert_called_once_with(
+        logging.getLogger("curie_dispatcher.handlers"),
+        "dispatcher.turn.enqueued",
+    )
     _assert_producer(exporter, redis_client, config)
     provider.shutdown()
 
@@ -214,12 +217,15 @@ def test_block_action_uses_the_same_producer_and_transport_metadata_path(
 
     assert stream_id
     assert order == ["claim", "placeholder", "xadd"]
-    emit.assert_called_once_with(logger, "dispatcher.turn.enqueued")
+    emit.assert_called_once_with(
+        logging.getLogger("curie_dispatcher.handlers"),
+        "dispatcher.turn.enqueued",
+    )
     _assert_producer(exporter, redis_client, config)
     provider.shutdown()
 
 
-def test_dispatch_never_performs_a_post_enqueue_agent_lookup(
+def test_dispatch_never_performs_a_post_enqueue_agent_lookup_or_rejects_custom_logger(
     redis_client: redis.Redis,
     config: DispatcherConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -242,6 +248,7 @@ def test_dispatch_never_performs_a_post_enqueue_agent_lookup(
         redis_client=redis_client,
         config=config,
         clock=lambda: "2026-08-23T00:00:00+00:00",
+        logger=logging.getLogger("external.application.diagnostics"),
         tracer=tracer,
     )
 

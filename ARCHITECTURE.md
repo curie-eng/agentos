@@ -173,7 +173,10 @@ flowchart TB
     API --> Store
     API --> PG
     UI --> API
-    Sandbox --> OTel
+    API -. OTLP .-> OTel
+    Dispatcher -. OTLP .-> OTel
+    Worker -. OTLP .-> OTel
+    Sandbox -. OTLP .-> OTel
     Worker -- eval scores --> LF
     API -- read --> LF
 ```
@@ -198,9 +201,10 @@ with four outbound dependencies of its own:
 - It writes eval scores straight to Langfuse
   ([`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`](apps/worker/src/curie_worker/eval/recorder.py)).
 
-The worker has **no** OTel dependency — the runner is the only emitter. Its one
-connection to observability is the eval-score write to Langfuse above. The CLI
-likewise never calls the dispatcher directly — see
+API, dispatcher, worker, and runner each emit traces and closed lifecycle logs
+to the OTel Collector. A turn's causal context crosses the Valkey and runner
+HTTP boundaries, while the worker's separate eval-score write to Langfuse
+remains unchanged. The CLI likewise never calls the dispatcher directly — see
 [the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) for
 how it enqueues a turn instead.
 

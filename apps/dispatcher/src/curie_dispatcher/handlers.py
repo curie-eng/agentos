@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from redis import Redis
 
 Clock = Callable[[], str]
+_telemetry_logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -179,7 +180,7 @@ def process_event(
         stream_id = enqueue(redis_client, config, queued)
         if span is not None:
             span.add_event("messaging.enqueued")
-        emit_log_event(log, "dispatcher.turn.enqueued")
+        emit_log_event(_telemetry_logger, "dispatcher.turn.enqueued")
         log.info(
             "enqueued slack event %s as stream entry %s", slack_event_id, stream_id
         )
@@ -283,7 +284,7 @@ def process_action(
         stream_id = enqueue(redis_client, config, queued)
         if span is not None:
             span.add_event("messaging.enqueued")
-        emit_log_event(log, "dispatcher.turn.enqueued")
+        emit_log_event(_telemetry_logger, "dispatcher.turn.enqueued")
         log.info(
             "enqueued block action %s as stream entry %s", slack_event_id, stream_id
         )
