@@ -23,19 +23,41 @@ args = " ".join(sys.argv[1:])
 with open(os.environ["CURIE_TEST_CLUSTER_LOG"], "a", encoding="utf-8") as log:
     log.write(os.path.basename(sys.argv[0]) + " " + args + "\n")
 
+state_path = os.environ["CURIE_TEST_CLUSTER_STATE"]
+try:
+    with open(state_path, encoding="utf-8") as state_file:
+        state = json.load(state_file)
+except FileNotFoundError:
+    state = {"trust": os.environ.get("CURIE_TEST_EXISTING_TRUST"), "holder": None, "version": 1}
+
+def save():
+    with open(state_path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file)
+
 if "get deployment curie-dispatcher" in args:
+    if os.environ.get("CURIE_TEST_DISPATCHER_PROBE_FAIL") == "1":
+        print("intentional dispatcher probe failure", file=sys.stderr)
+        sys.exit(1)
     if os.environ.get("CURIE_TEST_CONNECTED") == "1":
         print("deployment.apps/curie-dispatcher")
     sys.exit(0)
 
-# Permit implementations to snapshot either the Deployment or Helm values.
+# Model the Deployment snapshot and resourceVersion JSON Patch used by #1812.
 if "get deployment curie-worker" in args and "-o json" in args:
-    print(json.dumps({"spec":{"template":{"spec":{"containers":[{
-        "name":"worker", "env":[{"name":"CURIE_SLACK_TRUSTED_ORIGINS","value":""}]
-    }]}}}}))
+    env = [] if state["trust"] is None else [{"name":"CURIE_SLACK_TRUSTED_ORIGINS", "value":state["trust"]}]
+    annotations = {} if state["holder"] is None else {"curie.dev/cluster-message-trust-holder":state["holder"]}
+    print(json.dumps({"metadata":{"resourceVersion":str(state["version"]), "annotations":annotations}, "spec":{"template":{"spec":{"containers":[{"name":"worker", "env":env}]}}}}))
     sys.exit(0)
-if "get values" in args and "-o json" in args:
-    print("{}")
+if "patch deployment curie-worker" in args:
+    patch = json.loads(sys.argv[sys.argv.index("-p") + 1])
+    for operation in patch:
+        path = operation["path"].replace("~1", "/").replace("~0", "~")
+        if path.endswith("/env"):
+            state["trust"] = next((entry["value"] for entry in operation["value"] if entry.get("name") == "CURIE_SLACK_TRUSTED_ORIGINS"), None)
+        elif path.endswith("/cluster-message-trust-holder"):
+            state["holder"] = operation.get("value") if operation["op"] != "remove" else None
+    state["version"] += 1
+    save()
     sys.exit(0)
 
 # The Valkey forward fails after temporary trust should have been installed.
@@ -52,11 +74,21 @@ sys.exit(0)
     path
 }
 
-fn run_cluster_message(connected: bool) -> (Output, Vec<String>) {
+fn run_cluster_message(
+    connected: bool,
+    existing_trust: Option<&str>,
+    dispatcher_probe_fails: bool,
+) -> (Output, Vec<String>, serde_json::Value) {
     let tools = tempfile::tempdir().expect("create fake tool directory");
     write_tool(tools.path(), "kubectl");
     write_tool(tools.path(), "helm");
     let log_path = tools.path().join("cluster.log");
+    let state_path = tools.path().join("cluster-state.json");
+    fs::write(
+        &state_path,
+        serde_json::json!({"trust": existing_trust, "holder": null, "version": 1}).to_string(),
+    )
+    .expect("seed fake cluster state");
     let inherited_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{inherited_path}", tools.path().display());
 
@@ -86,6 +118,7 @@ fn run_cluster_message(connected: bool) -> (Output, Vec<String>) {
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
         .env("PATH", path)
         .env("CURIE_TEST_CLUSTER_LOG", &log_path)
+        .env("CURIE_TEST_CLUSTER_STATE", &state_path)
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_VALKEY_PASSWORD");
     if connected {
@@ -93,13 +126,22 @@ fn run_cluster_message(connected: bool) -> (Output, Vec<String>) {
             .env("CURIE_TEST_CONNECTED", "1")
             .env("CURIE_SLACK_BOT_TOKEN", "xoxb-example");
     }
+    if let Some(existing_trust) = existing_trust {
+        command.env("CURIE_TEST_EXISTING_TRUST", existing_trust);
+    }
+    if dispatcher_probe_fails {
+        command.env("CURIE_TEST_DISPATCHER_PROBE_FAIL", "1");
+    }
     let output = command.output().expect("run cluster message");
     let lines = fs::read_to_string(log_path)
         .expect("read fake cluster log")
         .lines()
         .map(str::to_owned)
         .collect();
-    (output, lines)
+    let state =
+        serde_json::from_str(&fs::read_to_string(state_path).expect("read fake cluster state"))
+            .expect("parse fake cluster state");
+    (output, lines, state)
 }
 
 fn trust_mutations(lines: &[String]) -> Vec<(usize, &str)> {
@@ -109,7 +151,8 @@ fn trust_mutations(lines: &[String]) -> Vec<(usize, &str)> {
         .filter(|(_, line)| {
             (line.contains("set env") || line.contains("patch") || line.contains("upgrade"))
                 && (line.contains("CURIE_SLACK_TRUSTED_ORIGINS")
-                    || line.contains("worker.slackTrustedOrigins"))
+                    || line.contains("worker.slackTrustedOrigins")
+                    || line.contains("cluster-message-trust-holder"))
         })
         .map(|(index, line)| (index, line.as_str()))
         .collect()
@@ -117,8 +160,11 @@ fn trust_mutations(lines: &[String]) -> Vec<(usize, &str)> {
 
 #[test]
 fn disconnected_cluster_message_temporarily_trusts_portless_stub_and_restores_on_error() {
-    let (output, lines) = run_cluster_message(false);
-    assert!(!output.status.success(), "fixture must reach its forced tunnel error");
+    let (output, lines, state) = run_cluster_message(false, None, false);
+    assert!(
+        !output.status.success(),
+        "fixture must reach its forced tunnel error"
+    );
 
     let mutations = trust_mutations(&lines);
     assert!(
@@ -139,16 +185,63 @@ fn disconnected_cluster_message_temporarily_trusts_portless_stub_and_restores_on
         .position(|line| line.contains("port-forward") && line.contains("valkey"))
         .expect("message must attempt its Valkey tunnel");
     let restore_index = mutations.last().expect("restore mutation").0;
-    assert!(apply_index < forward_index, "trust must precede enqueue plumbing: {lines:#?}");
-    assert!(restore_index > forward_index, "trust must be restored on error: {lines:#?}");
+    assert!(
+        apply_index < forward_index,
+        "trust must precede enqueue plumbing: {lines:#?}"
+    );
+    assert!(
+        restore_index > forward_index,
+        "trust must be restored on error: {lines:#?}"
+    );
+    assert!(
+        state["trust"].is_null(),
+        "the default release must finish with no stub trust env at all: {state}"
+    );
+    assert!(
+        state["holder"].is_null(),
+        "the temporary ownership marker must also be removed: {state}"
+    );
 }
 
 #[test]
-fn connected_cluster_message_never_mutates_worker_stub_trust() {
-    let (output, lines) = run_cluster_message(true);
-    assert!(!output.status.success(), "fixture must reach its forced tunnel error");
+fn disconnected_cluster_message_restores_a_preexisting_trusted_origin() {
+    let original = "https://trusted.example.com";
+    let (output, lines, state) = run_cluster_message(false, Some(original), false);
+    assert!(
+        !output.status.success(),
+        "fixture must reach its forced tunnel error"
+    );
+    assert!(
+        trust_mutations(&lines).len() >= 2,
+        "fixture must exercise apply and cleanup: {lines:#?}"
+    );
+    assert_eq!(
+        state["trust"], original,
+        "cleanup must preserve trust that predated this command"
+    );
+}
+
+#[test]
+fn connected_or_unprobeable_dispatcher_never_mutates_worker_stub_trust() {
+    let (output, lines, state) = run_cluster_message(true, None, false);
+    assert!(
+        !output.status.success(),
+        "fixture must reach its forced tunnel error"
+    );
     assert!(
         trust_mutations(&lines).is_empty(),
         "a Slack-connected release must not receive temporary stub trust: {lines:#?}"
     );
+    assert!(state["trust"].is_null());
+
+    let (output, lines, state) = run_cluster_message(false, None, true);
+    assert!(
+        !output.status.success(),
+        "fixture must reach its forced tunnel error"
+    );
+    assert!(
+        trust_mutations(&lines).is_empty(),
+        "a failed dispatcher probe is not proof it is safe to mutate worker trust: {lines:#?}"
+    );
+    assert!(state["trust"].is_null());
 }
