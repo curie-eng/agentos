@@ -101,6 +101,80 @@ function relativeAge(iso: string | null): string {
   return future ? `in ${label}` : `${label} ago`;
 }
 
+function ApprovalFacts({ approval }: { approval: ApprovalOut }) {
+  return (
+    <dl
+      style={{
+        display: "grid",
+        gridTemplateColumns: "auto 1fr",
+        gap: "6px 14px",
+        margin: 0,
+        fontSize: 12.5,
+        marginBottom: 16,
+      }}
+    >
+      {(
+        [
+          ["Author", approval.author],
+          ["Route", approval.route ?? "— (requesting channel)"],
+          ["Card channel", approval.card_channel ?? "—"],
+          ["Conversation", approval.conversation_id],
+          ["Created", formatWhen(approval.created_at)],
+          ["Expires", approval.expires_at ? `${formatWhen(approval.expires_at)} (${relativeAge(approval.expires_at)})` : "—"],
+          ["Resolved by", approval.resolved_by ?? "—"],
+          ["Resolution note", approval.resolution_note ?? "—"],
+        ] as [string, string][]
+      ).map(([k, v]) => (
+        <div key={k} style={{ display: "contents" }}>
+          <dt style={{ color: C.muted }}>{k}</dt>
+          <dd style={{ margin: 0, color: C.text2, fontFamily: C.mono, wordBreak: "break-word" }}>{v}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function AuditTrail({ audit, auditError }: { audit: ApprovalAudit[] | null; auditError: string | null }) {
+  return (
+    <div style={{ borderTop: "1px solid " + C.border, paddingTop: 14 }}>
+      <div style={{ fontWeight: 600, fontSize: 13, color: C.text2, marginBottom: 8 }}>Audit trail</div>
+      {auditError ? (
+        <div data-testid="audit-error" style={{ color: C.destructive, fontSize: 12.5, fontFamily: C.mono }}>
+          {auditError}
+        </div>
+      ) : audit === null ? (
+        <Notice padding="16px">Loading audit…</Notice>
+      ) : audit.length === 0 ? (
+        <Notice padding="16px">No resolution attempts yet.</Notice>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {audit.map((entry) => (
+            <div
+              key={entry.id}
+              data-testid="approval-audit-entry"
+              style={{ border: "1px solid " + C.border, borderRadius: 6, padding: "8px 10px", background: C.darkest }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
+                <span style={{ fontFamily: C.mono, color: C.text }}>{entry.action}</span>
+                <Chip color={entry.authorized ? C.success : C.failure} border={C.border}>
+                  {entry.authorized ? "authorized" : "denied"}
+                </Chip>
+                <span style={{ marginLeft: "auto", color: C.muted, fontSize: 11, fontFamily: C.mono }}>
+                  {formatWhen(entry.created_at)}
+                </span>
+              </div>
+              <div style={{ color: C.text2, fontSize: 12, marginTop: 4 }}>
+                {entry.actor} · {entry.decision} · via {entry.authorizer}
+                {entry.reason ? ` — ${entry.reason}` : ""}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ApprovalDetail({
   approval,
   onClose,
@@ -216,34 +290,7 @@ function ApprovalDetail({
           <Button label="Close" variant="ghost" size="sm" onClick={onClose} />
         </div>
 
-        <dl
-          style={{
-            display: "grid",
-            gridTemplateColumns: "auto 1fr",
-            gap: "6px 14px",
-            margin: 0,
-            fontSize: 12.5,
-            marginBottom: 16,
-          }}
-        >
-          {(
-            [
-              ["Author", approval.author],
-              ["Route", approval.route ?? "— (requesting channel)"],
-              ["Card channel", approval.card_channel ?? "—"],
-              ["Conversation", approval.conversation_id],
-              ["Created", formatWhen(approval.created_at)],
-              ["Expires", approval.expires_at ? `${formatWhen(approval.expires_at)} (${relativeAge(approval.expires_at)})` : "—"],
-              ["Resolved by", approval.resolved_by ?? "—"],
-              ["Resolution note", approval.resolution_note ?? "—"],
-            ] as [string, string][]
-          ).map(([k, v]) => (
-            <div key={k} style={{ display: "contents" }}>
-              <dt style={{ color: C.muted }}>{k}</dt>
-              <dd style={{ margin: 0, color: C.text2, fontFamily: C.mono, wordBreak: "break-word" }}>{v}</dd>
-            </div>
-          ))}
-        </dl>
+        <ApprovalFacts approval={approval} />
 
         {pending ? (
           <div
@@ -303,42 +350,7 @@ function ApprovalDetail({
           </div>
         ) : null}
 
-        <div style={{ borderTop: "1px solid " + C.border, paddingTop: 14 }}>
-          <div style={{ fontWeight: 600, fontSize: 13, color: C.text2, marginBottom: 8 }}>Audit trail</div>
-          {auditError ? (
-            <div data-testid="audit-error" style={{ color: C.destructive, fontSize: 12.5, fontFamily: C.mono }}>
-              {auditError}
-            </div>
-          ) : audit === null ? (
-            <Notice padding="16px">Loading audit…</Notice>
-          ) : audit.length === 0 ? (
-            <Notice padding="16px">No resolution attempts yet.</Notice>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {audit.map((entry) => (
-                <div
-                  key={entry.id}
-                  data-testid="approval-audit-entry"
-                  style={{ border: "1px solid " + C.border, borderRadius: 6, padding: "8px 10px", background: C.darkest }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
-                    <span style={{ fontFamily: C.mono, color: C.text }}>{entry.action}</span>
-                    <Chip color={entry.authorized ? C.success : C.failure} border={C.border}>
-                      {entry.authorized ? "authorized" : "denied"}
-                    </Chip>
-                    <span style={{ marginLeft: "auto", color: C.muted, fontSize: 11, fontFamily: C.mono }}>
-                      {formatWhen(entry.created_at)}
-                    </span>
-                  </div>
-                  <div style={{ color: C.text2, fontSize: 12, marginTop: 4 }}>
-                    {entry.actor} · {entry.decision} · via {entry.authorizer}
-                    {entry.reason ? ` — ${entry.reason}` : ""}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <AuditTrail audit={audit} auditError={auditError} />
       </div>
     </Modal>
   );
