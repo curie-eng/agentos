@@ -23,6 +23,7 @@ import contextlib
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from typing import Any, Protocol
 
 import anyio
 from aci_protocol import (
@@ -56,6 +57,24 @@ from .translate import TurnState, translate_message
 logger = logging.getLogger(__name__)
 
 SessionFactory = Callable[[], ModelSession]
+
+
+class TelemetryLifecycle(Protocol):
+    """The bounded runtime surface SessionRunner owns at process teardown."""
+
+    tracer: Any
+
+    def attach_logging(
+        self,
+        logger: logging.Logger,
+        *,
+        default_level: int | None = None,
+    ) -> None: ...
+
+    def force_flush(self, *, timeout_millis: int) -> bool: ...
+
+    def shutdown(self, *, timeout_millis: int = 2_000) -> bool: ...
+
 
 # The SDK surfaces a provider auth rejection (HTTP 401/403 -- e.g. a placeholder,
 # revoked, or wrong model key) as an ``AssistantMessage.error`` of this code
@@ -137,6 +156,8 @@ class SessionRunner:
         approval_resumed_kind: str | None = None,
         approval_decision: str | None = None,
         false_completion_check: bool = False,
+        sandbox_id: str | None = None,
+        telemetry: TelemetryLifecycle | None = None,
     ) -> None:
         self._factory = session_factory
         self._ceiling = ceiling
@@ -167,6 +188,17 @@ class SessionRunner:
         # resuming from, stamped onto the turn's OTel span. Authority-free,
         # like approval_resumed_kind -- it confers no capability.
         self._approval_decision = approval_decision
+        self._sandbox_id = sandbox_id
+        self._telemetry = telemetry
+        attach_logging = getattr(telemetry, "attach_logging", None)
+        if callable(attach_logging):
+            # Namespace-scoped and idempotent: runner diagnostics still
+            # propagate to their existing console handler, while the shared
+            # handler receives the same redacted records for correlation.
+            attach_logging(
+                logging.getLogger("curie_runner"),
+                default_level=logging.INFO,
+            )
         # Opt-in, observe-only false-completion check (#517): warn when a turn
         # ends DONE with a substantive answer but zero tool calls. Off by default.
         self._false_completion_check = false_completion_check
@@ -292,9 +324,57 @@ class SessionRunner:
         self._started = True
 
     async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-        self._tracer.shutdown()
+        try:
+            if self._session is not None:
+                await self._session.close()
+        finally:
+            if self._telemetry is None:
+                self._tracer.shutdown()
+            else:
+                await self._shutdown_telemetry()
+
+    async def flush_telemetry(self, timeout_millis: int = 500) -> bool:
+        """Best-effort bounded flush used before an event response reaches EOF."""
+
+        telemetry = self._telemetry
+        if telemetry is None:
+            return True
+        try:
+            with anyio.move_on_after(timeout_millis / 1000) as scope:
+                result = await anyio.to_thread.run_sync(
+                    lambda: telemetry.force_flush(timeout_millis=timeout_millis),
+                    abandon_on_cancel=True,
+                )
+            if scope.cancel_called:
+                logger.warning("telemetry flush timed out")
+                return False
+            return bool(result)
+        except Exception as exc:  # noqa: BLE001 - telemetry never changes turn outcome
+            logger.warning(
+                "telemetry flush failed error_class=%s", type(exc).__name__
+            )
+            return False
+
+    async def _shutdown_telemetry(self) -> bool:
+        """Shut down both telemetry signals within the process's two-second cap."""
+
+        telemetry = self._telemetry
+        assert telemetry is not None
+        try:
+            with anyio.move_on_after(2.0) as scope:
+                result = await anyio.to_thread.run_sync(
+                    lambda: telemetry.shutdown(timeout_millis=2_000),
+                    abandon_on_cancel=True,
+                )
+            if scope.cancel_called:
+                logger.warning("telemetry shutdown timed out")
+                return False
+            return bool(result)
+        except Exception as exc:  # noqa: BLE001 - cleanup remains best-effort
+            logger.warning(
+                "telemetry shutdown failed error_class=%s", type(exc).__name__
+            )
+            return False
 
     async def reset(self) -> None:
         """Discard the conversation and start a fresh model session (#550).
@@ -392,16 +472,19 @@ class SessionRunner:
                 self._session_id,
                 event.user,
                 approval_decision=self._approval_decision,
+                sandbox_id=self._sandbox_id,
             ) as gen:
                 try:
                     async for line in self._drive_turn(event, state, tracker, gen):
                         yield line
-                    logger.info(
-                        "turn end session=%s status=%s duration_ms=%d",
-                        self._session_id,
-                        self._status.value,
-                        int((time.monotonic() - start) * 1000),
-                    )
+                    gen.record_outcome(self._status)
+                    with gen.lifecycle_log_context():
+                        logger.info(
+                            "turn end session=%s status=%s duration_ms=%d",
+                            self._session_id,
+                            self._status.value,
+                            int((time.monotonic() - start) * 1000),
+                        )
                     # Persist the completed turn to the durable transcript so a
                     # restarted sandbox can rehydrate this thread (#20).
                     await self._record_turn(event, state)
@@ -412,15 +495,22 @@ class SessionRunner:
                     # stream. GeneratorExit (consumer disconnect) is a
                     # BaseException and is intentionally not caught here -- the
                     # finally handles that abandonment case.
-                    logger.error(
-                        "turn failed session=%s error_class=%s: %s duration_ms=%d",
-                        self._session_id,
-                        type(exc).__name__,
-                        exc,
-                        int((time.monotonic() - start) * 1000),
-                    )
                     self._turn_open = False
                     self._status = SessionStatus.CLASSIFIED_FAILURE
+                    gen.record_outcome(
+                        self._status,
+                        error_type=type(exc).__name__,
+                        exception_type=type(exc).__name__,
+                        exception_escaped=False,
+                    )
+                    with gen.lifecycle_log_context():
+                        logger.error(
+                            "turn failed session=%s error_class=%s: %s duration_ms=%d",
+                            self._session_id,
+                            type(exc).__name__,
+                            exc,
+                            int((time.monotonic() - start) * 1000),
+                        )
                     yield to_ndjson_line(
                         ErrorEvent(message=f"runner error: {exc}", classification="runner-error")
                     )

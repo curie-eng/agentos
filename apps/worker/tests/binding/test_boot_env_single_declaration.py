@@ -158,6 +158,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
         "CURIE_CONNECTOR_APP_NAME",
         "CURIE_RUNNER_IMAGE",
+        # Worker service config for selecting the collector address the Docker
+        # substrate relays to a child as its standard OTEL endpoint. The private
+        # relay name is read only by run.py and never enters runner boot env.
+        "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",
         # The runner-facing API base (#678): WorkerConfig reads it from the

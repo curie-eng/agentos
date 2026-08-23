@@ -9,10 +9,15 @@ import logging
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI
+from curie_telemetry import configure, extract_http_trace_context
+from fastapi import FastAPI, Request
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.util.types import AttributeValue
 
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
@@ -82,6 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+        tracer=app.state.telemetry.tracer,
     )
     # The composition root for approvals (#420, ADR-0034): the only place that
     # names Slack to build the approver-set selector, so the authorizer and the
@@ -213,9 +219,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await poller_task
             except asyncio.CancelledError:
                 pass
-        await valkey.aclose()
-        await http_client.aclose()
-        await engine.dispose()
+        try:
+            await valkey.aclose()
+            await http_client.aclose()
+            await engine.dispose()
+        finally:
+            app.state.telemetry.shutdown(timeout_millis=2000)
 
 
 def configure_logging(level: str | None = None) -> logging.Logger:
@@ -249,11 +258,70 @@ def configure_logging(level: str | None = None) -> logging.Logger:
 
 
 def create_app() -> FastAPI:
-    configure_logging()
+    service_logger = configure_logging()
+    telemetry = configure(service_name="curie-api", service_version="0.0.0")
+    telemetry.attach_logging(service_logger)
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
     log_credential_path(get_settings())
     app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
+    app.state.telemetry = telemetry
+
+    @app.middleware("http")
+    async def trace_http_request(request: Request, call_next: Any) -> Any:
+        """Adopt only W3C context and export a closed, value-free server span."""
+
+        parent = extract_http_trace_context(request.headers, logger=service_logger)
+        supplied_context = (
+            "traceparent" in request.headers or "tracestate" in request.headers
+        )
+        server = request.scope.get("server")
+        attributes: dict[str, AttributeValue] = {
+            "http.request.method": request.method,
+        }
+        if isinstance(server, (list, tuple)) and len(server) == 2:
+            address, port = server
+            if isinstance(address, str) and address:
+                attributes["server.address"] = address
+            if type(port) is int:
+                attributes["server.port"] = port
+
+        with telemetry.tracer.start_as_current_span(
+            f"{request.method} request",
+            context=parent,
+            kind=SpanKind.SERVER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            parent_is_valid = trace.get_current_span(parent).get_span_context().is_valid
+            if supplied_context and not parent_is_valid:
+                span.add_event("trace_context.invalid")
+            try:
+                response = await call_next(request)
+            except BaseException as exc:
+                error_type = type(exc).__name__
+                span.set_attribute("error.type", error_type)
+                span.set_attribute("exception.type", error_type)
+                span.set_attribute("exception.escaped", True)
+                span.set_status(Status(StatusCode.ERROR))
+                route = request.scope.get("route")
+                route_path = getattr(route, "path", None)
+                if isinstance(route_path, str):
+                    span.update_name(f"{request.method} {route_path}")
+                raise
+
+            route = request.scope.get("route")
+            route_path = getattr(route, "path", None)
+            if isinstance(route_path, str):
+                span.update_name(f"{request.method} {route_path}")
+            span.set_attribute("http.response.status_code", response.status_code)
+            if response.status_code >= 500:
+                span.set_attribute("error.type", f"{response.status_code // 100}xx")
+                span.set_status(Status(StatusCode.ERROR))
+            else:
+                span.set_status(Status(StatusCode.OK))
+            return response
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:

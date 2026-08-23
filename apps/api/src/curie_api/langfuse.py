@@ -79,23 +79,43 @@ def _probe_attr(bag: Any, key: str, *, bare_key: str | None = None) -> str | Non
     return None
 
 
+def _runner_first(
+    observations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prefer runner ``agent.run`` while still probing every observation."""
+
+    def priority(observation: dict[str, Any]) -> int:
+        is_runner = _probe_attr(observation, "service.name") == "curie-runner"
+        is_agent_run = observation.get("name") == "agent.run"
+        if is_runner and is_agent_run:
+            return 0
+        if is_runner:
+            return 1
+        if is_agent_run:
+            return 2
+        return 3
+
+    return sorted(observations, key=priority)
+
+
 def hoist_sandbox_id(
     trace: dict[str, Any], observations: list[dict[str, Any]]
 ) -> str | None:
     """Lift the runner's sandbox id out of a trace, or None when absent.
 
-    Checks, in order, the trace-level resource/metadata attributes then the
-    first observation's resource attributes, so the id resolves regardless of
-    whether Langfuse surfaces the OTel resource attr on the trace or only on an
-    observation. Only a present, non-empty attribute is returned -- no value is
-    invented.
+    Checks the trace-level resource/metadata attributes, then every observation
+    with the runner's ``agent.run`` preferred over platform ancestors. This
+    preserves the runner-owned value after a platform span becomes the root.
+    Only a present, non-empty attribute is returned -- no value is invented.
     """
 
     hit = _probe_attr(trace, _SANDBOX_ATTR, bare_key="sandbox_id")
     if hit:
         return hit
-    if observations:
-        return _probe_attr(observations[0], _SANDBOX_ATTR, bare_key="sandbox_id")
+    for observation in _runner_first(observations):
+        hit = _probe_attr(observation, _SANDBOX_ATTR, bare_key="sandbox_id")
+        if hit:
+            return hit
     return None
 
 
@@ -104,7 +124,7 @@ def hoist_approval_decision(
 ) -> str | None:
     """Lift the runner's approval-gate decision out of a trace, or None.
 
-    Mirrors ``hoist_sandbox_id``'s trace-then-first-observation probe. The
+    Mirrors ``hoist_sandbox_id``'s trace-then-runner-first observation probe. The
     attribute is stamped on the root ``agent.run`` span rather than as a
     provider-wide resource attribute (ADR-0076 Stone 3, #889), so it is
     ordinarily trace-level; the observation fallback stays for the same
@@ -116,8 +136,10 @@ def hoist_approval_decision(
     hit = _probe_attr(trace, _APPROVAL_DECISION_ATTR)
     if hit:
         return hit
-    if observations:
-        return _probe_attr(observations[0], _APPROVAL_DECISION_ATTR)
+    for observation in _runner_first(observations):
+        hit = _probe_attr(observation, _APPROVAL_DECISION_ATTR)
+        if hit:
+            return hit
     return None
 
 

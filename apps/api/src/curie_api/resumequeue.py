@@ -7,9 +7,11 @@ the identical consumer -> kernel -> claim path a Slack mention takes: the kernel
 finds the thread's route suspended and rehydrates it (ADR-0003), and the
 platform-authored resolution text becomes the turn that continues the run.
 
-Wire encoding mirrors the dispatcher's seam exactly (a single ``payload`` field
-holding the model's JSON). The turn's ``event_id`` is deterministic per
-approval, so the worker's done-marker dedupes any double-enqueue.
+Wire encoding mirrors the dispatcher's seam exactly: ``payload`` holds the
+model's JSON and an active causal request may add a separate optional W3C
+carrier. A background sweep with no parent remains payload-only. The turn's
+``event_id`` is deterministic per approval, so the worker's done-marker dedupes
+any double-enqueue.
 """
 
 import re
@@ -19,6 +21,9 @@ from typing import Any
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import TRACE_CONTEXT_FIELD, inject_trace_context
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode, Tracer
 
 from .config import get_settings
 from .models import Approval, ApprovalStatus
@@ -218,6 +223,7 @@ class ResumeQueue:
         stream: str | None = None,
         *,
         dead_letter_stream: str | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         # The runs stream is declared once, on the settings object (#492): the
         # module constant this used to default to was a second declaration of
@@ -227,6 +233,7 @@ class ResumeQueue:
         # when the queue is built, not at import time.
         self._client = client
         self._stream = stream if stream is not None else get_settings().runs_stream
+        self._tracer = tracer
         # The graveyard the #532 backstop scans (READ-ONLY here; the API never
         # mutates it). The derivation MUST match the worker's
         # WorkerConfig.dead_letter_stream_name() (`<stream>:dead`). An operator
@@ -236,8 +243,39 @@ class ResumeQueue:
         self._dead_letter_stream = dead_letter_stream or f"{self._stream}:dead"
 
     async def enqueue(self, turn: QueuedTurn) -> str:
-        fields: dict[Any, Any] = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
-        stream_id = await self._client.xadd(self._stream, fields)
+        async def _xadd(carrier: str | None) -> Any:
+            fields: dict[Any, Any] = {
+                STREAM_PAYLOAD_FIELD: turn.model_dump_json()
+            }
+            if carrier is not None:
+                fields[TRACE_CONTEXT_FIELD] = carrier
+            return await self._client.xadd(self._stream, fields)
+
+        current = trace.get_current_span().get_span_context()
+        if self._tracer is None or not current.is_valid:
+            # Background sweep/reconcile producers deliberately remain valid
+            # payload-only entries when there is no causal request span.
+            stream_id = await _xadd(None)
+        else:
+            with self._tracer.start_as_current_span(
+                "send curie:runs",
+                kind=SpanKind.PRODUCER,
+                attributes={
+                    "messaging.system": "valkey",
+                    "messaging.destination.name": self._stream,
+                    "messaging.operation.type": "send",
+                },
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
+                try:
+                    stream_id = await _xadd(inject_trace_context())
+                except BaseException as exc:
+                    span.set_attribute("error.type", type(exc).__name__)
+                    span.set_status(Status(StatusCode.ERROR))
+                    raise
+                span.add_event("messaging.enqueued")
+                span.set_status(Status(StatusCode.OK))
         return stream_id.decode() if isinstance(stream_id, bytes) else str(stream_id)
 
     async def read_dead_letter(

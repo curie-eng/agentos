@@ -41,7 +41,9 @@ from typing import Annotated
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import set_turn_identity
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from opentelemetry import trace
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -296,6 +298,12 @@ async def ingest_hook(
                     headers={"Retry-After": str(settings.hook_backlog_window_s)},
                 )
             turn = _mint_turn(agent, hook, event_id, raw)
+            set_turn_identity(
+                trace.get_current_span(),
+                agent_id=agent.id,
+                conversation_id=turn.conversation_id,
+                user_id=turn.author,
+            )
             enqueued, current = await enqueue_owned(
                 client,
                 key=key,
@@ -304,6 +312,7 @@ async def ingest_hook(
                 payload=turn.model_dump_json(),
                 payload_field=STREAM_PAYLOAD_FIELD,
                 lease_s=settings.channel_delivery_lease_s,
+                tracer=request.app.state.telemetry.tracer,
             )
             if enqueued:
                 logger.info(

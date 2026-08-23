@@ -35,3 +35,10 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlphttp/langfuse, debug]
+    # Logs are accepted and batched for correlation with the trace stream. The
+    # stock stack deliberately has no retained log backend yet (#1765), so the
+    # debug exporter preserves diagnostics without claiming query/storage.
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

@@ -32,6 +32,8 @@ from typing import cast
 from aci_protocol import Event, Interrupt, parse_inbound
 from aiohttp import web
 from aiohttp.typedefs import Handler, Middleware
+from curie_telemetry.carrier import extract_http_trace_context
+from opentelemetry.context import attach, detach
 
 from .session import SessionRunner
 
@@ -153,9 +155,30 @@ async def _event(request: web.Request) -> web.StreamResponse:
     # asyncgen GC on a different task, releasing the turn lock cross-task (see
     # SessionRunner._turn_lock). aclosing keeps the teardown -- and the turn
     # interrupt in run_turn's finally -- on the task that opened it.
-    async with contextlib.aclosing(runner.run_turn(frame)) as stream:
-        async for line in stream:
-            await response.write(line.encode("utf-8"))
+    trace_headers: dict[str, str] = {}
+    traceparents = request.headers.getall("traceparent", [])
+    tracestates = request.headers.getall("tracestate", [])
+    if traceparents:
+        # More than one traceparent is invalid; joining makes the value fail the
+        # value-free validator without ever putting it in a diagnostic.
+        trace_headers["traceparent"] = ",".join(traceparents)
+    if tracestates:
+        # HTTP permits repeated tracestate fields; W3C treats them as one list.
+        trace_headers["tracestate"] = ",".join(tracestates)
+    token = attach(extract_http_trace_context(trace_headers))
+    try:
+        try:
+            async with contextlib.aclosing(runner.run_turn(frame)) as stream:
+                async for line in stream:
+                    await response.write(line.encode("utf-8"))
+        finally:
+            # The worker may suspend/delete the sandbox as soon as it sees EOF.
+            # Flush the just-ended agent.run and its correlated logs first; a
+            # timeout or exporter error remains telemetry-only and never changes
+            # the already-produced ACI terminal result.
+            await runner.flush_telemetry(timeout_millis=500)
+    finally:
+        detach(token)
     await response.write_eof()
     return response
 

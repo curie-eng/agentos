@@ -41,6 +41,7 @@ spec:
           {{- end }}
           env:
             {{- include "curie.env.valkey" . | nindent 12 }}
+            {{- include "curie.env.otel" . | nindent 12 }}
             - name: SLACK_APP_TOKEN
               valueFrom:
                 secretKeyRef:

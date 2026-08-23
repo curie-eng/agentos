@@ -201,27 +201,46 @@ def test_tracer_provider_built_with_endpoint() -> None:
     provider.shutdown()
 
 
-def test_resource_stamps_sandbox_id_when_present() -> None:
-    # The sandbox id (ACI CURIE_SANDBOX_ID) lets a trace be attributed to the
-    # concrete sandbox that produced it, not just the session.
-    otel = OtelConfig(endpoint="http://localhost:24318")
-    provider = build_tracer_provider(otel, "s1", "sandbox-abc")
-    assert provider is not None
-    attrs = provider.resource.attributes
-    assert attrs["curie.session_id"] == "s1"
-    assert attrs["curie.sandbox_id"] == "sandbox-abc"
-    provider.shutdown()
+def test_run_span_stamps_session_and_sandbox_ids_when_present() -> None:
+    # Per-turn ids belong on agent.run, not on the process-wide resource.
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = RunTracer(provider)
+
+    with tracer.run_span(
+        trace_name="curie-run:test",
+        model="fake-model",
+        session_id="s1",
+        sandbox_id="sandbox-abc",
+    ):
+        pass
+
+    root = {span.name: span for span in exporter.get_finished_spans()}["agent.run"]
+    assert root.attributes["curie.session_id"] == "s1"
+    assert root.attributes["curie.sandbox_id"] == "sandbox-abc"
 
 
-def test_resource_omits_sandbox_id_when_absent_or_empty() -> None:
-    # Absent (default) and empty-string sandbox ids are both omitted rather than
-    # stamped as an empty attribute value.
-    otel = OtelConfig(endpoint="http://localhost:24318")
+def test_run_span_omits_sandbox_id_when_absent_or_empty() -> None:
+    # Absent (default) and empty-string sandbox ids are both omitted from the
+    # turn span rather than stamped as an empty attribute value.
     for sandbox_id in (None, ""):
-        provider = build_tracer_provider(otel, "s1", sandbox_id)
-        assert provider is not None
-        assert "curie.sandbox_id" not in provider.resource.attributes
-        provider.shutdown()
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = RunTracer(provider)
+
+        with tracer.run_span(
+            trace_name="curie-run:test",
+            model="fake-model",
+            session_id="s1",
+            sandbox_id=sandbox_id,
+        ):
+            pass
+
+        root = {span.name: span for span in exporter.get_finished_spans()}["agent.run"]
+        assert root.attributes["curie.session_id"] == "s1"
+        assert "curie.sandbox_id" not in root.attributes
 
 
 def test_resource_stamps_schema_version() -> None:
@@ -287,16 +306,15 @@ def test_validator_strips_sequence_value_hiding_an_unscrubbed_secret() -> None:
     assert "langfuse.trace.name" not in finished.attributes
 
 
-def test_validator_keeps_a_clean_sequence_value() -> None:
-    # The recursion must not become a blanket "drop all sequences": a clean
-    # sequence on an allowed key is legitimate telemetry and survives.
+def test_validator_strips_clean_sequence_with_wrong_closed_schema_type() -> None:
+    # A clean sequence is still invalid for a key whose closed type is `str`.
     provider, exporter = _validated_exporter()
     tracer = provider.get_tracer("test")
     with tracer.start_as_current_span("agent.run") as span:
         span.set_attribute("langfuse.trace.name", ["curie-run:test", "clean"])
 
     (finished,) = exporter.get_finished_spans()
-    assert finished.attributes["langfuse.trace.name"] == ("curie-run:test", "clean")
+    assert "langfuse.trace.name" not in finished.attributes
 
 
 def test_validator_leaves_clean_allowed_attributes_untouched() -> None:

@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 import redis
+from opentelemetry.trace import Tracer
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
@@ -69,6 +70,7 @@ def build_app(
     authorize: Callable[..., Any] | None = None,
     logger: logging.Logger | None = None,
     resolver: Any | None = None,
+    tracer: Tracer | None = None,
 ) -> App:
     """Build a Bolt App with the dispatcher's handlers registered."""
     signing = config.slack_signing_secret or _SOCKET_MODE_SIGNING_PLACEHOLDER
@@ -91,6 +93,7 @@ def build_app(
         "redis_client": redis_client,
         "config": config,
         "logger": logger,
+        "tracer": tracer,
     }
     if clock is not None:
         register_kwargs["clock"] = clock

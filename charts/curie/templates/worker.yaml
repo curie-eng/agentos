@@ -146,6 +146,7 @@ spec:
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
             {{- include "curie.env.valkey" . | nindent 12 }}
+            {{- include "curie.env.otel" . | nindent 12 }}
             {{- if not $hasWorkerApiUrl }}
             {{- include "curie.env.apiUrl" . | nindent 12 }}
             {{- end }}

@@ -6,9 +6,9 @@
 # (same components, same pinned versions).
 #
 # Bring up full:  docker compose --profile full -f compose.dev.yaml up -d
-# Bring up core:  OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d
-# otel-collector is full-profile only; a core-only stack must blank the endpoint
-# or every span pays a synchronous DNS retry against an absent collector.
+# Bring up core:  OTEL_EXPORTER_OTLP_ENDPOINT= CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d
+# otel-collector is full-profile only; a core-only stack must blank the worker's
+# endpoint and its bridge-runner relay or both processes retry an absent collector.
 # core = postgres, valkey, rustfs-perms, rustfs, rustfs-init, curie-migrate, curie-api, curie-worker
 # full = core + clickhouse, langfuse-web, langfuse-worker, otel-collector, curie-ui
 # The CLI `curie local up` wraps these compose profile invocations.
@@ -376,6 +376,8 @@ services:
       LANGFUSE_HOST: http://langfuse-web:3000
       LANGFUSE_PUBLIC_KEY: pk-lf-curie-dev
       LANGFUSE_SECRET_KEY: sk-lf-curie-dev
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
       # Approval user-group authorizers (#420) look up Slack usergroup
       # membership from the API itself, so the API reads the same bot token the
       # worker and dispatcher use. Empty by default: the Slack-free local loop
@@ -551,24 +553,23 @@ services:
       - CLAUDE_CODE_OAUTH_TOKEN
       - CURIE_CREDENTIALS
       # By default, the worker joins spawned sandbox containers to the DEDICATED
-      # runner network (CURIE_DOCKER_NETWORK=curie_runner, #631) and points
-      # them at the shipped collector (OTEL_EXPORTER_OTLP_ENDPOINT=
-      # http://otel-collector:4318), so a plain `curie local up` traces with no
-      # manual flags. curie_runner carries only the runner's documented
+      # runner network (CURIE_DOCKER_NETWORK=curie_runner, #631) and relays the
+      # bridge-reachable collector endpoint into each child's standard endpoint.
+      # The host-network worker exports through the collector's published
+      # loopback port. A plain `curie local up` therefore traces with no manual
+      # flags. curie_runner carries only the runner's documented
       # dependencies -- otel-collector (telemetry), ollama (--local-model), and
       # curie-api (state) -- NOT the data tier (postgres/valkey/rustfs), so a
       # trusted-but-buggy bundle cannot reach the stores' embedded credentials.
       # The collector join is also what lets --local-model resolve ollama by name.
       # Both are overridable from the shell.
       #
-      # The endpoint default is what a full-profile `local up` gets. It uses the
-      # `${VAR-default}` form (substitute only when UNSET), not `${VAR:-default}`
-      # (substitute when unset OR empty), so an explicit empty value means "no
-      # endpoint". That is what lets `curie local up --minimal` suppress it:
-      # --minimal selects the `core` profile, which does not start otel-collector,
-      # and a runner pointed at a host that never resolves stalls on synchronous
-      # export retries per span. CURIE_DOCKER_NETWORK stays on `:-` because the
-      # runner network is created (via curie-api's membership) under `core` too.
+      # Both endpoint defaults use `${VAR-default}` (substitute only when UNSET),
+      # not `${VAR:-default}` (substitute when unset OR empty), so explicit empty
+      # values mean "no endpoint". `curie local up --minimal` blanks both from
+      # one helper because the core profile does not start otel-collector.
+      # CURIE_DOCKER_NETWORK stays on `:-` because the runner network is created
+      # (via curie-api's membership) under `core` too.
       - CURIE_MODEL_BASE_URL=${CURIE_MODEL_BASE_URL:-}
       - CURIE_MODEL_API_BACKEND=${CURIE_MODEL_API_BACKEND:-}
       - CURIE_MODEL_ENV_KEY=${CURIE_MODEL_ENV_KEY:-}
@@ -579,7 +580,12 @@ services:
       # it to the worker, which forwards it into every claim's boot env.
       - CURIE_FALSE_COMPLETION_CHECK=${CURIE_FALSE_COMPLETION_CHECK:-}
       - CURIE_DOCKER_NETWORK=${CURIE_DOCKER_NETWORK:-curie_runner}
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT-http://127.0.0.1:24318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
+      # Compose-only boot plumbing: the worker maps this into the spawned
+      # runner's standard endpoint. Helm needs no relay because both pods use
+      # the same in-cluster collector address.
+      - CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT=${CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
       # config.py's connector_release/connector_namespace (CURIE_RELEASE /
       # CURIE_NAMESPACE) both default empty, which was built for the cluster
       # tier (#1118) where Helm supplies the real release name and namespace.
@@ -634,6 +640,8 @@ services:
       # Mirrors curie-api's API_KEY so resolve calls authenticate. Wired
       # explicitly rather than relying on the two defaults happening to match.
       CURIE_API_KEY: curie-dev-key
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT-http://otel-collector:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL-http/protobuf}
     restart: unless-stopped
 
 networks:

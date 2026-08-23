@@ -1,22 +1,98 @@
 {
   "$id": "https://schemas.curietech.ai/runner/otel-attributes/v1.json",
   "schema_version": "v1",
-  "keys": {
+  "shared": {
     "curie.sandbox_id": "str",
     "curie.session_id": "str",
-    "gen_ai.approval.decision": "str",
-    "gen_ai.operation.name": "str",
-    "gen_ai.request.model": "str",
-    "gen_ai.tool.name": "str",
-    "gen_ai.usage.cache_creation_input_tokens": "int",
-    "gen_ai.usage.cache_read_input_tokens": "int",
-    "gen_ai.usage.input_tokens": "int",
-    "gen_ai.usage.output_tokens": "int",
+    "deployment.environment.name": "str",
     "langfuse.session.id": "str",
     "langfuse.trace.name": "str",
     "langfuse.user.id": "str",
-    "model": "str",
     "schema.version": "str",
-    "service.name": "str"
+    "service.instance.id": "str",
+    "service.name": "str",
+    "service.namespace": "str",
+    "service.version": "str"
+  },
+  "services": {
+    "curie-api": {
+      "error.type": "str",
+      "exception.escaped": "bool",
+      "exception.type": "str",
+      "http.request.method": "str",
+      "http.response.status_code": "int",
+      "messaging.destination.name": "str",
+      "messaging.operation.type": "str",
+      "messaging.system": "str",
+      "server.address": "str",
+      "server.port": "int"
+    },
+    "curie-dispatcher": {
+      "error.type": "str",
+      "exception.escaped": "bool",
+      "exception.type": "str",
+      "messaging.destination.name": "str",
+      "messaging.operation.type": "str",
+      "messaging.system": "str"
+    },
+    "curie-worker": {
+      "curie.sandbox.outcome": "str",
+      "curie.turn.outcome": "str",
+      "error.type": "str",
+      "exception.escaped": "bool",
+      "exception.type": "str",
+      "http.request.method": "str",
+      "http.response.status_code": "int",
+      "messaging.destination.name": "str",
+      "messaging.operation.type": "str",
+      "messaging.system": "str",
+      "server.address": "str",
+      "server.port": "int"
+    },
+    "curie-runner": {
+      "error.type": "str",
+      "exception.escaped": "bool",
+      "exception.type": "str",
+      "gen_ai.approval.decision": "str",
+      "gen_ai.operation.name": "str",
+      "gen_ai.request.model": "str",
+      "gen_ai.tool.name": "str",
+      "gen_ai.usage.cache_creation_input_tokens": "int",
+      "gen_ai.usage.cache_read_input_tokens": "int",
+      "gen_ai.usage.input_tokens": "int",
+      "gen_ai.usage.output_tokens": "int",
+      "model": "str"
+    }
+  },
+  "events": {
+    "curie-api": [
+      "messaging.enqueued",
+      "trace_context.invalid"
+    ],
+    "curie-dispatcher": [
+      "dispatcher.agent_lookup.resolved",
+      "dispatcher.agent_lookup.unavailable",
+      "dispatcher.dedupe.checked",
+      "dispatcher.dedupe.skip",
+      "dispatcher.placeholder.posted",
+      "messaging.enqueued"
+    ],
+    "curie-worker": [
+      "messaging.ack",
+      "messaging.dead_letter",
+      "messaging.pending",
+      "trace_context.invalid",
+      "worker.completion.settled",
+      "worker.dedupe.checked",
+      "worker.dedupe.skip",
+      "worker.lock.acquired",
+      "worker.lock.wait",
+      "worker.reply.final",
+      "worker.route.finish_race",
+      "worker.route.start",
+      "worker.route.steer",
+      "worker.terminal"
+    ],
+    "curie-runner": []
   }
 }

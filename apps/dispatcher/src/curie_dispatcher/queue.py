@@ -5,13 +5,14 @@ enqueues onto the Valkey Stream and the worker consumes. The model was promoted
 into the frozen ACI package (issue #7) so the contract is shared across three
 languages and guarded by the schema-compat gate rather than hand-mirrored. This
 module owns only the Valkey Stream *transport* of that model (a transport detail
-that stays out of the frozen package): the single-``payload`` wire encoding plus
-the dedupe guard.
+that stays out of the frozen package): the ``payload`` wire encoding, optional
+W3C trace carrier metadata, and the dedupe guard.
 
-Wire encoding: a Stream entry carries the model as a single ``payload`` field
-holding ``model_dump_json()``. A one-field JSON blob keeps the seam explicit and
-versionable (add fields without reshaping the Stream schema) and lets the worker
-reconstruct the model with ``from_stream_fields``.
+Wire encoding: a Stream entry carries the model as a ``payload`` field holding
+``model_dump_json()`` and, while a producer span is active, a separate optional
+``trace_context`` field. The model remains one JSON blob and the worker
+reconstructs it from only ``payload`` with ``from_stream_fields``; legacy
+payload-only entries therefore remain valid.
 
 Dedupe (idempotency, detailed-architecture 2b rule 5): the idempotency key is the
 delivery's ``event_id`` (the Slack event id for the Slack adapter). A retried
@@ -25,6 +26,7 @@ does not require scanning the Stream.
 from typing import Any, Protocol, cast, runtime_checkable
 
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, parse_queued_turn
+from curie_telemetry import TRACE_CONTEXT_FIELD, inject_trace_context
 
 from .config import DispatcherConfig
 
@@ -52,8 +54,13 @@ class StreamPublisher(Protocol):
 
 
 def to_stream_fields(turn: QueuedTurn) -> dict[str, str]:
-    """Render a turn to the flat field map an ``XADD`` takes (one ``payload``)."""
-    return {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    """Render payload plus optional causal W3C transport metadata."""
+
+    fields = {STREAM_PAYLOAD_FIELD: turn.model_dump_json()}
+    carrier = inject_trace_context()
+    if carrier is not None:
+        fields[TRACE_CONTEXT_FIELD] = carrier
+    return fields
 
 
 def from_stream_fields(fields: dict[str, str]) -> QueuedTurn:

@@ -36,6 +36,7 @@ from typing import Annotated, Any
 
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import set_turn_identity
 from fastapi import (
     APIRouter,
     Depends,
@@ -46,6 +47,7 @@ from fastapi import (
     status,
 )
 from fastapi.exceptions import RequestValidationError
+from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 
@@ -494,6 +496,12 @@ async def ingest_turn(
             # those requests answers from `event_id` alone and would have thrown
             # the payload away.
             turn = _mint_turn(row, body, event_id)
+            set_turn_identity(
+                trace.get_current_span(),
+                agent_id=row.agent_id,
+                conversation_id=turn.conversation_id,
+                user_id=turn.author,
+            )
             enqueued, current = await enqueue_owned(
                 client,
                 key=key,
@@ -502,6 +510,7 @@ async def ingest_turn(
                 payload=turn.model_dump_json(),
                 payload_field=STREAM_PAYLOAD_FIELD,
                 lease_s=settings.channel_delivery_lease_s,
+                tracer=request.app.state.telemetry.tracer,
             )
             if enqueued:
                 logger.info(

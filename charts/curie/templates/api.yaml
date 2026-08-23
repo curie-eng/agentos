@@ -68,6 +68,7 @@ spec:
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
             {{- include "curie.env.valkey" . | nindent 12 }}
+            {{- include "curie.env.otel" . | nindent 12 }}
             - name: API_KEY
               valueFrom:
                 secretKeyRef:

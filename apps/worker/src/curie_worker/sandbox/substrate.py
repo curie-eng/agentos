@@ -29,6 +29,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol import BootEnv
+from curie_telemetry.attributes import sanitize_attributes
+from opentelemetry import trace
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 
 from ..binding import RUNNER_TOKEN_ENV
 from .affinity import AffinityStore
@@ -88,6 +91,7 @@ logger = logging.getLogger(__name__)
 # sandbox, and the next claim() takes the existing _evict_stale path, which
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
+_NOOP_TRACER = trace.NoOpTracerProvider().get_tracer("curie-worker.sandbox")
 
 
 class SandboxSubstrate:
@@ -98,10 +102,33 @@ class SandboxSubstrate:
         k8s: SandboxClient,
         affinity: AffinityStore,
         config: SubstrateConfig,
+        *,
+        tracer: Tracer | None = None,
     ) -> None:
         self._k8s = k8s
         self._affinity = affinity
         self._config = config
+        self._tracer = tracer or _NOOP_TRACER
+
+    @staticmethod
+    def _finish_lifecycle_span(
+        span: Span,
+        outcome: str,
+        *,
+        handle: SandboxHandle | None = None,
+        error: bool = False,
+    ) -> None:
+        attributes: dict[str, object] = {"curie.sandbox.outcome": outcome}
+        if handle is not None:
+            attributes.update(
+                {
+                    "curie.session_id": handle.session_id,
+                    "curie.sandbox_id": handle.sandbox_name,
+                }
+            )
+        for key, value in sanitize_attributes("curie-worker", attributes).items():
+            span.set_attribute(key, value)
+        span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
 
     # -- claim / lookup -------------------------------------------------------
 
@@ -112,21 +139,52 @@ class SandboxSubstrate:
         history ref); the fast path passes none so the claim binds a pre-warmed
         generic sandbox.
         """
+        with self._tracer.start_as_current_span(
+            "sandbox.claim",
+            kind=SpanKind.INTERNAL,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is not None:
+                    if record.state is RouteState.SUSPENDED:
+                        self._finish_lifecycle_span(span, "suspended")
+                        raise SuspendedThreadError(thread_key)
+                    sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+                    if sandbox is not None and sandbox.operating_mode == "Running":
+                        self._affinity.touch(thread_key, self._config.route_ttl_seconds)
+                        self._finish_lifecycle_span(
+                            span,
+                            "reused",
+                            handle=record.handle,
+                        )
+                        return record.handle
+                    # The sandbox died (or was suspended) out from under a live
+                    # route: never hand it back or let it win the fresh race.
+                    self._evict_stale(thread_key, record)
 
-        record = self._affinity.get(thread_key)
-        if record is not None:
-            if record.state is RouteState.SUSPENDED:
-                raise SuspendedThreadError(thread_key)
-            sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
-            if sandbox is not None and sandbox.operating_mode == "Running":
-                self._affinity.touch(thread_key, self._config.route_ttl_seconds)
-                return record.handle
-            # The sandbox died (or was suspended) out from under a live route:
-            # a stale route must never be handed back, and must not win the
-            # re-claim race below. Evict it and bind fresh.
-            self._evict_stale(thread_key, record)
-
-        return self._claim_fresh(thread_key, env=env, state=RouteState.LIVE)
+                handle, outcome = self._claim_fresh(
+                    thread_key,
+                    env=env,
+                    state=RouteState.LIVE,
+                )
+            except CapacityExhaustedError:
+                self._finish_lifecycle_span(span, "capacity", error=True)
+                raise
+            except ClaimTimeoutError:
+                self._finish_lifecycle_span(span, "timeout", error=True)
+                raise
+            except SuspendedThreadError:
+                # Also covers a suspended winner appearing in the fresh-claim
+                # race, not only the route observed before creation.
+                self._finish_lifecycle_span(span, "suspended")
+                raise
+            except Exception:
+                self._finish_lifecycle_span(span, "error", error=True)
+                raise
+            self._finish_lifecycle_span(span, outcome, handle=handle)
+            return handle
 
     def lookup(self, thread_key: str) -> SandboxHandle | None:
         """The thread's live handle, or None (no route, suspended, or the
@@ -150,13 +208,30 @@ class SandboxSubstrate:
         rebuild session state later.
         """
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            raise NoRouteError(thread_key)
-        self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
-        self._affinity.mark_suspended(
-            thread_key, history_ref, self._config.suspended_route_ttl_seconds
-        )
+        with self._tracer.start_as_current_span(
+            "sandbox.suspend",
+            kind=SpanKind.INTERNAL,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is None:
+                    raise NoRouteError(thread_key)
+                self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
+                self._affinity.mark_suspended(
+                    thread_key,
+                    history_ref,
+                    self._config.suspended_route_ttl_seconds,
+                )
+            except Exception:
+                self._finish_lifecycle_span(span, "error", error=True)
+                raise
+            self._finish_lifecycle_span(
+                span,
+                "suspended",
+                handle=record.handle,
+            )
 
     def resume(
         self, thread_key: str, *, env: dict[str, str] | None = None
@@ -176,26 +251,44 @@ class SandboxSubstrate:
         mint one (issue #63: the old token died with the old claim).
         """
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            raise NoRouteError(thread_key)
-        old = record.handle
-        boot = dict(env) if env else {}
-        boot.setdefault(SESSION_ENV, old.session_id)
-        if not boot.get(RUNNER_TOKEN_ENV):
-            boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
-        if old.history_ref is not None:
-            boot.setdefault(HISTORY_ENV, old.history_ref)
+        with self._tracer.start_as_current_span(
+            "sandbox.resume",
+            kind=SpanKind.INTERNAL,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is None:
+                    raise NoRouteError(thread_key)
+                old = record.handle
+                boot = dict(env) if env else {}
+                boot.setdefault(SESSION_ENV, old.session_id)
+                if not boot.get(RUNNER_TOKEN_ENV):
+                    boot[RUNNER_TOKEN_ENV] = secrets.token_urlsafe(32)
+                if old.history_ref is not None:
+                    boot.setdefault(HISTORY_ENV, old.history_ref)
 
-        self._k8s.delete_claim(old.claim_name)
-        self._affinity.delete_if_claim(thread_key, old.claim_name)
-        return self._claim_fresh(
-            thread_key,
-            env=boot,
-            state=RouteState.LIVE,
-            session_id=old.session_id,
-            history_ref=old.history_ref,
-        )
+                self._k8s.delete_claim(old.claim_name)
+                self._affinity.delete_if_claim(thread_key, old.claim_name)
+                handle, _claim_outcome = self._claim_fresh(
+                    thread_key,
+                    env=boot,
+                    state=RouteState.LIVE,
+                    session_id=old.session_id,
+                    history_ref=old.history_ref,
+                )
+            except CapacityExhaustedError:
+                self._finish_lifecycle_span(span, "capacity", error=True)
+                raise
+            except ClaimTimeoutError:
+                self._finish_lifecycle_span(span, "timeout", error=True)
+                raise
+            except Exception:
+                self._finish_lifecycle_span(span, "error", error=True)
+                raise
+            self._finish_lifecycle_span(span, "resumed", handle=handle)
+            return handle
 
     # -- release / reap -------------------------------------------------------
 
@@ -204,12 +297,28 @@ class SandboxSubstrate:
         deletes its sandbox and pod) and drop the route. True if a route
         existed."""
 
-        record = self._affinity.get(thread_key)
-        if record is None:
-            return False
-        self._k8s.delete_claim(record.handle.claim_name)
-        self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
-        return True
+        with self._tracer.start_as_current_span(
+            "sandbox.release",
+            kind=SpanKind.INTERNAL,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                if record is None:
+                    self._finish_lifecycle_span(span, "missing")
+                    return False
+                self._k8s.delete_claim(record.handle.claim_name)
+                self._affinity.delete_if_claim(thread_key, record.handle.claim_name)
+            except Exception:
+                self._finish_lifecycle_span(span, "error", error=True)
+                raise
+            self._finish_lifecycle_span(
+                span,
+                "released",
+                handle=record.handle,
+            )
+            return True
 
     def reap_orphans(self) -> list[str]:
         """Delete substrate-managed claims that no live route references AND
@@ -284,7 +393,7 @@ class SandboxSubstrate:
         state: RouteState,
         session_id: str | None = None,
         history_ref: str | None = None,
-    ) -> SandboxHandle:
+    ) -> tuple[SandboxHandle, str]:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
         name = config.claim_name_for(thread_key, nonce)
@@ -318,7 +427,7 @@ class SandboxSubstrate:
         record = RouteRecord(handle=handle, state=state)
         for _ in range(3):
             if self._affinity.put_if_absent(thread_key, record, config.route_ttl_seconds):
-                return handle
+                return handle, "created"
             # Lost the race: another worker recorded a route first. Adopt the
             # winner only if its sandbox is actually alive; a stale route
             # (dead sandbox) is evicted and the put retried.
@@ -331,7 +440,7 @@ class SandboxSubstrate:
             sandbox = self._k8s.get_sandbox(winner.handle.sandbox_name)
             if sandbox is not None and sandbox.operating_mode == "Running":
                 self._k8s.delete_claim(name)
-                return winner.handle
+                return winner.handle, "adopted"
             self._evict_stale(thread_key, winner)
         self._k8s.delete_claim(name)
         raise NoRouteError(f"could not record a route for {thread_key} after repeated races")

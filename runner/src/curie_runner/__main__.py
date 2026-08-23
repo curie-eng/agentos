@@ -15,7 +15,9 @@ import sys
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
+from curie_telemetry import TelemetryRuntime, configure
 
+from . import __version__
 from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
     APPROVAL_SERVER_NAME,
@@ -44,7 +46,7 @@ from .history import (
 )
 from .hooks import load_bundle_hooks
 from .memory import MemoryRecord, MemoryStore, format_memory_preamble, resolve_memory
-from .otel import RunTracer, build_tracer_provider
+from .otel import RunTracer
 from .redact import install_stdout_redaction
 from .sdk_auth import UnsupportedCredentialError
 from .server import create_app
@@ -52,7 +54,10 @@ from .session import SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
 
-logger = logging.getLogger(__name__)
+# A stable service namespace is load-bearing for the scoped OTEL handler. When
+# this module is executed with ``python -m``, ``__name__`` is ``__main__`` and
+# would otherwise put every boot diagnostic outside ``curie_runner``.
+logger = logging.getLogger("curie_runner.main")
 
 
 def _resolve_harness(name: str = DEFAULT_HARNESS) -> HarnessContribution:
@@ -115,6 +120,7 @@ def build_runner(
     history_store: TranscriptStore | None = None,
     conversation_preamble: str | None = None,
     harness: HarnessContribution | None = None,
+    telemetry: TelemetryRuntime | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -267,15 +273,13 @@ def build_runner(
         )
         return ClaudeAgentSession(options)
 
-    provider = build_tracer_provider(
-        config.session.otel,
-        config.session.session_id,
-        config.session.sandbox_id,
+    telemetry = telemetry or configure(
+        service_name="curie-runner", service_version=__version__
     )
     return SessionRunner(
         session_factory=factory,
         ceiling=config.ceiling,
-        tracer=RunTracer(provider),
+        tracer=RunTracer(telemetry.tracer),
         classifier=SideEffectClassifier(readonly_tools=harness.readonly_tools),
         trace_name=f"curie-run:{config.session.session_id}",
         session_id=config.session.session_id,
@@ -286,6 +290,8 @@ def build_runner(
         approval_resumed_kind=config.approval_resumed_kind,
         approval_decision=config.approval_decision,
         false_completion_check=config.false_completion_check,
+        sandbox_id=config.session.sandbox_id,
+        telemetry=telemetry,
     )
 
 
@@ -368,6 +374,11 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     install_stdout_redaction()
+    telemetry = configure(service_name="curie-runner", service_version=__version__)
+    telemetry.attach_logging(
+        logging.getLogger("curie_runner"),
+        default_level=logging.INFO,
+    )
     # The NAME comes from the one declaration (#488); the parse deliberately does
     # not. BootEnv reads any non-"0" value as true, while this boot has always
     # required an explicit 1/true/yes -- routing through it would turn
@@ -416,6 +427,7 @@ def main() -> None:
         history_store=history_store,
         conversation_preamble=conversation_preamble,
         harness=harness,
+        telemetry=telemetry,
     )
     app = create_app(runner, token=config.runner_token)
 

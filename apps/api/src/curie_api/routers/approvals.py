@@ -17,7 +17,9 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+from curie_telemetry import set_turn_identity
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from opentelemetry import trace
 from sqlalchemy.exc import IntegrityError
 
 from .. import crud
@@ -35,6 +37,17 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)]
 )
+
+
+def _stamp_resume_identity(approval: Approval, *, user_id: str) -> None:
+    if approval.agent_id is None:
+        return
+    set_turn_identity(
+        trace.get_current_span(),
+        agent_id=approval.agent_id,
+        conversation_id=approval.conversation_id,
+        user_id=user_id,
+    )
 
 
 def _expired(approval: Approval) -> bool:
@@ -201,7 +214,9 @@ async def resolve_approval(
             # redelivery of an already-finished turn re-running; it is the CAS,
             # not the shared key, that keeps this wakeup single.
             try:
-                await resume_queue.enqueue(build_expiry_resume_turn(expired))
+                turn = build_expiry_resume_turn(expired)
+                _stamp_resume_identity(expired, user_id=turn.author)
+                await resume_queue.enqueue(turn)
                 # Enqueue-first-then-mark (#418): only a wake that reached the
                 # stream is written off, so a failure below leaves resumed_at
                 # NULL and the reconciler re-enqueues it past its grace horizon.
@@ -289,7 +304,9 @@ async def resolve_approval(
     # a 200 would silently strand the suspended session -- re-raise instead, so the
     # failure surfaces as a 500 the caller can see (the CAS/audit already committed).
     try:
-        stream_id = await resume_queue.enqueue(build_resume_turn(claimed))
+        turn = build_resume_turn(claimed)
+        _stamp_resume_identity(claimed, user_id=turn.author)
+        stream_id = await resume_queue.enqueue(turn)
     except Exception:  # noqa: BLE001
         logger.warning(
             "approval %s %s by %s; resume enqueue failed, reconciler will retry",

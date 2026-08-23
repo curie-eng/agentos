@@ -20,8 +20,6 @@ import asyncpg
 import pytest
 from alembic import command
 from alembic.config import Config
-from curie_api.config import get_settings
-from curie_api.main import create_app
 from fastapi.testclient import TestClient
 from sqlalchemy import make_url
 from sqlalchemy.engine import URL
@@ -38,6 +36,14 @@ from sqlalchemy.sql import text
 # contributor pointing the suite at another store by exporting their own value wins.
 os.environ.setdefault("S3_ACCESS_KEY", "rustfs")
 os.environ.setdefault("S3_SECRET_KEY", "rustfssecret")
+
+# Import the application only after the suite environment is complete.
+# ``curie_api.db`` resolves the cached settings while its module-level schema is
+# initialized, so importing ``create_app`` above these declarations makes a
+# standalone TestClient inherit the empty production credential defaults even
+# though the test suite intended to select the disposable RustFS service.
+from curie_api.config import get_settings  # noqa: E402
+from curie_api.main import create_app  # noqa: E402
 
 API_DIR = Path(__file__).resolve().parents[1]
 ALEMBIC_DIR = API_DIR / "alembic"

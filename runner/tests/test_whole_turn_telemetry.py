@@ -268,6 +268,7 @@ def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
 ) -> None:
     runtime = _runtime(monkeypatch, otlp_capture.endpoint)
     logger = logging.getLogger("curie-runner.telemetry-boundary-test")
+    runtime.attach_logging(logger)
 
     with runtime.tracer.start_as_current_span("agent.run") as span:
         span.set_attribute("curie.session_id", "safe-session")
@@ -410,7 +411,7 @@ def test_immediate_post_turn_process_termination_still_exports_agent_run(
                 {"max_output_tokens_per_run": 1000, "max_usd_per_day": 5.0}
             ),
             "CURIE_FAKE_MODEL": "1",
-            "CURIE_PORT": str(port),
+            "CURIE_RUNNER_PORT": str(port),
             "OTEL_EXPORTER_OTLP_ENDPOINT": otlp_capture.endpoint,
             "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
             "PYTHONPATH": os.pathsep.join(

@@ -9,6 +9,7 @@ dependencies = [
     "kubernetes>=36.0.3",
     "aci-protocol",
     "curie-channel-protocol",
+    "curie-telemetry",
     "plugin-format",
     "curie-dispatcher",
     "aiohttp>=3.11",

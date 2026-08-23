@@ -106,6 +106,16 @@ def _span_payload(span: ReadableSpan) -> str:
     )
 
 
+async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if pred():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met before timeout")
+
+
 async def _deliver_new(
     consumer: Consumer,
     h: Any,
@@ -124,13 +134,18 @@ async def _deliver_new(
     [(read_id, read_fields)] = delivered[0][1]
     assert read_id == entry_id
     await consumer._dispatch(read_id, read_fields)
-    await asyncio.gather(*list(consumer._inflight))
+    # A fast handler can finish between ``_dispatch`` returning and a snapshot
+    # of ``_inflight``; its done callback then removes the task before the test
+    # can await it.  The entry remains in ``_inflight_ids`` until _handle's
+    # finally block has ended the process span, so its removal is the stable,
+    # observable settlement boundary these assertions need.
+    await _wait_until(lambda: read_id not in consumer._inflight_ids)
     return entry_id
 
 
 async def _reclaim_and_settle(consumer: Consumer) -> None:
     await consumer._reclaim_once()
-    await asyncio.gather(*list(consumer._inflight))
+    await _wait_until(lambda: not consumer._inflight_ids)
 
 
 def test_valid_valkey_carrier_parents_process_span_and_success_acks(
@@ -395,16 +410,6 @@ def test_kernel_turn_events_preserve_dedupe_and_finish_race_routing(
             assert {"worker.route.finish_race", "worker.route.start"} <= names[2]
 
     asyncio.run(go())
-
-
-async def _wait_until(pred: Callable[[], bool], timeout: float = 5.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if pred():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("condition not met before timeout")
 
 
 def test_kernel_live_followup_emits_steer_without_forking_a_turn(

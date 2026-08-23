@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "curie-channel-protocol",
+    "curie-telemetry",
     "plugin-format",
     "curie-api",
     "curie-dispatcher",
@@ -21,6 +22,7 @@ members = [
     "packages/aci-protocol",
     "packages/channel-protocol",
     "packages/plugin-format",
+    "packages/telemetry",
     "packages/test-support",
     "apps/api",
     "apps/dispatcher",
@@ -33,6 +35,7 @@ members = [
 [tool.uv.sources]
 aci-protocol = { workspace = true }
 curie-channel-protocol = { workspace = true }
+curie-telemetry = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
 curie-api = { workspace = true }
@@ -70,6 +73,7 @@ root_packages = [
     "curie_worker",
     "curie_dispatcher",
     "curie_runner",
+    "curie_telemetry",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -87,7 +91,7 @@ include_external_packages = true
 # direction that is hardest to see in review.
 name = "The platform never imports a harness SDK"
 type = "forbidden"
-source_modules = ["curie_api", "curie_worker", "curie_dispatcher"]
+source_modules = ["curie_api", "curie_worker", "curie_dispatcher", "curie_telemetry"]
 forbidden_modules = ["claude_agent_sdk"]
 
 [[tool.importlinter.contracts]]
@@ -127,6 +131,7 @@ testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
+    "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/worker/tests",
@@ -169,6 +174,7 @@ mypy_path = [
     "packages/aci-protocol/src",
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
+    "packages/telemetry/src",
     "packages/test-support/src",
     "apps/api/src",
     "apps/dispatcher/src",
@@ -181,6 +187,7 @@ files = [
     "packages/aci-protocol/src",
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
+    "packages/telemetry/src",
     "packages/test-support/src",
     "apps/api/src",
     "apps/dispatcher/src",

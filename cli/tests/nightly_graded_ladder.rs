@@ -286,9 +286,7 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
 #[test]
 fn live_local_rung_grades_the_deployed_weather_cases() {
     let text = ladder();
-    let contract = r#"assert_finalized_reply "local" "$out"
-
-    echo
+    let contract = r#"    echo
     echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -301,8 +299,14 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         echo "=== curie local eval ==="
         (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
     fi"#;
+    let finalized = text
+        .find(r#"assert_finalized_reply "local" "$out""#)
+        .expect("local rung must assert a finalized reply");
+    let eval = text
+        .find(contract)
+        .expect("local rung must retain the dry-run and live eval block");
     assert!(
-        text.contains(contract),
+        finalized < eval,
         "the live local rung must run local eval after its plumbing assertion \
          against the deployed weather bundle cases, with the suite-parity \
          dry-run check in front of it; ladder contents:\n{text}"
@@ -459,6 +463,11 @@ fn write_ladder_stubs(dir: &Path) {
         include_str!("data/deploy-provider-wire.json"),
     )
     .expect("write deploy provider fixture");
+    fs::write(
+        dir.join("otel-stub-evidence.py"),
+        include_str!("fixtures/otel/stub_evidence.py"),
+    )
+    .expect("write OTEL evidence fixture");
 
     write_executable(
         &dir.join("curie"),
@@ -653,9 +662,11 @@ print(json.dumps({
         echo "stub: removed the leftover runner named '$name'"
         ;;
     "local up --minimal")
+        touch "$STUB_STATE/no-otel-endpoint"
         echo "stub: compose stack up"
         ;;
     "local up")
+        rm -f "$STUB_STATE/no-otel-endpoint"
         echo "stub: full compose stack up"
         ;;
     "--json local deploy --plugin-dir "*)
@@ -667,7 +678,12 @@ print(json.dumps({
         emit_deploy "${STUB_CLUSTER_SHA256:-$(sha_of_bundle "$bundle_dir")}"
         ;;
     "--json local message "*)
-        printf '%s\n' '{"finalized":true,"reply":"stub local weather reply"}'
+        if [ ! -e "$STUB_STATE/no-otel-endpoint" ] && [ -n "${CURIE_OTEL_E2E_OUTPUT:-}" ]; then
+            python3 "$STUB_STATE/otel-stub-evidence.py" turn \
+                --agent-id "$STUB_AGENT_ID" --thread thread-example \
+                --topology cli --outcome success
+        fi
+        printf '%s\n' '{"finalized":true,"reply":"stub local weather reply","thread":"thread-example"}'
         ;;
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
@@ -706,6 +722,27 @@ print(json.dumps({
         exit 97
         ;;
 esac
+"#,
+    );
+
+    // The sealed transport-control block is an in-process Python driver in the
+    // real ladder. These executing controls have no Valkey/services, so this
+    // argv-strict uv stub emits equivalent file-boundary evidence and the same
+    // public JSON result. The no-endpoint runtime probe is the argument-free
+    // sibling and intentionally emits nothing.
+    write_executable(
+        &dir.join("uv"),
+        r#"#!/bin/sh
+set -u
+if [ "$#" -eq 4 ] && [ "$1" = "run" ] && [ "$2" = "python" ] && [ "$3" = "-" ]; then
+    python3 "$STUB_STATE/otel-stub-evidence.py" controls --agent-id "$4"
+elif [ "$#" -eq 3 ] && [ "$1" = "run" ] && [ "$2" = "python" ] && [ "$3" = "-" ]; then
+    # run_no_endpoint_runtime_probe: the absence of records is its assertion.
+    exit 0
+else
+    echo "unexpected uv invocation: $*" >&2
+    exit 97
+fi
 "#,
     );
 
@@ -920,12 +957,28 @@ fn run_eval_argument_control(trajectory: bool) -> (Output, String) {
     require_local_stub_port_free();
     let root = tempfile::tempdir().expect("create isolated ladder root");
     let scripts = root.path().join("cli/scripts");
+    let cli_tests = root.path().join("cli/tests");
+    let otel_fixtures = cli_tests.join("fixtures/otel");
     let evals = root.path().join("examples/weather/evals");
     fs::create_dir_all(&scripts).expect("create script directory");
+    fs::create_dir_all(&otel_fixtures).expect("create OTEL fixture directory");
     fs::create_dir_all(&evals).expect("create eval directory");
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/e2e-ladder.sh");
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest.join("scripts/e2e-ladder.sh");
     let script = scripts.join("e2e-ladder.sh");
     fs::copy(source, &script).expect("copy ladder script");
+    fs::copy(
+        manifest.join("tests/otel_e2e_assert.py"),
+        cli_tests.join("otel_e2e_assert.py"),
+    )
+    .expect("copy OTEL evidence parser");
+    for fixture in ["collector-config.yaml", "compose.override.yaml"] {
+        fs::copy(
+            manifest.join("tests/fixtures/otel").join(fixture),
+            otel_fixtures.join(fixture),
+        )
+        .expect("copy OTEL collector fixture");
+    }
     fs::write(
         evals.join("cases.json"),
         r#"{"name":"weather","cases":[{"id":"weather","input":"weather","grader":{"kind":"contains","expected":"sunny"}}]}"#,
@@ -1075,8 +1128,9 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .collect::<Vec<_>>();
     assert_eq!(
         ordinary_starts,
-        ["local up --minimal"],
-        "ordinary grading must retain the minimal local profile: {ordinary_invocations}"
+        ["local up"],
+        "the mandatory OTEL file-boundary proof requires the full local profile: \
+         {ordinary_invocations}"
     );
 }
 

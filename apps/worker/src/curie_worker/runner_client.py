@@ -17,9 +17,16 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from types import TracebackType
+from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 from aci_protocol import Event, Interrupt, OutboundEvent, parse_ndjson_line
+from curie_telemetry import inject_trace_headers
+from curie_telemetry.attributes import sanitize_attributes
+from opentelemetry import trace
+from opentelemetry.context import attach, detach
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer, set_span_in_context
 
 # The interrupt RPC is a control-plane POST, not a streaming turn (#742, a
 # follow-up to #739): it exists only to hard-stop the live turn, never to carry
@@ -34,6 +41,7 @@ from aci_protocol import Event, Interrupt, OutboundEvent, parse_ndjson_line
 # going) instead of re-deriving the bound -- or a coupling to this client's
 # other timeouts -- at each call site.
 _DEFAULT_INTERRUPT_TIMEOUT_S = 5.0
+_NOOP_TRACER = trace.NoOpTracerProvider().get_tracer("curie-worker.runner-client")
 
 
 def _auth_headers(token: str | None) -> dict[str, str] | None:
@@ -52,21 +60,61 @@ class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
 
 
+def _set_attributes(span: Span, attributes: dict[str, object]) -> None:
+    """Apply only the worker's closed telemetry vocabulary to ``span``."""
+
+    for key, value in sanitize_attributes("curie-worker", attributes).items():
+        span.set_attribute(key, value)
+
+
+def _finish_span(span: Span, *, error: bool) -> None:
+    span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
+    span.end()
+
+
 class TurnStream:
     """An open ``/v1/event`` response: the turn is active; iterate for frames."""
 
-    def __init__(self, response: aiohttp.ClientResponse) -> None:
+    def __init__(self, response: aiohttp.ClientResponse, span: Span | None = None) -> None:
         self._response = response
+        self._span = span or _NOOP_TRACER.start_span("POST runner")
+        self._closed = False
 
     async def __aiter__(self) -> AsyncIterator[OutboundEvent]:
-        async for raw in self._response.content:
-            line = raw.decode("utf-8").strip()
-            if not line:
-                continue
-            yield parse_ndjson_line(line)
+        try:
+            async for raw in self._response.content:
+                try:
+                    line = raw.decode("utf-8").strip()
+                    frame = parse_ndjson_line(line) if line else None
+                except Exception:
+                    raise RunnerError(
+                        "runner stream contained an unreadable NDJSON frame"
+                    ) from None
+                if not line:
+                    continue
+                assert frame is not None
+                yield frame
+        except BaseException:
+            # Never record the exception itself: a parse failure may carry the
+            # malformed runner line, which is agent-controlled content.
+            self._finish(error=True)
+            raise
+        else:
+            self._finish(error=False)
 
     def close(self) -> None:
-        self._response.release()
+        """Abandon an unconsumed response, idempotently."""
+
+        self._finish(error=True)
+
+    def _finish(self, *, error: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.release()
+        finally:
+            _finish_span(self._span, error=error)
 
     async def __aenter__(self) -> TurnStream:
         return self
@@ -77,7 +125,11 @@ class TurnStream:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        del exc_type, exc, tb
+        # Normal EOF already closed the owner as OK inside ``__aiter__``.  If
+        # the context exits while it is still open, the response was abandoned
+        # (with or without a caller exception) and must be ERROR.
+        self._finish(error=True)
 
 
 class RunnerClient:
@@ -90,6 +142,7 @@ class RunnerClient:
         total_timeout_s: float = 600.0,
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
         session: aiohttp.ClientSession | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._own_session = session is None
         self._session = session or aiohttp.ClientSession(
@@ -102,31 +155,108 @@ class RunnerClient:
         # ``/v1/interrupt`` gets its own short control-plane budget regardless of
         # how the streaming timeouts above are tuned.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
+        # The composition root injects its configured tracer into the runs lane.
+        # Defaulting to a private no-op (rather than the ambient global provider)
+        # prevents this shared client from silently instrumenting the eval lane.
+        self._tracer = tracer or _NOOP_TRACER
+
+    async def _request(
+        self,
+        method: str,
+        base_url: str,
+        path: str,
+        *,
+        token: str | None = None,
+        json: object | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+    ) -> tuple[aiohttp.ClientResponse, Span]:
+        """Send one request under a manually-owned CLIENT span.
+
+        Authorization and W3C context share the wire header map, but only the
+        closed method/address/port/status attributes are exported.  Using the
+        dedicated Trace Context propagator means baggage can never cross.
+        """
+
+        parsed = urlsplit(base_url)
+        attributes: dict[str, object] = {
+            "http.request.method": method,
+            "server.address": parsed.hostname or "runner",
+        }
+        if parsed.port is not None:
+            attributes["server.port"] = parsed.port
+        span = self._tracer.start_span(
+            f"{method} runner",
+            kind=SpanKind.CLIENT,
+            attributes=sanitize_attributes("curie-worker", attributes),
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        headers = _auth_headers(token) or {}
+        span_context = set_span_in_context(span)
+        context_token = attach(span_context)
+        try:
+            inject_trace_headers(headers)
+            kwargs: dict[str, Any] = {"headers": headers or None}
+            if json is not None:
+                kwargs["json"] = json
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            response = await self._session.request(
+                method,
+                f"{base_url}{path}",
+                **kwargs,
+            )
+        except BaseException:
+            _finish_span(span, error=True)
+            raise
+        finally:
+            detach(context_token)
+        _set_attributes(span, {"http.response.status_code": response.status})
+        return response, span
 
     async def start_turn(
         self, base_url: str, event: Event, token: str | None = None
     ) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
-        resp = await self._session.post(
-            f"{base_url}/v1/event", json=event.model_dump(), headers=_auth_headers(token)
+        resp, span = await self._request(
+            "POST",
+            base_url,
+            "/v1/event",
+            json=event.model_dump(),
+            token=token,
         )
         if resp.status != 200:
-            body = await resp.text()
-            resp.release()
-            raise RunnerError(f"/v1/event -> {resp.status}: {body}")
-        return TurnStream(resp)
+            try:
+                await resp.read()
+            finally:
+                resp.release()
+                _finish_span(span, error=True)
+            raise RunnerError(f"/v1/event -> {resp.status}")
+        return TurnStream(resp, span)
 
     async def steer(self, base_url: str, event: Event, token: str | None = None) -> bool:
         """Inject a follow-up into the live turn. False on 409 (no active turn)."""
-        async with self._session.post(
-            f"{base_url}/v1/steer", json=event.model_dump(), headers=_auth_headers(token)
-        ) as resp:
-            if resp.status == 409:
-                return False
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
-            return True
+        resp, span = await self._request(
+            "POST",
+            base_url,
+            "/v1/steer",
+            json=event.model_dump(),
+            token=token,
+        )
+        try:
+            async with resp:
+                if resp.status == 409:
+                    result = False
+                elif resp.status != 200:
+                    await resp.read()
+                    raise RunnerError(f"/v1/steer -> {resp.status}")
+                else:
+                    result = True
+        except BaseException:
+            _finish_span(span, error=True)
+            raise
+        _finish_span(span, error=False)
+        return result
 
     async def interrupt(self, base_url: str, reason: str, token: str | None = None) -> None:
         """Hard-stop the live turn; its final is reclassified to idle.
@@ -139,15 +269,23 @@ class RunnerClient:
         any other failure here -- callers already decide per call site whether
         to swallow-and-fallback or surface-and-continue."""
         frame = Interrupt(reason=reason)
-        async with self._session.post(
-            f"{base_url}/v1/interrupt",
+        resp, span = await self._request(
+            "POST",
+            base_url,
+            "/v1/interrupt",
             json=frame.model_dump(),
-            headers=_auth_headers(token),
+            token=token,
             timeout=self._interrupt_timeout,
-        ) as resp:
-            if resp.status not in (200, 409):
-                body = await resp.text()
-                raise RunnerError(f"/v1/interrupt -> {resp.status}: {body}")
+        )
+        try:
+            async with resp:
+                if resp.status not in (200, 409):
+                    await resp.read()
+                    raise RunnerError(f"/v1/interrupt -> {resp.status}")
+        except BaseException:
+            _finish_span(span, error=True)
+            raise
+        _finish_span(span, error=False)
 
     async def reset(self, base_url: str, token: str | None = None) -> None:
         """Discard the runner's conversation so the next turn starts fresh (#550).
@@ -158,20 +296,30 @@ class RunnerClient:
         never be live at reset time -- a 409 here is a real ordering bug, not a
         condition to swallow.
         """
-        async with self._session.post(
-            f"{base_url}/v1/reset", headers=_auth_headers(token)
-        ) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
+        resp, span = await self._request("POST", base_url, "/v1/reset", token=token)
+        try:
+            async with resp:
+                if resp.status != 200:
+                    await resp.read()
+                    raise RunnerError(f"/v1/reset -> {resp.status}")
+        except BaseException:
+            _finish_span(span, error=True)
+            raise
+        _finish_span(span, error=False)
 
     async def status(self, base_url: str) -> dict[str, object]:
-        async with self._session.get(f"{base_url}/status") as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RunnerError(f"/status -> {resp.status}: {body}")
-            data: dict[str, object] = await resp.json()
-            return data
+        resp, span = await self._request("GET", base_url, "/status")
+        try:
+            async with resp:
+                if resp.status != 200:
+                    await resp.read()
+                    raise RunnerError(f"/status -> {resp.status}")
+                data: dict[str, object] = await resp.json()
+        except BaseException:
+            _finish_span(span, error=True)
+            raise
+        _finish_span(span, error=False)
+        return data
 
     async def close(self) -> None:
         if self._own_session:

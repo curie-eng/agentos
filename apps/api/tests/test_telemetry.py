@@ -118,6 +118,25 @@ def valkey(runs_stream: str) -> Iterator[redis.Redis]:
         client.close()
 
 
+@pytest.fixture
+def channel_settings(
+    clean_db: None,
+    auth_headers: dict[str, str],
+    runs_stream: str,
+) -> Iterator[tuple[dict[str, str], str]]:
+    """Apply the per-test stream after every settings-consuming DB fixture."""
+
+    # ``auth_headers`` and the disposable-DB bootstrap both legitimately read
+    # the cached settings.  RUNS_STREAM must win after those reads so the app
+    # and the assertion observe the same isolated stream regardless of pytest's
+    # otherwise-unrelated fixture ordering.
+    get_settings.cache_clear()
+    try:
+        yield auth_headers, runs_stream
+    finally:
+        get_settings.cache_clear()
+
+
 def _any_value(value: Any) -> object:
     selected = value.WhichOneof("value")
     if selected == "string_value":
@@ -187,13 +206,11 @@ def test_http_middleware_adopts_valid_context_and_ignores_bad_context_value_free
 
 
 def test_channel_turn_writes_one_payload_plus_carrier_and_keeps_langfuse_identity(
-    _disposable_db: Any,
-    clean_db: None,
-    auth_headers: dict[str, str],
+    channel_settings: tuple[dict[str, str], str],
     otlp_capture: _OtlpCapture,
     valkey: redis.Redis,
-    runs_stream: str,
 ) -> None:
+    auth_headers, runs_stream = channel_settings
     with TestClient(create_app()) as client:
         created = client.post(
             "/agents",

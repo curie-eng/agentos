@@ -106,9 +106,9 @@ spec:
 {{- end }}
 {{- if .Values.otelCollector.deploy }}
 ---
-{{/* Allow the runner to ship OTLP traces to THIS release's in-chart collector.
-     Without this, the default-deny blocks span export and sandbox traces vanish
-     whenever the observability backbone is deployed alongside the rails. */}}
+{{/* Allow the runner to ship OTLP traces and logs to THIS release's in-chart
+     collector. Without this, default-deny blocks telemetry export whenever the
+     observability backbone is deployed alongside the rails. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

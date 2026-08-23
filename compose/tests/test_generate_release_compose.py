@@ -441,33 +441,50 @@ def collector_http_port():
     return protocols["http"]["endpoint"].rsplit(":", 1)[1]
 
 
-def test_worker_traces_to_shipped_collector_by_default():
-    """The worker exports traces to the collector this file ships, by default.
+def test_worker_and_spawned_runner_trace_to_shipped_collector_by_default():
+    """The worker and its bridge runner each use their reachable collector path.
 
     #545: `curie local up` boots otel-collector + Langfuse, but the deployed
     local tier exported ZERO traces because curie-worker was never given
     OTEL_EXPORTER_OTLP_ENDPOINT, and CURIE_DOCKER_NETWORK defaulted to empty
-    so spawned sandbox containers could not resolve otel-collector by name.
-    Both must default to values that work with no manual flags, matching the
-    documented manual recipe (README.md).
+    so spawned sandbox containers could not resolve otel-collector by name. The
+    host-network worker reaches the collector's published loopback port; the
+    spawned bridge-network runner receives the private service-name relay. Both
+    must default to their distinct reachable value with no manual flags.
 
     This pins the DEFAULT (full-profile) `curie local up`. `--minimal` selects
     the `core` profile, which starts no collector, and suppresses the endpoint by
     exporting it empty -- see `up_minimal_suppresses_otel_endpoint` in
     cli/src/local.rs, which is where the profile choice lives.
     """
-    expected = f"http://otel-collector:{collector_http_port()}"
+    expected_worker = "http://127.0.0.1:24318"
+    expected_runner = f"http://otel-collector:{collector_http_port()}"
     for label, doc in compose_docs():
         assert "otel-collector" in doc["services"], (
             f"{label}: otel-collector service not found in the compose document"
         )
         env = env_map(doc["services"]["curie-worker"])
-        otel_endpoint = resolve_shell_default(env.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
-        assert otel_endpoint == expected, (
+        worker_endpoint = resolve_shell_default(
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        )
+        runner_endpoint = resolve_shell_default(
+            env.get("CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT")
+        )
+        assert worker_endpoint == expected_worker, (
             f"{label}: curie-worker OTEL_EXPORTER_OTLP_ENDPOINT resolves to "
-            f"{otel_endpoint!r}, expected {expected!r} (the collector's own "
-            f"OTLP/HTTP receiver); traces from spawned sandbox containers have "
-            f"nowhere to go"
+            f"{worker_endpoint!r}, expected {expected_worker!r} (the collector's "
+            "published OTLP/HTTP receiver); the host-network worker cannot "
+            "resolve the bridge-only collector service name"
+        )
+        assert runner_endpoint == expected_runner, (
+            f"{label}: curie-worker CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT "
+            f"resolves to {runner_endpoint!r}, expected {expected_runner!r}; "
+            "spawned bridge-network runners cannot reach the host-only loopback "
+            "endpoint"
+        )
+        assert worker_endpoint != runner_endpoint, (
+            f"{label}: host worker and spawned runner endpoints must stay "
+            "distinct across their host/bridge network boundary"
         )
         docker_network = resolve_shell_default(env.get("CURIE_DOCKER_NETWORK"))
         assert docker_network == "curie_runner", (

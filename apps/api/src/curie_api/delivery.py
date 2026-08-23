@@ -27,7 +27,9 @@ import time
 from typing import Any
 
 import redis.asyncio as redis
+from curie_telemetry import TRACE_CONTEXT_FIELD, inject_trace_context
 from fastapi import Response
+from opentelemetry.trace import SpanKind, Status, StatusCode, Tracer
 
 # The API's Valkey client is built without `decode_responses`, so values come
 # back as bytes; `_text` is the package's named, documented decode for exactly
@@ -61,12 +63,22 @@ logger = logging.getLogger(__name__)
 _ENQUEUE_SCRIPT = """
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  local id
+  if ARGV[5] == '' then
+    id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  else
+    id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2], ARGV[5], ARGV[6])
+  end
   redis.call('SET', KEYS[1], id)
   return {1, id}
 elseif not cur then
   redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4])
-  local id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  local id
+  if ARGV[5] == '' then
+    id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
+  else
+    id = redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2], ARGV[5], ARGV[6])
+  end
   redis.call('SET', KEYS[1], id)
   return {1, id}
 else
@@ -145,6 +157,7 @@ async def enqueue_owned(
     payload: str,
     payload_field: str,
     lease_s: int,
+    tracer: Tracer | None = None,
 ) -> tuple[bool, str]:
     """Enqueue the payload if this request still owns the claim.
 
@@ -156,15 +169,53 @@ async def enqueue_owned(
         payload: The serialized ``QueuedTurn``.
         payload_field: The stream field the payload rides in.
         lease_s: The lease used by the re-claim arm.
+        tracer: Optional API tracer; when present its producer carrier is
+            appended in the same owner-check/XADD transaction.
 
     Returns:
         ``(True, stream_id)`` when THIS request enqueued; ``(False, owner_value)``
         naming the current owner when it did not.
     """
 
-    result: Any = await client.eval(
-        _ENQUEUE_SCRIPT, 2, key, stream, owner, payload, payload_field, str(lease_s)
-    )
+    async def _enqueue(carrier: str | None) -> Any:
+        return await client.eval(
+            _ENQUEUE_SCRIPT,
+            2,
+            key,
+            stream,
+            owner,
+            payload,
+            payload_field,
+            str(lease_s),
+            TRACE_CONTEXT_FIELD if carrier is not None else "",
+            carrier or "",
+        )
+
+    result: Any
+    if tracer is None:
+        result = await _enqueue(None)
+    else:
+        attributes = {
+            "messaging.system": "valkey",
+            "messaging.destination.name": stream,
+            "messaging.operation.type": "send",
+        }
+        with tracer.start_as_current_span(
+            "send curie:runs",
+            kind=SpanKind.PRODUCER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await _enqueue(inject_trace_context())
+            except BaseException as exc:
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(Status(StatusCode.ERROR))
+                raise
+            if bool(result[0]):
+                span.add_event("messaging.enqueued")
+            span.set_status(Status(StatusCode.OK))
     enqueued, current = result
     return bool(enqueued), _text(current)
 

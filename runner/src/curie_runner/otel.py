@@ -1,27 +1,23 @@
-"""OTel tracing for the runner: gen_ai spans exported OTLP-HTTP to the collector.
+"""Runner-specific gen_ai spans on the platform's shared OTEL runtime.
 
-Productizes the PT-4/PT-E prototype span shape. Each turn is a root ``agent.run``
-(SERVER) span carrying a ``langfuse.trace.name``, with a child ``llm.generation``
-span holding ``gen_ai.request.model`` and ``gen_ai.usage.*`` token counts, plus a
-child ``execute_tool`` span per tool call (``gen_ai.tool.name`` /
-``gen_ai.operation.name``). Langfuse maps a model-bearing span to a generation and
-nests tool spans as observations, so this reconstructs the tool-call tree (S1).
+Each turn is an ``agent.run`` SERVER span carrying a ``langfuse.trace.name``,
+with a child ``llm.generation`` span holding ``gen_ai.request.model`` and
+``gen_ai.usage.*`` token counts, plus a child ``execute_tool`` span per tool
+call. The HTTP server attaches only an incoming W3C Trace Context parent before
+opening this tree, so ``agent.run`` is a descendant of the worker RPC when one
+exists and a valid root when it does not.
 
-Traces go to the OTel Collector over OTLP-HTTP, never directly to Langfuse: the
-collector is the adapter that authenticates and forwards (Langfuse OTLP ingest is
-HTTP-only). Endpoint/headers come from the standard ``OTEL_EXPORTER_OTLP_*`` env
-vars via ``SessionConfig.otel``; the exporter is constructed argument-free so the
-opentelemetry SDK's own env parsing applies (it appends ``/v1/traces`` to a base
-``OTEL_EXPORTER_OTLP_ENDPOINT``). When no endpoint is configured the tracer is a
-no-op, so unit tests and offline runs neither export nor fail.
+Provider construction, correlated logs, batching, resource identity, redaction,
+flush, and shutdown live in ``curie_telemetry``. This module deliberately keeps
+only the runner's established Langfuse/gen-ai span shape and a compatibility
+provider builder used by older callers and drift tests.
 
-Per ADR-0076, every attribute this module attaches comes from the closed
-``SpanAttributeKey`` enum below rather than a bare string, so a future call site
-with an unlisted key is a construction-time error, not a silent addition to the
-wire shape. ``SCHEMA_VERSION`` is bumped only when a key is removed, renamed, or
-changes value type; a new optional key is additive and does not bump it.
-``SPAN_ATTRIBUTE_VALUE_TYPES`` declares each key's value type, the mirror the
-drift gate diffs to catch a retype.
+Per ADR-0076, the runner's shared-runtime and runner-owned attributes are mirrored
+by the closed ``SpanAttributeKey`` enum below. Runner-specific setters use the
+enum rather than bare strings; the shared bootstrap is governed by the same
+owner-partitioned artifact. ``SCHEMA_VERSION`` changes only when a key is removed,
+renamed, or retyped. ``SPAN_ATTRIBUTE_VALUE_TYPES`` mirrors each exact type for
+the drift gate.
 """
 
 from __future__ import annotations
@@ -29,33 +25,30 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any
 
 from aci_protocol import OtelConfig
+from curie_telemetry.attributes import SCHEMA_VERSION as SCHEMA_VERSION
+from curie_telemetry.attributes import SchemaValidatingSpanProcessor
+from curie_telemetry.bootstrap import service_resource
+from curie_telemetry.redact import redact_value
 from opentelemetry import trace
-from opentelemetry.attributes import BoundedAttributes
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.trace import SpanKind, Tracer
-
-from .redact import redact_span_attribute, redact_text
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import SpanKind, Status, StatusCode, Tracer
 
 _SERVICE_NAME = "curie-runner"
-
-# ADR-0076 decision 2: additive (a new optional key) does not bump this; removing,
-# renaming, or retyping an existing key does.
-SCHEMA_VERSION = "v1"
+_SERVICE_VERSION = "0.0.0"
 
 
 class SpanAttributeKey(StrEnum):
-    """The closed set of keys the runner may attach to a span or resource.
+    """The closed shared-plus-runner telemetry key set.
 
     ADR-0076 decision 1. Str-mixin so a member is usable anywhere a plain
-    attribute-value string is expected (e.g. dict keys, f-strings), but every
-    ``set_attribute``/``Resource.create`` call site should pass a member here
-    rather than a literal, so an unlisted key is a construction-time error.
+    attribute-value string is expected (e.g. dict keys, f-strings). Direct
+    runner-owned setters pass a member here rather than a literal; process
+    resource keys are emitted by the shared bootstrap from the same artifact.
     """
 
     TRACE_NAME = "langfuse.trace.name"
@@ -75,7 +68,14 @@ class SpanAttributeKey(StrEnum):
     USAGE_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
     TOOL_NAME = "gen_ai.tool.name"
     OPERATION_NAME = "gen_ai.operation.name"
+    DEPLOYMENT_ENVIRONMENT_NAME = "deployment.environment.name"
+    ERROR_TYPE = "error.type"
+    EXCEPTION_ESCAPED = "exception.escaped"
+    EXCEPTION_TYPE = "exception.type"
     SERVICE_NAME = "service.name"
+    SERVICE_INSTANCE_ID = "service.instance.id"
+    SERVICE_NAMESPACE = "service.namespace"
+    SERVICE_VERSION = "service.version"
     CURIE_SESSION_ID = "curie.session_id"
     CURIE_SANDBOX_ID = "curie.sandbox_id"
     SCHEMA_VERSION_KEY = "schema.version"
@@ -85,10 +85,8 @@ class SpanAttributeKey(StrEnum):
 # version-bump-worthy change exactly like a remove or rename, so it needs its
 # own source of truth to diff against -- the type half of the closed schema,
 # parallel to ``SpanAttributeKey`` being the key half. Every member above must
-# appear here exactly once, mapped to its value-type name ("str" or "int");
-# the ``gen_ai.usage.*`` token counts are the only "int" members (see
-# ``record_usage`` below and ``redact.py``'s "only str and int attributes are
-# set today").
+# appear here exactly once, mapped to its value-type name ("str", "int", or
+# deliberate "bool"); the ``gen_ai.usage.*`` token counts are the int members.
 SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.TRACE_NAME: "str",
     SpanAttributeKey.SESSION_ID: "str",
@@ -102,7 +100,14 @@ SPAN_ATTRIBUTE_VALUE_TYPES: Mapping[SpanAttributeKey, str] = {
     SpanAttributeKey.USAGE_CACHE_CREATION_INPUT_TOKENS: "int",
     SpanAttributeKey.TOOL_NAME: "str",
     SpanAttributeKey.OPERATION_NAME: "str",
+    SpanAttributeKey.DEPLOYMENT_ENVIRONMENT_NAME: "str",
+    SpanAttributeKey.ERROR_TYPE: "str",
+    SpanAttributeKey.EXCEPTION_ESCAPED: "bool",
+    SpanAttributeKey.EXCEPTION_TYPE: "str",
     SpanAttributeKey.SERVICE_NAME: "str",
+    SpanAttributeKey.SERVICE_INSTANCE_ID: "str",
+    SpanAttributeKey.SERVICE_NAMESPACE: "str",
+    SpanAttributeKey.SERVICE_VERSION: "str",
     SpanAttributeKey.CURIE_SESSION_ID: "str",
     SpanAttributeKey.CURIE_SANDBOX_ID: "str",
     SpanAttributeKey.SCHEMA_VERSION_KEY: "str",
@@ -128,104 +133,47 @@ def _set(span: Any, key: SpanAttributeKey, value: object) -> None:
     attached by construction (ADR-0076).
     """
 
-    span.set_attribute(key.value, redact_span_attribute(value))
+    span.set_attribute(key.value, redact_value(value))
 
 
-def _still_leaks(value: object) -> bool:
-    """Whether an attribute value still carries an unscrubbed secret.
+class _SchemaValidatingSpanProcessor(SchemaValidatingSpanProcessor):
+    """Compatibility wrapper for the runner-scoped shared export backstop."""
 
-    Type-agnostic on purpose (#935). ADR-0076 decision 3 frames the export
-    validator as a universal backstop, but it only inspected ``str``, so a
-    sequence-valued attribute on an ALLOWED key slipped a secret past BOTH the
-    scrub and this validator — the two layers failing together, which is exactly
-    what defense in depth is supposed to prevent. ``str`` is itself a Sequence, so
-    it is matched first; anything that is neither a str nor a list/tuple (int,
-    float, bool) cannot carry a pattern match and is clean by construction.
-    """
-
-    if isinstance(value, str):
-        return redact_text(value) != value
-    if isinstance(value, (list, tuple)):
-        return any(_still_leaks(item) for item in value)
-    return False
-
-
-class _SchemaValidatingSpanProcessor(SpanProcessor):
-    """Fail-closed export-time backstop (ADR-0076 decision 3).
-
-    ``_set()`` already gates every attribute this module attaches through the
-    closed ``SpanAttributeKey`` enum and the ``redact.py`` scrub; this processor
-    exists for the call site that bypasses both by calling ``span.set_attribute``
-    directly. On each span ending, it strips (does not replace) any attribute
-    whose key is outside the closed schema, or whose value — or any element of a
-    sequence value (#935) — still matches
-    an unscrubbed-secret pattern after the existing redaction pass — dropping the
-    offending attribute rather than the whole span, so one bad key costs a single
-    field of trace data rather than the whole record.
-
-    Must be registered on the provider ahead of the exporting processor
-    (``TracerProvider.add_span_processor`` invokes processors in registration
-    order); it mutates the span's attributes in place so the exporter that runs
-    after it sees the cleaned set.
-    """
-
-    _ALLOWED_KEYS = frozenset(member.value for member in SpanAttributeKey)
-
-    def on_end(self, span: ReadableSpan) -> None:
-        # ReadableSpan.attributes is a read-only MappingProxyType view; the
-        # underlying BoundedAttributes (span._attributes) is the same object the
-        # concrete Span held, flagged immutable at Span.end() (see the SDK's own
-        # `self._attributes._immutable = True` in Span.end()). Toggling that
-        # private flag to mutate here mirrors the SDK's own pattern. Always a
-        # BoundedAttributes at runtime (Span.__init__ constructs it directly);
-        # the cast narrows past the Mapping-typed private attribute.
-        raw = span._attributes  # noqa: SLF001
-        if raw is None:
-            return
-        attributes = cast(BoundedAttributes, raw)
-        was_immutable = attributes._immutable  # noqa: SLF001
-        attributes._immutable = False  # noqa: SLF001
-        try:
-            for key in list(attributes.keys()):
-                value = attributes[key]
-                still_leaks = _still_leaks(value)
-                if key not in self._ALLOWED_KEYS or still_leaks:
-                    del attributes[key]
-        finally:
-            attributes._immutable = was_immutable  # noqa: SLF001
+    def __init__(self) -> None:
+        super().__init__(_SERVICE_NAME)
 
 
 def build_tracer_provider(
     otel: OtelConfig, session_id: str, sandbox_id: str | None = None
 ) -> TracerProvider | None:
-    """Build a TracerProvider exporting to the collector, or None if unconfigured.
+    """Compatibility provider builder; process bootstrap uses shared configure.
 
-    ``session_id`` is attached as a resource attribute so traces are attributable
-    to the sandbox session that produced them. ``sandbox_id`` (the ACI
-    ``CURIE_SANDBOX_ID``) is stamped alongside it when present so a trace is
-    attributable to the concrete sandbox that ran it; an absent or empty value is
-    omitted rather than stamped as an empty string.
+    The legacy arguments remain source-compatible, but per-turn identities no
+    longer belong on process resources. ``RunTracer.run_span`` stamps them on
+    ``agent.run`` instead.
     """
 
     if not otel.endpoint:
         return None
 
-    attributes: dict[str, str] = {
-        SpanAttributeKey.SERVICE_NAME.value: _SERVICE_NAME,
-        SpanAttributeKey.CURIE_SESSION_ID.value: session_id,
-        SpanAttributeKey.SCHEMA_VERSION_KEY.value: SCHEMA_VERSION,
-    }
-    if sandbox_id:
-        attributes[SpanAttributeKey.CURIE_SANDBOX_ID.value] = sandbox_id
-    resource = Resource.create(attributes)
-    provider = TracerProvider(resource=resource)
+    _ = (session_id, sandbox_id)
+    resource = service_resource(_SERVICE_NAME, _SERVICE_VERSION)
+    provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     # The validator must run before the exporting processor (registration order)
     # so the exporter only ever sees attributes the closed schema allows.
     provider.add_span_processor(_SchemaValidatingSpanProcessor())
-    # The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT / _HEADERS / _PROTOCOL from
-    # the environment itself; SessionConfig.otel is the typed view of the same
-    # vars, so an argument-free exporter and the config agree by construction.
-    provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
+    # Compatibility callers still get bounded batching. The process bootstrap
+    # uses curie_telemetry.configure() instead; this helper remains for the
+    # exported legacy API and the ADR-0076 resource drift checks.
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(),
+            max_queue_size=2048,
+            schedule_delay_millis=500,
+            max_export_batch_size=512,
+            export_timeout_millis=500,
+        )
+    )
     return provider
 
 
@@ -235,13 +183,16 @@ class RunTracer:
     A None provider yields a no-op tracer so callers need no branching.
     """
 
-    def __init__(self, provider: TracerProvider | None) -> None:
-        self._provider = provider
-        self._tracer: Tracer = (
-            provider.get_tracer("curie-runner")
-            if provider is not None
-            else trace.get_tracer("curie-runner")
-        )
+    def __init__(self, provider: TracerProvider | Tracer | None) -> None:
+        if isinstance(provider, TracerProvider):
+            self._provider: TracerProvider | None = provider
+            self._tracer = provider.get_tracer("curie-runner")
+        elif provider is not None:
+            self._provider = None
+            self._tracer = provider
+        else:
+            self._provider = None
+            self._tracer = trace.get_tracer("curie-runner")
 
     @contextmanager
     def run_span(
@@ -251,6 +202,7 @@ class RunTracer:
         session_id: str | None = None,
         user_id: str | None = None,
         approval_decision: str | None = None,
+        sandbox_id: str | None = None,
     ) -> Iterator[_GenerationSpan]:
         """Open the root ``agent.run`` span and its child ``llm.generation`` span.
 
@@ -267,21 +219,46 @@ class RunTracer:
         an operator can see the outcome from the trace.
         """
 
-        with self._tracer.start_as_current_span("agent.run", kind=SpanKind.SERVER) as root:
+        with self._tracer.start_as_current_span(
+            "agent.run",
+            kind=SpanKind.SERVER,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as root:
             _set(root, SpanAttributeKey.TRACE_NAME, trace_name)
+            _set(root, SpanAttributeKey.SCHEMA_VERSION_KEY, SCHEMA_VERSION)
             if session_id:
                 _set(root, SpanAttributeKey.SESSION_ID, session_id)
+                _set(root, SpanAttributeKey.CURIE_SESSION_ID, session_id)
+            if sandbox_id:
+                _set(root, SpanAttributeKey.CURIE_SANDBOX_ID, sandbox_id)
             if user_id:
                 _set(root, SpanAttributeKey.USER_ID, user_id)
             if approval_decision:
                 _set(root, SpanAttributeKey.APPROVAL_DECISION, approval_decision)
-            with self._tracer.start_as_current_span("llm.generation") as gen:
-                span = _GenerationSpan(self._tracer, gen)
+            with self._tracer.start_as_current_span(
+                "llm.generation",
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as gen:
+                span = _GenerationSpan(self._tracer, root, gen)
                 # Stamp the configured model at span open when CURIE_MODEL is
                 # set; otherwise the span stays model-less until the SDK reports
                 # the actual model on its first assistant message (record_model).
                 span.record_model(model)
-                yield span
+                try:
+                    yield span
+                except BaseException as exc:
+                    exception_type = type(exc).__name__
+                    span.record_outcome(
+                        "abandoned",
+                        error_type=exception_type,
+                        exception_type=exception_type,
+                        exception_escaped=True,
+                    )
+                    raise
+                finally:
+                    span.ensure_outcome()
 
     def shutdown(self) -> None:
         """Flush and shut down the exporter if one was configured."""
@@ -293,10 +270,61 @@ class RunTracer:
 class _GenerationSpan:
     """Handle for annotating the generation span and emitting tool child spans."""
 
-    def __init__(self, tracer: Tracer, span: Any) -> None:
+    def __init__(self, tracer: Tracer, root: Any, span: Any) -> None:
         self._tracer = tracer
+        self._root = root
         self._span = span
         self._model_recorded = False
+        self._outcome_recorded = False
+
+    def record_outcome(
+        self,
+        status: object,
+        *,
+        error_type: str | None = None,
+        exception_type: str | None = None,
+        exception_escaped: bool | None = None,
+    ) -> None:
+        """Set a terminal status and value-free exception classification."""
+
+        if self._outcome_recorded:
+            return
+        value = getattr(status, "value", status)
+        if value in {"done", "idle-awaiting-input", "awaiting-approval"}:
+            self._root.set_status(Status(StatusCode.OK))
+        else:
+            self._root.set_status(Status(StatusCode.ERROR))
+            _set(
+                self._root,
+                SpanAttributeKey.ERROR_TYPE,
+                error_type or str(value),
+            )
+            if exception_type is not None:
+                _set(
+                    self._root,
+                    SpanAttributeKey.EXCEPTION_TYPE,
+                    exception_type,
+                )
+            if exception_escaped is not None:
+                _set(
+                    self._root,
+                    SpanAttributeKey.EXCEPTION_ESCAPED,
+                    exception_escaped,
+                )
+        self._outcome_recorded = True
+
+    def ensure_outcome(self) -> None:
+        """Treat an unclassified/abandoned span as an explicit error."""
+
+        if not self._outcome_recorded:
+            self.record_outcome("abandoned")
+
+    @contextmanager
+    def lifecycle_log_context(self) -> Iterator[None]:
+        """Correlate terminal lifecycle logs to ``agent.run`` itself."""
+
+        with trace.use_span(self._root, end_on_exit=False):
+            yield
 
     def record_model(self, model: str | None) -> None:
         """Stamp the generation model attribute once, first non-empty value wins.

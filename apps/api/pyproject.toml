@@ -20,6 +20,7 @@ dependencies = [
     # because this package imports it directly.
     "pyjwt[crypto]>=2.10",
     "redis>=5.0",
+    "curie-telemetry",
     "plugin-format",
     "aci-protocol",
 ]

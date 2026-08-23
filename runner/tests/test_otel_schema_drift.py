@@ -26,14 +26,18 @@ import json
 from pathlib import Path
 
 import anyio
-from aci_protocol import Event, OtelConfig
-from curie_runner import RunTracer, SideEffectClassifier, build_tracer_provider
+import curie_telemetry.bootstrap as telemetry_bootstrap
+import pytest
+from aci_protocol import Event
+from curie_runner import RunTracer, SideEffectClassifier
 from curie_runner.fake import FakeModelSession
 from curie_runner.otel import SCHEMA_VERSION, SPAN_ATTRIBUTE_VALUE_TYPES, SpanAttributeKey
 from curie_runner.session import SessionRunner
+from curie_telemetry import configure
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 _SCHEMA_PATH = Path(__file__).parent.parent / "schema" / "otel-attributes.schema.json"
 
@@ -144,53 +148,73 @@ def test_a_real_run_only_emits_attributes_within_the_committed_schema() -> None:
             _assert_value_type(committed, key, value, f"span {span.name!r} ")
 
 
-def test_every_declared_key_emits_its_committed_value_type() -> None:
-    # The real-run contract test above only exercises 9 of the 16 declared keys
-    # (the FakeModelSession default script never threads a session/sandbox id,
-    # an approval decision, or the prompt-cache usage fields through). This test
-    # closes that gap by driving every declared key through its real setter --
-    # the 12 span-level keys via RunTracer.run_span/record_usage/tool_span, and
-    # the 4 resource-level keys via build_tracer_provider -- so a call-site
-    # retype of any of the seven previously-unexercised keys (that also forgot
-    # to update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
+def test_every_declared_key_emits_its_committed_value_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The real-run contract test above does not exercise every optional identity,
+    # error, or prompt-cache key. This test closes that gap by driving every
+    # declared key through its real setter: turn keys via RunTracer, error keys
+    # via a real failed run span, and process identity via the shared runtime.
     committed = _committed_runner_keys()
     emitted: dict[str, object] = {}
 
     exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    tracer = RunTracer(provider)
+    monkeypatch.setenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "http://collector.example.test/v1/traces",
+    )
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf")
+    monkeypatch.setenv(
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "deployment.environment.name=test",
+    )
+    monkeypatch.setattr(
+        telemetry_bootstrap,
+        "_trace_exporter",
+        lambda _protocol: exporter,
+    )
+    runtime = configure(service_name="curie-runner", service_version="test-version")
+    tracer = RunTracer(runtime.tracer)
 
-    with tracer.run_span(
-        trace_name="t",
-        model="fake-model",
-        session_id="s1",
-        user_id="U1",
-        approval_decision="approved",
-    ) as span:
-        span.record_usage(
-            {
-                "input_tokens": 1,
-                "output_tokens": 2,
-                "cache_read_input_tokens": 3,
-                "cache_creation_input_tokens": 4,
-            }
-        )
-        span.tool_span("Bash")
+    with pytest.raises(RuntimeError, match="placeholder telemetry failure"):
+        with tracer.run_span(
+            trace_name="t",
+            model="fake-model",
+            session_id="s1",
+            user_id="U1",
+            approval_decision="approved",
+            sandbox_id="sandbox-abc",
+        ) as span:
+            span.record_usage(
+                {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 4,
+                }
+            )
+            span.tool_span("Bash")
+            raise RuntimeError("placeholder telemetry failure")
 
-    for finished in exporter.get_finished_spans():
+    assert runtime.force_flush(timeout_millis=500)
+    finished_spans = exporter.get_finished_spans()
+    failed_run = next(span for span in finished_spans if span.name == "agent.run")
+    assert failed_run.status.status_code is StatusCode.ERROR
+    assert failed_run.attributes is not None
+    assert failed_run.attributes["error.type"] == "RuntimeError"
+    assert failed_run.attributes["exception.type"] == "RuntimeError"
+    assert failed_run.attributes["exception.escaped"] is True
+    for finished in finished_spans:
         if finished.attributes:
             emitted.update(finished.attributes)
 
-    otel = OtelConfig(endpoint="http://localhost:24318")
-    resource_provider = build_tracer_provider(otel, "s1", "sandbox-abc")
-    assert resource_provider is not None
-    # The OTel SDK's own Resource.create() merges in ambient default attributes
-    # (telemetry.sdk.language/name/version) alongside the ones this module
-    # stamps; only the declared keys are this schema's concern.
+    resource_provider = getattr(runtime.tracer, "_tracer_provider", None)
+    assert isinstance(resource_provider, TracerProvider)
     resource_attrs = resource_provider.resource.attributes
-    emitted.update({key: value for key, value in resource_attrs.items() if key in committed})
-    resource_provider.shutdown()
+    emitted.update(
+        {key: value for key, value in resource_attrs.items() if key in committed}
+    )
+    runtime.shutdown(timeout_millis=2_000)
 
     exercised_keys = set(emitted)
     missing = set(committed) - exercised_keys

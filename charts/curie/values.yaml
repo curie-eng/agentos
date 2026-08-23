@@ -477,8 +477,9 @@ inference:
 
 # ---------------------------------------------------------------------------
 # OTel Collector. Receives OTLP (gRPC 4317 / HTTP 4318) from app services and
-# forwards to Langfuse over HTTP (Langfuse's OTLP ingest is HTTP-only). Deploy
-# false to send app traces to an external collector.
+# forwards to Langfuse over HTTP (Langfuse's OTLP ingest is HTTP-only). Setting
+# deploy=false omits the standard OTLP environment from every workload, leaving
+# the services on their no-endpoint behavior.
 # ---------------------------------------------------------------------------
 otelCollector:
   deploy: true

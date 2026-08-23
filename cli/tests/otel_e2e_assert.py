@@ -100,11 +100,11 @@ def assert_turn(
         if str(span.get("kind", "")).upper() in {"3", "SPAN_KIND_CLIENT"}
         and _attrs(span).get("http.request.method") == "POST"
     )
-    assert _attrs(process) >= {
+    assert {
         "messaging.system": "valkey",
         "messaging.destination.name": "curie:runs",
         "messaging.operation.type": "process",
-    }
+    }.items() <= _attrs(process).items()
     assert _descends(worker, process, tree)
     assert _descends(client, worker, tree)
     assert _descends(agent, client, tree)
@@ -121,11 +121,11 @@ def assert_turn(
     else:
         assert len(producer) == 1
         assert _descends(process, producer[0], tree)
-        assert _attrs(producer[0]) >= {
+        assert {
             "messaging.system": "valkey",
             "messaging.destination.name": "curie:runs",
             "messaging.operation.type": "send",
-        }
+        }.items() <= _attrs(producer[0]).items()
 
     expected_status = "STATUS_CODE_OK" if outcome == "success" else "STATUS_CODE_ERROR"
     assert _status(agent) in {expected_status, "1" if outcome == "success" else "2"}

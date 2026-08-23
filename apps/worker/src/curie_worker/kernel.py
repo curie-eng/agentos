@@ -62,6 +62,9 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_telemetry.attributes import sanitize_attributes, set_turn_identity
+from opentelemetry import trace
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 from pydantic import ValidationError
 
 from .approval_cards import ApprovalCardStore
@@ -226,6 +229,7 @@ _RESET_RELEASE_TIMEOUT_S = 5.0
 # the in-progress set, reported unconfirmed, retried by a fresh operator
 # request) rather than falling back to the old, unsafe lock-free release.
 _RESET_LOCK_ACQUIRE_TIMEOUT_S = 5.0
+_NOOP_TRACER = trace.NoOpTracerProvider().get_tracer("curie-worker.kernel")
 
 
 @dataclass
@@ -440,6 +444,7 @@ class Kernel:
         # ``ApprovalClient``.
         approval_reader: ApprovalReader | None = None,
         card_store: ApprovalCardStore | None = None,
+        tracer: Tracer | None = None,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -461,6 +466,7 @@ class Kernel:
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
+        self._tracer = tracer or _NOOP_TRACER
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -548,7 +554,53 @@ class Kernel:
         self._adopt_ref(qevent, ack)
         return ack
 
-    async def process_event(self, qevent: QueuedTurn) -> None:
+    @staticmethod
+    def _turn_event(name: str) -> None:
+        """Add one closed, value-free event to the current turn span."""
+
+        trace.get_current_span().add_event(name)
+
+    @staticmethod
+    def _set_turn_attributes(attributes: dict[str, object]) -> None:
+        span = trace.get_current_span()
+        for key, value in sanitize_attributes("curie-worker", attributes).items():
+            span.set_attribute(key, value)
+
+    @staticmethod
+    def _finish_turn_span(span: Span, outcome: str, *, error: bool) -> None:
+        for key, value in sanitize_attributes(
+            "curie-worker",
+            {"curie.turn.outcome": outcome},
+        ).items():
+            span.set_attribute(key, value)
+        span.add_event("worker.terminal")
+        span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
+
+    async def process_event(self, qevent: QueuedTurn) -> str:
+        """Trace and handle one queued turn, returning its closed outcome."""
+
+        with self._tracer.start_as_current_span(
+            "worker.turn",
+            kind=SpanKind.INTERNAL,
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                outcome = await self._process_event(qevent)
+            except BaseException:
+                # Exception messages can carry runner or adapter content.  The
+                # process span records the error class at its own boundary; this
+                # sacred-kernel span needs only a falsifiable ERROR outcome.
+                self._finish_turn_span(span, "failed", error=True)
+                raise
+            self._finish_turn_span(
+                span,
+                outcome,
+                error=outcome == "escalated",
+            )
+            return outcome
+
+    async def _process_event(self, qevent: QueuedTurn) -> str:
         """Handle one queued turn to a terminal state (success or escalate).
 
         Returns normally once the event is terminally handled; the consumer then
@@ -587,7 +639,9 @@ class Kernel:
                 self._release_order_entry(thread, entry)
 
         try:
-            if await self._markers.is_terminal(event_id):
+            terminal = await self._markers.is_terminal(event_id)
+            self._turn_event("worker.dedupe.checked")
+            if terminal:
                 # ``is_terminal``, not ``is_done``: a DONE outbox record proves
                 # this turn finished just as well as the marker does, and it
                 # outlives the marker by the retention window. Reading the marker
@@ -597,12 +651,13 @@ class Kernel:
                 # Completion emit stays at-least-once; turn side effects stay
                 # at-most-once for the whole outbox retention period.
                 logger.info("event %s already done; skipping", event_id)
+                self._turn_event("worker.dedupe.skip")
                 # The skip holds no resolved route of its own and must not
                 # invent one, so it makes no sink call -- except to hand off a
                 # completion an earlier delivery durably owed and never
                 # confirmed, which it re-emits from the STORED record.
                 await self._reemit_pending_completion(event_id)
-                return
+                return "duplicate"
 
             # If this is an approval resume, settle its live card before running
             # the continuation: expired (#419) or resolved (#1084). Best-effort,
@@ -636,7 +691,7 @@ class Kernel:
                     "not retrying automatically. Flagging for a human.",
                 )
                 await self._complete(qevent, route, "escalated")
-                return
+                return "escalated"
 
             # Deployment-to-runtime binding: resolve which agent/version this
             # channel runs, and refuse a killed agent. An unmapped channel is a
@@ -666,7 +721,7 @@ class Kernel:
                         f"{qevent.reply_handle.kind} address "
                         f"{qevent.reply_handle.channel} yet.",
                     )
-                    return
+                    return "dropped"
                 # The FIRST sanctioned route source, and the normal path: once a
                 # turn has resolved, its egress target is the binding row's,
                 # because endpoints are server-controlled (D4.1). A row that
@@ -684,8 +739,14 @@ class Kernel:
                         route,
                         "This agent is paused by an operator. Try again once it resumes.",
                     )
-                    return
+                    return "dropped"
                 agent_id = resolved.agent_id
+                set_turn_identity(
+                    trace.get_current_span(),
+                    agent_id=agent_id,
+                    conversation_id=thread,
+                    user_id=qevent.author,
+                )
                 boot_env = self._binding.boot_env(resolved, thread)
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
@@ -770,11 +831,11 @@ class Kernel:
                         qevent, route, outcome, agent_id, approval_routes
                     )
                     await self._complete(qevent, route, "awaiting-approval")
-                    return
+                    return "awaiting-approval"
 
                 if outcome.terminal_ok:
                     await self._complete(qevent, route, "delivered")
-                    return
+                    return "steered" if outcome.steered else "delivered"
 
                 if outcome.saw_side_effect:
                     await self._escalate(
@@ -784,7 +845,7 @@ class Kernel:
                         "starting an action; not retrying automatically. Flagging for a human.",
                     )
                     await self._complete(qevent, route, "escalated")
-                    return
+                    return "escalated"
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
@@ -795,7 +856,7 @@ class Kernel:
                         f"{attempt} attempt(s). Flagging for a human.",
                     )
                     await self._complete(qevent, route, "escalated")
-                    return
+                    return "escalated"
 
                 await asyncio.sleep(self._backoff(attempt))
         finally:
@@ -1094,7 +1155,8 @@ class Kernel:
         )
         generation = await self._markers.mark_completion_pending(event_id, record)
         await self._markers.mark_done(event_id)
-        await self._deliver_completion(record, generation=generation)
+        if await self._deliver_completion(record, generation=generation):
+            self._turn_event("worker.completion.settled")
 
     async def _deliver_completion(
         self, record: CompletionRecord, *, generation: str
@@ -1343,7 +1405,15 @@ class Kernel:
         # A placeholderless job must route first. Otherwise every busy redelivery
         # posts a notice for a turn that never started.
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        if not self._config.slack_no_edit_streaming and not defer_job_booting:
+        # A bound agent is rechecked after its runner stream is accepted, closing
+        # the precheck-vs-register kill race.  Do not mutate the placeholder
+        # before that last gate: if the recheck itself fails, no turn is consumed
+        # and leaving "Working on it" behind would claim progress that never
+        # happened.  The shimmer remains the pre-claim liveness affordance.
+        defer_killswitch_booting = agent_id is not None and self._killswitch is not None
+        if not self._config.slack_no_edit_streaming and not (
+            defer_job_booting or defer_killswitch_booting
+        ):
             try:
                 await self._reply_for(qevent, route, self._config.booting_text)
             except Exception:
@@ -1357,7 +1427,9 @@ class Kernel:
         # next same-thread event can route, and release the Valkey lock before
         # streaming so a follow-up can steer.
         try:
+            self._turn_event("worker.lock.wait")
             async with self._lock.hold(self._config.lock_key(thread)):
+                self._turn_event("worker.lock.acquired")
                 routed = await self._route_and_start(
                     thread, event, boot_env, packs, source=qevent.source
                 )
@@ -1399,7 +1471,16 @@ class Kernel:
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         release_order()
 
-        if not self._config.slack_no_edit_streaming and defer_job_booting:
+        defer_booting_until_postcheck = (
+            defer_killswitch_booting
+            and routed.handle is not None
+            and routed.turn is not None
+        )
+        if (
+            not self._config.slack_no_edit_streaming
+            and (defer_job_booting or defer_killswitch_booting)
+            and not defer_booting_until_postcheck
+        ):
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
@@ -1430,6 +1511,12 @@ class Kernel:
             return TurnOutcome(terminal_ok=True, steered=True)
 
         assert routed.handle is not None and routed.turn is not None
+        self._set_turn_attributes(
+            {
+                "curie.session_id": routed.handle.session_id,
+                "curie.sandbox_id": routed.handle.sandbox_name,
+            }
+        )
         # Register this owner turn so a kill for its agent interrupts it, then
         # stream; unregister when the turn ends.
         self._register_run(agent_id, thread)
@@ -1443,8 +1530,18 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
+            if not self._config.slack_no_edit_streaming and defer_booting_until_postcheck:
+                try:
+                    await self._reply_for(qevent, route, self._config.booting_text)
+                except Exception:
+                    logger.warning("booting-state update failed for %s", qevent.event_id)
             return await self._consume(qevent, route, routed.turn, nav)
         finally:
+            # ``start_turn`` transfers the open response and CLIENT span to the
+            # caller before the post-registration kill recheck.  Close it here
+            # as a final owner even when that recheck raises before ``_consume``
+            # can enter its async context; normal consumption is idempotent.
+            routed.turn.close()
             self._unregister_run(agent_id, thread)
 
     async def _route_and_start(
@@ -1509,7 +1606,14 @@ class Kernel:
                     f"thread {thread} has a live session; deferring the {source} turn"
                 )
         elif await self._runner.steer(handle.base_url, event, token=handle.token or None):
+            self._turn_event("worker.route.steer")
             return _RouteResult(steered=True)
+        elif not source.is_job:
+            # A 409 is the accepted steer-vs-finish CAS result.  Fresh claims
+            # also answer 409 because no turn exists yet; in both cases the
+            # required behavior is the same start fallback under this lock.
+            self._turn_event("worker.route.finish_race")
+        self._turn_event("worker.route.start")
         turn = await self._runner.start_turn(handle.base_url, event, token=handle.token or None)
         return _RouteResult(steered=False, handle=handle, turn=turn)
 
@@ -2151,6 +2255,7 @@ class Kernel:
         if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
             text = acc.rendered()
             await reply.finalize(text)
+            self._turn_event("worker.reply.final")
             return TurnOutcome(
                 terminal_ok=True,
                 saw_side_effect=acc.saw_side_effect,

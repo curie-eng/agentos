@@ -19,9 +19,12 @@ from typing import Any
 
 import httpx
 import redis
+from curie_telemetry import configure
+from opentelemetry.trace import Tracer
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from . import __version__
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
 from .binding import BindingResolver
@@ -202,7 +205,11 @@ def _sandbox_client(
                 "endpoint for local-model mode, or set CURIE_FAKE_MODEL=1 for an "
                 "offline/test run."
             )
-        if not env.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        runner_otel_endpoint = env.get(
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+            env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+        )
+        if not runner_otel_endpoint:
             logger.warning(
                 "Docker substrate selected but OTEL_EXPORTER_OTLP_ENDPOINT is "
                 "unset; runner traces will not be exported"
@@ -211,7 +218,7 @@ def _sandbox_client(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=BundleStore(config),
             network=env.get("CURIE_DOCKER_NETWORK") or None,
-            otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
+            otel_endpoint=runner_otel_endpoint or None,
             default_plugin_dir=config.bundle_plugin_dir,
             # Container isolation for every spawned runner (#631): read-only
             # rootfs, dropped caps, no-new-privileges, bounded resources. Mirrors
@@ -229,7 +236,12 @@ def _sandbox_client(
     return KubernetesSandboxClient(sub_config.namespace)
 
 
-def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
+def build(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    *,
+    tracer: Tracer | None = None,
+) -> Runtime:
     async_redis: AsyncRedis = AsyncRedis(
         host=config.valkey_host,
         port=config.valkey_port,
@@ -251,10 +263,12 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         _sandbox_client(config, env, sub_config),
         AffinityStore(sync_redis),
         sub_config,
+        tracer=tracer,
     )
     runner = RunnerClient(
         connect_timeout_s=config.runner_connect_timeout_s,
         total_timeout_s=config.runner_total_timeout_s,
+        tracer=tracer,
     )
     engine = create_async_engine(config.database_url, pool_pre_ping=True)
     binding = BindingResolver(engine, config)
@@ -284,10 +298,16 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         # half without also implementing a read it never exercises.
         approval_reader=approval_client,
         card_store=ApprovalCardStore(async_redis, config),
+        tracer=tracer,
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
-    consumer = Consumer(redis=async_redis, kernel=kernel, config=config)
+    consumer = Consumer(
+        redis=async_redis,
+        kernel=kernel,
+        config=config,
+        tracer=tracer,
+    )
 
     # The eval lane (F3): a second consumer group on curie:evals, on its own
     # Valkey connection so its blocking read never stalls the runs consumer. It
@@ -400,8 +420,13 @@ def _build_connector_loop(
     )
 
 
-async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
-    rt = build(config, env)
+async def _run(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    *,
+    tracer: Tracer | None = None,
+) -> None:
+    rt = build(config, env, tracer=tracer)
 
     loop = asyncio.get_running_loop()
 
@@ -460,7 +485,14 @@ def main(env: Mapping[str, str] | None = None) -> None:
     install_dead_letter_alerting()
     resolved = env if env is not None else os.environ
     config = WorkerConfig()
-    asyncio.run(_run(config, resolved))
+    telemetry = configure(service_name="curie-worker", service_version=__version__)
+    attach_logging = getattr(telemetry, "attach_logging", None)
+    if callable(attach_logging):
+        attach_logging(logging.getLogger("curie_worker"))
+    try:
+        asyncio.run(_run(config, resolved, tracer=telemetry.tracer))
+    finally:
+        telemetry.shutdown(timeout_millis=2_000)
 
 
 if __name__ == "__main__":

@@ -123,23 +123,30 @@ pub fn fake_model_env_override(mode: ModelMode) -> Option<(String, String)> {
 }
 
 /// The other injection step every worker-restarting command shares: suppress
-/// the OTel endpoint on a `core`-only stack. `otel-collector` is a `full`-profile
-/// service, so a `--minimal` stack has no collector to export to, and every span
-/// the runner emits would pay a synchronous DNS retry against a name that cannot
-/// resolve. An empty value (not an absent one) is what does it: compose writes
-/// the endpoint as `${OTEL_EXPORTER_OTLP_ENDPOINT-...}`, whose `-` (unset-only)
-/// form substitutes its default only when the var is UNSET, so exporting it
-/// empty resolves to empty and the runner exports nothing. `false` returns
-/// `None` so compose's shipped collector default stands. This is the one place
-/// that decision is made -- `up_command` and `local comms`'s connect/disconnect
-/// commands all call it instead of each re-deriving the pair inline, the same
-/// drift that let `local comms` fall out of parity with `local up` on the fake
-/// model (issue #450).
-pub fn otel_endpoint_env_override(minimal: bool) -> Option<(String, String)> {
+/// both OTel endpoints on a `core`-only stack. `otel-collector` is a
+/// `full`-profile service, so a `--minimal` stack has no collector to export to.
+/// The host-network worker uses the standard endpoint for its own exporter,
+/// while Compose's private relay supplies the bridge-network runner's standard
+/// endpoint; leaving either one populated would create retries against an
+/// absent collector.
+///
+/// Empty values (not absent ones) are what disable the two paths: Compose writes
+/// each endpoint as `${VAR-default}`, whose `-` (unset-only) form substitutes
+/// its default only when the variable is UNSET. `false` returns an empty vector
+/// so Compose's shipped collector defaults stand. This is the one place that
+/// decision is made -- `up_command`, targeted rebuilds, and `local comms` all
+/// call it instead of re-deriving either half inline.
+pub fn otel_endpoint_env_override(minimal: bool) -> Vec<(String, String)> {
     if minimal {
-        Some(("OTEL_EXPORTER_OTLP_ENDPOINT".into(), String::new()))
+        vec![
+            ("OTEL_EXPORTER_OTLP_ENDPOINT".into(), String::new()),
+            (
+                "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT".into(),
+                String::new(),
+            ),
+        ]
     } else {
-        None
+        Vec::new()
     }
 }
 
@@ -985,12 +992,16 @@ mod tests {
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.minimal = true;
         let cmd = up_command(&o);
-        assert!(
-            cmd.env
-                .contains(&(String::from("OTEL_EXPORTER_OTLP_ENDPOINT"), String::new(),)),
-            "--minimal must pass an empty OTEL_EXPORTER_OTLP_ENDPOINT; env={:?}",
-            cmd.env
-        );
+        for endpoint in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        ] {
+            assert!(
+                cmd.env.contains(&(String::from(endpoint), String::new(),)),
+                "--minimal must pass an empty {endpoint}; env={:?}",
+                cmd.env
+            );
+        }
     }
 
     /// The `--local-model` arm of `up_command`'s env build does not fall through
@@ -1001,12 +1012,16 @@ mod tests {
         let mut o = opts_with_local_model(DEFAULT_COMPOSE_FILE, "qwen3:4b");
         o.minimal = true;
         let cmd = up_command(&o);
-        assert!(
-            cmd.env
-                .contains(&(String::from("OTEL_EXPORTER_OTLP_ENDPOINT"), String::new(),)),
-            "--minimal --local-model must pass an empty OTEL_EXPORTER_OTLP_ENDPOINT; env={:?}",
-            cmd.env
-        );
+        for endpoint in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        ] {
+            assert!(
+                cmd.env.contains(&(String::from(endpoint), String::new(),)),
+                "--minimal --local-model must pass an empty {endpoint}; env={:?}",
+                cmd.env
+            );
+        }
         // The local-model wiring must survive the suppression.
         assert!(cmd
             .env
@@ -1097,9 +1112,12 @@ mod tests {
         let mut o = opts(DEFAULT_COMPOSE_FILE);
         o.minimal = true;
         let cmd = rebuild_command(&o, "curie-worker", None);
-        assert!(cmd
-            .env
-            .contains(&(String::from("OTEL_EXPORTER_OTLP_ENDPOINT"), String::new())));
+        for endpoint in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        ] {
+            assert!(cmd.env.contains(&(String::from(endpoint), String::new())));
+        }
         assert!(cmd.display().contains("--profile core"));
     }
 
@@ -1425,7 +1443,7 @@ mod tests {
         // profile starts no collector); `display` renders env before the program.
         assert_eq!(
             cmd.display(),
-            "OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= docker compose --profile core -f compose.dev.yaml up -d --wait"
         );
     }
 

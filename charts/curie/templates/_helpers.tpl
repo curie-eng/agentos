@@ -48,6 +48,18 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Standard application OTLP environment. Service identity is supplied by
+     each process's telemetry bootstrap, not by deployment environment, and the
+     variables are omitted entirely when the in-chart collector is disabled. */}}
+{{- define "curie.env.otel" -}}
+{{- if .Values.otelCollector.deploy }}
+- name: OTEL_EXPORTER_OTLP_ENDPOINT
+  value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+- name: OTEL_EXPORTER_OTLP_PROTOCOL
+  value: http/protobuf
+{{- end }}
+{{- end -}}
+
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
      The non-CURIE_-prefixed runner credential keys a per-agent connector
      secret must never declare, kept in list-parity with the Python source of
@@ -282,6 +294,10 @@ service:
       receivers: [otlp]
       processors: [batch]
       exporters: [otlphttp/langfuse, debug{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
 {{- end }}
 
 {{/* ---- Default-credential gate (issue #198) ----

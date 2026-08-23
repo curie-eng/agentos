@@ -39,8 +39,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextvars import ContextVar
 
 from curie_dispatcher.queue import from_stream_fields
+from curie_telemetry import TRACE_CONTEXT_FIELD, extract_trace_context
+from curie_telemetry.attributes import sanitize_attributes
+from opentelemetry import trace
+from opentelemetry.context import attach, detach
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer, set_span_in_context
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
@@ -92,6 +98,11 @@ THREAD_RESET_INFLIGHT_SET = "curie:thread-reset-inflight"
 # the set is picked up on the next tick rather than blocking the rest of the
 # maintenance work behind an arbitrarily large batch.
 _THREAD_RESET_DRAIN_BUDGET_S = 30.0
+_NOOP_TRACER = trace.NoOpTracerProvider().get_tracer("curie-worker.consumer")
+_ACTIVE_PROCESS_SPAN: ContextVar[Span | None] = ContextVar(
+    "curie_worker_active_process_span",
+    default=None,
+)
 
 
 class Consumer(StreamConsumer):
@@ -104,6 +115,7 @@ class Consumer(StreamConsumer):
         kernel: Kernel,
         config: WorkerConfig,
         max_concurrency: int = 16,
+        tracer: Tracer | None = None,
     ) -> None:
         super().__init__(redis)
         # The base class narrows self._redis to the StreamBroker port (stream
@@ -115,6 +127,7 @@ class Consumer(StreamConsumer):
         self._valkey: Redis = redis
         self._kernel = kernel
         self._config = config
+        self._tracer = tracer or _NOOP_TRACER
         self._sem = asyncio.Semaphore(max_concurrency)
         self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads. Built
@@ -214,8 +227,47 @@ class Consumer(StreamConsumer):
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
 
+    def _process_span(self, fields: dict[str, str]) -> tuple[Span, bool]:
+        """Start a process span from optional transport-owned W3C metadata.
+
+        ``extract_trace_context`` owns all bounds and value-free diagnostics.
+        A present but invalid value is reported as an event after the new root
+        starts; an absent/empty field is the ordinary payload-only path.
+        """
+
+        raw = fields.get(TRACE_CONTEXT_FIELD)
+        parent = extract_trace_context(raw, logger=logger)
+        parent_context = trace.get_current_span(parent).get_span_context()
+        malformed = bool(raw) and not parent_context.is_valid
+        attributes = sanitize_attributes(
+            "curie-worker",
+            {
+                "messaging.system": "valkey",
+                "messaging.destination.name": self._config.stream,
+                "messaging.operation.type": "process",
+            },
+        )
+        span = self._tracer.start_span(
+            "process curie:runs",
+            context=parent,
+            kind=SpanKind.CONSUMER,
+            attributes=attributes,
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+        return span, malformed
+
+    @staticmethod
+    def _finish_process_span(span: Span, *, error: bool) -> None:
+        span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
+
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
+        span, malformed = self._process_span(fields)
+        context_token = attach(set_span_in_context(span))
+        active_token = _ACTIVE_PROCESS_SPAN.set(span)
         try:
+            if malformed:
+                span.add_event("trace_context.invalid")
             try:
                 qevent = from_stream_fields(fields)
             except Exception:
@@ -228,15 +280,88 @@ class Consumer(StreamConsumer):
                 )
                 return
             try:
-                await self._kernel.process_event(qevent)
+                outcome = await self._kernel.process_event(qevent)
             except Exception:
                 # Leave the entry pending: XAUTOCLAIM will reclaim and retry.
+                span.add_event("messaging.pending")
+                self._finish_process_span(span, error=True)
                 logger.exception("processing failed for entry %s; left pending", entry_id)
                 return
-            await self._ack(entry_id)
+            try:
+                await self._ack(entry_id)
+            except Exception:
+                span.add_event("messaging.pending")
+                self._finish_process_span(span, error=True)
+                raise
+            span.add_event("messaging.ack")
+            self._finish_process_span(span, error=outcome == "escalated")
+        except BaseException:
+            self._finish_process_span(span, error=True)
+            raise
         finally:
+            _ACTIVE_PROCESS_SPAN.reset(active_token)
+            detach(context_token)
+            span.end()
             self._inflight_ids.discard(entry_id)
             self._sem.release()
+
+    async def _dead_letter(
+        self,
+        entry_id: str,
+        fields: dict[str, str] | None,
+        *,
+        reason: str,
+        delivery_count: int,
+    ) -> None:
+        """Trace XADD-before-XACK settlement without changing its ownership.
+
+        The unparseable path is already inside ``_handle``'s process span.  The
+        delivery-cap path runs directly from maintenance, so it opens the same
+        process span from the original carrier before delegating to the shared
+        bounded-delivery implementation.
+        """
+
+        active = _ACTIVE_PROCESS_SPAN.get()
+        if active is not None:
+            active.add_event("messaging.dead_letter")
+            try:
+                await super()._dead_letter(
+                    entry_id,
+                    fields,
+                    reason=reason,
+                    delivery_count=delivery_count,
+                )
+            except BaseException:
+                active.add_event("messaging.pending")
+                self._finish_process_span(active, error=True)
+                raise
+            active.add_event("messaging.ack")
+            self._finish_process_span(active, error=True)
+            return
+
+        span, malformed = self._process_span(fields or {})
+        context_token = attach(set_span_in_context(span))
+        active_token = _ACTIVE_PROCESS_SPAN.set(span)
+        try:
+            if malformed:
+                span.add_event("trace_context.invalid")
+            span.add_event("messaging.dead_letter")
+            await super()._dead_letter(
+                entry_id,
+                fields,
+                reason=reason,
+                delivery_count=delivery_count,
+            )
+            span.add_event("messaging.ack")
+            self._finish_process_span(span, error=True)
+        except BaseException:
+            span.add_event("messaging.pending")
+            self._finish_process_span(span, error=True)
+            raise
+        finally:
+            _ACTIVE_PROCESS_SPAN.reset(active_token)
+            detach(context_token)
+            span.end()
 
     async def _pending_delivery_count(self, entry_id: str) -> int:
         """This entry's CURRENT delivery count, read from the PEL.

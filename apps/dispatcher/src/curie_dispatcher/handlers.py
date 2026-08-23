@@ -18,11 +18,15 @@ dispatcher's.
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
+from curie_telemetry import set_turn_identity
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 from slack_bolt import App
 from slack_sdk.web import WebClient
 
@@ -66,6 +70,93 @@ def is_actionable(event: dict[str, Any]) -> bool:
     return True
 
 
+@contextmanager
+def _producer_span(
+    tracer: Tracer | None, config: DispatcherConfig
+) -> Iterator[Span | None]:
+    if tracer is None:
+        yield None
+        return
+    with tracer.start_as_current_span(
+        "send curie:runs",
+        kind=SpanKind.PRODUCER,
+        attributes={
+            "messaging.system": "valkey",
+            "messaging.destination.name": config.stream,
+            "messaging.operation.type": "send",
+        },
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            yield span
+        except BaseException as exc:
+            error_type = type(exc).__name__
+            span.set_attribute("error.type", error_type)
+            span.set_attribute("exception.type", error_type)
+            span.set_attribute("exception.escaped", True)
+            span.set_status(Status(StatusCode.ERROR))
+            raise
+        else:
+            span.set_status(Status(StatusCode.OK))
+
+
+def _stamp_agent_identity_after_enqueue(
+    *,
+    span: Span | None,
+    config: DispatcherConfig,
+    channel: str,
+    conversation_id: str,
+    user_id: str,
+    logger: logging.Logger,
+) -> None:
+    """Resolve the incumbent identity after XADD, bounded and fail open."""
+
+    if span is None or not span.is_recording():
+        return
+    try:
+        response = httpx.get(
+            f"{config.api_base_url.rstrip('/')}/agents",
+            headers={"X-API-Key": config.api_key},
+            timeout=min(config.api_preflight_timeout_s, 2.0),
+        )
+        response.raise_for_status()
+        body = response.json()
+        matches: list[dict[str, Any]] = []
+        if isinstance(body, list):
+            for item in body:
+                if not isinstance(item, dict):
+                    continue
+                binding = item.get("channel")
+                if (
+                    isinstance(binding, dict)
+                    and binding.get("kind") == "slack"
+                    and binding.get("address") == channel
+                    and item.get("id")
+                ):
+                    matches.append(item)
+    except Exception:  # lookup is compatibility metadata, never durability
+        span.add_event("dispatcher.agent_lookup.unavailable")
+        logger.warning(
+            "agent lookup unavailable after durable enqueue; trace identity omitted"
+        )
+        return
+
+    if len(matches) != 1:
+        span.add_event("dispatcher.agent_lookup.unavailable")
+        logger.warning(
+            "agent lookup ambiguous after durable enqueue; trace identity omitted"
+        )
+        return
+    set_turn_identity(
+        span,
+        agent_id=matches[0]["id"],
+        conversation_id=conversation_id,
+        user_id=user_id,
+    )
+    span.add_event("dispatcher.agent_lookup.resolved")
+
+
 def process_event(
     *,
     body: dict[str, Any],
@@ -75,6 +166,7 @@ def process_event(
     config: DispatcherConfig,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
+    tracer: Tracer | None = None,
 ) -> str | None:
     """Dedupe, post the placeholder, and enqueue one Slack event.
 
@@ -87,53 +179,75 @@ def process_event(
         return None
 
     slack_event_id = body["event_id"]
+    with _producer_span(tracer, config) as span:
+        if span is not None:
+            span.add_event("dispatcher.dedupe.checked")
+        if not claim_event(redis_client, config, slack_event_id):
+            if span is not None:
+                span.add_event("dispatcher.dedupe.skip")
+            log.info("duplicate slack event %s, skipping", slack_event_id)
+            return None
 
-    if not claim_event(redis_client, config, slack_event_id):
-        log.info("duplicate slack event %s, skipping", slack_event_id)
-        return None
+        # Reply in-thread: for a root message the thread key is its own ts.
+        thread_ts = event.get("thread_ts") or event["ts"]
+        channel = event["channel"]
 
-    # Reply in-thread: for a root message the thread key is its own ts.
-    thread_ts = event.get("thread_ts") or event["ts"]
-    channel = event["channel"]
+        placeholder = web_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=config.placeholder_text,
+        )
+        if span is not None:
+            span.add_event("dispatcher.placeholder.posted")
+        placeholder_ts = placeholder["ts"]
 
-    placeholder = web_client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=config.placeholder_text,
-    )
-    placeholder_ts = placeholder["ts"]
-
-    # Nothing else goes between the placeholder and the XADD below. The Slack
-    # assistant-thread status ("shimmer") used to sit right here, and it was the
-    # wrong side of the durable write (#1312): a best-effort cosmetic call, whose
-    # own failures are swallowed at debug, gating the only moment this turn
-    # becomes recoverable. slack_sdk's retry handler puts the worst case near
-    # 4.5s (see app.py's timeout constant), and Bolt has five shared listener
-    # workers, so a handful of slow status calls could stall ingestion with no
-    # visible explanation. The worker raises and lowers the shimmer now, which
-    # also puts set and clear in one process instead of racing across two.
-    queued = QueuedTurn(
-        event_id=slack_event_id,
-        conversation_id=thread_ts,
-        author=event.get("user", ""),
-        text=event.get("text", ""),
-        # A person spoke, so this turn MAY steer a live one. Stated rather than
-        # left to the model default for the same reason `kind` is: a producer
-        # that does not say what it is produces turns nobody can audit.
-        source=TurnSource.SLACK,
-        # The literal "slack" is this dispatcher stating what it is; it never
-        # comes from config, because a Slack Socket Mode dispatcher that could
-        # claim another kind is a misrouting vector. `adapter=None` is explicit
-        # rather than defaulted so a reader sees that Slack's route is the
-        # worker's configured origin, not an oversight (ADR-0096 D4.4).
-        reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder_ts, adapter=None
-        ),
-        received_at=clock(),
-    )
-    stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued slack event %s as stream entry %s", slack_event_id, stream_id)
-    return stream_id
+        # Nothing else goes between the placeholder and the XADD below. The Slack
+        # assistant-thread status ("shimmer") used to sit right here, and it was
+        # the wrong side of the durable write (#1312): a best-effort cosmetic call,
+        # whose own failures are swallowed at debug, gating the only moment this
+        # turn becomes recoverable. slack_sdk's retry handler puts the worst case
+        # near 4.5s (see app.py's timeout constant), and Bolt has five shared
+        # listener workers, so a handful of slow status calls could stall
+        # ingestion with no visible explanation. The worker raises and lowers the
+        # shimmer now, which also puts set and clear in one process instead of
+        # racing across two.
+        queued = QueuedTurn(
+            event_id=slack_event_id,
+            conversation_id=thread_ts,
+            author=event.get("user", ""),
+            text=event.get("text", ""),
+            # A person spoke, so this turn MAY steer a live one. Stated rather than
+            # left to the model default for the same reason `kind` is: a producer
+            # that does not say what it is produces turns nobody can audit.
+            source=TurnSource.SLACK,
+            # The literal "slack" is this dispatcher stating what it is; it never
+            # comes from config, because a Slack Socket Mode dispatcher that could
+            # claim another kind is a misrouting vector. `adapter=None` is explicit
+            # rather than defaulted so a reader sees that Slack's route is the
+            # worker's configured origin, not an oversight (ADR-0096 D4.4).
+            reply_handle=ReplyHandle(
+                kind="slack",
+                channel=channel,
+                placeholder=placeholder_ts,
+                adapter=None,
+            ),
+            received_at=clock(),
+        )
+        stream_id = enqueue(redis_client, config, queued)
+        if span is not None:
+            span.add_event("messaging.enqueued")
+        _stamp_agent_identity_after_enqueue(
+            span=span,
+            config=config,
+            channel=channel,
+            conversation_id=thread_ts,
+            user_id=queued.author,
+            logger=log,
+        )
+        log.info(
+            "enqueued slack event %s as stream entry %s", slack_event_id, stream_id
+        )
+        return stream_id
 
 
 def action_command(action: dict[str, Any]) -> str:
@@ -152,6 +266,7 @@ def process_action(
     config: DispatcherConfig,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
+    tracer: Tracer | None = None,
 ) -> str | None:
     """Normalize a Block Kit button click into a turn: dedupe, post an in-thread
     placeholder, and enqueue a ``QueuedTurn`` whose text is the button's
@@ -196,33 +311,54 @@ def process_action(
         f"{actions[0].get('action_ts', '')}-{actions[0].get('action_id', '')}"
     )
     slack_event_id = f"action-{interaction}"
-    if not claim_event(redis_client, config, slack_event_id):
-        log.info("duplicate block action %s, skipping", slack_event_id)
-        return None
+    with _producer_span(tracer, config) as span:
+        if span is not None:
+            span.add_event("dispatcher.dedupe.checked")
+        if not claim_event(redis_client, config, slack_event_id):
+            if span is not None:
+                span.add_event("dispatcher.dedupe.skip")
+            log.info("duplicate block action %s, skipping", slack_event_id)
+            return None
 
-    user = (body.get("user") or {}).get("id", "")
-
-    placeholder = web_client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=config.placeholder_text,
-    )
-    queued = QueuedTurn(
-        event_id=slack_event_id,
-        conversation_id=thread_ts,
-        author=user,
-        text=command,
-        # A person clicked a button. Still a person, still steerable.
-        source=TurnSource.SLACK,
-        # Same literal, same reason, on the sibling lane (ADR-0096 D4.4).
-        reply_handle=ReplyHandle(
-            kind="slack", channel=channel, placeholder=placeholder["ts"], adapter=None
-        ),
-        received_at=clock(),
-    )
-    stream_id = enqueue(redis_client, config, queued)
-    log.info("enqueued block action %s as stream entry %s", slack_event_id, stream_id)
-    return stream_id
+        user = (body.get("user") or {}).get("id", "")
+        placeholder = web_client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=config.placeholder_text,
+        )
+        if span is not None:
+            span.add_event("dispatcher.placeholder.posted")
+        queued = QueuedTurn(
+            event_id=slack_event_id,
+            conversation_id=thread_ts,
+            author=user,
+            text=command,
+            # A person clicked a button. Still a person, still steerable.
+            source=TurnSource.SLACK,
+            # Same literal, same reason, on the sibling lane (ADR-0096 D4.4).
+            reply_handle=ReplyHandle(
+                kind="slack",
+                channel=channel,
+                placeholder=placeholder["ts"],
+                adapter=None,
+            ),
+            received_at=clock(),
+        )
+        stream_id = enqueue(redis_client, config, queued)
+        if span is not None:
+            span.add_event("messaging.enqueued")
+        _stamp_agent_identity_after_enqueue(
+            span=span,
+            config=config,
+            channel=channel,
+            conversation_id=thread_ts,
+            user_id=user,
+            logger=log,
+        )
+        log.info(
+            "enqueued block action %s as stream entry %s", slack_event_id, stream_id
+        )
+        return stream_id
 
 
 def register_handlers(
@@ -234,6 +370,7 @@ def register_handlers(
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
     resolver: ApprovalResolveClient | None = None,
+    tracer: Tracer | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
@@ -251,6 +388,7 @@ def register_handlers(
             config=config,
             clock=clock,
             logger=logger,
+            tracer=tracer,
         )
 
     @app.event("message")
@@ -265,6 +403,7 @@ def register_handlers(
             config=config,
             clock=clock,
             logger=logger,
+            tracer=tracer,
         )
 
     # Approval-card clicks (#246): resolve through the API (which enforces the
@@ -378,4 +517,5 @@ def register_handlers(
             config=config,
             clock=clock,
             logger=logger,
+            tracer=tracer,
         )

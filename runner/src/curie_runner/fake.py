@@ -68,6 +68,12 @@ def default_turn() -> list[Any]:
 APPROVAL_MARKER = "[fake:request-approval]"
 _APPROVAL_MARKER_RE = re.compile(r"\[fake:request-approval(?::([A-Za-z0-9_-]+))?\]")
 
+# Explicit offline failure injection for platform/E2E error-path proofs. The
+# marker is interpreted only by FakeModelSession and raises before any scripted
+# output, so it exercises the runner's real classified-failure handling with no
+# provider or network dependency.
+RUNNER_ERROR_MARKER = "[fake:runner-error]"
+
 
 def approval_turn(summary: str, route: str | None = None) -> list[Any]:
     """A turn that calls the platform approval-request tool, then ends."""
@@ -158,6 +164,8 @@ class FakeModelSession:
         self._interrupted = True
 
     async def receive_turn(self) -> AsyncIterator[Any]:
+        if self.queries and RUNNER_ERROR_MARKER in self.queries[-1]:
+            raise RuntimeError("injected fake runner failure")
         for message in self._script_factory():
             if self._interrupted and self._truncate_on_interrupt:
                 return
