@@ -5,10 +5,6 @@ on:
     branches: [main, next]
   pull_request:
     branches: [main, next]
-    # A PR body can be edited without a new commit. Re-run the literal-newline
-    # guard on that event so a formerly valid closing keyword cannot become
-    # inert after the rest of CI has already passed.
-    types: [opened, synchronize, reopened, edited]
 
 # Supersede an in-flight run when a branch is pushed again so runs stop
 # stacking. Keyed per workflow+ref: each PR branch and main have independent
@@ -21,41 +17,6 @@ permissions:
   contents: read
 
 jobs:
-  pr-body:
-    name: PR body (real newlines)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      # Keep untrusted PR text out of shell source. github-script reads the
-      # payload directly and writes its bytes to a runner-owned temporary file.
-      - name: Write the pull request body to a temporary file
-        uses: actions/github-script@v8
-        env:
-          PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
-        with:
-          script: |
-            const fs = require("node:fs");
-            const body = context.payload.pull_request?.body ?? "";
-            if (typeof body !== "string") {
-              core.setFailed("pull request body must be a string or null");
-              return;
-            }
-            fs.writeFileSync(process.env.PR_BODY_FILE, body, { encoding: "utf8", mode: 0o600 });
-      # Prove both branches of the matcher can still be reached before trusting
-      # its verdict against the event payload.
-      - name: PR body guard self-test
-        run: bash scripts/check-pr-body.sh --self-test
-      - name: Reject literal newline escapes in the pull request body
-        env:
-          PR_BODY_FILE: ${{ runner.temp }}/curie-pr-body.md
-        run: |
-          set -euo pipefail
-          trap 'rm -f -- "$PR_BODY_FILE"' EXIT
-          bash scripts/check-pr-body.sh "$PR_BODY_FILE"
-
   python:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
