@@ -14,7 +14,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from .conftest import OtlpHttpCapture
 
-FAKE_API_KEY = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
+PRIVATE_MARKER = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 
 
 def _any_value(value: Any) -> object:
@@ -157,10 +157,10 @@ def test_configured_runtime_preserves_console_logs_and_exports_only_curated_reco
 
         with runtime.tracer.start_as_current_span("GET /health") as span:
             span.set_attribute("http.request.method", "GET")
-            span.set_attribute("http.request.header.authorization", FAKE_API_KEY)
-            span.set_attribute("error.type", FAKE_API_KEY)
+            span.set_attribute("http.request.header.authorization", PRIVATE_MARKER)
+            span.set_attribute("error.type", PRIVATE_MARKER)
             span_context = span.get_span_context()
-            logger.info("request completed credential=%s", FAKE_API_KEY)
+            logger.info("request completed credential=%s", PRIVATE_MARKER)
             emit_log_event(logger, "http.server.completed")
 
         assert runtime.force_flush(timeout_millis=1000) is True
@@ -171,7 +171,7 @@ def test_configured_runtime_preserves_console_logs_and_exports_only_curated_reco
         logger.propagate = prior_propagate
 
     console_output = stderr.getvalue()
-    assert FAKE_API_KEY not in console_output
+    assert PRIVATE_MARKER not in console_output
     assert "[REDACTED:" in console_output
 
     spans = _exported_spans(otlp_http_capture)
@@ -199,11 +199,11 @@ def test_configured_runtime_preserves_console_logs_and_exports_only_curated_reco
     span_attrs = _attributes(exported_span.attributes)
     assert span_attrs["http.request.method"] == "GET"
     assert "http.request.header.authorization" not in span_attrs
-    assert FAKE_API_KEY not in repr(span_attrs)
+    assert PRIVATE_MARKER not in repr(span_attrs)
 
     assert exported_log.trace_id == span_context.trace_id.to_bytes(16, "big")
     assert exported_log.span_id == span_context.span_id.to_bytes(8, "big")
-    assert FAKE_API_KEY not in repr(exported_log)
+    assert PRIVATE_MARKER not in repr(exported_log)
     assert _any_value(exported_log.body) == "http.server.completed"
 
 

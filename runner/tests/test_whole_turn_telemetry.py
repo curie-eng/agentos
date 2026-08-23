@@ -42,7 +42,7 @@ from opentelemetry.proto.trace.v1.trace_pb2 import Status
 
 _TRACE_ID = "11111111111111111111111111111111"
 _PARENT_ID = "2222222222222222"
-_FAKE_SECRET = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
+_PRIVATE_MARKER = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
 _EVENT = {"kind": "event", "type": "message", "text": "hello", "user": "U", "ts": "1"}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -270,7 +270,7 @@ def test_caught_failure_marks_agent_run_error_and_exports_a_redacted_correlated_
     assert [_body(record) for record in correlated] == ["agent.run.failed"]
     assert all(record.severity_text == "ERROR" for record in correlated)
     exported = repr(otlp_capture.traces) + repr(otlp_capture.logs)
-    assert _FAKE_SECRET not in exported
+    assert _PRIVATE_MARKER not in exported
     assert _ARBITRARY_EXCEPTION not in exported
 
 
@@ -301,14 +301,14 @@ def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
         span.set_attribute("curie.session_id", "safe-session")
         span.set_attribute("messaging.system", "otherwise-valid-for-another-service")
         span.set_attribute("unknown.attribute", "must-not-export")
-        span.set_attribute("langfuse.trace.name", ["safe", _FAKE_SECRET])
+        span.set_attribute("langfuse.trace.name", ["safe", _PRIVATE_MARKER])
         logger.error(
             "runner failed authorization=%s",
-            _FAKE_SECRET,
+            _PRIVATE_MARKER,
             extra={
                 "curie.session_id": "safe-session",
                 "messaging.system": "cross-service",
-                "unknown.attribute": _FAKE_SECRET,
+                "unknown.attribute": _PRIVATE_MARKER,
             },
         )
         emit_log_event(logger, "agent.run.failed", level=logging.ERROR)
@@ -325,8 +325,8 @@ def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
     )
     log_attributes = _attributes(log_record)
     assert log_attributes == {}, "curated log events carry correlation only, no values"
-    assert _FAKE_SECRET not in repr(otlp_capture.traces)
-    assert _FAKE_SECRET not in repr(otlp_capture.logs)
+    assert _PRIVATE_MARKER not in repr(otlp_capture.traces)
+    assert _PRIVATE_MARKER not in repr(otlp_capture.logs)
     runtime.shutdown(timeout_millis=2_000)
 
 
@@ -341,7 +341,7 @@ class _OrderingRuntime:
     def force_flush(self, *, timeout_millis: int) -> bool:
         self.calls.append(f"flush:{timeout_millis}")
         if self.fail_flush:
-            raise RuntimeError(f"flush rejected authorization={_FAKE_SECRET}")
+            raise RuntimeError(f"flush rejected authorization={_PRIVATE_MARKER}")
         return True
 
     def shutdown(self, *, timeout_millis: int = 2_000) -> bool:
@@ -381,7 +381,7 @@ def test_flush_failure_is_redacted_and_does_not_reclassify_the_turn(
     assert events[-1].status is SessionStatus.DONE
     rendered = " ".join(record.getMessage() for record in caplog.records)
     assert "telemetry flush failed" in rendered
-    assert _FAKE_SECRET not in rendered
+    assert _PRIVATE_MARKER not in rendered
 
 
 def test_unreachable_exporter_cannot_hold_runner_cleanup_past_the_shutdown_cap(
@@ -497,4 +497,4 @@ def test_immediate_post_turn_process_termination_still_exports_agent_run(
     agent = next(span for span in _spans(otlp_capture) if span.name == "agent.run")
     assert agent.trace_id.hex() == _TRACE_ID
     assert agent.parent_span_id.hex() == _PARENT_ID
-    assert _FAKE_SECRET not in output
+    assert _PRIVATE_MARKER not in output
