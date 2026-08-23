@@ -2,7 +2,7 @@
 seam: Channel / ingress (Slack)
 kind: SOFT
 impls: 1
-grade: C
+grade: B-
 vision_row: Communication
 epics:
   - "#7"
@@ -15,7 +15,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** C
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 1 &nbsp;·&nbsp; **Swap-readiness grade:** B-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -93,9 +93,15 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
 
 ## Implementations today
 
-One: Slack. Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
-`SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack Web API. The swap proof that the
-protocol (not just the service) is the seam: the Rust CLI mints the exact
+One proven first-party production channel: Slack. Ingress is `apps/dispatcher`
+(Bolt / Socket Mode); egress is `SlackReplyAdapter`
+(`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
+Web API. `HttpReplyAdapter`
+(`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) is also
+shipped for configured non-Slack endpoints and consumes the same versioned
+neutral events, but it is not evidence of a complete second production-channel
+lifecycle. The swap proof that the protocol (not just the service) is the seam:
+the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
 (`cli/src/queue.rs`) and drives the whole deployed system with zero Slack contact
 via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`).
@@ -146,7 +152,7 @@ routing key that carries no kind.
 - **Epic(s):** #19 — per-turn reply routing (landed)
 - **Epic(s):** #27 — deliberately defers a pluggable multi-channel framework
 - **Epic(s):** #38 — channel-seam hardening / follow-up
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 6 (Communication channel), grade C
+- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 6 (Communication channel), grade B-
 - **ADR(s):** none directly on this seam
 - **Interaction contract:** [Channel interaction](../channel-interaction/INTERFACE.md)
   defines the semantic reply before this Slack adapter renders it.
