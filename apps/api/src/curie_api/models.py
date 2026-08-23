@@ -5,12 +5,14 @@ bundle columns; J1 added the git-flow columns (agents.repo_full_name,
 agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 """
 
+from __future__ import annotations
+
 import enum
 import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, LargeBinary, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -112,7 +114,7 @@ class Agent(Base):
     hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
-    versions: Mapped[list["AgentVersion"]] = relationship(
+    versions: Mapped[list[AgentVersion]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
     # The agent's channel binding (ADR-0096, #1459). SINGULAR: one agent binds
@@ -124,7 +126,7 @@ class Agent(Base):
     # the default lazy strategy RAISES on attribute access outside an await under
     # asyncio instead of loading. Dropping it turns all three read endpoints into
     # 500s while the crud-level tests, which hold a live session, stay green.
-    channel: Mapped["AgentChannel"] = relationship(
+    channel: Mapped[AgentChannel] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
         uselist=False,
@@ -231,6 +233,9 @@ class Deployment(Base):
         Enum(Environment, name="environment", schema=SCHEMA)
     )
     commit_sha: Mapped[str | None] = mapped_column(default=None)
+    # A deployment-level managed checkout. NULL means no repository workspace;
+    # the value is canonical owner/repo and is never a URL or credential.
+    workspace_repo: Mapped[str | None] = mapped_column(default=None)
     status: Mapped[str] = mapped_column(server_default="active")
     deployed_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
@@ -316,6 +321,74 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Server-owned purpose. Only ``publication`` enables the narrowly scoped
+    # requester self-approval rule and suppresses the ordinary model wake.
+    purpose: Mapped[str] = mapped_column(server_default="session", default="session")
+
+    publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
+
+
+class Publication(Base):
+    """Private patch state settled by the platform publication reconciler."""
+
+    __tablename__ = "publications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE"), index=True
+    )
+    repo_full_name: Mapped[str]
+    status: Mapped[str] = mapped_column(server_default="pending", index=True)
+    version: Mapped[int] = mapped_column(server_default="1", default=1)
+    base_sha: Mapped[str]
+    # Deliberately excluded from every public DTO. Terminal retention clears
+    # these bytes while preserving the audit/result metadata.
+    patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    title: Mapped[str]
+    body: Mapped[str]
+    reply_kind: Mapped[str]
+    reply_channel: Mapped[str]
+    reply_placeholder: Mapped[str | None] = mapped_column(default=None)
+    reply_endpoint: Mapped[str | None] = mapped_column(default=None)
+    reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    lease_owner: Mapped[str | None] = mapped_column(default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_url: Mapped[str | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    terminal_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    approval: Mapped[Approval] = relationship(back_populates="publication")
+
+
+class CredentialRedemptionAuditEntry(Base):
+    """Credential-boundary audit containing names and outcomes, never material."""
+
+    __tablename__ = "credential_redemption_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    purpose: Mapped[str]
+    outcome: Mapped[str]
+    deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"),
+        default=None,
+        index=True,
+    )
+    publication_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publications.id", ondelete="SET NULL"),
+        default=None,
+        index=True,
+    )
+    repo_full_name: Mapped[str | None] = mapped_column(default=None)
+    detail: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class ApprovalAuditEntry(Base):
@@ -404,17 +477,13 @@ class ConsoleSession(Base):
 
     __tablename__ = "console_sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
     login_code_expires_at: Mapped[datetime]
     # Set at exchange, so NULL means "minted, never redeemed".
-    session_token_hash: Mapped[str | None] = mapped_column(
-        default=None, unique=True, index=True
-    )
+    session_token_hash: Mapped[str | None] = mapped_column(default=None, unique=True, index=True)
     session_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     # Stamped at exchange; its presence is what makes the code single-use.
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)

@@ -124,9 +124,8 @@ def _parse_trusted_origins(value: object) -> object:
 # ("http://localhost,http://127.0.0.1,...") raised SettingsError and killed the
 # worker at boot, and the BeforeValidator below was only ever reachable when the
 # env var was absent. Same declared-not-parsed defect as the boot env's (#1195).
-TrustedOrigins = Annotated[
-    tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)
-]
+TrustedOrigins = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
+CommaSeparatedNames = Annotated[tuple[str, ...], NoDecode, BeforeValidator(_parse_trusted_origins)]
 
 
 class WorkerConfig(BaseSettings):
@@ -529,6 +528,113 @@ class WorkerConfig(BaseSettings):
     s3_secret_key: str = ""
     s3_region: str = "us-east-1"
     bundle_bucket: str = "curie-bundles"
+    # Managed repository workspaces use the same object-store endpoint but a
+    # private prefix and an exact-object signed read capability. The internal
+    # token is distinct from the operator/CLI API key and is mounted only into
+    # API and worker. The public dev default is replaced by the chart Secret in
+    # a cluster install.
+    internal_worker_token: str = Field(
+        default="curie-dev-worker-token",
+        validation_alias="CURIE_INTERNAL_WORKER_TOKEN",
+    )
+    workspace_bucket: str = Field(
+        default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
+    )
+    workspace_object_prefix: str = Field(
+        default="private/workspaces",
+        validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
+    )
+    workspace_scratch_root: str = Field(
+        default="/tmp/curie-workspaces",
+        validation_alias="CURIE_WORKSPACE_SCRATCH_ROOT",
+    )
+    workspace_clone_timeout_seconds: int = Field(
+        default=90, gt=0, validation_alias="CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS"
+    )
+    workspace_archive_timeout_seconds: int = Field(
+        default=30, gt=0, validation_alias="CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS"
+    )
+    workspace_upload_timeout_seconds: int = Field(
+        default=30, gt=0, validation_alias="CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS"
+    )
+    workspace_total_timeout_seconds: int = Field(
+        default=150, gt=0, validation_alias="CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS"
+    )
+    workspace_max_checkout_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_CHECKOUT_BYTES",
+    )
+    workspace_max_archive_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES",
+    )
+    workspace_max_members: int = Field(
+        default=4096, gt=0, validation_alias="CURIE_WORKSPACE_MAX_MEMBERS"
+    )
+    workspace_max_compression_ratio: float = Field(
+        default=20.0,
+        gt=0,
+        validation_alias="CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
+    )
+    workspace_reference_ttl_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_WORKSPACE_REFERENCE_TTL_SECONDS"
+    )
+    workspace_max_concurrent_clones: int = Field(
+        default=2, gt=0, validation_alias="CURIE_WORKSPACE_MAX_CONCURRENT_CLONES"
+    )
+    # Approval-gated publication runs only on the Kubernetes substrate. These
+    # values shape the worker-owned Job; none are bundle inputs.
+    publication_reconcile_interval_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
+    )
+    publication_lease_seconds: int = Field(
+        default=60, gt=0, validation_alias="CURIE_PUBLICATION_LEASE_SECONDS"
+    )
+    publication_image_pull_policy: str = Field(
+        default="IfNotPresent", validation_alias="CURIE_PUBLICATION_IMAGE_PULL_POLICY"
+    )
+    publication_image_pull_secrets: CommaSeparatedNames = Field(
+        default=(), validation_alias="CURIE_PUBLICATION_IMAGE_PULL_SECRETS"
+    )
+    publication_priority_class_name: str = Field(
+        default="curie-platform-critical",
+        validation_alias="CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+    )
+    publication_service_account_name: str = Field(
+        default="curie-publication",
+        validation_alias="CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
+    )
+    publication_owner_name: str = Field(
+        default="curie-publication-owner",
+        validation_alias="CURIE_PUBLICATION_OWNER_NAME",
+    )
+    publication_git_user_name: str = Field(
+        default="Curie Publisher", validation_alias="CURIE_PUBLICATION_GIT_USER_NAME"
+    )
+    publication_git_user_email: str = Field(
+        default="publisher@example.com",
+        validation_alias="CURIE_PUBLICATION_GIT_USER_EMAIL",
+    )
+    publication_cpu_request: str = Field(
+        default="100m", validation_alias="CURIE_PUBLICATION_CPU_REQUEST"
+    )
+    publication_cpu_limit: str = Field(default="1", validation_alias="CURIE_PUBLICATION_CPU_LIMIT")
+    publication_memory_request: str = Field(
+        default="256Mi", validation_alias="CURIE_PUBLICATION_MEMORY_REQUEST"
+    )
+    publication_memory_limit: str = Field(
+        default="1Gi", validation_alias="CURIE_PUBLICATION_MEMORY_LIMIT"
+    )
+    publication_ephemeral_request: str = Field(
+        default="1Gi", validation_alias="CURIE_PUBLICATION_EPHEMERAL_REQUEST"
+    )
+    publication_ephemeral_limit: str = Field(
+        default="4Gi", validation_alias="CURIE_PUBLICATION_EPHEMERAL_LIMIT"
+    )
     # Bundle extraction bounds (ADR-0059 decision 3), applied by the Docker
     # substrate's claim-time bundle-fetch (`sandbox/docker.py`'s
     # `_prepare_bundle` -> `bundle_store.extract_bundle`) and the eval-stream

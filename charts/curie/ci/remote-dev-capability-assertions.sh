@@ -9,7 +9,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 RENDERED="$TMP/rendered.yaml"
 SEALED="$TMP/sealed.yaml"
-helm template remote-dev "$CHART" -f "$CHART/values-dev.yaml" > "$RENDERED"
+helm template remote-dev "$CHART" -f "$CHART/values-dev.yaml" \
+  --set agentSandbox.deploy=true \
+  --set agentSandbox.controller.deploy=false > "$RENDERED"
 helm template remote-dev "$CHART" --show-only templates/secrets.yaml > "$SEALED"
 
 python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" <<'PY'

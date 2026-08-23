@@ -25,6 +25,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # these is still in place under ENVIRONMENT=prod.
 _DEV_DEFAULT_API_KEY = "curie-dev-key"
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
+_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 
 
 class Settings(BaseSettings):
@@ -42,6 +43,14 @@ class Settings(BaseSettings):
 
     # Single shared API key. Dev-only default; override in any shared deployment.
     api_key: str = "curie-dev-key"
+    # Separate trust boundary for credential redemption. The operator/CLI API
+    # key can administer deployments but cannot redeem the GitHub identity.
+    internal_worker_token: str = Field(
+        default=_DEV_DEFAULT_INTERNAL_WORKER_TOKEN,
+        validation_alias=AliasChoices(
+            "CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"
+        ),
+    )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
@@ -351,6 +360,8 @@ class Settings(BaseSettings):
             offenders.append("API_KEY")
         if self.github_webhook_secret in ("", _DEV_DEFAULT_WEBHOOK_SECRET):
             offenders.append("GITHUB_WEBHOOK_SECRET")
+        if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
+            offenders.append("CURIE_INTERNAL_WORKER_TOKEN")
         if offenders:
             raise ValueError(
                 "ENVIRONMENT=prod but these secrets are unset or still the dev "

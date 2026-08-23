@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 import anyio
 from aci_protocol import BootEnv
@@ -51,6 +52,7 @@ from .server import create_app
 from .session import SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
+from .workspace_snapshot import capture_workspace_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,11 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
+    workspace_cwd = (
+        "/workspace"
+        if Path("/workspace").is_dir() and (Path("/workspace") / ".git").exists()
+        else None
+    )
 
     def factory() -> ModelSession:
         if fake_model:
@@ -261,9 +268,8 @@ def build_runner(
                     namespace=config.connector_namespace,
                 ),
             ),
-            can_use_tool=(
-                build_can_use_tool(approval_gate) if approval_gate is not None else None
-            ),
+            can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
+            cwd=workspace_cwd,
         )
         return ClaudeAgentSession(options)
 
@@ -313,9 +319,7 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
             exc,
         )
         return store, None
-    logger.info(
-        "memory loaded session=%s records=%d", config.session.session_id, len(records)
-    )
+    logger.info("memory loaded session=%s records=%d", config.session.session_id, len(records))
     return store, format_memory_preamble(records)
 
 
@@ -359,9 +363,7 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
             exc,
         )
         return store, None
-    logger.info(
-        "history loaded session=%s turns=%d", config.session.session_id, len(turns)
-    )
+    logger.info("history loaded session=%s turns=%d", config.session.session_id, len(turns))
     return store, format_conversation_preamble(turns, max_turns=max_turns, max_bytes=max_bytes)
 
 
@@ -417,7 +419,14 @@ def main() -> None:
         conversation_preamble=conversation_preamble,
         harness=harness,
     )
-    app = create_app(runner, token=config.runner_token)
+    app = create_app(
+        runner,
+        token=config.runner_token,
+        # The sanitized, credential-free origin in /workspace/.git/config is
+        # the repository fact. Do not add a second claim env value that could
+        # drift from it or widen what the sandbox receives.
+        snapshotter=lambda: capture_workspace_snapshot("/workspace"),
+    )
 
     async def _startup(_app: web.Application) -> None:
         try:

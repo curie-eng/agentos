@@ -33,3 +33,25 @@ async def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing or invalid API key",
         )
+
+
+def verify_internal_worker_token(value: str | None) -> bool:
+    """Constant-time check for the credential-redemption trust boundary."""
+
+    if value is None:
+        return False
+    expected = get_settings().internal_worker_token
+    return bool(expected) and hmac.compare_digest(value, expected)
+
+
+async def require_internal_worker_token(
+    x_curie_worker_token: Annotated[
+        str | None, Header(alias="X-Curie-Worker-Token")
+    ] = None,
+) -> None:
+    if not verify_internal_worker_token(x_curie_worker_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid internal worker token",
+            headers={"Cache-Control": "no-store"},
+        )

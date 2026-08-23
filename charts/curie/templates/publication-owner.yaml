@@ -1,0 +1,24 @@
+{{- if and .Values.worker.deploy .Values.worker.publication.enabled }}
+{{- $serviceAccountName := .Values.worker.publication.serviceAccountName | default (printf "%s-publication" (include "curie.fullname" .)) -}}
+{{- $ownerName := .Values.worker.publication.ownerName | default (printf "%s-publication-owner" (include "curie.fullname" .)) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $serviceAccountName }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication
+automountServiceAccountToken: false
+---
+# Stable Helm-owned anchor for dynamic ConfigMap, Secret, and Job owner refs.
+# It has no data and grants no authority; uninstall deletes it and Kubernetes
+# garbage-collects every publication object the worker attached to its UID.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $ownerName }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication-owner
+data: {}
+{{- end }}

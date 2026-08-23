@@ -15,10 +15,12 @@ import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import redis
+from aci_protocol.s3 import build_s3_client
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -35,6 +37,13 @@ from .heartbeat import run_heartbeat
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
+from .publication_clients import GitHubPublicationLookup, PublicationCredentialClient
+from .publication_k8s import KubernetesPublicationCluster, PublicationJobSettings
+from .publication_loop import (
+    PublicationReconcileLoop,
+    PublicationReconciler,
+)
+from .publication_store import PostgresPublicationStore
 from .reply_sink import ReplySinkRouter, build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
@@ -45,8 +54,17 @@ from .sandbox import (
     SandboxClient,
     SandboxSubstrate,
     SubstrateConfig,
+    SuspendedThreadError,
 )
 from .threadlock import ThreadLock
+from .workspace import (
+    SubprocessCommands,
+    WorkspaceClaimCoordinator,
+    WorkspaceCredentialClient,
+    WorkspaceLimits,
+    WorkspaceObjectStore,
+    WorkspacePreparer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +90,7 @@ class Runtime:
     # here so `_run` supervises it beside the consumers rather than letting it
     # run unsupervised.
     connector_loop: ConnectorReconcileLoop | None = None
+    publication_loop: PublicationReconcileLoop | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -172,6 +191,23 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
 _MODEL_CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 
 
+def _workspace_limits(config: WorkerConfig) -> WorkspaceLimits:
+    """One typed envelope shared by preparation and Docker extraction."""
+
+    return WorkspaceLimits(
+        clone_timeout_seconds=config.workspace_clone_timeout_seconds,
+        archive_timeout_seconds=config.workspace_archive_timeout_seconds,
+        upload_timeout_seconds=config.workspace_upload_timeout_seconds,
+        total_timeout_seconds=config.workspace_total_timeout_seconds,
+        max_checkout_bytes=config.workspace_max_checkout_bytes,
+        max_archive_bytes=config.workspace_max_archive_bytes,
+        max_members=config.workspace_max_members,
+        max_compression_ratio=config.workspace_max_compression_ratio,
+        reference_ttl_seconds=config.workspace_reference_ttl_seconds,
+        max_concurrent_clones=config.workspace_max_concurrent_clones,
+    )
+
+
 def _sandbox_client(
     config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
 ) -> SandboxClient:
@@ -190,6 +226,7 @@ def _sandbox_client(
     ``CURIE_CREDENTIALS`` reference, which the runner maps onto an SDK var.
     """
     substrate = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
+    bundle_store = BundleStore(config)
     if substrate == "docker":
         has_credential = bool(config.credentials) or any(v in env for v in _MODEL_CREDENTIAL_ENV)
         has_local_model = bool(config.model_base_url)
@@ -209,7 +246,7 @@ def _sandbox_client(
             )
         client = DockerSandboxClient(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
-            bundle_store=BundleStore(config),
+            bundle_store=bundle_store,
             network=env.get("CURIE_DOCKER_NETWORK") or None,
             otel_endpoint=env.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
             default_plugin_dir=config.bundle_plugin_dir,
@@ -221,12 +258,17 @@ def _sandbox_client(
             bundle_max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
             bundle_max_compression_ratio=config.bundle_max_compression_ratio,
             bundle_max_members=config.bundle_max_members,
+            workspace_limits=_workspace_limits(config),
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
         client.ensure_image()
         return client
-    return KubernetesSandboxClient(sub_config.namespace)
+    return KubernetesSandboxClient(
+        sub_config.namespace,
+        bundle_signer=bundle_store,
+        bundle_reference_ttl_seconds=config.workspace_reference_ttl_seconds,
+    )
 
 
 def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
@@ -258,11 +300,38 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     )
     engine = create_async_engine(config.database_url, pool_pre_ping=True)
     binding = BindingResolver(engine, config)
+    workspace_objects = WorkspaceObjectStore(
+        client=build_s3_client(
+            endpoint_url=config.s3_endpoint_url,
+            access_key=config.s3_access_key,
+            secret_key=config.s3_secret_key,
+            region=config.s3_region,
+        ),
+        bucket=config.workspace_bucket,
+        prefix=config.workspace_object_prefix,
+    )
+    workspace = WorkspaceClaimCoordinator(
+        preparer=WorkspacePreparer(
+            credentials=WorkspaceCredentialClient(
+                api_url=config.api_base_url,
+                worker_token=config.internal_worker_token,
+            ),
+            commands=SubprocessCommands(),
+            objects=workspace_objects,
+            scratch_root=Path(config.workspace_scratch_root),
+            limits=_workspace_limits(config),
+        ),
+        substrate=substrate,
+        suspended_error=SuspendedThreadError,
+    )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     approval_client = ApprovalClient(
-        api_base_url=config.api_base_url, api_key=config.api_key, client=eval_http
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
+        client=eval_http,
+        worker_token=config.internal_worker_token,
     )
     sink = build_reply_sink(config)
     kernel = Kernel(
@@ -278,7 +347,15 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
+        workspace=workspace,
         approvals=approval_client,
+        # Publication is cluster-only in v1. A local request sees an actionable
+        # refusal in the kernel before either durable row is created.
+        publication_creator=(
+            approval_client
+            if env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
+            else None
+        ),
         # The same client, handed in twice under the two roles the kernel needs
         # (#1084). Two parameters rather than one so a test can fake the create
         # half without also implementing a read it never exercises.
@@ -321,6 +398,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         ),
         repo_lookup=binding,
     )
+    publication_loop = _build_publication_loop(config, env, engine, sink, eval_http)
     return Runtime(
         consumer=consumer,
         killswitch=killswitch,
@@ -332,6 +410,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         eval_http=eval_http,
         engine=engine,
         connector_loop=_build_connector_loop(config, engine),
+        publication_loop=publication_loop,
     )
 
 
@@ -400,6 +479,60 @@ def _build_connector_loop(
     )
 
 
+def _build_publication_loop(
+    config: WorkerConfig,
+    env: Mapping[str, str],
+    engine: AsyncEngine,
+    sink: ReplySinkRouter,
+    http: httpx.AsyncClient,
+) -> PublicationReconcileLoop | None:
+    """Build the worker-owned Kubernetes publication lane, never a local twin."""
+
+    if env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes":
+        return None
+    namespace = env.get("CURIE_NAMESPACE", "default")
+    cluster = KubernetesPublicationCluster(namespace)
+    store = PostgresPublicationStore(
+        engine,
+        schema=config.db_schema,
+        lease_owner=config.consumer_name,
+        lease_seconds=config.publication_lease_seconds,
+    )
+    reconciler = PublicationReconciler(
+        store=store,
+        credentials=PublicationCredentialClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=http,
+        ),
+        cluster=cluster,
+        github=GitHubPublicationLookup(http),
+        replies=sink,
+        job_settings=PublicationJobSettings(
+            namespace=namespace,
+            runner_image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
+            image_pull_policy=config.publication_image_pull_policy,
+            image_pull_secrets=config.publication_image_pull_secrets,
+            priority_class_name=config.publication_priority_class_name,
+            service_account_name=config.publication_service_account_name,
+            owner_name=config.publication_owner_name,
+            git_user_name=config.publication_git_user_name,
+            git_user_email=config.publication_git_user_email,
+            cpu_request=config.publication_cpu_request,
+            cpu_limit=config.publication_cpu_limit,
+            memory_request=config.publication_memory_request,
+            memory_limit=config.publication_memory_limit,
+            ephemeral_request=config.publication_ephemeral_request,
+            ephemeral_limit=config.publication_ephemeral_limit,
+        ),
+    )
+    return PublicationReconcileLoop(
+        store=store,
+        reconciler=reconciler,
+        interval_seconds=config.publication_reconcile_interval_seconds,
+    )
+
+
 async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
     rt = build(config, env)
 
@@ -441,6 +574,17 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
                     )
                 ]
                 if rt.connector_loop is not None
+                else []
+            ),
+            *(
+                [
+                    _supervise(
+                        "publications",
+                        lambda: rt.publication_loop.run_forever(shutdown),  # type: ignore[union-attr]
+                        shutdown,
+                    )
+                ]
+                if rt.publication_loop is not None
                 else []
             ),
             return_exceptions=True,

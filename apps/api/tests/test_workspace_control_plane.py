@@ -9,6 +9,7 @@ at an arbitrary origin.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -113,9 +114,7 @@ def _credential_audit_columns() -> set[str]:
 
 
 @pytest.fixture
-def worker_client(
-    _disposable_db: Any, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[TestClient]:
+def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
@@ -138,13 +137,9 @@ def test_deployment_workspace_is_sticky_and_explicit_null_disables_it(
 
     agent_id, version_id = _create_agent_version(client, auth_headers)
 
-    enabled = _deploy(
-        client, auth_headers, agent_id, version_id, workspace=REPO
-    )
+    enabled = _deploy(client, auth_headers, agent_id, version_id, workspace=REPO)
     carried = _deploy(client, auth_headers, agent_id, version_id)
-    disabled = _deploy(
-        client, auth_headers, agent_id, version_id, workspace=None
-    )
+    disabled = _deploy(client, auth_headers, agent_id, version_id, workspace=None)
     disabled_carried = _deploy(client, auth_headers, agent_id, version_id)
 
     assert enabled["workspace_repo"] == REPO
@@ -152,9 +147,7 @@ def test_deployment_workspace_is_sticky_and_explicit_null_disables_it(
     assert disabled["workspace_repo"] is None
     assert disabled_carried["workspace_repo"] is None
 
-    listed = client.get(
-        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
-    )
+    listed = client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers)
     assert listed.status_code == 200, listed.text
     assert [row["workspace_repo"] for row in listed.json()] == [
         REPO,
@@ -201,10 +194,8 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(
-        worker_client, auth_headers, agent_id, version_id, workspace=REPO
-    )
-    url = f"/workspaces/{deployment['id']}/credential"
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=REPO)
+    url = f"/v1/internal/workspaces/{deployment['id']}/credential"
 
     refused = worker_client.post(url, headers=auth_headers)
     assert refused.status_code == 401
@@ -219,8 +210,10 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
     assert issued.status_code == 200, issued.text
     assert issued.headers["cache-control"] == "no-store"
     assert issued.json() == {
+        "repo_full_name": REPO,
         "clone_url": "https://github.com/acme-corp/acme-bot.git",
-        "token": "ghp_operator_workspace",
+        "authorization_header": "Basic "
+        + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode(),
     }
     assert OTHER_REPO not in issued.text
     assert "evil.example" not in issued.text
@@ -244,15 +237,17 @@ def test_workspace_credential_pat_fallback_is_redeemed_through_the_endpoint(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(
-        worker_client, auth_headers, agent_id, version_id, workspace=REPO
-    )
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=REPO)
 
     response = worker_client.post(
-        f"/workspaces/{deployment['id']}/credential", headers=WORKER_HEADERS
+        f"/v1/internal/workspaces/{deployment['id']}/credential",
+        headers=WORKER_HEADERS,
     )
     assert response.status_code == 200, response.text
-    assert response.json()["token"] == "ghp_operator_workspace"
+    assert (
+        response.json()["authorization_header"]
+        == "Basic " + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode()
+    )
 
 
 def test_workspace_credential_prefers_app_installation_token_over_pat(
@@ -301,16 +296,18 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     )
     with TestClient(create_app()) as app_client:
         agent_id, version_id = _create_agent_version(app_client, auth_headers)
-        deployment = _deploy(
-            app_client, auth_headers, agent_id, version_id, workspace=REPO
-        )
+        deployment = _deploy(app_client, auth_headers, agent_id, version_id, workspace=REPO)
 
         response = app_client.post(
-            f"/workspaces/{deployment['id']}/credential", headers=WORKER_HEADERS
+            f"/v1/internal/workspaces/{deployment['id']}/credential",
+            headers=WORKER_HEADERS,
         )
         assert response.status_code == 200, response.text
-        assert response.json()["token"] == "ghs_repo_scoped"
-        assert response.json()["token"] != "ghp_must_not_win"
+        authorization = response.json()["authorization_header"]
+        assert (
+            authorization == "Basic " + base64.b64encode(b"x-access-token:ghs_repo_scoped").decode()
+        )
+        assert base64.b64encode(b"x-access-token:ghp_must_not_win").decode() not in authorization
     assert any(url.endswith(f"/repos/{REPO}/installation") for _, url, _ in calls)
     mint = next(body for _, url, body in calls if url.endswith("/access_tokens"))
     assert mint == {"repositories": ["acme-bot"]}
@@ -322,12 +319,11 @@ def test_workspace_credential_requires_a_workspace_enabled_deployment(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(
-        worker_client, auth_headers, agent_id, version_id, workspace=None
-    )
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=None)
 
     response = worker_client.post(
-        f"/workspaces/{deployment['id']}/credential", headers=WORKER_HEADERS
+        f"/v1/internal/workspaces/{deployment['id']}/credential",
+        headers=WORKER_HEADERS,
     )
     assert response.status_code == 409
     assert response.headers["cache-control"] == "no-store"

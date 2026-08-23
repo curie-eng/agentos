@@ -841,6 +841,38 @@ worker:
     # path (#1325) binds its IAM role here, e.g.
     # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
     annotations: {}
+  # Dedicated API credential-redemption identity. The published value is for
+  # local/dev installs only; sealed installs generate and retain a distinct
+  # strong value. It is mounted into API + worker and nowhere else.
+  internalWorkerToken: curie-dev-worker-token
+  workspace:
+    maxConcurrentClones: 2
+    cloneTimeoutSeconds: 90
+    archiveTimeoutSeconds: 30
+    uploadTimeoutSeconds: 30
+    totalTimeoutSeconds: 150
+    maxCheckoutBytes: 536870912
+    maxArchiveBytes: 268435456
+    maxMembers: 4096
+    maxCompressionRatio: 20
+    referenceTtlSeconds: 300
+    bucket: curie-workspaces
+    cloneVolumeSize: 4Gi
+    mountPath: /var/lib/curie/workspaces
+  publication:
+    enabled: true
+    patchMaxBytes: 900000
+    retentionSeconds: 3600
+    reconcileIntervalSeconds: 2
+    leaseSeconds: 60
+    # Empty derives release-scoped `<fullname>-publication` names.
+    serviceAccountName: ""
+    ownerName: ""
+    gitUserName: Curie Publisher
+    gitUserEmail: publisher@example.com
+    resources:
+      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
+      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 4Gi }
   # Declarative connector hosting (ADR-0090): the worker converges each agent's
   # connector Deployment/Service/Secret/NetworkPolicy toward what its in-force
   # bundle declares, so an agent repo needs no CLI near the cluster.
@@ -964,8 +996,8 @@ worker:
   # worker override the fixed env block does not cover.
   extraEnv: []
   resources:
-    requests: { cpu: 100m, memory: 192Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    requests: { cpu: 500m, memory: 512Mi, ephemeral-storage: 2Gi }
+    limits: { cpu: "2", memory: 1Gi, ephemeral-storage: 8Gi }
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/worker/Dockerfile). This pod mounts a Kubernetes API token and drives
   # the sandbox lifecycle, so the hardening matters most here. readOnlyRootFilesystem
@@ -1203,6 +1235,14 @@ agentSandbox:
     # Per-claim env injection (the resume path injects CURIE_HISTORY_REF and
     # CURIE_SESSION_ID) must be able to override the template's baked env.
     envVarsInjectionPolicy: Overrides
+    # Deployment workspaces arrive as a claim-scoped, one-object signed read
+    # reference. The sandbox never receives an object-store or GitHub identity.
+    workspace:
+      enabled: true
+      mountPath: /workspace
+      sizeLimit: 1Gi
+      fetchTimeoutSeconds: 45
+      extractTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     extraEnv: []
     # --- BYO model: LiteLLM Anthropic-format sidecar (part of #24) ---
@@ -1245,20 +1285,21 @@ agentSandbox:
         requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
         limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi }
     # --- Bundle-fetch provisioning ---
-    # CURIE_BUNDLE_REF is an S3 object key the substrate injects per claim.
-    # (bound sandboxes carry it; warm/unbound pods do not). Before the runner
+    # CURIE_BUNDLE_REF is a claim-scoped signed object URL the substrate injects
+    # into init containers (bound sandboxes carry it; warm/unbound pods do not).
+    # Before the runner
     # starts, an init pair fetches that object and extracts it into the shared
     # bundle volume at <mountPath>/current, which the worker points
     # CURIE_PLUGIN_DIR at. Fail-closed: a set-but-unfetchable ref fails the pod
     # rather than booting the wrong (empty) capability set; a clean no-op (empty
-    # plugin dir) when the ref is unset. Two images because no stock image ships
-    # both an authenticated S3 client and archive tools. AWS CLI fetches and
-    # BusyBox extracts tar.gz, tar, and zip archives. The endpoint and
-    # credentials come from the rustfs block, including BYO S3 configuration.
+    # plugin dir) when the ref is unset. The fetcher receives no bucket identity;
+    # BusyBox extracts tar.gz, tar, and zip archives.
     bundleFetch:
       enabled: true
       bucket: curie-bundles
-      fetchImage: amazon/aws-cli:2.32.6
+      # CURIE_BUNDLE_REF is a worker-minted one-object signed URL. A curl-only
+      # image keeps object-store identity out of every sandbox container.
+      fetchImage: curlimages/curl:8.12.1
       extractImage: busybox:1.36
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
       # worker injects (CURIE_PLUGIN_DIR=/bundles/current) is `<mountPath>/current`.
@@ -1273,10 +1314,6 @@ agentSandbox:
       # pair it with the `runner.resources` `ephemeral-storage` request/limit
       # (ADR-0059 decision 1, tracked in #755) for the scheduling-time bound.
       sizeLimit: 2Gi
-      # Ceiling on the init only AWS configuration volume. The path addressing
-      # setting lives here. Credentials remain environment variables and are
-      # never written to this volume or the shared bundle volume.
-      awsConfigSizeLimit: 16Mi
     # ephemeral-storage alongside cpu/memory (ADR-0059 decision 1): this same
     # block is reused for the runner container AND both bundle init containers
     # (bundle-fetch, bundle-extract), matching how cpu/memory already work here.

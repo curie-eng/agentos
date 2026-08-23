@@ -41,8 +41,10 @@ from .routers import (
     hooks,
     memory,
     observability,
+    publications,
     runs,
     state,
+    workspaces,
 )
 from .slack_approvers import SlackApproverSetSelector
 from .slack_usergroups import SlackUserGroupClient
@@ -273,6 +275,9 @@ def create_app() -> FastAPI:
     app.include_router(state.router)
     app.include_router(memory.router)
     app.include_router(approvals.router)
+    app.include_router(publications.router)
+    app.include_router(publications.internal_router)
+    app.include_router(workspaces.router)
     app.include_router(channels.router)
     app.include_router(hooks.router)
     return app

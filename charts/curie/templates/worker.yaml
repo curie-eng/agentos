@@ -1,5 +1,13 @@
 {{- if .Values.worker.deploy }}
 {{- $warmPool := .Values.worker.warmPool | default (printf "%s-runner-pool" (include "curie.fullname" .)) }}
+{{- $workspaceStageBudget := add .Values.worker.workspace.cloneTimeoutSeconds .Values.worker.workspace.archiveTimeoutSeconds .Values.worker.workspace.uploadTimeoutSeconds }}
+{{- $publicationPullSecrets := list }}
+{{- range .Values.agentSandbox.runner.imagePullSecrets }}
+{{- $publicationPullSecrets = append $publicationPullSecrets .name }}
+{{- end }}
+{{- if gt (float64 $workspaceStageBudget) (float64 .Values.worker.workspace.totalTimeoutSeconds) }}
+{{- fail "worker.workspace stage timeouts must sum to no more than totalTimeoutSeconds" }}
+{{- end }}
 {{- if .Values.worker.serviceAccount.create }}
 {{/*
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
@@ -38,6 +46,19 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "patch"]
+{{- if .Values.worker.publication.enabled }}
+  # Approval-gated publication objects. Deliberately no pods/exec: the worker
+  # can observe the URL marker but cannot enter either a sandbox or Job pod.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+{{- end }}
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects
@@ -152,6 +173,67 @@ spec:
             {{- if not $hasWorkerApiKey }}
             {{- include "curie.env.apiKey" . | nindent 12 }}
             {{- end }}
+            - name: CURIE_INTERNAL_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: internalWorkerToken
+            - name: CURIE_WORKSPACE_MAX_CONCURRENT_CLONES
+              value: {{ .Values.worker.workspace.maxConcurrentClones | quote }}
+            - name: CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS
+              value: {{ .Values.worker.workspace.cloneTimeoutSeconds | quote }}
+            - name: CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS
+              value: {{ .Values.worker.workspace.archiveTimeoutSeconds | quote }}
+            - name: CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS
+              value: {{ .Values.worker.workspace.uploadTimeoutSeconds | quote }}
+            - name: CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS
+              value: {{ .Values.worker.workspace.totalTimeoutSeconds | quote }}
+            - name: CURIE_WORKSPACE_MAX_CHECKOUT_BYTES
+              value: {{ .Values.worker.workspace.maxCheckoutBytes | quote }}
+            - name: CURIE_WORKSPACE_MAX_ARCHIVE_BYTES
+              value: {{ .Values.worker.workspace.maxArchiveBytes | quote }}
+            - name: CURIE_WORKSPACE_MAX_MEMBERS
+              value: {{ .Values.worker.workspace.maxMembers | quote }}
+            - name: CURIE_WORKSPACE_MAX_COMPRESSION_RATIO
+              value: {{ .Values.worker.workspace.maxCompressionRatio | quote }}
+            - name: CURIE_WORKSPACE_REFERENCE_TTL_SECONDS
+              value: {{ .Values.worker.workspace.referenceTtlSeconds | quote }}
+            - name: CURIE_WORKSPACE_BUCKET
+              value: {{ .Values.worker.workspace.bucket | quote }}
+            - name: CURIE_WORKSPACE_SCRATCH_ROOT
+              value: {{ .Values.worker.workspace.mountPath | quote }}
+            - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
+              value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
+            - name: CURIE_PUBLICATION_LEASE_SECONDS
+              value: {{ .Values.worker.publication.leaseSeconds | quote }}
+            - name: CURIE_PUBLICATION_IMAGE_PULL_POLICY
+              value: {{ .Values.agentSandbox.runner.imagePullPolicy | quote }}
+            - name: CURIE_RUNNER_IMAGE
+              value: {{ include "curie.image" (dict "repository" .Values.agentSandbox.runner.image "tag" .Values.agentSandbox.runner.tag "digest" .Values.agentSandbox.runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+            - name: CURIE_PUBLICATION_IMAGE_PULL_SECRETS
+              value: {{ join "," $publicationPullSecrets | quote }}
+            - name: CURIE_PUBLICATION_PRIORITY_CLASS_NAME
+              value: {{ .Values.priorityClasses.platform.name | quote }}
+            - name: CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME
+              value: {{ .Values.worker.publication.serviceAccountName | default (printf "%s-publication" (include "curie.fullname" .)) | quote }}
+            - name: CURIE_PUBLICATION_OWNER_NAME
+              value: {{ .Values.worker.publication.ownerName | default (printf "%s-publication-owner" (include "curie.fullname" .)) | quote }}
+            - name: CURIE_PUBLICATION_GIT_USER_NAME
+              value: {{ .Values.worker.publication.gitUserName | quote }}
+            - name: CURIE_PUBLICATION_GIT_USER_EMAIL
+              value: {{ .Values.worker.publication.gitUserEmail | quote }}
+            - name: CURIE_PUBLICATION_CPU_REQUEST
+              value: {{ .Values.worker.publication.resources.requests.cpu | quote }}
+            - name: CURIE_PUBLICATION_CPU_LIMIT
+              value: {{ .Values.worker.publication.resources.limits.cpu | quote }}
+            - name: CURIE_PUBLICATION_MEMORY_REQUEST
+              value: {{ .Values.worker.publication.resources.requests.memory | quote }}
+            - name: CURIE_PUBLICATION_MEMORY_LIMIT
+              value: {{ .Values.worker.publication.resources.limits.memory | quote }}
+            - name: CURIE_PUBLICATION_EPHEMERAL_REQUEST
+              value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
+            - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
+              value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -321,4 +403,11 @@ spec:
           {{- include "curie.heartbeatProbes" . | nindent 10 }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: workspace-clone
+              mountPath: {{ .Values.worker.workspace.mountPath | quote }}
+      volumes:
+        - name: workspace-clone
+          emptyDir:
+            sizeLimit: {{ .Values.worker.workspace.cloneVolumeSize | quote }}
 {{- end }}

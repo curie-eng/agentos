@@ -144,10 +144,7 @@ fn workspace_enable_prefers_explicit_repo_and_sends_a_string() {
 
 #[test]
 fn workspace_enable_infers_the_persisted_agent_repo_without_an_extra_flag() {
-    let (output, server) = run_local(
-        ExistingAgent::Bound("acme-corp/acme-bot"),
-        &["--workspace"],
-    );
+    let (output, server) = run_local(ExistingAgent::Bound("acme-corp/acme-bot"), &["--workspace"]);
     assert!(output.status.success());
     assert_eq!(
         deployment_bodies(&server)[0]["workspace_repo"],
@@ -175,10 +172,14 @@ fn workspace_enable_fails_before_version_or_deployment_when_repo_is_underivable(
     let (output, server) = run_local(ExistingAgent::Unbound, &["--workspace"]);
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--repo") && stderr.contains("workspace"), "{stderr}");
-    assert!(server.recorded().iter().all(|request| {
-        request.path != "/deployments" && !request.path.ends_with("/versions")
-    }));
+    assert!(
+        stderr.contains("--repo") && stderr.contains("workspace"),
+        "{stderr}"
+    );
+    assert!(server
+        .recorded()
+        .iter()
+        .all(|request| { request.path != "/deployments" && !request.path.ends_with("/versions") }));
 }
 
 #[test]
@@ -213,9 +214,10 @@ esac
     path
 }
 
-fn target_agent(name: &str, repo: Option<&str>) -> Value {
+fn target_agent(name: &str, repo: Option<&str>, channel: &str) -> Value {
     let mut value = agent_json(name, repo);
     value["id"] = json!(format!("agent-{name}"));
+    value["channel"]["address"] = json!(channel);
     value
 }
 
@@ -249,8 +251,8 @@ fn fanout_response(
         ("GET", "/agents") => Response::json(
             200,
             &json!([
-                target_agent("acme-dev", dev_repo),
-                target_agent("acme-prod", prod_repo)
+                target_agent("acme-dev", dev_repo, "C0EXAMPLE1"),
+                target_agent("acme-prod", prod_repo, "C0EXAMPLE2")
             ])
             .to_string(),
         ),
@@ -318,7 +320,9 @@ fn run_fanout(
     let tools = tempfile::tempdir().expect("tool tempdir");
     write_kubectl_stub(tools.path());
     let mut paths = vec![tools.path().to_path_buf()];
-    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
     let path = std::env::join_paths(paths).expect("join PATH");
     let server = serve(move |req| fanout_response(req, dev_repo, prod_repo));
     let mut command = Command::new(bin());
@@ -377,7 +381,9 @@ fn all_targets_names_the_underivable_target_and_stops_before_its_deployment() {
     assert_eq!(output.status.code(), Some(2));
     let value: Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
     assert_eq!(value["failed_target"], json!("prod"));
-    assert!(value["error"].as_str().is_some_and(|text| text.contains("--repo")));
+    assert!(value["error"]
+        .as_str()
+        .is_some_and(|text| text.contains("--repo")));
     let bodies = deployment_bodies(&server);
     assert_eq!(bodies.len(), 1);
     assert_eq!(bodies[0]["workspace_repo"], json!("acme-corp/acme-dev"));
@@ -389,9 +395,9 @@ fn all_targets_applies_disable_to_each_target_and_omission_to_none() {
     assert!(disabled.status.success());
     let disabled_bodies = deployment_bodies(&disabled_server);
     assert_eq!(disabled_bodies.len(), 2);
-    assert!(disabled_bodies.iter().all(|body| {
-        body.get("workspace_repo").is_some() && body["workspace_repo"].is_null()
-    }));
+    assert!(disabled_bodies
+        .iter()
+        .all(|body| { body.get("workspace_repo").is_some() && body["workspace_repo"].is_null() }));
 
     let (omitted, omitted_server) = run_fanout(None, None, None);
     assert!(omitted.status.success());
@@ -420,7 +426,10 @@ fn deploy_args(manifest: &Value, tier: &str) -> Vec<Value> {
 
 #[test]
 fn command_manifests_expose_both_workspace_intent_flags_on_both_tiers() {
-    let live_output = Command::new(bin()).arg("schema").output().expect("curie schema");
+    let live_output = Command::new(bin())
+        .arg("schema")
+        .output()
+        .expect("curie schema");
     assert!(live_output.status.success());
     let live: Value = serde_json::from_slice(&live_output.stdout).expect("live manifest JSON");
     let committed_path = concat!(env!("CARGO_MANIFEST_DIR"), "/command-manifest.json");
@@ -443,8 +452,8 @@ fn command_manifests_expose_both_workspace_intent_flags_on_both_tiers() {
         }
     }
 
-    let ui_manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../apps/ui/src/generated/commandManifest.ts");
+    let ui_manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../apps/ui/src/generated/commandManifest.ts");
     let ui = fs::read_to_string(ui_manifest).expect("committed UI command manifest");
     assert!(ui.contains("\"id\": \"workspace\""));
     assert!(ui.contains("\"id\": \"no_workspace\""));

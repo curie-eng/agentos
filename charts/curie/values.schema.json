@@ -22,6 +22,51 @@
           "exclusiveMinimum": 0,
           "maximum": 31536000,
           "description": "Seconds a route suspended awaiting an approval pins its sandbox. Must be greater than 0 and at most 31536000 (one year). Integer rather than number for the same reason as routeTtlSeconds: a YAML float renders through `| quote` as scientific notation for larger values (ci/github-app-credential-assertions.sh:11)."
+        },
+        "workspace": {
+          "type": "object",
+          "properties": {
+            "maxConcurrentClones": {"type": "integer", "minimum": 1, "maximum": 64},
+            "cloneTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000},
+            "archiveTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000},
+            "uploadTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000},
+            "totalTimeoutSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 31536000},
+            "maxCheckoutBytes": {"type": "integer", "minimum": 1, "maximum": 17179869184},
+            "maxArchiveBytes": {"type": "integer", "minimum": 1, "maximum": 1073741824},
+            "maxMembers": {"type": "integer", "minimum": 1, "maximum": 100000},
+            "maxCompressionRatio": {"type": "number", "minimum": 1, "maximum": 1000},
+            "referenceTtlSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+            "bucket": {"type": "string", "minLength": 3}
+          }
+        },
+        "publication": {
+          "type": "object",
+          "properties": {
+            "patchMaxBytes": {"type": "integer", "minimum": 1, "maximum": 900000},
+            "retentionSeconds": {"type": "integer", "minimum": 1, "maximum": 31536000},
+            "reconcileIntervalSeconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+            "leaseSeconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+          }
+        }
+      }
+    },
+    "agentSandbox": {
+      "type": "object",
+      "properties": {
+        "runner": {
+          "type": "object",
+          "properties": {
+            "workspace": {
+              "type": "object",
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "mountPath": {"const": "/workspace"},
+                "sizeLimit": {"type": "string", "minLength": 2},
+                "fetchTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150},
+                "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
+              }
+            }
+          }
         }
       }
     }

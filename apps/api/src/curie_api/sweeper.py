@@ -104,6 +104,9 @@ async def sweep_expired_approvals(
                 authorized=True,
                 reason=f"approval expired at {expired.expires_at}",
             )
+            if expired.purpose == "publication":
+                flipped += 1
+                continue
             stream_id = await resume_queue.enqueue(build_expiry_resume_turn(expired))
             flipped += 1
             # Enqueue-first-then-mark: only a wake that actually reached the

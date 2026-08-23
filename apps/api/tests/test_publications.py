@@ -118,10 +118,8 @@ def _publication_payload(
     }
 
 
-def _create_publication(
-    client: TestClient, payload: dict[str, Any]
-) -> tuple[int, dict[str, Any]]:
-    response = client.post("/publications", json=payload, headers=WORKER_HEADERS)
+def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    response = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert response.status_code in (200, 201), response.text
     return response.status_code, response.json()
 
@@ -234,9 +232,7 @@ def test_publication_create_is_atomic_private_and_idempotent(
 
     changed_replay = dict(payload)
     changed_replay["patch_b64"] = base64.b64encode(b"different patch").decode()
-    conflict = client.post(
-        "/publications", json=changed_replay, headers=WORKER_HEADERS
-    )
+    conflict = client.post("/v1/internal/publications", json=changed_replay, headers=WORKER_HEADERS)
     assert conflict.status_code == 409
     assert _counts() == (1, 1)
 
@@ -277,14 +273,9 @@ def test_publication_insert_failure_rolls_back_the_approval(
         try:
             async with engine.begin() as conn:
                 await conn.execute(
-                    text(
-                        "DROP TRIGGER IF EXISTS test_fail_publication ON "
-                        "curie.publications"
-                    )
+                    text("DROP TRIGGER IF EXISTS test_fail_publication ON curie.publications")
                 )
-                await conn.execute(
-                    text("DROP FUNCTION IF EXISTS curie.fail_publication_insert()")
-                )
+                await conn.execute(text("DROP FUNCTION IF EXISTS curie.fail_publication_insert()"))
         finally:
             await engine.dispose()
 
@@ -292,7 +283,7 @@ def test_publication_insert_failure_rolls_back_the_approval(
     try:
         with pytest.raises(Exception, match="forced publication insert failure"):
             client.post(
-                "/publications",
+                "/v1/internal/publications",
                 json=_publication_payload(deployment["id"]),
                 headers=WORKER_HEADERS,
             )
@@ -315,15 +306,13 @@ def test_publication_patch_cap_counts_decoded_raw_bytes_exactly(
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
     response = client.post(
-        "/publications",
+        "/v1/internal/publications",
         json=_publication_payload(deployment["id"], patch=b"x" * size),
         headers=WORKER_HEADERS,
     )
     assert response.status_code == expected_status, response.text
     if expected_status == 201:
-        stored = _rows(
-            "SELECT octet_length(patch_bytes) AS size FROM curie.publications"
-        )
+        stored = _rows("SELECT octet_length(patch_bytes) AS size FROM curie.publications")
         assert stored == [{"size": size}]
         assert _counts() == (1, 1)
     else:
@@ -362,9 +351,7 @@ def test_publication_requester_self_approval_still_requires_membership_and_is_au
     assert stored.json()["status"] == "approved"
     assert stored.json()["version"] == 2
 
-    audit = client.get(
-        f"/approvals/{publication['approval_id']}/audit", headers=auth_headers
-    )
+    audit = client.get(f"/approvals/{publication['approval_id']}/audit", headers=auth_headers)
     assert audit.status_code == 200, audit.text
     denied, resolved = audit.json()
     assert denied["authorized"] is False
@@ -382,9 +369,7 @@ def test_publication_resolution_cas_has_one_winner_and_never_enqueues_resume(
 ) -> None:
     client, runs_stream = publication_stack
     deployment = _create_deployment(client, auth_headers)
-    _, publication = _create_publication(
-        client, _publication_payload(deployment["id"])
-    )
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
 
     def attempt(decision: str) -> Any:
         return _resolve(
@@ -401,9 +386,7 @@ def test_publication_resolution_cas_has_one_winner_and_never_enqueues_resume(
     assert _stream_entries(runs_stream) == []
     stored = client.get(f"/publications/{publication['id']}", headers=auth_headers).json()
     winner = next(
-        response.json()["status"]
-        for response in responses
-        if response.status_code == 200
+        response.json()["status"] for response in responses if response.status_code == 200
     )
     assert stored["status"] == ("approved" if winner == "approved" else "denied")
     assert stored["version"] == 2
@@ -418,9 +401,7 @@ def test_publication_approval_is_never_in_the_owed_wake_worklist(
 
     client, runs_stream = publication_stack
     deployment = _create_deployment(client, auth_headers)
-    _, publication = _create_publication(
-        client, _publication_payload(deployment["id"])
-    )
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
     resolved = _resolve(client, auth_headers, publication["approval_id"])
     assert resolved.status_code == 200, resolved.text
 
@@ -434,8 +415,7 @@ def test_publication_approval_is_never_in_the_owed_wake_worklist(
                 approval_id = uuid.UUID(publication["approval_id"])
                 ids = await crud.list_resolved_unresumed(
                     session,
-                    resolved_before=datetime.now(UTC).replace(tzinfo=None)
-                    + timedelta(days=1),
+                    resolved_before=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
                     limit=100,
                 )
                 claim = await crud.claim_resume_row(session, approval_id)
@@ -443,8 +423,7 @@ def test_publication_approval_is_never_in_the_owed_wake_worklist(
                 reopened = await crud.reopen_dead_lettered_resume(
                     session,
                     approval_id,
-                    dead_lettered_after=datetime.now(UTC).replace(tzinfo=None)
-                    + timedelta(days=1),
+                    dead_lettered_after=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
                 )
                 approval = await session.get(Approval, approval_id)
                 assert approval is not None
@@ -505,12 +484,16 @@ def test_expired_publication_settles_without_expiry_or_reconciler_wake(
     assert count == 1
     assert uuid.UUID(publication["approval_id"]) not in owed
     assert _stream_entries(runs_stream) == []
-    assert client.get(
-        f"/approvals/{publication['approval_id']}", headers=auth_headers
-    ).json()["status"] == "expired"
-    assert client.get(
-        f"/publications/{publication['id']}", headers=auth_headers
-    ).json()["status"] == "expired"
+    assert (
+        client.get(f"/approvals/{publication['approval_id']}", headers=auth_headers).json()[
+            "status"
+        ]
+        == "expired"
+    )
+    assert (
+        client.get(f"/publications/{publication['id']}", headers=auth_headers).json()["status"]
+        == "expired"
+    )
 
 
 def test_denied_publication_has_no_credential_or_launch_opportunity(
@@ -520,9 +503,7 @@ def test_denied_publication_has_no_credential_or_launch_opportunity(
 ) -> None:
     client, runs_stream = publication_stack
     deployment = _create_deployment(client, auth_headers)
-    _, publication = _create_publication(
-        client, _publication_payload(deployment["id"])
-    )
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
 
     denied = _resolve(
         client,
@@ -535,7 +516,8 @@ def test_denied_publication_has_no_credential_or_launch_opportunity(
     assert stored.json()["status"] == "denied"
     assert stored.json()["version"] == 2
     credential = client.post(
-        f"/publications/{publication['id']}/credential", headers=WORKER_HEADERS
+        f"/v1/internal/publications/{publication['id']}/credential",
+        headers=WORKER_HEADERS,
     )
     assert credential.status_code == 409
     assert credential.headers["cache-control"] == "no-store"
@@ -554,10 +536,8 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
 ) -> None:
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
-    _, publication = _create_publication(
-        client, _publication_payload(deployment["id"])
-    )
-    url = f"/publications/{publication['id']}/credential"
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    url = f"/v1/internal/publications/{publication['id']}/credential"
 
     pending = client.post(url, headers=WORKER_HEADERS)
     assert pending.status_code == 409
@@ -576,8 +556,10 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
     assert issued.status_code == 200, issued.text
     assert issued.headers["cache-control"] == "no-store"
     assert issued.json() == {
+        "repo_full_name": REPO,
         "clone_url": "https://github.com/acme-corp/acme-bot.git",
-        "token": "ghp_publication_operator",
+        "authorization_header": "Basic "
+        + base64.b64encode(b"x-access-token:ghp_publication_operator").decode(),
     }
 
     audit = _rows(
@@ -647,8 +629,7 @@ def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(
 
     assert asyncio.run(terminal_and_reap()) == 1
     sizes = _rows(
-        "SELECT id, octet_length(patch_bytes) AS size FROM curie.publications "
-        "ORDER BY id"
+        "SELECT id, octet_length(patch_bytes) AS size FROM curie.publications ORDER BY id"
     )
     by_id = {str(row["id"]): row["size"] for row in sizes}
     assert by_id[terminal["id"]] is None

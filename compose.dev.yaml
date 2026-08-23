@@ -153,7 +153,7 @@ services:
       retries: 12
       start_period: 10s
 
-  # Creates the Langfuse bucket so the web and worker never race a missing bucket.
+  # Creates every first-party bucket so no service races a missing store.
   rustfs-init:
     image: amazon/aws-cli:2.32.6
     profiles: *core_profiles
@@ -170,10 +170,12 @@ services:
       - -ec
       - |
         aws configure set default.s3.addressing_style path
-        if ! aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket langfuse >/dev/null 2>&1; then
-          aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket langfuse
-        fi
-        echo 'bucket ready'
+        for bucket in langfuse curie-bundles curie-workspaces; do
+          if ! aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+            aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket "$bucket"
+          fi
+          echo "bucket $bucket ready"
+        done
     restart: "no"
 
   # RustFS mounts are initialized as root, but the server runs as UID 10001.
@@ -366,6 +368,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/postgres
       DB_SCHEMA: curie
       API_KEY: curie-dev-key
+      CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -504,7 +507,9 @@ services:
       - S3_ACCESS_KEY=rustfs
       - S3_SECRET_KEY=rustfssecret
       - BUNDLE_BUCKET=curie-bundles
+      - CURIE_WORKSPACE_BUCKET=curie-workspaces
       - CURIE_API_URL=http://localhost:28000
+      - CURIE_INTERNAL_WORKER_TOKEN=curie-dev-worker-token
       # The worker runs host-net, so it self-dials the API at the published
       # localhost port above. But the runner containers it spawns join the
       # bridge runner network (curie_runner), where that localhost port is

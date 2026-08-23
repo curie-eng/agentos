@@ -66,6 +66,7 @@ def build_options(
     hooks: dict[str, list[HookMatcher]] | None = None,
     mcp_servers: dict[str, McpSdkServerConfig] | None = None,
     can_use_tool: CanUseTool | None = None,
+    cwd: str | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -88,18 +89,18 @@ def build_options(
     # others are allowed, preserving the pre-gate behavior). Without one there
     # is nothing to decide, so the historical bypassPermissions posture is kept
     # verbatim -- an unconfigured agent sees zero behavior change.
-    permission_mode: PermissionMode = (
-        "default" if can_use_tool is not None else "bypassPermissions"
-    )
+    permission_mode: PermissionMode = "default" if can_use_tool is not None else "bypassPermissions"
     # OMITTED, not defaulted, when the operator set nothing (#1182, ADR-0098).
     # Passing thinking=None would be a value the SDK could act on; leaving the
     # key out is the only way to say "no opinion", which is what an unconfigured
     # install has always said and must keep saying.
     thinking_option: dict[str, Any] = {"thinking": cast("Any", thinking)} if thinking else {}
+    cwd_option: dict[str, Any] = {"cwd": cwd} if cwd is not None else {}
     return ClaudeAgentOptions(
         plugins=plugins,
         model=model,
         **thinking_option,
+        **cwd_option,
         system_prompt=system_prompt,
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,

@@ -12,12 +12,13 @@ the k8scratch e2e test.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 
+from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -45,6 +46,7 @@ EXT_VERSION = "v1beta1"
 # and answer, with the bundle simply absent.
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
+WORKSPACE_INIT_CONTAINERS = ("workspace-fetch", "workspace-extract")
 
 # The SandboxClaim env schema is value-only (no secretKeyRef), so anything put
 # here is stored in plain text on the claim object. The model credential must NOT
@@ -69,6 +71,10 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # a local literal that drifted on a rename would stop matching the marker the
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
+
+
+class BundleSigner(Protocol):
+    def presign_get(self, key: str, *, expires_seconds: int) -> str: ...
 
 
 def _conditions_ready(status: dict[str, Any]) -> bool:
@@ -132,11 +138,7 @@ def _quota_rejection(status: dict[str, Any]) -> QuotaRejection | None:
         if not marker or "exceeded quota: " in details:
             continue
         quota_name, marker, details = details.partition(", requested: ")
-        if (
-            not marker
-            or not quota_name
-            or any(character.isspace() for character in quota_name)
-        ):
+        if not marker or not quota_name or any(character.isspace() for character in quota_name):
             continue
         requested_raw, marker, details = details.partition(", used: ")
         if not marker:
@@ -220,13 +222,22 @@ def _sandbox_view(obj: dict[str, Any]) -> SandboxView:
 class KubernetesSandboxClient:
     """SandboxClient against a real cluster (kubeconfig or in-cluster auth)."""
 
-    def __init__(self, namespace: str, *, kubeconfig: str | None = None) -> None:
+    def __init__(
+        self,
+        namespace: str,
+        *,
+        kubeconfig: str | None = None,
+        bundle_signer: BundleSigner | None = None,
+        bundle_reference_ttl_seconds: int = 300,
+    ) -> None:
         try:
             k8s_config.load_incluster_config()
         except k8s_config.ConfigException:
             k8s_config.load_kube_config(config_file=kubeconfig)
         self._api = k8s_client.CustomObjectsApi()
         self._namespace = namespace
+        self._bundle_signer = bundle_signer
+        self._bundle_reference_ttl_seconds = bundle_reference_ttl_seconds
 
     # -- SandboxClaim (extensions group) ------------------------------------
 
@@ -259,22 +270,51 @@ class KubernetesSandboxClient:
             stripped = {CREDENTIALS_ENV, CONNECTOR_SECRET_KEYS_ENV}
             stripped.update(k for k in marker.split(",") if k)
             entries: list[dict[str, str]] = [
-                {"name": k, "value": v}
-                for k, v in sorted(env.items())
-                if k not in stripped
+                {"name": k, "value": v} for k, v in sorted(env.items()) if k not in stripped
             ]
             # The bundle ref must also reach the init containers, which the
             # Overrides policy does not touch without an explicit containerName.
             bundle_ref = env.get(BUNDLE_REF_ENV)
             if bundle_ref is not None:
+                signer = getattr(self, "_bundle_signer", None)
+                init_bundle_ref = (
+                    signer.presign_get(
+                        bundle_ref,
+                        expires_seconds=getattr(self, "_bundle_reference_ttl_seconds", 300),
+                    )
+                    if signer is not None
+                    else bundle_ref
+                )
                 for container in BUNDLE_INIT_CONTAINERS:
                     entries.append(
                         {
                             "containerName": container,
                             "name": BUNDLE_REF_ENV,
-                            "value": bundle_ref,
+                            "value": init_bundle_ref,
                         }
                     )
+            # Workspace fetch/extract consumes only the short-lived exact-object
+            # reference and digest. It receives no worker-auth, object-store, or
+            # GitHub credential.
+            workspace_ref = env.get(WORKSPACE_REF_ENV)
+            workspace_sha256 = env.get(WORKSPACE_SHA256_ENV)
+            if workspace_ref is not None:
+                for container in WORKSPACE_INIT_CONTAINERS:
+                    entries.append(
+                        {
+                            "containerName": container,
+                            "name": WORKSPACE_REF_ENV,
+                            "value": workspace_ref,
+                        }
+                    )
+                    if workspace_sha256 is not None:
+                        entries.append(
+                            {
+                                "containerName": container,
+                                "name": WORKSPACE_SHA256_ENV,
+                                "value": workspace_sha256,
+                            }
+                        )
             body["spec"]["env"] = entries
         self._api.create_namespaced_custom_object(
             EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body

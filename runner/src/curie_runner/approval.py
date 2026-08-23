@@ -205,6 +205,34 @@ _TOOL_NAME = "request_approval"
 # The fully qualified tool identifier as it appears on ToolUseBlock.name.
 APPROVAL_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_TOOL_NAME}"
 
+# Platform-owned remote-development publication gate.  This is deliberately
+# mounted beside the policy tool rather than shipped by a bundle: a bundle is
+# untrusted input and must not be able to remove, execute, or grant its own
+# publication action.  The worker recognizes this exact runner-stamped
+# permission-gate provenance before it captures a patch.
+_PUBLISH_TOOL = "publish_changes"
+PUBLISH_TOOL_NAME = f"mcp__{APPROVAL_SERVER_NAME}__{_PUBLISH_TOOL}"
+
+_PUBLISH_DESCRIPTION = (
+    "Request publication of the current repository changes. The platform will"
+    " capture the patch, ask for human approval in the requesting thread, and"
+    " publish it from a separate trusted job only after approval. This tool"
+    " never publishes changes itself."
+)
+_PUBLISH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": "Short proposed pull request title.",
+        },
+        "body": {
+            "type": "string",
+            "description": "Optional proposed pull request description.",
+        },
+    },
+}
+
 _TOOL_DESCRIPTION = (
     "Request human approval before proceeding. Call this when your"
     " instructions say a step needs sign-off (a discount, an invoice, a"
@@ -288,8 +316,20 @@ def build_approval_server(gate: ApprovalGate | None = None) -> McpSdkServerConfi
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
+    @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
+    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+        # Defence in depth: the permission callback must deny the call before
+        # execution.  If a harness bypasses that callback, the in-process tool
+        # still performs no action and grants no capability.
+        return _approval_error(
+            "Publication is performed only by the platform after human approval; "
+            "this sandbox tool cannot execute it directly."
+        )
+
     return create_sdk_mcp_server(
-        name=APPROVAL_SERVER_NAME, version="1.0.0", tools=[request_approval]
+        name=APPROVAL_SERVER_NAME,
+        version="1.0.0",
+        tools=[request_approval, publish_changes],
     )
 
 
@@ -331,14 +371,11 @@ def resolve_policy_route(
     return (
         True,
         None,
-        f"Rejected: unknown approval route {route!r};"
-        f" pass route as one of: {', '.join(declared)}.",
+        f"Rejected: unknown approval route {route!r}; pass route as one of: {', '.join(declared)}.",
     )
 
 
-def process_approval_request(
-    gate: ApprovalGate | None, args: dict[str, Any]
-) -> dict[str, Any]:
+def process_approval_request(gate: ApprovalGate | None, args: dict[str, Any]) -> dict[str, Any]:
     """Apply one ``request_approval`` call to ``gate`` and return the model result.
 
     The single source of truth for the approval-request outcome, invoked from
@@ -418,6 +455,7 @@ def guard_reserved_summary(summary: str) -> str:
     if summary.startswith(APPROVAL_SUMMARY_PREFIX):
         return f"{_RESERVED_SUMMARY_MARKER}{summary}"
     return summary
+
 
 # What the denied model is told. It must steer the model to end the turn (so
 # the session can emit the awaiting-approval final and the platform can
@@ -573,7 +611,10 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
             # The one-shot post-approval allowance (#430): a resume-boot grant
             # for exactly this tool lets one call through (no block recorded, the
             # approved action completes) and re-arms the gate.
-            if gate.consume_grant(tool_name):
+            # Publication never resumes into the sandbox and is therefore not
+            # grantable.  An injected/stale grant naming it is discarded by the
+            # gate builder and this explicit branch keeps future callers safe.
+            if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
                 return PermissionResultAllow()
             gate.block(tool_name, tool_input)
             return PermissionResultDeny(message=_DENY_MESSAGE)
@@ -711,9 +752,7 @@ def resolve_approval_policy(plugin_dir: str | None) -> ApprovalPolicyResolution:
     # Compare DISTINCT declared names against armed names, not counts: two
     # entries for one tool are a last-wins duplicate that validate_bundle
     # accepts, and rejecting them here would crash-loop a deploy-valid bundle.
-    declared_names = {
-        gate.gate.strip() for gate in policy.gates if isinstance(gate.gate, str)
-    }
+    declared_names = {gate.gate.strip() for gate in policy.gates if isinstance(gate.gate, str)}
     unarmed = declared_names - set(routes)
     if unarmed:
         raise ApprovalPolicyError(
@@ -860,12 +899,14 @@ def build_approval_gate(
             " gated and the bundle's route decides the approving audience",
             redefined,
         )
-    gated_tools = operator | frozenset(policy_routes)
-    if not gated_tools:
-        return None
+    # Publication is a mandatory platform gate.  It is additive to both
+    # operator and bundle policy, has no audience route of its own (the request
+    # thread owns the card), and cannot consume a resume grant.
+    gated_tools = operator | frozenset(policy_routes) | frozenset({PUBLISH_TOOL_NAME})
+    safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
         required=gated_tools,
         route_by_tool=policy_routes,
-        grant_tool=grant_tool,
+        grant_tool=safe_grant_tool,
         grantable_by_route=grantable_by_route or {},
     )

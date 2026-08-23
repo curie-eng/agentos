@@ -76,11 +76,7 @@ async def _drain(runner: SessionRunner, text: str) -> list[dict[str, object]]:
 def test_translate_captures_approval_summary() -> None:
     state = TurnState()
     message = AssistantMessage(
-        content=[
-            ToolUseBlock(
-                id="t1", name=APPROVAL_TOOL_NAME, input={"summary": "Discount 20%"}
-            )
-        ],
+        content=[ToolUseBlock(id="t1", name=APPROVAL_TOOL_NAME, input={"summary": "Discount 20%"})],
         model="m",
     )
     events = translate_message(message, state, SideEffectClassifier(), None)
@@ -248,9 +244,7 @@ def test_can_use_tool_denies_configured_tool_and_records_block() -> None:
         gate = ApprovalGate(required=frozenset({"Bash"}))
         callback = build_can_use_tool(gate)
 
-        result = await callback(
-            "Bash", {"command": "rm -rf /tmp/x"}, ToolPermissionContext()
-        )
+        result = await callback("Bash", {"command": "rm -rf /tmp/x"}, ToolPermissionContext())
         assert isinstance(result, PermissionResultDeny)
         assert "requires human approval" in result.message
         assert gate.pending_summary is not None
@@ -376,16 +370,25 @@ def test_build_options_permission_posture() -> None:
     # Without a callback the historical bypass posture is preserved verbatim;
     # with one, the session runs in default mode and the callback decides.
     plain = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=1,
-        max_budget_usd=None, resume=None,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
     )
     assert plain.permission_mode == "bypassPermissions"
     assert plain.can_use_tool is None
 
     gate = ApprovalGate(required=frozenset({"Bash"}))
     gated = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=1,
-        max_budget_usd=None, resume=None, can_use_tool=build_can_use_tool(gate),
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=1,
+        max_budget_usd=None,
+        resume=None,
+        can_use_tool=build_can_use_tool(gate),
     )
     assert gated.permission_mode == "default"
     assert gated.can_use_tool is not None
@@ -420,9 +423,7 @@ def test_grant_allows_exactly_one_call_then_re_denies_and_blocks() -> None:
 
         # The granted tool is allowed exactly once, and no block is recorded for
         # that allowed call (the approved action completes cleanly).
-        first = await callback(
-            "Bash", {"command": "the approved action"}, ToolPermissionContext()
-        )
+        first = await callback("Bash", {"command": "the approved action"}, ToolPermissionContext())
         assert isinstance(first, PermissionResultAllow)
         assert gate.pending_summary is None
 
@@ -499,9 +500,7 @@ def test_interrupt_without_reset_does_not_miscount_boot_turn() -> None:
         callback = build_can_use_tool(gate)
 
         gate.reset()  # the one boot-turn reset; no second reset (interrupt != new turn)
-        result = await callback(
-            "Bash", {"command": "the approved action"}, ToolPermissionContext()
-        )
+        result = await callback("Bash", {"command": "the approved action"}, ToolPermissionContext())
         assert isinstance(result, PermissionResultAllow)
         assert gate.pending_summary is None
 
@@ -530,9 +529,7 @@ def test_non_gated_tool_does_not_consume_the_grant() -> None:
         gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
         callback = build_can_use_tool(gate)
 
-        passthrough = await callback(
-            "Read", {"file_path": "/etc/hosts"}, ToolPermissionContext()
-        )
+        passthrough = await callback("Read", {"file_path": "/etc/hosts"}, ToolPermissionContext())
         assert isinstance(passthrough, PermissionResultAllow)
 
         # The grant is still available for the gated tool it names.
@@ -743,7 +740,7 @@ def test_a_bundle_cannot_hollow_out_an_operator_set_gate() -> None:
     assert gate is not None
     # Every operator name survives, whatever the bundle declared.
     assert {"Read", "Bash"} <= gate.required
-    assert gate.required == frozenset({"Read", "Bash", "Write"})
+    assert gate.required == frozenset({"Read", "Bash", "Write", PUBLISH_TOOL_NAME})
 
 
 def test_bundle_routes_ride_the_names_the_bundle_gates() -> None:
@@ -754,7 +751,7 @@ def test_bundle_routes_ride_the_names_the_bundle_gates() -> None:
         policy_routes={"Bash": "managers"},
     )
     assert gate is not None
-    assert gate.required == frozenset({"Read", "Bash"})
+    assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
     # `Read` is operator-set with no route: ADR-0034 channel-membership default.
     assert gate.route_by_tool == {"Bash": "managers"}
     assert gate.route_by_tool.get("Read") is None
@@ -827,9 +824,7 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
             grant_tool=PUBLISH_TOOL_NAME,
         )
         assert gate is not None
-        result = await build_can_use_tool(gate)(
-            PUBLISH_TOOL_NAME, {}, ToolPermissionContext()
-        )
+        result = await build_can_use_tool(gate)(PUBLISH_TOOL_NAME, {}, ToolPermissionContext())
         assert isinstance(result, PermissionResultDeny)
         assert gate.grant_tool is None
         assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
@@ -848,9 +843,12 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
         )
         payload = direct.model_dump()
         assert payload.get("isError") is True
-        assert "platform" in " ".join(
-            str(item.get("text") or "") for item in payload.get("content") or []
-        ).lower()
+        assert (
+            "platform"
+            in " ".join(
+                str(item.get("text") or "") for item in payload.get("content") or []
+            ).lower()
+        )
 
     anyio.run(go)
 
@@ -868,9 +866,7 @@ def test_build_approval_gate_carries_the_grant_tool() -> None:
 
 
 def test_gate_block_records_the_declared_route() -> None:
-    gate = ApprovalGate(
-        required=frozenset({"Bash", "Read"}), route_by_tool={"Bash": "managers"}
-    )
+    gate = ApprovalGate(required=frozenset({"Bash", "Read"}), route_by_tool={"Bash": "managers"})
     gate.block("Bash", {"command": "x"})
     assert gate.pending_route == "managers"
     gate.reset()
@@ -881,9 +877,7 @@ def test_gate_block_records_the_declared_route() -> None:
 
 def test_blocked_turn_final_carries_the_route() -> None:
     async def go() -> None:
-        gate = ApprovalGate(
-            required=frozenset({"Bash"}), route_by_tool={"Bash": "managers"}
-        )
+        gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "managers"})
         turns = {"n": 0}
 
         def factory() -> list:
@@ -912,9 +906,7 @@ def test_blocked_turn_final_carries_the_route() -> None:
 
 def test_policy_tool_route_param_reaches_the_final() -> None:
     async def go() -> None:
-        session = FakeModelSession(
-            lambda: approval_turn("Discount for ACME", route="managers")
-        )
+        session = FakeModelSession(lambda: approval_turn("Discount for ACME", route="managers"))
         runner = _runner(session)
         await runner.start()
         frames = await _drain(runner, "discount please")
@@ -930,9 +922,7 @@ def test_fake_routed_marker_names_the_route() -> None:
         session = FakeModelSession()
         runner = _runner(session)
         await runner.start()
-        frames = await _drain(
-            runner, "[fake:request-approval:managers] Give ACME 20% off"
-        )
+        frames = await _drain(runner, "[fake:request-approval:managers] Give ACME 20% off")
         final = frames[-1]
         assert final["status"] == "awaiting-approval"
         assert final["approval_summary"] == "Give ACME 20% off"
@@ -958,9 +948,7 @@ def test_fake_routed_marker_names_the_route() -> None:
 _BARE_TOOL_NAME = APPROVAL_TOOL_NAME.rsplit("__", 1)[-1]
 
 
-async def _call_request_approval(
-    server: object, **args: object
-) -> tuple[bool, str]:
+async def _call_request_approval(server: object, **args: object) -> tuple[bool, str]:
     """EXECUTE the in-process approval tool through the built MCP server.
 
     Drives the real ``CallToolRequest`` path the SDK drives, so the assertions
@@ -974,15 +962,11 @@ async def _call_request_approval(
     result = await handler(
         mcp_types.CallToolRequest(
             method="tools/call",
-            params=mcp_types.CallToolRequestParams(
-                name=_BARE_TOOL_NAME, arguments=dict(args)
-            ),
+            params=mcp_types.CallToolRequestParams(name=_BARE_TOOL_NAME, arguments=dict(args)),
         )
     )
     payload = result.model_dump()
-    text = " ".join(
-        str(block.get("text") or "") for block in (payload.get("content") or [])
-    )
+    text = " ".join(str(block.get("text") or "") for block in (payload.get("content") or []))
     return bool(payload.get("isError")), text
 
 
@@ -1422,9 +1406,7 @@ def test_resolve_approval_policy_no_opt_in_has_empty_grantable_map(tmp_path) -> 
         json.dumps(
             {
                 "name": "deal-desk",
-                "approvalPolicy": {
-                    "gates": [{"gate": "Bash", "route": "managers"}]
-                },
+                "approvalPolicy": {"gates": [{"gate": "Bash", "route": "managers"}]},
             }
         ),
     )
@@ -1550,7 +1532,6 @@ def test_policy_gate_rejected_route_stays_none() -> None:
         assert final["status"] == "done"
         assert final.get("approval_granted_tool") is None
 
-
     anyio.run(go)
 
 
@@ -1583,9 +1564,7 @@ def test_validate_and_loader_agree_on_grantable_routes(tmp_path) -> None:
     )
     accept_result = validate_bundle(accept)
     assert accept_result.valid, accept_result.errors
-    assert resolve_approval_policy(accept).grantable_by_route == {
-        "deal-desk": "close_issue"
-    }
+    assert resolve_approval_policy(accept).grantable_by_route == {"deal-desk": "close_issue"}
 
     reject_dir = tmp_path / "reject"
     reject_dir.mkdir()
@@ -1612,9 +1591,7 @@ def test_validate_and_loader_agree_on_grantable_routes(tmp_path) -> None:
         ),
     )
     reject_result = validate_bundle(reject)
-    assert "approval_policy.grant_route_ambiguous" in {
-        i.code for i in reject_result.errors
-    }
+    assert "approval_policy.grant_route_ambiguous" in {i.code for i in reject_result.errors}
     # The loader arms the same config as no-grant: the ambiguous route is excluded.
     assert resolve_approval_policy(reject).grantable_by_route == {}
 
@@ -1773,8 +1750,7 @@ def _warnings(frames: list[dict[str, object]]) -> list[dict[str, object]]:
     return [
         f
         for f in frames
-        if f["type"] != "final"
-        and f.get("classification") == APPROVAL_NOT_ACTED_CLASSIFICATION
+        if f["type"] != "final" and f.get("classification") == APPROVAL_NOT_ACTED_CLASSIFICATION
     ]
 
 
@@ -1936,9 +1912,7 @@ def test_resumed_kind_marker_grants_nothing() -> None:
 
     async def go() -> None:
         # A gate built from that config: marker present, grant absent.
-        gate = ApprovalGate(
-            required=frozenset({"Bash"}), grant_tool=config.approval_grant_tool
-        )
+        gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool=config.approval_grant_tool)
         callback = build_can_use_tool(gate)
         gate.reset()  # the boot turn
 
@@ -1983,9 +1957,7 @@ def test_policy_route_retry_after_rejection_creates_the_approval() -> None:
     """
 
     async def go() -> None:
-        gate = ApprovalGate(
-            required=frozenset({"Bash"}), route_by_tool={"Bash": "managers"}
-        )
+        gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "managers"})
         script = [
             _request_approval_message("t1", "Discount for ACME", "not-a-route"),
             _request_approval_message("t2", "Discount for ACME", "managers"),
@@ -2134,9 +2106,7 @@ def test_builtin_and_already_effective_operator_gates_pass_verbatim() -> None:
         )
         assert builtin is not None
         assert isinstance(
-            await build_can_use_tool(builtin)(
-                "Bash", {"command": "x"}, ToolPermissionContext()
-            ),
+            await build_can_use_tool(builtin)("Bash", {"command": "x"}, ToolPermissionContext()),
             PermissionResultDeny,
         )
 
@@ -2181,10 +2151,9 @@ def test_bare_non_builtin_operator_gate_warns_it_may_be_a_silent_no_op(caplog) -
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({"resolve_leak"})  # unchanged: still arms verbatim
+    assert gate.required == frozenset({"resolve_leak", PUBLISH_TOOL_NAME})
     assert any(
-        "resolve_leak" in r.getMessage() and "mcp__" in r.getMessage()
-        for r in caplog.records
+        "resolve_leak" in r.getMessage() and "mcp__" in r.getMessage() for r in caplog.records
     ), caplog.text
 
 
@@ -2200,9 +2169,7 @@ def test_known_builtin_operator_gate_does_not_warn(caplog) -> None:
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert not any(
-        "does not match any well-known" in r.getMessage() for r in caplog.records
-    )
+    assert not any("does not match any well-known" in r.getMessage() for r in caplog.records)
 
 
 # Provenance and inclusion criterion for these names (#736): see the comment
@@ -2236,10 +2203,10 @@ def test_real_builtin_operator_gates_do_not_warn(caplog, builtin: str) -> None:
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({builtin})
-    assert not any(
-        "does not match any well-known" in r.getMessage() for r in caplog.records
-    ), caplog.text
+    assert gate.required == frozenset({builtin, PUBLISH_TOOL_NAME})
+    assert not any("does not match any well-known" in r.getMessage() for r in caplog.records), (
+        caplog.text
+    )
 
 
 @pytest.mark.parametrize(
@@ -2267,10 +2234,10 @@ def test_cli_alias_operator_gates_still_warn(caplog, alias: str) -> None:
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({alias})
-    assert any(
-        "does not match any well-known" in r.getMessage() for r in caplog.records
-    ), caplog.text
+    assert gate.required == frozenset({alias, PUBLISH_TOOL_NAME})
+    assert any("does not match any well-known" in r.getMessage() for r in caplog.records), (
+        caplog.text
+    )
 
 
 def test_manifest_gate_half_stays_fail_closed_after_operator_normalization(
@@ -2298,9 +2265,7 @@ def test_manifest_gate_half_stays_fail_closed_after_operator_normalization(
                 "name": "b",
                 "mcpServers": {"github": {"command": "gh-server"}},
                 "approvalPolicy": {
-                    "gates": [
-                        {"gate": "mcp__github__update_issue", "route": "legal"}
-                    ]
+                    "gates": [{"gate": "mcp__github__update_issue", "route": "legal"}]
                 },
             }
         ),
@@ -2433,7 +2398,7 @@ def test_operator_gate_on_a_connector_tool_arms_the_bare_name(tmp_path) -> None:
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({_K8S_TOOL})
+        assert gate.required == frozenset({_K8S_TOOL, PUBLISH_TOOL_NAME})
         result = await build_can_use_tool(gate)(
             _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
         )
@@ -2492,7 +2457,7 @@ def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({live, "mcp__git__hub__create_pr"})
+        assert gate.required == frozenset({live, "mcp__git__hub__create_pr", PUBLISH_TOOL_NAME})
         result = await build_can_use_tool(gate)(live, {"title": "..."}, ToolPermissionContext())
         assert isinstance(result, PermissionResultDeny)
 
@@ -2568,7 +2533,7 @@ def test_connector_gate_on_a_connector_tool_still_denies_alongside_a_prefixed_se
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({"mcp__git__status"})
+        assert gate.required == frozenset({"mcp__git__status", PUBLISH_TOOL_NAME})
         result = await build_can_use_tool(gate)(
             "mcp__git__status", {"manifest": "..."}, ToolPermissionContext()
         )

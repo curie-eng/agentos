@@ -73,6 +73,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: apiKey
+            - name: CURIE_INTERNAL_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: internalWorkerToken
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

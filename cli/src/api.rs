@@ -303,6 +303,28 @@ pub struct Deployment {
     pub version_id: Option<String>,
     #[serde(default)]
     pub deployed_at: Option<String>,
+    /// Deployment-level managed checkout; absent or null means disabled.
+    #[serde(default)]
+    pub workspace_repo: Option<String>,
+}
+
+/// Tri-state deployment intent. Preserve omits the request key, Disable sends
+/// JSON null, and Enable derives a canonical repository from known facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceIntent {
+    Preserve,
+    Enable,
+    Disable,
+}
+
+impl WorkspaceIntent {
+    pub fn from_flags(workspace: bool, no_workspace: bool) -> Self {
+        match (workspace, no_workspace) {
+            (true, false) => Self::Enable,
+            (false, true) => Self::Disable,
+            _ => Self::Preserve,
+        }
+    }
 }
 
 /// One readable text file from a version's stored bundle (`BundleFile` in
@@ -843,17 +865,22 @@ impl ApiClient {
         version_id: &str,
         environment: &str,
         commit_sha: Option<&str>,
+        workspace_repo: Option<Option<&str>>,
     ) -> Result<Deployment> {
+        let mut body = json!({
+            "agent_id": agent_id,
+            "version_id": version_id,
+            "environment": environment,
+            "commit_sha": commit_sha,
+        });
+        if let Some(repo) = workspace_repo {
+            body["workspace_repo"] = json!(repo);
+        }
         let resp = self
             .http
             .post(format!("{}/deployments", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json(&json!({
-                "agent_id": agent_id,
-                "version_id": version_id,
-                "environment": environment,
-                "commit_sha": commit_sha,
-            }))
+            .json(&body)
             .send()
             .await
             .context("POST /deployments")?;
@@ -878,10 +905,24 @@ impl ApiClient {
         secrets: &std::collections::BTreeMap<String, String>,
         repo_full_name: Option<&str>,
         commit_sha: Option<&str>,
+        workspace: WorkspaceIntent,
     ) -> Result<DeployOutcome> {
         let (agent, channel, repo_note) = self
             .resolve_agent(agent_name, slack_channel, repo_full_name)
             .await?;
+        let workspace_repo = match workspace {
+            WorkspaceIntent::Preserve => None,
+            WorkspaceIntent::Disable => Some(None),
+            WorkspaceIntent::Enable => Some(Some(
+                repo_full_name
+                    .or(agent.repo_full_name.as_deref())
+                    .ok_or_else(|| {
+                        crate::exit::usage(
+                            "--workspace needs a repository, but this agent has no repository binding; pass --repo OWNER/NAME",
+                        )
+                    })?,
+            )),
+        };
         // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
         // a freshly created agent and a redeploy that rotates a value; an empty
         // map leaves the agent's current secrets untouched.
@@ -893,7 +934,13 @@ impl ApiClient {
             .await?;
         let bundle = self.upload_bundle(&agent.id, &version.id, archive).await?;
         let deployment = self
-            .create_deployment(&agent.id, &version.id, environment, commit_sha)
+            .create_deployment(
+                &agent.id,
+                &version.id,
+                environment,
+                commit_sha,
+                workspace_repo,
+            )
             .await?;
         Ok(DeployOutcome {
             agent,

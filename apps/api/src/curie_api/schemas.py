@@ -1,5 +1,7 @@
 """Pydantic v2 request/response models for the API surface."""
 
+import base64
+import binascii
 import json
 import logging
 import re
@@ -42,6 +44,14 @@ _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
 # distinction between a user group and a channel.
 _SLACK_USERGROUP_ID = re.compile(r"^S[A-Z0-9]{7,}$")
 _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
+
+# A repository selector, not a URL. Keeping this allowlist deliberately narrow
+# prevents credentials, origins, and path traversal from entering durable
+# deployment state and later becoming a target for the operator credential.
+_REPO_FULL_NAME = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
+)
 
 # Channel kinds are lowercase slugs: the value names the owning adapter, and
 # `Slack`, `slack ` and `slack` must not be three different kinds. Shape only --
@@ -1023,9 +1033,25 @@ class DeploymentCreate(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None = None
+    # Three states are distinguished by ``model_fields_set`` in the router:
+    # omitted carries the last active deployment value, a canonical owner/repo
+    # enables the workspace, and explicit null disables it.
+    workspace_repo: str | None = None
     status: str = "active"
 
     _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
+
+    @field_validator("workspace_repo")
+    @classmethod
+    def _canonical_workspace_repo(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not _REPO_FULL_NAME.fullmatch(value) or value.endswith("/.git"):
+            raise ValueError(
+                "workspace_repo must be one canonical GitHub owner/repository "
+                "name (for example acme-corp/acme-bot), not a URL or credential"
+            )
+        return value
 
 
 class DeploymentOut(BaseModel):
@@ -1036,17 +1062,111 @@ class DeploymentOut(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None
+    workspace_repo: str | None
     status: str
     deployed_at: datetime
+
+
+class RepositoryCredentialOut(BaseModel):
+    """One server-derived Git credential returned only to the trusted worker."""
+
+    repo_full_name: str
+    clone_url: str
+    authorization_header: str
+
+
+class PublicationCreate(BaseModel):
+    """Trusted snapshot facts used to atomically create approval + publication."""
+
+    deployment_id: uuid.UUID
+    conversation_id: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    reply_kind: str = Field(min_length=1)
+    reply_channel: str = Field(min_length=1)
+    reply_placeholder: str | None = None
+    reply_endpoint: str | None = None
+    reply_adapter: str | None = None
+    dedupe_key: str = Field(min_length=1)
+    base_sha: str
+    patch_b64: str = Field(min_length=1)
+    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    expires_in_seconds: int | None = Field(default=None, ge=1)
+    title: str | None = None
+    body: str | None = None
+
+    _check_base_sha = field_validator("base_sha")(_validate_optional_commit_sha)
+
+    @model_validator(mode="after")
+    def _valid_reply_route(self) -> "PublicationCreate":
+        _validate_channel_binding(self.reply_kind, self.reply_channel)
+        if (self.reply_endpoint is None) != (self.reply_adapter is None):
+            raise ValueError(
+                "publication reply route must set endpoint and adapter together"
+            )
+        if self.reply_adapter is not None and not _CHANNEL_KIND.match(
+            self.reply_adapter
+        ):
+            raise ValueError("publication reply adapter must be a lowercase slug")
+        if self.reply_endpoint is not None:
+            _validate_channel_endpoint(self.reply_endpoint)
+        return self
+
+    @field_validator("changed_paths")
+    @classmethod
+    def _safe_changed_paths(cls, value: list[str]) -> list[str]:
+        for path in value:
+            if (
+                not path
+                or path.startswith("/")
+                or path == ".git"
+                or path.startswith(".git/")
+                or any(part in ("", ".", "..") for part in path.split("/"))
+            ):
+                raise ValueError("changed_paths must contain safe repository-relative paths")
+        return value
+
+    def decoded_patch(self) -> bytes:
+        try:
+            return base64.b64decode(self.patch_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("patch_b64 must be canonical base64") from exc
+
+
+class PublicationOut(BaseModel):
+    """Patch-free publication metadata safe for operator and worker reads."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    approval_id: uuid.UUID
+    deployment_id: uuid.UUID
+    repo_full_name: str
+    status: str
+    version: int
+    base_sha: str
+    changed_paths: list[str]
+    title: str
+    body: str
+    reply_kind: str
+    reply_channel: str
+    reply_placeholder: str | None
+    reply_endpoint: str | None
+    reply_adapter: str | None
+    result_url: str | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+    terminal_at: datetime | None
 
 
 class ApprovalResolve(BaseModel):
     """One resolution attempt. Exactly one attempt wins (compare-and-set), and
     the server-side authorizer (#246) decides first whether this actor may
-    resolve at all: self-approval is blocked, and channel membership is proven
-    by ``actor_channel`` -- the channel the resolution attempt was made from
-    (the card click's channel, relayed by the dispatcher; asserted explicitly
-    by API-key operators)."""
+    resolve at all: ordinary self-approval is blocked, while a server-linked
+    publication requester must still prove membership. ``actor_channel`` is the
+    channel the resolution attempt was made from (the card click's channel,
+    relayed by the dispatcher; asserted explicitly by API-key operators)."""
 
     decision: Literal["approved", "rejected"]
     resolved_by: str = Field(min_length=1)

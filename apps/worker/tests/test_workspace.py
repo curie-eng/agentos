@@ -30,7 +30,6 @@ from typing import Any
 
 import pytest
 
-
 WORKER_AUTH = "worker-auth-value"
 GIT_CREDENTIAL = "Basic redeemed-credential-value"
 CLEAN_URL = "https://github.com/acme-corp/acme-bot.git"
@@ -90,7 +89,7 @@ class _FakeCommands:
             os.chmod(checkout, 0o700)
             (checkout / ".git").mkdir()
             (checkout / ".git" / "config").write_text(
-                "[remote \"origin\"]\n"
+                '[remote "origin"]\n'
                 f"\turl = {AUTHENTICATED_URL}\n"
                 "\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
             )
@@ -332,9 +331,7 @@ def test_workspace_upload_is_streamed_and_reference_is_one_object_and_short_live
     assert "credential" not in decoded.url
 
 
-def test_worker_rehashes_private_object_before_any_claim(
-    workspace: Any, tmp_path: Path
-) -> None:
+def test_worker_rehashes_private_object_before_any_claim(workspace: Any, tmp_path: Path) -> None:
     preparer, _, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
     objects.objects[prepared.object_key] += b"tampered"

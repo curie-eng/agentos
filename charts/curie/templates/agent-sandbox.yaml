@@ -134,6 +134,7 @@ roleRef:
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
 {{- $bf := $runner.bundleFetch }}
+{{- $wf := $runner.workspace }}
 {{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
 {{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
 {{- if $agent }}
@@ -216,7 +217,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $runner.hardening.enabled $runner.liteLLM.enabled }}
+      {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled $runner.liteLLM.enabled }}
       volumes:
         {{- if $runner.liteLLM.enabled }}
         # LiteLLM proxy config (model_list + router/fallback), mounted read-only
@@ -241,12 +242,13 @@ spec:
         - name: bundles
           emptyDir:
             sizeLimit: {{ $bf.sizeLimit | quote }}
-        # AWS CLI stores only its path addressing setting here. Credentials are
-        # environment variables, and the runner never mounts this init only
-        # volume or receives the storage credential.
-        - name: aws-config
+        {{- end }}
+        {{- if $wf.enabled }}
+        # One claim-scoped managed checkout. It is separate from writablePaths
+        # so the workspace has one explicit size and lifetime boundary.
+        - name: workspace
           emptyDir:
-            sizeLimit: {{ $bf.awsConfigSizeLimit | quote }}
+            sizeLimit: {{ $wf.sizeLimit | quote }}
         {{- end }}
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
@@ -258,27 +260,22 @@ spec:
         {{- end }}
         {{- end }}
       {{- end }}
-      {{- if $bf.enabled }}
+      {{- if or $bf.enabled $wf.enabled }}
       {{/*
-      Bundle provisioning. CURIE_BUNDLE_REF is injected per-claim (the
-      substrate's Overrides policy); baked empty here so a warm/unbound pod
-      no-ops. Split in two because no single stock image carries both an
-      authenticated S3 client and archive tools. AWS CLI fetches the object and
-      BusyBox extracts it. A ref that is set but cannot be
-      fetched/extracted fails the pod instead of booting an empty plugin dir.
-      Egress to RustFS is opened by the runner NetworkPolicy carve out.
+      Claim-scoped provisioning. The worker signs the exact bundle/workspace
+      objects before a claim; these init stages can fetch and extract without
+      any bucket identity. Baked empty refs keep warm/unbound pods as no-ops.
+      A set-but-invalid ref fails the pod instead of booting stale or empty
+      content. Egress to RustFS is opened by the runner NetworkPolicy carve out.
       */}}
       initContainers:
+        {{- if $bf.enabled }}
         - name: bundle-fetch
           image: {{ $bf.fetchImage }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
-          # Same container-level lockdown as the runner: these init containers
-          # run an authenticated S3 fetch and archive extract of operator-supplied
-          # input in the untrusted pod, so they must not run looser than it. Every
-          # write targets a mounted emptyDir. The fetched archive goes to
-          # `bundles` and AWS config goes to the dedicated `aws-config` volume, so a
-          # read-only rootfs is safe.
+          # Same container-level lockdown as the runner. The fetch has one
+          # claim-scoped URL and writes only to the bounded bundles volume.
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
           {{- end }}
           command:
@@ -291,48 +288,19 @@ spec:
                 echo "no CURIE_BUNDLE_REF; skipping bundle fetch"
                 exit 0
               fi
-              {{- if include "curie.rustfs.staticCredentials" . }}
-              export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY"
-              export AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY"
-              {{- else }}
-              # Key-free path (#1325): no credential env is set, so the AWS CLI
-              # falls through its provider chain to the web-identity provider
-              # (AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE) fed by a projected
-              # ServiceAccount token. That reads a mounted file rather than the
-              # metadata endpoint, so Rail 1's IMDS denial stays intact.
-              {{- end }}
-              aws configure set default.s3.addressing_style path
-              aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://${BUNDLE_BUCKET}/${REF}" {{ $bf.mountPath }}/.bundle-archive
-              echo "fetched bundle '$REF' from ${BUNDLE_BUCKET}"
+              case "$REF" in
+                http://*|https://*) ;;
+                *) echo "FATAL: CURIE_BUNDLE_REF is not a signed HTTP(S) reference" >&2; exit 1 ;;
+              esac
+              curl --fail --silent --show-error --location --max-redirs 0 \
+                --output {{ $bf.mountPath }}/.bundle-archive "$REF"
+              echo "fetched claim-scoped bundle"
           env:
             - name: CURIE_BUNDLE_REF
               value: ""
-            - name: S3_ENDPOINT
-              value: {{ include "curie.rustfs.endpoint" . }}
-            {{- if include "curie.rustfs.staticCredentials" . }}
-            - name: S3_ACCESS_KEY
-              value: {{ .Values.rustfs.auth.accessKey | quote }}
-            - name: S3_SECRET_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.rustfs.existingSecret | default (include "curie.secretName" .) }}
-                  key: rustfsSecretKey
-            {{- end }}
-            - name: BUNDLE_BUCKET
-              value: {{ $bf.bucket | quote }}
-            - name: AWS_DEFAULT_REGION
-              value: {{ .Values.rustfs.region | quote }}
-            - name: AWS_CONFIG_FILE
-              value: /aws-config/config
-            - name: AWS_SHARED_CREDENTIALS_FILE
-              value: /aws-config/credentials
-            - name: HOME
-              value: /aws-config
           volumeMounts:
             - name: bundles
               mountPath: {{ $bf.mountPath }}
-            - name: aws-config
-              mountPath: /aws-config
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
         - name: bundle-extract
@@ -364,12 +332,16 @@ spec:
               STAGE={{ $bf.mountPath }}/.stage
               rm -rf "$STAGE"
               mkdir -p "$STAGE"
-              case "$REF" in
-                *.tar.gz|*.tgz) tar -xzf "$ARCHIVE" -C "$STAGE" ;;
-                *.tar)          tar -xf  "$ARCHIVE" -C "$STAGE" ;;
-                *.zip)          unzip -o "$ARCHIVE" -d "$STAGE" ;;
-                *) echo "FATAL: unsupported bundle extension for '$REF'" >&2; exit 1 ;;
-              esac
+              if tar -xzf "$ARCHIVE" -C "$STAGE" 2>/dev/null; then
+                :
+              elif tar -xf "$ARCHIVE" -C "$STAGE" 2>/dev/null; then
+                :
+              elif unzip -o "$ARCHIVE" -d "$STAGE" >/dev/null; then
+                :
+              else
+                echo "FATAL: bundle is not a supported archive" >&2
+                exit 1
+              fi
               # Unwrap a single top-level wrapper dir so the plugin manifest sits
               # at the plugin-dir root, matching the API's bundle_root validation
               # (a `tar czf b.tgz myplugin/` wraps everything in one folder). The
@@ -393,6 +365,98 @@ spec:
               mountPath: {{ $bf.mountPath }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
+        {{- end }}
+        {{- if $wf.enabled }}
+        - name: workspace-fetch
+          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ $runner.imagePullPolicy }}
+          {{- if $runner.hardening.enabled }}
+          {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
+          {{- end }}
+          command:
+            - python
+            - -c
+            - |
+              import base64, hashlib, json, os, pathlib, signal, sys, time, urllib.request
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, request, fp, code, message, headers, new_url):
+                      return None
+              ref = os.environ.get("CURIE_WORKSPACE_REF", "")
+              destination = pathlib.Path("{{ $wf.mountPath }}/.curie-workspace.tar.gz")
+              if not ref:
+                  sys.exit(0)
+              try:
+                  raw = base64.urlsafe_b64decode(ref + "=" * (-len(ref) % 4))
+                  claim = json.loads(raw)
+                  url, expected, expires = claim["u"], claim["s"], int(claim["e"])
+              except Exception as exc:
+                  raise SystemExit(f"workspace-fetch: invalid workspace reference: {exc}")
+              if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                  raise SystemExit("workspace-fetch: signed reference is not HTTP(S)")
+              if expires <= int(time.time()):
+                  raise SystemExit("workspace-fetch: signed reference expired")
+              if expected != os.environ.get("CURIE_WORKSPACE_SHA256"):
+                  raise SystemExit("workspace-fetch: claim digest mismatch")
+              signal.alarm({{ $wf.fetchTimeoutSeconds }})
+              digest, size = hashlib.sha256(), 0
+              opener = urllib.request.build_opener(NoRedirect())
+              with opener.open(url, timeout={{ $wf.fetchTimeoutSeconds }}) as source, destination.open("wb") as target:
+                  while chunk := source.read(1024 * 1024):
+                      size += len(chunk)
+                      if size > {{ .Values.worker.workspace.maxArchiveBytes }}:
+                          raise SystemExit("workspace-fetch: archive exceeds compressed-size limit")
+                      digest.update(chunk)
+                      target.write(chunk)
+              if digest.hexdigest() != expected:
+                  destination.unlink(missing_ok=True)
+                  raise SystemExit("workspace-fetch: archive digest mismatch")
+              signal.alarm(0)
+          env:
+            - name: CURIE_WORKSPACE_REF
+              value: ""
+            - name: CURIE_WORKSPACE_SHA256
+              value: ""
+          volumeMounts:
+            - name: workspace
+              mountPath: {{ $wf.mountPath }}
+          resources:
+            {{- toYaml $runner.resources | nindent 12 }}
+        - name: workspace-extract
+          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ $runner.imagePullPolicy }}
+          {{- if $runner.hardening.enabled }}
+          {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
+          {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              REF="${CURIE_WORKSPACE_REF:-}"
+              if [ -z "$REF" ]; then
+                exit 0
+              fi
+              git --version >/dev/null 2>&1 || { echo "workspace-extract: git is required" >&2; exit 1; }
+              ARCHIVE={{ $wf.mountPath }}/.curie-workspace.tar.gz
+              [ -f "$ARCHIVE" ] || { echo "workspace-extract: fetched archive is absent" >&2; exit 1; }
+              timeout {{ $wf.extractTimeoutSeconds }} tar -xzf "$ARCHIVE" -C {{ $wf.mountPath }}
+              rm -f "$ARCHIVE"
+              ORIGIN=$(git -C {{ $wf.mountPath }} remote get-url origin)
+              case "$ORIGIN" in
+                https://github.com/*.git) ;;
+                *) echo "workspace-extract: checkout origin is not credential-free" >&2; exit 1 ;;
+              esac
+          env:
+            - name: CURIE_WORKSPACE_REF
+              value: ""
+            - name: CURIE_WORKSPACE_SHA256
+              value: ""
+          volumeMounts:
+            - name: workspace
+              mountPath: {{ $wf.mountPath }}
+          resources:
+            {{- toYaml $runner.resources | nindent 12 }}
+        {{- end }}
       {{- end }}
       containers:
         {{- if $runner.liteLLM.enabled }}
@@ -521,11 +585,15 @@ spec:
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
-          {{- if or $bf.enabled $runner.hardening.enabled }}
+          {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled }}
           volumeMounts:
             {{- if $bf.enabled }}
             - name: bundles
               mountPath: {{ $bf.mountPath }}
+            {{- end }}
+            {{- if $wf.enabled }}
+            - name: workspace
+              mountPath: {{ $wf.mountPath }}
             {{- end }}
             {{- if $runner.hardening.enabled }}
             {{- range $i, $p := $runner.hardening.writablePaths }}
