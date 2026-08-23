@@ -81,6 +81,9 @@ fn local_otel_ladder_builds_and_selects_the_candidate_runner() {
     let api_build = script
         .find("docker build --file \"$REPO_ROOT/apps/api/Dockerfile\"")
         .expect("the local OTEL rung must build the candidate API source");
+    let dispatcher_build = script
+        .find("docker build --file \"$REPO_ROOT/apps/dispatcher/Dockerfile\"")
+        .expect("the local OTEL controls must run inside the candidate dispatcher image");
     let worker_build = script
         .find("docker build --file \"$REPO_ROOT/apps/worker/Dockerfile\"")
         .expect("the local OTEL rung must build the candidate worker source");
@@ -108,13 +111,21 @@ fn local_otel_ladder_builds_and_selects_the_candidate_runner() {
         .map(|offset| rung + offset)
         .expect("the local rung must verify its running image identities");
     assert!(
-        api_build < worker_build
+        api_build < dispatcher_build
+            && dispatcher_build < worker_build
             && worker_build < worker_overlay_build
             && worker_overlay_build < runner_build
             && runner_build < base_select
             && base_select < worker_select
             && worker_select < select,
         "the candidate image builder must build and select all service images"
+    );
+    assert!(
+        script.contains("--entrypoint python \"$OTEL_E2E_DISPATCHER_IMAGE\" - \"$agent_id\"")
+            && script.contains("docker run --rm --interactive --network host")
+            && script.contains("docker run --rm --interactive --network none")
+            && !script.contains("uv run python -"),
+        "the local OTEL controls must carry their dependencies in a candidate image"
     );
     assert!(
         incumbent_guard < build_call && build_call < up && up < image_assertion,
@@ -806,27 +817,6 @@ esac
 "#,
     );
 
-    // The sealed transport-control block is an in-process Python driver in the
-    // real ladder. These executing controls have no Valkey/services, so this
-    // argv-strict uv stub emits equivalent file-boundary evidence and the same
-    // public JSON result. The no-endpoint runtime probe is the argument-free
-    // sibling and intentionally emits nothing.
-    write_executable(
-        &dir.join("uv"),
-        r#"#!/bin/sh
-set -u
-if [ "$#" -eq 4 ] && [ "$1" = "run" ] && [ "$2" = "python" ] && [ "$3" = "-" ]; then
-    python3 "$STUB_STATE/otel-stub-evidence.py" controls --agent-id "$4"
-elif [ "$#" -eq 3 ] && [ "$1" = "run" ] && [ "$2" = "python" ] && [ "$3" = "-" ]; then
-    # run_no_endpoint_runtime_probe: the absence of records is its assertion.
-    exit 0
-else
-    echo "unexpected uv invocation: $*" >&2
-    exit 97
-fi
-"#,
-    );
-
     // The ladder's raw-docker uses are all either "is a stack already running"
     // or "assert nothing survived", so an unrecognized invocation returning
     // nothing is the honest default here; the two reads that carry a real
@@ -837,6 +827,13 @@ fi
         r#"#!/bin/sh
 set -u
 case "$*" in
+    "run --rm --interactive --network host --env OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318 --env OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf --entrypoint python ghcr.io/curie-eng/curie-dispatcher:"*" - "*)
+        python3 "$STUB_STATE/otel-stub-evidence.py" controls --agent-id "$STUB_AGENT_ID"
+        ;;
+    "run --rm --interactive --network none --entrypoint python ghcr.io/curie-eng/curie-dispatcher:"*" -")
+        # run_no_endpoint_runtime_probe: the absence of records is its assertion.
+        exit 0
+        ;;
     "inspect --format {{.Config.Image}} stub-curie-api")
         echo "ghcr.io/curie-eng/curie-api:${CURIE_BASE_TAG}"
         ;;

@@ -199,6 +199,7 @@ OTEL_E2E_COLLECTOR_MUTATED=0
 OTEL_E2E_COLLECTOR_WAS_RUNNING=0
 OTEL_E2E_RUNNER_IMAGE="curie-runner:otel-e2e-$$"
 OTEL_E2E_BASE_TAG="otel-e2e-$$"
+OTEL_E2E_DISPATCHER_IMAGE="ghcr.io/curie-eng/curie-dispatcher:$OTEL_E2E_BASE_TAG"
 OTEL_E2E_WORKER_LOCAL_IMAGE="curie-worker-local:otel-e2e-$$"
 OTEL_E2E_CANDIDATE_IMAGES_BUILT=0
 OTEL_E2E_OUTPUT=""
@@ -296,6 +297,7 @@ cleanup() {
         docker image rm -f "$OTEL_E2E_RUNNER_IMAGE" >/dev/null 2>&1
         docker image rm -f \
             "ghcr.io/curie-eng/curie-api:$OTEL_E2E_BASE_TAG" \
+            "$OTEL_E2E_DISPATCHER_IMAGE" \
             "ghcr.io/curie-eng/curie-worker:$OTEL_E2E_BASE_TAG" \
             "$OTEL_E2E_WORKER_LOCAL_IMAGE" \
             >/dev/null 2>&1
@@ -366,6 +368,8 @@ build_local_otel_candidate_images() {
     echo "=== build candidate platform images for local telemetry ==="
     docker build --file "$REPO_ROOT/apps/api/Dockerfile" \
         --tag "ghcr.io/curie-eng/curie-api:$OTEL_E2E_BASE_TAG" "$REPO_ROOT"
+    docker build --file "$REPO_ROOT/apps/dispatcher/Dockerfile" \
+        --tag "$OTEL_E2E_DISPATCHER_IMAGE" "$REPO_ROOT"
     docker build --file "$REPO_ROOT/apps/worker/Dockerfile" \
         --tag "ghcr.io/curie-eng/curie-worker:$OTEL_E2E_BASE_TAG" "$REPO_ROOT"
     docker build --file "$REPO_ROOT/compose/worker-local.Dockerfile" \
@@ -445,9 +449,10 @@ assert_local_otel_turn() {
 
 run_local_otel_transport_controls() {
     local agent_id="$1"
-    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318 \
-    OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
-    uv run python - "$agent_id" <<'PY'
+    docker run --rm --interactive --network host \
+        --env OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318 \
+        --env OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+        --entrypoint python "$OTEL_E2E_DISPATCHER_IMAGE" - "$agent_id" <<'PY'
 from __future__ import annotations
 
 import json
@@ -706,14 +711,8 @@ PY
 }
 
 run_no_endpoint_runtime_probe() {
-    env \
-        -u OTEL_EXPORTER_OTLP_ENDPOINT \
-        -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
-        -u OTEL_EXPORTER_OTLP_LOGS_ENDPOINT \
-        -u OTEL_EXPORTER_OTLP_PROTOCOL \
-        -u OTEL_EXPORTER_OTLP_TRACES_PROTOCOL \
-        -u OTEL_EXPORTER_OTLP_LOGS_PROTOCOL \
-        uv run python - <<'PY'
+    docker run --rm --interactive --network none \
+        --entrypoint python "$OTEL_E2E_DISPATCHER_IMAGE" - <<'PY'
 import logging
 
 from curie_telemetry import configure
