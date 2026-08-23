@@ -623,8 +623,6 @@ The following are built and verified:
 
 **Deferred:**
 
-- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
-- binding the UI's eval matrix view to the live `GET /evals/matrix` endpoint ([Pushing agent versions with git](#pushing-agent-versions-with-git-deploy-flow))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
 - the Interview-Me onboarding compiler
 - automatic memory generation
