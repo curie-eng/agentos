@@ -6335,6 +6335,12 @@ enum ServiceUrlKind {
 }
 
 impl ServiceUrl {
+    /// Build the shared port-forward text after the caller chooses whether the
+    /// URL target is plain (JSON) or styled (human output).
+    fn port_forward_hint(&self, local: u16, port: u16, target: &str) -> String {
+        port_forward_hint_with(&self.namespace, &self.name, local, port, target)
+    }
+
     fn to_json(&self) -> serde_json::Value {
         let (url, note): (Option<String>, Option<String>) = match &self.kind {
             ServiceUrlKind::NodePortUrl(url) => (Some(url.clone()), None),
@@ -6350,9 +6356,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 (
                     None,
-                    Some(port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    Some(self.port_forward_hint(
                         *local,
                         *port,
                         &format!("http://localhost:{local}{suffix_path}"),
@@ -6383,9 +6387,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 ui.kv(
                     &self.label,
-                    &port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    &self.port_forward_hint(
                         *local,
                         *port,
                         &ui.url(&format!("http://localhost:{local}{suffix_path}")),
@@ -9350,6 +9352,43 @@ mod tests {
                 "url": null,
                 "note": "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1",
             })
+        );
+    }
+
+    #[test]
+    fn service_url_port_forward_hint_preserves_a_human_identity_target() {
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward {
+                local: 18080,
+                port: 80,
+            },
+        };
+        let ui = crate::ui::Ui::resolve(
+            crate::ui::ColorFlag::Never,
+            false,
+            false,
+            false,
+            &crate::ui::UiEnv {
+                no_color: false,
+                clicolor_zero: false,
+                clicolor_force: false,
+                term_dumb: false,
+                ci: false,
+                stderr_tty: true,
+                stdout_tty: true,
+                utf8: true,
+                truecolor: false,
+            },
+        );
+        let target = ui.url("http://localhost:18080/?api=1");
+        assert_eq!(target, "http://localhost:18080/?api=1");
+        assert_eq!(
+            service_url.port_forward_hint(18080, 80, &target),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
     }
 
