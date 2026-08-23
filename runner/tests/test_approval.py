@@ -23,6 +23,7 @@ from curie_runner.adapter import build_options
 from curie_runner.approval import (
     APPROVAL_SUMMARY_PREFIX,
     APPROVAL_TOOL_NAME,
+    PUBLISH_TOOL_NAME,
     ApprovalGate,
     ApprovalPolicyError,
     ApprovalPolicyResolution,
@@ -782,10 +783,76 @@ def test_an_overlapping_bundle_route_is_logged_not_fatal(caplog) -> None:
     assert any("Bash" in r.getMessage() for r in caplog.records), caplog.text
 
 
-def test_no_declared_gate_from_either_source_keeps_the_bypass_posture() -> None:
-    """Neither source naming a tool yields no gate, as before."""
+def test_no_declared_gate_from_either_source_still_arms_platform_publish() -> None:
+    """The platform publish member remains armed with both policy sources empty."""
 
-    assert build_approval_gate(operator_tools=None, policy_routes={}) is None
+    gate = build_approval_gate(operator_tools=None, policy_routes={})
+    assert gate is not None
+    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+
+
+def test_publish_gate_is_an_additive_exact_platform_member() -> None:
+    gate = build_approval_gate(
+        operator_tools=["Read"],
+        policy_routes={"Bash": "managers"},
+    )
+    assert gate is not None
+    assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
+    assert gate.route_by_tool == {"Bash": "managers"}
+    assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
+
+
+def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:
+    async def go() -> None:
+        gate = build_approval_gate(operator_tools=None, policy_routes={})
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME,
+            {"title": "Update documentation"},
+            ToolPermissionContext(),
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert gate.pending_gate_kind == "permission"
+        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+        assert gate.pending_route is None
+
+    anyio.run(go)
+
+
+def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
+    async def go() -> None:
+        gate = build_approval_gate(
+            operator_tools=None,
+            policy_routes={},
+            grant_tool=PUBLISH_TOOL_NAME,
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME, {}, ToolPermissionContext()
+        )
+        assert isinstance(result, PermissionResultDeny)
+        assert gate.grant_tool is None
+        assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
+
+        # Bypass the permission callback and call the in-process tool directly:
+        # it must still refuse, because publication belongs to the platform Job.
+        server = build_approval_server(gate)
+        handler = server["instance"].request_handlers[mcp_types.CallToolRequest]
+        direct = await handler(
+            mcp_types.CallToolRequest(
+                method="tools/call",
+                params=mcp_types.CallToolRequestParams(
+                    name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1], arguments={}
+                ),
+            )
+        )
+        payload = direct.model_dump()
+        assert payload.get("isError") is True
+        assert "platform" in " ".join(
+            str(item.get("text") or "") for item in payload.get("content") or []
+        ).lower()
+
+    anyio.run(go)
 
 
 def test_build_approval_gate_carries_the_grant_tool() -> None:

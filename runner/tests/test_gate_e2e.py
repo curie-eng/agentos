@@ -22,6 +22,7 @@ import json
 import anyio
 from aci_protocol import Event
 from curie_runner.__main__ import build_runner
+from curie_runner.approval import PUBLISH_TOOL_NAME
 from curie_runner.config import RunnerConfig
 
 # A budget high enough that default_turn's 8 output tokens never trip the halt
@@ -73,3 +74,25 @@ def test_gate_e2e_ends_awaiting_approval_through_build_runner(tmp_path) -> None:
         assert final["approval_summary"].startswith("Tool call awaiting approval: Bash")
 
     anyio.run(go)
+
+
+def test_empty_policy_and_env_arm_publish_on_fake_boot_path(tmp_path) -> None:
+    plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
+
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+
+
+def test_empty_policy_and_env_arm_publish_on_real_boot_path(tmp_path) -> None:
+    plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=False
+    )
+
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is not None
+    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
