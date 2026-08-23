@@ -27,6 +27,15 @@ render auth-header --set otelCollector.otlpAuthHeader='Basic YXNzZXJ0OmFzc2VydA=
 render tempo \
   --set 'otelCollector.extraExporters.otlphttp/tempo.endpoint=http://tempo:4318' \
   --set 'otelCollector.extraPipelineExporters[0]=otlphttp/tempo'
+render service-wiring \
+  --set dispatcher.slack.appToken=test-app-token \
+  --set dispatcher.slack.botToken=test-bot-token \
+  --set dispatcher.slack.signingSecret=test-signing-secret
+render no-collector \
+  --set otelCollector.deploy=false \
+  --set dispatcher.slack.appToken=test-app-token \
+  --set dispatcher.slack.botToken=test-bot-token \
+  --set dispatcher.slack.signingSecret=test-signing-secret
 
 missing_exporter_stderr="$TMP/missing-exporter.stderr"
 if helm template curie "$CHART" \
@@ -40,7 +49,14 @@ missing_exporter_error="$(<"$missing_exporter_stderr")"
 [[ "$missing_exporter_error" == *"otelCollector.extraExporters"* ]] || \
   fail "Missing exporter error did not name otelCollector.extraExporters"
 
-python3 - "$(manifest_for "$TMP/default")" "$(manifest_for "$TMP/port-3001")" "$(manifest_for "$TMP/auth-header")" "$(manifest_for "$TMP/tempo")" <<'PY'
+python3 - \
+  "$(manifest_for "$TMP/default")" \
+  "$(manifest_for "$TMP/port-3001")" \
+  "$(manifest_for "$TMP/auth-header")" \
+  "$(manifest_for "$TMP/tempo")" \
+  "$TMP/service-wiring" \
+  "$TMP/no-collector" <<'PY'
+from pathlib import Path
 import sys
 import yaml
 
@@ -61,10 +77,68 @@ changed_config, changed_checksum = config_and_checksum(sys.argv[2])
 auth_config, auth_checksum = config_and_checksum(sys.argv[3])
 tempo_config, tempo_checksum = config_and_checksum(sys.argv[4])
 
+
+def all_docs(root):
+    return [
+        doc
+        for path in Path(root).rglob("*.yaml")
+        for doc in yaml.safe_load_all(path.read_text())
+        if doc
+    ]
+
+
+def container_env(docs, component):
+    if component == "runner":
+        workload = next(
+            doc
+            for doc in docs
+            if doc.get("kind") == "SandboxTemplate"
+        )
+        pod_spec = workload["spec"]["podTemplate"]["spec"]
+    else:
+        workload = next(
+            doc
+            for doc in docs
+            if doc.get("kind") == "Deployment"
+            and doc.get("metadata", {}).get("labels", {}).get(
+                "app.kubernetes.io/component"
+            )
+            == component
+        )
+        pod_spec = workload["spec"]["template"]["spec"]
+    container = next(item for item in pod_spec["containers"] if item["name"] == component)
+    return {item["name"]: item for item in container.get("env", [])}
+
+
+wired_docs = all_docs(sys.argv[5])
+no_collector_docs = all_docs(sys.argv[6])
+endpoint = "http://curie-otel-collector:4318"
+for component in ("api", "dispatcher", "worker", "runner"):
+    env = container_env(wired_docs, component)
+    assert env["OTEL_EXPORTER_OTLP_ENDPOINT"] == {
+        "name": "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "value": endpoint,
+    }, f"{component}: standard OTLP endpoint is missing or not the in-cluster collector"
+    assert env["OTEL_EXPORTER_OTLP_PROTOCOL"] == {
+        "name": "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "value": "http/protobuf",
+    }, f"{component}: standard OTLP HTTP protocol is missing"
+    assert "OTEL_SERVICE_NAME" not in env, (
+        f"{component}: service.name belongs to configure(service_name=...), not chart env"
+    )
+    assert "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT" not in env, (
+        f"{component}: Helm has one in-cluster endpoint; the Compose relay is not a chart contract"
+    )
+
+    disabled_env = container_env(no_collector_docs, component)
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in disabled_env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in disabled_env
+
 default_parsed = yaml.safe_load(default_config)
 tempo_parsed = yaml.safe_load(tempo_config)
 default_exporters = default_parsed["exporters"]
 default_trace_exporters = default_parsed["service"]["pipelines"]["traces"]["exporters"]
+default_log_pipeline = default_parsed["service"]["pipelines"]["logs"]
 tempo_exporters = tempo_parsed["exporters"]
 tempo_trace_exporters = tempo_parsed["service"]["pipelines"]["traces"]["exporters"]
 
@@ -74,6 +148,11 @@ assert set(default_exporters) == {"otlphttp/langfuse", "debug"}, (
 assert default_trace_exporters == ["otlphttp/langfuse", "debug"], (
     "Default traces pipeline exporters changed or unexpectedly include Tempo"
 )
+assert default_log_pipeline == {
+    "receivers": ["otlp"],
+    "processors": ["batch"],
+    "exporters": ["debug"],
+}, "The chart collector must accept batched OTLP logs without claiming a retained backend"
 assert tempo_exporters.get("otlphttp/tempo") == {"endpoint": "http://tempo:4318"}, (
     "Tempo exporter configuration was not rendered exactly"
 )
@@ -94,5 +173,7 @@ assert default_checksum != auth_checksum, (
     "OTLP auth header changed but Deployment checksum/config stayed identical. The pod would not roll."
 )
 
-print("ConfigMap changes roll the pod and OTLP auth header changes still roll it: OK")
+print(
+    "ConfigMap rollout, OTLP logs pipeline, and four-service standard env wiring: OK"
+)
 PY

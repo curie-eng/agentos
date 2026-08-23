@@ -13,7 +13,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import curie_worker.run as run_module
 import pytest
+from curie_worker import __version__
 from curie_worker.config import WorkerConfig
 from curie_worker.run import (
     _MAX_TUNABLE_SECONDS,
@@ -540,3 +542,173 @@ def test_crashing_supervised_task_does_not_cancel_its_siblings() -> None:
         assert sibling_ran["ok"] is True
 
     asyncio.run(go())
+
+
+# -- #1817: worker telemetry bootstrap, relay, and bounded shutdown -----------
+
+
+class _RecordingTelemetryRuntime:
+    def __init__(self, order: list[str]) -> None:
+        self.tracer = object()
+        self.order = order
+        self.shutdown_timeouts: list[int] = []
+
+    def force_flush(self, *, timeout_millis: int) -> bool:
+        self.order.append("telemetry-force-flush")
+        return timeout_millis <= 2_000
+
+    def shutdown(self, *, timeout_millis: int) -> bool:
+        self.shutdown_timeouts.append(timeout_millis)
+        self.order.append("telemetry-shutdown")
+        return timeout_millis <= 2_000
+
+
+def test_main_configures_worker_telemetry_and_shuts_down_after_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank standard endpoint is a normal no-op runtime, still lifecycle-owned.
+
+    The shared package decides whether exporters exist; the worker must always
+    use the same configure/shutdown seam so endpoint absence cannot grow a
+    second code path that skips ordinary diagnostics or cleanup.
+    """
+
+    for name in (
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    order: list[str] = []
+    runtime = _RecordingTelemetryRuntime(order)
+    configured: list[dict[str, object]] = []
+    basic_config: list[dict[str, object]] = []
+
+    def fake_configure(**kwargs: object) -> _RecordingTelemetryRuntime:
+        configured.append(kwargs)
+        order.append("telemetry-configured")
+        return runtime
+
+    async def fake_run(*args: object, **kwargs: object) -> None:
+        # The runtime tracer is the only tracer main has available to hand into
+        # build/_run.  Accept either a named tracer or the runtime itself so this
+        # assertion stays about dependency propagation, not a private signature.
+        flattened = (*args, *kwargs.values())
+        assert runtime in flattened or runtime.tracer in flattened
+        order.append("ordinary-runtime-finished")
+
+    def fake_basic_config(**kwargs: object) -> None:
+        basic_config.append(kwargs)
+
+    monkeypatch.setattr(run_module, "configure", fake_configure, raising=False)
+    monkeypatch.setattr(run_module, "_run", fake_run)
+    monkeypatch.setattr(run_module, "install_dead_letter_alerting", lambda: None)
+    monkeypatch.setattr(logging, "basicConfig", fake_basic_config)
+
+    run_module.main({})
+
+    assert configured == [
+        {"service_name": "curie-worker", "service_version": __version__}
+    ]
+    assert basic_config == [{"level": logging.INFO}]
+    assert runtime.shutdown_timeouts == [2_000]
+    assert order.index("ordinary-runtime-finished") < order.index("telemetry-shutdown")
+
+
+def _docker_envs(client: DockerSandboxClient) -> list[str]:
+    calls: list[list[str]] = []
+
+    def record(args: list[str], *, check: bool = True) -> str:
+        del check
+        calls.append(args)
+        return ""
+
+    client._docker = record  # type: ignore[method-assign]
+    client.create_claim(
+        "runner-otel-example",
+        pool="pool",
+        env={"CURIE_FAKE_MODEL": "1"},
+    )
+    assert len(calls) == 1
+    argv = calls[0]
+    return [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+
+
+def test_docker_worker_uses_private_runner_relay_as_child_standard_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        DockerSandboxClient,
+        "ensure_image",
+        lambda self: None,
+        raising=False,
+    )
+    host_endpoint = "http://127.0.0.1:24318"
+    runner_endpoint = "http://otel-collector:4318"
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True),
+        {
+            "CURIE_SANDBOX_SUBSTRATE": "docker",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": host_endpoint,
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT": runner_endpoint,
+        },
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+
+    child_env = _docker_envs(client)
+    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={runner_endpoint}" in child_env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in child_env
+    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={host_endpoint}" not in child_env
+    assert "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT" not in {
+        entry.partition("=")[0] for entry in child_env
+    }
+
+
+def test_docker_runner_relay_defaults_to_standard_endpoint_outside_compose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        DockerSandboxClient,
+        "ensure_image",
+        lambda self: None,
+        raising=False,
+    )
+    endpoint = "http://collector.example.com:4318"
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True),
+        {
+            "CURIE_SANDBOX_SUBSTRATE": "docker",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
+        },
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    child_env = _docker_envs(client)
+    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={endpoint}" in child_env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in child_env
+
+
+def test_docker_runner_with_both_endpoints_blank_injects_no_exporter_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        DockerSandboxClient,
+        "ensure_image",
+        lambda self: None,
+        raising=False,
+    )
+    client = _sandbox_client(
+        WorkerConfig(fake_model=True),
+        {
+            "CURIE_SANDBOX_SUBSTRATE": "docker",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT": "",
+        },
+        _SUB,
+    )
+    assert isinstance(client, DockerSandboxClient)
+    child_names = {entry.partition("=")[0] for entry in _docker_envs(client)}
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in child_names
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in child_names

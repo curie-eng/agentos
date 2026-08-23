@@ -192,6 +192,12 @@ fi
 # brought a stack up owns tearing it down, so a stack that was already running
 # when the ladder started is reused and left alone.
 LOCAL_STACK_OWNED=0
+# The local #1817 evidence temporarily swaps only the collector container to a
+# file exporter. These flags let the EXIT trap restore an incumbent collector
+# without touching the incumbent API, worker, connectors, or sandboxes.
+OTEL_E2E_COLLECTOR_MUTATED=0
+OTEL_E2E_COLLECTOR_WAS_RUNNING=0
+OTEL_E2E_OUTPUT=""
 
 # Cross-rung artifact identity, pinned by the first rung to report a digest and
 # matched by every later one (see assert_bundle_identity). Empty until then.
@@ -244,6 +250,18 @@ cleanup() {
     # turn a red run green, and a successful teardown must not mask a red rung.
     local code=$?
     set +e
+    if (( OTEL_E2E_COLLECTOR_MUTATED && ! LOCAL_STACK_OWNED )); then
+        echo
+        echo "=== teardown: restore the incumbent OTel Collector only ==="
+        if (( OTEL_E2E_COLLECTOR_WAS_RUNNING )); then
+            docker compose --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+                up -d --no-deps --force-recreate otel-collector >/dev/null
+        else
+            docker compose -f "$REPO_ROOT/compose.dev.yaml" \
+                rm -sf otel-collector >/dev/null
+        fi
+        OTEL_E2E_COLLECTOR_MUTATED=0
+    fi
     # The compose worker spawns runner containers as SIBLINGS on the host daemon
     # via the mounted docker socket, so a rung that died before `local down` can
     # strand them. This raw sweep is a BACKSTOP, not duplication: `local down`
@@ -297,6 +315,21 @@ trap cleanup EXIT
 # trap, stranding a running stack on a box that cannot afford one.
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+prepare_local_otel_evidence() {
+    OTEL_E2E_OUTPUT="$WORKDIR/otel-output"
+    mkdir -p "$OTEL_E2E_OUTPUT"
+    chmod 0777 "$OTEL_E2E_OUTPUT"
+    if [[ -n "$(docker ps -q --filter 'name=curie-otel-collector' 2>/dev/null)" ]]; then
+        OTEL_E2E_COLLECTOR_WAS_RUNNING=1
+    fi
+    export CURIE_OTEL_E2E_OUTPUT="$OTEL_E2E_OUTPUT"
+    docker compose --profile full \
+        -f "$REPO_ROOT/compose.dev.yaml" \
+        -f "$REPO_ROOT/cli/tests/fixtures/otel/compose.override.yaml" \
+        up -d --no-deps --force-recreate otel-collector >/dev/null
+    OTEL_E2E_COLLECTOR_MUTATED=1
+}
 
 # The ONE place the fake/live asymmetry is stated. There is no shared
 # fake-model control across tiers: skill reads CURIE_E2E_LIVE itself (see
@@ -1674,10 +1707,10 @@ rung_local() {
         echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
     else
         echo
+        # #1817 observes a real collector boundary, so the local rung always
+        # selects the full profile. The no-endpoint control below uses the CLI's
+        # separate --minimal path rather than weakening this positive.
         local up_args=(local up)
-        if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
-            up_args+=(--minimal)
-        fi
         echo "=== curie ${up_args[*]} ==="
         # Ordinary bundles use the core profile. A trajectory sidecar selects the
         # full profile because its matrix read requires Langfuse.
@@ -1691,6 +1724,10 @@ rung_local() {
         LOCAL_STACK_OWNED=1
         "$BIN" "${up_args[@]}"
     fi
+
+    echo
+    echo "=== install ladder-owned OTLP file sink (collector only) ==="
+    prepare_local_otel_evidence
 
     echo
     echo "=== curie --json local deploy ==="
@@ -1762,6 +1799,34 @@ rung_local() {
     assert_finalized_reply "local" "$out"
 
     echo
+    echo "=== assert the honest worker-rooted causal trace and correlated logs ==="
+    local thread session_id otel_ready=0
+    thread="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["thread"])')"
+    session_id="agent-${agent_id}-thread-${thread}"
+    for _ in $(seq 1 25); do
+        if python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
+            --traces "$OTEL_E2E_OUTPUT/traces.json" \
+            --logs "$OTEL_E2E_OUTPUT/logs.json" \
+            --topology cli --outcome success --session-id "$session_id" \
+            >/dev/null 2>&1; then
+            otel_ready=1
+            break
+        fi
+        sleep 0.2
+    done
+    (( otel_ready )) || {
+        python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
+            --traces "$OTEL_E2E_OUTPUT/traces.json" \
+            --logs "$OTEL_E2E_OUTPUT/logs.json" \
+            --topology cli --outcome success --session-id "$session_id"
+        return 1
+    }
+    python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
+        --traces "$OTEL_E2E_OUTPUT/traces.json" \
+        --logs "$OTEL_E2E_OUTPUT/logs.json" \
+        --topology cli --outcome success --session-id "$session_id"
+
+    echo
     echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -1780,6 +1845,9 @@ rung_local() {
         echo "=== curie local down ==="
         "$BIN" local down
         LOCAL_STACK_OWNED=0
+        # The owned stack's down removed the temporary collector with it; do
+        # not let the EXIT trap recreate that service while "restoring" it.
+        OTEL_E2E_COLLECTOR_MUTATED=0
 
         echo
         echo "=== assert nothing curie-related survived ==="

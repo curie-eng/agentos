@@ -42,6 +42,11 @@ def _committed_schema() -> dict:
     return json.loads(_SCHEMA_PATH.read_text())
 
 
+def _committed_runner_keys() -> dict[str, str]:
+    schema = _committed_schema()
+    return {**schema["shared"], **schema["services"]["curie-runner"]}
+
+
 def _assert_value_type(committed: dict, key: str, value: object, where: str = "") -> None:
     """Assert an emitted attribute's runtime type matches the committed type.
 
@@ -60,7 +65,7 @@ def _assert_value_type(committed: dict, key: str, value: object, where: str = ""
 
 
 def test_committed_schema_matches_the_enum() -> None:
-    committed_keys = _committed_schema()["keys"]
+    committed_keys = _committed_runner_keys()
     code_keys = {member.value: SPAN_ATTRIBUTE_VALUE_TYPES[member] for member in SpanAttributeKey}
     assert code_keys == committed_keys, (
         "SpanAttributeKey (otel.py) and the committed schema "
@@ -80,9 +85,9 @@ def test_declared_value_types_cover_exactly_the_enum() -> None:
         "SPAN_ATTRIBUTE_VALUE_TYPES (otel.py) must declare a value type for "
         "every SpanAttributeKey member, no more and no fewer."
     )
-    assert set(SPAN_ATTRIBUTE_VALUE_TYPES.values()) <= {"str", "int"}, (
-        "SPAN_ATTRIBUTE_VALUE_TYPES values must be one of {'str', 'int'} -- "
-        "the only value types the runner emits today."
+    assert set(SPAN_ATTRIBUTE_VALUE_TYPES.values()) <= {"str", "int", "bool"}, (
+        "SPAN_ATTRIBUTE_VALUE_TYPES values must be one of {'str', 'int', 'bool'}; "
+        "exact bool handling prevents Python's bool-is-an-int subtype trap."
     )
 
 
@@ -104,7 +109,7 @@ def test_a_real_run_only_emits_attributes_within_the_committed_schema() -> None:
     # that each emitted value's runtime type matches the committed type for
     # its key -- catching a call-site retype (e.g. emitting `model` as an int)
     # that forgot to update the declaration.
-    committed = _committed_schema()["keys"]
+    committed = _committed_runner_keys()
     committed_keys = set(committed)
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
@@ -148,7 +153,7 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
     # the 4 resource-level keys via build_tracer_provider -- so a call-site
     # retype of any of the seven previously-unexercised keys (that also forgot
     # to update SPAN_ATTRIBUTE_VALUE_TYPES) fails here instead of slipping past.
-    committed = _committed_schema()["keys"]
+    committed = _committed_runner_keys()
     emitted: dict[str, object] = {}
 
     exporter = InMemorySpanExporter()

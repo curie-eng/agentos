@@ -61,15 +61,25 @@ def test_get_trace_returns_reconstructed_tree(
 def test_get_trace_surfaces_sandbox_id_from_observation(
     auth_headers: dict[str, str],
 ) -> None:
-    # The endpoint hoists curie.sandbox_id onto the typed TraceTree field even
-    # when Langfuse carries it only on an observation (not the trace).
+    # Platform spans now precede agent.run. A first-observation probe returns
+    # the deliberately wrong value; the runner root is the authority.
     observations = [
+        {
+            "id": "platform",
+            "type": "SPAN",
+            "name": "POST /channels/turns",
+            "startTime": "1",
+            "metadata": {"curie.sandbox_id": "sbx-wrong-platform"},
+            "resourceAttributes": {"service.name": "curie-api"},
+        },
         {
             "id": "r",
             "type": "SPAN",
             "name": "agent.run",
-            "startTime": "1",
+            "startTime": "2",
+            "parentObservationId": "platform",
             "metadata": {"curie.sandbox_id": "sbx-proxy"},
+            "resourceAttributes": {"service.name": "curie-runner"},
         },
     ]
     with _app_with(observations) as client:
@@ -91,14 +101,25 @@ def test_get_trace_sandbox_id_null_when_absent(
 def test_get_trace_surfaces_approval_decision_from_observation(
     auth_headers: dict[str, str],
 ) -> None:
-    # Same hoist shape as sandbox_id, for the ADR-0076 Stone 3 (#889) attribute.
+    # Same precedence contract as sandbox_id: the runner agent.run observation
+    # wins after an earlier platform observation.
     observations = [
+        {
+            "id": "platform",
+            "type": "SPAN",
+            "name": "send curie:runs",
+            "startTime": "1",
+            "metadata": {"gen_ai.approval.decision": "rejected"},
+            "resourceAttributes": {"service.name": "curie-api"},
+        },
         {
             "id": "r",
             "type": "SPAN",
             "name": "agent.run",
-            "startTime": "1",
+            "startTime": "2",
+            "parentObservationId": "platform",
             "metadata": {"gen_ai.approval.decision": "approved"},
+            "resourceAttributes": {"service.name": "curie-runner"},
         },
     ]
     with _app_with(observations) as client:

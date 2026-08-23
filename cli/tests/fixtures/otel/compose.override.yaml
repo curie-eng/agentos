@@ -1,0 +1,5 @@
+services:
+  otel-collector:
+    volumes:
+      - ./cli/tests/fixtures/otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+      - ${CURIE_OTEL_E2E_OUTPUT:?set a ladder-owned output directory}:/var/lib/curie-otel-e2e

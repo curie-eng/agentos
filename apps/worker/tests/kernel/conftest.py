@@ -534,6 +534,7 @@ async def kernel_harness(
     approvals: object | None = None,
     approval_reader: object | None = None,
     sink: object | None = None,
+    tracer: object | None = None,
     claim_timeout_seconds: float = 3.0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
@@ -546,6 +547,7 @@ async def kernel_harness(
     assert port is not None
 
     fake_k8s = FakeK8s()
+    telemetry_kwargs = {"tracer": tracer} if tracer is not None else {}
     substrate = SandboxSubstrate(
         fake_k8s,  # type: ignore[arg-type]
         AffinityStore(sync_redis, key_prefix=names["sandbox_prefix"]),
@@ -558,12 +560,16 @@ async def kernel_harness(
             poll_interval_seconds=0.005,
             key_prefix=names["sandbox_prefix"],
         ),
+        **telemetry_kwargs,  # type: ignore[arg-type]
     )
     async_redis: AsyncRedis = AsyncRedis(
         host=_VALKEY_HOST, port=_VALKEY_PORT, password=_VALKEY_PW or None, decode_responses=True
     )
     reply_sink = FakeSink() if sink is None else sink
-    runner_client = RunnerClient(total_timeout_s=30.0)
+    runner_client = RunnerClient(
+        total_timeout_s=30.0,
+        **telemetry_kwargs,  # type: ignore[arg-type]
+    )
     card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
         substrate=substrate,
@@ -581,6 +587,7 @@ async def kernel_harness(
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
         card_store=card_store,
+        **telemetry_kwargs,  # type: ignore[arg-type]
     )
     killswitch = None
     if with_killswitch:
