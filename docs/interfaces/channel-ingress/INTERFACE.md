@@ -41,8 +41,9 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   a Pydantic model in the frozen ACI package with channel-neutral fields: `event_id`
   (idempotency key), `conversation_id` (the conversation/thread key routing keeps one live
   session per), `author`, `text`, `received_at`, and `reply_handle` — a `ReplyHandle`
-  (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying `channel`,
-  required nullable `placeholder`, and an optional per-turn `endpoint`. The Slack adapter
+  (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`) carrying the required
+  `kind` and `channel` routing pair, required nullable `placeholder`, and an optional
+  per-turn `endpoint`. The Slack adapter
   currently supplies the pre-posted reply ts that the worker edits in place. The
   dispatcher serializes the turn to a single Stream field via `to_stream_fields`
   (`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`), keyed by
@@ -54,8 +55,8 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   `cli/src/queue.rs`), so a second ingress adopts the package constant rather than copying
   the literal.
   For the Slack adapter, `event_id` is the Slack event id, `conversation_id` is the thread
-  ts, `author` is the Slack user id, and `reply_handle` carries the Slack channel plus the
-  placeholder ts.
+  ts, `author` is the Slack user id, and `reply_handle` carries the `slack` kind, Slack
+  channel, and placeholder ts.
 - **Egress** — the `ReplySink` Protocol (`apps/worker/src/curie_worker/reply_sink.py::ReplySink`),
   whose one method is `async def emit(self, event, *, route, best_effort_unreachable=False)`
   (`apps/worker/src/curie_worker/reply_sink.py::ReplySink.emit`) — four versioned neutral
@@ -86,10 +87,12 @@ A second channel must produce the ingress payload and satisfy the egress Protoco
   (`apps/worker/src/curie_worker/mrkdwn.py::to_mrkdwn`) and the Block Kit rendering in
   `render` (`apps/worker/src/curie_worker/blocks.py::render`) and `approval_card`
   (`apps/worker/src/curie_worker/blocks.py::approval_card`).
-- **Binding** — a channel resolves to a deployment by `agent_channels.address`
-  equality in `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
-  The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a second
-  channel binds its agent without a schema change.
+- **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
+  `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
+  Both halves are required, with no address-only fallback, and uniqueness is on the same
+  pair. The binding is written as a neutral `{kind, address}` pair (ADR-0096, #1459), so a
+  second channel binds its agent without a schema change and the same address may belong to
+  different adapter kinds.
 
 ## Implementations today
 
@@ -102,8 +105,8 @@ via `curie local message` / `cluster message` (`cli/src/chat.rs`, `cli/src/messa
 
 ## Known leakage
 
-Two ends and the binding surface were cleaned; what remains is egress semantics and a
-routing key that carries no kind.
+Two ends and the binding surface were cleaned; what remains is egress semantics and
+incomplete adapter coverage and conformance.
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`
@@ -133,11 +136,14 @@ routing key that carries no kind.
   validates on its own address shape, an unregistered one on a generic non-empty rule, so a
   new kind binds with no schema change. Still no multi-channel adapter framework (#27) — the
   restraint stands; only the Slack-shaped assumption is gone.
-- **Still leaks — `kind` is stored, not routed.** The queue wire carries no channel kind, so
-  the resolver matches on `address` alone and the uniqueness constraint is on `address`
-  alone. Until `ReplyHandle` carries a kind, two adapters cannot own the same address, and
-  `kind` selects the address validator and names the owning adapter without deciding
-  anything at routing time.
+- **Fixed (#1459, ADR-0096 phase 2).** `ReplyHandle.kind` is required, and the worker
+  resolves the required `(kind, address)` pair with uniqueness on that same pair. There is
+  no address-only overload or default kind: two adapters can own the same address without
+  silently selecting one another's binding.
+- **Still leaks — adapter coverage and conformance.** Slack is the only registered kind, and
+  there is no multi-channel adapter framework or a second adapter proving conformance yet
+  (#27). The routing pair removes the binding ambiguity; it does not by itself implement or
+  verify another adapter's ingress and egress behavior.
 
 ## Cross-links
 
