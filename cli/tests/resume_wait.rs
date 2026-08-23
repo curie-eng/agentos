@@ -374,10 +374,7 @@ async fn run_local_message_terminal(debug: bool) -> Option<String> {
         );
         return None;
     }
-    let Some(mut conn) = valkey_or_skip("local_message_transport_narration_is_debug_only").await
-    else {
-        return None;
-    };
+    let mut conn = valkey_or_skip("local_message_transport_narration_is_debug_only").await?;
     let stream = unique_stream("curie:test:resume:");
     let workspace = tempfile::tempdir().expect("create isolated command directory");
     let capture_path = workspace.path().join("terminal.log");

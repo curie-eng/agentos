@@ -674,7 +674,7 @@ Two shortcuts for working with the repo's own `agents/` scratch directory:
 ### Verify
 
 ```bash
-cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 The scripted E2E (real runner container, fake model by default, offline):

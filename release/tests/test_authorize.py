@@ -916,6 +916,27 @@ jobs:
 
 
 class TestReleaseWorkflowContract:
+    def test_rust_clippy_checks_all_targets_for_await_holding_lock(self):
+        """Clippy must compile test targets, where this lint is reachable (#1704)."""
+        workflow = yaml.load(CI_YAML.read_text(), Loader=yaml.BaseLoader)
+        clippy_step = next(
+            step
+            for step in workflow["jobs"]["rust"]["steps"]
+            if step.get("name") == "Clippy"
+        )
+        command = clippy_step["run"]
+
+        for required_fragment in (
+            "cargo clippy",
+            "--locked",
+            "--all-targets",
+            "-D warnings",
+        ):
+            assert required_fragment in command, (
+                "Rust CI Clippy must retain "
+                f"{required_fragment!r} to catch await-holding-lock regressions: {command!r}"
+            )
+
     def test_sre_bot_tempo_connector_builds_in_ordinary_ci(self):
         workflow = yaml.load(CI_YAML.read_text(), Loader=yaml.BaseLoader)
         image_job = workflow["jobs"]["images"]

@@ -189,7 +189,7 @@ jobs:
       # Cargo.toml -- cargo errors instead of silently updating the lock, which
       # is the lockfile-freshness gate for Rust (mirrors uv lock --check above).
       - name: Clippy
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Schema baseline
         run: bash scripts/refresh-schema-baseline.sh --check
       - name: Test

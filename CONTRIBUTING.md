@@ -86,7 +86,7 @@ uv run mypy             # type-check (strict)
 ```bash
 cd cli
 cargo fmt --check         # formatting
-cargo clippy -- -D warnings   # lint, warnings as errors
+cargo clippy --all-targets -- -D warnings   # lint, warnings as errors
 cargo test                # unit + integration tests
 ```
 

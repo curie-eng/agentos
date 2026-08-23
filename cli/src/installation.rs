@@ -1907,26 +1907,28 @@ mod diff_tests {
 
     #[tokio::test]
     async fn explicit_model_credential_set_survives_the_environment() {
-        let _lock = CREDENTIAL_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
-        env.set(
-            "CURIE_MODEL_CREDENTIALS",
-            "model credential from environment",
-        );
-        let cfg = Installation::parse(concat!(
-            "version: 1\n",
-            "install:\n",
-            "  namespace: acme\n",
-            "  release: acme\n",
-            "credentials:\n",
-            "  model: CURIE_MODEL_CREDENTIALS\n",
-            "set:\n",
-            "  agentSandbox.runner.credentials: model credential from set\n",
-        ))
-        .expect("configuration parses");
-        let local = plan_installation(cfg, true).expect("installation plans");
+        let local = {
+            let _lock = CREDENTIAL_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let env = CredentialEnvRestore::clear(&["CURIE_MODEL_CREDENTIALS"]);
+            env.set(
+                "CURIE_MODEL_CREDENTIALS",
+                "model credential from environment",
+            );
+            let cfg = Installation::parse(concat!(
+                "version: 1\n",
+                "install:\n",
+                "  namespace: acme\n",
+                "  release: acme\n",
+                "credentials:\n",
+                "  model: CURIE_MODEL_CREDENTIALS\n",
+                "set:\n",
+                "  agentSandbox.runner.credentials: model credential from set\n",
+            ))
+            .expect("configuration parses");
+            plan_installation(cfg, true).expect("installation plans")
+        };
 
         let plan = complete_installation_plan(local)
             .await
