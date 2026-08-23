@@ -243,10 +243,15 @@ def _archive_members(payload: bytes) -> dict[str, bytes]:
 
 
 def test_workspace_clone_strips_authenticated_remote_before_first_turn(
-    workspace: Any, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """Deleting the explicit set-url must put the fake clone's token in the archive."""
 
+    # Keep this import inside the selected node.  The fix-pin gate reverses the
+    # newly introduced worker module as part of the product diff; an import in
+    # a shared fixture would turn that expected red result into an unattributed
+    # setup error instead of a failure owned by this credential-isolation test.
+    workspace = importlib.import_module("curie_worker.workspace")
     preparer, commands, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
     payload = objects.objects[prepared.object_key]
