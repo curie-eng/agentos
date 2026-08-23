@@ -2,8 +2,9 @@
 
 The three constants read the same env vars with the same compose defaults every
 test site used before consolidation (compose.dev.yaml maps Valkey to host port
-26379, password ``valkeypass``); ``connect_or_skip`` is the sync build+ping+skip
-block those sites duplicated.
+26379, password ``valkeypass``); ``connect_or_skip`` is the sync build+ping
+block those sites duplicated. Local developer loops can skip an unreachable
+Valkey, but required CI must surface the original connection error.
 """
 
 from __future__ import annotations
@@ -19,11 +20,13 @@ VALKEY_PW = os.environ.get("TEST_VALKEY_PW", "valkeypass")
 
 
 def connect_or_skip(*, decode_responses: bool = True) -> redis.Redis:
-    """A sync Valkey client against the compose stack, or ``pytest.skip``.
+    """Connect to the compose Valkey, skipping only in optional local loops.
 
     Builds a ``redis.Redis`` on the shared ``TEST_VALKEY_*`` connection params,
-    pings it, and skips the test when Valkey is unreachable. The caller owns the
-    returned client (yield it from a fixture and ``.close()`` on teardown).
+    then pings it. An unreachable Valkey skips a local test only when
+    ``CI_REQUIRE_VALKEY_TESTS`` is absent. Its presence makes the original
+    ``RedisError`` fail the required CI job instead. The caller owns the returned
+    client (yield it from a fixture and ``.close()`` on teardown).
     """
     client: redis.Redis = redis.Redis(
         host=VALKEY_HOST,
@@ -34,5 +37,7 @@ def connect_or_skip(*, decode_responses: bool = True) -> redis.Redis:
     try:
         client.ping()
     except redis.exceptions.RedisError as exc:
+        if "CI_REQUIRE_VALKEY_TESTS" in os.environ:
+            raise
         pytest.skip(f"Valkey not reachable at {VALKEY_HOST}:{VALKEY_PORT}: {exc}")
     return client
