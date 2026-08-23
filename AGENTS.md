@@ -103,7 +103,7 @@ broken.
 ```bash
 cd cli
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
