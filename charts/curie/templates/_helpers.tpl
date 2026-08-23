@@ -643,6 +643,30 @@ service:
 {{ include "curie.env.apiKey" . }}
 {{- end -}}
 
+{{/* Coalesce the worker's egress credentials and the first-party mail
+     adapter's paired credential. The chart Secret and the worker rollout
+     checksum must use this same rendered JSON so a rotation reaches both
+     sides. mailAdapter.egressSecret is the source of truth; accepting an equal
+     hand-written worker entry keeps migrations from hand-rolled manifests
+     possible, while a disagreement fails rather than deploying a reply path
+     that can only return 401. */}}
+{{- define "curie.adapterCredentials" -}}
+{{- $creds := deepCopy (.Values.worker.adapterCredentials | default dict) -}}
+{{- if .Values.mailAdapter.deploy -}}
+{{- $slug := .Values.mailAdapter.adapterSlug -}}
+{{- $derived := .Values.mailAdapter.egressSecret -}}
+{{- if hasKey $creds $slug -}}
+{{- $existing := get $creds $slug -}}
+{{- if ne $existing $derived -}}
+{{- fail (printf "worker.adapterCredentials.%s and mailAdapter.egressSecret are set to DIFFERENT values. mailAdapter.egressSecret is the source of truth for both halves of the mail adapter's egress pair: the chart derives worker.adapterCredentials.%s from it. Fix the two configuration keys to the same value. Neither value is printed here because both are live egress credentials." $slug $slug) -}}
+{{- end -}}
+{{- else -}}
+{{- $_ := set $creds $slug $derived -}}
+{{- end -}}
+{{- end -}}
+{{- $creds | toJson -}}
+{{- end -}}
+
 {{/* Heartbeat exec probes for the worker and dispatcher. Neither has an HTTP
      port, so an exec probe checks CURIE_HEARTBEAT_FILE freshness (< 30s)
      instead of hitting a port. Each Deployment sets its own heartbeat path via

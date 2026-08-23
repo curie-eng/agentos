@@ -2,7 +2,7 @@
 
 Curie (codename **Relay**) turns a Slack thread into a conversation with a
 versioned, sandboxed AI agent, and turns a git push into a deployment of that
-agent. Slack and email are the two wired channels today; both sit behind a
+agent. Slack, Discord, and email are the three wired channels today; all sit behind a
 channel-agnostic message port ([ADR 0020](docs/adr/0020-message-port-rendering-free-channel-interface.md)),
 so additional channels are additive, not a rewrite. This document is the as-built map. It covers:
 

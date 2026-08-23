@@ -1,7 +1,7 @@
 ---
 seam: Channel / ingress
 kind: SOFT
-impls: "2 (Slack, email)"
+impls: "3 (Slack, Discord, email)"
 grade: C
 vision_row: Communication
 epics:
@@ -16,7 +16,7 @@ order: 4
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 2 (Slack, email) &nbsp;·&nbsp; **Swap-readiness grade:** C
+> **Kind:** SOFT &nbsp;·&nbsp; **Implementations today:** 3 (Slack, Discord, email) &nbsp;·&nbsp; **Swap-readiness grade:** C
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -30,10 +30,11 @@ routing, concurrency, sandboxing — is opinionated core and channel-agnostic. S
 #19 the ingress payload and the per-turn reply routing are channel-neutral, so this is no
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
 binding surface too; the remaining vendor shape is on the egress semantics
-(edit-in-place streaming, plus posting and settling platform-owned cards). Two
-implementations today, Slack and email, confirm that the seam boundary is the HTTP wire
-rather than only the in-process port: `apps/mail-adapter` is a service outside the core
-that neither constructs a `QueuedTurn` nor implements `ReplySink`.
+(edit-in-place streaming, plus posting and settling platform-owned cards). Three
+implementations today, Slack, Discord, and email, confirm that the seam boundary is the
+HTTP wire rather than only the in-process port: `adapters/discord` and
+`apps/mail-adapter` are services outside the core that neither construct a `QueuedTurn`
+nor implement `ReplySink`.
 
 ## Current contract
 
@@ -105,11 +106,13 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 
 ## Implementations today
 
-Two: Slack and email.
+Three: Slack, Discord, and email.
 
 - **Slack.** Ingress is `apps/dispatcher` (Bolt / Socket Mode); egress is
   `SlackReplyAdapter` (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on
   the Slack Web API.
+- **Discord.** Ingress and egress are the separate `adapters/discord` service. It uses the
+  same channel HTTP wire and stores thread routing and delivery ids in SQLite.
 - **Email (#1515).** Ingress and egress are one process outside the core,
   `apps/mail-adapter`: it polls an AgentMail inbox and POSTs each new message to the
   platform's channel ingress under a scoped `chn` token, then serves the four neutral
@@ -141,7 +144,7 @@ Two ends and the binding surface were cleaned; what remains is egress semantics.
   Slack's `chat.update` against the message the ingress already posted, so a channel with no
   in-place edit must emulate it. That is no longer the whole egress model: the adapter also
   posts platform-owned messages such as approval cards and settles them in place afterwards.
-  Email is the second datapoint: it accumulates reply events per conversation and sends one
+  Email is another datapoint: it accumulates reply events per conversation and sends one
   threaded mail on `turn.completed`
   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not

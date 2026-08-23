@@ -32,7 +32,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, cast
 
 from curie_mail_adapter.egress import ADAPTER_SECRET_HEADER
 
@@ -231,7 +231,7 @@ class _JsonHandler(BaseHTTPRequestHandler):
 class MailHandler(_JsonHandler):
     @property
     def state(self) -> MailState:
-        return self.server.state  # type: ignore[attr-defined]
+        return cast(MailState, self.server.state)  # type: ignore[attr-defined]
 
     def _parts(self) -> list[str]:
         path = urllib.parse.urlparse(self.path).path
@@ -319,7 +319,7 @@ class MailHandler(_JsonHandler):
 class IngressHandler(_JsonHandler):
     @property
     def state(self) -> IngressState:
-        return self.server.state  # type: ignore[attr-defined]
+        return cast(IngressState, self.server.state)  # type: ignore[attr-defined]
 
     def do_POST(self) -> None:
         state = self.state

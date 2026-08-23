@@ -201,7 +201,7 @@ schema-scoped native enum (`apps/api/src/curie_api/db.py::SCHEMA`, the
 `Environment` enum). Both have portable SQLAlchemy equivalents if a
 non-Postgres target ever materializes.
 
-### 6. Communication channel (Slack and email today)
+### 6. Communication channel (Slack, Discord, and email today)
 
 **Port:** the ingress half of this seam is now clean; the egress half is where
 it stays least clean. The ingress contract was promoted out of the dispatcher
@@ -218,12 +218,14 @@ over a `TargetRoute`, with the vendor render below it in `SlackReplyAdapter`
 is that the kernel still assumes the edit-a-placeholder reply shape, so a channel
 with no editable message emulates it.
 
-**Current adapters:** two. Slack is `apps/dispatcher` (Bolt, Socket Mode) on
-ingress and `SlackReplyAdapter` on egress. Email (#1515) is `apps/mail-adapter`,
+**Current adapters:** three. Slack is `apps/dispatcher` (Bolt, Socket Mode) on
+ingress and `SlackReplyAdapter` on egress. Discord is `adapters/discord`, a
+separate service that speaks the channel HTTP wire and keeps durable thread
+routing in SQLite. Email (#1515) is `apps/mail-adapter`,
 one process outside the core that speaks only the HTTP wire: it POSTs each polled
 message to `POST /channels/turns` under a scoped `chn` token and serves the four
 reply events on its own endpoint behind `X-Curie-Adapter-Secret`, holding no
-platform key, queue credential or database access. A third channel follows
+platform key, queue credential or database access. Another channel follows
 [Building a channel adapter](guides/building-a-channel-adapter.md) and needs no
 patch to this repo.
 
@@ -260,6 +262,7 @@ increment; the interaction-primitive half is driven now by the approval interfac
 flowchart TB
     subgraph channel["Job 6: communication channel"]
         Slack["Slack via Bolt (today)"]
+        Discord["adapters/discord (today)"]
         Mail["apps/mail-adapter (email, today)"]
         CLIStub["curie local message / cluster message stub (swap proof)"]
     end
@@ -301,6 +304,8 @@ flowchart TB
     end
 
     Slack -- "QueuedTurn" --> Dispatcher
+    Discord -- "POST /channels/turns" --> API
+    Worker -- "reply events" --> Discord
     Mail -- "POST /channels/turns" --> API
     Worker -- "reply events" --> Mail
     CLIStub -- "same wire payload" --> Queue
@@ -323,12 +328,12 @@ flowchart TB
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
 | Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
 | Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; two Postgres-isms in models | Leave as is; note the `postgresql.UUID` and schema-scoped enum as the two things a non-Postgres target would touch |
-| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + the `ReplySink` four-event wire | Slack (Bolt + chat.update) and email (`apps/mail-adapter`, out of process over HTTP) | C: both ends are channel-neutral and a second implementation ships (#1515), but the kernel still assumes an edit-in-place reply, so a channel with no editable message emulates it | Give the port an explicit post-once mode, so a channel that sends one message per turn is not modelled as an edit |
+| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + the `ReplySink` four-event wire | Slack (Bolt + chat.update), Discord (`adapters/discord`), and email (`apps/mail-adapter`), with both external adapters out of process over HTTP | C: both ends are channel-neutral and three implementations ship, but the kernel still assumes an edit-in-place reply, so a channel with no editable message emulates it | Give the port an explicit post-once mode, so a channel that sends one message per turn is not modelled as an edit |
 
 ## What we deliberately do not abstract yet
 
 The second implementation teaches the interface. Communication is the one port
-above with two (Slack and email, #1515); the rest have one, and we resist
+above with three (Slack, Discord, and email); the rest have one, and we resist
 writing adapter layers ahead of a real swap demand: a speculative
 `StorageInterface` or `ChannelAdapter` would encode
 guesses about the second implementation's needs and would be wrong in the
