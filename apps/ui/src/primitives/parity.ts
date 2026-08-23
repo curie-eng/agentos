@@ -59,6 +59,16 @@ export const WIRED_ACTIONS = [
   { id: "reset-thread-cluster", label: "Reset a thread (prod)", mapping: { command: "cluster.reset-thread" } },
   { id: "reset-thread-local", label: "Reset a thread (dev)", mapping: { command: "local.reset-thread" } },
 
+  // RealTraces / RealMetrics (#866) — API-proxied observability reads. Each
+  // view selects the tier from the active console environment and resolves the
+  // exact query grammar from the generated command manifest.
+  { id: "observability-runs-cluster", label: "List runs (prod)", mapping: { command: "cluster.observability.runs" } },
+  { id: "observability-runs-local", label: "List runs (dev)", mapping: { command: "local.observability.runs" } },
+  { id: "observability-run-cluster", label: "View a run (prod)", mapping: { command: "cluster.observability.run" } },
+  { id: "observability-run-local", label: "View a run (dev)", mapping: { command: "local.observability.run" } },
+  { id: "observability-metrics-cluster", label: "Query metrics (prod)", mapping: { command: "cluster.observability.metrics" } },
+  { id: "observability-metrics-local", label: "Query metrics (dev)", mapping: { command: "local.observability.metrics" } },
+
   // Genuinely-unmapped actions: no dedicated CLI verb exists yet. These render
   // the honest amber glyph linking to the parity epic instead of a command.
   { id: "rollback", label: "Roll back to an earlier version", mapping: { noCliEquivalent: PARITY_TRACKING_ISSUE } },

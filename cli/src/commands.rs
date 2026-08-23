@@ -6418,6 +6418,12 @@ pub const MEMORY_REASON: &str =
 /// Where to run `memory` instead.
 pub const MEMORY_ALT: &str =
     "use `curie local memory <agent>` or `curie cluster memory <agent>` for a deployed agent";
+/// Why observability query verbs cannot be answered at this tier.
+pub const OBSERVABILITY_REASON: &str =
+    "the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API";
+/// Where to query observability, or how to export telemetry from a skill runner.
+pub const OBSERVABILITY_ALT: &str =
+    "use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API";
 
 /// `skill versions`: answered, but unavailable at this tier by construction.
 ///
@@ -6447,6 +6453,19 @@ pub fn skill_versions_unavailable() -> anyhow::Error {
 /// (issue #459, ADR-0041).
 pub fn skill_memory_unavailable() -> anyhow::Error {
     crate::exit::unsupported("memory", MEMORY_REASON, MEMORY_ALT)
+}
+
+/// `skill observability runs|run|metrics`: understood, but unavailable here.
+///
+/// A skill runner can emit OTLP when explicitly wired, but it does not host the
+/// API read models these query verbs intentionally use. Decline with ADR-0041's
+/// capability exit (4) rather than bypassing the API to query a backend.
+pub fn skill_observability_unavailable() -> anyhow::Error {
+    crate::exit::unsupported(
+        "observability runs|run|metrics",
+        OBSERVABILITY_REASON,
+        OBSERVABILITY_ALT,
+    )
 }
 
 /// Why `skill approvals --list`/`--resolve` cannot be answered at this tier.

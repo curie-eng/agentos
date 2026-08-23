@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/observability-metrics/v1.json",
+  "title": "curie local|cluster observability metrics --json",
+  "description": "Exactly one complete existing Curie API metrics DTO: MetricsSummary when no metric is selected, or MetricSeries when a supported metric is selected.",
+  "oneOf": [
+    {
+      "title": "MetricsSummary",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end",
+        "runs",
+        "latency_p95_ms",
+        "tokens",
+        "cost_usd",
+        "cost_known",
+        "error_rate"
+      ],
+      "properties": {
+        "start": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "runs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "latency_p95_ms": {
+          "type": "number"
+        },
+        "tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_usd": {
+          "type": "number"
+        },
+        "cost_known": {
+          "type": "boolean"
+        },
+        "error_rate": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "title": "MetricSeries",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "granularity",
+        "start",
+        "end",
+        "points"
+      ],
+      "properties": {
+        "metric": {
+          "enum": [
+            "runs",
+            "latency_p95_ms",
+            "tokens",
+            "cost_usd",
+            "error_rate"
+          ]
+        },
+        "granularity": {
+          "enum": [
+            "hour",
+            "day",
+            "week"
+          ]
+        },
+        "start": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ts",
+              "value"
+            ],
+            "properties": {
+              "ts": {
+                "type": "string"
+              },
+              "value": {
+                "type": "number"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

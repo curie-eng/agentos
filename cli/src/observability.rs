@@ -10,7 +10,12 @@
 //! resolver needs ops-private kubectl helpers, so it lives in `ops.rs` and
 //! yields these same `Endpoint` values.
 
+use anyhow::Result;
+use serde::Serialize;
 use serde_json::Value;
+
+use crate::api::{ApiClient, MetricSeries, MetricsSummary, TraceListRow, TraceTree};
+use crate::ui::{CliOutput, Ui};
 
 /// A single observability surface.
 ///
@@ -92,6 +97,218 @@ impl crate::ui::CliOutput for ObservabilityOutput {
             }
         }
     }
+}
+
+/// One bounded newest-first trace-list result. `count` is the number actually
+/// returned after defensive client-side truncation, not a backend total.
+#[derive(Debug, Serialize)]
+pub struct ObservabilityRunsOutput {
+    pub limit: usize,
+    pub count: usize,
+    pub runs: Vec<TraceListRow>,
+}
+
+impl CliOutput for ObservabilityRunsOutput {
+    fn to_json(&self) -> Value {
+        serde_json::to_value(self)
+            .unwrap_or_else(|_| serde_json::json!({"limit": self.limit, "count": 0, "runs": []}))
+    }
+
+    fn render(&self, ui: &Ui) {
+        if self.runs.is_empty() {
+            ui.payload("No runs found.");
+            return;
+        }
+        for row in &self.runs {
+            let id = row.0.get("id").and_then(Value::as_str).unwrap_or("unknown");
+            let name = row.0.get("name").and_then(Value::as_str).unwrap_or("run");
+            let timestamp = row
+                .0
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown time");
+            ui.kv(id, &format!("{timestamp}  {name}"));
+        }
+    }
+}
+
+/// One complete API `TraceTree`, serialized wholesale so correlation fields
+/// and recursively typed observation nodes cannot be projected away.
+pub struct ObservabilityRunOutput(pub TraceTree);
+
+impl CliOutput for ObservabilityRunOutput {
+    fn to_json(&self) -> Value {
+        serde_json::to_value(&self.0).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn render(&self, ui: &Ui) {
+        let rendered = serde_json::to_string_pretty(&self.0).unwrap_or_else(|_| "{}".to_string());
+        ui.payload_plain(&rendered);
+    }
+}
+
+/// Metrics queries return either of the existing API DTOs directly. The enum
+/// gives `Ui::emit` one typed result while retaining the response's direct JSON
+/// shape (there is no CLI wrapper or projection around either DTO).
+pub enum ObservabilityMetricsOutput {
+    Summary(MetricsSummary),
+    Series(MetricSeries),
+}
+
+impl CliOutput for ObservabilityMetricsOutput {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Summary(summary) => {
+                serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}))
+            }
+            Self::Series(series) => {
+                serde_json::to_value(series).unwrap_or_else(|_| serde_json::json!({}))
+            }
+        }
+    }
+
+    fn render(&self, ui: &Ui) {
+        match self {
+            Self::Summary(summary) => {
+                ui.kv("window", &format!("{} to {}", summary.start, summary.end));
+                ui.kv("runs", &summary.runs.to_string());
+                ui.kv("latency p95", &format!("{:.2} ms", summary.latency_p95_ms));
+                ui.kv("tokens", &summary.tokens.to_string());
+                let cost = if summary.cost_known {
+                    format!("${:.6}", summary.cost_usd)
+                } else {
+                    "unknown (model pricing unavailable)".to_string()
+                };
+                ui.kv("cost", &cost);
+                ui.kv("error rate", &format!("{:.2}%", summary.error_rate * 100.0));
+            }
+            Self::Series(series) => {
+                ui.kv("metric", &series.metric);
+                ui.kv("granularity", &series.granularity);
+                ui.kv("window", &format!("{} to {}", series.start, series.end));
+                for point in &series.points {
+                    ui.kv(&point.ts, &point.value.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Shared local/cluster query request. Tier-specific connection discovery is
+/// completed in `main.rs`; from here onward both siblings execute this one API
+/// client path.
+pub enum ObservabilityQuery {
+    Runs {
+        limit: usize,
+        agent_id: Option<String>,
+    },
+    Run {
+        trace_id: String,
+    },
+    Metrics {
+        metric: Option<String>,
+        granularity: String,
+        start: Option<String>,
+        end: Option<String>,
+        environment: Option<String>,
+        agent: Option<String>,
+    },
+}
+
+/// Execute one read-only observability query through the Curie platform API.
+/// The returned trait object still flows through the single `Ui::emit` success
+/// decision in `main.rs`; this function never writes a success payload itself.
+pub async fn query(
+    tier: &str,
+    api_url: &str,
+    api_key: &str,
+    query: ObservabilityQuery,
+) -> Result<Box<dyn CliOutput>> {
+    let client = ApiClient::new(api_url, api_key)?;
+    let output: Box<dyn CliOutput> = match query {
+        ObservabilityQuery::Runs { limit, agent_id } => {
+            let mut runs = client
+                .list_observability_runs(limit, agent_id.as_deref())
+                .await
+                .map_err(|error| classify_api_error(error, tier))?;
+            runs.truncate(limit);
+            let count = runs.len();
+            crate::ui::ui().note(&format!(
+                "Inspect one result with `curie {tier} observability run <trace-id>`."
+            ));
+            Box::new(ObservabilityRunsOutput { limit, count, runs })
+        }
+        ObservabilityQuery::Run { trace_id } => {
+            let run = client
+                .observability_run(&trace_id)
+                .await
+                .map_err(|error| classify_api_error(error, tier))?
+                .ok_or_else(|| {
+                    crate::exit::CliError::failure(format!(
+                        "observability trace {trace_id:?} was not found"
+                    ))
+                    .with_fix(format!(
+                        "list recent traces with `curie {tier} observability runs --limit 20`"
+                    ))
+                })?;
+            Box::new(ObservabilityRunOutput(run))
+        }
+        ObservabilityQuery::Metrics {
+            metric,
+            granularity,
+            start,
+            end,
+            environment,
+            agent,
+        } => match metric {
+            Some(metric) => Box::new(ObservabilityMetricsOutput::Series(
+                client
+                    .observability_metric_series(
+                        &metric,
+                        &granularity,
+                        start.as_deref(),
+                        end.as_deref(),
+                        environment.as_deref(),
+                        agent.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| classify_api_error(error, tier))?,
+            )),
+            None => Box::new(ObservabilityMetricsOutput::Summary(
+                client
+                    .observability_metrics_summary(
+                        start.as_deref(),
+                        end.as_deref(),
+                        environment.as_deref(),
+                        agent.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| classify_api_error(error, tier))?,
+            )),
+        },
+    };
+    Ok(output)
+}
+
+fn classify_api_error(error: anyhow::Error, tier: &str) -> anyhow::Error {
+    if !crate::exit::is_transient_reqwest(&error) {
+        return error;
+    }
+    let fix = if tier == "local" {
+        "start the local API with `curie local up`, or pass a reachable --api-url"
+    } else {
+        "verify the cluster API endpoint, or pass a reachable --api-url"
+    };
+    // Keep the tagged error as the anyhow chain head. `exit::classify` walks
+    // concrete causes to recover `CliError`; attaching it as anyhow context
+    // would instead leave a `ContextError` head and fall through to the generic
+    // reqwest retry hint, losing this tier's actionable remediation.
+    anyhow::Error::from(
+        crate::exit::CliError::transient(format!(
+            "the Curie API is unavailable for this query: {error:#}"
+        ))
+        .with_fix(fix),
+    )
 }
 
 /// Local Curie Console (browsable). Port literal lives once, here;

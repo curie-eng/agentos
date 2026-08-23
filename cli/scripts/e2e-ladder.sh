@@ -167,6 +167,22 @@ PROMPT="What is the weather in Denver right now?"
 # as a pass condition. Matching it to green is the #612 bypass.
 FAKE_SENTINEL="all done"
 
+# Fixed proof inputs for the local observability queries (#866). The trace used
+# for the positive detail read is NOT fixed here: it is discovered from the
+# bounded runs response after the rung's real turn has finalized. The all-f
+# trace keeps the negative syntactically valid while making an accidental match
+# infeasible. The explicit UTC window is captured immediately after this rung's
+# real local turn, then passed to both metrics DTOs rather than relying on their
+# default-window clock. It intentionally brackets that turn by one hour on each
+# side, giving asynchronous ingestion a bounded future edge without reaching
+# into an unrelated historical day.
+OBSERVABILITY_UNKNOWN_TRACE_ID="ffffffffffffffffffffffffffffffff"
+OBSERVABILITY_START=""
+OBSERVABILITY_END=""
+OBSERVABILITY_UNAVAILABLE_API_URL="http://127.0.0.1:1"
+OBSERVABILITY_POLL_ATTEMPTS=60
+OBSERVABILITY_POLL_INTERVAL_SECONDS=2
+
 # The component label every connector container carries, in both the skill start
 # path and the local compose overlay (cli/src/docker.rs
 # CONNECTOR_COMPONENT_LABEL). Teardown reaps by label, so this is the only
@@ -420,6 +436,346 @@ else:
         fi
         echo "$label: reply is not the fake sentinel (live negative control)"
     fi
+}
+
+# A `--json` failure is useful to an agent only when stdout contains one object
+# with exactly the centralized error contract's two non-empty string fields.
+# `json.loads` consumes the whole stream, so a second JSON document is rejected
+# as firmly as malformed or empty stdout.
+assert_observability_error_json() {
+    local label="$1" payload="$2" verdict
+    verdict="$(printf '%s' "$payload" | python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.stdin.read())
+except Exception as exc:
+    print("invalid JSON: %s" % exc)
+    sys.exit(0)
+if not isinstance(value, dict):
+    print("top level is not an object")
+elif set(value) != {"error", "fix"}:
+    print("keys are %s" % sorted(value))
+elif not isinstance(value["error"], str) or not value["error"].strip():
+    print("error is not a non-empty string")
+elif not isinstance(value["fix"], str) or not value["fix"].strip():
+    print("fix is not a non-empty string")
+else:
+    print("ok")
+' || echo "validator failed")"
+    if [[ "$verdict" != "ok" ]]; then
+        echo "$label: expected exactly one JSON object with non-empty error and fix fields; $verdict." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    fi
+}
+
+# Capture one bounded, explicit UTC window after the local message has
+# finalized. Python's standard library keeps this portable across GNU/BSD date
+# implementations; it is already a required dependency for this script's JSON
+# assertions. One capture is shared by summary and series so their transcript
+# and result windows remain directly comparable.
+derive_observability_window() {
+    local window
+    if ! window="$(python3 -c '
+from datetime import datetime, timedelta, timezone
+
+now = datetime.now(timezone.utc).replace(microsecond=0)
+start = now - timedelta(hours=1)
+end = now + timedelta(hours=1)
+print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
+')"; then
+        echo "local observability metrics: could not derive the explicit UTC window." >&2
+        return 1
+    fi
+    read -r OBSERVABILITY_START OBSERVABILITY_END <<< "$window"
+    if [[ -z "$OBSERVABILITY_START" || -z "$OBSERVABILITY_END" ]]; then
+        echo "local observability metrics: derived an incomplete explicit UTC window." >&2
+        return 1
+    fi
+    echo "local observability metrics: captured explicit UTC window $OBSERVABILITY_START through $OBSERVABILITY_END around the just-completed local turn"
+}
+
+# Langfuse ingestion is asynchronous to turn finalization. Poll through the
+# candidate CLI, never its backing API, and accept only a one-row bounded result
+# for this rung's agent. The returned id is the sole input to the detail read;
+# no latest shortcut or message-output parsing duplicates #1664.
+discover_local_observability_trace() {
+    local agent_id="$1" attempt out code verdict state detail
+    DISCOVERED_OBSERVABILITY_TRACE_ID=""
+    for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
+        out="$("$BIN" --json local observability runs --limit 1)" && code=0 || code=$?
+        if (( code != 0 )); then
+            echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        verdict="$(printf '%s' "$out" | python3 -c '
+import json, re, sys
+agent_id = sys.argv[1]
+try:
+    value = json.loads(sys.stdin.read())
+except Exception as exc:
+    print("invalid")
+    print("expected exactly one JSON object: %s" % exc)
+    sys.exit(0)
+if not isinstance(value, dict):
+    print("invalid")
+    print("top level is not an object")
+    sys.exit(0)
+runs = value.get("runs")
+limit = value.get("limit")
+count = value.get("count")
+if isinstance(limit, bool) or limit != 1:
+    print("invalid")
+    print("limit is not the requested bound of 1")
+elif not isinstance(runs, list) or len(runs) > 1:
+    print("invalid")
+    print("runs is not an array bounded to at most one row")
+elif isinstance(count, bool) or not isinstance(count, int) or count != len(runs):
+    print("invalid")
+    print("count does not equal the bounded row count")
+elif not runs:
+    print("pending")
+    print("no ingested run yet")
+else:
+    row = runs[0]
+    trace_id = row.get("id") if isinstance(row, dict) else None
+    name = row.get("name") if isinstance(row, dict) else None
+    if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
+        print("invalid")
+        print("run id is absent or not a safe trace id")
+    elif not isinstance(name, str):
+        print("invalid")
+        print("run name is not a string")
+    elif "agent-" + agent_id not in name:
+        print("pending")
+        print("newest ingested run belongs to a different agent")
+    else:
+        print("ok")
+        print(trace_id)
+' "$agent_id" || printf '%s\n%s\n' invalid 'validator failed')"
+        detail="${verdict#*$'\n'}"
+        state="${verdict%%$'\n'*}"
+        case "$state" in
+            ok)
+                DISCOVERED_OBSERVABILITY_TRACE_ID="${detail%%$'\n'*}"
+                printf '%s\n' "$out"
+                echo "local observability runs: bounded result discovered trace $DISCOVERED_OBSERVABILITY_TRACE_ID after $attempt ingestion poll(s)"
+                return 0
+                ;;
+            pending)
+                if (( attempt < OBSERVABILITY_POLL_ATTEMPTS )); then
+                    sleep "$OBSERVABILITY_POLL_INTERVAL_SECONDS"
+                fi
+                ;;
+            *)
+                echo "local observability runs: $detail." >&2
+                printf '%s\n' "$out" >&2
+                return 1
+                ;;
+        esac
+    done
+    echo "local observability runs: no run for agent $agent_id was ingested after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
+    return 1
+}
+
+assert_local_observability_detail() {
+    local trace_id="$1" payload="$2" verdict
+    verdict="$(printf '%s' "$payload" | python3 -c '
+import json, sys
+expected = sys.argv[1]
+try:
+    value = json.loads(sys.stdin.read())
+except Exception as exc:
+    print("expected exactly one JSON object: %s" % exc)
+    sys.exit(0)
+trace = value.get("trace") if isinstance(value, dict) else None
+tree = value.get("tree") if isinstance(value, dict) else None
+def valid_node(node):
+    if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not isinstance(node.get("type"), str):
+        return False
+    for key in ("name", "startTime", "model"):
+        if node.get(key) is not None and not isinstance(node.get(key), str):
+            return False
+    if node.get("usageDetails") is not None and not isinstance(node.get("usageDetails"), dict):
+        return False
+    children = node.get("children")
+    return isinstance(children, list) and all(valid_node(child) for child in children)
+if not isinstance(trace, dict) or trace.get("id") != expected:
+    print("trace object does not carry the discovered id")
+elif not isinstance(trace.get("name"), str):
+    print("trace name is not a string")
+elif not isinstance(tree, list):
+    print("observation tree is not an array")
+elif not all(valid_node(node) for node in tree):
+    print("observation tree does not match the recursive typed node shape")
+elif "sandbox_id" not in value or value["sandbox_id"] is not None and not isinstance(value["sandbox_id"], str):
+    print("sandbox_id correlation field is absent or mistyped")
+elif "approval_decision" not in value or value["approval_decision"] is not None and not isinstance(value["approval_decision"], str):
+    print("approval_decision correlation field is absent or mistyped")
+else:
+    print("ok %d" % len(tree))
+' "$trace_id" || echo "validator failed")"
+    if [[ "$verdict" != ok\ * ]]; then
+        echo "local observability run: $verdict." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    fi
+    echo "local observability run: fetched complete trace $trace_id with ${verdict#ok } root observation(s) and both correlation fields"
+}
+
+assert_local_observability_summary() {
+    local payload="$1" verdict
+    verdict="$(printf '%s' "$payload" | python3 -c '
+import datetime, json, sys
+expected_start, expected_end = sys.argv[1:3]
+def instant(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp is not a string")
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+try:
+    value = json.loads(sys.stdin.read())
+    if not isinstance(value, dict):
+        raise ValueError("top level is not an object")
+    if instant(value.get("start")) != instant(expected_start) or instant(value.get("end")) != instant(expected_end):
+        raise ValueError("summary window differs from the explicit UTC window")
+    for key in ("runs", "tokens"):
+        if isinstance(value.get(key), bool) or not isinstance(value.get(key), int) or value[key] < 0:
+            raise ValueError("%s is not a non-negative integer" % key)
+    if value["runs"] < 1:
+        raise ValueError("summary has no run in the window around the just-completed local turn")
+    for key in ("latency_p95_ms", "cost_usd", "error_rate"):
+        if isinstance(value.get(key), bool) or not isinstance(value.get(key), (int, float)):
+            raise ValueError("%s is not numeric" % key)
+    if not isinstance(value.get("cost_known"), bool):
+        raise ValueError("cost_known is not boolean")
+except Exception as exc:
+    print(str(exc))
+else:
+    print("ok %d %d %s" % (value["runs"], value["tokens"], str(value["cost_known"]).lower()))
+' "$OBSERVABILITY_START" "$OBSERVABILITY_END" || echo "validator failed")"
+    if [[ "$verdict" != ok\ * ]]; then
+        echo "local observability metrics summary: expected one complete typed summary object; $verdict." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    fi
+    local fields="${verdict#ok }" runs tokens cost_known
+    read -r runs tokens cost_known <<< "$fields"
+    echo "local observability metrics summary: typed UTC-window result runs=$runs tokens=$tokens cost_known=$cost_known"
+}
+
+assert_local_observability_series() {
+    local payload="$1" verdict
+    verdict="$(printf '%s' "$payload" | python3 -c '
+import datetime, json, sys
+expected_start, expected_end = sys.argv[1:3]
+def instant(value):
+    if not isinstance(value, str):
+        raise ValueError("timestamp is not a string")
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+try:
+    value = json.loads(sys.stdin.read())
+    if not isinstance(value, dict):
+        raise ValueError("top level is not an object")
+    if value.get("metric") != "runs" or value.get("granularity") != "hour":
+        raise ValueError("series does not report metric=runs and granularity=hour")
+    if instant(value.get("start")) != instant(expected_start) or instant(value.get("end")) != instant(expected_end):
+        raise ValueError("series window differs from the explicit UTC window")
+    points = value.get("points")
+    if not isinstance(points, list):
+        raise ValueError("points is not an array")
+    if not points:
+        raise ValueError("runs/hour series has no point for the just-completed local turn")
+    observed_run = False
+    for point in points:
+        if not isinstance(point, dict):
+            raise ValueError("a metric point is not an object")
+        instant(point.get("ts"))
+        number = point.get("value")
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            raise ValueError("a metric point value is not numeric")
+        observed_run = observed_run or number != 0
+    if not observed_run:
+        raise ValueError("runs/hour series has no non-zero point for the just-completed local turn")
+except Exception as exc:
+    print(str(exc))
+else:
+    print("ok %d" % len(points))
+' "$OBSERVABILITY_START" "$OBSERVABILITY_END" || echo "validator failed")"
+    if [[ "$verdict" != ok\ * ]]; then
+        echo "local observability metrics runs/hour series: expected one complete typed series object; $verdict." >&2
+        printf '%s\n' "$payload" >&2
+        return 1
+    fi
+    echo "local observability metrics runs/hour series: typed UTC-window result with ${verdict#ok } point(s), including a non-zero run"
+}
+
+prove_local_observability_queries() {
+    local agent_id="$1" out code trace_id
+
+    derive_observability_window
+
+    echo
+    echo "=== curie local observability runs --json (bounded ingestion poll) ==="
+    discover_local_observability_trace "$agent_id"
+    trace_id="$DISCOVERED_OBSERVABILITY_TRACE_ID"
+
+    echo
+    echo "=== curie local observability run --json (discovered trace) ==="
+    out="$("$BIN" --json local observability run "$trace_id")" && code=0 || code=$?
+    if (( code != 0 )); then
+        echo "local observability run: discovered trace detail exited $code, expected 0." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+    assert_local_observability_detail "$trace_id" "$out"
+
+    echo
+    echo "=== curie local observability metrics --json (explicit UTC window) ==="
+    out="$("$BIN" --json local observability metrics --start "$OBSERVABILITY_START" --end "$OBSERVABILITY_END")" && code=0 || code=$?
+    if (( code != 0 )); then
+        echo "local observability metrics summary: query exited $code, expected 0." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+    assert_local_observability_summary "$out"
+
+    echo
+    echo "=== curie local observability metrics --json (runs/hour series) ==="
+    out="$("$BIN" --json local observability metrics --metric runs --granularity hour --start "$OBSERVABILITY_START" --end "$OBSERVABILITY_END")" && code=0 || code=$?
+    if (( code != 0 )); then
+        echo "local observability metrics runs/hour series: query exited $code, expected 0." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+    assert_local_observability_series "$out"
+
+    echo
+    echo "=== curie local observability run --json (unknown trace negative) ==="
+    out="$("$BIN" --json local observability run "$OBSERVABILITY_UNKNOWN_TRACE_ID")" && code=0 || code=$?
+    if (( code != 1 )); then
+        echo "local observability unknown trace: expected exit 1, got $code." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+    assert_observability_error_json "local observability unknown trace" "$out"
+    echo "local observability unknown trace: exit 1 with exactly one {error,fix} JSON object"
+
+    echo
+    echo "=== curie local observability runs --json (unavailable API negative) ==="
+    out="$(CURIE_API_URL="$OBSERVABILITY_UNAVAILABLE_API_URL" "$BIN" --json local observability runs --limit 1)" && code=0 || code=$?
+    if (( code != 3 )); then
+        echo "local observability unavailable API: expected exit 3, got $code." >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+    assert_observability_error_json "local observability unavailable API" "$out"
+    echo "local observability unavailable API: exit 3 with exactly one {error,fix} JSON object"
 }
 
 # Cross-rung artifact identity. The digest identifies the ARCHIVE a tier
@@ -2309,12 +2665,11 @@ rung_local() {
     else
         echo
         local up_args=(local up)
-        if (( ! LOCAL_OTEL_SINK_ACTIVE )) && [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
-            up_args+=(--minimal)
-        fi
         echo "=== curie ${up_args[*]} ==="
-        # Ordinary bundles use the core profile. A trajectory sidecar selects the
-        # full profile because its matrix read requires Langfuse.
+        # The observability query proof below reads traces and metrics through
+        # the Curie API. Those routes require Langfuse/ClickHouse, so every
+        # local rung now uses the full profile, including an ordinary suite
+        # with no trajectory sidecar.
         #
         # Claim ownership BEFORE starting, never after: `local up` blocks for
         # seconds while it waits for health, and containers exist for that whole
@@ -2413,6 +2768,8 @@ rung_local() {
         assert_local_otel_healthy_turn "$healthy_before"
         case_local_otel_runner_failure
     fi
+
+    prove_local_observability_queries "$agent_id"
 
     echo
     echo "=== curie local eval --dry-run (suite parity) ==="

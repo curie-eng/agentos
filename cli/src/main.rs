@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use curie::api;
 use curie::artifacts;
 use curie::commands::{
@@ -91,6 +91,230 @@ struct ClusterConn {
     release: String,
 }
 
+/// Local API connection flags shared by every observability query leaf. They
+/// intentionally live on the leaves: bare `local observability` remains the
+/// existing URL printer and does not grow a transport contract.
+#[derive(Args, Debug, Clone)]
+struct LocalObservabilityConn {
+    /// Platform API base URL.
+    #[arg(
+        long,
+        default_value = message::DEFAULT_LOCAL_API_URL,
+        env = "CURIE_API_URL"
+    )]
+    api_url: String,
+    /// Platform API key.
+    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+    api_key: String,
+}
+
+/// Explicit cluster API overrides shared by every observability query leaf.
+/// Namespace and release stay on the parent `cluster observability` command so
+/// discovery and the bare surface report always target the same release.
+#[derive(Args, Debug, Clone)]
+struct ClusterObservabilityConn {
+    /// Platform API base URL. Omit to discover the release's UI `/api` proxy.
+    #[arg(long, env = "CURIE_API_URL")]
+    api_url: Option<String>,
+    /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
+    #[arg(long, env = "CURIE_API_KEY")]
+    api_key: Option<String>,
+}
+
+fn parse_observability_limit(raw: &str) -> std::result::Result<usize, String> {
+    let limit = raw
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 through 100".to_string())?;
+    if (1..=100).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err("limit must be from 1 through 100".to_string())
+    }
+}
+
+/// Shared list filters and defaults for the local and cluster sibling leaves.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityRunsArgs {
+    /// Maximum newest-first trace rows to return (1-100).
+    #[arg(long, default_value = "20", value_parser = parse_observability_limit)]
+    limit: usize,
+    /// Restrict traces to one agent id.
+    #[arg(long)]
+    agent_id: Option<String>,
+}
+
+/// Shared detail selector for the local and cluster sibling leaves.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityRunArgs {
+    /// Trace id previously returned by `observability runs` or a completed turn.
+    #[arg(value_parser = api::parse_trace_id)]
+    trace_id: String,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ObservabilityMetric {
+    Runs,
+    #[value(name = "latency_p95_ms")]
+    LatencyP95Ms,
+    Tokens,
+    #[value(name = "cost_usd")]
+    CostUsd,
+    #[value(name = "error_rate")]
+    ErrorRate,
+}
+
+impl ObservabilityMetric {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::LatencyP95Ms => "latency_p95_ms",
+            Self::Tokens => "tokens",
+            Self::CostUsd => "cost_usd",
+            Self::ErrorRate => "error_rate",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ObservabilityGranularity {
+    Hour,
+    Day,
+    Week,
+}
+
+impl ObservabilityGranularity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// Shared metrics filters for both tiers. `--granularity` applies only to a
+/// series; omitting it with `--metric` resolves to `day` before the API call.
+#[derive(Args, Debug, Clone)]
+struct ObservabilityMetricsArgs {
+    /// Return a time series for this metric; omit for the scalar summary.
+    #[arg(long, value_enum)]
+    metric: Option<ObservabilityMetric>,
+    /// Series bucket size. Defaults to day when --metric is present.
+    #[arg(long, value_enum)]
+    granularity: Option<ObservabilityGranularity>,
+    /// Inclusive ISO 8601 window start.
+    #[arg(long)]
+    start: Option<String>,
+    /// Exclusive ISO 8601 window end.
+    #[arg(long)]
+    end: Option<String>,
+    /// Restrict metrics to one deployment environment.
+    #[arg(long)]
+    environment: Option<String>,
+    /// Restrict metrics to one agent name.
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+impl ObservabilityMetricsArgs {
+    fn into_query(self) -> Result<curie::observability::ObservabilityQuery> {
+        if self.metric.is_none() && self.granularity.is_some() {
+            return Err(curie::exit::usage(
+                "--granularity requires --metric because summaries are not bucketed",
+            ));
+        }
+        Ok(curie::observability::ObservabilityQuery::Metrics {
+            metric: self.metric.map(|metric| metric.as_str().to_string()),
+            granularity: self
+                .granularity
+                .unwrap_or(ObservabilityGranularity::Day)
+                .as_str()
+                .to_string(),
+            start: self.start,
+            end: self.end,
+            environment: self.environment,
+            agent: self.agent,
+        })
+    }
+}
+
+/// Local query grammar. Only the connection block differs from the cluster
+/// enum below; every behavioral flag is one of the shared argument structs.
+#[derive(Subcommand, Debug, Clone)]
+enum LocalObservabilityQuery {
+    /// List recent runs, newest first.
+    Runs {
+        #[command(flatten)]
+        query: ObservabilityRunsArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+    /// Read one complete run by trace id.
+    Run {
+        #[command(flatten)]
+        query: ObservabilityRunArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+    /// Read the metrics summary or one bounded metric series.
+    Metrics {
+        #[command(flatten)]
+        query: ObservabilityMetricsArgs,
+        #[command(flatten)]
+        conn: LocalObservabilityConn,
+    },
+}
+
+/// Cluster query grammar. Explicit URL/key values bypass discovery; omitted
+/// values use the same namespace/release discovery as other cluster reads.
+#[derive(Subcommand, Debug, Clone)]
+enum ClusterObservabilityQuery {
+    /// List recent runs, newest first.
+    Runs {
+        #[command(flatten)]
+        query: ObservabilityRunsArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+    /// Read one complete run by trace id.
+    Run {
+        #[command(flatten)]
+        query: ObservabilityRunArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+    /// Read the metrics summary or one bounded metric series.
+    Metrics {
+        #[command(flatten)]
+        query: ObservabilityMetricsArgs,
+        #[command(flatten)]
+        conn: ClusterObservabilityConn,
+    },
+}
+
+/// Skill-tier query grammar. The leaves deliberately accept the same query
+/// selectors as the platform tiers so a caller gets the tier-capability answer
+/// (exit 4) instead of an "unknown command" usage error. They never execute a
+/// query: the skill tier has no platform API to read from.
+#[derive(Subcommand, Debug, Clone)]
+enum SkillObservabilityQuery {
+    /// Explain why recent runs cannot be queried at the skill tier.
+    Runs {
+        #[command(flatten)]
+        _query: ObservabilityRunsArgs,
+    },
+    /// Explain why a run cannot be queried by trace id at the skill tier.
+    Run {
+        #[command(flatten)]
+        _query: ObservabilityRunArgs,
+    },
+    /// Explain why metrics cannot be queried at the skill tier.
+    Metrics {
+        #[command(flatten)]
+        _query: ObservabilityMetricsArgs,
+    },
+}
+
 /// An agent-target cluster verb (`versions`/`memory`/`approvals`): the agent plus
 /// the discoverable [`ClusterConn`] and a `--dry-run`. The cluster analogue of
 /// `AgentTarget<LocalTier>`, which keeps its localhost defaults for the local tier.
@@ -124,6 +348,59 @@ async fn resolve_cluster_conn(conn: ClusterConn) -> anyhow::Result<(String, Stri
         None => ops::discover_api_key(&namespace, &release).await?,
     };
     Ok((api_url, api_key))
+}
+
+async fn run_local_observability_query(
+    action: LocalObservabilityQuery,
+) -> Result<Box<dyn curie::ui::CliOutput>> {
+    let (conn, query) = match action {
+        LocalObservabilityQuery::Runs { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Runs {
+                limit: query.limit,
+                agent_id: query.agent_id,
+            },
+        ),
+        LocalObservabilityQuery::Run { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Run {
+                trace_id: query.trace_id,
+            },
+        ),
+        LocalObservabilityQuery::Metrics { query, conn } => (conn, query.into_query()?),
+    };
+    curie::observability::query("local", &conn.api_url, &conn.api_key, query).await
+}
+
+async fn run_cluster_observability_query(
+    action: ClusterObservabilityQuery,
+    namespace: String,
+    release: String,
+) -> Result<Box<dyn curie::ui::CliOutput>> {
+    let (conn, query) = match action {
+        ClusterObservabilityQuery::Runs { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Runs {
+                limit: query.limit,
+                agent_id: query.agent_id,
+            },
+        ),
+        ClusterObservabilityQuery::Run { query, conn } => (
+            conn,
+            curie::observability::ObservabilityQuery::Run {
+                trace_id: query.trace_id,
+            },
+        ),
+        ClusterObservabilityQuery::Metrics { query, conn } => (conn, query.into_query()?),
+    };
+    let (api_url, api_key) = resolve_cluster_conn(ClusterConn {
+        api_url: conn.api_url,
+        api_key: conn.api_key,
+        namespace,
+        release,
+    })
+    .await?;
+    curie::observability::query("cluster", &api_url, &api_key, query).await
 }
 
 /// clap `value_parser` for every `--local-model` (#1254). All four sites carry the
@@ -751,6 +1028,14 @@ enum SkillAction {
         commands::MEMORY_REASON, commands::MEMORY_ALT,
     ))]
     Memory,
+    #[command(about = format!(
+        "Not available at this tier: {}; {}",
+        commands::OBSERVABILITY_REASON, commands::OBSERVABILITY_ALT,
+    ))]
+    Observability {
+        #[command(subcommand)]
+        _query: SkillObservabilityQuery,
+    },
     /// Stop and remove the local runner container.
     Down {
         /// Container name to remove. Defaults to the recorded runner, then to
@@ -1222,6 +1507,10 @@ enum LocalAction {
     },
     /// Show the local observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
+        /// Query platform observability data through the Curie API. Omit to
+        /// preserve the existing URL/surface report.
+        #[command(subcommand)]
+        query: Option<LocalObservabilityQuery>,
         /// Also open the browsable surfaces in a browser. Off by default: the URLs
         /// are printed and nothing is opened unless --open is passed, and --json
         /// never opens a browser.
@@ -1538,11 +1827,15 @@ enum ClusterAction {
     },
     /// Show the release's observability surfaces (Curie Console + Langfuse traces/cost + API base).
     Observability {
+        /// Query platform observability data through the Curie API. Omit to
+        /// preserve the existing URL/surface report.
+        #[command(subcommand)]
+        query: Option<ClusterObservabilityQuery>,
         /// Kubernetes namespace.
-        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+        #[arg(long, global = true, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
         /// Helm release name.
-        #[arg(long, default_value = "curie")]
+        #[arg(long, global = true, default_value = "curie")]
         release: String,
         /// Print the read-only discovery commands that would run and exit.
         #[arg(long)]
@@ -2113,6 +2406,13 @@ fn emit<T: curie::ui::CliOutput>(out: T) -> Result<()> {
     Ok(())
 }
 
+/// Trait-object counterpart used by the shared observability query handler,
+/// whose three leaves intentionally return different concrete output types.
+fn emit_boxed(out: Box<dyn curie::ui::CliOutput>) -> Result<()> {
+    ui::ui().emit(out.as_ref());
+    Ok(())
+}
+
 /// Dispatch one parsed command. No subcommand opens the interactive terminal,
 /// matching `curie interactive` / `curie ui`. Returns the command's
 /// `Result`; `main`
@@ -2315,6 +2615,7 @@ async fn run(command: Option<Command>) -> Result<()> {
             // the verb reports why and exits 4 (issue #459, ADR-0041).
             SkillAction::Versions => Err(commands::skill_versions_unavailable()),
             SkillAction::Memory => Err(commands::skill_memory_unavailable()),
+            SkillAction::Observability { .. } => Err(commands::skill_observability_unavailable()),
             SkillAction::Down { name } => commands::stop(name, std::path::Path::new(".")).await,
             SkillAction::Status { url } => commands::status(url).await,
             SkillAction::Message {
@@ -2680,7 +2981,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                 )
                 .await?,
             ),
-            LocalAction::Observability { open } => emit(commands::observability(open).await?),
+            LocalAction::Observability { query, open } => match query {
+                None => emit(commands::observability(open).await?),
+                Some(_) if open => Err(curie::exit::usage(
+                    "--open cannot be combined with an observability query",
+                )),
+                Some(query) => emit_boxed(run_local_observability_query(query).await?),
+            },
             LocalAction::Overrides {
                 agent,
                 model,
@@ -2906,21 +3213,33 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
             ClusterAction::Observability {
+                query,
                 namespace,
                 release,
                 dry_run,
                 open,
-            } => emit(
-                ops::observability(
-                    CommonOpts {
-                        namespace,
-                        release,
-                        dry_run,
-                    },
-                    open,
-                )
-                .await?,
-            ),
+            } => match query {
+                None => emit(
+                    ops::observability(
+                        CommonOpts {
+                            namespace,
+                            release,
+                            dry_run,
+                        },
+                        open,
+                    )
+                    .await?,
+                ),
+                Some(_) if open => Err(curie::exit::usage(
+                    "--open cannot be combined with an observability query",
+                )),
+                Some(_) if dry_run => Err(curie::exit::usage(
+                    "--dry-run applies to bare cluster observability discovery, not API queries",
+                )),
+                Some(query) => {
+                    emit_boxed(run_cluster_observability_query(query, namespace, release).await?)
+                }
+            },
             ClusterAction::MigrateStore {
                 phase,
                 namespace,
@@ -4800,7 +5119,7 @@ mod tests {
             .command
         {
             Some(Command::Local {
-                action: LocalAction::Observability { open },
+                action: LocalAction::Observability { open, .. },
             }) => assert!(!open, "--open must default to false"),
             _ => panic!("expected local observability command"),
         }
@@ -4810,7 +5129,7 @@ mod tests {
             .command
         {
             Some(Command::Local {
-                action: LocalAction::Observability { open },
+                action: LocalAction::Observability { open, .. },
             }) => assert!(open, "--open must parse to true"),
             _ => panic!("expected local observability command"),
         }
@@ -4829,6 +5148,7 @@ mod tests {
                         release,
                         dry_run,
                         open,
+                        ..
                     },
             }) => {
                 assert_eq!(namespace, "curie");
