@@ -157,6 +157,14 @@ if clone_volume is None or clone_volume.get("emptyDir", {}).get("sizeLimit") != 
 worker_container = containers(worker)[0]
 if not any(m.get("name") == "workspace-clone" for m in worker_container.get("volumeMounts", [])):
     fail("worker must mount the workspace-clone volume")
+worker_env = env_map(worker_container)
+for name, expected in {
+    "CURIE_WORKSPACE_MAX_CHECKOUT_BYTES": "536870912",
+    "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES": "268435456",
+}.items():
+    rendered = worker_env.get(name, {}).get("value")
+    if rendered != expected:
+        fail(f"{name} must render as a decimal integer, got {rendered!r}")
 expected_worker_resources = {
     "requests": {"cpu": "500m", "memory": "512Mi", "ephemeral-storage": "2Gi"},
     "limits": {"cpu": "2", "memory": "1Gi", "ephemeral-storage": "8Gi"},
