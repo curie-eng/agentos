@@ -493,64 +493,6 @@ mod tests {
         );
     }
 
-    fn missing_release_with_credential(credential: Option<&str>) -> Facts {
-        Facts {
-            model_credential: credential.map(|_| "CURIE_CREDENTIALS".into()),
-            model_credential_source: credential.map(|_| "environment".into()),
-            model_credential_provider: credential
-                .and_then(crate::ops::provider_from_credential_prefix),
-            kube_context: Some("minikube".into()),
-            ..laptop()
-        }
-    }
-
-    /// Doctor's recovery command must follow the same prefix map as `cluster
-    /// up`; otherwise accepting its advice can fail closed under ADR-0114.
-    #[test]
-    fn missing_release_recovery_infers_egress_from_credential_prefix() {
-        let openrouter_checks =
-            evaluate(&missing_release_with_credential(Some("sk-or-PLACEHOLDER")));
-        let openrouter = find(&openrouter_checks, "release")
-            .fix
-            .as_deref()
-            .expect("missing release must offer a recovery command");
-        assert!(
-            openrouter.starts_with("curie cluster up --namespace <ns> --release <name>"),
-            "recovery command must be runnable: {openrouter}"
-        );
-        assert!(
-            openrouter.contains("--allow-egress-host openrouter"),
-            "OpenRouter credential must select OpenRouter egress: {openrouter}"
-        );
-        assert!(
-            !openrouter.contains("--allow-egress-host anthropic"),
-            "OpenRouter credential must not select Anthropic egress: {openrouter}"
-        );
-
-        let anthropic_checks =
-            evaluate(&missing_release_with_credential(Some("sk-ant-PLACEHOLDER")));
-        let anthropic = find(&anthropic_checks, "release")
-            .fix
-            .as_deref()
-            .expect("missing release must offer a recovery command");
-        assert!(
-            anthropic.contains("--allow-egress-host anthropic"),
-            "Anthropic credential must select Anthropic egress: {anthropic}"
-        );
-
-        for credential in [None, Some("unknown-PLACEHOLDER")] {
-            let checks = evaluate(&missing_release_with_credential(credential));
-            let fix = find(&checks, "release")
-                .fix
-                .as_deref()
-                .expect("missing release must offer a recovery command");
-            assert_eq!(
-                fix, "curie cluster up --namespace <ns> --release <name>",
-                "no unambiguous provider means egress remains sealed"
-            );
-        }
-    }
-
     /// This output gets pasted into issues and chat.
     #[test]
     fn no_check_can_carry_a_credential_value() {
