@@ -208,6 +208,10 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
 - **Reference the issue in the PR body** with `Closes #123` (or `Ref #123`). Do
   not put the issue number in the PR or commit title; use a plain descriptive
   title.
+- **Use real line breaks in the PR body**. The PR body guard rejects escaped
+  newline sequences because GitHub treats them as text, which makes closing
+  keywords inert. Before opening or editing a PR, run
+  `scripts/check-pr-body.sh <body-file>`.
 - **No dashes or emdashes in prose; no emojis** in code or docs.
 - **Never mention any AI assistant** (or AI in general) in commit messages, and
   never add `Co-Authored-By` lines referencing an AI.

@@ -553,6 +553,93 @@ def _tokens_of(filename: str, job_id: str, step_name: str) -> list[str]:
     ]
 
 
+def _pull_request_body_workflow_steps() -> list[dict[str, Any]]:
+    """Return the dedicated PR-body workflow's steps, rejecting a CI transplant.
+
+    This guard is intentionally rooted in the separate workflow GitHub runs for
+    pull-request body edits. `ci.yaml` only runs on commits, so placing the
+    checker there would leave a post-CI body edit unchecked.
+    """
+    workflows = _load_workflows()
+    assert "pr-body.yaml" in workflows, (
+        "the dedicated PR-body workflow is missing. Do not move this guard into "
+        "ci.yaml: GitHub can edit a pull request body without creating a commit."
+    )
+    assert "check-pr-body.sh" not in (
+        WORKFLOWS_DIR / "ci.yaml"
+    ).read_text(encoding="utf-8"), (
+        "the PR-body guard must remain independent of ci.yaml, whose commit-driven "
+        "runs cannot observe a body-only edit."
+    )
+    jobs = workflows["pr-body.yaml"].get("jobs")
+    assert isinstance(jobs, dict), "pr-body.yaml must declare the PR-body guard job"
+    job = jobs.get("pr-body")
+    assert isinstance(job, dict), "pr-body.yaml must retain its dedicated `pr-body` job"
+    steps = job.get("steps")
+    assert isinstance(steps, list), "the dedicated `pr-body` job must have steps"
+    return [step for step in steps if isinstance(step, dict)]
+
+
+def test_pr_body_guard_workflow_handles_body_only_pull_request_edits() -> None:
+    """Pin #1713's runner wiring over the real workflow GitHub executes.
+
+    A unit test of the shell matcher is not enough: the historical failure was a
+    PR body containing literal ``\\n`` characters, and GitHub can create that
+    failure through `edited` without starting commit-triggered CI. The test
+    therefore checks the dedicated event wiring, safe github-script byte write,
+    checker self-test, and the event-payload invocation as one executable
+    contract. Removing any link makes this test red.
+    """
+    workflow = _load_workflows()["pr-body.yaml"]
+    trigger = workflow.get(True, workflow.get("on"))
+    assert isinstance(trigger, dict), "pr-body.yaml must be triggered by `pull_request`"
+    pull_request = trigger.get("pull_request")
+    assert isinstance(pull_request, dict), "pr-body.yaml must configure pull_request events"
+    assert set(pull_request.get("types") or []) == {
+        "opened",
+        "reopened",
+        "synchronize",
+        "edited",
+    }, (
+        "the PR-body guard must run on opened, reopened, synchronize, and edited. "
+        "In particular, `edited` closes the body-only bypass that ci.yaml cannot see."
+    )
+
+    steps = _pull_request_body_workflow_steps()
+    script_steps = [
+        step
+        for step in steps
+        if isinstance(step.get("uses"), str)
+        and step["uses"].split("@", 1)[0] == "actions/github-script"
+    ]
+    assert len(script_steps) == 1, "the PR payload must be serialized by one github-script step"
+    script_step = script_steps[0]
+    assert script_step.get("env", {}).get("PR_BODY_FILE") == (
+        "${{ runner.temp }}/curie-pr-body.md"
+    ), "github-script must write only to a runner-owned temporary file"
+    script = script_step.get("with", {}).get("script")
+    assert isinstance(script, str), "github-script must contain the payload serialization script"
+    assert "context.payload.pull_request?.body ?? \"\"" in script
+    assert "fs.writeFileSync(process.env.PR_BODY_FILE, body" in script
+    assert "github.event.pull_request.body" not in script, (
+        "untrusted PR text must be read from context.payload, not interpolated into script source"
+    )
+
+    run_bodies = [step.get("run") for step in steps if isinstance(step.get("run"), str)]
+    assert "bash scripts/check-pr-body.sh --self-test" in run_bodies, (
+        "the workflow must execute the matcher's self-test before guarding event data"
+    )
+    guard_runs = [
+        body
+        for body in run_bodies
+        if isinstance(body, str) and 'bash scripts/check-pr-body.sh "$PR_BODY_FILE"' in body
+    ]
+    assert len(guard_runs) == 1, "the event check must pass the runner temp file to the guard"
+    assert "${{ github.event.pull_request.body }}" not in guard_runs[0], (
+        "the guard must receive the temporary file, never an interpolated PR body"
+    )
+
+
 def _render(entries: list[Identity]) -> str:
     return "\n".join(f"  {filename} :: {job} :: {name}" for filename, job, name in sorted(entries))
 
