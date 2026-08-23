@@ -232,9 +232,546 @@ def test_publication_create_is_atomic_private_and_idempotent(
 
     changed_replay = dict(payload)
     changed_replay["patch_b64"] = base64.b64encode(b"different patch").decode()
-    conflict = client.post("/v1/internal/publications", json=changed_replay, headers=WORKER_HEADERS)
+    conflict = client.post(
+        "/v1/internal/publications", json=changed_replay, headers=WORKER_HEADERS
+    )
     assert conflict.status_code == 409
     assert _counts() == (1, 1)
+
+
+def test_publication_card_outbox_acks_original_turn_before_job_claim(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Real Postgres owns card retry; the source turn never reruns its model."""
+
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(
+        deployment["id"], dedupe_key="event-card-outbox-original-snapshot"
+    )
+    _, publication = _create_publication(client, payload)
+
+    # A changed replay is still rejected by the atomic API facts. Card delivery
+    # cannot depend on reclaiming this event, because a second model snapshot
+    # would hit this conflict and strand the first approval.
+    changed = dict(payload)
+    changed["patch_b64"] = base64.b64encode(b"changed second-run snapshot").decode()
+    replay = client.post(
+        "/v1/internal/publications", json=changed, headers=WORKER_HEADERS
+    )
+    assert replay.status_code == 409
+
+    async def exercise() -> tuple[Any, Any, Any]:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner="card-outbox-test",
+            lease_seconds=10,
+            result_max_attempts=2,
+        )
+        try:
+            card = await store.claim_pending_card()
+            assert card is not None
+            approved = _resolve(client, auth_headers, publication["approval_id"])
+            assert approved.status_code == 200, approved.text
+            before_card = await store.claim_next()
+            await store.mark_card_delivered(card.publication_id)
+            after_card = await store.claim_next()
+            return card, before_card, after_card
+        finally:
+            await engine.dispose()
+
+    card, before_card, after_card = asyncio.run(exercise())
+    assert str(card.publication_id) == publication["id"]
+    assert str(card.approval_id) == publication["approval_id"]
+    assert before_card is None, "Job mutation is gated on durable card delivery"
+    assert after_card is not None
+    assert after_card.patch == base64.b64decode(payload["patch_b64"])
+
+
+def test_publication_card_outbox_dead_letters_to_terminal_result(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(
+            deployment["id"], dedupe_key="event-card-outbox-dead-letter"
+        ),
+    )
+
+    async def exhaust() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner="card-dead-letter-test",
+            result_max_attempts=2,
+        )
+        try:
+            first = await store.claim_pending_card()
+            assert first is not None
+            await store.retry_card_delivery(first.publication_id, error="Slack unavailable")
+            second = await store.claim_pending_card()
+            assert second is not None
+            await store.retry_card_delivery(second.publication_id, error="Slack unavailable")
+            cleanup = await store.claim_pending_cleanup()
+            assert cleanup is not None
+            await store.mark_cleanup_completed(cleanup.publication_id)
+            return await store.pending_result(second.publication_id)
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(exhaust())
+    assert result is not None and result.outcome == "failed"
+    stored = _rows(
+        "SELECT p.status, p.patch_bytes IS NULL AS patch_cleared, "
+        "p.approval_card_delivery_attempts, "
+        "p.approval_card_delivery_dead_lettered_at IS NOT NULL AS dead_lettered, "
+        "a.status AS approval_status "
+        "FROM curie.publications p JOIN curie.approvals a ON a.id = p.approval_id "
+        "WHERE p.id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert stored == {
+        "status": "failed",
+        "patch_cleared": True,
+        "approval_card_delivery_attempts": 2,
+        "dead_lettered": True,
+        "approval_status": "expired",
+    }
+
+
+def test_publication_card_and_result_claims_survive_process_replacement(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """Expired leases are reclaimable because claims do not consume attempts."""
+
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client,
+        _publication_payload(deployment["id"], dedupe_key="process-replacement"),
+    )
+
+    async def exercise() -> tuple[int, int, int, int]:
+        engine = create_async_engine(get_settings().database_url)
+        first = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="replaced-worker", lease_seconds=60
+        )
+        replacement = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="replacement-worker", lease_seconds=60
+        )
+        try:
+            abandoned_card = await first.claim_pending_card()
+            assert abandoned_card is not None
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET approval_card_lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": abandoned_card.publication_id},
+                )
+            reclaimed_card = await replacement.claim_pending_card()
+            assert reclaimed_card is not None
+            await replacement.mark_card_delivered(reclaimed_card.publication_id)
+
+            approved = _resolve(client, auth_headers, publication["approval_id"])
+            assert approved.status_code == 200, approved.text
+            job = await replacement.claim_next()
+            assert job is not None
+            await replacement.persist_result(
+                job.publication_id,
+                outcome="failed",
+                pr_url=None,
+                error="safe terminal fixture",
+            )
+            cleanup = await replacement.claim_pending_cleanup()
+            assert cleanup is not None
+            await replacement.mark_cleanup_completed(cleanup.publication_id)
+
+            abandoned_result = await first.pending_result(job.publication_id)
+            assert abandoned_result is not None
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job.publication_id},
+                )
+            reclaimed_result = await replacement.pending_result(job.publication_id)
+            assert reclaimed_result is not None
+            await replacement.retry_result_delivery(
+                reclaimed_result.publication_id, error="reply unavailable"
+            )
+            return (
+                abandoned_card.attempt,
+                reclaimed_card.attempt,
+                abandoned_result.attempt,
+                reclaimed_result.attempt,
+            )
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == (0, 0, 0, 0)
+    attempts = _rows(
+        "SELECT approval_card_delivery_attempts, result_delivery_attempts "
+        "FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert attempts == {
+        "approval_card_delivery_attempts": 0,
+        "result_delivery_attempts": 1,
+    }
+
+
+def test_publication_cleanup_outbox_retries_beyond_result_delivery_cap(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="cleanup-unbounded")
+    )
+
+    async def exercise() -> tuple[bool, str | None]:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner="cleanup-unbounded",
+            result_max_attempts=2,
+        )
+        try:
+            card = await store.claim_pending_card()
+            assert card is not None
+            await store.mark_card_delivered(card.publication_id)
+            approved = _resolve(client, auth_headers, publication["approval_id"])
+            assert approved.status_code == 200, approved.text
+            job = await store.claim_next()
+            assert job is not None
+            await store.persist_result(
+                job.publication_id,
+                outcome="failed",
+                pr_url=None,
+                error="terminal fixture",
+            )
+            for attempt in range(6):
+                cleanup = await store.claim_pending_cleanup()
+                assert cleanup is not None
+                await store.retry_cleanup(
+                    cleanup.publication_id, error=f"apiserver unavailable {attempt}"
+                )
+                assert await store.pending_result(job.publication_id) is None
+            recovered = await store.claim_pending_cleanup()
+            assert recovered is not None
+            await store.mark_cleanup_completed(recovered.publication_id)
+            result = await store.pending_result(job.publication_id)
+            assert result is not None
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            "SELECT resource_cleanup_completed_at IS NOT NULL AS completed, "
+                            "resource_cleanup_error FROM curie.publications WHERE id = :id"
+                        ),
+                        {"id": publication["id"]},
+                    )
+                ).mappings().one()
+            return bool(row["completed"]), row["resource_cleanup_error"]
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == (True, None)
+
+
+def test_claimed_card_then_denied_waits_for_adoption_without_status_overwrite(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="claim-then-deny")
+    )
+
+    async def exercise() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner="card-deny-race",
+            lease_seconds=60,
+            result_max_attempts=1,
+        )
+        try:
+            claimed = await store.claim_pending_card()
+            assert claimed is not None
+            denied = _resolve(
+                client,
+                auth_headers,
+                publication["approval_id"],
+                decision="rejected",
+            )
+            assert denied.status_code == 200, denied.text
+            assert await store.pending_result(claimed.publication_id) is None
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET approval_card_lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": claimed.publication_id},
+                )
+            adopted = await store.claim_pending_card()
+            assert adopted is not None
+            await store.retry_card_delivery(adopted.publication_id, error="post uncertain")
+            result = await store.pending_result(adopted.publication_id)
+            assert result is not None
+            return result.outcome
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == "denied"
+    assert _rows(
+        "SELECT status FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    ) == [{"status": "denied"}]
+
+
+def test_claimed_card_then_expired_waits_for_adoption_without_status_overwrite(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    from curie_api.models import Approval
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    client, runs_stream = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(
+        client, _publication_payload(deployment["id"], dedupe_key="claim-then-expire")
+    )
+
+    async def exercise() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine,
+            schema="curie",
+            lease_owner="card-expire-race",
+            lease_seconds=60,
+            result_max_attempts=1,
+        )
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = aioredis.from_url(get_settings().valkey_dsn())
+        try:
+            claimed = await store.claim_pending_card()
+            assert claimed is not None
+            now = datetime.now(UTC).replace(tzinfo=None)
+            async with sessionmaker() as session:
+                await session.execute(
+                    update(Approval)
+                    .where(Approval.id == uuid.UUID(publication["approval_id"]))
+                    .values(expires_at=now - timedelta(seconds=1))
+                )
+                await session.commit()
+                queue = ResumeQueue(valkey, stream=runs_stream)
+                assert await sweep_expired_approvals(session, queue, now=now) == 1
+            assert await store.pending_result(claimed.publication_id) is None
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET approval_card_lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": claimed.publication_id},
+                )
+            adopted = await store.claim_pending_card()
+            assert adopted is not None
+            await store.retry_card_delivery(adopted.publication_id, error="post uncertain")
+            result = await store.pending_result(adopted.publication_id)
+            assert result is not None
+            return result.outcome
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == "expired"
+    assert _rows(
+        "SELECT status FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    ) == [{"status": "expired"}]
+
+
+def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    """The real publication insert is the card outbox; Slack never owns the turn ACK."""
+
+    from aci_protocol import QueuedTurn, ReplyHandle, SessionStatus
+    from curie_api.schemas import PublicationCreate
+    from curie_worker.approvals import CreatedPublication, PublicationCreateRequest
+    from curie_worker.behaviorpacks import BehaviorPacks
+    from curie_worker.binding import ResolvedDeployment
+    from curie_worker.kernel import TurnOutcome
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    from apps.worker.tests.kernel.conftest import kernel_harness
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    token = uuid.uuid4().hex
+    names = {
+        "stream": f"test:curie:publication-kernel:{token}",
+        "group": f"g-{token}",
+        "prefix": f"test:curie:publication-kernel:{token}:",
+        "sandbox_prefix": f"test:curie:publication-sandbox:{token}:",
+    }
+    sync_redis = connect_or_skip(decode_responses=True)
+
+    class DatabasePublicationCreator:
+        def __init__(self, engine: Any) -> None:
+            self.engine = engine
+
+        async def create_publication(
+            self, request: PublicationCreateRequest
+        ) -> CreatedPublication:
+            sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                data = PublicationCreate.model_validate(request.to_json())
+                publication, _ = await crud.create_publication(
+                    session, data, patch=data.decoded_patch()
+                )
+                return CreatedPublication(
+                    id=str(publication.id),
+                    approval_id=str(publication.approval_id),
+                    status=publication.status,
+                )
+
+    class WorkspaceBinding:
+        async def resolve(self, kind: str, channel: str) -> ResolvedDeployment:
+            return ResolvedDeployment(
+                agent_id=uuid.UUID(deployment["agent_id"]),
+                agent_name="acme-bot",
+                deployment_id=uuid.UUID(deployment["id"]),
+                workspace_repo=REPO,
+                version_id=uuid.UUID(deployment["version_id"]),
+                version_label="v1",
+                bundle_ref=None,
+                max_usd_per_day=None,
+                max_output_tokens_per_run=None,
+            )
+
+        def boot_env(self, resolved: Any, thread: str) -> dict[str, str]:
+            return {"CURIE_SESSION_ID": f"session-{thread}"}
+
+        def packs_for(self, resolved: Any) -> BehaviorPacks:
+            return BehaviorPacks.from_config(None)
+
+    event = QueuedTurn(
+        event_id="event-publication-card-outbox-no-model-replay",
+        conversation_id="1700000000.000100",
+        author="U0REQUEST1",
+        text="publish these changes",
+        reply_handle=ReplyHandle(
+            kind="slack",
+            channel="C0EXAMPLE1",
+            placeholder="1700000000.000001",
+        ),
+        received_at="2026-08-23T00:00:00+00:00",
+    )
+
+    async def exercise() -> tuple[int, int]:
+        engine = create_async_engine(get_settings().database_url)
+        attempts = 0
+        patch = b"diff --git a/README.md b/README.md\n"
+        try:
+            async with kernel_harness(
+                names,
+                sync_redis,
+                binding=WorkspaceBinding(),
+                publication_creator=DatabasePublicationCreator(engine),
+            ) as harness:
+                harness.sink.fail_events.add("reply.post")
+
+                async def publication_attempt(*args: Any, **kwargs: Any) -> TurnOutcome:
+                    nonlocal attempts
+                    attempts += 1
+                    return TurnOutcome(
+                        terminal_ok=False,
+                        text="Prepared repository changes",
+                        status=SessionStatus.AWAITING_APPROVAL,
+                        approval_gate_kind="permission",
+                        approval_granted_tool="mcp__curie__publish_changes",
+                        publication_snapshot=RunnerWorkspaceSnapshot(
+                            repo_full_name=REPO,
+                            base_sha=BASE_SHA,
+                            patch=patch,
+                            changed_paths=("README.md",),
+                            contains_workflow_files=False,
+                            publication_title="Update repository",
+                            publication_body="Approved platform publication.",
+                        ),
+                    )
+
+                harness.kernel._attempt = publication_attempt  # type: ignore[method-assign]
+                await harness.kernel.process_event(event)
+                # A reclaim would produce changed bytes if the model ran again.
+                # The durable done marker must short-circuit before _attempt.
+                patch = b"changed second-run snapshot"
+                await harness.kernel.process_event(event)
+                return attempts, len(harness.sink.posts)
+        finally:
+            await engine.dispose()
+
+    try:
+        attempts, card_posts = asyncio.run(exercise())
+    finally:
+        keys = list(sync_redis.scan_iter(match=f"*{token}*"))
+        if keys:
+            sync_redis.delete(*keys)
+        sync_redis.close()
+
+    assert attempts == 1
+    assert card_posts == 0, "the persisted outbox, not process_event, posts the card"
+    rows = _rows(
+        "SELECT patch_bytes, approval_card_reported_at FROM curie.publications"
+    )
+    assert rows == [
+        {
+            "patch_bytes": b"diff --git a/README.md b/README.md\n",
+            "approval_card_reported_at": None,
+        }
+    ]
 
 
 def test_publication_insert_failure_rolls_back_the_approval(

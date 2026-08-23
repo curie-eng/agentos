@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from urllib.parse import quote, urlsplit
 
@@ -101,9 +102,16 @@ class GitHubPublicationLookup:
             raise PublicationReconcileError(
                 "GitHub deterministic-head recovery requires authorization"
             )
+        default_branch = await self._default_branch(
+            repo_full_name,
+            authorization_header=authorization_header,
+        )
         existing = await self._find(
             repo_full_name,
             branch,
+            title=title,
+            body=body,
+            base=default_branch,
             authorization_header=authorization_header,
         )
         if existing is not None:
@@ -130,29 +138,6 @@ class GitHubPublicationLookup:
                 f"{ref_response.status_code}"
             )
 
-        try:
-            repo_response = await self._client.get(
-                repo_api,
-                headers=headers,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as exc:
-            raise PublicationReconcileError("GitHub repository lookup was unreachable") from exc
-        if repo_response.status_code != 200:
-            raise PublicationReconcileError(
-                f"GitHub repository lookup returned HTTP {repo_response.status_code}"
-            )
-        try:
-            default_branch = repo_response.json()["default_branch"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "GitHub repository response omitted its default branch"
-            ) from exc
-        if not isinstance(default_branch, str) or not default_branch:
-            raise PublicationReconcileError(
-                "GitHub repository response carried an invalid default branch"
-            )
-
         pulls_url = f"{repo_api}/pulls"
         try:
             created = await self._client.post(
@@ -169,13 +154,23 @@ class GitHubPublicationLookup:
         except httpx.HTTPError:
             created = None
         if created is not None and created.status_code == 201:
-            return self._pull_url(created, repo_full_name)
+            return self._pull_url(
+                created,
+                repo_full_name,
+                branch=branch,
+                title=title,
+                body=body,
+                base=default_branch,
+            )
 
         # A lost POST response or a concurrent reconciler is ambiguous. Query
         # the deterministic head once more before surfacing an error.
         recovered = await self._find(
             repo_full_name,
             branch,
+            title=title,
+            body=body,
+            base=default_branch,
             authorization_header=authorization_header,
         )
         if recovered is not None:
@@ -192,16 +187,89 @@ class GitHubPublicationLookup:
             "User-Agent": "curie-publication-worker",
         }
 
+    async def _default_branch(
+        self,
+        repo_full_name: str,
+        *,
+        authorization_header: str,
+    ) -> str:
+        try:
+            response = await self._client.get(
+                f"{self._api_base}/repos/{repo_full_name}",
+                headers=self._headers(authorization_header),
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError("GitHub repository lookup was unreachable") from exc
+        if response.status_code != 200:
+            raise PublicationReconcileError(
+                f"GitHub repository lookup returned HTTP {response.status_code}"
+            )
+        try:
+            default_branch = response.json()["default_branch"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublicationReconcileError(
+                "GitHub repository response omitted its default branch"
+            ) from exc
+        if not isinstance(default_branch, str) or not default_branch:
+            raise PublicationReconcileError(
+                "GitHub repository response carried an invalid default branch"
+            )
+        return default_branch
+
     @staticmethod
-    def _pull_url(response: httpx.Response, repo_full_name: str) -> str:
+    def _pull_url(
+        response: httpx.Response,
+        repo_full_name: str,
+        *,
+        branch: str,
+        title: str,
+        body: str,
+        base: str,
+    ) -> str:
         try:
             payload = response.json()
-            url = payload.get("html_url") if isinstance(payload, dict) else None
         except ValueError as exc:
             raise PublicationReconcileError("GitHub returned an invalid pull request") from exc
-        if not isinstance(url, str) or not url.startswith(
-            f"https://github.com/{repo_full_name}/pull/"
-        ):
+        if not isinstance(payload, dict):
+            raise PublicationReconcileError("GitHub returned an invalid pull request")
+        url = payload.get("html_url")
+        head = payload.get("head")
+        base_payload = payload.get("base")
+        expected = {
+            "title": title,
+            "body": body,
+            "head_ref": branch,
+            "head_repo": repo_full_name,
+            "base_ref": base,
+            "base_repo": repo_full_name,
+        }
+        actual = {
+            "title": payload.get("title"),
+            "body": payload.get("body"),
+            "head_ref": head.get("ref") if isinstance(head, dict) else None,
+            "head_repo": (
+                (head.get("repo") or {}).get("full_name")
+                if isinstance(head, dict) and isinstance(head.get("repo"), dict)
+                else None
+            ),
+            "base_ref": (
+                base_payload.get("ref") if isinstance(base_payload, dict) else None
+            ),
+            "base_repo": (
+                (base_payload.get("repo") or {}).get("full_name")
+                if isinstance(base_payload, dict)
+                and isinstance(base_payload.get("repo"), dict)
+                else None
+            ),
+        }
+        if actual != expected:
+            raise PublicationReconcileError(
+                "GitHub pull request does not match the approved publication contract"
+            )
+        if not isinstance(url, str) or re.fullmatch(
+            rf"https://github\.com/{re.escape(repo_full_name)}/pull/[1-9][0-9]*", url
+        ) is None:
             raise PublicationReconcileError("GitHub returned an invalid pull request URL")
         return url
 
@@ -210,6 +278,9 @@ class GitHubPublicationLookup:
         repo_full_name: str,
         branch: str,
         *,
+        title: str,
+        body: str,
+        base: str,
         authorization_header: str,
     ) -> str | None:
         owner = repo_full_name.split("/", 1)[0]
@@ -236,4 +307,11 @@ class GitHubPublicationLookup:
             ) from exc
         if not isinstance(rows, list) or not rows:
             return None
-        return self._pull_url(httpx.Response(200, json=rows[0]), repo_full_name)
+        return self._pull_url(
+            httpx.Response(200, json=rows[0]),
+            repo_full_name,
+            branch=branch,
+            title=title,
+            body=body,
+            base=base,
+        )

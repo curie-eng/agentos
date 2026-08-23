@@ -336,6 +336,17 @@ class Publication(Base):
         Index("ix_publications_status_lease", "status", "lease_expires_at"),
         Index("ix_publications_deployment_id", "deployment_id"),
         Index(
+            "ix_publications_approval_card_delivery",
+            "approval_card_reported_at",
+            "approval_card_delivery_dead_lettered_at",
+            "approval_card_lease_expires_at",
+        ),
+        Index(
+            "ix_publications_resource_cleanup",
+            "resource_cleanup_completed_at",
+            "resource_cleanup_lease_expires_at",
+        ),
+        Index(
             "ix_publications_result_delivery",
             "result_reported_at",
             "result_delivery_dead_lettered_at",
@@ -366,6 +377,31 @@ class Publication(Base):
     reply_placeholder: Mapped[str | None] = mapped_column(default=None)
     reply_endpoint: Mapped[str | None] = mapped_column(default=None)
     reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    # Durable initial approval-card outbox. Its lease/version are separate from
+    # publication mutation, while claim_next gates Job creation on delivery so
+    # even an immediate CLI approval cannot race ahead of the required card.
+    approval_card_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    approval_card_delivery_started_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_delivery_attempts: Mapped[int] = mapped_column(
+        server_default="0", default=0
+    )
+    approval_card_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    approval_card_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    approval_card_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    approval_card_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Resource cleanup is an unbounded durable obligation, separate from the
+    # bounded human-facing result outbox. A Slack outage can dead-letter its
+    # report; credentials and publication resources can never be abandoned.
+    resource_cleanup_completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    resource_cleanup_error: Mapped[str | None] = mapped_column(Text, default=None)
+    resource_cleanup_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    resource_cleanup_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    resource_cleanup_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     lease_owner: Mapped[str | None] = mapped_column(default=None)
     lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     result_url: Mapped[str | None] = mapped_column(default=None)

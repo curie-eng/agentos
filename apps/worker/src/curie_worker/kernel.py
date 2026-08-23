@@ -928,7 +928,26 @@ class Kernel:
         """Periodic tick: delete substrate claims no live route references."""
         reaped = await asyncio.to_thread(self._substrate.reap_orphans)
         if self._workspace is not None:
-            await asyncio.to_thread(self._workspace.reap_expired)
+            expired_threads = await asyncio.to_thread(self._workspace.enumerate_expired)
+            for thread_key in expired_threads:
+                # Enumeration is advisory. Serialize with claim/touch/release,
+                # then re-read this exact ledger so an active base staged by a
+                # different worker after enumeration cannot be deleted.
+                async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+                    candidate = await asyncio.to_thread(
+                        self._workspace.begin_expired_reap,
+                        thread_key,
+                    )
+                    if candidate is not None:
+                        # The object deletes above can be slow. Fence the final
+                        # ledger delete with the still-current Valkey token; the
+                        # exact-ledger comparison is the second guard if a lease
+                        # is lost immediately after this check.
+                        await lease.ensure_owned()
+                        await asyncio.to_thread(
+                            self._workspace.finish_expired_reap,
+                            candidate,
+                        )
         return reaped
 
     async def interrupt_thread(self, thread_key: str, reason: str) -> bool:
@@ -2135,22 +2154,22 @@ class Kernel:
             )
             return
 
-        if is_publication and self._workspace is not None:
-            try:
-                await asyncio.to_thread(self._workspace.release, thread)
-            except Exception as exc:  # noqa: BLE001 - durable patch already exists
-                logger.warning(
-                    "publication base-object cleanup failed for thread %s: %s",
-                    thread,
-                    exc,
-                )
-
         if self._workspace is not None:
-            await asyncio.to_thread(
-                self._workspace.touch,
-                thread,
-                ttl_seconds=self._suspended_route_ttl_seconds,
-            )
+            async with self._lock.hold(self._config.lock_key(thread)):
+                if is_publication:
+                    try:
+                        await asyncio.to_thread(self._workspace.release, thread)
+                    except Exception as exc:  # noqa: BLE001 - patch is already durable
+                        logger.warning(
+                            "publication base-object cleanup failed for thread %s: %s",
+                            thread,
+                            exc,
+                        )
+                await asyncio.to_thread(
+                    self._workspace.touch,
+                    thread,
+                    ttl_seconds=self._suspended_route_ttl_seconds,
+                )
         try:
             await asyncio.to_thread(self._substrate.suspend, thread, history_ref=None)
         except SandboxError as exc:
@@ -2181,6 +2200,18 @@ class Kernel:
                 "resolves this request."
             )
         await self._reply_for(qevent, route, f"{base}\n\n{notice}" if base else notice)
+
+        if is_publication:
+            # The atomic Approval+Publication insert is also the durable initial
+            # card outbox. The publication reconciler posts and remembers that
+            # card independently, so this turn can be acknowledged now and is
+            # never reclaimed through the model merely because Slack is down.
+            logger.info(
+                "thread %s suspended awaiting publication approval %s; card queued",
+                thread,
+                created.id,
+            )
+            return
 
         # The card's destination -- kind AND route -- is selected from the
         # channel it POSTS TO, never from the turn that requested it. In the

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from channel_protocol.reply import ReplyTarget
+from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.reply_sink import TargetRoute
 
@@ -41,6 +41,49 @@ class _Store:
         self.target = _target()
         self.route = TargetRoute(endpoint=None, adapter=None)
         self.retry_terminal_after = 99
+        self.card_pending: Any | None = None
+        self.card_delivery_retries: list[tuple[uuid.UUID, str]] = []
+        self.card_delivered: set[uuid.UUID] = set()
+        self.card_retry_terminal_after = 99
+        self.cleanup_pending: set[uuid.UUID] = set()
+        self.cleanup_claimed: set[uuid.UUID] = set()
+        self.cleanup_completed: set[uuid.UUID] = set()
+        self.cleanup_retries: list[tuple[uuid.UUID, str]] = []
+
+    def claim_pending_card(self) -> Any | None:
+        return self.card_pending
+
+    def mark_card_delivered(self, publication_id: uuid.UUID) -> None:
+        self.card_delivered.add(publication_id)
+        self.card_pending = None
+
+    def retry_card_delivery(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.card_delivery_retries.append((publication_id, error))
+        if len(self.card_delivery_retries) >= self.card_retry_terminal_after:
+            self.completed[publication_id] = ("failed", None)
+            self.pending[publication_id] = {
+                "outcome": "failed",
+                "pr_url": None,
+                "error": f"publication approval card could not be delivered: {error}",
+            }
+            self.cleanup_pending.add(publication_id)
+            self.card_pending = None
+
+    def claim_pending_cleanup(self) -> Any | None:
+        publication_id = next(iter(self.cleanup_pending), None)
+        if publication_id is None:
+            return None
+        self.cleanup_claimed.add(publication_id)
+        return SimpleNamespace(publication_id=publication_id, version=1)
+
+    def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None:
+        self.cleanup_pending.discard(publication_id)
+        self.cleanup_claimed.discard(publication_id)
+        self.cleanup_completed.add(publication_id)
+
+    def retry_cleanup(self, publication_id: uuid.UUID, *, error: str) -> None:
+        self.cleanup_retries.append((publication_id, error))
+        self.cleanup_claimed.discard(publication_id)
 
     def is_terminal(self, publication_id: uuid.UUID) -> bool:
         return publication_id in self.completed
@@ -58,6 +101,11 @@ class _Store:
             return None
         value = self.pending.get(publication_id)
         if value is None:
+            return None
+        if (
+            value["outcome"] in {"published", "failed"}
+            and publication_id in self.cleanup_pending
+        ):
             return None
         return SimpleNamespace(
             publication_id=publication_id,
@@ -85,6 +133,8 @@ class _Store:
             "pr_url": pr_url,
             "error": error,
         }
+        if outcome in {"published", "failed"}:
+            self.cleanup_pending.add(publication_id)
 
     def mark_result_delivered(self, publication_id: uuid.UUID) -> None:
         self.delivered.add(publication_id)
@@ -103,6 +153,7 @@ class _Store:
                 "pr_url": None,
                 "error": error,
             }
+            self.cleanup_pending.add(publication_id)
 
     async def claim_next(self) -> None:
         return None
@@ -135,14 +186,22 @@ class _Cluster:
         )
         self.preexisting_observation: Any | None = None
         self.raise_after_apply = False
+        self.apply_error: Exception | None = None
+        self.observe_after_apply_error: Exception | None = None
+        self.terminal_cleanup_fail_once = False
+        self.terminal_cleanup_failures_remaining = 0
 
     def apply(self, resources: Any) -> None:
         self.applied.append(resources)
+        if self.apply_error is not None:
+            raise self.apply_error
         if self.raise_after_apply:
             self.raise_after_apply = False
             raise RuntimeError("worker stopped after apiserver accepted resources")
 
     def observe(self, job_name: str) -> Any:
+        if self.applied and self.observe_after_apply_error is not None:
+            raise self.observe_after_apply_error
         if not self.applied:
             return self.preexisting_observation or self.module.PublicationJobObservation(
                 phase="pending", pr_url=None, logs="", exists=False
@@ -157,6 +216,12 @@ class _Cluster:
         self.credentials_cleaned.append(names)
 
     def cleanup_terminal(self, names: Any) -> None:
+        if self.terminal_cleanup_fail_once or self.terminal_cleanup_failures_remaining:
+            self.terminal_cleanup_fail_once = False
+            self.terminal_cleanup_failures_remaining = max(
+                0, self.terminal_cleanup_failures_remaining - 1
+            )
+            raise RuntimeError("publication resource cleanup unavailable")
         self.terminals_cleaned.append(names)
 
 
@@ -182,6 +247,7 @@ class _Replies:
         self.events: list[tuple[Any, TargetRoute]] = []
         self.fail_once = False
         self.on_emit: Any | None = None
+        self.post_refs: dict[str, str] = {}
 
     async def emit(
         self, event: Any, *, route: TargetRoute, best_effort_unreachable: bool = False
@@ -192,7 +258,12 @@ class _Replies:
         self.events.append((event, route))
         if self.on_emit is not None:
             self.on_emit()
-        return object()
+        interaction = getattr(getattr(event, "message", None), "interaction", None)
+        interaction_id = getattr(interaction, "id", None)
+        if event.event == "reply.post" and interaction_id:
+            ref = self.post_refs.setdefault(interaction_id, "1700000000.000050")
+            return ReplyAck(ref=ref)
+        return ReplyAck(ref=event.target.reply_ref)
 
 
 class _Cards:
@@ -200,6 +271,7 @@ class _Cards:
         self.ref: ApprovalCardRef | None = None
         self.popped: list[str] = []
         self.restored: list[tuple[str, ApprovalCardRef]] = []
+        self.remember_fail_once = False
 
     async def pop(self, thread: str) -> ApprovalCardRef | None:
         self.popped.append(thread)
@@ -210,6 +282,33 @@ class _Cards:
         self.restored.append((thread, ref))
         if self.ref is None:
             self.ref = ref
+
+    async def remember(
+        self,
+        thread: str,
+        *,
+        channel: str,
+        ts: str,
+        summary: str,
+        endpoint: str | None,
+        approval_id: str,
+        requested_by: str = "",
+        kind: str = "",
+        adapter: str | None = None,
+    ) -> None:
+        if self.remember_fail_once:
+            self.remember_fail_once = False
+            raise RuntimeError("card ref store unavailable")
+        self.ref = ApprovalCardRef(
+            channel=channel,
+            ts=ts,
+            summary=summary,
+            endpoint=endpoint,
+            requested_by=requested_by,
+            approval_id=approval_id,
+            kind=kind,
+            adapter=adapter,
+        )
 
 
 def _card(*, approval_id: str = str(APPROVAL_ID)) -> ApprovalCardRef:
@@ -252,6 +351,24 @@ def _work(module: Any, *, decision: str = "approved", kind: str = "slack") -> An
     )
 
 
+def _card_work() -> Any:
+    return SimpleNamespace(
+        publication_id=PUBLICATION_ID,
+        approval_id=APPROVAL_ID,
+        summary="Publish these repository changes?",
+        requested_by="U0REQUEST1",
+        target=ReplyTarget(
+            kind="slack",
+            address="C0EXAMPLE1",
+            conversation_id="1700000000.000100",
+            reply_ref=None,
+        ),
+        route=TargetRoute(endpoint=None, adapter=None),
+        attempt=1,
+        version=1,
+    )
+
+
 def _loop(
     module: Any,
     cards: _Cards | None = None,
@@ -289,6 +406,71 @@ def _loop(
         ),
     )
     return loop, store, credentials, cluster, github, replies
+
+
+async def test_publication_card_outbox_posts_and_remembers_before_ack(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+
+    assert await loop.deliver_pending_card() is True
+
+    assert store.card_delivered == {PUBLICATION_ID}
+    assert store.card_pending is None
+    assert cards.ref is not None
+    assert cards.ref.ts == "1700000000.000050"
+    assert cards.ref.approval_id == str(APPROVAL_ID)
+    event = replies.events[0][0]
+    assert event.event == "reply.post"
+    assert event.target.conversation_id == "1700000000.000100"
+    assert event.message.interaction.id == str(APPROVAL_ID)
+
+
+async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    cards.remember_fail_once = True
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+
+    with pytest.raises(RuntimeError, match="card ref store unavailable"):
+        await loop.deliver_pending_card()
+    assert store.card_delivered == set()
+
+    await loop.deliver_pending_card()
+
+    assert len(replies.events) == 2
+    assert {
+        replies.post_refs[str(APPROVAL_ID)]
+    } == {"1700000000.000050"}, "the UUID idempotency key adopts one Slack message"
+    assert cards.ref is not None and cards.ref.ts == "1700000000.000050"
+    assert store.card_delivered == {PUBLICATION_ID}
+
+
+async def test_publication_card_delivery_cap_fails_safely_and_reports_result(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.card_pending = _card_work()
+    store.card_retry_terminal_after = 2
+    replies.fail_once = True
+
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_card()
+    replies.fail_once = True
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_card()
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.card_pending is None
+    assert store.card_delivered == set()
+    assert await loop.deliver_pending_cleanup() is True
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+    assert "approval card could not be delivered" in replies.events[0][0].text
 
 
 async def test_approved_publication_launches_job_and_reports_pr_url(
@@ -340,8 +522,6 @@ async def test_worker_crash_reuses_the_same_job_and_cannot_duplicate_publication
     work = _work(publication)
     cluster.raise_after_apply = True
 
-    with pytest.raises(RuntimeError, match="worker stopped"):
-        await loop.reconcile(work)
     await loop.reconcile(work)
     await loop.reconcile(work)  # terminal duplicate callback is a no-op
 
@@ -447,7 +627,6 @@ async def test_mismatched_approval_card_is_restored_without_wrong_settlement(
         "pr_url": PR_URL,
         "error": None,
     }
-
     await loop.deliver_pending_result(PUBLICATION_ID)
 
     assert cards.ref == mismatched
@@ -483,7 +662,7 @@ async def test_terminal_result_is_persisted_and_credentials_removed_before_reply
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert PUBLICATION_ID in store.pending
     assert len(cluster.credentials_cleaned) == 1
-    assert cluster.terminals_cleaned == []
+    assert len(cluster.terminals_cleaned) == 1
     assert credentials.calls == [PUBLICATION_ID]
     assert cards.ref == _card()
     assert cards.restored == [(_target().conversation_id, _card())]
@@ -492,7 +671,7 @@ async def test_terminal_result_is_persisted_and_credentials_removed_before_reply
 
     assert PUBLICATION_ID in store.delivered
     assert store.pending == {}
-    assert len(cluster.credentials_cleaned) == 2
+    assert len(cluster.credentials_cleaned) == 1
     assert len(cluster.terminals_cleaned) == 1
     assert credentials.calls == [PUBLICATION_ID]
     assert len(replies.events) == 2
@@ -511,6 +690,7 @@ async def test_supervisor_drains_terminal_result_outbox_without_job_work(
         "pr_url": PR_URL,
         "error": None,
     }
+    store.cleanup_pending.add(PUBLICATION_ID)
     shutdown = asyncio.Event()
     replies.on_emit = shutdown.set
     supervisor = publication.PublicationReconcileLoop(
@@ -573,3 +753,113 @@ async def test_credential_setup_failure_is_bounded_and_terminalized(publication:
     assert cluster.applied == []
     assert github.calls == []
     assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_hostile_resource_collision_is_bounded_and_terminalized(
+    publication: Any,
+) -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.apply_error = k8s.PublicationResourceError(
+        "existing publication Job metadata contract does not match"
+    )
+    store.retry_terminal_after = 2
+    work = _work(publication)
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert len(cluster.applied) == 2
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert len(store.retries) == 2
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_unvalidated_terminal_marker_cannot_bypass_resource_adoption(
+    publication: Any,
+) -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url="https://github.com/other-corp/other-repo/pull/9",
+        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
+    )
+    cluster.apply_error = k8s.PublicationResourceError(
+        "existing publication Job metadata contract does not match"
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.applied) == 1
+    assert store.completed == {}
+    assert len(store.retries) == 1
+    assert replies.events == []
+
+
+async def test_foreign_repository_pr_url_is_bounded_instead_of_reported(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded",
+        pr_url="https://github.com/other-corp/other-repo/pull/9",
+        logs="CURIE_PR_URL=https://github.com/other-corp/other-repo/pull/9\n",
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert store.completed == {}
+    assert store.retries == [
+        (
+            PUBLICATION_ID,
+            "publication result URL does not belong to the requested repository",
+        )
+    ]
+    assert replies.events == []
+
+
+async def test_repeated_apiserver_failure_after_apply_is_dead_lettered(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.apply_error = RuntimeError("apiserver response was lost")
+    cluster.observe_after_apply_error = RuntimeError("apiserver is unavailable")
+    store.retry_terminal_after = 2
+    work = _work(publication)
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert len(store.retries) == 2
+    assert all("apiserver" in error for _, error in store.retries)
+    assert "failed safely" in replies.events[0][0].text.lower()
+
+
+async def test_cleanup_retries_beyond_result_cap_before_result_outbox_ack(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    cluster.terminal_cleanup_failures_remaining = 6
+    work = _work(publication)
+
+    with pytest.raises(RuntimeError, match="resource cleanup unavailable"):
+        await loop.reconcile(work)
+
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="resource cleanup unavailable"):
+            await loop.deliver_pending_cleanup()
+
+    assert PUBLICATION_ID not in store.delivered
+    assert PUBLICATION_ID in store.pending
+    assert replies.events == []
+    assert len(store.cleanup_retries) == 6
+    assert store.delivery_retries == []
+
+    assert await loop.deliver_pending_cleanup() is True
+    await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert PUBLICATION_ID in store.delivered
+    assert cluster.terminals_cleaned
+    assert PR_URL in replies.events[0][0].text

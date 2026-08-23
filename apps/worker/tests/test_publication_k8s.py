@@ -6,9 +6,11 @@ import base64
 import importlib
 import json
 import subprocess
+import sys
 import uuid
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -247,6 +249,68 @@ def test_job_retries_rest_by_querying_deterministic_head_before_posting_again(
     assert "urllib" in script or "http.client" in script
 
 
+def _run_job_pull_validator(
+    script: str, row: dict[str, object]
+) -> subprocess.CompletedProcess[str]:
+    start = script.index("def validate_pull(")
+    end = script.index("\ndef existing(", start)
+    validator = script[start:end]
+    program = f"""
+import json
+import os
+import sys
+repo = {json.dumps('acme-corp/acme-bot')}
+branch = {json.dumps('curie/publication-22222222222242228222222222222222')}
+{validator}
+print(validate_pull(json.loads(sys.stdin.read()), "main"))
+"""
+    return subprocess.run(
+        [sys.executable, "-c", program],
+        input=json.dumps(row),
+        text=True,
+        capture_output=True,
+        env={
+            "PR_TITLE": "Update repository",
+            "PR_BODY": "Approved platform publication.",
+        },
+        check=False,
+    )
+
+
+def _job_pull_row() -> dict[str, object]:
+    return {
+        "html_url": "https://github.com/acme-corp/acme-bot/pull/123",
+        "title": "Update repository",
+        "body": "Approved platform publication.",
+        "head": {
+            "ref": "curie/publication-22222222222242228222222222222222",
+            "repo": {"full_name": "acme-corp/acme-bot"},
+        },
+        "base": {"ref": "main", "repo": {"full_name": "acme-corp/acme-bot"}},
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("title", "Mutated title"), ("body", "Mutated body")),
+)
+def test_job_rejects_mutated_pull_request_metadata(
+    publication_k8s: Any,
+    field: str,
+    value: str,
+) -> None:
+    script = _resources(publication_k8s).config_map["data"]["publish.sh"]
+    valid = _run_job_pull_validator(script, _job_pull_row())
+    assert valid.returncode == 0, valid.stderr
+
+    mutated = _job_pull_row()
+    mutated[field] = value
+    rejected = _run_job_pull_validator(script, mutated)
+
+    assert rejected.returncode != 0
+    assert "approved publication contract" in rejected.stderr
+
+
 def test_every_dynamic_resource_has_the_helm_owner_reference(
     publication_k8s: Any,
 ) -> None:
@@ -390,3 +454,54 @@ def test_stale_immutable_secret_is_uid_replaced_only_when_job_is_gone(
     assert base64.b64decode(
         core.secrets[resources.names.secret]["data"]["credential"]
     ).decode() == "rotated-publication-write-credential"
+
+
+def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
+    publication_k8s: Any,
+) -> None:
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    job_uid = "job-uid-123"
+    cluster._batch = SimpleNamespace(
+        read_namespaced_job=lambda *_args: SimpleNamespace(
+            metadata=SimpleNamespace(uid=job_uid),
+            status=SimpleNamespace(succeeded=1, failed=0, conditions=[]),
+        )
+    )
+    log_reads: list[str] = []
+    hostile = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="hostile-pod",
+            owner_references=[SimpleNamespace(kind="Job", uid="different-job")],
+        )
+    )
+    owned = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="owned-pod",
+            owner_references=[SimpleNamespace(kind="Job", uid=job_uid)],
+        )
+    )
+
+    def read_log(name: str, *_args: object, **_kwargs: object) -> str:
+        log_reads.append(name)
+        if name == "hostile-pod":
+            return "CURIE_PR_URL=https://github.com/attacker/repo/pull/1"
+        return "CURIE_PR_URL=https://github.com/acme-corp/acme-bot/pull/123"
+
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(
+            items=[hostile, owned]
+        ),
+        read_namespaced_pod_log=read_log,
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert log_reads == ["owned-pod"]
+    assert observed.pr_url == "https://github.com/acme-corp/acme-bot/pull/123"
+
+
+def test_publication_cluster_has_no_legacy_combined_cleanup_shim(
+    publication_k8s: Any,
+) -> None:
+    assert not hasattr(publication_k8s.KubernetesPublicationCluster, "cleanup")

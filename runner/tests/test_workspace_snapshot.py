@@ -115,6 +115,46 @@ def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
     assert b"diff --git a/b/release notes.md b/b/release notes.md" in captured.patch
 
 
+def test_snapshot_represents_pure_rename_as_source_and_destination_with_spaces(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    source = "old release notes.md"
+    destination = "new release notes.md"
+    (repo / source).write_text("rename me\n")
+    _git(repo, "add", source)
+    _git(
+        repo,
+        "-c",
+        "user.name=Curie Test",
+        "-c",
+        "user.email=curie@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "Add rename fixture",
+    )
+    _git(repo, "mv", source, destination)
+
+    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+
+    assert captured.changed_paths == (destination, source)
+    assert f"diff --git a/{source} b/{source}".encode() in captured.patch
+    assert f"diff --git a/{destination} b/{destination}".encode() in captured.patch
+    assert b"rename from" not in captured.patch
+    assert b"rename to" not in captured.patch
+
+    clean = tmp_path / "apply-rename"
+    subprocess.run(
+        ["git", "clone", "--quiet", str(repo), str(clean)],
+        check=True,
+        capture_output=True,
+    )
+    patch_file = tmp_path / "rename.patch"
+    patch_file.write_bytes(captured.patch)
+    _git(clean, "apply", "--check", "--binary", str(patch_file))
+
+
 @pytest.mark.parametrize(
     "patch",
     [

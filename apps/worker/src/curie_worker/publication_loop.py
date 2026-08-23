@@ -11,9 +11,10 @@ from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
-from channel_protocol import MESSAGE_VERSION, OutboundMessage
+from channel_protocol import MESSAGE_VERSION, Action, ConfirmIntent, OutboundMessage
 from channel_protocol.reply import (
     REPLY_WIRE_VERSION,
+    ReplyPost,
     ReplyTarget,
     ReplyUpdate,
     SettledOutcome,
@@ -23,6 +24,7 @@ from .approval_cards import ApprovalCardRef, ApprovalCardStore
 from .publication_k8s import (
     PublicationJobSettings,
     PublicationPayload,
+    PublicationResourceError,
     PublicationResourceNames,
     build_publication_resources,
     deterministic_publication_branch,
@@ -70,6 +72,26 @@ class PublicationWork:
 
 
 class PublicationStore(Protocol):
+    def claim_pending_card(self) -> Any: ...
+
+    def mark_card_delivered(
+        self, publication_id: uuid.UUID
+    ) -> None | Awaitable[None]: ...
+
+    def retry_card_delivery(
+        self, publication_id: uuid.UUID, *, error: str
+    ) -> None | Awaitable[None]: ...
+
+    def claim_pending_cleanup(self) -> Any: ...
+
+    def mark_cleanup_completed(
+        self, publication_id: uuid.UUID
+    ) -> None | Awaitable[None]: ...
+
+    def retry_cleanup(
+        self, publication_id: uuid.UUID, *, error: str
+    ) -> None | Awaitable[None]: ...
+
     def is_terminal(self, publication_id: uuid.UUID) -> bool | Awaitable[bool]: ...
 
     def persist_result(
@@ -109,7 +131,13 @@ class PublicationCluster(Protocol):
         self, job_name: str
     ) -> PublicationJobObservation | Awaitable[PublicationJobObservation]: ...
 
-    def cleanup(self, names: PublicationResourceNames) -> None | Awaitable[None]: ...
+    def cleanup_credentials(
+        self, names: PublicationResourceNames
+    ) -> None | Awaitable[None]: ...
+
+    def cleanup_terminal(
+        self, names: PublicationResourceNames
+    ) -> None | Awaitable[None]: ...
 
 
 class PublicationGitHub(Protocol):
@@ -134,6 +162,21 @@ def _marker_url(logs: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _validated_pr_url(work: PublicationWork, url: str | None) -> str | None:
+    """Accept only a pull request URL for the publication's exact repository."""
+
+    if url is None:
+        return None
+    expected = re.compile(
+        rf"https://github\.com/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*"
+    )
+    if expected.fullmatch(url) is None:
+        raise PublicationReconcileError(
+            "publication result URL does not belong to the requested repository"
+        )
+    return url
+
+
 class PublicationReconciler:
     """Converge one durable decision onto one deterministic Job and result."""
 
@@ -155,6 +198,92 @@ class PublicationReconciler:
         self._replies = replies
         self._job_settings = job_settings
         self._card_store = card_store
+
+    async def deliver_pending_card(self) -> bool:
+        """Deliver one persisted publication approval card independently."""
+
+        work = await _resolve(self._store.claim_pending_card())
+        if work is None:
+            return False
+        if self._card_store is None:
+            error = "durable approval-card reference storage is unavailable"
+            await _resolve(
+                self._store.retry_card_delivery(work.publication_id, error=error)
+            )
+            raise PublicationReconcileError(error)
+        try:
+            message = OutboundMessage(
+                version=MESSAGE_VERSION,
+                text=work.summary,
+                interaction=ConfirmIntent(
+                    kind="confirm",
+                    id=str(work.approval_id),
+                    prompt=work.summary,
+                    confirm=Action(label="Approve", value=str(work.approval_id)),
+                    cancel=Action(label="Reject", value=str(work.approval_id)),
+                    allow_free_text=True,
+                ),
+            )
+            ack = await self._replies.emit(
+                ReplyPost(
+                    version=REPLY_WIRE_VERSION,
+                    event="reply.post",
+                    target=work.target,
+                    message=message,
+                    requested_by=work.requested_by,
+                ),
+                route=work.route,
+                best_effort_unreachable=False,
+            )
+            if not ack.ref:
+                raise PublicationReconcileError(
+                    "publication approval card post returned no durable reply ref"
+                )
+            conversation_id = work.target.conversation_id
+            if conversation_id is None:
+                raise PublicationReconcileError(
+                    "publication approval card has no session conversation"
+                )
+            await self._card_store.remember(
+                conversation_id,
+                channel=work.target.address,
+                ts=ack.ref,
+                summary=work.summary,
+                endpoint=work.route.endpoint,
+                requested_by=work.requested_by,
+                approval_id=str(work.approval_id),
+                kind=work.target.kind,
+                adapter=work.route.adapter,
+            )
+        except Exception as exc:
+            error = str(exc)[:2000] or type(exc).__name__
+            await _resolve(
+                self._store.retry_card_delivery(work.publication_id, error=error)
+            )
+            raise
+        await _resolve(self._store.mark_card_delivered(work.publication_id))
+        return True
+
+    async def deliver_pending_cleanup(self) -> bool:
+        """Remove one terminal publication's resources on an unbounded outbox."""
+
+        work = await _resolve(self._store.claim_pending_cleanup())
+        if work is None:
+            return False
+        names = publication_resource_names(work.publication_id)
+        try:
+            await self._cleanup_credentials(names)
+            await self._cleanup_terminal(names)
+        except Exception as exc:
+            await _resolve(
+                self._store.retry_cleanup(
+                    work.publication_id,
+                    error=(str(exc)[:2000] or type(exc).__name__),
+                )
+            )
+            raise
+        await _resolve(self._store.mark_cleanup_completed(work.publication_id))
+        return True
 
     async def _report(self, target: ReplyTarget, route: TargetRoute, text: str) -> None:
         await self._replies.emit(
@@ -186,16 +315,10 @@ class PublicationReconciler:
         )
 
     async def _cleanup_credentials(self, names: PublicationResourceNames) -> None:
-        cleanup = getattr(self._cluster, "cleanup_credentials", None)
-        if cleanup is not None:
-            await _resolve(cleanup(names))
-            return
-        await _resolve(self._cluster.cleanup(names))
+        await _resolve(self._cluster.cleanup_credentials(names))
 
     async def _cleanup_terminal(self, names: PublicationResourceNames) -> None:
-        cleanup = getattr(self._cluster, "cleanup_terminal", None)
-        if cleanup is not None:
-            await _resolve(cleanup(names))
+        await _resolve(self._cluster.cleanup_terminal(names))
 
     async def _settle_card(self, result: Any, ref: ApprovalCardRef) -> None:
         decision: Literal["approved", "rejected"] | None
@@ -231,16 +354,10 @@ class PublicationReconciler:
     async def deliver_pending_result(
         self,
         publication_id: uuid.UUID | None = None,
-        *,
-        credentials_already_clean: bool = False,
     ) -> bool:
         result = await _resolve(self._store.pending_result(publication_id))
         if result is None:
             return False
-        names = publication_resource_names(result.publication_id)
-        has_publication_resources = result.outcome in {"published", "failed"}
-        if has_publication_resources and not credentials_already_clean:
-            await self._cleanup_credentials(names)
         if result.outcome == "published":
             text = f"Published the approved changes: {result.pr_url}"
         elif result.outcome == "denied":
@@ -284,8 +401,6 @@ class PublicationReconciler:
                 )
             raise
         await _resolve(self._store.mark_result_delivered(result.publication_id))
-        if has_publication_resources:
-            await self._cleanup_terminal(names)
         return True
 
     async def _terminalize(
@@ -297,17 +412,12 @@ class PublicationReconciler:
         error: str | None = None,
         names: PublicationResourceNames,
     ) -> None:
-        # The durable outcome is the source of truth. Credentials are removed
-        # immediately after it commits; reply delivery is an independent outbox
-        # attempt and may be retried without re-running GitHub mutation.
+        # The durable outcome is the source of truth. Resource cleanup and reply
+        # delivery are independent outboxes; result claims remain gated until
+        # cleanup has durably completed.
         await self._persist_result(work, outcome=outcome, pr_url=pr_url, error=error)
-        has_publication_resources = outcome in {"published", "failed"}
-        if has_publication_resources:
-            await self._cleanup_credentials(names)
-        await self.deliver_pending_result(
-            work.publication_id,
-            credentials_already_clean=has_publication_resources,
-        )
+        await self.deliver_pending_cleanup()
+        await self.deliver_pending_result(work.publication_id)
 
     async def _bounded_setup_failure(
         self,
@@ -316,8 +426,9 @@ class PublicationReconciler:
     ) -> None:
         error = str(exc)[:2000] or type(exc).__name__
         await _resolve(self._store.retry(work.publication_id, error=error))
-        # retry() terminalizes at its durable cap. If it did, report the newly
-        # available outbox record now; otherwise this is a no-op.
+        # retry() terminalizes at its durable cap. If it did, drain the newly
+        # available cleanup and result outboxes; otherwise these are no-ops.
+        await self.deliver_pending_cleanup()
         await self.deliver_pending_result(work.publication_id)
 
     async def _recover_remote(
@@ -326,7 +437,7 @@ class PublicationReconciler:
         branch: str,
         credential: PublicationCredential,
     ) -> str | None:
-        return await _resolve(
+        recovered = await _resolve(
             self._github.recover_pr_by_head(
                 work.repo_full_name,
                 branch,
@@ -335,6 +446,7 @@ class PublicationReconciler:
                 credential.authorization_header,
             )
         )
+        return _validated_pr_url(work, recovered)
 
     async def reconcile(self, work: PublicationWork) -> None:
         names = publication_resource_names(work.publication_id)
@@ -352,19 +464,11 @@ class PublicationReconciler:
             return
 
         branch = deterministic_publication_branch(work.publication_id)
-        observation = await _resolve(self._cluster.observe(names.job))
-        if observation.exists and observation.phase in {"pending", "running"}:
+        try:
+            observation = await _resolve(self._cluster.observe(names.job))
+        except Exception as exc:
+            await self._bounded_setup_failure(work, exc)
             return
-        if observation.exists:
-            pr_url = observation.pr_url or _marker_url(observation.logs)
-            if pr_url is not None:
-                await self._terminalize(
-                    work,
-                    outcome="published",
-                    pr_url=pr_url,
-                    names=names,
-                )
-                return
 
         credential: PublicationCredential
         recovered: str | None
@@ -372,15 +476,6 @@ class PublicationReconciler:
         try:
             credential = await _resolve(self._credentials.redeem(work.publication_id))
             recovered = await self._recover_remote(work, branch, credential)
-            if recovered is None and observation.exists and observation.phase in {
-                "failed",
-                "succeeded",
-            }:
-                diagnostic = observation.error or (
-                    "publication Job succeeded but no pull request was found for its branch"
-                )
-                raise PublicationReconcileError(diagnostic)
-
             if recovered is None:
                 resources = build_publication_resources(
                     PublicationPayload(
@@ -415,15 +510,61 @@ class PublicationReconciler:
         if resources is None:
             raise PublicationReconcileError("publication resources were not constructed")
 
+        # Server-side apply/create-or-adopt validates every deterministic
+        # resource before any Job log marker is trusted. This includes a Job
+        # observed before the apply: an attacker cannot plant a same-name Job
+        # and make its marker authoritative without passing the full spec and
+        # ownership contract.
         try:
-            # Server-side apply/create-or-adopt must use these deterministic
-            # names. A crash immediately after the apiserver accepts this call
-            # therefore re-adopts the same Job on the next lease.
             await _resolve(self._cluster.apply(resources))
-            observation = await _resolve(self._cluster.observe(resources.names.job))
-            if observation.phase in {"pending", "running"}:
+        except PublicationResourceError as exc:
+            await self._bounded_setup_failure(work, exc)
+            return
+        except Exception as apply_exc:
+            # The apiserver may have accepted the resources and lost only the
+            # response. Observe the deterministic name, then recover the
+            # deterministic remote head, before charging a bounded retry.
+            try:
+                observation = await _resolve(self._cluster.observe(resources.names.job))
+                if observation.exists and observation.phase in {"pending", "running"}:
+                    return
+                pr_url = _validated_pr_url(
+                    work,
+                    observation.pr_url or _marker_url(observation.logs)
+                    if observation.exists
+                    else None,
+                )
+                if pr_url is None:
+                    pr_url = await self._recover_remote(work, branch, credential)
+            except Exception as recovery_exc:
+                await self._bounded_setup_failure(
+                    work,
+                    PublicationReconcileError(
+                        f"ambiguous publication apply could not be recovered: {recovery_exc}"
+                    ),
+                )
                 return
-            pr_url = observation.pr_url or _marker_url(observation.logs)
+            if pr_url is not None:
+                await self._terminalize(
+                    work,
+                    outcome="published",
+                    pr_url=pr_url,
+                    names=resources.names,
+                )
+                return
+            await self._bounded_setup_failure(work, apply_exc)
+            return
+
+        try:
+            observation = await _resolve(self._cluster.observe(resources.names.job))
+            if observation.exists and observation.phase in {"pending", "running"}:
+                return
+            pr_url = _validated_pr_url(
+                work,
+                observation.pr_url or _marker_url(observation.logs)
+                if observation.exists
+                else None,
+            )
             if pr_url is None:
                 # Covers both crash-after-push and crash-after-REST-POST: the
                 # authenticated recovery client adopts an existing PR or opens
@@ -434,21 +575,15 @@ class PublicationReconciler:
                     observation.error
                     or "publication Job finished but no pull request was found for its branch"
                 )
-
-            await self._terminalize(
-                work,
-                outcome="published",
-                pr_url=pr_url,
-                names=resources.names,
-            )
         except Exception as exc:
-            # A process-crash simulation deliberately raises immediately after
-            # apply. At that point we cannot know whether the Job is live, so do
-            # not mark the row failed or delete the idempotency anchor; let the
-            # durable lease expire and re-adopt it.
-            if not isinstance(exc, PublicationReconcileError):
-                raise
             await self._bounded_setup_failure(work, exc)
+            return
+        await self._terminalize(
+            work,
+            outcome="published",
+            pr_url=pr_url,
+            names=resources.names,
+        )
 
 
 class PublicationReconcileLoop:
@@ -469,6 +604,16 @@ class PublicationReconcileLoop:
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
         while not shutdown.is_set():
+            try:
+                await self._reconciler.deliver_pending_card()
+            except Exception:
+                logger.exception("publication approval card delivery failed")
+            try:
+                await self._reconciler.deliver_pending_cleanup()
+            except Exception:
+                # Cleanup is deliberately unbounded. Its released lease is
+                # reclaimed until every deterministic resource is absent.
+                logger.exception("publication resource cleanup failed")
             try:
                 await self._reconciler.deliver_pending_result()
             except Exception:

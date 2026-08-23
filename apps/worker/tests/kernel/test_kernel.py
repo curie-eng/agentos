@@ -1226,6 +1226,51 @@ def test_release_thread_force_releases_a_live_route(make_harness) -> None:
     asyncio.run(go())
 
 
+def test_workspace_reaper_holds_the_route_lock_during_exact_ledger_recheck(
+    make_harness,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            lock_ttl_ms=90,
+            lock_acquire_timeout_s=1.0,
+            lock_poll_interval_s=0.01,
+        ) as h:
+            thread = "tWorkspaceReap"
+            entered = threading.Event()
+            gate = threading.Event()
+
+            class GatedWorkspace:
+                def enumerate_expired(self) -> list[str]:
+                    return [thread]
+
+                def begin_expired_reap(self, thread_key: str) -> object:
+                    assert thread_key == thread
+                    entered.set()
+                    gate.wait(timeout=5.0)
+                    return object()
+
+                def finish_expired_reap(self, candidate: object) -> bool:
+                    return True
+
+            h.kernel._workspace = GatedWorkspace()  # type: ignore[assignment]
+            reaping = asyncio.create_task(h.kernel.reap_orphans())
+            await _wait_until(entered.is_set)
+
+            contender = asyncio.create_task(h.kernel._lock.acquire(h.config.lock_key(thread)))
+            try:
+                # Object cleanup outlives the original lease. Renewal must keep
+                # the competing claimant fenced for the full critical section.
+                await asyncio.sleep(0.25)
+                assert not contender.done(), "reaper mutated the ledger outside the route lock"
+            finally:
+                gate.set()
+            await reaping
+            token = await contender
+            await h.kernel._lock.release(h.config.lock_key(thread), token)
+
+    asyncio.run(go())
+
+
 def test_release_thread_interrupts_a_live_turn_first(make_harness) -> None:
     """Releasing a thread mid-turn interrupts it first rather than yanking the
     claim out from under a running turn silently."""

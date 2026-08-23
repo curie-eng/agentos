@@ -165,6 +165,25 @@ class _StreamingObjectStore:
         yield from sorted(key for key in self.objects if key.startswith(needle))
 
 
+class _CommitThenRaiseObjectStore(_StreamingObjectStore):
+    """Model an S3 PutObject that commits before its response is lost."""
+
+    fail_next_ownership_put = True
+
+    def put_stream(self, key: str, chunks: Iterable[bytes]) -> None:
+        super().put_stream(key, chunks)
+        if key.startswith("_ownership/") and self.fail_next_ownership_put:
+            self.fail_next_ownership_put = False
+            raise TimeoutError("put response was lost after commit")
+
+
+class _CommitThenRaiseUnreadableObjectStore(_CommitThenRaiseObjectStore):
+    def get_stream(self, key: str) -> Iterator[bytes]:
+        if key.startswith("_ownership/") and not self.fail_next_ownership_put:
+            raise OSError("ownership read-back is unavailable")
+        yield from super().get_stream(key)
+
+
 def _limits(workspace: Any, **overrides: Any) -> Any:
     values = {
         "clone_timeout_seconds": 90,
@@ -514,6 +533,112 @@ class _RecordingSubstrate:
         return object()
 
 
+def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """A worker crash after claim starts must not orphan its delivered base."""
+
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+
+    class SimulatedWorkerCrash(BaseException):
+        pass
+
+    class CrashingSubstrate:
+        observed: Any | None = None
+
+        def claim(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+            restarted = workspace.WorkspaceClaimCoordinator(
+                preparer=preparer,
+                substrate=_RecordingSubstrate(),
+            )
+            self.observed = restarted.current(claimed_thread)
+            assert self.observed is not None
+            assert env is not None
+            assert self.observed.claim_env() == {
+                "CURIE_WORKSPACE_REF": env["CURIE_WORKSPACE_REF"],
+                "CURIE_WORKSPACE_SHA256": env["CURIE_WORKSPACE_SHA256"],
+            }
+            raise SimulatedWorkerCrash
+
+    substrate = CrashingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+    )
+
+    with pytest.raises(SimulatedWorkerCrash):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+        )
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+    )
+    assert restarted.current(thread_key) == substrate.observed
+    assert substrate.observed.object_key in objects.objects
+
+
+@pytest.mark.parametrize("failure_mode", ["claim", "resume"])
+def test_workspace_claim_or_resume_failure_restores_prior_durable_ownership(
+    workspace: Any, tmp_path: Path, failure_mode: str
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+
+    class Suspended(Exception):
+        pass
+
+    class FailingSubstrate(_RecordingSubstrate):
+        failure_mode: str | None = None
+
+        def claim(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+            self.calls.append(("claim", claimed_thread, dict(env or {})))
+            if self.failure_mode == "claim":
+                raise RuntimeError("claim refused")
+            if self.failure_mode == "resume":
+                raise Suspended("route is suspended")
+            return object()
+
+        def resume(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+            self.calls.append(("resume", claimed_thread, dict(env or {})))
+            raise RuntimeError("resume refused")
+
+    substrate = FailingSubstrate()
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=substrate,
+        suspended_error=Suspended,
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    previous = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    substrate.failure_mode = failure_mode
+
+    with pytest.raises(RuntimeError, match=rf"{failure_mode} refused"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key=thread_key,
+            deployment_id=DEPLOYMENT_ID,
+        )
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+    assert restarted.current(thread_key) == previous
+    assert previous.object_key in objects.objects
+    deleted_workspace_keys = [key for key in objects.deleted if not key.startswith("_ownership/")]
+    assert len(deleted_workspace_keys) == 1
+    assert previous.object_key not in objects.deleted
+
+
 def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_object(
     workspace: Any, tmp_path: Path
 ) -> None:
@@ -583,6 +708,52 @@ def test_workspace_ownership_survives_worker_restart_and_release(
     assert restarted.current(thread_key) is None
 
 
+def test_workspace_ownership_adopts_a_put_that_committed_before_response_loss(
+    workspace: Any, tmp_path: Path
+) -> None:
+    objects = _CommitThenRaiseObjectStore()
+    preparer, _, _ = _preparer(workspace, tmp_path, objects=objects)
+    thread_key = "1700000000.000100"
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+    )
+
+    prepared = coordinator.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+    )
+    assert restarted.current(thread_key) == prepared
+    assert prepared.object_key in objects.objects
+    assert prepared.object_key not in objects.deleted
+
+
+def test_uncertain_ownership_put_never_deletes_a_possibly_referenced_archive(
+    workspace: Any, tmp_path: Path
+) -> None:
+    objects = _CommitThenRaiseUnreadableObjectStore()
+    preparer, _, _ = _preparer(workspace, tmp_path, objects=objects)
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError, match="outcome is uncertain"):
+        coordinator.claim_or_resume_with_handle(
+            thread_key="1700000000.000100",
+            deployment_id=DEPLOYMENT_ID,
+        )
+
+    archive_keys = [key for key in objects.objects if not key.startswith("_ownership/")]
+    assert len(archive_keys) == 1
+    assert archive_keys[0] not in objects.deleted
+
+
 def test_expired_workspace_ownership_is_reaped_after_restart(
     workspace: Any, tmp_path: Path
 ) -> None:
@@ -607,9 +778,61 @@ def test_expired_workspace_ownership_is_reaped_after_restart(
         wall_clock=lambda: now[0],
     )
 
-    assert restarted.reap_expired() == [prepared.object_key]
+    assert restarted.enumerate_expired() == [thread_key]
+    candidate = restarted.begin_expired_reap(thread_key)
+    assert candidate is not None
+    assert candidate.deleted_object_keys == (prepared.object_key,)
+    assert restarted.finish_expired_reap(candidate)
     assert prepared.object_key not in objects.objects
     assert restarted.current(thread_key) is None
+
+
+def test_reaper_rereads_after_lock_and_preserves_a_newly_staged_ledger(
+    workspace: Any, tmp_path: Path
+) -> None:
+    now = [1000.0]
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    first = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+    expired = first.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    now[0] = 1011.0
+    reaper = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+
+    # The reaper enumerates and begins slow object cleanup while holding its
+    # lease. Model that lease being lost before the final ledger delete: another
+    # replica acquires the lock and stages a fresh base first.
+    assert reaper.enumerate_expired() == [thread_key]
+    candidate = reaper.begin_expired_reap(thread_key)
+    assert candidate is not None
+    claimant = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+    active = claimant.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+
+    assert not reaper.finish_expired_reap(candidate)
+    assert reaper.current(thread_key) == active
+    assert active.object_key in objects.objects
+    assert active.object_key not in objects.deleted
+    assert expired.object_key in objects.deleted
 
 
 def test_workspace_ownership_touch_extends_affinity_lease_across_restart(
@@ -638,7 +861,7 @@ def test_workspace_ownership_touch_extends_affinity_lease_across_restart(
         ownership_ttl_seconds=10,
         wall_clock=lambda: now[0],
     )
-    assert restarted.reap_expired() == []
+    assert restarted.enumerate_expired() == []
     assert restarted.current(thread_key) == prepared
     assert prepared.object_key in objects.objects
 

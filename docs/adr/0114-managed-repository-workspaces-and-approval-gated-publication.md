@@ -71,11 +71,14 @@ provenance that causes the platform to snapshot the workspace after the turn.
 
 The worker validates the binary patch, base commit, repository, paths, and the
 private base archive before one database transaction creates both Approval and
-Publication. Patch bytes are private durable state and never appear in list or
-read responses. Publication approvals are a distinct server-owned purpose. The
-requester may approve their own publication only when the existing authorizer
-also proves channel membership; ordinary approval self-blocks are unchanged.
-The publication requester exception is audited.
+Publication. The Publication row is also a leased approval-card outbox: the
+worker posts and records the card independently of the session turn, so a Slack
+retry never reruns the repository work that produced the patch. Patch bytes are
+private durable state and never appear in list or read responses. Publication
+approvals are a distinct server-owned purpose. The requester may approve their
+own publication only when the existing authorizer also proves channel
+membership; ordinary approval self-blocks are unchanged. The publication
+requester exception is audited.
 
 Resolving a publication approval performs durable compare-and-set state changes
 only. It never enters the ordinary resume, owed-wake, grant, dead-letter reopen,

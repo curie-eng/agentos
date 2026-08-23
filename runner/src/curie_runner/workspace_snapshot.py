@@ -192,7 +192,10 @@ def _canonical_repo(origin: str) -> str:
 
 
 def _changed_paths(repo: Path) -> tuple[str, ...]:
-    tracked = _git(repo, "diff", "--name-only", "-z", "HEAD", "--").stdout
+    # Keep path enumeration identical to patch capture. Explicitly disabling
+    # rename detection represents a rename as one deletion plus one addition,
+    # so both paths are validated and disclosed to the approver.
+    tracked = _git(repo, "diff", "--no-renames", "--name-only", "-z", "HEAD", "--").stdout
     untracked = _git(repo, "ls-files", "--others", "--exclude-standard", "-z").stdout
     paths: set[str] = set()
     for item in (tracked + untracked).split(b"\0"):
@@ -268,7 +271,15 @@ def capture_workspace_snapshot(
         raise WorkspaceSnapshotError("workspace base commit is not a valid object id")
 
     changed_paths = _changed_paths(repo)
-    patch = _git(repo, "diff", "--binary", "--full-index", "HEAD", "--").stdout
+    patch = _git(
+        repo,
+        "diff",
+        "--no-renames",
+        "--binary",
+        "--full-index",
+        "HEAD",
+        "--",
+    ).stdout
     patch += _untracked_patch(repo, changed_paths)
     validate_patch(patch)
     return WorkspaceSnapshot(

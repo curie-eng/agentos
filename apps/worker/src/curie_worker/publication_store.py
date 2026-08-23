@@ -36,6 +36,28 @@ class PublicationResult:
     version: int
 
 
+@dataclass(frozen=True)
+class PublicationCardWork:
+    """One leased initial approval card awaiting durable delivery."""
+
+    publication_id: uuid.UUID
+    approval_id: uuid.UUID
+    summary: str
+    requested_by: str
+    target: ReplyTarget
+    route: TargetRoute
+    attempt: int
+    version: int
+
+
+@dataclass(frozen=True)
+class PublicationCleanupWork:
+    """One terminal publication whose resources still must be removed."""
+
+    publication_id: uuid.UUID
+    version: int
+
+
 class PostgresPublicationStore:
     """Claims one approval decision at a time without cross-worker blocking."""
 
@@ -65,6 +87,229 @@ class PostgresPublicationStore:
         self._result_max_attempts = result_max_attempts
         self._reconcile_max_attempts = reconcile_max_attempts
         self._versions: dict[uuid.UUID, int] = {}
+        self._card_versions: dict[uuid.UUID, int] = {}
+        self._cleanup_versions: dict[uuid.UUID, int] = {}
+
+    async def claim_pending_card(self) -> PublicationCardWork | None:
+        """Lease one pending publication's initial approval card."""
+
+        statement = text(
+            f"""
+            SELECT p.id, p.approval_id, p.reply_kind, p.reply_channel,
+                   p.reply_endpoint, p.reply_adapter,
+                   p.approval_card_delivery_attempts,
+                   p.approval_card_version,
+                   p.approval_card_delivery_started_at,
+                   a.conversation_id, a.summary, a.author
+              FROM {self._table} p
+              JOIN {self._approvals} a ON a.id = p.approval_id
+             WHERE (
+                    (p.status IN ('pending', 'approved', 'launching', 'running')
+                     AND a.status IN ('pending', 'approved'))
+                    OR
+                    (p.status IN ('denied', 'expired', 'succeeded', 'failed')
+                     AND p.approval_card_delivery_started_at IS NOT NULL)
+               )
+               AND p.approval_card_reported_at IS NULL
+               AND p.approval_card_delivery_dead_lettered_at IS NULL
+               AND p.approval_card_delivery_attempts < :max_attempts
+               AND (
+                    p.approval_card_lease_expires_at IS NULL
+                    OR p.approval_card_lease_expires_at < now()
+               )
+             ORDER BY p.created_at, p.id
+             FOR UPDATE OF p SKIP LOCKED
+             LIMIT 1
+            """
+        )
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    statement, {"max_attempts": self._result_max_attempts}
+                )
+            ).mappings().first()
+            if row is None:
+                return None
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET approval_card_delivery_started_at =
+                                   COALESCE(approval_card_delivery_started_at, now()),
+                               approval_card_version = approval_card_version + 1,
+                               approval_card_lease_owner = :owner,
+                               approval_card_lease_expires_at = now() + :lease,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND approval_card_reported_at IS NULL
+                           AND approval_card_version = :version
+                     RETURNING approval_card_delivery_attempts,
+                               approval_card_version
+                        """
+                    ),
+                    {
+                        "owner": self._lease_owner,
+                        "lease": timedelta(seconds=self._lease_seconds),
+                        "id": row["id"],
+                        "version": int(row["approval_card_version"]),
+                    },
+                )
+            ).mappings().first()
+            if updated is None:
+                raise PublicationStoreError("publication card claim was lost")
+            publication_id = uuid.UUID(str(row["id"]))
+            version = int(updated["approval_card_version"])
+            self._card_versions[publication_id] = version
+        return PublicationCardWork(
+            publication_id=publication_id,
+            approval_id=uuid.UUID(str(row["approval_id"])),
+            summary=str(row["summary"]),
+            requested_by=str(row["author"]),
+            target=ReplyTarget(
+                kind=str(row["reply_kind"]),
+                address=str(row["reply_channel"]),
+                conversation_id=str(row["conversation_id"]),
+                reply_ref=None,
+            ),
+            route=TargetRoute(
+                endpoint=row["reply_endpoint"], adapter=row["reply_adapter"]
+            ),
+            attempt=int(updated["approval_card_delivery_attempts"]),
+            version=version,
+        )
+
+    async def mark_card_delivered(self, publication_id: uuid.UUID) -> None:
+        """Acknowledge the card only after its exact reply ref is durable."""
+
+        version = self._card_versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication card has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET approval_card_reported_at = now(),
+                               approval_card_delivery_error = NULL,
+                               approval_card_version = approval_card_version + 1,
+                               approval_card_lease_owner = NULL,
+                               approval_card_lease_expires_at = NULL,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND approval_card_reported_at IS NULL
+                           AND approval_card_lease_owner = :owner
+                           AND approval_card_version = :version
+                     RETURNING approval_card_version
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "owner": self._lease_owner,
+                        "version": version,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication card delivery acknowledgement was lost")
+        self._card_versions[publication_id] = int(updated)
+
+    async def retry_card_delivery(
+        self, publication_id: uuid.UUID, *, error: str
+    ) -> None:
+        """Release a card lease or terminalize safely at the bounded cap."""
+
+        version = self._card_versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication card has no owned lease version")
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET approval_card_delivery_attempts =
+                                   approval_card_delivery_attempts + 1,
+                               approval_card_delivery_error = :error,
+                               approval_card_delivery_dead_lettered_at = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                   THEN now()
+                                   ELSE approval_card_delivery_dead_lettered_at
+                               END,
+                               status = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                    AND status IN ('pending', 'approved', 'launching', 'running')
+                                   THEN 'failed'
+                                   ELSE status
+                               END,
+                               error = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                    AND status IN ('pending', 'approved', 'launching', 'running')
+                                   THEN :terminal_error
+                                   ELSE error
+                               END,
+                               patch_bytes = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                    AND status IN ('pending', 'approved', 'launching', 'running')
+                                   THEN NULL
+                                   ELSE patch_bytes
+                               END,
+                               terminal_at = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                    AND status IN ('pending', 'approved', 'launching', 'running')
+                                   THEN COALESCE(terminal_at, now())
+                                   ELSE terminal_at
+                               END,
+                               approval_card_lease_owner = NULL,
+                               approval_card_lease_expires_at = NULL,
+                               approval_card_version = approval_card_version + 1,
+                               version = CASE
+                                   WHEN approval_card_delivery_attempts + 1 >= :max_attempts
+                                    AND status IN ('pending', 'approved', 'launching', 'running')
+                                   THEN version + 1
+                                   ELSE version
+                               END,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND approval_card_reported_at IS NULL
+                           AND approval_card_lease_owner = :owner
+                           AND approval_card_version = :version
+                     RETURNING approval_id,
+                               approval_card_version,
+                               approval_card_delivery_attempts >= :max_attempts AS terminal,
+                               status
+                        """
+                    ),
+                    {
+                        "id": publication_id,
+                        "owner": self._lease_owner,
+                        "version": version,
+                        "max_attempts": self._result_max_attempts,
+                        "error": error[:2000],
+                        "terminal_error": (
+                            "publication approval card could not be delivered: "
+                            f"{error[:1900]}"
+                        ),
+                    },
+                )
+            ).mappings().first()
+            if row is None:
+                raise PublicationStoreError("publication card retry acknowledgement was lost")
+            self._card_versions[publication_id] = int(row["approval_card_version"])
+            if bool(row["terminal"]) and str(row["status"]) == "failed":
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._approvals}
+                           SET status = 'expired',
+                               resolved_at = COALESCE(resolved_at, now()),
+                               resumed_at = COALESCE(resumed_at, now())
+                         WHERE id = :approval_id AND status = 'pending'
+                        """
+                    ),
+                    {"approval_id": row["approval_id"]},
+                )
 
     async def claim_next(self) -> PublicationWork | None:
         statement = text(
@@ -78,6 +323,7 @@ class PostgresPublicationStore:
               JOIN {self._approvals} a ON a.id = p.approval_id
              WHERE p.patch_bytes IS NOT NULL
                AND p.status IN ('approved', 'launching', 'running')
+               AND p.approval_card_reported_at IS NOT NULL
                AND p.reconcile_attempts < :max_attempts
                AND p.reconcile_dead_lettered_at IS NULL
                AND (p.lease_expires_at IS NULL OR p.lease_expires_at < now())
@@ -218,6 +464,7 @@ class PostgresPublicationStore:
         """Lease one undelivered terminal result from the durable outbox."""
 
         id_filter = "AND p.id = :requested_id" if publication_id is not None else ""
+        abandon_id_filter = "AND id = :requested_id" if publication_id is not None else ""
         statement = text(
             f"""
             SELECT p.id, p.approval_id, p.status, p.result_url, p.error, p.version,
@@ -228,6 +475,14 @@ class PostgresPublicationStore:
               JOIN {self._approvals} a ON a.id = p.approval_id
              WHERE p.status IN ('denied', 'expired', 'succeeded', 'failed')
                AND p.patch_bytes IS NULL
+               AND (
+                    p.approval_card_reported_at IS NOT NULL
+                    OR p.approval_card_delivery_dead_lettered_at IS NOT NULL
+               )
+               AND (
+                    p.status IN ('denied', 'expired')
+                    OR p.resource_cleanup_completed_at IS NOT NULL
+               )
                AND p.result_reported_at IS NULL
                AND p.result_delivery_dead_lettered_at IS NULL
                AND p.result_delivery_attempts < :max_attempts
@@ -242,6 +497,28 @@ class PostgresPublicationStore:
         if publication_id is not None:
             params["requested_id"] = publication_id
         async with self._engine.begin() as connection:
+            # A terminal resolution that won before card delivery ever began
+            # has no ambiguous external post to adopt. Abandon that card
+            # atomically so the terminal result can proceed. Once delivery has
+            # started, only the card outbox may report or dead-letter it.
+            await connection.execute(
+                text(
+                    f"""
+                    UPDATE {self._table}
+                       SET approval_card_delivery_dead_lettered_at = now(),
+                           approval_card_delivery_error =
+                               'approval resolved before card delivery began',
+                           approval_card_version = approval_card_version + 1,
+                           updated_at = now()
+                     WHERE status IN ('denied', 'expired', 'succeeded', 'failed')
+                       AND approval_card_reported_at IS NULL
+                       AND approval_card_delivery_dead_lettered_at IS NULL
+                       AND approval_card_delivery_started_at IS NULL
+                       {abandon_id_filter}
+                    """
+                ),
+                params,
+            )
             row = (await connection.execute(statement, params)).mappings().first()
             if row is None:
                 return None
@@ -251,8 +528,7 @@ class PostgresPublicationStore:
                     text(
                         f"""
                         UPDATE {self._table}
-                           SET result_delivery_attempts = result_delivery_attempts + 1,
-                               lease_owner = :owner,
+                           SET lease_owner = :owner,
                                lease_expires_at = now() + :lease,
                                version = version + 1,
                                updated_at = now()
@@ -320,10 +596,14 @@ class PostgresPublicationStore:
                         UPDATE {self._table}
                            SET result_reported_at = CASE WHEN :delivered THEN now()
                                                         ELSE result_reported_at END,
+                               result_delivery_attempts = CASE
+                                   WHEN :delivered THEN result_delivery_attempts
+                                   ELSE result_delivery_attempts + 1
+                               END,
                                result_delivery_error = :error,
                                result_delivery_dead_lettered_at = CASE
                                    WHEN NOT :delivered
-                                    AND result_delivery_attempts >= :max_attempts
+                                    AND result_delivery_attempts + 1 >= :max_attempts
                                    THEN now()
                                    ELSE result_delivery_dead_lettered_at
                                END,
@@ -348,6 +628,115 @@ class PostgresPublicationStore:
         if updated is None:
             raise PublicationStoreError("publication result delivery CAS was lost")
         self._versions[publication_id] = int(updated)
+
+    async def claim_pending_cleanup(self) -> PublicationCleanupWork | None:
+        """Lease one terminal publication resource cleanup without a retry cap."""
+
+        async with self._engine.begin() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        f"""
+                        SELECT id, resource_cleanup_version
+                          FROM {self._table}
+                         WHERE status IN ('succeeded', 'failed')
+                           AND patch_bytes IS NULL
+                           AND resource_cleanup_completed_at IS NULL
+                           AND (
+                                resource_cleanup_lease_expires_at IS NULL
+                                OR resource_cleanup_lease_expires_at < now()
+                           )
+                         ORDER BY terminal_at, id
+                         FOR UPDATE SKIP LOCKED
+                         LIMIT 1
+                        """
+                    )
+                )
+            ).mappings().first()
+            if row is None:
+                return None
+            publication_id = uuid.UUID(str(row["id"]))
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET resource_cleanup_lease_owner = :owner,
+                               resource_cleanup_lease_expires_at = now() + :lease,
+                               resource_cleanup_version = resource_cleanup_version + 1,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND resource_cleanup_completed_at IS NULL
+                           AND resource_cleanup_version = :version
+                     RETURNING resource_cleanup_version
+                        """
+                    ),
+                    {
+                        "owner": self._lease_owner,
+                        "lease": timedelta(seconds=self._lease_seconds),
+                        "id": publication_id,
+                        "version": int(row["resource_cleanup_version"]),
+                    },
+                )
+            ).scalar_one_or_none()
+            if updated is None:
+                raise PublicationStoreError("publication cleanup claim CAS was lost")
+        version = int(updated)
+        self._cleanup_versions[publication_id] = version
+        return PublicationCleanupWork(publication_id=publication_id, version=version)
+
+    async def mark_cleanup_completed(self, publication_id: uuid.UUID) -> None:
+        """Acknowledge cleanup only after every deterministic resource is absent."""
+
+        await self._cleanup_cas(publication_id, completed=True, error=None)
+
+    async def retry_cleanup(self, publication_id: uuid.UUID, *, error: str) -> None:
+        """Release failed cleanup for an unbounded future retry."""
+
+        await self._cleanup_cas(
+            publication_id, completed=False, error=error[:2000]
+        )
+
+    async def _cleanup_cas(
+        self, publication_id: uuid.UUID, *, completed: bool, error: str | None
+    ) -> None:
+        version = self._cleanup_versions.get(publication_id)
+        if version is None:
+            raise PublicationStoreError("publication cleanup has no owned lease version")
+        async with self._engine.begin() as connection:
+            updated = (
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE {self._table}
+                           SET resource_cleanup_completed_at = CASE
+                                   WHEN :completed THEN now()
+                                   ELSE resource_cleanup_completed_at
+                               END,
+                               resource_cleanup_error = :error,
+                               resource_cleanup_lease_owner = NULL,
+                               resource_cleanup_lease_expires_at = NULL,
+                               resource_cleanup_version = resource_cleanup_version + 1,
+                               updated_at = now()
+                         WHERE id = :id
+                           AND resource_cleanup_completed_at IS NULL
+                           AND resource_cleanup_lease_owner = :owner
+                           AND resource_cleanup_version = :version
+                     RETURNING resource_cleanup_version
+                        """
+                    ),
+                    {
+                        "completed": completed,
+                        "error": error,
+                        "id": publication_id,
+                        "owner": self._lease_owner,
+                        "version": version,
+                    },
+                )
+            ).scalar_one_or_none()
+        if updated is None:
+            raise PublicationStoreError("publication cleanup acknowledgement was lost")
+        self._cleanup_versions[publication_id] = int(updated)
 
     async def retry(self, publication_id: uuid.UUID, *, error: str) -> None:
         """Release reconcile work, or dead-letter it into a reportable failure."""

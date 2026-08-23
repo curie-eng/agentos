@@ -60,6 +60,24 @@ def upgrade() -> None:
         sa.Column("reply_placeholder", sa.String(), nullable=True),
         sa.Column("reply_endpoint", sa.String(), nullable=True),
         sa.Column("reply_adapter", sa.String(), nullable=True),
+        sa.Column("approval_card_reported_at", sa.DateTime(), nullable=True),
+        sa.Column("approval_card_delivery_started_at", sa.DateTime(), nullable=True),
+        sa.Column(
+            "approval_card_delivery_attempts",
+            sa.Integer(),
+            server_default="0",
+            nullable=False,
+        ),
+        sa.Column("approval_card_version", sa.Integer(), server_default="1", nullable=False),
+        sa.Column("approval_card_delivery_error", sa.Text(), nullable=True),
+        sa.Column("approval_card_delivery_dead_lettered_at", sa.DateTime(), nullable=True),
+        sa.Column("approval_card_lease_owner", sa.String(), nullable=True),
+        sa.Column("approval_card_lease_expires_at", sa.DateTime(), nullable=True),
+        sa.Column("resource_cleanup_completed_at", sa.DateTime(), nullable=True),
+        sa.Column("resource_cleanup_error", sa.Text(), nullable=True),
+        sa.Column("resource_cleanup_version", sa.Integer(), server_default="1", nullable=False),
+        sa.Column("resource_cleanup_lease_owner", sa.String(), nullable=True),
+        sa.Column("resource_cleanup_lease_expires_at", sa.DateTime(), nullable=True),
         sa.Column("lease_owner", sa.String(), nullable=True),
         sa.Column("lease_expires_at", sa.DateTime(), nullable=True),
         sa.Column("result_url", sa.String(), nullable=True),
@@ -84,6 +102,18 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "result_delivery_attempts >= 0",
             name="publications_result_delivery_attempts_ck",
+        ),
+        sa.CheckConstraint(
+            "approval_card_delivery_attempts >= 0",
+            name="publications_approval_card_delivery_attempts_ck",
+        ),
+        sa.CheckConstraint(
+            "approval_card_version >= 1",
+            name="publications_approval_card_version_ck",
+        ),
+        sa.CheckConstraint(
+            "resource_cleanup_version >= 1",
+            name="publications_resource_cleanup_version_ck",
         ),
         sa.CheckConstraint(
             "reconcile_attempts >= 0", name="publications_reconcile_attempts_ck"
@@ -112,6 +142,22 @@ def upgrade() -> None:
         "ix_publications_deployment_id",
         "publications",
         ["deployment_id"],
+        schema=SCHEMA,
+    )
+    op.create_index(
+        "ix_publications_approval_card_delivery",
+        "publications",
+        [
+            "approval_card_reported_at",
+            "approval_card_delivery_dead_lettered_at",
+            "approval_card_lease_expires_at",
+        ],
+        schema=SCHEMA,
+    )
+    op.create_index(
+        "ix_publications_resource_cleanup",
+        "publications",
+        ["resource_cleanup_completed_at", "resource_cleanup_lease_expires_at"],
         schema=SCHEMA,
     )
     op.create_index(

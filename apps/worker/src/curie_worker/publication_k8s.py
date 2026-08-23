@@ -205,33 +205,73 @@ def request(method, url, payload=None):
     with urlopen(req, timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])) as response:
         return json.load(response)
 
-def existing():
+def validate_pull(row, expected_base):
+    if not isinstance(row, dict):
+        raise SystemExit("GitHub returned an invalid pull request")
+    head = row.get("head")
+    base = row.get("base")
+    expected = {
+        "title": os.environ["PR_TITLE"],
+        "body": os.environ["PR_BODY"],
+        "head_ref": branch,
+        "head_repo": repo,
+        "base_ref": expected_base,
+        "base_repo": repo,
+    }
+    actual = {
+        "title": row.get("title"),
+        "body": row.get("body"),
+        "head_ref": head.get("ref") if isinstance(head, dict) else None,
+        "head_repo": (
+            (head.get("repo") or {}).get("full_name")
+            if isinstance(head, dict) and isinstance(head.get("repo"), dict)
+            else None
+        ),
+        "base_ref": base.get("ref") if isinstance(base, dict) else None,
+        "base_repo": (
+            (base.get("repo") or {}).get("full_name")
+            if isinstance(base, dict) and isinstance(base.get("repo"), dict)
+            else None
+        ),
+    }
+    if actual != expected:
+        raise SystemExit(
+            "GitHub pull request does not match the approved publication contract"
+        )
+    url = row.get("html_url")
+    prefix = f"https://github.com/{repo}/pull/"
+    if not isinstance(url, str) or not url.startswith(prefix):
+        raise SystemExit("GitHub did not return a usable pull request URL")
+    number = url.removeprefix(prefix)
+    if not number.isdigit() or int(number) <= 0:
+        raise SystemExit("GitHub did not return a usable pull request URL")
+    return url
+
+def existing(expected_base):
     head=quote(f"{owner}:{branch}", safe="")
     rows = request("GET", f"{api}?state=open&head={head}")
-    return rows[0].get("html_url") if rows else None
+    return validate_pull(rows[0], expected_base) if rows else None
 
 # Query the deterministic head before POST, and again after an ambiguous REST
 # failure. This is the idempotency boundary for a lost response.
-url = existing()
+repository = request("GET", repo_api)
+default_base = repository.get("default_branch")
+if not isinstance(default_base, str) or not default_base:
+    raise SystemExit("GitHub repository has no default branch")
+url = existing(default_base)
 if not url:
-    repository = request("GET", repo_api)
-    base = repository.get("default_branch")
-    if not isinstance(base, str) or not base:
-        raise SystemExit("GitHub repository has no default branch")
     try:
         created = request("POST", api, {
             "title": os.environ["PR_TITLE"],
             "head": branch,
-            "base": base,
+            "base": default_base,
             "body": os.environ["PR_BODY"],
         })
-        url = created.get("html_url")
+        url = validate_pull(created, default_base)
     except (HTTPError, URLError):
-        url = existing()
+        url = existing(default_base)
         if not url:
             raise
-if not isinstance(url, str) or not url.startswith("https://github.com/"):
-    raise SystemExit("GitHub did not return a usable pull request URL")
 print(f"CURIE_PR_URL={url}")
 PY
 """
@@ -656,6 +696,16 @@ class KubernetesPublicationCluster:
                     phase="pending", pr_url=None, logs="", error=None, exists=False
                 )
             raise
+        metadata = job.get("metadata") if isinstance(job, dict) else getattr(job, "metadata", None)
+        job_uid = (
+            metadata.get("uid")
+            if isinstance(metadata, dict)
+            else getattr(metadata, "uid", None)
+        )
+        if not job_uid:
+            raise PublicationResourceError(
+                f"publication Job {job_name!r} has no stable UID"
+            )
         status = getattr(job, "status", None)
         phase = "running"
         error: str | None = None
@@ -679,8 +729,54 @@ class KubernetesPublicationCluster:
                 self.namespace, label_selector=f"job-name={job_name}"
             )
             items = getattr(pods, "items", None) or []
-            if items:
-                pod_name = str(items[0].metadata.name)
+            owned = []
+            for pod in items:
+                pod_metadata = (
+                    pod.get("metadata")
+                    if isinstance(pod, dict)
+                    else getattr(pod, "metadata", None)
+                )
+                references = (
+                    pod_metadata.get("ownerReferences", [])
+                    if isinstance(pod_metadata, dict)
+                    else getattr(pod_metadata, "owner_references", None) or []
+                )
+                if any(
+                    (
+                        reference.get("kind") == "Job"
+                        and str(reference.get("uid")) == str(job_uid)
+                    )
+                    if isinstance(reference, dict)
+                    else (
+                        getattr(reference, "kind", None) == "Job"
+                        and str(getattr(reference, "uid", None)) == str(job_uid)
+                    )
+                    for reference in references
+                ):
+                    owned.append(pod)
+            if owned:
+                owned.sort(
+                    key=lambda pod: str(
+                        (pod.get("metadata") or {}).get("name")
+                        if isinstance(pod, dict)
+                        else getattr(getattr(pod, "metadata", None), "name", "")
+                    )
+                )
+                selected = owned[0]
+                selected_metadata = (
+                    selected.get("metadata")
+                    if isinstance(selected, dict)
+                    else getattr(selected, "metadata", None)
+                )
+                pod_name = str(
+                    selected_metadata.get("name")
+                    if isinstance(selected_metadata, dict)
+                    else getattr(selected_metadata, "name", "")
+                )
+                if not pod_name:
+                    raise PublicationResourceError(
+                        f"publication Job {job_name!r} owns a pod without a name"
+                    )
                 logs = str(
                     self._core.read_namespaced_pod_log(
                         pod_name,
@@ -723,9 +819,3 @@ class KubernetesPublicationCluster:
             except k8s_client.ApiException as exc:
                 if not self._is_not_found(exc):
                     raise
-
-    def cleanup(self, names: PublicationResourceNames) -> None:
-        """Compatibility cleanup for callers that do not split result delivery."""
-
-        self.cleanup_credentials(names)
-        self.cleanup_terminal(names)

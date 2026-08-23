@@ -64,6 +64,16 @@ class WorkspaceArchiveError(WorkspacePreparationError):
         super().__init__("archive-validation", detail)
 
 
+class _OwnershipWriteUncertain(WorkspacePreparationError):
+    """A ledger write may have committed but could not be read back safely."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "ownership-ledger",
+            "workspace ownership write outcome is uncertain; retaining its archive",
+        )
+
+
 @dataclass(frozen=True)
 class WorkspaceLimits:
     """Resource and deadline envelope for one trusted preparation."""
@@ -531,6 +541,14 @@ class _WorkspaceOwnership:
             expires_at_epoch=expires_at_epoch,
             stale_object_keys=stale,
         )
+
+
+@dataclass(frozen=True)
+class WorkspaceReapCandidate:
+    """Exact expired ledger observed before its potentially slow object cleanup."""
+
+    ownership: _WorkspaceOwnership
+    deleted_object_keys: tuple[str, ...]
 
 
 class WorkspaceCloneLimiter:
@@ -1034,8 +1052,18 @@ class WorkspaceClaimCoordinator:
             thread_key=thread_key,
             generation=uuid.uuid4().hex,
         )
+        previous_ownership: _WorkspaceOwnership | None = None
+        ownership_staged = False
+        sandbox_exposed = False
         try:
             self.preparer.verify(prepared)
+            # Store the exact base facts before the substrate can expose a
+            # sandbox using this object's claim capability. If the worker dies
+            # after the claim starts, a replacement can still recover the base
+            # used by that sandbox and all superseded objects remain accounted
+            # for in the same durable record.
+            previous_ownership = self._stage_ownership(thread_key, prepared)
+            ownership_staged = True
             claim_env = {**(env or {}), **prepared.claim_env()}
             try:
                 handle = self.substrate.claim(thread_key, env=claim_env)
@@ -1045,13 +1073,23 @@ class WorkspaceClaimCoordinator:
                 if not isinstance(exc, self._suspended_errors):
                     raise
                 handle = self.substrate.resume(thread_key, env=claim_env)
-            self._remember(thread_key, prepared)
+            sandbox_exposed = True
+            self._commit_ownership(thread_key, prepared)
             return WorkspaceClaimResult(prepared=prepared, handle=handle)
+        except _OwnershipWriteUncertain:
+            # A response-lost write whose read-back also failed may durably name
+            # this archive. Retaining it is the only fail-safe choice.
+            raise
         except Exception:
-            self.preparer.delete(prepared)
+            if ownership_staged and not sandbox_exposed:
+                self._rollback_ownership(thread_key, prepared, previous_ownership)
+            elif not ownership_staged:
+                self.preparer.delete(prepared)
             raise
 
-    def _remember(self, thread_key: str, prepared: PreparedWorkspace) -> None:
+    def _stage_ownership(
+        self, thread_key: str, prepared: PreparedWorkspace
+    ) -> _WorkspaceOwnership | None:
         with self._lock:
             old = self._load_ownership(thread_key)
             stale = set(old.stale_object_keys if old is not None else ())
@@ -1065,7 +1103,41 @@ class WorkspaceClaimCoordinator:
             )
             self._store_ownership(ownership)
             self._current[thread_key] = prepared
+            return old
+
+    def _commit_ownership(self, thread_key: str, prepared: PreparedWorkspace) -> None:
+        with self._lock:
+            ownership = self._load_ownership(thread_key)
+            if ownership is None or ownership.prepared.object_key != prepared.object_key:
+                raise WorkspacePreparationError(
+                    "ownership-ledger", "workspace ownership changed during sandbox claim"
+                )
             self._cleanup_stale(ownership)
+
+    def _rollback_ownership(
+        self,
+        thread_key: str,
+        prepared: PreparedWorkspace,
+        previous: _WorkspaceOwnership | None,
+    ) -> None:
+        """Restore the exact prior ledger before discarding a failed claim's object."""
+
+        with self._lock:
+            ownership = self._load_ownership(thread_key)
+            if ownership is None or ownership.prepared.object_key != prepared.object_key:
+                raise WorkspacePreparationError(
+                    "ownership-ledger", "workspace ownership changed during claim rollback"
+                )
+            if previous is None:
+                self.preparer.objects.delete(self._ownership_key(thread_key))
+                self._current.pop(thread_key, None)
+            else:
+                self._store_ownership(previous)
+                self._current[thread_key] = previous.prepared
+        # Delete only after durable ownership points away from this object. A
+        # failed ledger restore deliberately retains the staged object rather
+        # than creating an unowned archive or deleting a still-referenced base.
+        self.preparer.delete(prepared)
 
     def release(self, thread_key: str) -> None:
         with self._lock:
@@ -1096,20 +1168,42 @@ class WorkspaceClaimCoordinator:
             )
             return True
 
-    def reap_expired(self) -> list[str]:
-        """Delete expired workspace bases and stale keys after any worker restart."""
+    def enumerate_expired(self) -> list[str]:
+        """Snapshot expired thread ids without mutating their durable ledgers."""
 
-        deleted: list[str] = []
+        expired: list[str] = []
         now = int(self._wall_clock())
         with self._lock:
             for ledger_key in tuple(self.preparer.objects.list_keys(_OWNERSHIP_PREFIX)):
                 ownership = self._load_ownership_key(ledger_key)
-                if ownership.expires_at_epoch > now:
-                    continue
-                deleted.extend(self._delete_owned_objects(ownership))
-                self.preparer.objects.delete(ledger_key)
-                self._current.pop(ownership.thread_key, None)
-        return deleted
+                if ownership.expires_at_epoch <= now:
+                    expired.append(ownership.thread_key)
+        return sorted(expired)
+
+    def begin_expired_reap(self, thread_key: str) -> WorkspaceReapCandidate | None:
+        """Re-read one expiry and delete only the objects named by that snapshot."""
+
+        with self._lock:
+            ownership = self._load_ownership(thread_key)
+            if ownership is None or ownership.expires_at_epoch > int(self._wall_clock()):
+                return None
+            deleted = tuple(self._delete_owned_objects(ownership))
+            return WorkspaceReapCandidate(
+                ownership=ownership,
+                deleted_object_keys=deleted,
+            )
+
+    def finish_expired_reap(self, candidate: WorkspaceReapCandidate) -> bool:
+        """Delete only the unchanged ledger after the caller fences its lock token."""
+
+        ownership = candidate.ownership
+        with self._lock:
+            current = self._load_ownership(ownership.thread_key)
+            if current != ownership:
+                return False
+            self.preparer.objects.delete(self._ownership_key(ownership.thread_key))
+            self._current.pop(ownership.thread_key, None)
+            return True
 
     def current(self, thread_key: str) -> PreparedWorkspace | None:
         """The trusted base facts retained for this active/suspended session."""
@@ -1120,8 +1214,10 @@ class WorkspaceClaimCoordinator:
                 self._current.pop(thread_key, None)
                 return None
             if ownership.expires_at_epoch <= int(self._wall_clock()):
-                self._delete_owned_objects(ownership)
-                self.preparer.objects.delete(self._ownership_key(thread_key))
+                # Reaping is a separate enumerate -> distributed-lock -> exact
+                # re-read operation. A read path must never race a fresh claim
+                # by mutating an expiry observed before that claim committed.
+                self._current.pop(thread_key, None)
                 return None
             self._current[thread_key] = ownership.prepared
             return ownership.prepared
@@ -1146,10 +1242,26 @@ class WorkspaceClaimCoordinator:
         return f"{_OWNERSHIP_PREFIX}/{digest}.json"
 
     def _store_ownership(self, ownership: _WorkspaceOwnership) -> None:
-        self.preparer.objects.put_stream(
-            self._ownership_key(ownership.thread_key),
-            (ownership.encode(),),
-        )
+        key = self._ownership_key(ownership.thread_key)
+        try:
+            self.preparer.objects.put_stream(key, (ownership.encode(),))
+        except Exception as write_exc:
+            # Object stores can commit PutObject and then lose the response. A
+            # read-after-write match adopts that committed outcome. If read-back
+            # itself is unavailable, preserve every possibly referenced archive
+            # and fail loudly rather than guessing that the put did not land.
+            try:
+                observed = self._load_ownership_key(
+                    key,
+                    expected_thread_key=ownership.thread_key,
+                )
+            except Exception as read_exc:
+                if self._is_missing_object(read_exc):
+                    raise write_exc from None
+                raise _OwnershipWriteUncertain() from write_exc
+            if observed == ownership:
+                return
+            raise write_exc
 
     def _load_ownership(self, thread_key: str) -> _WorkspaceOwnership | None:
         key = self._ownership_key(thread_key)
