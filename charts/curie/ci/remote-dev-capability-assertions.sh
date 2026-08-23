@@ -135,9 +135,11 @@ if worker_container.get("resources") != expected_worker_resources:
     fail(f"worker clone resources differ: {worker_container.get('resources')!r}")
 
 
-# Sandbox receives only claim-scoped workspace facts. Both init stages and the
-# runner share a dedicated 1Gi /workspace; no object-store identity survives in
-# any sandbox container and /workspace is not a general writable-root path.
+# Sandbox workspace consumers receive only claim-scoped workspace facts. Both
+# workspace init stages and the runner share a dedicated 1Gi /workspace; no
+# workspace/GitHub/internal-worker identity reaches those consumers and
+# /workspace is not a general writable-root path. The established bundle-fetch
+# S3 identity is covered independently by object-store-web-identity-assertions.
 sandbox = one("SandboxTemplate", component="agent-sandbox")
 pod = sandbox["spec"]["podTemplate"]["spec"]
 workspace_volume = next((v for v in pod.get("volumes", []) if v.get("name") == "workspace"), None)
@@ -147,32 +149,52 @@ init_containers = list(pod.get("initContainers") or [])
 runner = next((c for c in pod.get("containers") or [] if c.get("name") == "runner"), None)
 if runner is None:
     fail("sandbox is missing runner")
-workspace_inits = [
-    container for container in init_containers
-    if any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
-           for m in container.get("volumeMounts", []))
-]
-if len(workspace_inits) < 2:
-    fail("sandbox fetch and extract stages must both share /workspace")
-if not any("fetch" in container.get("name", "") for container in workspace_inits):
-    fail("no workspace-mounted fetch init stage")
-if not any("extract" in container.get("name", "") for container in workspace_inits):
-    fail("no workspace-mounted extract init stage")
+workspace_fetch = next(
+    (container for container in init_containers if container.get("name") == "workspace-fetch"),
+    None,
+)
+workspace_extract = next(
+    (container for container in init_containers if container.get("name") == "workspace-extract"),
+    None,
+)
+if workspace_fetch is None or workspace_extract is None:
+    fail("sandbox must render workspace-fetch and workspace-extract init stages")
+workspace_inits = [workspace_fetch, workspace_extract]
+for container in workspace_inits:
+    if not any(
+        mount.get("name") == "workspace" and mount.get("mountPath") == "/workspace"
+        for mount in container.get("volumeMounts", [])
+    ):
+        fail(f"{container['name']} must share /workspace")
 if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
            for m in runner.get("volumeMounts", [])):
     fail("runner must share workspace at /workspace")
 
-all_containers = init_containers + list(pod.get("containers") or [])
+signed_workspace_facts = {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
+fetch_env = set(env_map(workspace_fetch))
+if fetch_env != signed_workspace_facts:
+    fail(
+        "workspace-fetch must carry only the signed exact-object reference and digest; "
+        f"rendered env was {sorted(fetch_env)}"
+    )
 
-for container in all_containers:
+for container in workspace_inits + [runner]:
     names = set(env_map(container))
     forbidden = {
         "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "CURIE_INTERNAL_WORKER_TOKEN",
+        "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
+        "GITHUB_APP_PRIVATE_KEY", "CURIE_INTERNAL_WORKER_TOKEN", "GIT_CONFIG_COUNT",
     }
     leaked = names & forbidden
+    leaked.update(
+        name for name in names
+        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    )
     if leaked:
-        fail(f"sandbox container {container.get('name')} receives credential env {sorted(leaked)}")
+        fail(
+            f"workspace consumer {container.get('name')} receives credential env "
+            f"{sorted(leaked)}"
+        )
 
 writable = values["agentSandbox"]["runner"]["hardening"]["writablePaths"]
 paths = [item["path"] if isinstance(item, dict) else item for item in writable]
