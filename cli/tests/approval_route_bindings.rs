@@ -11,8 +11,8 @@
 //! body, or in the ABSENCE of one:
 //!
 //! - a write must send the whole map (the field replaces, it does not merge);
-//! - `channel` and `approvers` must stay separate on the wire, since ADR-0034
-//!   exists to keep WHERE a card posts unfused from WHO may resolve it;
+//! - the interactive `resolution` target, text-only `notification` target, and
+//!   `approvers` must stay separate on the wire;
 //! - and a malformed input must send NOTHING. A half-written binding map is a
 //!   silently widened or narrowed approver set, which is exactly the failure the
 //!   approval gate exists to prevent, so validation runs before the connection
@@ -22,6 +22,7 @@ mod support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::credcheck::check_channel_id;
+use curie::ui::CliOutput;
 use std::sync::{Arc, Mutex};
 use support::{serve, MockServer, Response};
 
@@ -31,14 +32,14 @@ const AGENT_ID: &str = "ag_1";
 /// `GET /agents` payload: the handler resolves the agent by name first.
 fn agents_list(routes_json: &str) -> String {
     format!(
-        r#"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0INTAKE00"}}],"approval_required_tools":null,"approval_routes":{routes_json},"memory":false}}]"#
+        r#"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0EXAMPLE0"}}],"approval_required_tools":null,"approval_routes":{routes_json},"memory":false}}]"#
     )
 }
 
 /// `PATCH /agents/{id}` echo: the updated agent the CLI renders from.
 fn patched_agent(routes_json: &str) -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0INTAKE00"}}],"approval_required_tools":null,"approval_routes":{routes_json},"memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"C0EXAMPLE0"}}],"approval_required_tools":null,"approval_routes":{routes_json},"memory":false}}"#
     )
 }
 
@@ -179,25 +180,118 @@ fn assert_no_write(server: &MockServer) {
     );
 }
 
+/// Run one rejected flag invocation and prove it fails before any PATCH.
+async fn rejected(cmd: ApprovalCmd, reason: &str) -> String {
+    let server = stub("null", "null");
+    let err = match run(&server, cmd).await {
+        Ok(_) => panic!("{reason}"),
+        Err(err) => err,
+    };
+    assert_no_write(&server);
+    err.to_string()
+}
+
+/// Write one strict `--routes-from` input and reuse the same no-PATCH proof.
+async fn rejected_routes_file(route: serde_json::Value, reason: &str) -> String {
+    rejected_routes_file_with(route, ApprovalCmd::default(), reason).await
+}
+
+/// Write one strict file, apply any flag overrides, and prove rejection is
+/// still decided from the complete map before a PATCH.
+async fn rejected_routes_file_with(
+    route: serde_json::Value,
+    mut cmd: ApprovalCmd,
+    reason: &str,
+) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, route.to_string()).expect("write routes file");
+    cmd.routes_from = Some(path);
+    rejected(cmd, reason).await
+}
+
+#[test]
+fn old_route_flag_is_unknown() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
+        .args([
+            "local",
+            "approvals",
+            "deal-desk",
+            "--route",
+            "deal_desk=C0EXAMPLE1",
+        ])
+        .output()
+        .expect("run curie");
+
+    assert_eq!(out.status.code(), Some(2), "retired syntax must be usage");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--route'")
+            || stderr.contains("unrecognized option '--route'"),
+        "the retired flag must not remain an alias or fallback:\n{stderr}"
+    );
+}
+
+#[test]
+fn tolerant_response_binding_cannot_be_reused_as_a_patch_body() {
+    let api = include_str!("../src/api.rs");
+    assert!(
+        api.contains("pub struct ApprovalRouteBindingResponse"),
+        "the API read model must be explicitly display-only"
+    );
+    assert!(
+        api.contains("pub struct ApprovalRouteBindingWrite"),
+        "the PATCH body needs a separate strict writer"
+    );
+    let setter = api
+        .split("pub async fn set_approval_routes")
+        .nth(1)
+        .expect("set_approval_routes exists")
+        .split('{')
+        .next()
+        .expect("set_approval_routes signature");
+    assert!(
+        setter.contains("ApprovalRouteBindingWrite"),
+        "set_approval_routes must accept only the strict write DTO: {setter}"
+    );
+    assert!(
+        !setter.contains("ApprovalRouteBindingResponse"),
+        "a tolerant/redacted response must never become the PATCH body: {setter}"
+    );
+    assert!(
+        !api.contains("From<ApprovalRouteBindingResponse> for ApprovalRouteBindingWrite"),
+        "no conversion may turn the tolerant response into a writer"
+    );
+}
+
 #[tokio::test]
-async fn route_flag_writes_the_channel_binding() {
-    let bound = r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#;
+async fn routes_from_builds_the_strict_split_route_shape() {
+    let bound = r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"notification":{"kind":"slack","address":"C0EXAMPLE2"}}}"#;
     let server = stub("null", bound);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(&path, bound).expect("write routes file");
 
     let out = run(
         &server,
         ApprovalCmd {
-            route: vec!["deal_desk=C0MANAGERS".to_string()],
+            routes_from: Some(path),
             ..ApprovalCmd::default()
         },
     )
     .await
-    .expect("a well-formed --route should succeed");
+    .expect("a well-formed split route file should succeed");
 
     let body = patch_body(&server);
     assert_eq!(
-        body["approval_routes"]["deal_desk"]["channel"], "C0MANAGERS",
-        "the PATCH must carry the binding, got {body:?}"
+        body["approval_routes"]["deal_desk"]["resolution"],
+        serde_json::json!({"kind":"slack", "address":"C0EXAMPLE1"}),
+        "the PATCH must carry the one interactive target, got {body:?}"
+    );
+    assert_eq!(
+        body["approval_routes"]["deal_desk"]["notification"],
+        serde_json::json!({"kind":"slack", "address":"C0EXAMPLE2"}),
+        "the PATCH must carry the separate text-only target, got {body:?}"
     );
     // No approvers block was asked for, so none may be sent: an explicit null is
     // a different statement from an omitted key against a model that forbids
@@ -206,13 +300,21 @@ async fn route_flag_writes_the_channel_binding() {
         body["approval_routes"]["deal_desk"]
             .get("approvers")
             .is_none(),
-        "a channel-only write must send no approvers key, got {body:?}"
+        "a route without declared approvers must send no approvers key, got {body:?}"
     );
 
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
-            assert!(routes["deal_desk"].approvers.is_none());
+            let binding = &routes["deal_desk"];
+            assert_eq!(binding.resolution.address, "C0EXAMPLE1");
+            assert_eq!(
+                binding
+                    .notification
+                    .as_ref()
+                    .map(|target| target.address.as_str()),
+                Some("C0EXAMPLE2")
+            );
+            assert!(binding.approvers.is_none());
         }
         _ => panic!("expected the Routes output"),
     }
@@ -229,15 +331,24 @@ fn guided_channel_validation_accepts_slack_channel_kinds() {
 #[tokio::test]
 async fn direct_and_group_channels_reach_the_route_request() {
     for (channel, bound) in [
-        ("C0EXAMPLE1", r#"{"team":{"channel":"C0EXAMPLE1"}}"#),
-        ("D0EXAMPLE1", r#"{"team":{"channel":"D0EXAMPLE1"}}"#),
-        ("G0EXAMPLE1", r#"{"team":{"channel":"G0EXAMPLE1"}}"#),
+        (
+            "C0EXAMPLE1",
+            r#"{"team":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#,
+        ),
+        (
+            "D0EXAMPLE1",
+            r#"{"team":{"resolution":{"kind":"slack","address":"D0EXAMPLE1"}}}"#,
+        ),
+        (
+            "G0EXAMPLE1",
+            r#"{"team":{"resolution":{"kind":"slack","address":"G0EXAMPLE1"}}}"#,
+        ),
     ] {
         let server = stub("null", bound);
         run(
             &server,
             ApprovalCmd {
-                route: vec![format!("team={channel}")],
+                route_resolution: vec![format!("team={channel}")],
                 ..ApprovalCmd::default()
             },
         )
@@ -245,22 +356,25 @@ async fn direct_and_group_channels_reach_the_route_request() {
         .unwrap_or_else(|error| panic!("route validation rejected {channel}: {error}"));
 
         let body = patch_body(&server);
-        assert_eq!(body["approval_routes"]["team"]["channel"], channel);
+        assert_eq!(
+            body["approval_routes"]["team"]["resolution"]["address"],
+            channel
+        );
     }
 }
 
 #[tokio::test]
 async fn route_approvers_narrows_who_without_moving_where() {
-    // The ADR-0034 property, asserted on the wire: `channel` and `approvers` are
+    // The ADR-0034 property, asserted on the wire: resolution and `approvers` are
     // independent axes, so narrowing WHO must leave WHERE untouched and must not
     // collapse the two into one field.
-    let bound = r#"{"finance":{"channel":"C0FINANCE0","approvers":{"group":"S0FINGRP0"}}}"#;
+    let bound = r#"{"finance":{"resolution":{"kind":"slack","address":"C0EXAMPLE3"},"approvers":{"group":"S0FINGRP0"}}}"#;
     let server = stub("null", bound);
 
     let out = run(
         &server,
         ApprovalCmd {
-            route: vec!["finance=C0FINANCE0".to_string()],
+            route_resolution: vec!["finance=C0EXAMPLE3".to_string()],
             route_approvers: vec!["finance=group:S0FINGRP0".to_string()],
             ..ApprovalCmd::default()
         },
@@ -269,7 +383,10 @@ async fn route_approvers_narrows_who_without_moving_where() {
     .expect("a well-formed group binding should succeed");
 
     let body = patch_body(&server);
-    assert_eq!(body["approval_routes"]["finance"]["channel"], "C0FINANCE0");
+    assert_eq!(
+        body["approval_routes"]["finance"]["resolution"]["address"],
+        "C0EXAMPLE3"
+    );
     assert_eq!(
         body["approval_routes"]["finance"]["approvers"]["group"],
         "S0FINGRP0"
@@ -284,7 +401,7 @@ async fn route_approvers_narrows_who_without_moving_where() {
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
             let binding = &routes["finance"];
-            assert_eq!(binding.channel, "C0FINANCE0");
+            assert_eq!(binding.resolution.address, "C0EXAMPLE3");
             assert_eq!(
                 binding.approvers.as_ref().and_then(|a| a.group.as_deref()),
                 Some("S0FINGRP0")
@@ -296,14 +413,13 @@ async fn route_approvers_narrows_who_without_moving_where() {
 
 #[tokio::test]
 async fn route_approvers_users_forwards_the_whole_list() {
-    let bound =
-        r#"{"cro_cfo":{"channel":"C0EXEC0000","approvers":{"users":["U0CRO00000","W0CFO00000"]}}}"#;
+    let bound = r#"{"cro_cfo":{"resolution":{"kind":"slack","address":"C0EXAMPLE4"},"approvers":{"users":["U0CRO00000","W0CFO00000"]}}}"#;
     let server = stub("null", bound);
 
     run(
         &server,
         ApprovalCmd {
-            route: vec!["cro_cfo=C0EXEC0000".to_string()],
+            route_resolution: vec!["cro_cfo=C0EXAMPLE4".to_string()],
             // A W-prefixed id is a valid enterprise-grid user, so the shape check
             // must accept it rather than assuming every user id starts with U.
             route_approvers: vec!["cro_cfo=users:U0CRO00000, W0CFO00000".to_string()],
@@ -323,7 +439,7 @@ async fn route_approvers_users_forwards_the_whole_list() {
 
 #[tokio::test]
 async fn list_routes_reads_without_writing() {
-    let bound = r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#;
+    let bound = r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#;
     let server = stub(bound, bound);
 
     let out = run(
@@ -340,7 +456,7 @@ async fn list_routes_reads_without_writing() {
     match out {
         ApprovalsOutput::Routes { agent, routes } => {
             assert_eq!(agent, "deal-desk");
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+            assert_eq!(routes["deal_desk"].resolution.address, "C0EXAMPLE1");
         }
         _ => panic!("expected the Routes output"),
     }
@@ -354,7 +470,10 @@ async fn clear_routes_sends_an_empty_object_not_null() {
     // An empty object is the only spelling that passes the guard and reaches
     // `crud.update_agent_approval_routes`, whose `routes or None` is a STORAGE
     // normalization applied after the guard, not the wire contract (#1071).
-    let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
+    let server = stub(
+        r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#,
+        "null",
+    );
 
     run(
         &server,
@@ -383,7 +502,8 @@ async fn clear_routes_actually_clears_the_bindings() {
     // router's guard, then read what it hands back. A spelling the guard skips
     // leaves the binding in place, so the operator is told "updated" while the
     // approver set they meant to revoke is still live.
-    let server = router_stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#);
+    let server =
+        router_stub(r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#);
 
     let out = run(
         &server,
@@ -408,7 +528,8 @@ async fn a_routes_file_holding_an_empty_map_clears_the_bindings() {
     let path = dir.path().join("routes.json");
     std::fs::write(&path, "{}").expect("write routes file");
 
-    let server = router_stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#);
+    let server =
+        router_stub(r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#);
 
     let out = run(
         &server,
@@ -429,7 +550,10 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
     // reading if it names the same request. Both halves are read back from what
     // the code produced; comparing two literals would prove nothing.
     let planned = {
-        let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
+        let server = stub(
+            r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#,
+            "null",
+        );
         let out = approvals(
             AgentActionOpts {
                 api_url: server.base_url.clone(),
@@ -454,7 +578,10 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
         }
     };
 
-    let server = stub(r#"{"deal_desk":{"channel":"C0MANAGERS"}}"#, "null");
+    let server = stub(
+        r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}}}"#,
+        "null",
+    );
     run(
         &server,
         ApprovalCmd {
@@ -473,6 +600,64 @@ async fn the_dry_run_plan_names_the_payload_the_real_clear_sends() {
 }
 
 #[tokio::test]
+async fn dry_run_redacts_notification_endpoint_path_query_and_fragment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                "notification": {
+                    "kind": "email",
+                    "address": "approvals@example.com",
+                    "endpoint": "https://adapter.example.com/private/replies?token=secret#credential",
+                    "adapter": "mail"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write routes file");
+    let server = stub("null", "null");
+
+    let out = approvals(
+        AgentActionOpts {
+            api_url: server.base_url.clone(),
+            api_key: TEST_API_KEY.to_string(),
+            agent: "deal-desk".to_string(),
+            dry_run: true,
+        },
+        vec![],
+        false,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a valid notification route should produce a dry-run plan");
+
+    assert_no_write(&server);
+    let ApprovalsOutput::DryRun(plan) = out else {
+        panic!("expected the DryRun output");
+    };
+    let planned = planned_routes_payload(&plan.lines);
+    let notification = &planned["finance"]["notification"];
+    assert_eq!(notification["endpoint"], "https://adapter.example.com");
+    assert_eq!(notification["kind"], "email");
+    assert_eq!(notification["address"], "approvals@example.com");
+    assert_eq!(notification["adapter"], "mail");
+    let rendered = planned.to_string();
+    for secret_detail in ["private/replies", "token=secret", "credential"] {
+        assert!(
+            !rendered.contains(secret_detail),
+            "dry-run output leaked endpoint detail {secret_detail:?}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_malformed_channel_writes_nothing() {
     let server = stub("null", "null");
 
@@ -481,9 +666,9 @@ async fn a_malformed_channel_writes_nothing() {
         ApprovalCmd {
             // The second route is well-formed; the first is not. Neither may be
             // written, or the resulting map is one an operator never asked for.
-            route: vec![
+            route_resolution: vec![
                 "deal_desk=#managers".to_string(),
-                "finance=C0FINANCE0".to_string(),
+                "finance=C0EXAMPLE3".to_string(),
             ],
             ..ApprovalCmd::default()
         },
@@ -507,8 +692,8 @@ async fn a_channel_id_where_a_usergroup_belongs_writes_nothing() {
     let Err(err) = run(
         &server,
         ApprovalCmd {
-            route: vec!["finance=C0FINANCE0".to_string()],
-            route_approvers: vec!["finance=group:C0FINANCE0".to_string()],
+            route_resolution: vec!["finance=C0EXAMPLE3".to_string()],
+            route_approvers: vec!["finance=group:C0EXAMPLE3".to_string()],
             ..ApprovalCmd::default()
         },
     )
@@ -525,7 +710,7 @@ async fn a_channel_id_where_a_usergroup_belongs_writes_nothing() {
 }
 
 #[tokio::test]
-async fn approvers_without_a_channel_writes_nothing() {
+async fn approvers_without_a_resolution_writes_nothing() {
     // A write replaces the whole map, so narrowing a route the invocation never
     // gives a channel would produce a binding with nowhere to post.
     let server = stub("null", "null");
@@ -539,11 +724,11 @@ async fn approvers_without_a_channel_writes_nothing() {
     )
     .await
     else {
-        panic!("approvers with no channel must be refused");
+        panic!("approvers with no resolution must be refused");
     };
 
     assert!(
-        err.to_string().contains("no channel"),
+        err.to_string().contains("no resolution"),
         "unexpected error: {err}"
     );
     assert_no_write(&server);
@@ -559,7 +744,7 @@ async fn route_flags_cannot_be_mixed_with_gate_or_record_flags() {
     let Err(err) = run(
         &server,
         ApprovalCmd {
-            route: vec!["finance=C0FINANCE0".to_string()],
+            route_resolution: vec!["finance=C0EXAMPLE3".to_string()],
             list: true,
             ..ApprovalCmd::default()
         },
@@ -582,18 +767,18 @@ async fn routes_from_seeds_the_map_and_flags_override_it() {
     let path = dir.path().join("routes.json");
     std::fs::write(
         &path,
-        r#"{"deal_desk":{"channel":"C0OLDROOM0"},"finance":{"channel":"C0FINANCE0","approvers":{"group":"S0FINGRP0"}}}"#,
+        r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE5"}},"finance":{"resolution":{"kind":"slack","address":"C0EXAMPLE3"},"approvers":{"group":"S0FINGRP0"}}}"#,
     )
     .expect("write routes file");
 
-    let bound = r#"{"deal_desk":{"channel":"C0MANAGERS"},"finance":{"channel":"C0FINANCE0","approvers":{"group":"S0FINGRP0"}}}"#;
+    let bound = r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"}},"finance":{"resolution":{"kind":"slack","address":"C0EXAMPLE3"},"approvers":{"group":"S0FINGRP0"}}}"#;
     let server = stub("null", bound);
 
     run(
         &server,
         ApprovalCmd {
             routes_from: Some(path),
-            route: vec!["deal_desk=C0MANAGERS".to_string()],
+            route_resolution: vec!["deal_desk=C0EXAMPLE1".to_string()],
             ..ApprovalCmd::default()
         },
     )
@@ -602,7 +787,7 @@ async fn routes_from_seeds_the_map_and_flags_override_it() {
 
     let body = patch_body(&server);
     assert_eq!(
-        body["approval_routes"]["deal_desk"]["channel"], "C0MANAGERS",
+        body["approval_routes"]["deal_desk"]["resolution"]["address"], "C0EXAMPLE1",
         "the flag must win over the file's value, got {body:?}"
     );
     assert_eq!(
@@ -612,77 +797,186 @@ async fn routes_from_seeds_the_map_and_flags_override_it() {
 }
 
 #[tokio::test]
-async fn a_routes_file_with_an_unknown_binding_key_writes_nothing() {
+async fn routes_from_preserves_non_slack_notification_transport_in_the_write_dto() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("routes.json");
+    let route = serde_json::json!({
+        "finance": {
+            "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+            "notification": {
+                "kind": "email",
+                "address": "approvals@example.com",
+                "endpoint": "https://adapter.example.com/replies",
+                "adapter": "mail"
+            }
+        }
+    });
+    std::fs::write(&path, route.to_string()).expect("write");
+    let leaked_echo = route.to_string();
+    let leaked_echo: &'static str = Box::leak(leaked_echo.into_boxed_str());
+    let server = stub("null", leaked_echo);
+
+    let out = run(
+        &server,
+        ApprovalCmd {
+            routes_from: Some(path),
+            ..ApprovalCmd::default()
+        },
+    )
+    .await
+    .expect("a complete adapter notification route should succeed");
+
+    let body = patch_body(&server);
+    assert_eq!(
+        body["approval_routes"]["finance"]["notification"], route["finance"]["notification"],
+        "the strict PATCH DTO must retain both adapter credentials"
+    );
+    let json = out.to_json();
+    assert!(
+        json["routes"]["finance"]["notification"]
+            .get("endpoint")
+            .is_none(),
+        "the tolerant display DTO must redact notification transport: {json}"
+    );
+    assert!(
+        json["routes"]["finance"]["notification"]
+            .get("adapter")
+            .is_none(),
+        "the tolerant display DTO must redact adapter identity: {json}"
+    );
+}
+
+#[tokio::test]
+async fn routes_from_rejections_fail_before_write() {
     // #1072: the typo that matters. `approver` (for `approvers`) used to be
     // silently stripped, and the write that landed was a channel-only binding --
     // which falls back to card-channel membership, so an operator who meant to
     // narrow authority to one group had instead granted it to everyone in the
     // channel. The API guards this with `extra="forbid"`; #1057 made the CLI a
     // second writer that re-serialized a parsed struct, so the operator's bytes
-    // never reached that guard.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("routes.json");
-    std::fs::write(
-        &path,
-        r#"{"deal_desk":{"channel":"C0GENERAL0","approver":{"group":"S0DESKGRP"}}}"#,
-    )
-    .expect("write");
-
-    let server = stub("null", "null");
-
-    let Err(err) = run(
-        &server,
-        ApprovalCmd {
-            routes_from: Some(path),
-            ..ApprovalCmd::default()
-        },
-    )
-    .await
-    else {
-        panic!("an unknown key at the binding level must be refused, not stripped");
-    };
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("approver"),
-        "the error must name the key: {msg}"
-    );
-    assert!(
-        msg.contains("deal_desk"),
-        "the error must name the route carrying it: {msg}"
-    );
-    assert_no_write(&server);
+    // never reached that guard. The sibling typo inside `approvers` must fail at
+    // the same strict boundary.
+    for (route, reason, needles) in [
+        (
+            serde_json::json!({"finance": {"channel": "C0EXAMPLE3"}}),
+            "the retired fused shape must be refused, not migrated at runtime",
+            &["channel", "finance"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                    "notification": {"kind": "email", "address": "approvals@example.com"}
+                }
+            }),
+            "a non-Slack notification without transport must be refused",
+            &["endpoint", "adapter"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                    "notification": {"kind": "email", "address": "approvals@example.com", "endpoint": "https://adapter.example.com/replies"}
+                }
+            }),
+            "an endpoint without an adapter must be refused",
+            &["endpoint", "adapter"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                    "notification": {"kind": "email", "address": "approvals@example.com", "adapter": "mail"}
+                }
+            }),
+            "an adapter without an endpoint must be refused",
+            &["endpoint", "adapter"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "email", "address": "approvals@example.com"}
+                }
+            }),
+            "a non-Slack resolution must be refused",
+            &["slack"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                    "notification": {"kind": "slack", "address": "C0EXAMPLE2", "interactive": true}
+                }
+            }),
+            "an unknown notification key must be refused",
+            &["interactive"][..],
+        ),
+        (
+            serde_json::json!({
+                "deal_desk": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE6"},
+                    "approver": {"group": "S0DESKGRP"}
+                }
+            }),
+            "an unknown key at the binding level must be refused, not stripped",
+            &["approver", "deal_desk"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                    "approvers": {"grup": "S0FINGRP0"}
+                }
+            }),
+            "an unknown key inside approvers must be refused",
+            &["grup"][..],
+        ),
+        (
+            serde_json::json!({
+                "finance": {
+                    "resolution": {"kind": "slack", "address": "finance-room"}
+                }
+            }),
+            "a bad channel in the file must be refused",
+            &["not a Slack channel ID"][..],
+        ),
+        (
+            serde_json::json!({"legacy": {}}),
+            "a binding without resolution must be refused",
+            &["resolution"][..],
+        ),
+    ] {
+        let message = rejected_routes_file(route, reason).await;
+        let lowercase = message.to_lowercase();
+        assert!(
+            needles
+                .iter()
+                .all(|needle| lowercase.contains(&needle.to_lowercase())),
+            "{reason}; expected {needles:?} in {message:?}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_routes_file_with_an_unknown_approvers_key_writes_nothing() {
-    // The sibling case one level down. Already refused before #1072 (the
-    // approvers block was validated when present), and it must stay refused --
-    // the fix moved where parsing happens, so this pins that it did not regress.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("routes.json");
-    std::fs::write(
-        &path,
-        r#"{"finance":{"channel":"C0FINANCE0","approvers":{"grup":"S0FINGRP0"}}}"#,
-    )
-    .expect("write");
-
-    let server = stub("null", "null");
-
-    let Err(err) = run(
-        &server,
+async fn resolution_override_cannot_duplicate_file_notification() {
+    let message = rejected_routes_file_with(
+        serde_json::json!({
+            "finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                "notification": {"kind": "slack", "address": "C0EXAMPLE4"}
+            }
+        }),
         ApprovalCmd {
-            routes_from: Some(path),
+            route_resolution: vec!["finance=C0EXAMPLE4".to_string()],
             ..ApprovalCmd::default()
         },
+        "the final binding map must be revalidated after flag overrides",
     )
-    .await
-    else {
-        panic!("an unknown key inside approvers must be refused");
-    };
-
-    assert!(err.to_string().contains("grup"), "unexpected error: {err}");
-    assert_no_write(&server);
+    .await;
+    assert!(
+        message.contains("must differ from resolution"),
+        "the override-created duplicate must fail closed: {message}"
+    );
 }
 
 #[tokio::test]
@@ -691,7 +985,7 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
     // struct rather than `deny_unknown_fields` on the existing one: the RESPONSE
     // side must keep decoding a binding a newer server has added a field to,
     // or an older CLI breaks against a newer platform.
-    let bound = r#"{"deal_desk":{"channel":"C0MANAGERS","escalation_after_s":3600}}"#;
+    let bound = r#"{"deal_desk":{"resolution":{"kind":"slack","address":"C0EXAMPLE1"},"notification":{"kind":"email","address":"approvals@example.com"},"escalation_after_s":3600}}"#;
     let server = stub(bound, bound);
 
     let out = run(
@@ -706,38 +1000,12 @@ async fn an_api_response_tolerates_a_field_the_cli_does_not_model() {
 
     match out {
         ApprovalsOutput::Routes { routes, .. } => {
-            assert_eq!(routes["deal_desk"].channel, "C0MANAGERS");
+            let json = serde_json::to_value(&routes["deal_desk"]).unwrap();
+            assert_eq!(json["resolution"]["address"], "C0EXAMPLE1");
+            assert_eq!(json["notification"]["address"], "approvals@example.com");
+            assert!(json["notification"].get("endpoint").is_none());
+            assert!(json["notification"].get("adapter").is_none());
         }
         _ => panic!("expected the Routes output"),
     }
-}
-
-#[tokio::test]
-async fn a_malformed_routes_file_writes_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("routes.json");
-    // Valid JSON, invalid binding: the file path must be validated with the same
-    // rules the flag path uses, or the two input forms disagree about what a
-    // legal binding is.
-    std::fs::write(&path, r#"{"finance":{"channel":"finance-room"}}"#).expect("write");
-
-    let server = stub("null", "null");
-
-    let Err(err) = run(
-        &server,
-        ApprovalCmd {
-            routes_from: Some(path),
-            ..ApprovalCmd::default()
-        },
-    )
-    .await
-    else {
-        panic!("a bad channel in the file must be refused");
-    };
-
-    assert!(
-        err.to_string().contains("not a Slack channel ID"),
-        "unexpected error: {err}"
-    );
-    assert_no_write(&server);
 }

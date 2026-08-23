@@ -1638,6 +1638,21 @@ fn approvals_output_validates_all_variants() {
         record: approval_record(),
     };
     assert_valid("approvals.schema.json", &resolved.to_json());
+    let routes = ApprovalsOutput::Routes {
+        agent: "d".to_string(),
+        routes: serde_json::from_value(serde_json::json!({
+            "finance": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE1"}
+            }
+        }))
+        .expect("the route response carries its required resolution"),
+    };
+    let routes_json = routes.to_json();
+    assert_eq!(
+        routes_json["routes"]["finance"]["resolution"]["address"],
+        "C0EXAMPLE1"
+    );
+    assert_valid("approvals.schema.json", &routes_json);
     let dry = ApprovalsOutput::DryRun(DryRunPlan {
         lines: vec!["GET /approvals".to_string()],
     });

@@ -5063,8 +5063,8 @@ pub struct ApprovalCmd {
     pub reject: bool,
     pub note: Option<String>,
     pub actor_channel: Option<String>,
-    /// `--route NAME=CHANNEL`, repeatable.
-    pub route: Vec<String>,
+    /// `--route-resolution NAME=CHANNEL`, repeatable.
+    pub route_resolution: Vec<String>,
     /// `--route-approvers NAME=users:U1,U2` or `NAME=group:S1`, repeatable.
     pub route_approvers: Vec<String>,
     /// `--routes-from FILE`: the whole binding map as JSON.
@@ -5075,16 +5075,17 @@ pub struct ApprovalCmd {
 
 // --- Approval route bindings (#1052) -----------------------------------------
 //
-// Which channel an approval card posts to, and who may resolve it, live in the
-// agent's `approval_routes` map. Until this verb existed the only way to write
-// one was a hand-rolled `PATCH /agents/{id}`, against the repo's own "one entry
-// point: curie <command>" rule.
+// The verified resolution card, optional text-only notification, and who may
+// resolve live as separate fields in the agent's `approval_routes` map. Until
+// this verb existed the only way to write one was a hand-rolled
+// `PATCH /agents/{id}`, against the repo's own "one entry point: curie
+// <command>" rule.
 //
 // Two properties shape the code below.
 //
 // The write is a FULL REPLACEMENT, exactly as `--gate` already is for
 // `approval_required_tools`. That is the field's semantics on `AgentUpdate`, and
-// a merge would make `--route` unable to express removal.
+// a merge would make the route inputs unable to express removal.
 //
 // Every parse and shape error is collected BEFORE any HTTP call. A partial write
 // of a binding map is a silently widened (or silently narrowed) approver set,
@@ -5100,6 +5101,9 @@ static SLACK_USERGROUP_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^S[A-Z0-9]{7,}$").expect("usergroup id re"));
 static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^[UW][A-Z0-9]{7,}$").expect("user id re"));
+static CHANNEL_KIND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$").expect("channel kind re")
+});
 
 /// Split `NAME=VALUE` once, rejecting an empty half.
 ///
@@ -5109,7 +5113,7 @@ static SLACK_USER_ID: std::sync::LazyLock<regex::Regex> =
 fn split_route_arg<'a>(flag: &str, raw: &'a str) -> Result<(&'a str, &'a str)> {
     let (name, value) = raw.split_once('=').ok_or_else(|| {
         crate::exit::usage(format!(
-            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0123ABCD"
+            "{flag} {raw:?} is not NAME=VALUE; pass e.g. {flag} deal_desk=C0EXAMPLE1"
         ))
     })?;
     let (name, value) = (name.trim(), value.trim());
@@ -5194,23 +5198,24 @@ fn parse_route_approvers(value: &str) -> Result<crate::api::ApprovalApprovers> {
     }
 }
 
-/// Build the binding map a write should send, from the three input forms.
+/// Build the binding map a write should send from a strict file plus overrides.
 ///
 /// `--routes-from` seeds the map and the repeatable flags apply on top, so a
 /// committed file can be spot-overridden on the command line. Every error is a
 /// usage error raised before the caller opens a connection.
 fn build_route_bindings(
-    route: &[String],
+    route_resolution: &[String],
     route_approvers: &[String],
     routes_from: Option<&PathBuf>,
-) -> Result<BTreeMap<String, crate::api::ApprovalRouteBinding>> {
-    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBinding> = BTreeMap::new();
+) -> Result<BTreeMap<String, crate::api::ApprovalRouteBindingWrite>> {
+    let mut bindings: BTreeMap<String, crate::api::ApprovalRouteBindingWrite> = BTreeMap::new();
 
     if let Some(path) = routes_from {
         let text = std::fs::read_to_string(path).map_err(|e| {
             crate::exit::usage(format!(
                 "--routes-from {}: {e}; the file must be JSON shaped \
-                 {{\"<route>\": {{\"channel\": \"C0123ABCD\"}}}}",
+                 {{\"<route>\": {{\"resolution\": \
+                 {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}}}}}",
                 path.display()
             ))
         })?;
@@ -5223,7 +5228,8 @@ fn build_route_bindings(
             serde_json::from_str(&text).map_err(|e| {
                 crate::exit::usage(format!(
                     "--routes-from {}: {e}; expected JSON shaped \
-                     {{\"<route>\": {{\"channel\": \"C0123ABCD\", \
+                     {{\"<route>\": {{\"resolution\": \
+                     {{\"kind\": \"slack\", \"address\": \"C0EXAMPLE1\"}}, \
                      \"approvers\": {{\"group\": \"S0123ABCD\"}}}}}}",
                     path.display()
                 ))
@@ -5231,8 +5237,8 @@ fn build_route_bindings(
         for (name, value) in raw {
             // RouteBindingInput is the strict, operator-file twin of the
             // response-side type: it refuses an unknown key instead of dropping
-            // it (#1072). A dropped `approver` would leave a channel-only
-            // binding, which widens the approver set to the whole card channel.
+            // it (#1072). A dropped `approver` would leave authority falling
+            // back to the whole resolution-card channel.
             let input: crate::api::RouteBindingInput =
                 serde_json::from_value(value).map_err(|e| {
                     anyhow::Error::from(
@@ -5241,30 +5247,34 @@ fn build_route_bindings(
                             path.display()
                         ))
                         .with_fix(
-                            "a route binding takes `channel` and an optional `approvers` \
-                             block of `group` or `users`, and nothing else. A dropped \
-                             sibling key would leave a channel-only binding, which makes \
-                             every member of that channel an approver",
+                            "a route binding requires `resolution: {kind: \"slack\", \
+                             address: \"C...\"}` and accepts optional `notification` and \
+                             `approvers` blocks, and nothing else. The retired `channel` key \
+                             is not accepted",
                         ),
                     )
                 })?;
-            let binding: crate::api::ApprovalRouteBinding = input.into();
-            validate_route_channel(&name, &binding.channel)?;
-            if let Some(approvers) = &binding.approvers {
-                validate_parsed_approvers(&name, approvers)?;
-            }
+            let binding: crate::api::ApprovalRouteBindingWrite = input.into();
             bindings.insert(name, binding);
         }
     }
 
-    for raw in route {
-        let (name, channel) = split_route_arg("--route", raw)?;
-        validate_route_channel(name, channel)?;
+    for raw in route_resolution {
+        let (name, channel) = split_route_arg("--route-resolution", raw)?;
         bindings
             .entry(name.to_string())
-            .and_modify(|b| b.channel = channel.to_string())
-            .or_insert_with(|| crate::api::ApprovalRouteBinding {
-                channel: channel.to_string(),
+            .and_modify(|b| {
+                b.resolution = crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                }
+            })
+            .or_insert_with(|| crate::api::ApprovalRouteBindingWrite {
+                resolution: crate::api::ApprovalResolutionTargetWrite {
+                    kind: "slack".to_string(),
+                    address: channel.to_string(),
+                },
+                notification: None,
                 approvers: None,
             });
     }
@@ -5272,17 +5282,15 @@ fn build_route_bindings(
     for raw in route_approvers {
         let (name, value) = split_route_arg("--route-approvers", raw)?;
         let approvers = parse_route_approvers(value)?;
-        // Approvers narrow an EXISTING binding; without a channel there is
-        // nowhere for the card to post, and the API's model requires one. Refuse
-        // rather than invent a channel.
+        // Approvers narrow an EXISTING binding; without a resolution there is
+        // no verified card surface. Refuse rather than invent one.
         let binding = bindings.get_mut(name).ok_or_else(|| {
             anyhow::Error::from(
                 crate::exit::CliError::usage(format!(
-                    "--route-approvers {name:?} names a route with no channel to post its \
-                     card in"
+                    "--route-approvers {name:?} names a route with no resolution"
                 ))
                 .with_fix(format!(
-                    "add --route {name}=<CHANNEL> to the same invocation (or name the \
+                    "add --route-resolution {name}=<CHANNEL> to the same invocation (or name the \
                      route in --routes-from): a write replaces the whole route map, so \
                      every route it should keep must be present"
                 )),
@@ -5291,7 +5299,136 @@ fn build_route_bindings(
         binding.approvers = Some(approvers);
     }
 
+    // Overrides can invalidate a previously valid file binding (for example,
+    // by moving resolution onto its notification target), so validate only the
+    // complete final map. Nothing reaches HTTP unless every binding survives.
+    for (name, binding) in &bindings {
+        validate_resolution_target(name, &binding.resolution)?;
+        if let Some(notification) = &binding.notification {
+            validate_notification_target(name, notification)?;
+            reject_identical_targets(name, &binding.resolution, notification)?;
+        }
+        if let Some(approvers) = &binding.approvers {
+            validate_parsed_approvers(name, approvers)?;
+        }
+    }
+
     Ok(bindings)
+}
+
+/// The interactive extension point is explicit but remains Slack-only until a
+/// second channel can mint a scoped, verified resolver credential.
+fn validate_resolution_target(
+    route: &str,
+    target: &crate::api::ApprovalResolutionTargetWrite,
+) -> Result<()> {
+    if target.kind != "slack" {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: resolution kind {:?} is unsupported; only slack can carry \
+             a verified resolver identity",
+            target.kind
+        )));
+    }
+    validate_route_channel(route, &target.address)
+}
+
+/// Validate the notification identity and its independent transport route.
+fn validate_notification_target(
+    route: &str,
+    target: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if !CHANNEL_KIND.is_match(&target.kind) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification kind {:?} is not a lowercase channel-kind slug",
+            target.kind
+        )));
+    }
+    if target.kind == "slack" {
+        validate_route_channel(route, &target.address)?;
+    } else if target.address.is_empty() || target.address.chars().any(char::is_whitespace) {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification address must be non-empty and contain no whitespace"
+        )));
+    }
+    let complete_transport = target.endpoint.is_some() && target.adapter.is_some();
+    let empty_transport = target.endpoint.is_none() && target.adapter.is_none();
+    if !complete_transport && !empty_transport {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification endpoint and adapter must be supplied together"
+        )));
+    }
+    if target.kind != "slack" && !complete_transport {
+        return Err(crate::exit::CliError::usage(format!(
+            "route {route:?}: non-Slack notification kind {:?} requires both endpoint and adapter",
+            target.kind
+        ))
+        .with_fix(
+            "put the complete notification object in --routes-from, including an absolute \
+             endpoint URL and adapter name",
+        )
+        .into());
+    }
+    if let Some(adapter) = &target.adapter {
+        if !CHANNEL_KIND.is_match(adapter) {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification adapter is not a lowercase slug"
+            )));
+        }
+    }
+    if let Some(endpoint) = &target.endpoint {
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must be an absolute http(s) URL with a host"
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(crate::exit::usage(format!(
+                "route {route:?}: notification endpoint must not contain userinfo; use adapter credentials"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_identical_targets(
+    route: &str,
+    resolution: &crate::api::ApprovalResolutionTargetWrite,
+    notification: &crate::api::NotificationTargetWrite,
+) -> Result<()> {
+    if resolution.kind == notification.kind && resolution.address == notification.address {
+        return Err(crate::exit::usage(format!(
+            "route {route:?}: notification must differ from resolution; a duplicate target \
+             is not a second notification surface"
+        )));
+    }
+    Ok(())
+}
+
+/// Render route bindings for a dry-run without exposing credential-bearing
+/// adapter URL paths, queries, or fragments. The origin is enough to identify
+/// the transport destination; the real PATCH retains the complete endpoint.
+fn route_bindings_plan_json(
+    bindings: &BTreeMap<String, crate::api::ApprovalRouteBindingWrite>,
+) -> String {
+    let mut display = bindings.clone();
+    for binding in display.values_mut() {
+        let Some(endpoint) = binding
+            .notification
+            .as_mut()
+            .and_then(|target| target.endpoint.as_mut())
+        else {
+            continue;
+        };
+        *endpoint = reqwest::Url::parse(endpoint)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "<redacted>".to_string());
+    }
+    serde_json::to_string(&display).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
 /// Channel-shape check for one route binding, with the route named in the error.
@@ -5303,8 +5440,8 @@ fn validate_route_channel(route: &str, channel: &str) -> Result<()> {
              receives messages"
         ))
         .with_fix(
-            "pass the channel ID (e.g. C0123ABCD): find it in the channel's About tab, \
-             or at the end of the channel URL (.../archives/C0123ABCD)",
+            "pass the channel ID (e.g. C0EXAMPLE1): find it in the channel's About tab, \
+             or at the end of the channel URL (.../archives/C0EXAMPLE1)",
         )
         .into());
     }
@@ -5381,7 +5518,7 @@ pub enum ApprovalsOutput {
     /// bundle names escalates to a human rather than posting a card.
     Routes {
         agent: String,
-        routes: BTreeMap<String, crate::api::ApprovalRouteBinding>,
+        routes: BTreeMap<String, crate::api::ApprovalRouteBindingResponse>,
     },
 }
 
@@ -5508,10 +5645,21 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                         routes.len()
                     ));
                     for (name, binding) in routes {
-                        // Print WHERE and WHO as separate labelled facts: ADR-0034
-                        // unfused these two axes, and a single collapsed line would
-                        // re-fuse them in the operator's head.
-                        ui.kv(name, &format!("channel {}", binding.channel));
+                        // Keep resolution, notification, and authority as three
+                        // labelled facts. The notification is never presented as
+                        // a place where an operator can act.
+                        let resolution =
+                            format!("{}:{}", binding.resolution.kind, binding.resolution.address);
+                        ui.kv(
+                            name,
+                            &format!("resolution {resolution} (verified interactive card)"),
+                        );
+                        let notification = binding
+                            .notification
+                            .as_ref()
+                            .map(|target| format!("{}:{} (text-only)", target.kind, target.address))
+                            .unwrap_or_else(|| "(none)".to_string());
+                        ui.kv("", &format!("  notification: {notification}"));
                         ui.kv("", &format!("  approvers: {}", describe_approvers(binding)));
                     }
                 }
@@ -5521,11 +5669,11 @@ impl crate::ui::CliOutput for ApprovalsOutput {
 }
 
 /// One line naming who may resolve a route's approvals, including the default.
-fn describe_approvers(binding: &crate::api::ApprovalRouteBinding) -> String {
+fn describe_approvers(binding: &crate::api::ApprovalRouteBindingResponse) -> String {
     match &binding.approvers {
         None => format!(
-            "members of {} (the default: no approvers block declared)",
-            binding.channel
+            "members of {}:{} (the default: no approvers block declared)",
+            binding.resolution.kind, binding.resolution.address
         ),
         Some(a) => match (&a.users, &a.group) {
             // Mirror the API's precedence in the wording rather than hiding it:
@@ -5587,20 +5735,19 @@ pub async fn approvals(
 ) -> Result<ApprovalsOutput> {
     let gate_mode = clear || !gate.is_empty();
 
-    // --route/--route-approvers/--routes-from/--list-routes/--clear-routes (#1052):
-    // the agent's route bindings, which decide WHERE a card posts and WHO may
-    // resolve it. Handled ahead of every other branch because it is a distinct
+    // The split target/approver flags address the agent's approval route map.
+    // Handled ahead of every other branch because it is a distinct
     // object from both the tool gates and the pending records, and mixing it with
     // either in one invocation would make the write's replace-the-whole-map
     // semantics ambiguous.
-    let route_write = !cmd.route.is_empty()
+    let route_write = !cmd.route_resolution.is_empty()
         || !cmd.route_approvers.is_empty()
         || cmd.routes_from.is_some()
         || cmd.clear_routes;
     if route_write || cmd.list_routes {
         if gate_mode || cmd.list || cmd.resolve.is_some() {
             return Err(crate::exit::usage(
-                "the route-binding flags (--route/--route-approvers/--routes-from/\
+                "the route-binding flags (--route-resolution/--route-approvers/--routes-from/\
                  --list-routes/--clear-routes) address the agent's approval ROUTES; they \
                  cannot be combined with --gate/--clear (tool gates) or --list/--resolve \
                  (pending records). Run them as separate invocations",
@@ -5612,13 +5759,14 @@ pub async fn approvals(
             ));
         }
         if cmd.clear_routes
-            && (!cmd.route.is_empty()
+            && (!cmd.route_resolution.is_empty()
                 || !cmd.route_approvers.is_empty()
                 || cmd.routes_from.is_some())
         {
             return Err(crate::exit::usage(
-                "--clear-routes cannot be combined with --route/--route-approvers/\
-                 --routes-from (clear removes every binding)",
+                "--clear-routes cannot be combined with --route-resolution/\
+                 --route-approvers/--routes-from \
+                 (clear removes every binding)",
             ));
         }
 
@@ -5627,7 +5775,11 @@ pub async fn approvals(
         let bindings = if cmd.clear_routes {
             BTreeMap::new()
         } else {
-            build_route_bindings(&cmd.route, &cmd.route_approvers, cmd.routes_from.as_ref())?
+            build_route_bindings(
+                &cmd.route_resolution,
+                &cmd.route_approvers,
+                cmd.routes_from.as_ref(),
+            )?
         };
 
         if opts.dry_run {
@@ -5635,9 +5787,10 @@ pub async fn approvals(
                 format!(
                     "PATCH {}/agents/<id> approval_routes={} (a FULL REPLACEMENT of the map)",
                     opts.api_url,
-                    // Deliberately not valid JSON. "{}" is the real clear payload, so a
-                    // fallback that looked like "{}" would misreport a full revocation.
-                    serde_json::to_string(&bindings).unwrap_or_else(|_| "<unserializable>".into())
+                    // Deliberately not valid JSON on serialization failure. "{}" is the
+                    // real clear payload, so a fallback that looked like "{}" would
+                    // misreport a full revocation.
+                    route_bindings_plan_json(&bindings)
                 )
             } else {
                 format!(
@@ -5838,7 +5991,7 @@ pub async fn observability(open: bool) -> Result<crate::observability::Observabi
 /// answered authoritatively by the API.
 ///
 /// The `slack` arm rejects a `#name` rather than a channel ID: real Slack
-/// events carry the channel **ID** (e.g. `C0123ABCD`), and the worker's
+/// events carry the channel **ID** (e.g. `C0EXAMPLE1`), and the worker's
 /// binding resolver matches on that ID, so a `#name` value is stored verbatim
 /// and never routes -- a silently dead binding. Fail the deploy up front
 /// instead.
@@ -5846,9 +5999,9 @@ fn validate_channel_binding(kind: &str, address: &str) -> Result<()> {
     if kind == "slack" && address.trim_start().starts_with('#') {
         return Err(crate::exit::usage(format!(
             "slack channel {address:?} is a name, not an ID: real Slack events carry the \
-             channel ID (e.g. C0123ABCD) and the worker routes on it, so a #name binding \
+             channel ID (e.g. C0EXAMPLE1) and the worker routes on it, so a #name binding \
              never receives messages. Pass the channel ID instead -- find it in the \
-             channel's About tab, or the channel URL (.../archives/C0123ABCD)."
+             channel's About tab, or the channel URL (.../archives/C0EXAMPLE1)."
         )));
     }
     Ok(())
@@ -6482,15 +6635,14 @@ pub const APPROVALS_ROUTES_REASON: &str =
     "an approval route binding is per-agent platform config (agents.approval_routes), and the skill tier runs a bare runner with no platform, no agent record, and therefore nothing to bind a route on";
 /// Where to bind approval routes instead.
 pub const APPROVALS_ROUTES_ALT: &str =
-    "use `curie local approvals <agent> --route <name>=<channel>` or `curie cluster approvals <agent> --route <name>=<channel>` for a deployed agent; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
+    "use `curie local approvals <agent> --route-resolution <name>=<channel>` or `curie cluster approvals <agent> --route-resolution <name>=<channel>` for a deployed agent; use `--routes-from <file>` to declare a complete route with a text-only notification; the bundle-side half (which routes exist) is the manifest's approvalPolicy, which `curie skill approvals` does show";
 
-/// `skill approvals --route`/`--route-approvers`/`--routes-from`/`--list-routes`/
-/// `--clear-routes`: answered, but unavailable at this tier by construction
-/// (ADR-0041). Accepted so the tier reports WHY (exit 4) rather than erroring
-/// like an unknown-flag typo, matching `--list`/`--resolve` above.
+/// The route-binding inputs are answered but unavailable at this tier by
+/// construction (ADR-0041). Accepted so the tier reports WHY (exit 4) rather
+/// than erroring like an unknown-flag typo, matching `--list`/`--resolve` above.
 pub fn skill_approval_routes_unavailable() -> anyhow::Error {
     crate::exit::unsupported(
-        "approvals --route/--route-approvers/--routes-from/--list-routes/--clear-routes",
+        "approvals --route-resolution/--route-approvers/--routes-from/--list-routes/--clear-routes",
         APPROVALS_ROUTES_REASON,
         APPROVALS_ROUTES_ALT,
     )

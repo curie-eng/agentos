@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -33,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import aiohttp
 from aci_protocol import (
@@ -278,15 +279,102 @@ RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
 # platform contract on a platform-authored turn -- not user-intent guessing.
 _EXPIRY_RESUME_MARKER = "[approval expired]"
 
-# The channel kind a POLICY-ROUTED approval card posts to (#247). The one place
-# the kernel names a kind, and it is a fact about the route binding rather than a
-# branch on the turn: ``ApprovalRouteBinding.channel`` is validated as a Slack
-# channel id (``apps/api/src/curie_api/schemas.py``), the channel-membership
-# authorizer proves approver membership through Slack, and widening that binding
-# to other kinds is explicitly out of scope for ADR-0096 phase 2. Its route is
-# empty on both halves, which means the worker's DEFAULT Slack transport (#451):
-# the card is policy, so its transport is policy too, never the trigger's.
+# The only channel kind a POLICY-ROUTED approval RESOLUTION target may name
+# (#1460). The explicit kind is the future extension point, but accepting another
+# resolver now would bypass the verified Slack identity on which the API's
+# authorizer relies. Its route is empty on both halves, which means the worker's
+# DEFAULT Slack transport (#451): the card is policy, so its transport is policy
+# too, never the trigger's or the notification target's.
 POLICY_CARD_KIND = "slack"
+_POLICY_CARD_ADDRESS = re.compile(r"^[CDG][A-Z0-9]{7,}$")
+_NOTIFICATION_ADDRESS_SHAPES = {POLICY_CARD_KIND: _POLICY_CARD_ADDRESS}
+_CHANNEL_SLUG = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+_ROUTE_WHITESPACE = re.compile(r"\s")
+
+
+def _valid_notification_endpoint(endpoint: Any) -> bool:
+    """Mirror the API's absolute HTTP(S), host, and no-userinfo endpoint gate."""
+
+    if not isinstance(endpoint, str):
+        return False
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
+
+
+def _parse_approval_targets(
+    binding: Any,
+) -> tuple[tuple[str, str], tuple[str, str, TargetRoute] | None] | None:
+    """Parse one stored approval binding, or fail closed with ``None``.
+
+    The API owns complete config validation. This worker boundary independently
+    reasserts the authority-bearing envelope and Slack resolution-ID shape
+    because JSONB may be written out of band: the retired ``channel`` key, a
+    non-Slack resolver, an unknown target field, a half-configured transport,
+    or duplicate targets must not produce a durable approval with ambiguous
+    authority.
+    """
+
+    if not isinstance(binding, dict) or set(binding) - {
+        "resolution",
+        "notification",
+        "approvers",
+    }:
+        return None
+
+    resolution = binding.get("resolution")
+    if (
+        not isinstance(resolution, dict)
+        or set(resolution) != {"kind", "address"}
+        or resolution.get("kind") != POLICY_CARD_KIND
+        or not isinstance(resolution.get("address"), str)
+        or _POLICY_CARD_ADDRESS.fullmatch(resolution["address"]) is None
+    ):
+        return None
+    resolution_pair = (POLICY_CARD_KIND, resolution["address"])
+
+    notification = binding.get("notification")
+    if notification is None:
+        return resolution_pair, None
+    if not isinstance(notification, dict) or set(notification) - {
+        "kind",
+        "address",
+        "endpoint",
+        "adapter",
+    }:
+        return None
+
+    kind = notification.get("kind")
+    address = notification.get("address")
+    endpoint = notification.get("endpoint")
+    adapter = notification.get("adapter")
+    address_shape = (
+        _NOTIFICATION_ADDRESS_SHAPES.get(kind) if isinstance(kind, str) else None
+    )
+    if (
+        not isinstance(kind, str)
+        or _CHANNEL_SLUG.fullmatch(kind) is None
+        or not isinstance(address, str)
+        or not address
+        or _ROUTE_WHITESPACE.search(address) is not None
+        or (address_shape is not None and address_shape.fullmatch(address) is None)
+        or (adapter is not None and (
+            not isinstance(adapter, str) or _CHANNEL_SLUG.fullmatch(adapter) is None
+        ))
+        or (endpoint is None) != (adapter is None)
+        or (endpoint is not None and not _valid_notification_endpoint(endpoint))
+        or (kind != POLICY_CARD_KIND and endpoint is None)
+        or (kind, address) == resolution_pair
+    ):
+        return None
+    return resolution_pair, (kind, address, TargetRoute(endpoint=endpoint, adapter=adapter))
 
 
 def _approval_id_from_resume_event(event_id: str) -> str | None:
@@ -2291,13 +2379,13 @@ class Kernel:
         resume path cold-claims a fresh sandbox regardless (ADR-0003).
 
         ``approval_routes`` is the agent's per-deployment route-binding map
-        (#247): when the request named a route bound to a channel, the card is
-        routed there and that channel's members become the approvers. A named
-        but UNBOUND route (declared in the manifest, not bound in this agent's
-        deployment config) is ESCALATED loudly rather than routed to the
-        requesting channel (#544, Decision B, reversing #247): silently widening
-        authority to whoever happens to be in the requesting channel is exactly
-        the failure AC2 closes. No approval is created in that case.
+        (#247/#1460): ``resolution`` owns the sole interactive card and verified
+        identity path; ``notification`` may receive a separate text-only ping.
+        A named but UNBOUND or malformed route is ESCALATED loudly rather than
+        routed to the requesting channel (#544, Decision B, reversing #247):
+        silently widening authority to whoever happens to be in the requesting
+        channel is exactly the failure AC2 closes. No approval is created in
+        that case.
         """
 
         # Both identities are live in this function and they are not
@@ -2333,18 +2421,13 @@ class Kernel:
         # happens to equal a Slack policy channel as "the requesting channel".
         card_kind = qevent.reply_handle.kind
         card_channel = qevent.reply_handle.channel
+        notification_target: tuple[str, str, TargetRoute] | None = None
         if route_name:
             binding = (approval_routes or {}).get(route_name)
-            bound = binding.get("channel") if isinstance(binding, dict) else None
-            if bound:
-                # A policy channel is a Slack channel id by construction
-                # (POLICY_CARD_KIND), so the routed card's pair is that kind
-                # with that address -- whatever kind the requesting turn had.
-                card_kind = POLICY_CARD_KIND
-                card_channel = str(bound)
-            else:
+            targets = _parse_approval_targets(binding)
+            if targets is None:
                 logger.warning(
-                    "approval route %r is not bound for agent %s; escalating "
+                    "approval route %r is not bound or is malformed for agent %s; escalating "
                     "rather than routing the card to the requesting channel",
                     route_name,
                     agent_id,
@@ -2353,10 +2436,12 @@ class Kernel:
                     qevent,
                     route,
                     f"The run requested approval via route {route_name!r}, but that "
-                    "route is not bound to a channel for this agent; flagging for "
-                    "a human instead of widening the request to this channel.",
+                    "route is not bound to a valid resolution target for this "
+                    "agent; flagging for a human instead of widening the request "
+                    "to this channel.",
                 )
                 return
+            (card_kind, card_channel), notification_target = targets
 
         if not is_publication and self._approvals is None:
             await self._escalate(
@@ -2593,10 +2678,11 @@ class Kernel:
         # requesting channel the card joins the thread and rides the trigger's
         # own transport. A route-bound channel has no such thread and is policy,
         # not a per-turn reply: it posts top-level over the worker's default
-        # Slack transport, because an ``ApprovalRouteBinding`` is a Slack channel
-        # id by construction (``schemas.py`` validates it as one, and #247's
-        # binding shape is explicitly out of scope for ADR-0096 phase 2), and the
-        # authorizer proves membership of that channel through Slack.
+        # Slack transport, because ``ApprovalRouteBinding.resolution`` is
+        # Slack-only by construction (``schemas.py`` validates the explicit
+        # pair), and the authorizer proves membership of that channel through a
+        # verified Slack card click. Notification transport never feeds this
+        # comparison or these route fields.
         #
         # Keeping the requesting turn's kind and adapter here was a fail-closed
         # bug: an email-originated approval routed to a Slack policy channel kept
@@ -2724,6 +2810,38 @@ class Kernel:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort memory
                     logger.warning("remembering approval card for %s failed: %s", created.id, exc)
+        # Visibility is independent of card delivery. This is a second post, not
+        # a second card: there is deliberately no ConfirmIntent, action value, or
+        # remembered card ref. A failed notification cannot invalidate or move
+        # the durable approval, and a failed resolution-card transport must not
+        # suppress the notification attempt.
+        if notification_target is not None:
+            notification_kind, notification_address, notification_route = notification_target
+            try:
+                await self._sink.emit(
+                    ReplyPost(
+                        version=REPLY_WIRE_VERSION,
+                        event="reply.post",
+                        target=ReplyTarget(
+                            kind=notification_kind,
+                            address=notification_address,
+                            conversation_id=None,
+                            reply_ref=None,
+                        ),
+                        message=OutboundMessage(
+                            version=MESSAGE_VERSION,
+                            text=(
+                                f"Approval {created.id} requires review: {notice_summary}. "
+                                "Resolve in the configured approval channel."
+                            ),
+                            interaction=None,
+                        ),
+                        requested_by=qevent.author,
+                    ),
+                    route=notification_route,
+                )
+            except Exception as exc:  # noqa: BLE001 - the durable pause stands
+                logger.warning("approval notification post failed for %s: %s", created.id, exc)
         logger.info("thread %s suspended awaiting approval %s", thread_key, created.id)
 
     async def _consume(

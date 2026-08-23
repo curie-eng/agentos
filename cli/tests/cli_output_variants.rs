@@ -289,31 +289,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 truncated: false,
             },
             "Resolved" => ApprovalsOutput::Resolved { record: approval_record() },
-            // Both binding shapes in one sample so the schema gate sees a route
-            // WITH an approvers block and one without: the absent block is the
-            // zero-setup default (card-channel membership), which is a distinct
-            // wire state from a declared one, not merely a missing key.
+            // Both binding shapes in one sample so the schema gate sees the
+            // resolution/notification split and the optional approvers block.
+            // Response deserialization is deliberate: transport fields are
+            // write-only and must never be constructible in display output.
             "Routes" => ApprovalsOutput::Routes {
                 agent: "a".to_string(),
-                routes: std::collections::BTreeMap::from([
-                    (
-                        "deal_desk".to_string(),
-                        curie::api::ApprovalRouteBinding {
-                            channel: "C0MANAGERS".to_string(),
-                            approvers: None,
-                        },
-                    ),
-                    (
-                        "finance".to_string(),
-                        curie::api::ApprovalRouteBinding {
-                            channel: "C0FINANCE0".to_string(),
-                            approvers: Some(curie::api::ApprovalApprovers {
-                                group: Some("S0FINGRP0".to_string()),
-                                users: None,
-                            }),
-                        },
-                    ),
-                ]),
+                routes: serde_json::from_value(serde_json::json!({
+                    "deal_desk": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                        "notification": {"kind": "slack", "address": "C0EXAMPLE2"}
+                    },
+                    "finance": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE3"},
+                        "approvers": {"group": "S0FINGRP0"}
+                    }
+                }))
+                .expect("approval route response mirror deserializes its display shape"),
             },
         ],
     );

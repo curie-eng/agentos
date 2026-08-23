@@ -32,13 +32,38 @@
       "omissions": []
     },
     {
-      "struct": "ApprovalRouteBinding",
-      "schema": "ApprovalRouteBinding",
+      "struct": "ApprovalRouteBindingResponse",
+      "schema": "ApprovalRouteBindingOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetResponse",
+      "schema": "ApprovalTargetOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalNotificationTargetResponse",
+      "schema": "ApprovalTargetOut",
       "omissions": []
     },
     {
       "struct": "ApprovalApprovers",
-      "schema": "ApprovalApprovers",
+      "schema": "ApprovalApproversOut",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalRouteBindingWrite",
+      "schema": "ApprovalRouteBinding",
+      "omissions": []
+    },
+    {
+      "struct": "ApprovalResolutionTargetWrite",
+      "schema": "ApprovalResolutionTarget",
+      "omissions": []
+    },
+    {
+      "struct": "NotificationTargetWrite",
+      "schema": "ApprovalNotificationTarget",
       "omissions": []
     },
     {

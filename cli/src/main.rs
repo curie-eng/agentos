@@ -716,25 +716,24 @@ enum SkillAction {
         /// declined cleanly at this tier.
         #[arg(long)]
         reject: bool,
-        /// Bind an approval route to a channel. Accepted so it can be DECLINED
-        /// with a reason rather than error like a typo: a route binding is
-        /// per-agent platform config, and the skill tier has no platform.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
+        /// Bind a route's verified Slack resolution card. Accepted so it can be
+        /// DECLINED with a reason: the skill tier has no platform agent record.
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
         /// Narrow a route's approvers. Declined at this tier for the same reason
-        /// as --route.
+        /// as --route-resolution.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
-        /// Read the route map from a JSON file. Declined at this tier for the
-        /// same reason as --route.
+        /// Read the complete route map, including optional notifications, from
+        /// JSON. Declined at this tier for the same reason as --route-resolution.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's route bindings. Declined at this tier for the same
-        /// reason as --route.
+        /// reason as --route-resolution.
         #[arg(long)]
         list_routes: bool,
         /// Remove every route binding. Declined at this tier for the same reason
-        /// as --route.
+        /// as --route-resolution.
         #[arg(long)]
         clear_routes: bool,
     },
@@ -1198,19 +1197,20 @@ enum LocalAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
-        /// Bind a manifest approval route to the channel its card posts in, as
+        /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
-        /// Narrow WHO may resolve a route, independently of where its card posts,
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of its resolution target,
         /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
-        /// card channel's members as the approvers.
+        /// resolution card's channel members as the approvers.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
         /// Read the whole route map from a JSON file, e.g.
-        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
-        /// top of it.
+        /// {"deal_desk":{"resolution":{"kind":"slack","address":"C0123ABCD"}}}.
+        /// Notifications, including endpoint+adapter transport, are declared in
+        /// this strict map. The repeatable override flags apply on top of it.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's approval route bindings instead of its tool gates.
@@ -2024,19 +2024,20 @@ enum ClusterAction {
         /// channel-authorized approval gates (with --resolve).
         #[arg(long)]
         actor_channel: Option<String>,
-        /// Bind a manifest approval route to the channel its card posts in, as
+        /// Bind a manifest route's verified Slack resolution card, as
         /// NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES
         /// the whole route map, like --gate does for tool gates.
-        #[arg(long = "route", value_name = "NAME=CHANNEL")]
-        route: Vec<String>,
-        /// Narrow WHO may resolve a route, independently of where its card posts,
+        #[arg(long = "route-resolution", value_name = "NAME=CHANNEL")]
+        route_resolution: Vec<String>,
+        /// Narrow WHO may resolve a route, independently of its resolution target,
         /// as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the
-        /// card channel's members as the approvers.
+        /// resolution card's channel members as the approvers.
         #[arg(long = "route-approvers", value_name = "NAME=KIND:VALUES")]
         route_approvers: Vec<String>,
         /// Read the whole route map from a JSON file, e.g.
-        /// {"deal_desk": {"channel": "C0123ABCD"}}. The repeatable flags apply on
-        /// top of it.
+        /// {"deal_desk":{"resolution":{"kind":"slack","address":"C0123ABCD"}}}.
+        /// Notifications, including endpoint+adapter transport, are declared in
+        /// this strict map. The repeatable override flags apply on top of it.
         #[arg(long = "routes-from", value_name = "FILE")]
         routes_from: Option<PathBuf>,
         /// Show the agent's approval route bindings instead of its tool gates.
@@ -2282,7 +2283,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 clear,
                 list,
                 resolve,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -2298,7 +2299,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // record is absent because this tier keeps no durable store, but a
                 // route binding is absent because it is per-agent platform config
                 // and this tier has no agent. Same wrong answer, different fix.
-                let routes_asked = !route.is_empty()
+                let routes_asked = !route_resolution.is_empty()
                     || !route_approvers.is_empty()
                     || routes_from.is_some()
                     || list_routes
@@ -2654,7 +2655,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -2671,7 +2672,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         reject,
                         note,
                         actor_channel,
-                        route,
+                        route_resolution,
                         route_approvers,
                         routes_from,
                         list_routes,
@@ -3617,7 +3618,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 reject,
                 note,
                 actor_channel,
-                route,
+                route_resolution,
                 route_approvers,
                 routes_from,
                 list_routes,
@@ -3646,7 +3647,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             reject,
                             note,
                             actor_channel,
-                            route,
+                            route_resolution,
                             route_approvers,
                             routes_from,
                             list_routes,

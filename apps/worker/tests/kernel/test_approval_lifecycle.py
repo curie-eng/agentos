@@ -17,7 +17,7 @@ import aiohttp
 import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
 from channel_protocol import ConfirmIntent
-from channel_protocol.reply import ReplyAck, ReplyEvent
+from channel_protocol.reply import ReplyAck, ReplyEvent, ReplyPost
 from curie_worker.approvals import (
     ApprovalBackendError,
     ApprovalRequest,
@@ -87,6 +87,7 @@ def _qevent(
     placeholder: str | None = "p-1",
     endpoint: str | None = None,
     kind: str = "slack",
+    channel: str = "C1",
     adapter: str | None = None,
 ) -> QueuedTurn:
     return QueuedTurn(
@@ -96,7 +97,7 @@ def _qevent(
         text=text,
         reply_handle=ReplyHandle(
             kind=kind,
-            channel="C1",
+            channel=channel,
             placeholder=placeholder,
             endpoint=endpoint,
             adapter=adapter,
@@ -778,7 +779,7 @@ def test_every_posted_card_carries_the_note_variant(make_harness) -> None:
             unrouted = h.sink.posts[0]
 
         # Routed: the card posts top-level in the bound channel.
-        binding = RoutedBinding({"finance": {"channel": "C_FINANCE"}})
+        binding = RoutedBinding({"finance": _resolution_route("C0EXAMPLE2")})
         async with make_harness(approvals=RecordingApprovals(), binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Approve the invoice", "finance")
             await h.kernel.process_event(_qevent("please invoice", thread="th-routed"))
@@ -859,6 +860,51 @@ class RoutedBinding:
         return {"CURIE_SESSION_ID": f"s-{thread_key}"}
 
 
+_NOTIFICATION_ENDPOINT = "https://adapter.example.com/replies"
+
+
+def _resolution_route(address: str = "C0EXAMPLE1") -> dict:
+    return {"resolution": {"kind": "slack", "address": address}}
+
+
+def _notification_route(**changes) -> dict:
+    notification = {
+        "kind": "email",
+        "address": "approvals@example.com",
+        "endpoint": _NOTIFICATION_ENDPOINT,
+        "adapter": "mail",
+    }
+    notification.update(changes)
+    return {**_resolution_route(), "notification": notification}
+
+
+def _split_approval_routes() -> dict:
+    return {"managers": _notification_route()}
+
+
+_MALFORMED_NOTIFICATION_OVERRIDES = [
+    ("extra-key", {"unexpected": True}),
+    ("kind-whitespace", {"kind": " email"}),
+    ("kind-uppercase", {"kind": "Email"}),
+    ("address-whitespace", {"address": "approvals team@example.com"}),
+    (
+        "slack-name-is-not-an-id",
+        {"kind": "slack", "address": "#notify", "endpoint": None, "adapter": None},
+    ),
+    ("adapter-whitespace", {"adapter": "mail adapter"}),
+    ("adapter-uppercase", {"adapter": "Mail"}),
+    (
+        "same-as-resolution",
+        {"kind": "slack", "address": "C0EXAMPLE1", "endpoint": None, "adapter": None},
+    ),
+    ("half-configured-transport", {"adapter": None}),
+    ("non-slack-needs-transport", {"endpoint": None, "adapter": None}),
+    ("endpoint-http-only", {"endpoint": "ftp://adapter.example.com/replies"}),
+    ("endpoint-needs-host", {"endpoint": "https:///replies"}),
+    ("endpoint-no-userinfo", {"endpoint": "https://user@adapter.example.com/replies"}),
+]
+
+
 def test_routed_approval_cards_go_to_the_bound_channel(make_harness) -> None:
     """#247: the manifest route resolves through the agent's bindings; the card
     lands in the bound channel (top-level, no foreign thread) and the record
@@ -868,22 +914,152 @@ def test_routed_approval_cards_go_to_the_bound_channel(make_harness) -> None:
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        binding = RoutedBinding({"managers": {"channel": "C_MGRS"}})
+        binding = RoutedBinding({"managers": _resolution_route()})
         async with make_harness(approvals=approvals, binding=binding) as h:
-            h.runner.default_script = _awaiting_routed_script(
-                "Discount for ACME", "managers"
-            )
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
             await h.kernel.process_event(_qevent("discount?", thread="th-routed"))
 
             req = approvals.requests[0]
             assert req.route == "managers"
-            assert req.card_channel == "C_MGRS"
+            assert req.card_channel == "C0EXAMPLE1"
             # Card posted to the bound channel, top-level (no thread there).
             channel, message, _requested_by, thread_ts, endpoint = h.sink.posts[0]
-            assert channel == "C_MGRS"
+            assert channel == "C0EXAMPLE1"
             assert thread_ts is None
             assert isinstance(message.interaction, ConfirmIntent)
             assert endpoint is None
+
+    asyncio.run(go())
+
+
+def test_routed_approval_posts_one_interactive_resolution_card_and_one_text_only_notification(
+    make_harness,
+) -> None:
+    """The split adds visibility without adding a second resolver.
+
+    The resolution target owns the only ``ConfirmIntent`` and the only durable
+    card ref. The notification directs readers back to that configured surface,
+    but carries neither its identifier nor an interaction payload.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(
+            approvals=approvals, binding=RoutedBinding(_split_approval_routes())
+        ) as h:
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-split"))
+
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].card_channel == "C0EXAMPLE1"
+
+            posts = [
+                (event, route)
+                for event, route, _best_effort in h.sink.events
+                if isinstance(event, ReplyPost)
+            ]
+            assert len(posts) == 2
+            (card, card_route), (notification, notification_route) = posts
+
+            assert card.target.kind == "slack"
+            assert card.target.address == "C0EXAMPLE1"
+            assert card.target.conversation_id is None
+            assert isinstance(card.message.interaction, ConfirmIntent)
+            assert card_route.endpoint is None
+            assert card_route.adapter is None
+
+            assert notification.target.kind == "email"
+            assert notification.target.address == "approvals@example.com"
+            assert notification.target.conversation_id is None
+            assert notification.message.interaction is None
+            assert notification.message.text == (
+                "Approval appr-1 requires review: Discount for ACME. "
+                "Resolve in the configured approval channel."
+            )
+            assert "C0EXAMPLE1" not in notification.message.text
+            assert notification_route.endpoint == _NOTIFICATION_ENDPOINT
+            assert notification_route.adapter == "mail"
+
+            card_keys = [
+                key async for key in h.async_redis.scan_iter(match=h.config.approval_card_key("*"))
+            ]
+            assert card_keys == [h.config.approval_card_key(_thread_key("th-split"))]
+
+    asyncio.run(go())
+
+
+def test_notification_failure_leaves_resolution_card_and_durable_pause_intact(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(
+            approvals=approvals, binding=RoutedBinding(_split_approval_routes())
+        ) as h:
+            original_emit = h.sink.emit
+            notification_attempted = False
+
+            async def fail_notification(event, **kwargs):
+                nonlocal notification_attempted
+                if isinstance(event, ReplyPost) and event.message.interaction is None:
+                    notification_attempted = True
+                    raise RuntimeError("injected notification delivery failure")
+                return await original_emit(event, **kwargs)
+
+            monkeypatch.setattr(h.sink, "emit", fail_notification)
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-notification-failure"))
+
+            assert notification_attempted
+            assert len(approvals.requests) == 1
+            assert len(h.sink.posts) == 1
+            assert isinstance(h.sink.posts[0][1].interaction, ConfirmIntent)
+            remembered = await _peek_card_ref(h, "th-notification-failure")
+            assert remembered is not None
+            assert remembered["channel"] == "C0EXAMPLE1"
+            assert [s.operating_mode for s in h.fake_k8s.sandboxes.values()] == ["Suspended"]
+
+    asyncio.run(go())
+
+
+def test_resolution_card_transport_failure_still_posts_text_notification_and_preserves_durable_pause(  # noqa: E501
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        async with make_harness(
+            approvals=approvals, binding=RoutedBinding(_split_approval_routes())
+        ) as h:
+            original_emit = h.sink.emit
+            card_attempted = False
+
+            async def fail_resolution_card(event, **kwargs):
+                nonlocal card_attempted
+                if isinstance(event, ReplyPost) and isinstance(
+                    event.message.interaction, ConfirmIntent
+                ):
+                    card_attempted = True
+                    raise RuntimeError("injected resolution card delivery failure")
+                return await original_emit(event, **kwargs)
+
+            monkeypatch.setattr(h.sink, "emit", fail_resolution_card)
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
+            await h.kernel.process_event(_qevent("discount?", thread="th-card-failure"))
+
+            assert card_attempted
+            assert len(approvals.requests) == 1
+            assert approvals.requests[0].card_channel == "C0EXAMPLE1"
+            assert [s.operating_mode for s in h.fake_k8s.sandboxes.values()] == ["Suspended"]
+            assert len(h.sink.posts) == 1
+            channel, message, _requested_by, thread_ts, endpoint = h.sink.posts[0]
+            assert channel == "approvals@example.com"
+            assert message.interaction is None
+            assert "appr-1" in message.text
+            assert "C0EXAMPLE1" not in message.text
+            assert "configured approval channel" in message.text
+            assert thread_ts is None
+            assert endpoint == _NOTIFICATION_ENDPOINT
+            assert await _peek_card_ref(h, "th-card-failure") is None
 
     asyncio.run(go())
 
@@ -919,6 +1095,61 @@ def test_unbound_route_escalates_instead_of_routing_to_the_requesting_channel(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize(
+    "route_binding",
+    [
+        pytest.param(
+            {"resolution": {"kind": "slack", "address": "#finance"}},
+            id="slack-name-is-not-an-id",
+        ),
+        pytest.param(
+            {"resolution": {"kind": "email", "address": "review@example.com"}},
+            id="non-slack-resolution",
+        ),
+        pytest.param(
+            {
+                "resolution": {
+                    "kind": "slack",
+                    "address": "C0EXAMPLE3",
+                    "unexpected": True,
+                }
+            },
+            id="resolution-extra-key",
+        ),
+        pytest.param({"channel": "C0EXAMPLE3"}, id="retired-channel-key"),
+        *[
+            pytest.param(_notification_route(**overrides), id=f"notification-{case}")
+            for case, overrides in _MALFORMED_NOTIFICATION_OVERRIDES
+        ],
+    ],
+)
+def test_malformed_route_target_escalates_without_creating_an_approval(
+    make_harness, route_binding: dict
+) -> None:
+    """Out-of-band JSONB cannot widen or invent a resolution surface.
+
+    The worker independently pins the API's target identity, transport pair,
+    endpoint, strict-envelope, and retired-key rules. The database migration is
+    the only legacy-shape translator.
+    """
+
+    async def go() -> None:
+        approvals = RecordingApprovals()
+        binding = RoutedBinding({"managers": route_binding})
+        async with make_harness(approvals=approvals, binding=binding) as h:
+            h.runner.default_script = _awaiting_routed_script("Anything", "managers")
+            ev = _qevent("gate", thread="th-malformed-route")
+            await h.kernel.process_event(ev)
+
+            assert approvals.requests == []
+            assert h.sink.posts == []
+            assert h.sink.last_text is not None
+            assert "managers" in h.sink.last_text
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
 def test_routeless_approval_keeps_prior_behavior(make_harness) -> None:
     async def go() -> None:
         approvals = RecordingApprovals()
@@ -947,17 +1178,15 @@ def test_routed_card_ignores_the_triggering_turns_endpoint(make_harness) -> None
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        binding = RoutedBinding({"managers": {"channel": "C_MGRS"}})
+        binding = RoutedBinding({"managers": _resolution_route()})
         async with make_harness(approvals=approvals, binding=binding) as h:
-            h.runner.default_script = _awaiting_routed_script(
-                "Discount for ACME", "managers"
-            )
+            h.runner.default_script = _awaiting_routed_script("Discount for ACME", "managers")
             await h.kernel.process_event(
                 _qevent("discount?", thread="th-cli-routed", endpoint=_CLI_STUB)
             )
 
             channel, _message, _requested_by, thread_ts, endpoint = h.sink.posts[0]
-            assert channel == "C_MGRS"
+            assert channel == "C0EXAMPLE1"
             assert thread_ts is None
             assert endpoint is None
 
@@ -974,15 +1203,21 @@ def test_card_routed_to_requesting_channel_keeps_the_trigger_endpoint(
 
     async def go() -> None:
         approvals = RecordingApprovals()
-        binding = RoutedBinding({"managers": {"channel": "C1"}})  # the requesting channel
+        # The policy target is the requesting channel itself.
+        binding = RoutedBinding({"managers": _resolution_route("C0EXAMPLE4")})
         async with make_harness(approvals=approvals, binding=binding) as h:
             h.runner.default_script = _awaiting_routed_script("Ship it", "managers")
             await h.kernel.process_event(
-                _qevent("ship?", thread="th-self-routed", endpoint=_CLI_STUB)
+                _qevent(
+                    "ship?",
+                    thread="th-self-routed",
+                    endpoint=_CLI_STUB,
+                    channel="C0EXAMPLE4",
+                )
             )
 
             channel, _message, _requested_by, thread_ts, endpoint = h.sink.posts[0]
-            assert channel == "C1"
+            assert channel == "C0EXAMPLE4"
             assert thread_ts == "th-self-routed"
             assert endpoint == _CLI_STUB
 

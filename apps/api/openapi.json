@@ -624,7 +624,9 @@
           "approval_routes": {
             "anyOf": [
               {
-                "additionalProperties": true,
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ApprovalRouteBindingOut"
+                },
                 "type": "object"
               },
               {
@@ -844,7 +846,7 @@
       },
       "ApprovalApprovers": {
         "additionalProperties": false,
-        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``channel``, which is only WHERE the card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the card channel's members are the approvers.",
+        "description": "WHO may resolve a route's approvals (#420), as opposed to the binding's\n``resolution``, which is only WHERE the interactive card posts.\n\nDeclaring an approvers block is what lets a request sit in a broad channel\nwhere everyone can see it while only a narrow set may act on it. Omitting it\nkeeps the zero-setup default: the resolution-card channel's members are the\napprovers. Notification recipients never enter this policy.",
         "properties": {
           "group": {
             "anyOf": [
@@ -873,6 +875,38 @@
           }
         },
         "title": "ApprovalApprovers",
+        "type": "object"
+      },
+      "ApprovalApproversOut": {
+        "description": "Repair-oriented read projection of the stored approver declaration.",
+        "properties": {
+          "group": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group"
+          },
+          "users": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Users"
+          }
+        },
+        "title": "ApprovalApproversOut",
         "type": "object"
       },
       "ApprovalAuditOut": {
@@ -962,6 +996,48 @@
           "created_at"
         ],
         "title": "ApprovalAuditOut",
+        "type": "object"
+      },
+      "ApprovalNotificationTarget": {
+        "additionalProperties": false,
+        "description": "A visibility-only approval ping target and its server-side transport.\n\nSlack may use the worker's configured default transport. Every other kind\nneeds the full endpoint/adapter pair at write time, so a declared\nnotification cannot persist as a permanently undeliverable best-effort\nbranch.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalNotificationTarget",
         "type": "object"
       },
       "ApprovalOut": {
@@ -1296,6 +1372,27 @@
         "title": "ApprovalRequest",
         "type": "object"
       },
+      "ApprovalResolutionTarget": {
+        "additionalProperties": false,
+        "description": "The one target permitted to carry an approval-resolving affordance.\n\n``kind`` is an explicit extension point, but it is intentionally Slack-only\nuntil a second adapter can present the scoped verified identity ADR-0096\nrequires. Merely teaching an adapter to render buttons cannot widen this\nauthority boundary.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "const": "slack",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "ApprovalResolutionTarget",
+        "type": "object"
+      },
       "ApprovalResolve": {
         "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: ordinary self-approval is blocked, while a server-linked\npublication requester must still prove membership. ``actor_channel`` is the\nchannel the resolution attempt was made from (the card click's channel,\nrelayed by the dispatcher; asserted explicitly by API-key operators).",
         "properties": {
@@ -1344,7 +1441,7 @@
       },
       "ApprovalRouteBinding": {
         "additionalProperties": false,
-        "description": "One workspace binding for a manifest-declared approval route (#247):\nthe Slack channel whose members are that route's approvers (under the\nchannel-membership authorizer), and optionally the ``approvers`` block that\nnarrows WHO may act (#420), leaving ``channel`` to mean only WHERE the card\nposts.",
+        "description": "One strict workspace binding for a declared approval route (#1460).\n\n``resolution`` is the single verified-identity action surface.\n``notification`` may make the pending request visible elsewhere, but its\nmessage carries no interaction. ``approvers`` continues to narrow WHO may\nact through the resolution card path and is never inferred from notification\nrecipients.",
         "properties": {
           "approvers": {
             "anyOf": [
@@ -1356,15 +1453,76 @@
               }
             ]
           },
-          "channel": {
-            "title": "Channel",
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalNotificationTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalResolutionTarget"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBinding",
+        "type": "object"
+      },
+      "ApprovalRouteBindingOut": {
+        "description": "The required resolution plus optional, redacted visibility policy.",
+        "properties": {
+          "approvers": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalApproversOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notification": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApprovalTargetOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/ApprovalTargetOut"
+          }
+        },
+        "required": [
+          "resolution"
+        ],
+        "title": "ApprovalRouteBindingOut",
+        "type": "object"
+      },
+      "ApprovalTargetOut": {
+        "description": "Display-safe target identity; stored transport is write-only.\n\nThis is deliberately a tolerant read projection. Write models validate the\nchannel kind/address pair before persistence, while reads must still expose\na malformed historical address so an operator can repair it.",
+        "properties": {
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
             "type": "string"
           }
         },
         "required": [
-          "channel"
+          "kind",
+          "address"
         ],
-        "title": "ApprovalRouteBinding",
+        "title": "ApprovalTargetOut",
         "type": "object"
       },
       "BehaviorPacksConfig": {
