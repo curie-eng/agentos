@@ -4,6 +4,11 @@ This directory contains the versioned, interactive Curie architecture atlas.
 The HTML is only a renderer: architecture facts, seams, flows, ADR links, and
 version metadata live in JSON.
 
+Once this directory is on `main`, open the
+[GitHub-rendered atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html)
+without cloning the repository. During branch review, replace `main` in that URL
+with the branch name.
+
 From the repository root, serve it with:
 
 ```bash
