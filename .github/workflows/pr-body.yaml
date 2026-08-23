@@ -19,7 +19,6 @@ jobs:
   pr-body:
     name: PR body (real newlines)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v7
         with:
