@@ -199,37 +199,44 @@ non-Postgres target ever materializes.
 
 ### 6. Communication channel (Slack today)
 
-**Port:** the ingress half of this seam is now clean; the egress half is where
-it stays least clean. The ingress contract was promoted out of the dispatcher
+**Port:** the ingress half of this seam is clean, and the worker now ships a
+neutral egress port. The ingress contract was promoted out of the dispatcher
 into the channel-neutral `QueuedTurn`
 (`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`, issue #7): a
 generic `event_id` idempotency key, a `conversation_id` conversation key, and a
 `ReplyHandle` (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`)
 carrying the channel and placeholder, so the Slack-shaped field names are gone
-from the core contract. The egress contract is the worker's `SlackSink` protocol
-(`apps/worker/src/curie_worker/slack_sink.py`), a single
-`update(channel, ts, text)` built on `chat.update`. The mrkdwn dialect is
-correctly confined to the sink (`mrkdwn.py`), but the kernel does assume the
-edit-a-placeholder reply shape, which is the remaining Slack coupling.
+from the core contract. The egress contract is the worker's `ReplySink`
+protocol (`apps/worker/src/curie_worker/reply_sink.py`): the kernel emits
+versioned neutral reply events through one `emit` verb, and
+`ReplySinkRouter` selects an adapter from the route. `SlackReplyAdapter`
+renders those events into Slack posts and `chat.update` edits; `HttpReplyAdapter`
+POSTs the same neutral JSON event to a binding's server-controlled endpoint.
 
 **Current adapter:** `apps/dispatcher` (Bolt, Socket Mode) on ingress,
-`AsyncSlackSink` on egress.
+`SlackReplyAdapter` for Slack egress, and `HttpReplyAdapter` for configured
+non-Slack reply endpoints.
 
-**Evidence the channel is already semi-swappable:** `curie local message` and
+**What this proves, and what it does not:** `curie local message` and
 `curie cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`) drive the entire
 deployed system with zero Slack contact by minting the exact
 `QueuedTurn` wire payload (`cli/src/queue.rs`) and standing in as the
-Slack Web API. The Slack service swaps; the ingress payload is already
-channel-neutral, and the remaining Slack coupling is the egress reply shape.
+Slack Web API. Together with the HTTP adapter, that proves the neutral reply
+wire and per-turn routing, not a second production channel: Slack remains the
+only first-party production surface, and a complete third-party adapter
+lifecycle has not been exercised. Slack-specific rendering and interaction
+handling remain below the port: mrkdwn and Block Kit, including approval-card
+buttons and their settlement forms, live in
+`apps/worker/src/curie_worker/slack_sink.py`.
 
-**What a channel-neutral port looks like:** the ingress half already matches this
-target — `QueuedTurn` carries `{event_id, conversation_id, author, text,
-reply_handle, received_at}` ([issue #7](https://github.com/curie-eng/curie/issues/7),
-landed). What remains is a `ReplySink` with post/update semantics per channel
-adapter. The remaining reshaping cost is bounded: the CLI's mirrored struct already
-tracks the promoted contract, while the kernel's thread-lock and marker keys and the
-channel-based deployment binding (`apps/worker/src/curie_worker/binding.py`) still
-assume Slack. Reply routing, by contrast, already landed per turn
+**Remaining channel work:** `QueuedTurn` carries `{event_id, conversation_id,
+author, text, reply_handle, received_at}`
+([issue #7](https://github.com/curie-eng/curie/issues/7), landed), and
+`ReplySink` carries the reply path. The remaining reshaping cost is bounded:
+the CLI's mirrored struct already tracks the promoted contract, while the
+kernel's thread-lock and marker keys and the channel-based deployment binding
+(`apps/worker/src/curie_worker/binding.py`) still assume Slack. Reply routing
+already lands per turn
 ([issue #19](https://github.com/curie-eng/curie/issues/19)): a turn's
 `ReplyHandle.endpoint` (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`)
 is the reply target, so a real Slack workspace and a no-Slack CLI stub can coexist on
@@ -309,7 +316,7 @@ flowchart TB
 | Evals | Our stream schema + `EvalMatrix` DTO; store behind recorder | Langfuse traces + `eval_pass` scores | B: schema is ours; the case format converged into one frozen, drift-gated schema (#8, ADR-0019), leaving the `version:`/`suite:` tag convention as the unfrozen part | Freeze the tag convention into the schema, or record it as a deliberate soft contract |
 | Blob storage | S3 protocol (boto3 + AWS CLI, path-style, endpoint-configurable) | RustFS | B+: config-only within S3-compatible stores; the client is now built in one shared place (`packages/aci-protocol/src/aci_protocol/s3.py::build_s3_client`, #572), and the `ObjectStore` port (`apps/api/src/curie_api/storage.py::ObjectStore`) names the contract, but the second, non-S3 adapter is deferred by decision until a real demand lands (#282) | None needed until a non-S3 demand exists |
 | Relational DB | SQLAlchemy 2.0 + alembic | Postgres | A-: managed-Postgres swap is a DSN change; two Postgres-isms in models | Leave as is; note the `postgresql.UUID` and schema-scoped enum as the two things a non-Postgres target would touch |
-| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + `SlackSink` | Slack (Bolt + chat.update) | C: the ingress payload is now the channel-neutral `QueuedTurn` (#7), but egress still assumes Slack's edit-in-place `chat.update` reply shape; service swappable (CLI stub), egress protocol not | Route replies per turn (#19) and define a channel-neutral `ReplySink` post/update port so a second channel can coexist |
+| Communication | `QueuedTurn` (channel-neutral, in `aci-protocol`) + versioned `ReplySink` events | Slack (Bolt + `SlackReplyAdapter`) plus `HttpReplyAdapter` for configured endpoints | B-: ingress and reply egress are neutral, with Slack-specific rendering and interactions held in its adapter; the HTTP adapter proves the wire, not a second first-party production channel or complete third-party lifecycle | Exercise a second production channel end to end, including its rendering, interaction, and lifecycle ownership |
 
 ## What we deliberately do not abstract yet
 
@@ -321,12 +328,13 @@ ways that matter. Concretely, we do not yet abstract:
 
 - A blob-storage interface beyond the S3 protocol. GCS-native support waits
   for a user who needs it; until then the protocol is the port.
-- A multi-channel adapter framework. The channel-neutral rename above is
-  cheap and worth doing; a pluggable channel registry is not, until a second
-  real channel exists. Nuance (ADR-0020): the approval interface (ADR-0010) is a
-  real forcing function that exists today, so the port's *interaction-primitive*
-  half (semantic `Confirm`/`Choice` rendered per-adapter) is worth defining now;
-  the full pluggable registry still waits for a second real channel.
+- A multi-channel adapter framework. `ReplySink` and its router are shipped,
+  but a pluggable channel registry is not justified until a second real
+  production channel exists. Nuance (ADR-0020): the approval interface
+  (ADR-0010) is a real forcing function that exists today, so the port's
+  *interaction-primitive* half (semantic `Confirm`/`Choice` rendered
+  per-adapter) is worth defining now; the full lifecycle still waits for a
+  second real channel.
 - A generic eval-store interface. The recorder is one file; the second store
   defines what the interface must be.
 - Cross-database portability. Managed Postgres is the swap that will actually
