@@ -81,6 +81,7 @@ def assert_turn(
     outcome: str,
     session_id: str,
     forbidden: str | None,
+    require_reply_completion: bool,
 ) -> None:
     agent = next(
         span
@@ -103,6 +104,7 @@ def assert_turn(
         for span in tree
         if str(span.get("kind", "")).upper() in {"3", "SPAN_KIND_CLIENT"}
         and _attrs(span).get("http.request.method") == "POST"
+        and _descends(agent, span, tree)
     )
     assert {
         "messaging.system": "valkey",
@@ -116,7 +118,8 @@ def assert_turn(
     event_names = {
         event.get("name") for span in tree for event in span.get("events", [])
     }
-    assert {"worker.reply.final", "worker.completion.settled"} <= event_names
+    if require_reply_completion:
+        assert {"worker.reply.final", "worker.completion.settled"} <= event_names
 
     producer = [span for span in tree if span.get("name") == "send curie:runs"]
     if topology == "cli":
@@ -161,6 +164,7 @@ def main() -> None:
     parser.add_argument("--session-id", required=False, default="")
     parser.add_argument("--forbidden")
     parser.add_argument("--require-warning")
+    parser.add_argument("--require-reply-completion", action="store_true")
     parser.add_argument("--expect-empty", action="store_true")
     args = parser.parse_args()
 
@@ -180,6 +184,7 @@ def main() -> None:
         outcome=args.outcome,
         session_id=args.session_id,
         forbidden=args.forbidden,
+        require_reply_completion=args.require_reply_completion,
     )
     print(
         f"otel-e2e topology={args.topology} outcome={args.outcome}: "

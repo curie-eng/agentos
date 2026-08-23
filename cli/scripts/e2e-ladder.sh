@@ -197,6 +197,10 @@ LOCAL_STACK_OWNED=0
 # without touching the incumbent API, worker, connectors, or sandboxes.
 OTEL_E2E_COLLECTOR_MUTATED=0
 OTEL_E2E_COLLECTOR_WAS_RUNNING=0
+OTEL_E2E_RUNNER_IMAGE="curie-runner:otel-e2e-$$"
+OTEL_E2E_BASE_TAG="otel-e2e-$$"
+OTEL_E2E_WORKER_LOCAL_IMAGE="curie-worker-local:otel-e2e-$$"
+OTEL_E2E_CANDIDATE_IMAGES_BUILT=0
 OTEL_E2E_OUTPUT=""
 OTEL_E2E_THREAD_HASHES=""
 
@@ -288,6 +292,14 @@ cleanup() {
             docker rm -f $orphans >/dev/null 2>&1
         fi
     fi
+    if (( OTEL_E2E_CANDIDATE_IMAGES_BUILT )); then
+        docker image rm -f "$OTEL_E2E_RUNNER_IMAGE" >/dev/null 2>&1
+        docker image rm -f \
+            "ghcr.io/curie-eng/curie-api:$OTEL_E2E_BASE_TAG" \
+            "ghcr.io/curie-eng/curie-worker:$OTEL_E2E_BASE_TAG" \
+            "$OTEL_E2E_WORKER_LOCAL_IMAGE" \
+            >/dev/null 2>&1
+    fi
     # Only the container THIS run created, matched by its exact unique name, so
     # the sweep can never reach a runner belonging to another session. Cleared by
     # the case itself once `skill down` has removed it.
@@ -349,6 +361,52 @@ prepare_local_otel_evidence() {
     OTEL_E2E_COLLECTOR_MUTATED=1
 }
 
+build_local_otel_candidate_images() {
+    echo
+    echo "=== build candidate platform images for local telemetry ==="
+    docker build --file "$REPO_ROOT/apps/api/Dockerfile" \
+        --tag "ghcr.io/curie-eng/curie-api:$OTEL_E2E_BASE_TAG" "$REPO_ROOT"
+    docker build --file "$REPO_ROOT/apps/worker/Dockerfile" \
+        --tag "ghcr.io/curie-eng/curie-worker:$OTEL_E2E_BASE_TAG" "$REPO_ROOT"
+    docker build --file "$REPO_ROOT/compose/worker-local.Dockerfile" \
+        --build-arg "BASE_TAG=$OTEL_E2E_BASE_TAG" \
+        --tag "$OTEL_E2E_WORKER_LOCAL_IMAGE" "$REPO_ROOT/compose"
+    docker build --file "$REPO_ROOT/runner/Dockerfile" \
+        --tag "$OTEL_E2E_RUNNER_IMAGE" "$REPO_ROOT"
+    OTEL_E2E_CANDIDATE_IMAGES_BUILT=1
+    export CURIE_BASE_TAG="$OTEL_E2E_BASE_TAG"
+    export CURIE_WORKER_LOCAL_IMAGE="$OTEL_E2E_WORKER_LOCAL_IMAGE"
+    export CURIE_RUNNER_IMAGE="$OTEL_E2E_RUNNER_IMAGE"
+}
+
+assert_local_candidate_images() {
+    local api worker api_image worker_image runner_image
+    api="$(docker ps -q --filter 'name=^/curie-curie-api-1$')"
+    worker="$(local_worker_container)"
+    if [[ -z "$api" || -z "$worker" ]]; then
+        echo "candidate local OTEL rung could not resolve its API and worker containers" >&2
+        return 1
+    fi
+    api_image="$(docker inspect --format '{{.Config.Image}}' "$api")"
+    worker_image="$(docker inspect --format '{{.Config.Image}}' "$worker")"
+    runner_image="$(docker inspect --format '{{json .Config.Env}}' "$worker" | python3 -c '
+import json
+import sys
+
+values = json.load(sys.stdin)
+print(next((value.split("=", 1)[1] for value in values if value.startswith("CURIE_RUNNER_IMAGE=")), ""))
+')"
+    if [[ "$api_image" != "ghcr.io/curie-eng/curie-api:$OTEL_E2E_BASE_TAG" \
+        || "$worker_image" != "$OTEL_E2E_WORKER_LOCAL_IMAGE" \
+        || "$runner_image" != "$OTEL_E2E_RUNNER_IMAGE" ]]; then
+        echo "candidate local OTEL rung did not start the images built by this run" >&2
+        echo "observed: api=$api_image worker=$worker_image runner=$runner_image" >&2
+        echo "fix: run in an unoccupied Docker daemon and do not reuse a prior compose stack" >&2
+        return 1
+    fi
+    echo "local: candidate API, worker overlay, and runner image selection verified"
+}
+
 remember_otel_thread() {
     local thread="$1" thread_hash
     thread_hash="$(printf '%s' "$thread" | sha256sum | cut -c1-10)"
@@ -359,7 +417,7 @@ remember_otel_thread() {
 
 assert_local_otel_turn() {
     local topology="$1" outcome="$2" session_id="$3"
-    local forbidden="${4:-}" warning="${5:-}" ready=0
+    local forbidden="${4:-}" warning="${5:-}" require_reply="${6:-0}" ready=0
     local args=(
         --traces "$OTEL_E2E_OUTPUT/traces.json"
         --logs "$OTEL_E2E_OUTPUT/logs.json"
@@ -369,6 +427,7 @@ assert_local_otel_turn() {
     )
     [[ -z "$forbidden" ]] || args+=(--forbidden "$forbidden")
     [[ -z "$warning" ]] || args+=(--require-warning "$warning")
+    (( require_reply )) && args+=(--require-reply-completion)
     for _ in $(seq 1 100); do
         if python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" "${args[@]}" \
             >/dev/null 2>&1; then
@@ -2049,33 +2108,28 @@ rung_local() {
     assert_stub_port_free
 
     if [[ -n "$(docker ps -q --filter 'name=curie-api' 2>/dev/null)" ]]; then
-        # Reuse it and do NOT tear it down: the thread that brought a stack up
-        # owns tearing it down, in both directions.
-        echo "a compose stack is already running; reusing it and leaving teardown to whoever started it"
-        # Model mode is fixed at `local up` time, so a reused stack may have been
-        # started sealed. That used to be a warning; it is now VERIFIED by
-        # assert_model_mode below, off the reused stack's own running worker, and
-        # a contradiction is a hard failure with a fix line.
-        echo "note: the reused stack's model mode was fixed by whoever ran \`local up\`; it is verified below against this run's mode, and a mismatch fails this rung."
-    else
-        echo
-        # #1817 observes a real collector boundary, so the local rung always
-        # selects the full profile. The no-endpoint control below uses the CLI's
-        # separate --minimal path rather than weakening this positive.
-        local up_args=(local up)
-        echo "=== curie ${up_args[*]} ==="
-        # Ordinary bundles use the core profile. A trajectory sidecar selects the
-        # full profile because its matrix read requires Langfuse.
-        #
-        # Claim ownership BEFORE starting, never after: `local up` blocks for
-        # seconds while it waits for health, and containers exist for that whole
-        # window. Setting the flag afterwards means a signal or a mid-boot
-        # failure leaves the trap disowning a stack this run created, stranding
-        # it. Claiming a stack that then fails to boot is harmless, because
-        # `local down` is safe against a partial or already-stopped stack.
-        LOCAL_STACK_OWNED=1
-        "$BIN" "${up_args[@]}"
+        echo "candidate local OTEL rung requires an unoccupied compose stack" >&2
+        echo "fix: use an isolated Docker daemon, or wait for the owning session to stop its stack" >&2
+        return 1
     fi
+
+    build_local_otel_candidate_images
+
+    echo
+    # #1817 observes a real collector boundary, so the local rung always
+    # selects the full profile. The no-endpoint control below uses the CLI's
+    # separate --minimal path rather than weakening this positive.
+    local up_args=(local up)
+    echo "=== curie ${up_args[*]} ==="
+    # Claim ownership BEFORE starting, never after: `local up` blocks for
+    # seconds while it waits for health, and containers exist for that whole
+    # window. Setting the flag afterwards means a signal or a mid-boot
+    # failure leaves the trap disowning a stack this run created, stranding
+    # it. Claiming a stack that then fails to boot is harmless, because
+    # `local down` is safe against a partial or already-stopped stack.
+    LOCAL_STACK_OWNED=1
+    "$BIN" "${up_args[@]}"
+    assert_local_candidate_images
 
     echo
     echo "=== install ladder-owned OTLP file sink (collector only) ==="
@@ -2156,7 +2210,7 @@ rung_local() {
     thread="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["thread"])')"
     session_id="agent-${agent_id}-thread-${thread}"
     remember_otel_thread "$thread"
-    assert_local_otel_turn cli success "$session_id"
+    assert_local_otel_turn cli success "$session_id" "" "" 1
 
     if [[ "$LIVE" == "0" ]]; then
         echo
@@ -2176,7 +2230,7 @@ rung_local() {
             control_session="agent-${agent_id}-thread-${control_thread}"
             case "$label" in
                 dispatcher)
-                    assert_local_otel_turn dispatcher success "$control_session"
+                    assert_local_otel_turn dispatcher success "$control_session" "" "" 1
                     ;;
                 missing)
                     assert_local_otel_turn cli success "$control_session"

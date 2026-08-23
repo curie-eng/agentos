@@ -59,6 +59,87 @@ fn ladder() -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn dev_compose() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../compose.dev.yaml");
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+#[test]
+fn local_otel_ladder_builds_and_selects_the_candidate_runner() {
+    let script = ladder();
+    let rung = script
+        .find("rung_local() {")
+        .expect("the local rung must remain present");
+    let incumbent_guard = script[rung..]
+        .find("candidate local OTEL rung requires an unoccupied compose stack")
+        .map(|offset| rung + offset)
+        .expect("the local OTEL rung must refuse an incumbent stack");
+    let build_call = script[rung..]
+        .find("build_local_otel_candidate_images")
+        .map(|offset| rung + offset)
+        .expect("the local rung must invoke its candidate image builder");
+    let api_build = script
+        .find("docker build --file \"$REPO_ROOT/apps/api/Dockerfile\"")
+        .expect("the local OTEL rung must build the candidate API source");
+    let worker_build = script
+        .find("docker build --file \"$REPO_ROOT/apps/worker/Dockerfile\"")
+        .expect("the local OTEL rung must build the candidate worker source");
+    let worker_overlay_build = script
+        .find("docker build --file \"$REPO_ROOT/compose/worker-local.Dockerfile\"")
+        .expect("the local OTEL rung must build its candidate worker overlay");
+    let runner_build = script
+        .find("docker build --file \"$REPO_ROOT/runner/Dockerfile\"")
+        .expect("the local OTEL rung must build the candidate runner source");
+    let base_select = script
+        .find("export CURIE_BASE_TAG=\"$OTEL_E2E_BASE_TAG\"")
+        .expect("the local OTEL rung must select its candidate API and worker images");
+    let worker_select = script
+        .find("export CURIE_WORKER_LOCAL_IMAGE=\"$OTEL_E2E_WORKER_LOCAL_IMAGE\"")
+        .expect("the local OTEL rung must select its unique worker overlay image");
+    let select = script
+        .find("export CURIE_RUNNER_IMAGE=\"$OTEL_E2E_RUNNER_IMAGE\"")
+        .expect("the local OTEL rung must select its candidate runner image");
+    let up = script[rung..]
+        .find("\"$BIN\" \"${up_args[@]}\"")
+        .map(|offset| rung + offset)
+        .expect("the local rung must still drive the real local-up command");
+    let image_assertion = script[rung..]
+        .find("assert_local_candidate_images")
+        .map(|offset| rung + offset)
+        .expect("the local rung must verify its running image identities");
+    assert!(
+        api_build < worker_build
+            && worker_build < worker_overlay_build
+            && worker_overlay_build < runner_build
+            && runner_build < base_select
+            && base_select < worker_select
+            && worker_select < select,
+        "the candidate image builder must build and select all service images"
+    );
+    assert!(
+        incumbent_guard < build_call && build_call < up && up < image_assertion,
+        "the local rung must guard ownership, build, start, then inspect candidate images"
+    );
+    assert!(
+        !script[rung..]
+            .split("rung_local_release() {")
+            .next()
+            .unwrap_or_default()
+            .contains("reusing it and leaving teardown to whoever started it"),
+        "candidate telemetry evidence must never reuse another session's services"
+    );
+    assert!(
+        dev_compose().contains("image: ${CURIE_WORKER_LOCAL_IMAGE:-curie-worker-local:dev}"),
+        "compose must honor the ladder's unique worker overlay image"
+    );
+    assert!(
+        dev_compose().contains(
+            "CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}"
+        ),
+        "compose must honor the ladder's candidate image while retaining the released default"
+    );
+}
+
 fn count_lines_containing(text: &str, needle: &str) -> usize {
     text.lines().filter(|line| line.contains(needle)).count()
 }
@@ -756,6 +837,15 @@ fi
         r#"#!/bin/sh
 set -u
 case "$*" in
+    "inspect --format {{.Config.Image}} stub-curie-api")
+        echo "ghcr.io/curie-eng/curie-api:${CURIE_BASE_TAG}"
+        ;;
+    "inspect --format {{.Config.Image}} stub-curie-worker")
+        echo "${CURIE_WORKER_LOCAL_IMAGE}"
+        ;;
+    "inspect --format {{json .Config.Env}} stub-curie-worker")
+        printf '["CURIE_RUNNER_IMAGE=%s"]\n' "${CURIE_RUNNER_IMAGE}"
+        ;;
     "inspect curie-runner-local")
         # The first-run credential check refuses to touch an existing shared
         # local runner. Its harness begins with no such runner, while all
@@ -782,6 +872,7 @@ case "$*" in
         if [ -n "${STUB_FAKE_MODEL:-}" ]; then
             echo "CURIE_FAKE_MODEL=$STUB_FAKE_MODEL"
         fi
+        echo "CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE}"
         # The default local rungs read the connector scope off the same worker
         # env: the stock weather bundle declares the netpol-probe fixture, so
         # the dual assertion derives its identity label from this release.
@@ -799,6 +890,9 @@ case "$*" in
         # assumption breaks, so returning one id is the only shape that lets the
         # mode assertion be reached at all.
         echo "stub-curie-worker"
+        ;;
+    *"name=^/curie-curie-api-1$"*)
+        echo "stub-curie-api"
         ;;
     *)
         ;;

@@ -19,7 +19,9 @@ via three ordered text transforms:
       version (this also pins the worker-local image introduced by T1). Also
       collapses the `:${CURIE_BASE_TAG:-latest}` override form (issue #698)
       to the same literal pin, since the release asset has no shell to resolve
-      that override in.
+      that override in. The local ladder's `CURIE_RUNNER_IMAGE` override is
+      collapsed the same way so release compose always names its published
+      runner image literally.
 
 Each transform locates its anchor explicitly and raises ValueError if it is
 missing: this runs unattended at publish time, so a silent no-op would ship a
@@ -31,7 +33,8 @@ import re
 import textwrap
 from pathlib import Path
 
-WORKER_BUILD_BLOCK = """    build:
+WORKER_BUILD_BLOCK = """    image: ${CURIE_WORKER_LOCAL_IMAGE:-curie-worker-local:dev}
+    build:
       context: compose
       dockerfile: worker-local.Dockerfile
       # Threads CURIE_BASE_TAG through to the overlay's own ARG BASE_TAG
@@ -66,6 +69,9 @@ OTEL_CONFIGS_REF = """    configs:
 CURIE_LATEST_RE = re.compile(
     r"(ghcr\.io/curie-eng/curie-[a-z-]+):(?:latest|\$\{CURIE_BASE_TAG:-latest\})"
 )
+RUNNER_IMAGE_OVERRIDE_RE = re.compile(
+    r"\$\{CURIE_RUNNER_IMAGE:-(ghcr\.io/curie-eng/curie-runner):latest\}"
+)
 
 DEV_COMPOSE = Path("compose.dev.yaml")
 OTEL_CONFIG = Path("otel/collector-config.yaml")
@@ -97,6 +103,7 @@ def generate(dev_text: str, otel_text: str, version: str) -> str:
     text = text.replace(OTEL_VOLUME_BLOCK, OTEL_CONFIGS_REF, 1)
 
     # T3: pin every curie-* image tag to the release version (worker-local too).
+    text = RUNNER_IMAGE_OVERRIDE_RE.sub(rf"\1:{version}", text)
     text = CURIE_LATEST_RE.sub(rf"\1:{version}", text)
 
     return text

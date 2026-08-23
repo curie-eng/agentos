@@ -454,6 +454,7 @@ services:
   # dials each runner on the loopback host port Docker publishes for it, and
   # reaches the `curie local message` Slack stub at localhost:8155.
   curie-worker:
+    image: ${CURIE_WORKER_LOCAL_IMAGE:-curie-worker-local:dev}
     build:
       context: compose
       dockerfile: worker-local.Dockerfile
@@ -495,7 +496,7 @@ services:
       - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
-      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:latest
+      - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
       - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
