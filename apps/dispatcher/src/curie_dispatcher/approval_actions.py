@@ -116,12 +116,6 @@ def is_approval_action(action_id: str) -> bool:
     return action_id in _APPROVAL_ACTION_IDS
 
 
-def decision_for_action(action_id: str) -> str | None:
-    """The decision an approval action id resolves to, or None if it is not one."""
-
-    return _DECISION_BY_ACTION_ID.get(action_id)
-
-
 @dataclass(frozen=True)
 class ResolveOutcome:
     """The API's verdict on one resolution attempt, normalized for rendering."""
