@@ -6471,8 +6471,8 @@ pub enum ServiceEndpoint {
     /// Type NodePort but no nodePort assigned yet.
     UnassignedNodePort,
     /// ClusterIP/other: reachable only via a port-forward.
-    /// `local` is a non-privileged port: HTTP services on port 80 use 18080,
-    /// while an absent service port falls back to 8080.
+    /// `local` is non-privileged: service ports below 1024 are offset by
+    /// 18000, while an absent service port falls back to 8080.
     PortForwardHint { local: u16, port: u16 },
     /// `parse_service` returned None (malformed/unreadable JSON).
     Unreadable,
@@ -6500,7 +6500,7 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
             local: match port {
                 0 => 8080,
-                80 => 18080,
+                1..=1023 => port + 18000,
                 _ => port,
             },
             port,
@@ -9244,19 +9244,40 @@ mod tests {
 
     #[test]
     fn resolve_service_endpoint_clusterip_yields_a_port_forward_hint() {
-        // ClusterIP: not node-exposed, so the caller must port-forward. HTTP's
-        // privileged service port maps to a non-privileged local port.
-        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
-        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+        // ClusterIP: not node-exposed, so the caller must port-forward. Each
+        // privileged service port maps to a deterministic non-privileged local port.
+        let http_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let http_endpoint = resolve_service_endpoint(http_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: http_local,
+            port: http_port,
+        } = http_endpoint
+        else {
             panic!("ClusterIP services must yield a port-forward hint");
         };
-        assert_eq!(local, 18080);
-        assert_eq!(port, 80);
+        assert_eq!(http_local, 18080);
+        assert_eq!(http_port, 80);
         assert!(
-            local >= 1024,
+            http_local >= 1024,
             "the local port must be bindable by a non-root user"
         );
+
+        let https_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":443}]}}"#;
+        let https_endpoint = resolve_service_endpoint(https_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: https_local,
+            port: https_port,
+        } = https_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(https_local, 18443);
+        assert_eq!(https_port, 443);
+        assert!(
+            https_local >= 1024,
+            "the local port must be bindable by a non-root user"
+        );
+
         // An absent port parses as 0, which falls back to local port 8080.
         let no_port = r#"{"spec":{"type":"ClusterIP","ports":[{}]}}"#;
         assert_eq!(
@@ -9304,6 +9325,31 @@ mod tests {
         assert_eq!(
             port_forward_hint("curie", "curie-langfuse-web", 8080, 0, ""),
             "kubectl -n curie port-forward svc/curie-langfuse-web 8080:0  then http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn service_url_json_uses_the_privileged_port_forward_hint() {
+        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward { local, port },
+        };
+
+        assert_eq!(
+            service_url.to_json(),
+            serde_json::json!({
+                "name": "UI",
+                "url": null,
+                "note": "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1",
+            })
         );
     }
 
