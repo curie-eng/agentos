@@ -6471,7 +6471,8 @@ pub enum ServiceEndpoint {
     /// Type NodePort but no nodePort assigned yet.
     UnassignedNodePort,
     /// ClusterIP/other: reachable only via a port-forward.
-    /// `local = if port == 0 { 8080 } else { port }`.
+    /// `local` is a non-privileged port: HTTP services on port 80 use 18080,
+    /// while an absent service port falls back to 8080.
     PortForwardHint { local: u16, port: u16 },
     /// `parse_service` returned None (malformed/unreadable JSON).
     Unreadable,
@@ -6497,7 +6498,11 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: if port == 0 { 8080 } else { port },
+            local: match port {
+                0 => 8080,
+                80 => 18080,
+                _ => port,
+            },
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -9239,15 +9244,18 @@ mod tests {
 
     #[test]
     fn resolve_service_endpoint_clusterip_yields_a_port_forward_hint() {
-        // ClusterIP: not node-exposed, so the caller must port-forward. The local
-        // port mirrors the service port.
+        // ClusterIP: not node-exposed, so the caller must port-forward. HTTP's
+        // privileged service port maps to a non-privileged local port.
         let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        assert_eq!(
-            resolve_service_endpoint(clusterip, "10.0.0.5", true),
-            ServiceEndpoint::PortForwardHint {
-                local: 80,
-                port: 80
-            }
+        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(local, 18080);
+        assert_eq!(port, 80);
+        assert!(
+            local >= 1024,
+            "the local port must be bindable by a non-root user"
         );
         // An absent port parses as 0, which falls back to local port 8080.
         let no_port = r#"{"spec":{"type":"ClusterIP","ports":[{}]}}"#;
@@ -9289,8 +9297,8 @@ mod tests {
         // The exact hint `cluster status` prints today for a ClusterIP service
         // (PR#34 visual-parity guard): two spaces before `then`.
         assert_eq!(
-            port_forward_hint("curie", "curie-ui", 80, 80, "/?api=1"),
-            "kubectl -n curie port-forward svc/curie-ui 80:80  then http://localhost:80/?api=1"
+            port_forward_hint("curie", "curie-ui", 18080, 80, "/?api=1"),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
         // The 0-port fallback surfaces local 8080 while still forwarding to 0.
         assert_eq!(
