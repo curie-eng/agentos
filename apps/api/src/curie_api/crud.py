@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -37,6 +38,31 @@ _WORKSPACE_UNSET = object()
 
 class PublicationReplayConflict(RuntimeError):
     """A publication dedupe key was replayed with different private facts."""
+
+
+async def _adopt_publication_replay(
+    session: AsyncSession, data: PublicationCreate, patch: bytes
+) -> Publication | None:
+    approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
+    if approval is None:
+        return None
+    publication = await get_publication_by_approval(session, approval.id)
+    if publication is None:
+        raise PublicationReplayConflict(
+            "publication dedupe key belongs to a non-publication approval"
+        )
+    if (
+        publication.deployment_id != data.deployment_id
+        or publication.base_sha != data.base_sha
+        or publication.patch_bytes != patch
+        or publication.changed_paths != data.changed_paths
+        or publication.title != (data.title or data.summary)
+        or publication.body != (data.body or "Approved platform publication.")
+    ):
+        raise PublicationReplayConflict(
+            "publication dedupe key was replayed with different snapshot facts"
+        )
+    return publication
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
@@ -439,22 +465,8 @@ async def create_publication(
     conflict and can never replace bytes that were already approved.
     """
 
-    existing_approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
-    if existing_approval is not None:
-        existing = await get_publication_by_approval(session, existing_approval.id)
-        if existing is None:
-            raise PublicationReplayConflict(
-                "publication dedupe key belongs to a non-publication approval"
-            )
-        if (
-            existing.deployment_id != data.deployment_id
-            or existing.base_sha != data.base_sha
-            or existing.patch_bytes != patch
-            or existing.changed_paths != data.changed_paths
-        ):
-            raise PublicationReplayConflict(
-                "publication dedupe key was replayed with different snapshot facts"
-            )
+    existing = await _adopt_publication_replay(session, data, patch)
+    if existing is not None:
         return existing, False
 
     deployment = await get_deployment(session, data.deployment_id)
@@ -487,7 +499,14 @@ async def create_publication(
         expires_at=expires_at,
     )
     session.add(approval)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        existing = await _adopt_publication_replay(session, data, patch)
+        if existing is None:
+            raise
+        return existing, False
     publication = Publication(
         approval_id=approval.id,
         deployment_id=deployment.id,
@@ -506,7 +525,17 @@ async def create_publication(
         reply_adapter=data.reply_adapter,
     )
     session.add(publication)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Two reclaimed deliveries can both miss the optimistic pre-read. The
+        # unique approval dedupe key is the arbiter; after rolling back the
+        # losing INSERT, re-read and adopt only an exact private-fact replay.
+        await session.rollback()
+        existing = await _adopt_publication_replay(session, data, patch)
+        if existing is None:
+            raise
+        return existing, False
     await session.refresh(publication)
     return publication, True
 
@@ -725,6 +754,7 @@ async def claim_approval_resolution(
         }
         if publication_status == "denied":
             publication_values["terminal_at"] = func.now()
+            publication_values["patch_bytes"] = None
         changed = await session.execute(
             update(Publication)
             .where(
@@ -796,6 +826,7 @@ async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Appr
             .where(Publication.id == publication.id, Publication.status == "pending")
             .values(
                 status="expired",
+                patch_bytes=None,
                 version=Publication.version + 1,
                 updated_at=func.now(),
                 terminal_at=func.now(),

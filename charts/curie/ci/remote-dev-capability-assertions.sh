@@ -88,10 +88,18 @@ for workload in [doc for doc in docs if doc.get("kind") == "Deployment" and doc 
             fail(f"internal worker auth leaked into {workload['metadata']['name']}")
 
 
-# The trusted worker gets exactly the publication resource verbs and no
-# pods/exec. A dynamic Job can be created and observed; a sandbox cannot be
-# entered through the worker's service account.
-role = one("Role", component="worker")
+# Publication authority lives only in the dedicated namespace Role. The main
+# worker Role remains free of publication resources.
+worker_role = one("Role", component="worker")
+worker_resources = {
+    resource
+    for rule in worker_role.get("rules") or []
+    for resource in rule.get("resources") or []
+}
+if worker_resources & {"jobs", "configmaps", "secrets", "pods", "pods/log"}:
+    fail(f"main worker Role carries publication authority: {sorted(worker_resources)}")
+
+role = one("Role", component="publication-worker")
 rules = role.get("rules") or []
 resources_to_verbs = {}
 for rule in rules:
@@ -102,6 +110,8 @@ for resource in ("jobs", "configmaps", "secrets"):
         fail(f"worker Role is missing publication lifecycle verbs for {resource}")
 if "get" not in resources_to_verbs.get("pods/log", set()):
     fail("worker Role cannot read the publication Job URL marker")
+if "list" not in resources_to_verbs.get("pods", set()):
+    fail("worker Role cannot discover the publication Job pod")
 if "pods/exec" in resources_to_verbs:
     fail("worker Role must never grant pods/exec")
 
@@ -112,10 +122,30 @@ publication_sa = one("ServiceAccount", component="publication")
 if publication_sa.get("automountServiceAccountToken") is not False:
     fail("publication ServiceAccount must disable token automount")
 publication_sa_name = publication_sa["metadata"]["name"]
+publication_namespace = publication_sa["metadata"].get("namespace")
+if not publication_namespace or publication_namespace == worker["metadata"].get("namespace", "default"):
+    fail("publication resources must use a dedicated namespace")
 for binding in [doc for doc in docs if doc.get("kind") in ("RoleBinding", "ClusterRoleBinding")]:
     if any(subject.get("name") == publication_sa_name for subject in binding.get("subjects") or []):
         fail("publication ServiceAccount must have no RBAC binding")
-one("ConfigMap", component="publication-owner")
+owner = one("ConfigMap", component="publication-owner")
+if owner["metadata"].get("namespace") != publication_namespace:
+    fail("publication owner is outside the publication namespace")
+publication_binding = one("RoleBinding", component="publication-worker")
+subjects = publication_binding.get("subjects") or []
+if not any(
+    subject.get("name") == worker["metadata"]["name"]
+    and subject.get("namespace") == worker["metadata"].get("namespace", "default")
+    for subject in subjects
+):
+    fail("publication RoleBinding must bind the release worker ServiceAccount")
+for secret_doc in [doc for doc in docs if doc.get("kind") == "Secret"]:
+    if secret_doc.get("metadata", {}).get("namespace") == publication_namespace:
+        fail("operator credential Secret was copied into the publication namespace")
+publication_policy = one("NetworkPolicy", component="publication")
+publication_selector = publication_policy["spec"]["podSelector"]["matchLabels"]
+if publication_selector != {"curietech.ai/component": "publication"}:
+    fail(f"publication NetworkPolicy selector drifted: {publication_selector!r}")
 
 
 # Worker scratch is private and bounded; worker resources include explicit
@@ -210,9 +240,15 @@ if not policies:
     fail("runner fail-closed NetworkPolicies are absent")
 for policy in policies:
     labels = policy.get("spec", {}).get("podSelector", {}).get("matchLabels", {})
-    if labels.get("app.kubernetes.io/component") != "runner-sandbox":
+    expected_runner_labels = {
+        "app.kubernetes.io/name": "curie",
+        "app.kubernetes.io/instance": "remote-dev",
+        "app.kubernetes.io/component": "runner-sandbox",
+    }
+    if labels != expected_runner_labels:
         fail(f"runner policy selector widened: {policy['metadata']['name']}")
-    if labels.get("app.kubernetes.io/component") == "publication":
+    publication_pod_labels = {"curietech.ai/component": "publication"}
+    if all(publication_pod_labels.get(key) == value for key, value in labels.items()):
         fail("publication pods were selected by sandbox NetworkPolicy")
 
 print("remote-dev capability render assertions passed")

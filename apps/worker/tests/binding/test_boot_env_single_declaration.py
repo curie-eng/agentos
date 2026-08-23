@@ -114,6 +114,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # archive, upload, and capability-minting policy; none is runner boot
         # configuration.
         "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_WORKSPACE_ENABLED",
         "CURIE_WORKSPACE_BUCKET",
         "CURIE_WORKSPACE_OBJECT_PREFIX",
         "CURIE_WORKSPACE_SCRATCH_ROOT",
@@ -137,6 +138,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # WorkerConfig and consumed by PublicationReconcileLoop and its
         # Kubernetes Job builder. They configure the platform-side publisher,
         # never a runner sandbox boot.
+        "CURIE_PUBLICATION_ENABLED",
+        "CURIE_PUBLICATION_NAMESPACE",
+        "CURIE_PUBLICATION_PATCH_MAX_BYTES",
+        "CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
+        "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
+        "CURIE_PUBLICATION_GITHUB_API_URL",
         "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
         "CURIE_PUBLICATION_LEASE_SECONDS",
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",

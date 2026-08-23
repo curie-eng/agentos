@@ -52,7 +52,7 @@ from .server import create_app
 from .session import SessionRunner
 from .side_effects import SideEffectClassifier
 from .state import STATE_SERVER_NAME, build_state_server, resolve_state_client
-from .workspace_snapshot import capture_workspace_snapshot
+from .workspace_snapshot import WorkspaceSnapshot, capture_workspace_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +117,7 @@ def build_runner(
     history_store: TranscriptStore | None = None,
     conversation_preamble: str | None = None,
     harness: HarnessContribution | None = None,
+    workspace_path: Path | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -155,6 +156,13 @@ def build_runner(
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
     bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
+    mounted_workspace = (
+        workspace_path
+        if workspace_path is not None
+        and workspace_path.is_dir()
+        and (workspace_path / ".git").exists()
+        else None
+    )
     # The permission gate (#245/#247): approval-required tools come from the
     # union of the bundle manifest's approvalPolicy gates (versioned with the
     # agent, each carrying its route name) and the CURIE_APPROVAL_REQUIRED_TOOLS
@@ -184,6 +192,7 @@ def build_runner(
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
+            managed_workspace=mounted_workspace is not None,
         )
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths
@@ -198,11 +207,7 @@ def build_runner(
     # bundle shipping its own server. Absent (fake/local, or an older worker), no
     # state server is mounted and the agent simply sees no state tools.
     state_client = resolve_state_client(os.environ)
-    workspace_cwd = (
-        "/workspace"
-        if Path("/workspace").is_dir() and (Path("/workspace") / ".git").exists()
-        else None
-    )
+    workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
 
     def factory() -> ModelSession:
         if fake_model:
@@ -245,7 +250,9 @@ def build_runner(
             # reads/writes durable state the same way -- no bundle-shipped server.
             mcp_servers=build_mcp_servers(
                 platform={
-                    APPROVAL_SERVER_NAME: build_approval_server(approval_gate),
+                    APPROVAL_SERVER_NAME: build_approval_server(
+                        approval_gate, managed_workspace=mounted_workspace is not None
+                    ),
                     **(
                         {STATE_SERVER_NAME: build_state_server(state_client)}
                         if state_client is not None
@@ -409,6 +416,12 @@ def main() -> None:
             raise
     memory_store, memory_preamble = _load_memory(config)
     history_store, conversation_preamble = _load_history(config)
+    workspace_candidate = Path("/workspace")
+    workspace_path: Path | None = (
+        workspace_candidate
+        if workspace_candidate.is_dir() and (workspace_candidate / ".git").exists()
+        else None
+    )
     runner = build_runner(
         config,
         fake_model=fake_model,
@@ -418,15 +431,24 @@ def main() -> None:
         history_store=history_store,
         conversation_preamble=conversation_preamble,
         harness=harness,
+        workspace_path=workspace_path,
     )
-    app = create_app(
-        runner,
-        token=config.runner_token,
+    def capture_mounted_workspace() -> WorkspaceSnapshot:
         # The sanitized, credential-free origin in /workspace/.git/config is
-        # the repository fact. Do not add a second claim env value that could
-        # drift from it or widen what the sandbox receives.
-        snapshotter=lambda: capture_workspace_snapshot("/workspace"),
-    )
+        # the repository fact. The proposal is runner-held state from the
+        # permission-gated tool input; neither needs another claim env.
+        if workspace_path is None:
+            raise RuntimeError("managed workspace disappeared before snapshot wiring")
+        gate = runner._approval_gate  # noqa: SLF001 - same package wiring
+        return capture_workspace_snapshot(
+            workspace_path,
+            publication_title=gate.publication_title if gate is not None else None,
+            publication_body=gate.publication_body if gate is not None else None,
+        )
+
+    snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
+
+    app = create_app(runner, token=config.runner_token, snapshotter=snapshot_callback)
 
     async def _startup(_app: web.Application) -> None:
         try:

@@ -64,18 +64,68 @@ def test_snapshot_captures_staged_unstaged_untracked_and_binary_changes(
     (repo / "asset.bin").write_bytes(b"\x00changed\xfe")
     (repo / "untracked.bin").write_bytes(b"\x00new\xfd")
 
-    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+    captured = snapshot.capture_workspace_snapshot(
+        repo,
+        expected_repo=REPO,
+        publication_title="Update assets",
+        publication_body="Keep the exact requested body.",
+    )
 
     assert captured.repo_full_name == REPO
     assert captured.base_sha == base_sha
     assert set(captured.changed_paths) == {"README.md", "asset.bin", "untracked.bin"}
     assert b"GIT binary patch" in captured.patch
     assert len(captured.patch) <= 900_000
+    assert captured.publication_title == "Update assets"
+    assert captured.publication_body == "Keep the exact requested body."
 
     clean, _ = _repo(tmp_path / "apply-check")
     patch_file = tmp_path / "publication.patch"
     patch_file.write_bytes(captured.patch)
     _git(clean, "apply", "--check", "--binary", str(patch_file))
+
+
+def test_snapshot_preserves_real_top_level_a_and_b_paths_with_spaces(
+    snapshot: Any, tmp_path: Path
+) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / "a").mkdir()
+    (repo / "b").mkdir()
+    (repo / "a" / "read me.md").write_text("base a\n")
+    (repo / "b" / "release notes.md").write_text("base b\n")
+    _git(repo, "add", ".")
+    _git(
+        repo,
+        "-c",
+        "user.name=Curie Test",
+        "-c",
+        "user.email=curie@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "Add path fixtures",
+    )
+    (repo / "a" / "read me.md").write_text("changed a\n")
+    (repo / "b" / "release notes.md").write_text("changed b\n")
+
+    captured = snapshot.capture_workspace_snapshot(repo, expected_repo=REPO)
+
+    assert captured.changed_paths == ("a/read me.md", "b/release notes.md")
+    assert b"diff --git a/a/read me.md b/a/read me.md" in captured.patch
+    assert b"diff --git a/b/release notes.md b/b/release notes.md" in captured.patch
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        b"diff --git a/read me.md b/read me.md\n",
+        b'diff --git "a/read me.md" "b/read me.md"\n',
+    ],
+)
+def test_snapshot_accepts_unquoted_and_c_quoted_git_headers_with_spaces(
+    snapshot: Any, patch: bytes
+) -> None:
+    assert snapshot.validate_patch(patch) == patch
 
 
 @pytest.mark.parametrize("size", [899_999, 900_000])
@@ -143,6 +193,8 @@ def test_snapshot_route_requires_runner_token_and_returns_base64_binary_patch(
         patch=b"\x00binary-patch\xff",
         changed_paths=("asset.bin",),
         contains_workflow_files=False,
+        publication_title="Update binary asset",
+        publication_body="Exact requested body",
     )
 
     async def go() -> None:
@@ -163,7 +215,22 @@ def test_snapshot_route_requires_runner_token_and_returns_base64_binary_patch(
                 "changed_paths": ["asset.bin"],
                 "contains_workflow_files": False,
                 "patch_size_bytes": len(captured.patch),
+                "publication_title": "Update binary asset",
+                "publication_body": "Exact requested body",
             }
+
+    anyio.run(go)
+
+
+def test_snapshot_route_returns_intentional_conflict_without_managed_workspace() -> None:
+    async def go() -> None:
+        runner = _runner()
+        await runner.start()
+        async with TestClient(TestServer(create_app(runner, token=TOKEN))) as client:
+            response = await client.post("/v1/snapshot", headers=AUTH)
+            assert response.status == 409
+            body = await response.json()
+            assert "no managed repository workspace" in body["error"]
 
     anyio.run(go)
 
@@ -175,6 +242,8 @@ def test_snapshot_json_never_contains_raw_binary_or_credential_material(snapshot
         patch=b"patch-without-secrets",
         changed_paths=("README.md",),
         contains_workflow_files=False,
+        publication_title="Update README",
+        publication_body="",
     )
     encoded = json.dumps(captured.to_json())
     assert "Authorization" not in encoded

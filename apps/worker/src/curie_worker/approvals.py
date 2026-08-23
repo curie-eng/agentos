@@ -69,10 +69,15 @@ class PublicationCreateRequest:
     patch: bytes
     changed_paths: tuple[str, ...]
     expires_in_seconds: int
+    title: str
+    body: str
+    max_patch_bytes: int = 900_000
 
     def to_json(self) -> dict[str, Any]:
-        if len(self.patch) > 900_000:
-            raise ApprovalBackendError("publication patch exceeds 900000 raw bytes")
+        if len(self.patch) > self.max_patch_bytes:
+            raise ApprovalBackendError(
+                f"publication patch exceeds {self.max_patch_bytes} raw bytes"
+            )
         return {
             "deployment_id": str(self.deployment_id),
             "conversation_id": self.conversation_id,
@@ -88,6 +93,8 @@ class PublicationCreateRequest:
             "patch_b64": base64.b64encode(self.patch).decode("ascii"),
             "changed_paths": list(self.changed_paths),
             "expires_in_seconds": self.expires_in_seconds,
+            "title": self.title,
+            "body": self.body,
         }
 
 

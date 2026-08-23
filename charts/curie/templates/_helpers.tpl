@@ -48,6 +48,11 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Dedicated namespace for short-lived publication resources. */}}
+{{- define "curie.publicationNamespace" -}}
+{{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
      The non-CURIE_-prefixed runner credential keys a per-agent connector
      secret must never declare, kept in list-parity with the Python source of

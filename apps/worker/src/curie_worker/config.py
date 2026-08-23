@@ -540,6 +540,9 @@ class WorkerConfig(BaseSettings):
     workspace_bucket: str = Field(
         default="curie-workspaces", validation_alias="CURIE_WORKSPACE_BUCKET"
     )
+    workspace_enabled: bool = Field(
+        default=True, validation_alias="CURIE_WORKSPACE_ENABLED"
+    )
     workspace_object_prefix: str = Field(
         default="private/workspaces",
         validation_alias="CURIE_WORKSPACE_OBJECT_PREFIX",
@@ -571,7 +574,7 @@ class WorkerConfig(BaseSettings):
         validation_alias="CURIE_WORKSPACE_MAX_ARCHIVE_BYTES",
     )
     workspace_max_members: int = Field(
-        default=4096, gt=0, validation_alias="CURIE_WORKSPACE_MAX_MEMBERS"
+        default=50_000, gt=0, validation_alias="CURIE_WORKSPACE_MAX_MEMBERS"
     )
     workspace_max_compression_ratio: float = Field(
         default=20.0,
@@ -586,6 +589,40 @@ class WorkerConfig(BaseSettings):
     )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
+    publication_enabled: bool = Field(
+        default=True, validation_alias="CURIE_PUBLICATION_ENABLED"
+    )
+    publication_namespace: str = Field(
+        default="curie-publication", validation_alias="CURIE_PUBLICATION_NAMESPACE"
+    )
+    publication_patch_max_bytes: int = Field(
+        default=900_000,
+        gt=0,
+        le=900_000,
+        validation_alias="CURIE_PUBLICATION_PATCH_MAX_BYTES",
+    )
+    publication_result_max_attempts: int = Field(
+        default=5, gt=0, validation_alias="CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS"
+    )
+    publication_reconcile_max_attempts: int = Field(
+        default=10,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
+    )
+    publication_job_active_deadline_seconds: int = Field(
+        default=300,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
+    )
+    publication_git_command_timeout_seconds: int = Field(
+        default=120,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
+    )
+    publication_github_api_url: str = Field(
+        default="https://api.github.com",
+        validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
+    )
     publication_reconcile_interval_seconds: float = Field(
         default=2.0,
         gt=0,

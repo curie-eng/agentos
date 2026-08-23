@@ -225,12 +225,16 @@ _PUBLISH_SCHEMA = {
         "title": {
             "type": "string",
             "description": "Short proposed pull request title.",
+            "minLength": 1,
+            "maxLength": 240,
         },
         "body": {
             "type": "string",
             "description": "Optional proposed pull request description.",
+            "maxLength": 65_536,
         },
     },
+    "required": ["title"],
 }
 
 _TOOL_DESCRIPTION = (
@@ -294,7 +298,9 @@ def _distinct_routes(gate: ApprovalGate | None) -> list[str]:
     return sorted({r for r in gate.route_by_tool.values() if r})
 
 
-def build_approval_server(gate: ApprovalGate | None = None) -> McpSdkServerConfig:
+def build_approval_server(
+    gate: ApprovalGate | None = None, *, managed_workspace: bool = False
+) -> McpSdkServerConfig:
     """The in-process MCP server carrying the approval-request tool.
 
     Per-gate (#544, Decision B): the tool closes over ``gate`` so it can
@@ -316,20 +322,25 @@ def build_approval_server(gate: ApprovalGate | None = None) -> McpSdkServerConfi
     async def request_approval(args: dict[str, Any]) -> dict[str, Any]:
         return process_approval_request(gate, args)
 
-    @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
-    async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
-        # Defence in depth: the permission callback must deny the call before
-        # execution.  If a harness bypasses that callback, the in-process tool
-        # still performs no action and grants no capability.
-        return _approval_error(
-            "Publication is performed only by the platform after human approval; "
-            "this sandbox tool cannot execute it directly."
-        )
+    tools = [request_approval]
+    if managed_workspace:
+
+        @tool(_PUBLISH_TOOL, _PUBLISH_DESCRIPTION, _PUBLISH_SCHEMA)
+        async def publish_changes(_args: dict[str, Any]) -> dict[str, Any]:
+            # Defence in depth: the permission callback must deny the call before
+            # execution. If a harness bypasses that callback, the in-process tool
+            # still performs no action and grants no capability.
+            return _approval_error(
+                "Publication is performed only by the platform after human approval; "
+                "this sandbox tool cannot execute it directly."
+            )
+
+        tools.append(publish_changes)
 
     return create_sdk_mcp_server(
         name=APPROVAL_SERVER_NAME,
         version="1.0.0",
-        tools=[request_approval, publish_changes],
+        tools=tools,
     )
 
 
@@ -544,6 +555,8 @@ class ApprovalGate:
     policy_route: str | None = None
     grant_tool: str | None = None
     grantable_by_route: dict[str, str] = field(default_factory=dict)
+    publication_title: str | None = None
+    publication_body: str | None = None
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -566,6 +579,8 @@ class ApprovalGate:
         self.policy_requested = False
         self.policy_rejected = False
         self.policy_route = None
+        self.publication_title = None
+        self.publication_body = None
         # Boot-turn-only grant: keep it on the first reset (the boot turn),
         # expire any unspent grant on the second and later resets so it never
         # leaks into a subsequent turn.
@@ -583,6 +598,15 @@ class ApprovalGate:
 
     def block(self, tool_name: str, tool_input: dict[str, Any]) -> None:
         if self.pending_summary is None:
+            if tool_name == PUBLISH_TOOL_NAME:
+                title = tool_input.get("title")
+                body = tool_input.get("body", "")
+                if not isinstance(title, str) or not title.strip() or len(title) > 240:
+                    raise ValueError("publication title must be 1-240 characters")
+                if not isinstance(body, str) or len(body) > 65_536:
+                    raise ValueError("publication body must be at most 65536 characters")
+                self.publication_title = title.strip()
+                self.publication_body = body
             self.pending_summary = summarize_tool_call(tool_name, tool_input)
             self.pending_route = self.route_by_tool.get(tool_name)
             # Provenance for the permission gate (#544, Decision C): the tool
@@ -616,7 +640,12 @@ def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:
             # gate builder and this explicit branch keeps future callers safe.
             if tool_name != PUBLISH_TOOL_NAME and gate.consume_grant(tool_name):
                 return PermissionResultAllow()
-            gate.block(tool_name, tool_input)
+            try:
+                gate.block(tool_name, tool_input)
+            except ValueError as exc:
+                return PermissionResultDeny(
+                    message=f"Publication request was not recorded: {exc}. Correct it and retry."
+                )
             return PermissionResultDeny(message=_DENY_MESSAGE)
         return PermissionResultAllow()
 
@@ -794,6 +823,7 @@ def build_approval_gate(
     bundle_name: str | None = None,
     mcp_servers: set[str] | None = None,
     connector_servers: set[str] | None = None,
+    managed_workspace: bool = False,
 ) -> ApprovalGate | None:
     """Merge the operator's gated tools with the bundle's declared gates.
 
@@ -890,7 +920,15 @@ def build_approval_gate(
         # extra approval card, under-arming is a silent fail-open.
         normalized.extend(effective)
 
-    operator = frozenset(normalized)
+    operator = frozenset(name for name in normalized if name != PUBLISH_TOOL_NAME)
+    # The publication gate is platform-owned and requester-thread scoped. A
+    # bundle may mention the name, but it cannot attach its own audience route
+    # or cause publication to exist without a mounted managed workspace.
+    policy_routes = {
+        tool_name: route
+        for tool_name, route in policy_routes.items()
+        if tool_name != PUBLISH_TOOL_NAME
+    }
     redefined = sorted(operator & set(policy_routes))
     if redefined:
         logger.warning(
@@ -899,10 +937,14 @@ def build_approval_gate(
             " gated and the bundle's route decides the approving audience",
             redefined,
         )
-    # Publication is a mandatory platform gate.  It is additive to both
-    # operator and bundle policy, has no audience route of its own (the request
-    # thread owns the card), and cannot consume a resume grant.
-    gated_tools = operator | frozenset(policy_routes) | frozenset({PUBLISH_TOOL_NAME})
+    # Publication is a mandatory platform gate only for a managed checkout. It
+    # is additive to both operator and bundle policy, has no audience route of
+    # its own (the request thread owns the card), and cannot consume a grant.
+    gated_tools = operator | frozenset(policy_routes)
+    if managed_workspace:
+        gated_tools |= frozenset({PUBLISH_TOOL_NAME})
+    if not gated_tools:
+        return None
     safe_grant_tool = None if grant_tool == PUBLISH_TOOL_NAME else grant_tool
     return ApprovalGate(
         required=gated_tools,

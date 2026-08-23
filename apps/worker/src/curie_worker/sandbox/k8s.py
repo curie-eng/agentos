@@ -259,7 +259,12 @@ class KubernetesSandboxClient:
             # secretKeyRef, and connector-secret delivery is #440. The marker var
             # naming the connector-secret keys is stripped too.
             marker = env.get(CONNECTOR_SECRET_KEYS_ENV, "")
-            stripped = {CREDENTIALS_ENV, CONNECTOR_SECRET_KEYS_ENV}
+            stripped = {
+                CREDENTIALS_ENV,
+                CONNECTOR_SECRET_KEYS_ENV,
+                WORKSPACE_REF_ENV,
+                WORKSPACE_SHA256_ENV,
+            }
             stripped.update(k for k in marker.split(",") if k)
             entries: list[dict[str, str]] = [
                 {"name": k, "value": v} for k, v in sorted(env.items()) if k not in stripped

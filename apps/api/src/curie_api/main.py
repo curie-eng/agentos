@@ -137,6 +137,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.resume_queue,
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
+                publication_patch_retention_seconds=(
+                    settings.publication_patch_retention_seconds
+                ),
             )
         )
     else:

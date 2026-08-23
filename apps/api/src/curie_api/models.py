@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, LargeBinary, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -332,18 +332,27 @@ class Publication(Base):
     """Private patch state settled by the platform publication reconciler."""
 
     __tablename__ = "publications"
+    __table_args__ = (
+        Index("ix_publications_status_lease", "status", "lease_expires_at"),
+        Index("ix_publications_deployment_id", "deployment_id"),
+        Index(
+            "ix_publications_result_delivery",
+            "result_reported_at",
+            "result_delivery_dead_lettered_at",
+            "lease_expires_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     approval_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
         unique=True,
-        index=True,
     )
     deployment_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE"), index=True
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE")
     )
     repo_full_name: Mapped[str]
-    status: Mapped[str] = mapped_column(server_default="pending", index=True)
+    status: Mapped[str] = mapped_column(server_default="pending")
     version: Mapped[int] = mapped_column(server_default="1", default=1)
     base_sha: Mapped[str]
     # Deliberately excluded from every public DTO. Terminal retention clears
@@ -351,7 +360,7 @@ class Publication(Base):
     patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
     changed_paths: Mapped[list[str]] = mapped_column(JSONB)
     title: Mapped[str]
-    body: Mapped[str]
+    body: Mapped[str] = mapped_column(Text)
     reply_kind: Mapped[str]
     reply_channel: Mapped[str]
     reply_placeholder: Mapped[str | None] = mapped_column(default=None)
@@ -360,7 +369,16 @@ class Publication(Base):
     lease_owner: Mapped[str | None] = mapped_column(default=None)
     lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     result_url: Mapped[str | None] = mapped_column(default=None)
-    error: Mapped[str | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Terminalization and credential/resource cleanup happen before reply
+    # delivery. These fields form the durable result outbox so a transient
+    # adapter failure cannot resurrect publication work or retain patch bytes.
+    result_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_delivery_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    result_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    result_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
+    reconcile_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    reconcile_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
     terminal_at: Mapped[datetime | None] = mapped_column(default=None)

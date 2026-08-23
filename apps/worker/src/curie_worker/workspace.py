@@ -308,6 +308,8 @@ class WorkspaceObjectPort(Protocol):
 
     def delete(self, key: str) -> None: ...
 
+    def list_keys(self, prefix: str) -> Iterator[str]: ...
+
 
 class WorkspaceObjectStore:
     """Private S3/RustFS storage with streaming exact-object operations."""
@@ -353,6 +355,21 @@ class WorkspaceObjectStore:
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=self._key(key))
+
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        """Yield logical keys below the private workspace prefix."""
+
+        logical_prefix = prefix.strip("/")
+        object_prefix = self._key(logical_prefix)
+        if logical_prefix:
+            object_prefix += "/"
+        private_prefix = f"{self._prefix}/"
+        paginator = self._client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=object_prefix):
+            for item in page.get("Contents") or ():
+                key = str(item.get("Key") or "")
+                if key.startswith(private_prefix):
+                    yield key.removeprefix(private_prefix)
 
 
 class _IteratorReader:
@@ -441,6 +458,81 @@ class PreparedWorkspace:
         }
 
 
+_OWNERSHIP_PREFIX = "_ownership"
+
+
+@dataclass(frozen=True)
+class _WorkspaceOwnership:
+    """Private durable ownership record for one thread's workspace base."""
+
+    thread_key: str
+    prepared: PreparedWorkspace
+    expires_at_epoch: int
+    stale_object_keys: tuple[str, ...] = ()
+
+    def encode(self) -> bytes:
+        prepared = self.prepared
+        return json.dumps(
+            {
+                "version": 1,
+                "thread_key": self.thread_key,
+                "expires_at_epoch": self.expires_at_epoch,
+                "stale_object_keys": list(self.stale_object_keys),
+                "prepared": {
+                    "object_key": prepared.object_key,
+                    "sha256": prepared.sha256,
+                    "clean_clone_url": prepared.clean_clone_url,
+                    "repo_full_name": prepared.repo_full_name,
+                    "base_sha": prepared.base_sha,
+                    "checkout_mode": prepared.checkout_mode,
+                    "reference": prepared.reference.encode(),
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+
+    @classmethod
+    def decode(
+        cls, payload: bytes, *, expected_thread_key: str | None = None
+    ) -> _WorkspaceOwnership:
+        try:
+            raw = json.loads(payload)
+            if raw.get("version") != 1:
+                raise ValueError("unsupported ownership record version")
+            thread_key = str(raw["thread_key"])
+            if expected_thread_key is not None and thread_key != expected_thread_key:
+                raise ValueError("ownership record names a different thread")
+            prepared_raw = raw["prepared"]
+            stale = tuple(str(key) for key in raw.get("stale_object_keys") or ())
+            if any(not key or key.startswith("_") for key in stale):
+                raise ValueError("ownership record contains an invalid stale object key")
+            prepared = PreparedWorkspace(
+                object_key=str(prepared_raw["object_key"]),
+                sha256=str(prepared_raw["sha256"]),
+                clean_clone_url=str(prepared_raw["clean_clone_url"]),
+                repo_full_name=str(prepared_raw["repo_full_name"]),
+                base_sha=str(prepared_raw["base_sha"]),
+                checkout_mode=int(prepared_raw["checkout_mode"]),
+                reference=WorkspaceRef.decode(str(prepared_raw["reference"])),
+            )
+            expires_at_epoch = int(raw["expires_at_epoch"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorkspacePreparationError(
+                "ownership-ledger", "private workspace ownership record is invalid"
+            ) from exc
+        if not thread_key or not prepared.object_key or prepared.object_key.startswith("_"):
+            raise WorkspacePreparationError(
+                "ownership-ledger", "private workspace ownership record is incomplete"
+            )
+        return cls(
+            thread_key=thread_key,
+            prepared=prepared,
+            expires_at_epoch=expires_at_epoch,
+            stale_object_keys=stale,
+        )
+
+
 class WorkspaceCloneLimiter:
     """Process-wide bounded clone semaphore with observable active count."""
 
@@ -521,8 +613,13 @@ def _link_escapes(member_name: str, link_name: str) -> bool:
     return False
 
 
-def _spool_chunks(chunks: Iterable[bytes], *, maximum: int) -> tuple[Any, int]:
-    spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+def _spool_chunks(
+    chunks: Iterable[bytes], *, maximum: int, scratch_root: Path | None = None
+) -> tuple[Any, int]:
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=8 * 1024 * 1024,
+        dir=str(scratch_root) if scratch_root is not None else None,
+    )
     total = 0
     try:
         for chunk in chunks:
@@ -537,10 +634,17 @@ def _spool_chunks(chunks: Iterable[bytes], *, maximum: int) -> tuple[Any, int]:
         raise
 
 
-def validate_workspace_archive(chunks: Iterable[bytes], *, limits: WorkspaceLimits) -> None:
+def validate_workspace_archive(
+    chunks: Iterable[bytes],
+    *,
+    limits: WorkspaceLimits,
+    scratch_root: Path | None = None,
+) -> None:
     """Validate normalized archive structure and decompression bounds."""
 
-    spool, compressed = _spool_chunks(chunks, maximum=limits.max_archive_bytes)
+    spool, compressed = _spool_chunks(
+        chunks, maximum=limits.max_archive_bytes, scratch_root=scratch_root
+    )
     uncompressed = 0
     members = 0
     try:
@@ -559,23 +663,6 @@ def validate_workspace_archive(chunks: Iterable[bytes], *, limits: WorkspaceLimi
         ratio = uncompressed / max(1, compressed)
         if ratio > limits.max_compression_ratio:
             raise WorkspaceArchiveError("archive compression ratio limit exceeded")
-    finally:
-        spool.close()
-
-
-def validate_then_deliver_archive(
-    chunks: Iterable[bytes],
-    *,
-    limits: WorkspaceLimits,
-    start_init: Callable[[bytes], None],
-) -> None:
-    """Validate all bytes before invoking a substrate-specific init handoff."""
-
-    spool, _ = _spool_chunks(chunks, maximum=limits.max_archive_bytes)
-    try:
-        validate_workspace_archive(iter(lambda: spool.read(1024 * 1024), b""), limits=limits)
-        spool.seek(0)
-        start_init(spool.read())
     finally:
         spool.close()
 
@@ -717,9 +804,12 @@ class WorkspacePreparer:
                         "archive", self.limits.archive_timeout_seconds
                     ) from exc
                 self._check_total(started)
-                self._check_total(started)
 
-                validate_workspace_archive(self._file_chunks(archive_path), limits=self.limits)
+                validate_workspace_archive(
+                    self._file_chunks(archive_path),
+                    limits=self.limits,
+                    scratch_root=self.scratch_root,
+                )
                 digest = self._hash_file(archive_path)
                 object_key = (
                     f"{deployment_id}/{uuid.uuid4().hex}-"
@@ -830,7 +920,9 @@ class WorkspacePreparer:
         """Yield a deterministic gzip tar without links or special files."""
 
         del archive_path  # caller owns the final spool path
-        with tempfile.NamedTemporaryFile(prefix="curie-workspace-", suffix=".tar.gz") as temp:
+        with tempfile.NamedTemporaryFile(
+            prefix="archive-", suffix=".tar.gz", dir=self.scratch_root
+        ) as temp:
             with gzip.GzipFile(fileobj=temp, mode="wb", compresslevel=6, mtime=0) as compressed:
                 with tarfile.open(fileobj=compressed, mode="w") as archive:
                     for path in sorted(checkout.rglob("*"), key=lambda item: item.as_posix()):
@@ -898,7 +990,14 @@ class WorkspaceClaimResult:
 
 
 class WorkspaceClaimCoordinator:
-    """Prepare before claim/resume and reap superseded private objects."""
+    """Prepare before claim/resume and durably own private workspace bases.
+
+    Ownership lives beside the archives in the private workspace bucket rather
+    than solely in this process. A replacement worker can therefore validate a
+    publication against the existing base, release it, or reap it after the
+    route lease expires. Superseded keys remain in the ledger until deletion is
+    confirmed, making cleanup restart-safe as well.
+    """
 
     def __init__(
         self,
@@ -906,64 +1005,20 @@ class WorkspaceClaimCoordinator:
         preparer: WorkspacePreparer,
         substrate: Any,
         suspended_error: type[Exception] | tuple[type[Exception], ...] = (),
+        ownership_ttl_seconds: int = 24 * 60 * 60,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
+        if ownership_ttl_seconds <= 0:
+            raise ValueError("ownership_ttl_seconds must be positive")
         self.preparer = preparer
         self.substrate = substrate
         self._suspended_errors = (
             (suspended_error,) if isinstance(suspended_error, type) else suspended_error
         )
+        self._ownership_ttl_seconds = ownership_ttl_seconds
+        self._wall_clock = wall_clock
         self._current: dict[str, PreparedWorkspace] = {}
         self._lock = threading.Lock()
-
-    def claim(
-        self,
-        *,
-        thread_key: str,
-        deployment_id: uuid.UUID,
-        env: dict[str, str] | None = None,
-    ) -> PreparedWorkspace:
-        return self.claim_with_handle(
-            thread_key=thread_key, deployment_id=deployment_id, env=env
-        ).prepared
-
-    def resume(
-        self,
-        *,
-        thread_key: str,
-        deployment_id: uuid.UUID,
-        env: dict[str, str] | None = None,
-    ) -> PreparedWorkspace:
-        return self.resume_with_handle(
-            thread_key=thread_key, deployment_id=deployment_id, env=env
-        ).prepared
-
-    def claim_with_handle(
-        self,
-        *,
-        thread_key: str,
-        deployment_id: uuid.UUID,
-        env: dict[str, str] | None = None,
-    ) -> WorkspaceClaimResult:
-        return self._prepare_and_deliver(
-            operation="claim",
-            thread_key=thread_key,
-            deployment_id=deployment_id,
-            env=env,
-        )
-
-    def resume_with_handle(
-        self,
-        *,
-        thread_key: str,
-        deployment_id: uuid.UUID,
-        env: dict[str, str] | None = None,
-    ) -> WorkspaceClaimResult:
-        return self._prepare_and_deliver(
-            operation="resume",
-            thread_key=thread_key,
-            deployment_id=deployment_id,
-            env=env,
-        )
 
     def claim_or_resume_with_handle(
         self,
@@ -996,71 +1051,80 @@ class WorkspaceClaimCoordinator:
             self.preparer.delete(prepared)
             raise
 
-    def claim_prepared(
-        self,
-        *,
-        thread_key: str,
-        prepared: PreparedWorkspace,
-        env: dict[str, str] | None = None,
-    ) -> PreparedWorkspace:
-        self._deliver_prepared(operation="claim", thread_key=thread_key, prepared=prepared, env=env)
-        return prepared
-
-    def _prepare_and_deliver(
-        self,
-        *,
-        operation: str,
-        thread_key: str,
-        deployment_id: uuid.UUID,
-        env: dict[str, str] | None,
-    ) -> WorkspaceClaimResult:
-        prepared = self.preparer.prepare(
-            deployment_id=deployment_id,
-            thread_key=thread_key,
-            generation=uuid.uuid4().hex,
-        )
-        try:
-            handle = self._deliver_prepared(
-                operation=operation, thread_key=thread_key, prepared=prepared, env=env
-            )
-        except Exception:
-            self.preparer.delete(prepared)
-            raise
-        return WorkspaceClaimResult(prepared=prepared, handle=handle)
-
-    def _deliver_prepared(
-        self,
-        *,
-        operation: str,
-        thread_key: str,
-        prepared: PreparedWorkspace,
-        env: dict[str, str] | None,
-    ) -> Any:
-        self.preparer.verify(prepared)
-        claim_env = {**(env or {}), **prepared.claim_env()}
-        method = getattr(self.substrate, operation)
-        handle = method(thread_key, env=claim_env)
-        self._remember(thread_key, prepared)
-        return handle
-
     def _remember(self, thread_key: str, prepared: PreparedWorkspace) -> None:
         with self._lock:
-            old = self._current.get(thread_key)
+            old = self._load_ownership(thread_key)
+            stale = set(old.stale_object_keys if old is not None else ())
+            if old is not None and old.prepared.object_key != prepared.object_key:
+                stale.add(old.prepared.object_key)
+            ownership = _WorkspaceOwnership(
+                thread_key=thread_key,
+                prepared=prepared,
+                expires_at_epoch=self._lease_expiry(),
+                stale_object_keys=tuple(sorted(stale)),
+            )
+            self._store_ownership(ownership)
             self._current[thread_key] = prepared
-        if old is not None and old.object_key != prepared.object_key:
-            self.preparer.delete(old)
+            self._cleanup_stale(ownership)
 
     def release(self, thread_key: str) -> None:
         with self._lock:
-            prepared = self._current.pop(thread_key, None)
-        if prepared is not None:
-            self.preparer.delete(prepared)
+            self._current.pop(thread_key, None)
+            ownership = self._load_ownership(thread_key)
+            if ownership is None:
+                return
+            self._delete_owned_objects(ownership)
+            self.preparer.objects.delete(self._ownership_key(thread_key))
+
+    def touch(self, thread_key: str, *, ttl_seconds: int | None = None) -> bool:
+        """Refresh a durable workspace lease when sandbox affinity is refreshed."""
+
+        ttl = self._ownership_ttl_seconds if ttl_seconds is None else ttl_seconds
+        if ttl <= 0:
+            raise ValueError("workspace ownership TTL must be positive")
+        with self._lock:
+            ownership = self._load_ownership(thread_key)
+            if ownership is None:
+                return False
+            self._store_ownership(
+                _WorkspaceOwnership(
+                    thread_key=thread_key,
+                    prepared=ownership.prepared,
+                    expires_at_epoch=int(self._wall_clock()) + ttl,
+                    stale_object_keys=ownership.stale_object_keys,
+                )
+            )
+            return True
+
+    def reap_expired(self) -> list[str]:
+        """Delete expired workspace bases and stale keys after any worker restart."""
+
+        deleted: list[str] = []
+        now = int(self._wall_clock())
+        with self._lock:
+            for ledger_key in tuple(self.preparer.objects.list_keys(_OWNERSHIP_PREFIX)):
+                ownership = self._load_ownership_key(ledger_key)
+                if ownership.expires_at_epoch > now:
+                    continue
+                deleted.extend(self._delete_owned_objects(ownership))
+                self.preparer.objects.delete(ledger_key)
+                self._current.pop(ownership.thread_key, None)
+        return deleted
 
     def current(self, thread_key: str) -> PreparedWorkspace | None:
         """The trusted base facts retained for this active/suspended session."""
 
         with self._lock:
-            return self._current.get(thread_key)
+            ownership = self._load_ownership(thread_key)
+            if ownership is None:
+                self._current.pop(thread_key, None)
+                return None
+            if ownership.expires_at_epoch <= int(self._wall_clock()):
+                self._delete_owned_objects(ownership)
+                self.preparer.objects.delete(self._ownership_key(thread_key))
+                return None
+            self._current[thread_key] = ownership.prepared
+            return ownership.prepared
 
     def stream_current_base(self, thread_key: str) -> Iterator[bytes]:
         """Rehash, then stream the private base object for patch validation."""
@@ -1072,3 +1136,72 @@ class WorkspaceClaimCoordinator:
             )
         self.preparer.verify(prepared)
         yield from self.preparer.objects.get_stream(prepared.object_key)
+
+    def _lease_expiry(self) -> int:
+        return int(self._wall_clock()) + self._ownership_ttl_seconds
+
+    @staticmethod
+    def _ownership_key(thread_key: str) -> str:
+        digest = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()
+        return f"{_OWNERSHIP_PREFIX}/{digest}.json"
+
+    def _store_ownership(self, ownership: _WorkspaceOwnership) -> None:
+        self.preparer.objects.put_stream(
+            self._ownership_key(ownership.thread_key),
+            (ownership.encode(),),
+        )
+
+    def _load_ownership(self, thread_key: str) -> _WorkspaceOwnership | None:
+        key = self._ownership_key(thread_key)
+        try:
+            return self._load_ownership_key(key, expected_thread_key=thread_key)
+        except Exception as exc:
+            if self._is_missing_object(exc):
+                return None
+            raise
+
+    def _load_ownership_key(
+        self, key: str, *, expected_thread_key: str | None = None
+    ) -> _WorkspaceOwnership:
+        payload = b"".join(self.preparer.objects.get_stream(key))
+        if len(payload) > 64 * 1024:
+            raise WorkspacePreparationError(
+                "ownership-ledger", "private workspace ownership record is oversized"
+            )
+        return _WorkspaceOwnership.decode(payload, expected_thread_key=expected_thread_key)
+
+    def _cleanup_stale(self, ownership: _WorkspaceOwnership) -> None:
+        remaining: list[str] = []
+        for key in ownership.stale_object_keys:
+            try:
+                self.preparer.objects.delete(key)
+            except Exception:
+                remaining.append(key)
+        if tuple(remaining) != ownership.stale_object_keys:
+            self._store_ownership(
+                _WorkspaceOwnership(
+                    thread_key=ownership.thread_key,
+                    prepared=ownership.prepared,
+                    expires_at_epoch=ownership.expires_at_epoch,
+                    stale_object_keys=tuple(remaining),
+                )
+            )
+
+    def _delete_owned_objects(self, ownership: _WorkspaceOwnership) -> list[str]:
+        keys = (ownership.prepared.object_key, *ownership.stale_object_keys)
+        deleted: list[str] = []
+        for key in dict.fromkeys(keys):
+            self.preparer.objects.delete(key)
+            deleted.append(key)
+        return deleted
+
+    @staticmethod
+    def _is_missing_object(exc: Exception) -> bool:
+        if isinstance(exc, (KeyError, FileNotFoundError)):
+            return True
+        response = getattr(exc, "response", None)
+        if not isinstance(response, Mapping):
+            return False
+        error = response.get("Error")
+        code = error.get("Code") if isinstance(error, Mapping) else None
+        return str(code) in {"404", "NoSuchKey", "NotFound"}

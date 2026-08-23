@@ -306,19 +306,24 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         bucket=config.workspace_bucket,
         prefix=config.workspace_object_prefix,
     )
-    workspace = WorkspaceClaimCoordinator(
-        preparer=WorkspacePreparer(
-            credentials=WorkspaceCredentialClient(
-                api_url=config.api_base_url,
-                worker_token=config.internal_worker_token,
+    workspace = (
+        WorkspaceClaimCoordinator(
+            preparer=WorkspacePreparer(
+                credentials=WorkspaceCredentialClient(
+                    api_url=config.api_base_url,
+                    worker_token=config.internal_worker_token,
+                ),
+                commands=SubprocessCommands(),
+                objects=workspace_objects,
+                scratch_root=Path(config.workspace_scratch_root),
+                limits=_workspace_limits(config),
             ),
-            commands=SubprocessCommands(),
-            objects=workspace_objects,
-            scratch_root=Path(config.workspace_scratch_root),
-            limits=_workspace_limits(config),
-        ),
-        substrate=substrate,
-        suspended_error=SuspendedThreadError,
+            substrate=substrate,
+            suspended_error=SuspendedThreadError,
+            ownership_ttl_seconds=sub_config.route_ttl_seconds,
+        )
+        if config.workspace_enabled
+        else None
     )
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
@@ -330,6 +335,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         worker_token=config.internal_worker_token,
     )
     sink = build_reply_sink(config)
+    card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
         substrate=substrate,
         runner=runner,
@@ -349,14 +355,18 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         # refusal in the kernel before either durable row is created.
         publication_creator=(
             approval_client
-            if env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() == "kubernetes"
+            if config.publication_enabled
+            and env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
+            == "kubernetes"
             else None
         ),
         # The same client, handed in twice under the two roles the kernel needs
         # (#1084). Two parameters rather than one so a test can fake the create
         # half without also implementing a read it never exercises.
         approval_reader=approval_client,
-        card_store=ApprovalCardStore(async_redis, config),
+        card_store=card_store,
+        route_ttl_seconds=sub_config.route_ttl_seconds,
+        suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
     )
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
@@ -394,7 +404,14 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         ),
         repo_lookup=binding,
     )
-    publication_loop = _build_publication_loop(config, env, engine, sink, eval_http)
+    publication_loop = _build_publication_loop(
+        config,
+        env,
+        engine,
+        sink,
+        eval_http,
+        card_store,
+    )
     return Runtime(
         consumer=consumer,
         killswitch=killswitch,
@@ -481,18 +498,23 @@ def _build_publication_loop(
     engine: AsyncEngine,
     sink: ReplySinkRouter,
     http: httpx.AsyncClient,
+    card_store: ApprovalCardStore,
 ) -> PublicationReconcileLoop | None:
     """Build the worker-owned Kubernetes publication lane, never a local twin."""
 
-    if env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower() != "kubernetes":
+    if not config.publication_enabled or env.get(
+        "CURIE_SANDBOX_SUBSTRATE", "kubernetes"
+    ).lower() != "kubernetes":
         return None
-    namespace = env.get("CURIE_NAMESPACE", "default")
+    namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
     store = PostgresPublicationStore(
         engine,
         schema=config.db_schema,
         lease_owner=config.consumer_name,
         lease_seconds=config.publication_lease_seconds,
+        result_max_attempts=config.publication_result_max_attempts,
+        reconcile_max_attempts=config.publication_reconcile_max_attempts,
     )
     reconciler = PublicationReconciler(
         store=store,
@@ -504,6 +526,7 @@ def _build_publication_loop(
         cluster=cluster,
         github=GitHubPublicationLookup(http),
         replies=sink,
+        card_store=card_store,
         job_settings=PublicationJobSettings(
             namespace=namespace,
             runner_image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
@@ -514,6 +537,11 @@ def _build_publication_loop(
             owner_name=config.publication_owner_name,
             git_user_name=config.publication_git_user_name,
             git_user_email=config.publication_git_user_email,
+            github_api_url=config.publication_github_api_url,
+            active_deadline_seconds=(
+                config.publication_job_active_deadline_seconds
+            ),
+            git_timeout_seconds=config.publication_git_command_timeout_seconds,
             cpu_request=config.publication_cpu_request,
             cpu_limit=config.publication_cpu_limit,
             memory_request=config.publication_memory_request,

@@ -76,21 +76,38 @@ def test_gate_e2e_ends_awaiting_approval_through_build_runner(tmp_path) -> None:
     anyio.run(go)
 
 
-def test_empty_policy_and_env_arm_publish_on_fake_boot_path(tmp_path) -> None:
+def test_empty_policy_and_env_preserve_bypass_without_workspace_on_fake_boot_path(
+    tmp_path,
+) -> None:
     plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
     runner = build_runner(
         RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
     )
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
-    assert gate is not None
-    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+    assert gate is None
 
 
-def test_empty_policy_and_env_arm_publish_on_real_boot_path(tmp_path) -> None:
+def test_empty_policy_and_env_preserve_bypass_without_workspace_on_real_boot_path(
+    tmp_path,
+) -> None:
     plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
     runner = build_runner(
         RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=False
+    )
+
+    gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
+    assert gate is None
+
+
+def test_managed_workspace_arms_mandatory_publish_on_fake_boot_path(tmp_path) -> None:
+    plugin_dir = _write_manifest(tmp_path / "plugin", {"name": "publisher"})
+    workspace = tmp_path / "workspace"
+    (workspace / ".git").mkdir(parents=True)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)),
+        fake_model=True,
+        workspace_path=workspace,
     )
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion

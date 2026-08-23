@@ -236,6 +236,22 @@ def test_approval_server_config_shape() -> None:
     assert APPROVAL_TOOL_NAME == "mcp__curie__request_approval"
 
 
+def test_publish_tool_exists_only_for_a_managed_workspace() -> None:
+    async def names(server: object) -> set[str]:
+        handler = server["instance"].request_handlers[mcp_types.ListToolsRequest]  # type: ignore[index]
+        result = await handler(mcp_types.ListToolsRequest(method="tools/list"))
+        payload = result.model_dump()
+        return {str(item["name"]) for item in payload["tools"]}
+
+    async def go() -> None:
+        assert "publish_changes" not in await names(build_approval_server())
+        assert "publish_changes" in await names(
+            build_approval_server(managed_workspace=True)
+        )
+
+    anyio.run(go)
+
+
 # --- the permission gate (#245): canUseTool over approval-required tools --------
 
 
@@ -740,7 +756,7 @@ def test_a_bundle_cannot_hollow_out_an_operator_set_gate() -> None:
     assert gate is not None
     # Every operator name survives, whatever the bundle declared.
     assert {"Read", "Bash"} <= gate.required
-    assert gate.required == frozenset({"Read", "Bash", "Write", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Read", "Bash", "Write"})
 
 
 def test_bundle_routes_ride_the_names_the_bundle_gates() -> None:
@@ -751,7 +767,7 @@ def test_bundle_routes_ride_the_names_the_bundle_gates() -> None:
         policy_routes={"Bash": "managers"},
     )
     assert gate is not None
-    assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"Read", "Bash"})
     # `Read` is operator-set with no route: ADR-0034 channel-membership default.
     assert gate.route_by_tool == {"Bash": "managers"}
     assert gate.route_by_tool.get("Read") is None
@@ -780,18 +796,18 @@ def test_an_overlapping_bundle_route_is_logged_not_fatal(caplog) -> None:
     assert any("Bash" in r.getMessage() for r in caplog.records), caplog.text
 
 
-def test_no_declared_gate_from_either_source_still_arms_platform_publish() -> None:
-    """The platform publish member remains armed with both policy sources empty."""
+def test_no_declared_gate_without_workspace_preserves_historical_bypass() -> None:
+    """A non-workspace boot has neither a permission callback nor publish."""
 
     gate = build_approval_gate(operator_tools=None, policy_routes={})
-    assert gate is not None
-    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+    assert gate is None
 
 
 def test_publish_gate_is_an_additive_exact_platform_member() -> None:
     gate = build_approval_gate(
         operator_tools=["Read"],
         policy_routes={"Bash": "managers"},
+        managed_workspace=True,
     )
     assert gate is not None
     assert gate.required == frozenset({"Read", "Bash", PUBLISH_TOOL_NAME})
@@ -799,19 +815,54 @@ def test_publish_gate_is_an_additive_exact_platform_member() -> None:
     assert gate.route_by_tool.get(PUBLISH_TOOL_NAME) is None
 
 
+def test_bundle_cannot_attach_a_route_to_platform_publish() -> None:
+    gate = build_approval_gate(
+        operator_tools=None,
+        policy_routes={PUBLISH_TOOL_NAME: "bundle-selected-audience"},
+        managed_workspace=True,
+    )
+
+    assert gate is not None
+    assert gate.required == frozenset({PUBLISH_TOOL_NAME})
+    assert PUBLISH_TOOL_NAME not in gate.route_by_tool
+
+
 def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:
     async def go() -> None:
-        gate = build_approval_gate(operator_tools=None, policy_routes={})
+        gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
         assert gate is not None
         result = await build_can_use_tool(gate)(
             PUBLISH_TOOL_NAME,
-            {"title": "Update documentation"},
+            {"title": "  Update documentation  ", "body": "Exact body\n" * 100},
             ToolPermissionContext(),
         )
         assert isinstance(result, PermissionResultDeny)
         assert gate.pending_gate_kind == "permission"
         assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
         assert gate.pending_route is None
+        assert gate.publication_title == "Update documentation"
+        assert gate.publication_body == "Exact body\n" * 100
+
+    anyio.run(go)
+
+
+def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
+    async def go() -> None:
+        gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
+        assert gate is not None
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
+        )
+
+        assert isinstance(result, PermissionResultDeny)
+        assert "not recorded" in result.message
+        assert gate.pending_summary is None
+        assert gate.publication_title is None
+        assert gate.publication_body is None
 
     anyio.run(go)
 
@@ -822,22 +873,26 @@ def test_publish_tool_never_consumes_a_resume_grant_or_executes() -> None:
             operator_tools=None,
             policy_routes={},
             grant_tool=PUBLISH_TOOL_NAME,
+            managed_workspace=True,
         )
         assert gate is not None
-        result = await build_can_use_tool(gate)(PUBLISH_TOOL_NAME, {}, ToolPermissionContext())
+        result = await build_can_use_tool(gate)(
+            PUBLISH_TOOL_NAME, {"title": "Ship changes"}, ToolPermissionContext()
+        )
         assert isinstance(result, PermissionResultDeny)
         assert gate.grant_tool is None
         assert gate.pending_granted_tool == PUBLISH_TOOL_NAME
 
         # Bypass the permission callback and call the in-process tool directly:
         # it must still refuse, because publication belongs to the platform Job.
-        server = build_approval_server(gate)
+        server = build_approval_server(gate, managed_workspace=True)
         handler = server["instance"].request_handlers[mcp_types.CallToolRequest]
         direct = await handler(
             mcp_types.CallToolRequest(
                 method="tools/call",
                 params=mcp_types.CallToolRequestParams(
-                    name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1], arguments={}
+                    name=PUBLISH_TOOL_NAME.rsplit("__", 1)[-1],
+                    arguments={"title": "Ship changes"},
                 ),
             )
         )
@@ -2151,7 +2206,7 @@ def test_bare_non_builtin_operator_gate_warns_it_may_be_a_silent_no_op(caplog) -
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({"resolve_leak", PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({"resolve_leak"})
     assert any(
         "resolve_leak" in r.getMessage() and "mcp__" in r.getMessage() for r in caplog.records
     ), caplog.text
@@ -2203,7 +2258,7 @@ def test_real_builtin_operator_gates_do_not_warn(caplog, builtin: str) -> None:
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({builtin, PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({builtin})
     assert not any("does not match any well-known" in r.getMessage() for r in caplog.records), (
         caplog.text
     )
@@ -2234,7 +2289,7 @@ def test_cli_alias_operator_gates_still_warn(caplog, alias: str) -> None:
             mcp_servers={"revenue-leak-engine"},
         )
     assert gate is not None
-    assert gate.required == frozenset({alias, PUBLISH_TOOL_NAME})
+    assert gate.required == frozenset({alias})
     assert any("does not match any well-known" in r.getMessage() for r in caplog.records), (
         caplog.text
     )
@@ -2398,7 +2453,7 @@ def test_operator_gate_on_a_connector_tool_arms_the_bare_name(tmp_path) -> None:
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({_K8S_TOOL, PUBLISH_TOOL_NAME})
+        assert gate.required == frozenset({_K8S_TOOL})
         result = await build_can_use_tool(gate)(
             _K8S_TOOL, {"manifest": "..."}, ToolPermissionContext()
         )
@@ -2457,7 +2512,7 @@ def test_connector_does_not_shadow_a_plugin_server_it_prefixes(tmp_path) -> None
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({live, "mcp__git__hub__create_pr", PUBLISH_TOOL_NAME})
+        assert gate.required == frozenset({live, "mcp__git__hub__create_pr"})
         result = await build_can_use_tool(gate)(live, {"title": "..."}, ToolPermissionContext())
         assert isinstance(result, PermissionResultDeny)
 
@@ -2533,7 +2588,7 @@ def test_connector_gate_on_a_connector_tool_still_denies_alongside_a_prefixed_se
             connector_servers=resolution.connector_servers,
         )
         assert gate is not None
-        assert gate.required == frozenset({"mcp__git__status", PUBLISH_TOOL_NAME})
+        assert gate.required == frozenset({"mcp__git__status"})
         result = await build_can_use_tool(gate)(
             "mcp__git__status", {"manifest": "..."}, ToolPermissionContext()
         )

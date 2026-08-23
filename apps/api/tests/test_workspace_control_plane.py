@@ -200,7 +200,11 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
     refused = worker_client.post(url, headers=auth_headers)
     assert refused.status_code == 401
     assert refused.headers["cache-control"] == "no-store"
+    assert "internal worker token" in refused.json()["detail"]
     assert "ghp_operator_workspace" not in refused.text
+    # Unauthenticated internet traffic is bounded to the 401 response and
+    # access log; it cannot grow the durable credential audit table.
+    assert _audit_rows() == []
 
     issued = worker_client.post(
         url,
@@ -220,7 +224,6 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
 
     rows = _audit_rows()
     assert [(row["purpose"], row["outcome"]) for row in rows] == [
-        ("workspace_clone", "refused"),
         ("workspace_clone", "issued"),
     ]
     assert all(str(row["deployment_id"]) == deployment["id"] for row in rows)

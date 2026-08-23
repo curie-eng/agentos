@@ -160,6 +160,10 @@ class _StreamingObjectStore:
         self.deleted.append(key)
         self.objects.pop(key, None)
 
+    def list_keys(self, prefix: str) -> Iterator[str]:
+        needle = f"{prefix.strip('/')}/"
+        yield from sorted(key for key in self.objects if key.startswith(needle))
+
 
 def _limits(workspace: Any, **overrides: Any) -> Any:
     values = {
@@ -331,19 +335,12 @@ def test_workspace_upload_is_streamed_and_reference_is_one_object_and_short_live
     assert "credential" not in decoded.url
 
 
-def test_worker_rehashes_private_object_before_any_claim(workspace: Any, tmp_path: Path) -> None:
+def test_worker_rehashes_private_object_before_delivery(workspace: Any, tmp_path: Path) -> None:
     preparer, _, objects = _preparer(workspace, tmp_path)
     prepared = _prepare(preparer)
     objects.objects[prepared.object_key] += b"tampered"
-    substrate = _RecordingSubstrate()
-    coordinator = workspace.WorkspaceClaimCoordinator(preparer=preparer, substrate=substrate)
-
     with pytest.raises(workspace.WorkspacePreparationError, match="digest"):
-        coordinator.claim_prepared(
-            thread_key="1700000000.000100", prepared=prepared, env={"CURIE_BUNDLE_REF": "b"}
-        )
-
-    assert substrate.calls == []
+        preparer.verify(prepared)
 
 
 def _tar_with_member(name: str, *, kind: str = "file", data: bytes = b"x") -> bytes:
@@ -375,17 +372,8 @@ def _tar_with_member(name: str, *, kind: str = "file", data: bytes = b"x") -> by
 def test_hostile_workspace_archive_is_rejected_before_init(
     workspace: Any, payload: bytes, reason: str
 ) -> None:
-    init_calls: list[bytes] = []
-
-    def start_init(data: bytes) -> None:
-        init_calls.append(data)
-
     with pytest.raises(workspace.WorkspaceArchiveError, match=reason):
-        workspace.validate_then_deliver_archive(
-            iter([payload]), limits=_limits(workspace), start_init=start_init
-        )
-
-    assert init_calls == []
+        workspace.validate_workspace_archive(iter([payload]), limits=_limits(workspace))
 
 
 def test_workspace_missing_git_fails_loudly_at_git_preflight(
@@ -531,18 +519,31 @@ def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_ob
 ) -> None:
     preparer, _, objects = _preparer(workspace, tmp_path)
     substrate = _RecordingSubstrate()
-    coordinator = workspace.WorkspaceClaimCoordinator(preparer=preparer, substrate=substrate)
+    class Suspended(Exception):
+        pass
 
-    first = coordinator.claim(
+    original_claim = substrate.claim
+
+    def claim(thread_key: str, *, env: dict[str, str] | None = None) -> object:
+        if substrate.calls:
+            raise Suspended(thread_key)
+        return original_claim(thread_key, env=env)
+
+    substrate.claim = claim  # type: ignore[method-assign]
+    coordinator = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer, substrate=substrate, suspended_error=Suspended
+    )
+
+    first = coordinator.claim_or_resume_with_handle(
         thread_key="1700000000.000100",
         deployment_id=DEPLOYMENT_ID,
         env={"CURIE_BUNDLE_REF": "bundles/first"},
-    )
-    second = coordinator.resume(
+    ).prepared
+    second = coordinator.claim_or_resume_with_handle(
         thread_key="1700000000.000100",
         deployment_id=DEPLOYMENT_ID,
         env={"CURIE_BUNDLE_REF": "bundles/first"},
-    )
+    ).prepared
 
     first_env = substrate.calls[0][2]
     second_env = substrate.calls[1][2]
@@ -551,6 +552,95 @@ def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_ob
     assert first.object_key != second.object_key
     assert first.object_key in objects.deleted
     assert second.object_key in objects.objects
+
+
+def test_workspace_ownership_survives_worker_restart_and_release(
+    workspace: Any, tmp_path: Path
+) -> None:
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    first_process = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1000.0,
+    )
+    prepared = first_process.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=60,
+        wall_clock=lambda: 1001.0,
+    )
+
+    assert restarted.current(thread_key) == prepared
+    restarted.release(thread_key)
+    assert prepared.object_key not in objects.objects
+    assert restarted.current(thread_key) is None
+
+
+def test_expired_workspace_ownership_is_reaped_after_restart(
+    workspace: Any, tmp_path: Path
+) -> None:
+    now = [1000.0]
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    first_process = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+    prepared = first_process.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    now[0] = 1011.0
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+
+    assert restarted.reap_expired() == [prepared.object_key]
+    assert prepared.object_key not in objects.objects
+    assert restarted.current(thread_key) is None
+
+
+def test_workspace_ownership_touch_extends_affinity_lease_across_restart(
+    workspace: Any, tmp_path: Path
+) -> None:
+    now = [1000.0]
+    preparer, _, objects = _preparer(workspace, tmp_path)
+    thread_key = "1700000000.000100"
+    first_process = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+    prepared = first_process.claim_or_resume_with_handle(
+        thread_key=thread_key,
+        deployment_id=DEPLOYMENT_ID,
+    ).prepared
+    now[0] = 1008.0
+    assert first_process.touch(thread_key, ttl_seconds=10)
+    now[0] = 1011.0
+
+    restarted = workspace.WorkspaceClaimCoordinator(
+        preparer=preparer,
+        substrate=_RecordingSubstrate(),
+        ownership_ttl_seconds=10,
+        wall_clock=lambda: now[0],
+    )
+    assert restarted.reap_expired() == []
+    assert restarted.current(thread_key) == prepared
+    assert prepared.object_key in objects.objects
 
 
 def test_runner_claim_never_starts_until_workspace_preparation_and_verification_succeed(
@@ -563,7 +653,7 @@ def test_runner_claim_never_starts_until_workspace_preparation_and_verification_
     coordinator = workspace.WorkspaceClaimCoordinator(preparer=preparer, substrate=substrate)
 
     with pytest.raises(workspace.WorkspaceStageTimeout):
-        coordinator.claim(
+        coordinator.claim_or_resume_with_handle(
             thread_key="1700000000.000100",
             deployment_id=DEPLOYMENT_ID,
             env={"CURIE_BUNDLE_REF": "bundles/first"},

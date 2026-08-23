@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 import aiohttp
@@ -120,6 +121,28 @@ def _is_publish_provenance(gate_kind: str | None, granted_tool: str | None) -> b
     """Require both trusted runner-held publication provenance fields."""
 
     return (gate_kind, granted_tool) == _PUBLISH_PROVENANCE
+
+
+def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
+    """Build approval text from validated facts, labeling requester prose."""
+
+    visible_paths = list(snapshot.changed_paths[:20])
+    path_list = ", ".join(visible_paths)
+    if len(snapshot.changed_paths) > len(visible_paths):
+        path_list += f", and {len(snapshot.changed_paths) - len(visible_paths)} more"
+    workflow_warning = (
+        " WARNING: this patch changes GitHub workflow files."
+        if any(path.startswith(".github/workflows/") for path in snapshot.changed_paths)
+        else " No GitHub workflow files are changed."
+    )
+    requester_title = " ".join(snapshot.publication_title.split())[:256]
+    requester_body = " ".join(snapshot.publication_body.split())[:500]
+    return (
+        f"Publish {snapshot.repo_full_name} from {snapshot.base_sha[:12]} with "
+        f"{len(snapshot.changed_paths)} changed path(s): {path_list}."
+        f"{workflow_warning} Requester-provided title: {requester_title}. "
+        f"Requester-provided description: {requester_body}"
+    )
 
 
 def _target_for(qevent: QueuedTurn) -> ReplyTarget:
@@ -471,6 +494,8 @@ class Kernel:
         # ``ApprovalClient``.
         approval_reader: ApprovalReader | None = None,
         card_store: ApprovalCardStore | None = None,
+        route_ttl_seconds: int = 3600,
+        suspended_route_ttl_seconds: int = 86400,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -498,6 +523,8 @@ class Kernel:
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
+        self._route_ttl_seconds = route_ttl_seconds
+        self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -899,7 +926,10 @@ class Kernel:
 
     async def reap_orphans(self) -> list[str]:
         """Periodic tick: delete substrate claims no live route references."""
-        return await asyncio.to_thread(self._substrate.reap_orphans)
+        reaped = await asyncio.to_thread(self._substrate.reap_orphans)
+        if self._workspace is not None:
+            await asyncio.to_thread(self._workspace.reap_expired)
+        return reaped
 
     async def interrupt_thread(self, thread_key: str, reason: str) -> bool:
         """Hard-stop the thread's live turn. True if a live runner was signalled."""
@@ -1522,6 +1552,11 @@ class Kernel:
                         self._workspace,
                         thread_key=thread,
                         snapshot=snapshot,
+                        max_patch_bytes=self._config.publication_patch_max_bytes,
+                        scratch_root=Path(self._config.workspace_scratch_root),
+                        git_timeout_seconds=(
+                            self._config.publication_git_command_timeout_seconds
+                        ),
                     )
                     outcome.publication_snapshot = snapshot
                 except (
@@ -1652,27 +1687,35 @@ class Kernel:
         # this check would clone on every threaded steer and could even replace
         # the base object while the existing sandbox is still using it.
         if workspace_deployment_id is not None:
-            existing = await asyncio.to_thread(self._substrate.lookup, thread)
-            if existing is not None:
-                return await asyncio.to_thread(self._substrate.claim, thread, env=boot_env)
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted preparer"
                 )
+            existing = await asyncio.to_thread(self._substrate.lookup, thread)
+            if existing is not None:
+                existing_handle = await asyncio.to_thread(
+                    self._substrate.claim, thread, env=boot_env
+                )
+                await asyncio.to_thread(
+                    self._workspace.touch,
+                    thread,
+                    ttl_seconds=self._route_ttl_seconds,
+                )
+                return existing_handle
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
-            claimed = await asyncio.to_thread(
+            workspace_claim = await asyncio.to_thread(
                 self._workspace.claim_or_resume_with_handle,
                 thread_key=thread,
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
             )
-            if not isinstance(claimed.handle, SandboxHandle):
+            if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
                     "claim", "workspace substrate returned an invalid sandbox handle"
                 )
-            return claimed.handle
+            return workspace_claim.handle
         try:
             return await asyncio.to_thread(self._substrate.claim, thread, env=boot_env)
         except SuspendedThreadError:
@@ -2014,6 +2057,7 @@ class Kernel:
                     raise ApprovalBackendError(
                         "publication requires a deployment-managed repository workspace"
                     )
+                summary = _publication_approval_summary(snapshot)
                 published = await publication_creator.create_publication(
                     PublicationCreateRequest(
                         deployment_id=deployment_id,
@@ -2030,6 +2074,9 @@ class Kernel:
                         patch=snapshot.patch,
                         changed_paths=snapshot.changed_paths,
                         expires_in_seconds=_PUBLICATION_EXPIRES_IN_SECONDS,
+                        title=snapshot.publication_title,
+                        body=snapshot.publication_body,
+                        max_patch_bytes=self._config.publication_patch_max_bytes,
                     )
                 )
                 created = CreatedApproval(
@@ -2098,6 +2145,12 @@ class Kernel:
                     exc,
                 )
 
+        if self._workspace is not None:
+            await asyncio.to_thread(
+                self._workspace.touch,
+                thread,
+                ttl_seconds=self._suspended_route_ttl_seconds,
+            )
         try:
             await asyncio.to_thread(self._substrate.suspend, thread, history_ref=None)
         except SandboxError as exc:

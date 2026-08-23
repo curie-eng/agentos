@@ -214,6 +214,20 @@ class Settings(BaseSettings):
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).
     approval_sweep_interval_s: float = 30.0
+    # Publication patches are private control-plane inputs. The ingress bound
+    # and terminal retention are operator-owned, and the periodic approval
+    # sweeper also reaps terminal bytes after this retention window.
+    publication_patch_max_bytes: int = Field(
+        default=900_000,
+        gt=0,
+        le=900_000,
+        validation_alias="CURIE_PUBLICATION_PATCH_MAX_BYTES",
+    )
+    publication_patch_retention_seconds: int = Field(
+        default=3600,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RETENTION_SECONDS",
+    )
 
     # Resume reconciler (#411): the backstop that re-enqueues resume turns for
     # resolved approvals whose inline enqueue failed. enabled is the off-switch

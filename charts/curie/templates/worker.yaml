@@ -46,19 +46,6 @@ rules:
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
     verbs: ["get", "patch"]
-{{- if .Values.worker.publication.enabled }}
-  # Approval-gated publication objects. Deliberately no pods/exec: the worker
-  # can observe the URL marker but cannot enter either a sandbox or Job pod.
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "get", "delete"]
-  - apiGroups: [""]
-    resources: ["configmaps", "secrets"]
-    verbs: ["create", "get", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
-{{- end }}
 {{- if .Values.worker.connectorReconciler.enabled }}
 {{/*
 ADR-0090: the connector reconciler converges each agent's connector objects
@@ -178,6 +165,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: internalWorkerToken
+            - name: CURIE_WORKSPACE_ENABLED
+              value: {{ .Values.agentSandbox.runner.workspace.enabled | quote }}
             - name: CURIE_WORKSPACE_MAX_CONCURRENT_CLONES
               value: {{ .Values.worker.workspace.maxConcurrentClones | quote }}
             - name: CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS
@@ -202,6 +191,22 @@ spec:
               value: {{ .Values.worker.workspace.bucket | quote }}
             - name: CURIE_WORKSPACE_SCRATCH_ROOT
               value: {{ .Values.worker.workspace.mountPath | quote }}
+            - name: CURIE_PUBLICATION_ENABLED
+              value: {{ .Values.worker.publication.enabled | quote }}
+            - name: CURIE_PUBLICATION_NAMESPACE
+              value: {{ include "curie.publicationNamespace" . | quote }}
+            - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
+              value: {{ .Values.worker.publication.patchMaxBytes | quote }}
+            - name: CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS
+              value: {{ .Values.worker.publication.resultMaxAttempts | quote }}
+            - name: CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS
+              value: {{ .Values.worker.publication.reconcileMaxAttempts | quote }}
+            - name: CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS
+              value: {{ .Values.worker.publication.jobActiveDeadlineSeconds | quote }}
+            - name: CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS
+              value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
+            - name: CURIE_PUBLICATION_GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | quote }}
             - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
             - name: CURIE_PUBLICATION_LEASE_SECONDS

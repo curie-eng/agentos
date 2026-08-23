@@ -5,15 +5,13 @@ GitHub side effects belong to the trusted worker publication reconciler.
 """
 
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from .. import crud
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
-    verify_internal_worker_token,
 )
 from ..config import get_settings
 from ..deps import SessionDep
@@ -28,9 +26,6 @@ router = APIRouter(
 internal_router = APIRouter(
     prefix="/v1/internal/publications", tags=["internal-publications"]
 )
-
-PATCH_LIMIT_BYTES = 900_000
-
 
 @internal_router.post(
     "",
@@ -47,10 +42,11 @@ async def create_publication(
         patch = data.decoded_patch()
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    if len(patch) > PATCH_LIMIT_BYTES:
+    patch_limit_bytes = get_settings().publication_patch_max_bytes
+    if len(patch) > patch_limit_bytes:
         raise HTTPException(
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            f"publication patch exceeds the {PATCH_LIMIT_BYTES}-byte limit",
+            f"publication patch exceeds the {patch_limit_bytes}-byte limit",
         )
     try:
         publication, created = await crud.create_publication(session, data, patch=patch)
@@ -84,33 +80,10 @@ async def get_publication(
     return PublicationOut.model_validate(publication)
 
 
-async def _require_publication_credential_worker(
-    publication_id: uuid.UUID,
-    session: SessionDep,
-    x_curie_worker_token: Annotated[
-        str | None, Header(alias="X-Curie-Worker-Token")
-    ] = None,
-) -> None:
-    if verify_internal_worker_token(x_curie_worker_token):
-        return
-    publication = await crud.get_publication(session, publication_id)
-    repo = publication.repo_full_name if publication is not None else None
-    await crud.append_credential_redemption_audit(
-        session,
-        purpose="publication_push",
-        outcome="refused",
-        deployment_id=publication.deployment_id if publication is not None else None,
-        publication_id=publication.id if publication is not None else None,
-        repo_full_name=repo,
-        detail="missing or invalid internal worker token",
-    )
-    await require_internal_worker_token(x_curie_worker_token)
-
-
 @internal_router.post(
     "/{publication_id}/credential",
     response_model=RepositoryCredentialOut,
-    dependencies=[Depends(_require_publication_credential_worker)],
+    dependencies=[Depends(require_internal_worker_token)],
 )
 async def redeem_publication_credential(
     publication_id: uuid.UUID,

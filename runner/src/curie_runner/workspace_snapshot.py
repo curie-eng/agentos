@@ -34,6 +34,8 @@ class WorkspaceSnapshot:
     patch: bytes
     changed_paths: tuple[str, ...]
     contains_workflow_files: bool
+    publication_title: str | None = None
+    publication_body: str | None = None
 
     def to_json(self) -> dict[str, object]:
         """Return the JSON boundary form; raw binary is never interpolated."""
@@ -45,6 +47,8 @@ class WorkspaceSnapshot:
             "changed_paths": list(self.changed_paths),
             "contains_workflow_files": self.contains_workflow_files,
             "patch_size_bytes": len(self.patch),
+            "publication_title": self.publication_title,
+            "publication_body": self.publication_body,
         }
 
 
@@ -56,19 +60,63 @@ def enforce_patch_cap(patch: bytes) -> bytes:
     return patch
 
 
-def _safe_path(raw: str) -> str:
-    path = raw.removeprefix("a/").removeprefix("b/")
-    pure = PurePosixPath(path)
+def _safe_repository_path(raw: str) -> str:
+    """Validate a repository-relative path without rewriting its first component."""
+
+    pure = PurePosixPath(raw)
     if (
-        not path
-        or path.startswith("/")
-        or "\\" in path
+        not raw
+        or raw.startswith("/")
+        or "\\" in raw
         or pure.is_absolute()
         or any(part in ("", ".", "..") for part in pure.parts)
         or pure.parts[0] == ".git"
     ):
         raise WorkspaceSnapshotError(f"unsafe patch path {raw!r}")
     return pure.as_posix()
+
+
+def _safe_diff_path(raw: str, *, prefix: str) -> str:
+    expected = f"{prefix}/"
+    if not raw.startswith(expected):
+        raise WorkspaceSnapshotError(f"patch header path lacks {expected!r} prefix")
+    return _safe_repository_path(raw[len(expected) :])
+
+
+def _diff_header_paths(line: str) -> tuple[str, str]:
+    payload = line.removeprefix("diff --git ")
+    if payload.startswith(('"', "'")):
+        try:
+            parts = shlex.split(payload)
+        except ValueError as exc:
+            raise WorkspaceSnapshotError("malformed git patch header") from exc
+        if len(parts) != 2:
+            raise WorkspaceSnapshotError("malformed git patch header")
+        return parts[0], parts[1]
+
+    # Git does not quote ordinary spaces in diff --git headers. Enumerate the
+    # known ` b/` boundary and accept it only when it gives one unambiguous pair
+    # of safe a/ and b/ paths. This preserves names such as `a/read me.md`
+    # without weakening traversal or metadata checks.
+    candidates: list[tuple[str, str]] = []
+    offset = 0
+    while True:
+        boundary = payload.find(" b/", offset)
+        if boundary < 0:
+            break
+        left = payload[:boundary]
+        right = payload[boundary + 1 :]
+        try:
+            _safe_diff_path(left, prefix="a")
+            _safe_diff_path(right, prefix="b")
+        except WorkspaceSnapshotError:
+            pass
+        else:
+            candidates.append((left, right))
+        offset = boundary + 1
+    if len(candidates) != 1:
+        raise WorkspaceSnapshotError("malformed or ambiguous git patch header")
+    return candidates[0]
 
 
 def validate_patch(patch: bytes) -> bytes:
@@ -80,15 +128,9 @@ def validate_patch(patch: bytes) -> bytes:
     for line in text.splitlines():
         if line.startswith("diff --git "):
             saw_header = True
-            try:
-                parts = shlex.split(line.removeprefix("diff --git "))
-                if len(parts) != 2:
-                    raise ValueError("expected two paths")
-                left, right = parts
-            except ValueError as exc:
-                raise WorkspaceSnapshotError("malformed git patch header") from exc
-            _safe_path(left)
-            _safe_path(right)
+            left, right = _diff_header_paths(line)
+            _safe_diff_path(left, prefix="a")
+            _safe_diff_path(right, prefix="b")
         if line.startswith(("new file mode ", "old mode ", "new mode ")):
             mode = line.rsplit(" ", 1)[-1]
             if mode not in {"100644", "100755"}:
@@ -160,7 +202,7 @@ def _changed_paths(repo: Path) -> tuple[str, ...]:
             raw = item.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise WorkspaceSnapshotError("workspace contains a non-UTF-8 path") from exc
-        safe = _safe_path(raw)
+        safe = _safe_repository_path(raw)
         candidate = repo / safe
         try:
             mode = candidate.lstat().st_mode
@@ -194,13 +236,16 @@ def _untracked_patch(repo: Path, paths: tuple[str, ...]) -> bytes:
         if result.returncode not in (0, 1):
             diagnostic = result.stderr.decode("utf-8", errors="replace").strip()
             raise WorkspaceSnapshotError(f"git could not capture untracked path: {diagnostic}")
-        chunk = result.stdout.replace(f" b/{path}".encode(), f" b/{path}".encode())
-        chunks.append(chunk)
+        chunks.append(result.stdout)
     return b"".join(chunks)
 
 
 def capture_workspace_snapshot(
-    workspace: str | Path = "/workspace", *, expected_repo: str | None = None
+    workspace: str | Path = "/workspace",
+    *,
+    expected_repo: str | None = None,
+    publication_title: str | None = None,
+    publication_body: str | None = None,
 ) -> WorkspaceSnapshot:
     repo = Path(workspace)
     if not repo.is_dir():
@@ -234,4 +279,6 @@ def capture_workspace_snapshot(
         contains_workflow_files=any(
             path.startswith(".github/workflows/") for path in changed_paths
         ),
+        publication_title=publication_title,
+        publication_body=publication_body,
     )

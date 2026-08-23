@@ -64,6 +64,8 @@ class RunnerWorkspaceSnapshot:
     patch: bytes
     changed_paths: tuple[str, ...]
     contains_workflow_files: bool
+    publication_title: str
+    publication_body: str
 
 
 class TurnStream:
@@ -208,12 +210,24 @@ class RunnerClient:
                     isinstance(path, str) and path for path in paths
                 ):
                     raise TypeError("changed_paths is not a string list")
+                title = body["publication_title"]
+                description = body["publication_body"]
+                if not isinstance(title, str) or not title.strip() or len(title) > 256:
+                    raise TypeError("publication_title is not a bounded non-empty string")
+                if (
+                    not isinstance(description, str)
+                    or not description.strip()
+                    or len(description) > 65_536
+                ):
+                    raise TypeError("publication_body is not a bounded non-empty string")
                 return RunnerWorkspaceSnapshot(
                     repo_full_name=str(body["repo_full_name"]),
                     base_sha=str(body["base_sha"]),
                     patch=patch,
                     changed_paths=tuple(paths),
                     contains_workflow_files=bool(body["contains_workflow_files"]),
+                    publication_title=title,
+                    publication_body=description,
                 )
             except (KeyError, TypeError, ValueError, binascii.Error) as exc:
                 raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc

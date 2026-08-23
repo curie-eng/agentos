@@ -885,8 +885,24 @@ etcd entirely, as below.
 
 ### The GitHub App private key
 
-This is the most sensitive value the chart handles: it can mint read tokens for
-every repository the App is installed on. Two ways to supply it.
+This is the most sensitive value the chart handles: it can mint tokens carrying
+the App's configured permissions for every repository where it is installed.
+Two ways to supply it.
+
+Managed repository workspaces need App **Contents: Read** permission. Approval-
+gated publication additionally needs **Contents: Read and write** and **Pull
+requests: Read and write**. Curie prefers a repository-scoped installation token
+when the App is configured and falls back to `api.githubToken`; neither
+credential is mounted into a sandbox. Publication Jobs run in the dedicated
+namespace named by `worker.publication.namespace` (release-scoped when empty).
+For a private runner image, create the referenced image pull Secret in that
+namespace separately; the chart deliberately does not copy the platform Secret.
+
+Deployment workspace selection is tri-state: `curie ... deploy --workspace
+owner/repository` enables or replaces it, `--no-workspace` explicitly disables
+it, and omitting both carries the active deployment's value forward. The API
+accepts only the repository already bound to the agent, so this cannot redirect
+the operator credential to an arbitrary repository.
 
 **Recommended — a Secret you manage.** The chart only references it, so the key
 never passes through helm values and never lands in release history (helm

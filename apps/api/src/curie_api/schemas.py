@@ -1095,7 +1095,12 @@ class PublicationCreate(BaseModel):
     title: str | None = None
     body: str | None = None
 
-    _check_base_sha = field_validator("base_sha")(_validate_optional_commit_sha)
+    @field_validator("base_sha")
+    @classmethod
+    def _full_base_sha(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("base_sha must be one full 40-character hexadecimal commit id")
+        return value.lower()
 
     @model_validator(mode="after")
     def _valid_reply_route(self) -> "PublicationCreate":

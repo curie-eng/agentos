@@ -64,6 +64,14 @@ def upgrade() -> None:
         sa.Column("lease_expires_at", sa.DateTime(), nullable=True),
         sa.Column("result_url", sa.String(), nullable=True),
         sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("result_reported_at", sa.DateTime(), nullable=True),
+        sa.Column(
+            "result_delivery_attempts", sa.Integer(), server_default="0", nullable=False
+        ),
+        sa.Column("result_delivery_error", sa.Text(), nullable=True),
+        sa.Column("result_delivery_dead_lettered_at", sa.DateTime(), nullable=True),
+        sa.Column("reconcile_attempts", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("reconcile_dead_lettered_at", sa.DateTime(), nullable=True),
         sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
         sa.Column("terminal_at", sa.DateTime(), nullable=True),
@@ -73,6 +81,13 @@ def upgrade() -> None:
             name="publications_status_ck",
         ),
         sa.CheckConstraint("version >= 1", name="publications_version_ck"),
+        sa.CheckConstraint(
+            "result_delivery_attempts >= 0",
+            name="publications_result_delivery_attempts_ck",
+        ),
+        sa.CheckConstraint(
+            "reconcile_attempts >= 0", name="publications_reconcile_attempts_ck"
+        ),
         sa.CheckConstraint(
             "octet_length(patch_bytes) <= 900000",
             name="publications_patch_size_ck",
@@ -91,6 +106,18 @@ def upgrade() -> None:
         "ix_publications_status_lease",
         "publications",
         ["status", "lease_expires_at"],
+        schema=SCHEMA,
+    )
+    op.create_index(
+        "ix_publications_deployment_id",
+        "publications",
+        ["deployment_id"],
+        schema=SCHEMA,
+    )
+    op.create_index(
+        "ix_publications_result_delivery",
+        "publications",
+        ["result_reported_at", "result_delivery_dead_lettered_at", "lease_expires_at"],
         schema=SCHEMA,
     )
 

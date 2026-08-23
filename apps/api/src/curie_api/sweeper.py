@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -153,6 +153,8 @@ async def run_expiry_sweeper(
     resume_queue: ResumeQueue,
     interval_s: float,
     stop: asyncio.Event,
+    *,
+    publication_patch_retention_seconds: int = 3600,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
 
@@ -179,5 +181,11 @@ async def run_expiry_sweeper(
         try:
             async with sessionmaker() as session:
                 await sweep_expired_approvals(session, resume_queue)
+                await crud.reap_terminal_publication_patches(
+                    session,
+                    terminal_before=datetime.now(UTC).replace(tzinfo=None)
+                    - timedelta(seconds=publication_patch_retention_seconds),
+                    limit=100,
+                )
         except Exception:
             logger.exception("expiry sweep pass failed; retrying next interval")

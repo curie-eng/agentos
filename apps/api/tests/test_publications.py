@@ -545,6 +545,15 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
     platform_key = client.post(url, headers=auth_headers)
     assert platform_key.status_code == 401
     assert platform_key.headers["cache-control"] == "no-store"
+    assert "internal worker token" in platform_key.json()["detail"]
+    # The authenticated pending-state refusal above is auditable. The
+    # unauthenticated probe is bounded to its 401/access log and adds no row.
+    audit_after_unauthenticated = _rows(
+        "SELECT outcome FROM curie.credential_redemption_audit_entries "
+        "WHERE publication_id = :id ORDER BY created_at, id",
+        {"id": publication["id"]},
+    )
+    assert audit_after_unauthenticated == [{"outcome": "refused"}]
 
     approved = _resolve(client, auth_headers, publication["approval_id"])
     assert approved.status_code == 200, approved.text
@@ -568,7 +577,7 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
         "WHERE publication_id = :id ORDER BY created_at, id",
         {"id": publication["id"]},
     )
-    assert [row["outcome"] for row in audit] == ["refused", "refused", "issued"]
+    assert [row["outcome"] for row in audit] == ["refused", "issued"]
     assert all(row["purpose"] == "publication_push" for row in audit)
     assert all(str(row["publication_id"]) == publication["id"] for row in audit)
     assert all(str(row["deployment_id"]) == deployment["id"] for row in audit)
