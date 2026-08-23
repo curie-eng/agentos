@@ -23,9 +23,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-import httpx
 from aci_protocol import QueuedTurn, ReplyHandle, TurnSource
-from curie_telemetry import set_turn_identity
+from curie_telemetry import emit_log_event
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
 from slack_bolt import App
 from slack_sdk.web import WebClient
@@ -99,62 +98,6 @@ def _producer_span(
             raise
         else:
             span.set_status(Status(StatusCode.OK))
-
-
-def _stamp_agent_identity_after_enqueue(
-    *,
-    span: Span | None,
-    config: DispatcherConfig,
-    channel: str,
-    conversation_id: str,
-    user_id: str,
-    logger: logging.Logger,
-) -> None:
-    """Resolve the incumbent identity after XADD, bounded and fail open."""
-
-    if span is None or not span.is_recording():
-        return
-    try:
-        response = httpx.get(
-            f"{config.api_base_url.rstrip('/')}/agents",
-            headers={"X-API-Key": config.api_key},
-            timeout=min(config.api_preflight_timeout_s, 2.0),
-        )
-        response.raise_for_status()
-        body = response.json()
-        matches: list[dict[str, Any]] = []
-        if isinstance(body, list):
-            for item in body:
-                if not isinstance(item, dict):
-                    continue
-                binding = item.get("channel")
-                if (
-                    isinstance(binding, dict)
-                    and binding.get("kind") == "slack"
-                    and binding.get("address") == channel
-                    and item.get("id")
-                ):
-                    matches.append(item)
-    except Exception:  # lookup is compatibility metadata, never durability
-        span.add_event("dispatcher.agent_lookup.unavailable")
-        logger.warning(
-            "agent lookup unavailable after durable enqueue; trace identity omitted"
-        )
-        return
-
-    if len(matches) != 1:
-        span.add_event("dispatcher.agent_lookup.unavailable")
-        logger.warning(
-            "agent lookup ambiguous after durable enqueue; trace identity omitted"
-        )
-        return
-    set_turn_identity(
-        span,
-        agent_id=matches[0]["id"],
-        conversation_id=conversation_id,
-        user_id=user_id,
-    )
-    span.add_event("dispatcher.agent_lookup.resolved")
 
 
 def process_event(
@@ -236,14 +179,7 @@ def process_event(
         stream_id = enqueue(redis_client, config, queued)
         if span is not None:
             span.add_event("messaging.enqueued")
-        _stamp_agent_identity_after_enqueue(
-            span=span,
-            config=config,
-            channel=channel,
-            conversation_id=thread_ts,
-            user_id=queued.author,
-            logger=log,
-        )
+        emit_log_event(log, "dispatcher.turn.enqueued")
         log.info(
             "enqueued slack event %s as stream entry %s", slack_event_id, stream_id
         )
@@ -347,14 +283,7 @@ def process_action(
         stream_id = enqueue(redis_client, config, queued)
         if span is not None:
             span.add_event("messaging.enqueued")
-        _stamp_agent_identity_after_enqueue(
-            span=span,
-            config=config,
-            channel=channel,
-            conversation_id=thread_ts,
-            user_id=user,
-            logger=log,
-        )
+        emit_log_event(log, "dispatcher.turn.enqueued")
         log.info(
             "enqueued block action %s as stream entry %s", slack_event_id, stream_id
         )

@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 import redis.asyncio as redis
-from curie_telemetry import configure, extract_http_trace_context
+from curie_telemetry import configure, emit_log_event, extract_http_trace_context
 from fastapi import FastAPI, Request
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, Status, StatusCode
@@ -272,17 +272,13 @@ def create_app() -> FastAPI:
         """Adopt only W3C context and export a closed, value-free server span."""
 
         parent = extract_http_trace_context(request.headers, logger=service_logger)
-        supplied_context = (
-            "traceparent" in request.headers or "tracestate" in request.headers
-        )
+        supplied_context = "traceparent" in request.headers
         server = request.scope.get("server")
         attributes: dict[str, AttributeValue] = {
             "http.request.method": request.method,
         }
         if isinstance(server, (list, tuple)) and len(server) == 2:
-            address, port = server
-            if isinstance(address, str) and address:
-                attributes["server.address"] = address
+            _address, port = server
             if type(port) is int:
                 attributes["server.port"] = port
 
@@ -305,6 +301,11 @@ def create_app() -> FastAPI:
                 span.set_attribute("exception.type", error_type)
                 span.set_attribute("exception.escaped", True)
                 span.set_status(Status(StatusCode.ERROR))
+                emit_log_event(
+                    service_logger,
+                    "http.server.failed",
+                    level=logging.ERROR,
+                )
                 route = request.scope.get("route")
                 route_path = getattr(route, "path", None)
                 if isinstance(route_path, str):
@@ -319,8 +320,14 @@ def create_app() -> FastAPI:
             if response.status_code >= 500:
                 span.set_attribute("error.type", f"{response.status_code // 100}xx")
                 span.set_status(Status(StatusCode.ERROR))
+                emit_log_event(
+                    service_logger,
+                    "http.server.failed",
+                    level=logging.ERROR,
+                )
             else:
                 span.set_status(Status(StatusCode.OK))
+                emit_log_event(service_logger, "http.server.completed")
             return response
 
     @app.get("/health", tags=["health"])

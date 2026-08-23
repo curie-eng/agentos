@@ -19,52 +19,75 @@ order: 7
 
 ## The black line
 
-On the write side, observability is swapped at the OTLP wire, not in code: the runner
-exports `gen_ai.*` spans over OTLP-HTTP to a collector, and the collector is the only
-component that authenticates and forwards to a backend. Services never speak the
-backend directly. Swapping the trace store means repointing one collector exporter
-block, not touching the runner. The opinionated core is the span tree shape
-(`agent.run` → `llm.generation` → `execute_tool`) and the attributes on it, which since
-ADR-0076 are a closed, versioned key set rather than an open bag of `gen_ai.*` names.
+On the write side, observability is swapped at the OTLP wire, not in code. The API,
+dispatcher, worker, and runner export spans and correlated logs to one collector; the
+collector is the only component that authenticates and forwards to a backend. Services
+never speak the backend directly. Swapping the store means repointing one collector
+exporter block, not changing a service. The opinionated core is the causal turn tree, the
+runner's `agent.run` → `llm.generation` → `execute_tool` subtree, and the closed,
+versioned attributes and events exported by each service.
 
 ## Current contract
 
-A second backend must ingest the OTLP-HTTP export produced in
-`runner/src/curie_runner/otel.py`. Per ADR-0076 that export is a closed, versioned
-attribute schema, not an open bag of `gen_ai.*` keys:
+A second backend must ingest the standard OTLP trace and log exports created by
+`configure` (`packages/telemetry/src/curie_telemetry/bootstrap.py::configure`). The
+contract is:
 
-- **The vocabulary is closed and committed.** `SpanAttributeKey`
-  (`runner/src/curie_runner/otel.py::SpanAttributeKey`) is the only key set the runner
-  may attach: `langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
-  `gen_ai.approval.decision`, `gen_ai.request.model`, a bare `model`,
-  `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read_input_tokens` /
-  `cache_creation_input_tokens`, `gen_ai.tool.name`, `gen_ai.operation.name`, plus the
-  resource keys `service.name`, `curie.session_id`, `curie.sandbox_id` and
-  `schema.version`. `SPAN_ATTRIBUTE_VALUE_TYPES`
-  (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
-  value type (the four usage counts are `int`, every other key is `str`).
-- **The schema is versioned.** `SCHEMA_VERSION`
-  (`runner/src/curie_runner/otel.py::SCHEMA_VERSION`) is `v1`, stamped on the resource as
-  `schema.version`, and bumps only when a key is removed, renamed, or retyped; a new
-  optional key is additive. `runner/schema/otel-attributes.schema.json` is the committed
-  mirror, and `runner/tests/test_otel_schema_drift.py` fails CI when the mirror, the enum,
-  the declared types, or a real run's emitted attributes disagree.
-- `build_tracer_provider` (`runner/src/curie_runner/otel.py::build_tracer_provider`) takes
-  `(otel, session_id, sandbox_id=None)` and returns `None` when `otel.endpoint` is unset
-  (so offline runs neither export nor fail). Otherwise the `TracerProvider`'s `Resource`
-  carries `service.name` (`curie-runner`), `curie.session_id`, `schema.version`, and
-  `curie.sandbox_id` when that value is non-empty.
-- **A fail-closed validator runs ahead of the exporter.** The provider registers
-  `_SchemaValidatingSpanProcessor`
-  (`runner/src/curie_runner/otel.py::_SchemaValidatingSpanProcessor`) first, then
-  `SimpleSpanProcessor(OTLPSpanExporter())`. On each span ending the validator strips any
-  attribute whose key falls outside the closed set, or whose value (or any element of a
-  sequence value) still matches a redaction pattern after the `redact.py` scrub. It drops
-  the offending attribute, never the span, so the exporter only ever sees schema-legal
-  attributes.
-- Endpoint/headers come from the standard `OTEL_EXPORTER_OTLP_*` env vars, read by the
-  opentelemetry SDK itself because the exporter is constructed argument-free;
-  `SessionConfig.otel` is the typed view of the same vars.
+- **Four emitters, one bootstrap.** The API, dispatcher, worker, and runner configure
+  `curie-api`, `curie-dispatcher`, `curie-worker`, and `curie-runner` runtimes
+  respectively. Each runtime owns explicit trace and log providers; it does not install a
+  process-global provider or replace stderr logging.
+- **Standard environment, including an honest off switch.** Signal-specific
+  `OTEL_EXPORTER_OTLP_TRACES_*` / `OTEL_EXPORTER_OTLP_LOGS_*` values override the generic
+  `OTEL_EXPORTER_OTLP_*` endpoint, protocol, and headers. HTTP/protobuf and gRPC are both
+  accepted on the service-to-collector hop. When neither signal has an endpoint (or
+  `OTEL_SDK_DISABLED=true`), `configure` returns a true no-op runtime: no provider,
+  exporter, queue, handler, or network attempt is created.
+- **Resources identify processes; spans identify turns.** `service_resource`
+  (`packages/telemetry/src/curie_telemetry/bootstrap.py::service_resource`) emits only
+  process facts such as `service.name`, namespace, version, instance id,
+  `deployment.environment.name`, and `schema.version`. Agent, session, user, and sandbox
+  identity is attached only after the worker resolves the binding, then carried on the
+  relevant worker and runner spans. A process resource never freezes one turn's identity
+  onto later turns.
+- **The vocabulary and privacy boundary are closed per service.** The shared schema in
+  `attributes.py` (`packages/telemetry/src/curie_telemetry/attributes.py`) partitions
+  allowed attributes and event names by emitter. `SchemaValidatingSpanProcessor`
+  (`packages/telemetry/src/curie_telemetry/attributes.py::SchemaValidatingSpanProcessor`)
+  drops unknown, mistyped, or recursively leaking attributes and unlisted events before
+  export. `SchemaValidatingLogRecordProcessor`
+  (`packages/telemetry/src/curie_telemetry/attributes.py::SchemaValidatingLogRecordProcessor`)
+  applies the same closed/redacted policy to logs. Prompts, tool content, secrets, and
+  transport identifiers are not telemetry attributes.
+- **Export is bounded and lifecycle-owned.** Both signals use bounded batch queues and
+  export timeouts. `TelemetryRuntime.force_flush`
+  (`packages/telemetry/src/curie_telemetry/bootstrap.py::TelemetryRuntime.force_flush`)
+  and `TelemetryRuntime.shutdown`
+  (`packages/telemetry/src/curie_telemetry/bootstrap.py::TelemetryRuntime.shutdown`)
+  share a hard two-second ceiling and detach only the handlers that runtime installed.
+- **Trace Context crosses transports, not domain models.** Dispatcher and API producer
+  spans inject only a W3C `traceparent`/optional `tracestate` carrier into Valkey Stream
+  metadata beside the unchanged `QueuedTurn` payload. The worker consumer extracts it,
+  and `RunnerClient._request`
+  (`apps/worker/src/curie_worker/runner_client.py::RunnerClient._request`) injects the
+  current context into the worker-to-runner HTTP headers. Missing metadata deliberately
+  starts a valid worker root; malformed metadata is ignored with a value-free warning and
+  a `trace_context.invalid` event rather than rejecting the turn.
+- **The causal tree is observable at its real ownership boundaries.** A dispatcher or API
+  `send curie:runs` producer parents the worker's `process curie:runs` consumer. Worker
+  routing, sandbox claim/start/stop, and the runner HTTP client are descendants; the
+  runner accepts that HTTP parent and opens its `agent.run` server span. Reply completion
+  and broker settlement remain events on the worker side. Static, value-free lifecycle
+  records emitted while those spans are current become trace/span-correlated OTLP logs;
+  stderr diagnostics remain available independently.
+- **The runner keeps its established GenAI subtree.** `SpanAttributeKey`
+  (`runner/src/curie_runner/otel.py::SpanAttributeKey`) and
+  `SPAN_ATTRIBUTE_VALUE_TYPES`
+  (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) mirror the shared plus
+  runner-owned key set for the ADR-0076 drift gate. `RunTracer.run_span`
+  (`runner/src/curie_runner/otel.py::RunTracer.run_span`) opens `agent.run` and
+  `llm.generation`; model, token-usage, approval-decision, and `execute_tool` children
+  retain their existing semantics.
 - `RunTracer.run_span` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) takes
   `(trace_name, model, session_id=None, user_id=None, approval_decision=None)`, opens the
   root `agent.run` (`SpanKind.SERVER`) and a child `llm.generation` span. It always stamps
@@ -82,14 +105,11 @@ attribute schema, not an open bag of `gen_ai.*` keys:
 
 ## Implementations today
 
-One: Langfuse, reached through the OTel Collector (which authenticates and forwards,
-since Langfuse OTLP ingest is HTTP-only). The runner does not know it is Langfuse — it
-only knows OTLP. The runner is also the only span producer: neither the API nor the
-worker builds a tracer, and the chart hands `OTEL_EXPORTER_OTLP_ENDPOINT` only to the
-sandbox pod (`charts/curie/templates/agent-sandbox.yaml`). The read side (trace list, tree
-reconstruction) is a separate concern in the API — Langfuse's query model spans several
-API modules plus routers, not one isolated module — and is out of scope for this
-write-side seam, though it is not attribute-blind (see leakage below).
+One backend: Langfuse, reached through the OTel Collector (which authenticates and
+forwards because Langfuse OTLP ingest is HTTP-only). Four services emit into that wire,
+but none knows which backend sits behind it. This foundation adds no query model,
+installable backend, agent-discovery surface, token/cost semantics, or console log-tail
+backend. The existing API Langfuse proxy and UI read path remain separate and unchanged.
 
 ## Known leakage
 

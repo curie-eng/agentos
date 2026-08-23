@@ -162,6 +162,34 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # substrate relays to a child as its standard OTEL endpoint. The private
         # relay name is read only by run.py and never enters runner boot env.
         "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
+        # Standard OTLP exporter tuning relayed verbatim from the worker process
+        # into a Docker runner for #1817. These are owned by OpenTelemetry (not
+        # Curie's frozen BootEnv schema); the three generic keys BootEnv already
+        # knows remain derived from that declaration at their source sites.
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
         "CURIE_SANDBOX_SUBSTRATE",
         "CURIE_WARM_POOL",
         # The runner-facing API base (#678): WorkerConfig reads it from the
@@ -254,16 +282,6 @@ _EXEMPT: dict[tuple[str, str], str] = {
     ): "worker service config",
     ("apps/worker/src/curie_worker/config.py", "CURIE_MODEL_ENV_KEY"): "worker service config",
     ("apps/worker/src/curie_worker/eval/run.py", "CURIE_MODEL"): "eval entrypoint env read",
-    # run.py reads the WORKER's own OTel endpoint -- the standard var its own
-    # deployment sets to point the worker process at the collector -- to warn when
-    # middle mode has none and to hand the docker client a target. The consumer is
-    # the worker process; the name it later writes INTO a container is read from
-    # the declaration (sandbox/docker.py). Renaming the boot key must not rename
-    # the worker's own OTel var, so this site is not the drift.
-    (
-        "apps/worker/src/curie_worker/run.py",
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-    ): "worker service config",
     # Substrate-authoritative producers. The chart/docker own pod identity and
     # the runner port; the worker must never render them (see BootEnv).
     ("apps/worker/src/curie_worker/run.py", "CURIE_RUNNER_PORT"): "substrate producer",

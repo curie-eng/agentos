@@ -157,14 +157,10 @@ async def _event(request: web.Request) -> web.StreamResponse:
     # interrupt in run_turn's finally -- on the task that opened it.
     trace_headers: dict[str, str] = {}
     traceparents = request.headers.getall("traceparent", [])
-    tracestates = request.headers.getall("tracestate", [])
     if traceparents:
         # More than one traceparent is invalid; joining makes the value fail the
         # value-free validator without ever putting it in a diagnostic.
         trace_headers["traceparent"] = ",".join(traceparents)
-    if tracestates:
-        # HTTP permits repeated tracestate fields; W3C treats them as one list.
-        trace_headers["tracestate"] = ",".join(tracestates)
     token = attach(extract_http_trace_context(trace_headers))
     try:
         try:

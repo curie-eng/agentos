@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import threading
-from collections.abc import Iterator
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import MagicMock
+import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 import redis
@@ -21,7 +19,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import SpanKind
 from slack_sdk.web import WebClient
 
-AGENT_ID = "11111111-1111-1111-1111-111111111111"
 CHANNEL = "C0EXAMPLE1"
 THREAD = "1700.0001"
 BOT_TS = "1700.0002"
@@ -116,73 +113,6 @@ class _OrderedPublisher:
         return self._client.xadd(*args, **kwargs)
 
 
-class _AgentLookupServer(ThreadingHTTPServer):
-    daemon_threads = True
-
-    def __init__(
-        self, redis_client: redis.Redis, stream: str, order: list[str]
-    ) -> None:
-        self.redis_client = redis_client
-        self.stream = stream
-        self.order = order
-        super().__init__(("127.0.0.1", 0), _agent_handler())
-
-
-def _agent_handler() -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
-            server = self.server
-            assert isinstance(server, _AgentLookupServer)
-            assert self.path.startswith("/agents")
-            assert self.headers.get("X-API-Key") == "test-api-key"
-            assert server.redis_client.xlen(server.stream) == 1
-            server.order.append("lookup")
-            body = json.dumps(
-                [
-                    {
-                        "id": AGENT_ID,
-                        "channel": {"kind": "slack", "address": CHANNEL},
-                    }
-                ]
-            ).encode()
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            return
-
-    return Handler
-
-
-@pytest.fixture
-def agent_lookup_server(
-    redis_client: redis.Redis, config: DispatcherConfig
-) -> Iterator[tuple[_AgentLookupServer, list[str]]]:
-    order: list[str] = []
-    server = _AgentLookupServer(redis_client, config.stream, order)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield server, order
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-def _traced_config(config: DispatcherConfig, server: _AgentLookupServer) -> DispatcherConfig:
-    host, port = server.server_address
-    return config.model_copy(
-        update={
-            "api_base_url": f"http://{host}:{port}",
-            "api_key": "test-api-key",
-        }
-    )
-
-
 def _web_client(order: list[str]) -> WebClient:
     client = WebClient(token="xoxb-test")
 
@@ -205,10 +135,9 @@ def _assert_producer(
     assert producer.attributes["messaging.system"] == "valkey"
     assert producer.attributes["messaging.destination.name"] == config.stream
     assert producer.attributes["messaging.operation.type"] == "send"
-    session_id = f"agent-{AGENT_ID}-thread-{THREAD}"
-    assert producer.attributes["langfuse.session.id"] == session_id
-    assert producer.attributes["langfuse.trace.name"] == f"curie-run:{session_id}"
-    assert producer.attributes["langfuse.user.id"] == "U0EXAMPLE1"
+    assert "langfuse.session.id" not in producer.attributes
+    assert "langfuse.trace.name" not in producer.attributes
+    assert "langfuse.user.id" not in producer.attributes
 
     _, fields = redis_client.xrange(config.stream)[0]
     carrier = json.loads(fields[TRACE_CONTEXT_FIELD])
@@ -221,85 +150,19 @@ def _assert_producer(
     assert "safe placeholder request" not in exported
 
 
-def test_message_claim_placeholder_xadd_lookup_order_and_producer_parentage(
+def test_message_claim_placeholder_xadd_order_producer_parentage_and_curated_log(
     redis_client: redis.Redis,
     config: DispatcherConfig,
-    agent_lookup_server: tuple[_AgentLookupServer, list[str]],
 ) -> None:
-    server, order = agent_lookup_server
-    traced_config = _traced_config(config, server)
+    order: list[str] = []
     provider, exporter = _provider()
     tracer = provider.get_tracer("dispatcher-handler")
     publisher = _OrderedPublisher(redis_client, order)
+    logger = logging.getLogger("curie_dispatcher.telemetry-test")
 
-    stream_id = process_event(
-        body={"event_id": "Ev-otel-message"},
-        event={
-            "type": "app_mention",
-            "channel": CHANNEL,
-            "user": "U0EXAMPLE1",
-            "text": "safe placeholder request",
-            "ts": THREAD,
-        },
-        web_client=_web_client(order),
-        redis_client=publisher,  # type: ignore[arg-type]
-        config=traced_config,
-        clock=lambda: "2026-08-23T00:00:00+00:00",
-        tracer=tracer,
-    )
-
-    assert stream_id
-    assert order == ["claim", "placeholder", "xadd", "lookup"]
-    _assert_producer(exporter, redis_client, traced_config)
-    provider.shutdown()
-
-
-def test_block_action_uses_the_same_producer_and_transport_metadata_path(
-    redis_client: redis.Redis,
-    config: DispatcherConfig,
-    agent_lookup_server: tuple[_AgentLookupServer, list[str]],
-) -> None:
-    server, order = agent_lookup_server
-    traced_config = _traced_config(config, server)
-    provider, exporter = _provider()
-    tracer = provider.get_tracer("dispatcher-action")
-    publisher = _OrderedPublisher(redis_client, order)
-
-    stream_id = process_action(
-        body={
-            "trigger_id": "trigger-otel",
-            "channel": {"id": CHANNEL},
-            "user": {"id": "U0EXAMPLE1"},
-            "message": {"ts": THREAD, "thread_ts": THREAD},
-            "actions": [{"action_id": "reports", "action_ts": "1.5"}],
-        },
-        web_client=_web_client(order),
-        redis_client=publisher,  # type: ignore[arg-type]
-        config=traced_config,
-        clock=lambda: "2026-08-23T00:00:00+00:00",
-        tracer=tracer,
-    )
-
-    assert stream_id
-    assert order == ["claim", "placeholder", "xadd", "lookup"]
-    _assert_producer(exporter, redis_client, traced_config)
-    provider.shutdown()
-
-
-def test_agent_lookup_failure_never_rolls_back_the_durable_enqueue(
-    redis_client: redis.Redis,
-    config: DispatcherConfig,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    provider, _ = _provider()
-    tracer = provider.get_tracer("dispatcher-lookup-failure")
-    unavailable = config.model_copy(
-        update={"api_base_url": "http://127.0.0.1:1", "api_key": "test-api-key"}
-    )
-
-    with caplog.at_level("WARNING"):
+    with patch("curie_dispatcher.handlers.emit_log_event") as emit:
         stream_id = process_event(
-            body={"event_id": "Ev-otel-lookup-failure"},
+            body={"event_id": "Ev-otel-message"},
             event={
                 "type": "app_mention",
                 "channel": CHANNEL,
@@ -307,16 +170,82 @@ def test_agent_lookup_failure_never_rolls_back_the_durable_enqueue(
                 "text": "safe placeholder request",
                 "ts": THREAD,
             },
-            web_client=_web_client([]),
-            redis_client=redis_client,
-            config=unavailable,
+            web_client=_web_client(order),
+            redis_client=publisher,  # type: ignore[arg-type]
+            config=config,
             clock=lambda: "2026-08-23T00:00:00+00:00",
+            logger=logger,
             tracer=tracer,
         )
 
     assert stream_id
+    assert order == ["claim", "placeholder", "xadd"]
+    emit.assert_called_once_with(logger, "dispatcher.turn.enqueued")
+    _assert_producer(exporter, redis_client, config)
+    provider.shutdown()
+
+
+def test_block_action_uses_the_same_producer_and_transport_metadata_path(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+) -> None:
+    order: list[str] = []
+    provider, exporter = _provider()
+    tracer = provider.get_tracer("dispatcher-action")
+    publisher = _OrderedPublisher(redis_client, order)
+    logger = logging.getLogger("curie_dispatcher.telemetry-action-test")
+
+    with patch("curie_dispatcher.handlers.emit_log_event") as emit:
+        stream_id = process_action(
+            body={
+                "trigger_id": "trigger-otel",
+                "channel": {"id": CHANNEL},
+                "user": {"id": "U0EXAMPLE1"},
+                "message": {"ts": THREAD, "thread_ts": THREAD},
+                "actions": [{"action_id": "reports", "action_ts": "1.5"}],
+            },
+            web_client=_web_client(order),
+            redis_client=publisher,  # type: ignore[arg-type]
+            config=config,
+            clock=lambda: "2026-08-23T00:00:00+00:00",
+            logger=logger,
+            tracer=tracer,
+        )
+
+    assert stream_id
+    assert order == ["claim", "placeholder", "xadd"]
+    emit.assert_called_once_with(logger, "dispatcher.turn.enqueued")
+    _assert_producer(exporter, redis_client, config)
+    provider.shutdown()
+
+
+def test_dispatch_never_performs_a_post_enqueue_agent_lookup(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _ = _provider()
+    tracer = provider.get_tracer("dispatcher-lookup-failure")
+    lookup = MagicMock(side_effect=AssertionError("dispatcher performed HTTP lookup"))
+    monkeypatch.setattr("httpx.get", lookup)
+
+    stream_id = process_event(
+        body={"event_id": "Ev-otel-no-lookup"},
+        event={
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "user": "U0EXAMPLE1",
+            "text": "safe placeholder request",
+            "ts": THREAD,
+        },
+        web_client=_web_client([]),
+        redis_client=redis_client,
+        config=config,
+        clock=lambda: "2026-08-23T00:00:00+00:00",
+        tracer=tracer,
+    )
+
+    assert stream_id
     assert redis_client.xlen(config.stream) == 1
-    logged = " ".join(record.getMessage() for record in caplog.records)
-    assert "agent lookup" in logged.lower()
-    assert CHANNEL not in logged
+    lookup.assert_not_called()
     provider.shutdown()

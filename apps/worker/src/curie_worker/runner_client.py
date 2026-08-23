@@ -83,17 +83,10 @@ class TurnStream:
     async def __aiter__(self) -> AsyncIterator[OutboundEvent]:
         try:
             async for raw in self._response.content:
-                try:
-                    line = raw.decode("utf-8").strip()
-                    frame = parse_ndjson_line(line) if line else None
-                except Exception:
-                    raise RunnerError(
-                        "runner stream contained an unreadable NDJSON frame"
-                    ) from None
+                line = raw.decode("utf-8").strip()
                 if not line:
                     continue
-                assert frame is not None
-                yield frame
+                yield parse_ndjson_line(line)
         except BaseException:
             # Never record the exception itself: a parse failure may carry the
             # malformed runner line, which is agent-controlled content.
@@ -180,7 +173,10 @@ class RunnerClient:
         parsed = urlsplit(base_url)
         attributes: dict[str, object] = {
             "http.request.method": method,
-            "server.address": parsed.hostname or "runner",
+            # The worker talks only to its claimed runner. Exporting live pod or
+            # container addresses adds high-cardinality deployment identifiers
+            # without adding causal information.
+            "server.address": "runner",
         }
         if parsed.port is not None:
             attributes["server.port"] = parsed.port
@@ -227,11 +223,11 @@ class RunnerClient:
         )
         if resp.status != 200:
             try:
-                await resp.read()
+                body = await resp.text()
             finally:
                 resp.release()
                 _finish_span(span, error=True)
-            raise RunnerError(f"/v1/event -> {resp.status}")
+            raise RunnerError(f"/v1/event -> {resp.status}: {body}")
         return TurnStream(resp, span)
 
     async def steer(self, base_url: str, event: Event, token: str | None = None) -> bool:
@@ -248,8 +244,8 @@ class RunnerClient:
                 if resp.status == 409:
                     result = False
                 elif resp.status != 200:
-                    await resp.read()
-                    raise RunnerError(f"/v1/steer -> {resp.status}")
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/steer -> {resp.status}: {body}")
                 else:
                     result = True
         except BaseException:
@@ -280,8 +276,8 @@ class RunnerClient:
         try:
             async with resp:
                 if resp.status not in (200, 409):
-                    await resp.read()
-                    raise RunnerError(f"/v1/interrupt -> {resp.status}")
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/interrupt -> {resp.status}: {body}")
         except BaseException:
             _finish_span(span, error=True)
             raise
@@ -300,8 +296,8 @@ class RunnerClient:
         try:
             async with resp:
                 if resp.status != 200:
-                    await resp.read()
-                    raise RunnerError(f"/v1/reset -> {resp.status}")
+                    body = await resp.text()
+                    raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
         except BaseException:
             _finish_span(span, error=True)
             raise
@@ -312,8 +308,8 @@ class RunnerClient:
         try:
             async with resp:
                 if resp.status != 200:
-                    await resp.read()
-                    raise RunnerError(f"/status -> {resp.status}")
+                    body = await resp.text()
+                    raise RunnerError(f"/status -> {resp.status}: {body}")
                 data: dict[str, object] = await resp.json()
         except BaseException:
             _finish_span(span, error=True)

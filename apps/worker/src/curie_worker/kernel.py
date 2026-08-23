@@ -838,6 +838,7 @@ class Kernel:
                     return "steered" if outcome.steered else "delivered"
 
                 if outcome.saw_side_effect:
+                    self._turn_event("worker.retry.stopped")
                     await self._escalate(
                         qevent,
                         route,
@@ -849,6 +850,7 @@ class Kernel:
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
                 if not retryable or attempt >= self._config.max_attempts:
+                    self._turn_event("worker.retry.stopped")
                     await self._escalate(
                         qevent,
                         route,
@@ -858,6 +860,7 @@ class Kernel:
                     await self._complete(qevent, route, "escalated")
                     return "escalated"
 
+                self._turn_event("worker.retry.scheduled")
                 await asyncio.sleep(self._backoff(attempt))
         finally:
             release_order()
@@ -1405,15 +1408,7 @@ class Kernel:
         # A placeholderless job must route first. Otherwise every busy redelivery
         # posts a notice for a turn that never started.
         defer_job_booting = qevent.reply_handle.placeholder is None and qevent.source.is_job
-        # A bound agent is rechecked after its runner stream is accepted, closing
-        # the precheck-vs-register kill race.  Do not mutate the placeholder
-        # before that last gate: if the recheck itself fails, no turn is consumed
-        # and leaving "Working on it" behind would claim progress that never
-        # happened.  The shimmer remains the pre-claim liveness affordance.
-        defer_killswitch_booting = agent_id is not None and self._killswitch is not None
-        if not self._config.slack_no_edit_streaming and not (
-            defer_job_booting or defer_killswitch_booting
-        ):
+        if not self._config.slack_no_edit_streaming and not defer_job_booting:
             try:
                 await self._reply_for(qevent, route, self._config.booting_text)
             except Exception:
@@ -1471,16 +1466,7 @@ class Kernel:
             return TurnOutcome(terminal_ok=False, classification="runner-error")
         release_order()
 
-        defer_booting_until_postcheck = (
-            defer_killswitch_booting
-            and routed.handle is not None
-            and routed.turn is not None
-        )
-        if (
-            not self._config.slack_no_edit_streaming
-            and (defer_job_booting or defer_killswitch_booting)
-            and not defer_booting_until_postcheck
-        ):
+        if not self._config.slack_no_edit_streaming and defer_job_booting:
             try:
                 # Routing succeeded, so this delivery owns a real turn. Adopt the
                 # minted ref before streaming so every later update edits it.
@@ -1530,11 +1516,6 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
-            if not self._config.slack_no_edit_streaming and defer_booting_until_postcheck:
-                try:
-                    await self._reply_for(qevent, route, self._config.booting_text)
-                except Exception:
-                    logger.warning("booting-state update failed for %s", qevent.event_id)
             return await self._consume(qevent, route, routed.turn, nav)
         finally:
             # ``start_turn`` transfers the open response and CLIENT span to the

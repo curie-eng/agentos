@@ -44,6 +44,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
@@ -82,12 +83,6 @@ logger = logging.getLogger(__name__)
 # is published to is Docker-assigned and read back per-container.
 RUNNER_CONTAINER_PORT = 8080
 
-# Declared boot keys this substrate produces. Docker is the OTel producer here
-# (the chart's env block is its Kubernetes counterpart), and the runner parses
-# both names out of the one declaration, so they are read from it (#488).
-_OTEL_ENDPOINT_ENV = BootEnv.env_key("otel_endpoint")
-_OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
-
 # The ambient SDK credential vars, forwarded into the container BY NAME (docker
 # reads the value from the worker env; this code never does, and no secret ever
 # lands in the docker argv). These authenticate the runner directly on the legacy
@@ -98,6 +93,40 @@ _OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
 _SDK_PASSTHROUGH_ENV = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
+)
+_OTEL_ENDPOINT_ENV = BootEnv.env_key("otel_endpoint")
+_OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
+_OTEL_HEADERS_ENV = BootEnv.env_key("otel_headers")
+_STANDARD_OTEL_EXPORTER_ENV = frozenset(
+    {
+        _OTEL_ENDPOINT_ENV,
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        _OTEL_PROTOCOL_ENV,
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        _OTEL_HEADERS_ENV,
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_INSECURE",
+        "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+    }
 )
 # A Claude Code OAuth token shares the sk-ant- prefix with an API key; this more
 # specific prefix marks it. Under a base-URL override the runner blanks such a
@@ -113,7 +142,13 @@ _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
 # (the runner never fetches), and the credential is forwarded by name (never as
 # a value in the argv).
 _WORKER_OWNED_ENV = frozenset(
-    {BUNDLE_REF_ENV, PLUGIN_DIR_ENV, "CURIE_SANDBOX_ID", CREDENTIALS_ENV}
+    {
+        BUNDLE_REF_ENV,
+        PLUGIN_DIR_ENV,
+        "CURIE_SANDBOX_ID",
+        CREDENTIALS_ENV,
+        *_STANDARD_OTEL_EXPORTER_ENV,
+    }
 )
 
 
@@ -256,6 +291,7 @@ class DockerSandboxClient:
         bundle_store: BundleReader,
         network: str | None = None,
         otel_endpoint: str | None = None,
+        otel_environment: Mapping[str, str] | None = None,
         host: str = "127.0.0.1",
         default_plugin_dir: str = "/bundles/current",
         healthz_timeout_s: float = 0.5,
@@ -268,7 +304,14 @@ class DockerSandboxClient:
         self._image = image
         self._bundles = bundle_store
         self._network = network
-        self._otel_endpoint = otel_endpoint
+        self._otel_environment = dict(otel_environment or {})
+        if otel_endpoint and _OTEL_ENDPOINT_ENV not in self._otel_environment:
+            self._otel_environment[_OTEL_ENDPOINT_ENV] = otel_endpoint
+            self._otel_environment.setdefault(_OTEL_PROTOCOL_ENV, "http/protobuf")
+        # Per-thread because concurrent claims run in separate ``to_thread``
+        # calls. It carries sensitive exporter values to the docker CLI process
+        # environment while argv contains names only.
+        self._docker_environment = threading.local()
         self._host = host
         self._default_plugin_dir = default_plugin_dir
         self._healthz_timeout_s = healthz_timeout_s
@@ -338,13 +381,8 @@ class DockerSandboxClient:
             "-e",
             f"CURIE_RUNNER_PORT={RUNNER_CONTAINER_PORT}",
         ]
-        if self._otel_endpoint:
-            args += [
-                "-e",
-                f"{_OTEL_ENDPOINT_ENV}={self._otel_endpoint}",
-                "-e",
-                f"{_OTEL_PROTOCOL_ENV}=http/protobuf",
-            ]
+        for key in sorted(self._otel_environment):
+            args += ["-e", key]
         for key, value in sorted(env.items()):
             if key not in _WORKER_OWNED_ENV:
                 args += ["-e", f"{key}={value}"]
@@ -389,11 +427,14 @@ class DockerSandboxClient:
         args.append(self._image)
 
         try:
+            self._docker_environment.values = self._otel_environment
             self._docker(args)
         except DockerError:
             # A failed boot must not leak the bundle dir we just staged.
             self._cleanup_bundle(name)
             raise
+        finally:
+            self._docker_environment.values = {}
 
     def get_claim(self, name: str) -> ClaimView | None:
         inspected = self._inspect(name)
@@ -605,11 +646,13 @@ class DockerSandboxClient:
             return False
 
     def _docker(self, args: list[str], *, check: bool = True) -> str:
+        overrides = self._docker_command_environment()
         proc = subprocess.run(  # noqa: S603 -- fixed argv, no shell.
             ["docker", *args],
             capture_output=True,
             text=True,
             check=False,
+            env={**os.environ, **overrides} if overrides else None,
         )
         if proc.returncode != 0:
             if check:
@@ -621,6 +664,12 @@ class DockerSandboxClient:
                 )
             return ""
         return proc.stdout
+
+    def _docker_command_environment(self) -> Mapping[str, str]:
+        """Sensitive one-call env overrides; intentionally never part of argv."""
+
+        values: object = getattr(self._docker_environment, "values", {})
+        return values if isinstance(values, Mapping) else {}
 
     def _network_remediation_hint(self, stderr: str) -> str:
         """An actionable one-liner appended when ``stderr`` names our own

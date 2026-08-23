@@ -45,10 +45,12 @@ class _RecordingDocker(DockerSandboxClient):
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.calls: list[list[str]] = []
+        self.call_environments: list[dict[str, str]] = []
         self.outputs: dict[str, str] = {}
 
     def _docker(self, args: list[str], *, check: bool = True) -> str:
         self.calls.append(args)
+        self.call_environments.append(dict(self._docker_command_environment()))
         return self.outputs.get(args[0], "")
 
 

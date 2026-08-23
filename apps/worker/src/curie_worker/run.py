@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 import redis
+from aci_protocol import BootEnv
 from curie_telemetry import configure
 from opentelemetry.trace import Tracer
 from redis.asyncio import Redis as AsyncRedis
@@ -174,6 +175,65 @@ def _substrate_config(env: Mapping[str, str]) -> SubstrateConfig:
 # either satisfies the local-middle-mode credential requirement.
 _MODEL_CREDENTIAL_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
 
+_OTEL_ENDPOINT_ENV = BootEnv.env_key("otel_endpoint")
+_OTEL_PROTOCOL_ENV = BootEnv.env_key("otel_protocol")
+_OTEL_HEADERS_ENV = BootEnv.env_key("otel_headers")
+
+_RUNNER_OTEL_EXPORTER_ENV = (
+    _OTEL_ENDPOINT_ENV,
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    _OTEL_PROTOCOL_ENV,
+    "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    _OTEL_HEADERS_ENV,
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION",
+    "OTEL_EXPORTER_OTLP_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_INSECURE",
+    "OTEL_EXPORTER_OTLP_TRACES_INSECURE",
+    "OTEL_EXPORTER_OTLP_LOGS_INSECURE",
+)
+_RUNNER_OTEL_ENDPOINT_ENV = (
+    _OTEL_ENDPOINT_ENV,
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+)
+
+
+def _runner_otel_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """Select the standard exporter contract relayed to a Docker runner.
+
+    The private compose-only endpoint replaces the child's generic endpoint but
+    never enters its environment under the private name. Signal-specific
+    standard settings retain their normal precedence. A present blank private
+    endpoint deliberately disables the generic fallback, preserving the
+    no-endpoint control.
+    """
+
+    selected = {name: env[name] for name in _RUNNER_OTEL_EXPORTER_ENV if name in env}
+    private = "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT"
+    if private in env:
+        selected[_OTEL_ENDPOINT_ENV] = env[private]
+    if not any(selected.get(name, "").strip() for name in _RUNNER_OTEL_ENDPOINT_ENV):
+        return {}
+    selected.setdefault(_OTEL_PROTOCOL_ENV, "http/protobuf")
+    return selected
+
 
 def _sandbox_client(
     config: WorkerConfig, env: Mapping[str, str], sub_config: SubstrateConfig
@@ -205,11 +265,8 @@ def _sandbox_client(
                 "endpoint for local-model mode, or set CURIE_FAKE_MODEL=1 for an "
                 "offline/test run."
             )
-        runner_otel_endpoint = env.get(
-            "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT",
-            env.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
-        )
-        if not runner_otel_endpoint:
+        runner_otel_environment = _runner_otel_environment(env)
+        if not runner_otel_environment:
             logger.warning(
                 "Docker substrate selected but OTEL_EXPORTER_OTLP_ENDPOINT is "
                 "unset; runner traces will not be exported"
@@ -218,7 +275,7 @@ def _sandbox_client(
             image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),
             bundle_store=BundleStore(config),
             network=env.get("CURIE_DOCKER_NETWORK") or None,
-            otel_endpoint=runner_otel_endpoint or None,
+            otel_environment=runner_otel_environment,
             default_plugin_dir=config.bundle_plugin_dir,
             # Container isolation for every spawned runner (#631): read-only
             # rootfs, dropped caps, no-new-privileges, bounded resources. Mirrors

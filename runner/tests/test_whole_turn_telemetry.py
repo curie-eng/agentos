@@ -31,7 +31,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from curie_runner import RunTracer, SideEffectClassifier, create_app
 from curie_runner.fake import FakeModelSession
 from curie_runner.session import SessionRunner
-from curie_telemetry import TelemetryRuntime, configure
+from curie_telemetry import TelemetryRuntime, configure, emit_log_event
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
     ExportLogsServiceRequest,
 )
@@ -195,7 +195,10 @@ def test_http_traceparent_is_the_direct_parent_of_agent_run_and_flushes_before_r
     runtime = _runtime(monkeypatch, otlp_capture.endpoint)
     events = _turn(
         _runner(runtime),
-        {"traceparent": f"00-{_TRACE_ID}-{_PARENT_ID}-01"},
+        {
+            "traceparent": f"00-{_TRACE_ID}-{_PARENT_ID}-01",
+            "tracestate": "vendor=OPAQUE_TRACE_STATE_SENTINEL",
+        },
     )
 
     assert events[-1].status is SessionStatus.DONE
@@ -203,10 +206,12 @@ def test_http_traceparent_is_the_direct_parent_of_agent_run_and_flushes_before_r
     assert agent.trace_id.hex() == _TRACE_ID
     assert agent.parent_span_id.hex() == _PARENT_ID
     assert agent.status.code == Status.STATUS_CODE_OK
+    assert agent.trace_state == ""
+    assert "OPAQUE_TRACE_STATE_SENTINEL" not in repr(otlp_capture.traces)
     assert any(
         record.trace_id == agent.trace_id
         and record.span_id == agent.span_id
-        and "turn end" in _body(record)
+        and _body(record) == "agent.run.completed"
         for record in _logs(otlp_capture)
     ), "the terminal runner log must be exported before the HTTP EOF is observable"
 
@@ -234,11 +239,17 @@ def test_missing_or_malformed_http_parent_is_a_safe_new_root(
         assert traceparent not in rendered
 
 
+_ARBITRARY_EXCEPTION = (
+    "review the quarterly plan; model output was incomplete; "
+    "tool exception calendar lookup failed"
+)
+
+
 class _ExplodingSession(FakeModelSession):
     async def receive_turn(self) -> Any:
         if False:  # make this an async generator while failing before its first item
             yield None
-        raise RuntimeError(f"provider rejected authorization={_FAKE_SECRET}")
+        raise RuntimeError(_ARBITRARY_EXCEPTION)
 
 
 def test_caught_failure_marks_agent_run_error_and_exports_a_redacted_correlated_log(
@@ -256,10 +267,26 @@ def test_caught_failure_marks_agent_run_error_and_exports_a_redacted_correlated_
         for record in _logs(otlp_capture)
         if record.trace_id == agent.trace_id and record.span_id == agent.span_id
     ]
-    assert any("turn failed" in _body(record) for record in correlated)
+    assert [_body(record) for record in correlated] == ["agent.run.failed"]
+    assert all(record.severity_text == "ERROR" for record in correlated)
     exported = repr(otlp_capture.traces) + repr(otlp_capture.logs)
     assert _FAKE_SECRET not in exported
-    assert "provider rejected" in exported, "redaction must not erase the useful error class"
+    assert _ARBITRARY_EXCEPTION not in exported
+
+
+def test_arbitrary_prompt_model_and_tool_exception_stays_in_stderr_only(
+    monkeypatch: pytest.MonkeyPatch,
+    otlp_capture: _OtlpCapture,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = _runtime(monkeypatch, otlp_capture.endpoint)
+    with caplog.at_level(logging.ERROR, logger="curie_runner.session"):
+        events = _turn(_runner(runtime, _ExplodingSession))
+
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert any(_ARBITRARY_EXCEPTION in record.getMessage() for record in caplog.records)
+    assert _ARBITRARY_EXCEPTION not in repr(otlp_capture.logs)
+    assert [_body(record) for record in _logs(otlp_capture)] == ["agent.run.failed"]
 
 
 def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
@@ -284,6 +311,7 @@ def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
                 "unknown.attribute": _FAKE_SECRET,
             },
         )
+        emit_log_event(logger, "agent.run.failed", level=logging.ERROR)
     assert runtime.force_flush(timeout_millis=500)
 
     span_record = next(span for span in _spans(otlp_capture) if span.name == "agent.run")
@@ -292,11 +320,11 @@ def test_runner_export_boundary_is_recursively_redacted_and_service_closed(
     assert "messaging.system" not in span_attributes
     assert "unknown.attribute" not in span_attributes
     assert "langfuse.trace.name" not in span_attributes
-    log_record = next(record for record in _logs(otlp_capture) if "runner failed" in _body(record))
+    log_record = next(
+        record for record in _logs(otlp_capture) if _body(record) == "agent.run.failed"
+    )
     log_attributes = _attributes(log_record)
-    assert log_attributes.get("curie.session_id") == "safe-session"
-    assert "messaging.system" not in log_attributes
-    assert "unknown.attribute" not in log_attributes
+    assert log_attributes == {}, "curated log events carry correlation only, no values"
     assert _FAKE_SECRET not in repr(otlp_capture.traces)
     assert _FAKE_SECRET not in repr(otlp_capture.logs)
     runtime.shutdown(timeout_millis=2_000)

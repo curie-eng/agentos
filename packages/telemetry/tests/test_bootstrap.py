@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 import pytest
-from curie_telemetry import TelemetryRuntime, configure
+from curie_telemetry import TelemetryRuntime, configure, emit_log_event
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
@@ -127,7 +127,7 @@ def test_signal_specific_endpoint_gates_are_independent(
     logs_only.shutdown(timeout_millis=1000)
 
 
-def test_configured_runtime_preserves_console_logs_and_exports_correlated_records(
+def test_configured_runtime_preserves_console_logs_and_exports_only_curated_records(
     monkeypatch: pytest.MonkeyPatch, otlp_http_capture: OtlpHttpCapture
 ) -> None:
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", otlp_http_capture.endpoint)
@@ -161,6 +161,7 @@ def test_configured_runtime_preserves_console_logs_and_exports_correlated_record
             span.set_attribute("error.type", FAKE_API_KEY)
             span_context = span.get_span_context()
             logger.info("request completed credential=%s", FAKE_API_KEY)
+            emit_log_event(logger, "http.server.completed")
 
         assert runtime.force_flush(timeout_millis=1000) is True
     finally:
@@ -203,7 +204,53 @@ def test_configured_runtime_preserves_console_logs_and_exports_correlated_record
     assert exported_log.trace_id == span_context.trace_id.to_bytes(16, "big")
     assert exported_log.span_id == span_context.span_id.to_bytes(8, "big")
     assert FAKE_API_KEY not in repr(exported_log)
-    assert "[REDACTED:" in str(_any_value(exported_log.body))
+    assert _any_value(exported_log.body) == "http.server.completed"
+
+
+def test_unmarked_arbitrary_diagnostics_never_reach_otel_but_remain_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, otlp_http_capture: OtlpHttpCapture
+) -> None:
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", otlp_http_capture.endpoint)
+    runtime = configure(service_name="curie-api", service_version="1.2.3")
+    logger = logging.getLogger("curie_api.arbitrary_diagnostics")
+    stderr = io.StringIO()
+    console = logging.StreamHandler(stderr)
+    prior_handlers = list(logger.handlers)
+    prior_level = logger.level
+    prior_propagate = logger.propagate
+    logger.handlers = [console]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        runtime.attach_logging(logger)
+        with runtime.tracer.start_as_current_span("GET /health"):
+            arbitrary_prompt = "prompt fragment: compare the quarterly strategy"
+            logger.info(arbitrary_prompt)
+            logger.warning(
+                "model output: the forecast changed",
+                extra={"curie.session_id": "arbitrary-tool-session"},
+            )
+            try:
+                raise RuntimeError("tool exception: calendar lookup failed")
+            except RuntimeError:
+                logger.exception("tool execution failed")
+            with pytest.raises(ValueError, match="unsupported telemetry log event"):
+                emit_log_event(logger, arbitrary_prompt)
+            emit_log_event(logger, "http.server.completed")
+        assert runtime.force_flush(timeout_millis=1000)
+    finally:
+        runtime.shutdown(timeout_millis=1000)
+        logger.handlers = prior_handlers
+        logger.setLevel(prior_level)
+        logger.propagate = prior_propagate
+
+    diagnostics = stderr.getvalue()
+    assert "prompt fragment: compare the quarterly strategy" in diagnostics
+    assert "model output: the forecast changed" in diagnostics
+    assert "tool exception: calendar lookup failed" in diagnostics
+    assert [_any_value(record.body) for _, record in _exported_logs(otlp_http_capture)] == [
+        "http.server.completed"
+    ]
 
 
 @pytest.mark.parametrize("protocol", ["http/protobuf", "grpc"])

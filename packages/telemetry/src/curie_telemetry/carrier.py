@@ -14,16 +14,12 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 
 TRACE_CONTEXT_FIELD = "trace_context"
 
-_ALLOWED_KEYS = frozenset({"traceparent", "tracestate"})
+_ALLOWED_KEYS = frozenset({"traceparent"})
 _MAX_CARRIER_BYTES = 4096
 _MAX_INJECTED_CARRIER_BYTES = 512
 _PROPAGATOR = TraceContextTextMapPropagator()
 _TRACEPARENT_RE = re.compile(
     r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$"
-)
-_TRACESTATE_SIMPLE_KEY_RE = re.compile(r"^[a-z0-9][_0-9a-z\-*/]{0,255}$")
-_TRACESTATE_MULTI_KEY_RE = re.compile(
-    r"^[a-z0-9][_0-9a-z\-*/]{0,240}@[a-z][_0-9a-z\-*/]{0,13}$"
 )
 
 
@@ -40,48 +36,9 @@ def _valid_traceparent(value: str) -> bool:
     )
 
 
-def _valid_tracestate(value: str) -> bool:
-    """Validate W3C tracestate before the SDK can diagnose its raw value."""
-
-    if not value or len(value) > 512:
-        return False
-    members = [member.strip(" \t") for member in value.split(",")]
-    if len(members) > 32 or any(not member for member in members):
-        return False
-    seen: set[str] = set()
-    for member in members:
-        if "=" not in member:
-            return False
-        key, member_value = member.split("=", 1)
-        if not (
-            _TRACESTATE_SIMPLE_KEY_RE.fullmatch(key)
-            or _TRACESTATE_MULTI_KEY_RE.fullmatch(key)
-        ):
-            return False
-        if key in seen:
-            return False
-        seen.add(key)
-        if (
-            not member_value
-            or len(member_value) > 256
-            or member_value.endswith(" ")
-            or any(
-                char in ",=" or ord(char) < 0x20 or ord(char) > 0x7E
-                for char in member_value
-            )
-        ):
-            return False
-    return True
-
-
 def _valid_carrier(carrier: Mapping[str, str]) -> bool:
     traceparent = carrier.get("traceparent")
-    tracestate = carrier.get("tracestate")
-    return bool(
-        traceparent is not None
-        and _valid_traceparent(traceparent)
-        and (tracestate is None or _valid_tracestate(tracestate))
-    )
+    return bool(traceparent is not None and _valid_traceparent(traceparent))
 
 
 def inject_trace_headers(
@@ -89,7 +46,7 @@ def inject_trace_headers(
     *,
     context: Context | None = None,
 ) -> dict[str, str]:
-    """Inject only W3C trace headers, returning a plain string dictionary."""
+    """Inject only W3C traceparent, returning a plain string dictionary."""
 
     carrier: dict[str, str] = {}
     _PROPAGATOR.inject(carrier, context=context)
@@ -159,7 +116,7 @@ def extract_trace_context(
 def extract_http_trace_context(
     headers: Mapping[str, str], *, logger: logging.Logger | None = None
 ) -> Context:
-    """Extract only traceparent/tracestate from HTTP headers."""
+    """Extract only traceparent from HTTP headers."""
 
     carrier: dict[str, str] = {}
     saw_trace_header = False

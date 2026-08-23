@@ -247,23 +247,25 @@ sequenceDiagram
     D->>V: SET dedupe:<event_id> NX EX ttl
     Note over D: retried delivery finds the key set, is dropped (still acked, never re-posted)
     D->>U: post placeholder ("On it...")
-    D->>V: XADD curie:runs {QueuedTurn}
+    D->>V: XADD curie:runs {QueuedTurn + W3C carrier metadata}
 
-    W->>V: XREADGROUP (consumer group)
+    W->>V: XREADGROUP (consumer group; extract carrier or start a root)
     W->>V: SET NX PX thread lock (routing CAS)
     W->>W: binding: resolve agent+version+bundle_ref by channel address
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
-        W->>R: POST /v1/event {message}
+        W->>R: POST /v1/event {message} + W3C Trace Context
     else turn already live for this thread
-        W->>R: POST /v1/steer {text}
+        W->>R: POST /v1/steer {text} + W3C Trace Context
         Note over W,R: 409 if the turn finished first (finish race), worker opens a fresh turn on the same idle sandbox
     end
 
     R->>A: model call (streaming)
     R-->>W: NDJSON: text_delta*, tool notes*, final
-    R--)O: gen_ai spans (agent.run -> generation -> tool)
+    D--)O: producer span + correlated lifecycle log
+    W--)O: consumer, routing, sandbox, HTTP, reply spans/events + logs
+    R--)O: child gen_ai spans (agent.run -> generation -> tool) + logs
 
     alt turn completes
         W->>V: markers (done / side_effect_flag as seen)
@@ -542,23 +544,30 @@ The write path runs down; the read path (arrows reversed) runs back up from
 Langfuse to whoever's asking:
 
 ```
-runner (OTLP spans, resource attr curie.session_id)
+API + dispatcher + worker + runner (OTLP spans and correlated logs)
   --> OTel Collector (OTLP gRPC 4317 / HTTP 4318 in)
         --> Langfuse v3 over HTTP (ClickHouse-backed)
               <-- apps/api Langfuse proxy (trace tree, metrics, cost)
                     <-- apps/ui Runs / Metrics / Cost / Logs views
 ```
 
-- The runner emits `gen_ai`-style spans (`agent.run -> generation -> tool`) with a resource including `service.name`, `curie.session_id`, and `curie.sandbox_id` ([`runner/src/curie_runner/otel.py`](runner/src/curie_runner/otel.py)). The `sandbox_id` is what lets a trace be tied back to the sandbox that served it.
+- **One turn is one causal trace across both async and HTTP boundaries.** The dispatcher (or an API queue producer) opens `send curie:runs` and injects W3C Trace Context into Valkey Stream metadata next to the unchanged `QueuedTurn` payload ([`apps/dispatcher/src/curie_dispatcher/queue.py::to_stream_fields`](apps/dispatcher/src/curie_dispatcher/queue.py), [`apps/api/src/curie_api/resumequeue.py::ResumeQueue.enqueue`](apps/api/src/curie_api/resumequeue.py)). The worker extracts that metadata into `process curie:runs`; missing metadata starts a valid root and malformed metadata is ignored with a value-free diagnostic ([`apps/worker/src/curie_worker/consumer.py::Consumer._process_span`](apps/worker/src/curie_worker/consumer.py)). `RunnerClient._request` then forwards the current W3C context over HTTP ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient._request`](apps/worker/src/curie_worker/runner_client.py)), making the runner's `agent.run -> generation -> tool` tree its descendant. Worker routing, sandbox lifecycle, reply completion, and stream settlement remain in that same trace.
+- **Four services emit through one bounded runtime.** API, dispatcher, worker, and runner use [`curie_telemetry.configure`](packages/telemetry/src/curie_telemetry/bootstrap.py::configure) for explicit trace and log providers. Resources contain process identity (`service.*`, `schema.version`, optional deployment environment); turn identity is attached to spans only after binding resolution, including `curie.sandbox_id` where known. Bounded batch processors, a two-second flush/shutdown ceiling, and handler detachment are owned by [`TelemetryRuntime`](packages/telemetry/src/curie_telemetry/bootstrap.py::TelemetryRuntime). Existing stderr diagnostics remain intact.
+- **Telemetry is closed and value-conscious.** Each emitter has an allowlisted attribute and event partition; recursive redaction covers span attributes, log bodies, logging arguments, and exception text before export ([`packages/telemetry/src/curie_telemetry/attributes.py`](packages/telemetry/src/curie_telemetry/attributes.py), [`packages/telemetry/src/curie_telemetry/redact.py`](packages/telemetry/src/curie_telemetry/redact.py)). Static lifecycle log events emitted while a span is current carry its trace and span ids without exporting prompts, tool content, secrets, or real transport identifiers.
+- **No endpoint means no exporter.** Standard `OTEL_EXPORTER_OTLP_*` variables configure HTTP/protobuf or gRPC per signal. With no endpoint (or `OTEL_SDK_DISABLED=true`) the runtime creates neither provider, queue, handler, nor network attempt; service behavior and stderr logging continue normally.
 - **Langfuse OTLP (OpenTelemetry Protocol) ingest is HTTP-only.** Services send to the OTel Collector (which may take gRPC or HTTP), and the collector always exports to Langfuse over HTTP. Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml). The load-bearing constraint is documented in [`CLAUDE.md`](CLAUDE.md).
 - The API reconstructs the tool-call tree from Langfuse's public API via `parentObservationId` ([`apps/api/src/curie_api/langfuse.py::build_tree`](apps/api/src/curie_api/langfuse.py)) and proxies metrics/cost ([`apps/api/src/curie_api/langfuse.py::LangfuseClient`](apps/api/src/curie_api/langfuse.py), surfaced at [`apps/api/src/curie_api/routers/observability.py`](apps/api/src/curie_api/routers/observability.py)).
 - The UI's Runs (`RealTraces.tsx`), Metrics (`RealMetrics.tsx`), Cost (`RealCost.tsx`), and Logs (`RealLogs.tsx`) views render these live in wired mode ([`apps/ui/src/views/obs/`](apps/ui/src/views/obs/)).
 
-The `sandbox_id` is also known worker-side (the affinity store and
-`SandboxHandle`), so a trace, its session, and its serving sandbox all line up.
+The `sandbox_id` is known worker-side (the affinity store and
+`SandboxHandle`) and is stamped on the relevant turn spans, so a trace, its session, and its serving sandbox all line up without putting per-turn identity on a process resource.
 The API hoists it out of the trace's observations onto the trace itself
 ([`apps/api/src/curie_api/langfuse.py::hoist_sandbox_id`](apps/api/src/curie_api/langfuse.py)),
 so sandbox identity is surfaced, not pending.
+
+This is a write-path foundation only. It does not add a second query API, change the
+Langfuse-backed read surfaces, make the backend installable, define harness-neutral
+token/cost telemetry, or expand agent trace discovery.
 
 **The observability CLI.** `curie local observability` prints the local
 observability surfaces — the console, Langfuse traces/cost, and the API base.

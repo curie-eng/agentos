@@ -12,8 +12,10 @@ run orchestration are the worker's job, not the dispatcher's.
 ## The queue seam (what the worker consumes)
 
 The dispatcher `XADD`s onto a Valkey Stream (`CURIE_STREAM`, default
-`curie:runs`). Each entry carries one field, `payload`, holding the JSON of a
-`QueuedTurn` (from `aci_protocol`). Its fields are channel-neutral; the
+`curie:runs`). Each entry carries `payload`, holding the JSON of a `QueuedTurn`
+(from `aci_protocol`), plus optional transport-owned W3C Trace Context metadata
+when a producer span is active. The carrier is not part of `QueuedTurn`; legacy
+payload-only entries remain valid. Its domain fields are channel-neutral; the
 parenthetical is what the Slack adapter maps onto each one:
 
 | field | meaning |
@@ -29,9 +31,9 @@ The worker reconstructs it with `from_stream_fields(fields)`, a module-level
 helper in `curie_dispatcher.queue`. The model lives in the frozen `aci_protocol`
 package (promoted out of the dispatcher in issue #7) so the producer and the
 Rust/TS consumers share one schema-gated contract instead of a hand-mirrored copy;
-the dispatcher's queue module owns only the Stream transport of it. The
-single-`payload`-field encoding keeps the seam explicit and lets fields be added
-without reshaping the Stream schema.
+the dispatcher's queue module owns only the Stream transport of it. Domain data
+stays inside `payload`; the only sibling field is the optional, bounded trace
+carrier consumed by the worker at the async boundary.
 
 ## Dedupe (idempotency)
 

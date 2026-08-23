@@ -9,6 +9,7 @@ from curie_telemetry.attributes import (
     SchemaValidatingSpanProcessor,
     attribute_types_for,
     event_names_for,
+    log_event_names_for,
     sanitize_attributes,
 )
 from opentelemetry.attributes import BoundedAttributes
@@ -29,6 +30,9 @@ WORKER_EVENTS = frozenset(
         "worker.dedupe.skip",
         "worker.lock.wait",
         "worker.lock.acquired",
+        "worker.queue.wait",
+        "worker.retry.scheduled",
+        "worker.retry.stopped",
         "worker.route.start",
         "worker.route.steer",
         "worker.route.finish_race",
@@ -53,6 +57,12 @@ def test_committed_artifact_has_shared_and_per_service_partitions() -> None:
     events = schema["events"]
     assert isinstance(events, dict)
     assert set(events) == set(SERVICES)
+    log_events = schema["log_events"]
+    assert isinstance(log_events, dict)
+    assert set(log_events) == set(SERVICES)
+    assert {
+        service: sorted(event_names_for(service)) for service in SERVICES
+    } == events
 
     runner = {**schema["shared"], **services["curie-runner"]}
     assert {
@@ -74,6 +84,33 @@ def test_committed_artifact_has_shared_and_per_service_partitions() -> None:
 def test_worker_event_vocabulary_is_closed_in_the_same_service_artifact() -> None:
     assert WORKER_EVENTS <= event_names_for("curie-worker")
     assert "worker.terminal" not in event_names_for("curie-api")
+
+
+def test_application_log_vocabulary_and_worker_queue_wait_type_are_closed() -> None:
+    assert log_event_names_for("curie-api") == frozenset(
+        {"http.server.completed", "http.server.failed"}
+    )
+    assert log_event_names_for("curie-runner") == frozenset(
+        {"agent.run.completed", "agent.run.failed"}
+    )
+    assert log_event_names_for("curie-dispatcher") == frozenset(
+        {"dispatcher.turn.enqueued"}
+    )
+    assert {
+        "worker.trace_context.invalid",
+        "worker.turn.completed",
+        "worker.turn.failed",
+    } <= log_event_names_for("curie-worker")
+    assert "worker.turn.completed" not in log_event_names_for("curie-api")
+    assert attribute_types_for("curie-worker")["curie.queue.wait_ms"] == "int"
+    assert sanitize_attributes("curie-worker", {"curie.queue.wait_ms": 17}) == {
+        "curie.queue.wait_ms": 17
+    }
+    assert sanitize_attributes("curie-worker", {"curie.queue.wait_ms": True}) == {}
+    schema = _schema()
+    assert {
+        service: sorted(log_event_names_for(service)) for service in SERVICES
+    } == schema["log_events"]
 
 
 def test_service_allowlist_is_shared_plus_its_partition_only() -> None:

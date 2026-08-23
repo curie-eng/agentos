@@ -34,6 +34,9 @@ from curie_test_support.valkey import (
     connect_or_skip,
 )
 from fastapi.testclient import TestClient
+from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
+    ExportLogsServiceRequest,
+)
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
 )
@@ -48,6 +51,7 @@ TURN_TEXT = "PLACEHOLDER_TURN_TEXT"
 class _OtlpCapture:
     server: ThreadingHTTPServer
     traces: list[ExportTraceServiceRequest] = field(default_factory=list)
+    logs: list[ExportLogsServiceRequest] = field(default_factory=list)
 
     @property
     def endpoint(self) -> str:
@@ -66,6 +70,10 @@ def _handler(capture_ref: list[_OtlpCapture]) -> type[BaseHTTPRequestHandler]:
                 request = ExportTraceServiceRequest()
                 request.ParseFromString(body)
                 capture_ref[0].traces.append(request)
+            elif self.path == "/v1/logs":
+                request = ExportLogsServiceRequest()
+                request.ParseFromString(body)
+                capture_ref[0].logs.append(request)
             assert self.path in {"/v1/traces", "/v1/logs"}
             self.send_response(200)
             self.end_headers()
@@ -162,6 +170,16 @@ def _spans(capture: _OtlpCapture) -> list[Any]:
     ]
 
 
+def _logs(capture: _OtlpCapture) -> list[Any]:
+    return [
+        record
+        for request in capture.logs
+        for resource_logs in request.resource_logs
+        for scope_logs in resource_logs.scope_logs
+        for record in scope_logs.log_records
+    ]
+
+
 def test_http_middleware_adopts_valid_context_and_ignores_bad_context_value_free(
     otlp_capture: _OtlpCapture,
     caplog: pytest.LogCaptureFixture,
@@ -173,6 +191,7 @@ def test_http_middleware_adopts_valid_context_and_ignores_bad_context_value_free
                 "/health?query=PLACEHOLDER_QUERY",
                 headers={
                     "traceparent": TRACEPARENT,
+                    "tracestate": "vendor=OPAQUE_TRACE_STATE_SENTINEL",
                     "authorization": "PLACEHOLDER_AUTH",
                 },
             )
@@ -191,7 +210,6 @@ def test_http_middleware_adopts_valid_context_and_ignores_bad_context_value_free
 
     allowed = {
         "http.request.method",
-        "server.address",
         "server.port",
         "http.response.status_code",
     }
@@ -200,9 +218,20 @@ def test_http_middleware_adopts_valid_context_and_ignores_bad_context_value_free
     assert "PLACEHOLDER_QUERY" not in exported
     assert "PLACEHOLDER_AUTH" not in exported
     assert malformed not in exported
+    assert "OPAQUE_TRACE_STATE_SENTINEL" not in exported
     warnings = " ".join(record.getMessage() for record in caplog.records)
     assert warnings.count("ignored malformed trace context") == 1
     assert malformed not in warnings
+    assert all("server.address" not in _attrs(span) for span in health_spans)
+    logs = _logs(otlp_capture)
+    assert [record.body.string_value for record in logs] == [
+        "http.server.completed",
+        "http.server.completed",
+        "http.server.completed",
+    ]
+    span_by_identity = {(span.trace_id, span.span_id) for span in health_spans}
+    assert all((record.trace_id, record.span_id) in span_by_identity for record in logs)
+    assert all(record.severity_text == "INFO" for record in logs)
 
 
 def test_channel_turn_writes_one_payload_plus_carrier_and_keeps_langfuse_identity(

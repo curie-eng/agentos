@@ -25,11 +25,12 @@ summary.
   no scan. Order is always claim -> post placeholder -> `XADD`, so a
   duplicate delivery can never produce a second placeholder. Do not reorder
   these three steps.
-- **The queue seam is one `payload` field, not a multi-field Stream entry.**
-  Each Stream entry carries a single `payload` field holding the
-  `QueuedTurn` JSON. This lets fields be added to the payload without
-  reshaping the Stream schema itself -- do not add a second top-level Stream
-  field for a new piece of data; put it inside the JSON payload.
+- **The queue seam is one domain `payload`, with transport metadata kept
+  outside it.** Each Stream entry carries `payload` holding the `QueuedTurn`
+  JSON. An optional bounded W3C Trace Context carrier is the one sanctioned
+  sibling field: it belongs to the Valkey transport, never the frozen domain
+  model, and payload-only legacy entries remain valid. New domain data still
+  goes through the frozen-contract process; do not grow ad hoc Stream fields.
 - **Reconnects are the supervisor's job, not the Slack client's.** The Bolt
   socket client self-heals transient drops; `dispatcher.supervisor.Supervisor`
   is the outer net for failures the client cannot recover from (connect

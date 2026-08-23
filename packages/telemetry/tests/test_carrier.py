@@ -27,11 +27,23 @@ def test_carrier_field_is_transport_metadata_not_a_payload_key() -> None:
     assert TRACE_CONTEXT_FIELD == "trace_context"
 
 
-def test_inject_emits_only_w3c_trace_headers_and_never_baggage() -> None:
+def test_inject_emits_only_traceparent_and_never_baggage_or_tracestate() -> None:
     provider = TracerProvider()
     tracer = provider.get_tracer("carrier-test")
     baggage_context = baggage.set_baggage("prompt", "do not transport this")
-    token = attach(baggage_context)
+    remote = trace.set_span_in_context(
+        trace.NonRecordingSpan(
+            trace.SpanContext(
+                trace_id=int(TRACE_ID, 16),
+                span_id=int(PARENT_ID, 16),
+                is_remote=True,
+                trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+                trace_state=trace.TraceState((("vendor", "opaque-state"),)),
+            )
+        ),
+        baggage_context,
+    )
+    token = attach(remote)
     try:
         with tracer.start_as_current_span("producer") as span:
             raw = inject_trace_context()
@@ -42,8 +54,10 @@ def test_inject_emits_only_w3c_trace_headers_and_never_baggage() -> None:
         detach(token)
         provider.shutdown()
 
-    assert set(carrier) <= {"traceparent", "tracestate"}
+    assert set(carrier) == {"traceparent"}
     assert "baggage" not in carrier
+    assert "tracestate" not in carrier
+    assert "opaque-state" not in raw
     assert "do not transport this" not in raw
     assert carrier["traceparent"].startswith(
         f"00-{span_context.trace_id:032x}-{span_context.span_id:016x}-"
@@ -76,6 +90,12 @@ def test_missing_carrier_returns_an_empty_context_without_a_warning(
             {
                 "traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01",
                 "baggage": "prompt=never",
+            }
+        ),
+        json.dumps(
+            {
+                "traceparent": f"00-{TRACE_ID}-{PARENT_ID}-01",
+                "tracestate": "vendor=opaque-state",
             }
         ),
         "x" * 4097,

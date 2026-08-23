@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -20,8 +21,10 @@ from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelt
 from curie_dispatcher.queue import to_stream_fields
 from curie_telemetry import TRACE_CONTEXT_FIELD, inject_trace_context
 from curie_telemetry.attributes import event_names_for
+from curie_worker import consumer as consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.consumer import Consumer
+from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.trace import SpanKind, StatusCode
 
@@ -34,6 +37,7 @@ _WORKER_EVENTS = frozenset(
         "messaging.ack",
         "messaging.pending",
         "messaging.dead_letter",
+        "worker.queue.wait",
         "worker.dedupe.checked",
         "worker.dedupe.skip",
         "worker.lock.wait",
@@ -42,6 +46,8 @@ _WORKER_EVENTS = frozenset(
         "worker.route.steer",
         "worker.route.finish_race",
         "worker.reply.final",
+        "worker.retry.scheduled",
+        "worker.retry.stopped",
         "worker.completion.settled",
         "worker.terminal",
     }
@@ -151,8 +157,21 @@ async def _reclaim_and_settle(consumer: Consumer) -> None:
 def test_valid_valkey_carrier_parents_process_span_and_success_acks(
     make_harness,
     span_recorder,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def go() -> None:
+        log_events: list[tuple[str, int, int]] = []
+
+        def record_log_event(
+            _logger: logging.Logger,
+            event: str,
+            *,
+            level: int = logging.INFO,
+        ) -> None:
+            context = trace.get_current_span().get_span_context()
+            log_events.append((event, level, context.span_id))
+
+        monkeypatch.setattr(consumer_module, "emit_log_event", record_log_event)
         async with make_harness(tracer=span_recorder.tracer) as h:
             h.runner.default_script = [Final(text="safe answer", status=DONE)]
             consumer = Consumer(
@@ -180,12 +199,18 @@ def test_valid_valkey_carrier_parents_process_span_and_success_acks(
             assert process.attributes["messaging.system"] == "valkey"
             assert process.attributes["messaging.destination.name"] == h.config.stream
             assert process.attributes["messaging.operation.type"] == "process"
+            assert isinstance(process.attributes["curie.queue.wait_ms"], int)
+            assert process.attributes["curie.queue.wait_ms"] >= 0
             assert process.context is not None
             assert process.context.trace_id == producer_context.trace_id
             assert process.parent is not None
             assert process.parent.span_id == producer_context.span_id
             assert "messaging.ack" in _event_names(process)
+            assert "worker.queue.wait" in _event_names(process)
             assert h.sink.last_text == "safe answer"
+            assert log_events == [
+                ("worker.turn.completed", logging.INFO, process.context.span_id)
+            ]
             pending = await h.async_redis.xpending(
                 h.config.stream, h.config.consumer_group
             )
@@ -193,6 +218,39 @@ def test_valid_valkey_carrier_parents_process_span_and_success_acks(
             assert all(
                 prompt not in _span_payload(span) for span in span_recorder.spans()
             )
+
+    asyncio.run(go())
+
+
+def test_queue_wait_uses_valkey_enqueue_time_and_malformed_ids_omit_safely(
+    make_harness,
+    span_recorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        async with make_harness(tracer=span_recorder.tracer) as h:
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                tracer=span_recorder.tracer,
+            )
+            monkeypatch.setattr(time, "time_ns", lambda: 1_700_000_001_500_000_000)
+
+            measured, _ = consumer._process_span("1700000000000-0", {})
+            measured.end()
+            malformed, _ = consumer._process_span("not-a-stream-id", {})
+            malformed.end()
+
+            measured_span, malformed_span = span_recorder.spans(
+                name="process curie:runs"
+            )
+            assert measured_span.attributes is not None
+            assert measured_span.attributes["curie.queue.wait_ms"] == 1_500
+            assert "worker.queue.wait" in _event_names(measured_span)
+            assert malformed_span.attributes is not None
+            assert "curie.queue.wait_ms" not in malformed_span.attributes
+            assert "worker.queue.wait" not in _event_names(malformed_span)
 
     asyncio.run(go())
 
@@ -270,8 +328,21 @@ def test_malformed_valkey_carrier_is_value_free_warning_and_fail_open(
 def test_processing_exception_marks_error_and_leaves_entry_pending(
     make_harness,
     span_recorder,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def go() -> None:
+        log_events: list[tuple[str, int, int]] = []
+
+        def record_log_event(
+            _logger: logging.Logger,
+            event: str,
+            *,
+            level: int = logging.INFO,
+        ) -> None:
+            context = trace.get_current_span().get_span_context()
+            log_events.append((event, level, context.span_id))
+
+        monkeypatch.setattr(consumer_module, "emit_log_event", record_log_event)
         async with make_harness(tracer=span_recorder.tracer) as h:
             consumer = Consumer(
                 redis=h.async_redis,
@@ -290,6 +361,10 @@ def test_processing_exception_marks_error_and_leaves_entry_pending(
             process = span_recorder.one("process curie:runs")
             assert process.status.status_code is StatusCode.ERROR
             assert "messaging.pending" in _event_names(process)
+            assert process.context is not None
+            assert log_events == [
+                ("worker.turn.failed", logging.ERROR, process.context.span_id)
+            ]
             pending = await h.async_redis.xpending_range(
                 h.config.stream,
                 h.config.consumer_group,
@@ -468,7 +543,15 @@ def test_classified_failure_marks_worker_turn_error_without_changing_retry_polic
             assert turn.status.status_code is StatusCode.ERROR
             assert turn.attributes is not None
             assert turn.attributes["curie.turn.outcome"] == "escalated"
-            assert {"worker.terminal", "worker.completion.settled"} <= _event_names(turn)
+            assert {
+                "worker.terminal",
+                "worker.completion.settled",
+                "worker.retry.scheduled",
+                "worker.retry.stopped",
+            } <= _event_names(turn)
+            assert [event.name for event in turn.events].count(
+                "worker.retry.scheduled"
+            ) == 2
 
     asyncio.run(go())
 
@@ -533,7 +616,10 @@ def test_killswitch_recheck_failure_closes_started_http_stream_before_consumptio
 
             assert killswitch.calls == 2
             assert h.runner.opened == ["preconsume"]
-            assert h.sink.last_text is None
+            # Preserve the pre-telemetry timing contract: the placeholder is
+            # updated before route/start, even when the post-start kill recheck
+            # later fails. The open response still closes below.
+            assert h.sink.last_text == h.config.booting_text
             assert not await h.async_redis.exists(h.config.done_key(event.event_id))
             clients = span_recorder.spans(kind=SpanKind.CLIENT)
             assert len(clients) == 2  # steer 409 followed by the accepted event stream

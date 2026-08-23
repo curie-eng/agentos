@@ -299,7 +299,7 @@ def test_runner_http_injects_w3c_separately_from_auth_and_never_baggage(
             headers = runner.headers[route]
             assert headers["Authorization"] == f"Bearer {auth}"
             assert headers["traceparent"].startswith(expected_prefix)
-            assert headers["tracestate"] == "vendor=opaque-example"
+            assert "tracestate" not in {name.lower() for name in headers}
             assert "baggage" not in {name.lower() for name in headers}
 
         spans = _client_spans(span_recorder)
@@ -312,7 +312,7 @@ def test_runner_http_injects_w3c_separately_from_auth_and_never_baggage(
             assert span.status.status_code is StatusCode.OK
             assert span.attributes is not None
             assert span.attributes["http.request.method"] == "POST"
-            assert span.attributes["server.address"] == "127.0.0.1"
+            assert span.attributes["server.address"] == "runner"
             assert span.attributes["server.port"] == port
             assert span.attributes["http.response.status_code"] == 200
             exported = _span_payload(span)
@@ -345,7 +345,7 @@ def test_non_200_ends_client_span_error_without_body_or_auth_leak(
         await server.start_server()
         client = RunnerClient(total_timeout_s=30.0, tracer=span_recorder.tracer)
         try:
-            with pytest.raises(RunnerError):
+            with pytest.raises(RunnerError, match=body):
                 await client.start_turn(
                     f"http://127.0.0.1:{server.port}",
                     _event(),
@@ -395,7 +395,7 @@ def test_decode_failure_ends_stream_span_error_without_line_content(
         client = RunnerClient(total_timeout_s=30.0, tracer=span_recorder.tracer)
         try:
             turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
-            with pytest.raises((json.JSONDecodeError, RunnerError)):
+            with pytest.raises(json.JSONDecodeError, match=r"line 1 column 1"):
                 await _drain(turn)
         finally:
             await client.close()

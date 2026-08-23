@@ -2183,7 +2183,7 @@ rung_local() {
                     ;;
                 malformed)
                     assert_local_otel_turn cli success "$control_session" \
-                        "$malformed_sentinel" "ignored malformed trace context"
+                        "$malformed_sentinel" "worker.trace_context.invalid"
                     ;;
                 failure)
                     assert_local_otel_turn cli failure "$control_session"

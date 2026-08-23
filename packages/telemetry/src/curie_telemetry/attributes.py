@@ -64,6 +64,7 @@ _SERVICES: dict[str, dict[str, str]] = {
         **_MESSAGING,
         **_ERROR,
         "curie.sandbox.outcome": "str",
+        "curie.queue.wait_ms": "int",
         "curie.turn.outcome": "str",
     },
     "curie-runner": {
@@ -89,8 +90,6 @@ _EVENTS: dict[str, frozenset[str]] = {
     ),
     "curie-dispatcher": frozenset(
         {
-            "dispatcher.agent_lookup.resolved",
-            "dispatcher.agent_lookup.unavailable",
             "dispatcher.dedupe.checked",
             "dispatcher.dedupe.skip",
             "dispatcher.placeholder.posted",
@@ -108,7 +107,10 @@ _EVENTS: dict[str, frozenset[str]] = {
             "worker.dedupe.skip",
             "worker.lock.acquired",
             "worker.lock.wait",
+            "worker.queue.wait",
             "worker.reply.final",
+            "worker.retry.scheduled",
+            "worker.retry.stopped",
             "worker.route.finish_race",
             "worker.route.start",
             "worker.route.steer",
@@ -116,6 +118,19 @@ _EVENTS: dict[str, frozenset[str]] = {
         }
     ),
     "curie-runner": frozenset(),
+}
+
+_LOG_EVENTS: dict[str, frozenset[str]] = {
+    "curie-api": frozenset({"http.server.completed", "http.server.failed"}),
+    "curie-dispatcher": frozenset({"dispatcher.turn.enqueued"}),
+    "curie-worker": frozenset(
+        {
+            "worker.trace_context.invalid",
+            "worker.turn.completed",
+            "worker.turn.failed",
+        }
+    ),
+    "curie-runner": frozenset({"agent.run.completed", "agent.run.failed"}),
 }
 
 _EXACT_TYPES: dict[str, type[object]] = {
@@ -163,6 +178,13 @@ def event_names_for(service_name: str) -> frozenset[str]:
 
     _require_service(service_name)
     return _EVENTS[service_name]
+
+
+def log_event_names_for(service_name: str) -> frozenset[str]:
+    """Return the exact value-free application log vocabulary for a service."""
+
+    _require_service(service_name)
+    return _LOG_EVENTS[service_name]
 
 
 def sanitize_attributes(
@@ -257,7 +279,7 @@ class SchemaValidatingSpanProcessor(SpanProcessor):
 
 
 class SchemaValidatingLogRecordProcessor(LogRecordProcessor):
-    """Redact bodies and close log attributes before the batch exporter."""
+    """Redact bodies and enforce value-free records before batch export."""
 
     def __init__(self, service_name: str) -> None:
         _require_service(service_name)
@@ -268,9 +290,15 @@ class SchemaValidatingLogRecordProcessor(LogRecordProcessor):
         record.body = cast(Any, redact_value(record.body))
         raw = record.attributes
         if isinstance(raw, BoundedAttributes):
-            _sanitize_bounded_attributes(self._service_name, raw)
+            was_immutable = raw._immutable  # noqa: SLF001
+            raw._immutable = False  # noqa: SLF001
+            try:
+                for key in list(raw.keys()):
+                    del raw[key]
+            finally:
+                raw._immutable = was_immutable  # noqa: SLF001
         else:
-            record.attributes = sanitize_attributes(self._service_name, raw)
+            record.attributes = {}
 
     def shutdown(self) -> None:
         return

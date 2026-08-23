@@ -36,6 +36,7 @@
       "messaging.system": "str"
     },
     "curie-worker": {
+      "curie.queue.wait_ms": "int",
       "curie.sandbox.outcome": "str",
       "curie.turn.outcome": "str",
       "error.type": "str",
@@ -70,8 +71,6 @@
       "trace_context.invalid"
     ],
     "curie-dispatcher": [
-      "dispatcher.agent_lookup.resolved",
-      "dispatcher.agent_lookup.unavailable",
       "dispatcher.dedupe.checked",
       "dispatcher.dedupe.skip",
       "dispatcher.placeholder.posted",
@@ -87,12 +86,33 @@
       "worker.dedupe.skip",
       "worker.lock.acquired",
       "worker.lock.wait",
+      "worker.queue.wait",
       "worker.reply.final",
+      "worker.retry.scheduled",
+      "worker.retry.stopped",
       "worker.route.finish_race",
       "worker.route.start",
       "worker.route.steer",
       "worker.terminal"
     ],
     "curie-runner": []
+  },
+  "log_events": {
+    "curie-api": [
+      "http.server.completed",
+      "http.server.failed"
+    ],
+    "curie-dispatcher": [
+      "dispatcher.turn.enqueued"
+    ],
+    "curie-worker": [
+      "worker.trace_context.invalid",
+      "worker.turn.completed",
+      "worker.turn.failed"
+    ],
+    "curie-runner": [
+      "agent.run.completed",
+      "agent.run.failed"
+    ]
   }
 }

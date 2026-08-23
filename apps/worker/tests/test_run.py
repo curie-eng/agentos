@@ -616,12 +616,14 @@ def test_main_configures_worker_telemetry_and_shuts_down_after_runtime(
     assert order.index("ordinary-runtime-finished") < order.index("telemetry-shutdown")
 
 
-def _docker_envs(client: DockerSandboxClient) -> list[str]:
+def _docker_envs(client: DockerSandboxClient) -> tuple[list[str], dict[str, str]]:
     calls: list[list[str]] = []
+    environments: list[dict[str, str]] = []
 
     def record(args: list[str], *, check: bool = True) -> str:
         del check
         calls.append(args)
+        environments.append(dict(client._docker_command_environment()))
         return ""
 
     client._docker = record  # type: ignore[method-assign]
@@ -632,7 +634,10 @@ def _docker_envs(client: DockerSandboxClient) -> list[str]:
     )
     assert len(calls) == 1
     argv = calls[0]
-    return [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+    return (
+        [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"],
+        environments[0],
+    )
 
 
 def test_docker_worker_uses_private_runner_relay_as_child_standard_endpoint(
@@ -657,10 +662,13 @@ def test_docker_worker_uses_private_runner_relay_as_child_standard_endpoint(
     )
     assert isinstance(client, DockerSandboxClient)
 
-    child_env = _docker_envs(client)
-    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={runner_endpoint}" in child_env
-    assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in child_env
-    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={host_endpoint}" not in child_env
+    child_env, command_env = _docker_envs(client)
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in child_env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" in child_env
+    assert all(runner_endpoint not in entry for entry in child_env)
+    assert all(host_endpoint not in entry for entry in child_env)
+    assert command_env["OTEL_EXPORTER_OTLP_ENDPOINT"] == runner_endpoint
+    assert command_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
     assert "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT" not in {
         entry.partition("=")[0] for entry in child_env
     }
@@ -685,9 +693,12 @@ def test_docker_runner_relay_defaults_to_standard_endpoint_outside_compose(
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
-    child_env = _docker_envs(client)
-    assert f"OTEL_EXPORTER_OTLP_ENDPOINT={endpoint}" in child_env
-    assert "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf" in child_env
+    child_env, command_env = _docker_envs(client)
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in child_env
+    assert "OTEL_EXPORTER_OTLP_PROTOCOL" in child_env
+    assert all(endpoint not in entry for entry in child_env)
+    assert command_env["OTEL_EXPORTER_OTLP_ENDPOINT"] == endpoint
+    assert command_env["OTEL_EXPORTER_OTLP_PROTOCOL"] == "http/protobuf"
 
 
 def test_docker_runner_with_both_endpoints_blank_injects_no_exporter_env(
@@ -709,6 +720,50 @@ def test_docker_runner_with_both_endpoints_blank_injects_no_exporter_env(
         _SUB,
     )
     assert isinstance(client, DockerSandboxClient)
-    child_names = {entry.partition("=")[0] for entry in _docker_envs(client)}
+    child_env, command_env = _docker_envs(client)
+    child_names = {entry.partition("=")[0] for entry in child_env}
     assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in child_names
     assert "OTEL_EXPORTER_OTLP_PROTOCOL" not in child_names
+    assert command_env == {}
+
+
+def test_docker_runner_relays_complete_standard_exporter_config_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        DockerSandboxClient,
+        "ensure_image",
+        lambda self: None,
+        raising=False,
+    )
+    private_endpoint = "https://collector.example.com:4318"
+    headers = "authorization=Bearer PRIVATE-OTEL-HEADER"
+    env = {
+        "CURIE_SANDBOX_SUBSTRATE": "docker",
+        "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT": private_endpoint,
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://traces.example.com/v1/traces",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://logs.example.com/v1/logs",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "http/protobuf",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "grpc",
+        "OTEL_EXPORTER_OTLP_HEADERS": headers,
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE": "/certs/traces.pem",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE": "/certs/logs-client.pem",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY": "/certs/logs-client.key",
+        "OTEL_EXPORTER_OTLP_TIMEOUT": "1.5",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION": "gzip",
+        "OTEL_EXPORTER_OTLP_LOGS_INSECURE": "false",
+    }
+    client = _sandbox_client(WorkerConfig(fake_model=True), env, _SUB)
+    assert isinstance(client, DockerSandboxClient)
+
+    child_env, command_env = _docker_envs(client)
+    expected_names = {
+        name for name in env if name.startswith("OTEL_EXPORTER_OTLP_")
+    }
+    expected_names.add("OTEL_EXPORTER_OTLP_ENDPOINT")
+    assert expected_names <= set(child_env)
+    assert "CURIE_RUNNER_OTEL_EXPORTER_OTLP_ENDPOINT" not in child_env
+    assert command_env["OTEL_EXPORTER_OTLP_ENDPOINT"] == private_endpoint
+    assert command_env["OTEL_EXPORTER_OTLP_HEADERS"] == headers
+    assert all(headers not in arg for arg in child_env)
+    assert all(private_endpoint not in arg for arg in child_env)

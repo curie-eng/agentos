@@ -142,6 +142,7 @@ def emit_turn(
         {
             "traceId": trace_id,
             "spanId": ids["agent"],
+            "severityText": "ERROR" if outcome == "failure" else "INFO",
             "body": {"stringValue": log_body},
             "attributes": [],
         }
@@ -172,7 +173,7 @@ def emit_controls(output: Path, agent_id: str) -> dict[str, Any]:
             topology="dispatcher" if label == "dispatcher" else "cli",
             outcome="failure" if label == "failure" else "success",
             warning=(
-                "ignored malformed trace context" if label == "malformed" else None
+                "worker.trace_context.invalid" if label == "malformed" else None
             ),
         )
     return {

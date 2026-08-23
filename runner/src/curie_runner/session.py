@@ -36,6 +36,7 @@ from aci_protocol import (
     to_ndjson_line,
 )
 from claude_agent_sdk import AssistantMessage, ResultMessage
+from curie_telemetry import emit_log_event
 
 from .adapter import ModelSession
 from .approval import ApprovalGate
@@ -485,6 +486,7 @@ class SessionRunner:
                             self._status.value,
                             int((time.monotonic() - start) * 1000),
                         )
+                        emit_log_event(logger, "agent.run.completed")
                     # Persist the completed turn to the durable transcript so a
                     # restarted sandbox can rehydrate this thread (#20).
                     await self._record_turn(event, state)
@@ -510,6 +512,11 @@ class SessionRunner:
                             type(exc).__name__,
                             exc,
                             int((time.monotonic() - start) * 1000),
+                        )
+                        emit_log_event(
+                            logger,
+                            "agent.run.failed",
+                            level=logging.ERROR,
                         )
                     yield to_ndjson_line(
                         ErrorEvent(message=f"runner error: {exc}", classification="runner-error")

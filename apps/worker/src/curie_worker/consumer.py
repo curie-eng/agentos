@@ -42,7 +42,7 @@ import time
 from contextvars import ContextVar
 
 from curie_dispatcher.queue import from_stream_fields
-from curie_telemetry import TRACE_CONTEXT_FIELD, extract_trace_context
+from curie_telemetry import TRACE_CONTEXT_FIELD, emit_log_event, extract_trace_context
 from curie_telemetry.attributes import sanitize_attributes
 from opentelemetry import trace
 from opentelemetry.context import attach, detach
@@ -103,6 +103,7 @@ _ACTIVE_PROCESS_SPAN: ContextVar[Span | None] = ContextVar(
     "curie_worker_active_process_span",
     default=None,
 )
+_MAX_QUEUE_WAIT_MS = 31_536_000_000
 
 
 class Consumer(StreamConsumer):
@@ -227,7 +228,22 @@ class Consumer(StreamConsumer):
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
 
-    def _process_span(self, fields: dict[str, str]) -> tuple[Span, bool]:
+    @staticmethod
+    def _queue_wait_ms(entry_id: str) -> int | None:
+        """Return bounded Valkey enqueue-to-process latency from its stream ID."""
+
+        millis, separator, _sequence = entry_id.partition("-")
+        if separator != "-" or not millis.isdigit():
+            return None
+        enqueued_ms = int(millis)
+        now_ms = time.time_ns() // 1_000_000
+        return min(max(0, now_ms - enqueued_ms), _MAX_QUEUE_WAIT_MS)
+
+    def _process_span(
+        self,
+        entry_id: str,
+        fields: dict[str, str],
+    ) -> tuple[Span, bool]:
         """Start a process span from optional transport-owned W3C metadata.
 
         ``extract_trace_context`` owns all bounds and value-free diagnostics.
@@ -239,13 +255,17 @@ class Consumer(StreamConsumer):
         parent = extract_trace_context(raw, logger=logger)
         parent_context = trace.get_current_span(parent).get_span_context()
         malformed = bool(raw) and not parent_context.is_valid
+        raw_attributes: dict[str, object] = {
+            "messaging.system": "valkey",
+            "messaging.destination.name": self._config.stream,
+            "messaging.operation.type": "process",
+        }
+        queue_wait_ms = self._queue_wait_ms(entry_id)
+        if queue_wait_ms is not None:
+            raw_attributes["curie.queue.wait_ms"] = queue_wait_ms
         attributes = sanitize_attributes(
             "curie-worker",
-            {
-                "messaging.system": "valkey",
-                "messaging.destination.name": self._config.stream,
-                "messaging.operation.type": "process",
-            },
+            raw_attributes,
         )
         span = self._tracer.start_span(
             "process curie:runs",
@@ -255,6 +275,8 @@ class Consumer(StreamConsumer):
             record_exception=False,
             set_status_on_exception=False,
         )
+        if queue_wait_ms is not None:
+            span.add_event("worker.queue.wait")
         return span, malformed
 
     @staticmethod
@@ -262,12 +284,17 @@ class Consumer(StreamConsumer):
         span.set_status(Status(StatusCode.ERROR if error else StatusCode.OK))
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
-        span, malformed = self._process_span(fields)
+        span, malformed = self._process_span(entry_id, fields)
         context_token = attach(set_span_in_context(span))
         active_token = _ACTIVE_PROCESS_SPAN.set(span)
         try:
             if malformed:
                 span.add_event("trace_context.invalid")
+                emit_log_event(
+                    logger,
+                    "worker.trace_context.invalid",
+                    level=logging.WARNING,
+                )
             try:
                 qevent = from_stream_fields(fields)
             except Exception:
@@ -285,6 +312,7 @@ class Consumer(StreamConsumer):
                 # Leave the entry pending: XAUTOCLAIM will reclaim and retry.
                 span.add_event("messaging.pending")
                 self._finish_process_span(span, error=True)
+                emit_log_event(logger, "worker.turn.failed", level=logging.ERROR)
                 logger.exception("processing failed for entry %s; left pending", entry_id)
                 return
             try:
@@ -292,9 +320,15 @@ class Consumer(StreamConsumer):
             except Exception:
                 span.add_event("messaging.pending")
                 self._finish_process_span(span, error=True)
+                emit_log_event(logger, "worker.turn.failed", level=logging.ERROR)
                 raise
             span.add_event("messaging.ack")
             self._finish_process_span(span, error=outcome == "escalated")
+            emit_log_event(
+                logger,
+                "worker.turn.failed" if outcome == "escalated" else "worker.turn.completed",
+                level=logging.ERROR if outcome == "escalated" else logging.INFO,
+            )
         except BaseException:
             self._finish_process_span(span, error=True)
             raise
@@ -339,12 +373,17 @@ class Consumer(StreamConsumer):
             self._finish_process_span(active, error=True)
             return
 
-        span, malformed = self._process_span(fields or {})
+        span, malformed = self._process_span(entry_id, fields or {})
         context_token = attach(set_span_in_context(span))
         active_token = _ACTIVE_PROCESS_SPAN.set(span)
         try:
             if malformed:
                 span.add_event("trace_context.invalid")
+                emit_log_event(
+                    logger,
+                    "worker.trace_context.invalid",
+                    level=logging.WARNING,
+                )
             span.add_event("messaging.dead_letter")
             await super()._dead_letter(
                 entry_id,

@@ -25,6 +25,7 @@ from .attributes import (
     SchemaValidatingSpanProcessor,
     attribute_types_for,
 )
+from .logs import CuratedLogEventFilter
 from .redact import RedactingLogFilter, install_logging_redaction
 
 _MAX_QUEUE_SIZE = 2048
@@ -164,18 +165,6 @@ def _logger_provider(
     return provider
 
 
-class _ServiceLogFilter(logging.Filter):
-    def __init__(self, service_name: str) -> None:
-        super().__init__()
-        self._prefixes = (
-            service_name,
-            service_name.replace("-", "_"),
-        )
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.name.startswith(self._prefixes)
-
-
 def _bounded_calls(
     calls: tuple[Callable[[], object], ...], timeout_millis: int
 ) -> bool:
@@ -248,13 +237,13 @@ class TelemetryRuntime:
             if self._shutdown_started:
                 return
             if not any(
+                isinstance(item, CuratedLogEventFilter) for item in handler.filters
+            ):
+                handler.addFilter(CuratedLogEventFilter(self.service_name))
+            if not any(
                 isinstance(item, RedactingLogFilter) for item in handler.filters
             ):
                 handler.addFilter(RedactingLogFilter())
-            if not any(
-                isinstance(item, _ServiceLogFilter) for item in handler.filters
-            ):
-                handler.addFilter(_ServiceLogFilter(self.service_name))
             if (
                 default_level is not None
                 and logger.level == logging.NOTSET

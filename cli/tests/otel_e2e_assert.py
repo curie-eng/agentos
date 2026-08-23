@@ -55,6 +55,10 @@ def _status(record: dict[str, Any]) -> str:
     return str(record.get("status", {}).get("code", "")).upper()
 
 
+def _severity(record: dict[str, Any]) -> str:
+    return str(record.get("severityText", "")).upper()
+
+
 def _descends(child: dict[str, Any], ancestor: dict[str, Any], spans: list[dict[str, Any]]) -> bool:
     by_id = {_id(span, "spanId"): span for span in spans}
     cursor = child
@@ -135,6 +139,14 @@ def assert_turn(
         if _id(record, "traceId") == trace_id and _id(record, "spanId")
     ]
     assert correlated, "the causal trace has no trace-correlated OTLP logs"
+    if outcome == "failure":
+        agent_span_id = _id(agent, "spanId")
+        assert any(
+            _id(record, "traceId") == agent_trace_id
+            and _id(record, "spanId") == agent_span_id
+            and _severity(record) == "ERROR"
+            for record in logs
+        ), "the failing agent.run span has no correlated ERROR-severity OTLP log"
     raw = json.dumps({"spans": tree, "logs": correlated})
     if forbidden:
         assert forbidden not in raw

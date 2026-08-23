@@ -71,7 +71,11 @@ def test_create_claim_argv_carries_boot_env() -> None:
     assert "CURIE_RUNNER_PORT=8080" in envs
     assert 'CURIE_BUDGET={"max_usd_per_day":5.0}' in envs
     assert "CURIE_FAKE_MODEL=1" in envs
-    assert "OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:4318" in envs
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in envs
+    assert all("http://otel:4318" not in arg for arg in argv)
+    assert client.call_environments[0]["OTEL_EXPORTER_OTLP_ENDPOINT"] == (
+        "http://otel:4318"
+    )
     assert argv[-1] == "curie-runner"
 
 
