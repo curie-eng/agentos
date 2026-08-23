@@ -198,6 +198,7 @@ LOCAL_STACK_OWNED=0
 OTEL_E2E_COLLECTOR_MUTATED=0
 OTEL_E2E_COLLECTOR_WAS_RUNNING=0
 OTEL_E2E_OUTPUT=""
+OTEL_E2E_THREAD_HASHES=""
 
 # Cross-rung artifact identity, pinned by the first rung to report a digest and
 # matched by every later one (see assert_bundle_identity). Empty until then.
@@ -307,6 +308,23 @@ cleanup() {
             docker rm -f "$survivor" >/dev/null 2>&1
         done
     fi
+    # On a reused stack, release only sandboxes created for this ladder's
+    # cryptographically-derived thread hashes. Never sweep the host-wide label:
+    # another session may have created a sandbox after our run began.
+    if (( ! LOCAL_STACK_OWNED )) && [[ -n "$OTEL_E2E_THREAD_HASHES" ]]; then
+        local thread_hash sandbox_ids
+        while IFS= read -r thread_hash; do
+            [[ -n "$thread_hash" ]] || continue
+            sandbox_ids="$(docker ps -aq \
+                --filter "label=$SANDBOX_LABEL" \
+                --filter "label=curietech.ai/thread-hash=$thread_hash" 2>/dev/null)"
+            if [[ -n "$sandbox_ids" ]]; then
+                echo "sweeping ladder-owned sandbox(es) for thread hash $thread_hash"
+                # shellcheck disable=SC2086
+                docker rm -f $sandbox_ids >/dev/null 2>&1
+            fi
+        done <<< "$OTEL_E2E_THREAD_HASHES"
+    fi
     rm -rf "$WORKDIR"
     exit "$code"
 }
@@ -329,6 +347,340 @@ prepare_local_otel_evidence() {
         -f "$REPO_ROOT/cli/tests/fixtures/otel/compose.override.yaml" \
         up -d --no-deps --force-recreate otel-collector >/dev/null
     OTEL_E2E_COLLECTOR_MUTATED=1
+}
+
+remember_otel_thread() {
+    local thread="$1" thread_hash
+    thread_hash="$(printf '%s' "$thread" | sha256sum | cut -c1-10)"
+    if [[ "$OTEL_E2E_THREAD_HASHES" != *"$thread_hash"* ]]; then
+        OTEL_E2E_THREAD_HASHES="${OTEL_E2E_THREAD_HASHES}${thread_hash}"$'\n'
+    fi
+}
+
+assert_local_otel_turn() {
+    local topology="$1" outcome="$2" session_id="$3"
+    local forbidden="${4:-}" warning="${5:-}" ready=0
+    local args=(
+        --traces "$OTEL_E2E_OUTPUT/traces.json"
+        --logs "$OTEL_E2E_OUTPUT/logs.json"
+        --topology "$topology"
+        --outcome "$outcome"
+        --session-id "$session_id"
+    )
+    [[ -z "$forbidden" ]] || args+=(--forbidden "$forbidden")
+    [[ -z "$warning" ]] || args+=(--require-warning "$warning")
+    for _ in $(seq 1 100); do
+        if python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" "${args[@]}" \
+            >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 0.2
+    done
+    (( ready )) || {
+        python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" "${args[@]}"
+        return 1
+    }
+    python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" "${args[@]}"
+}
+
+run_local_otel_transport_controls() {
+    local agent_id="$1"
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:24318 \
+    OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+    uv run python - "$agent_id" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+import redis
+from aci_protocol import QueuedTurn, ReplyHandle, STREAM_PAYLOAD_FIELD, TurnSource
+from curie_dispatcher.config import DispatcherConfig
+from curie_dispatcher.handlers import process_event
+from curie_telemetry import configure
+from curie_telemetry.carrier import TRACE_CONTEXT_FIELD
+
+AGENT_ID = sys.argv[1]
+CHANNEL = "C0LOCALDEV"
+AUTHOR = "U0EXAMPLE1"
+STREAM = "curie:runs"
+API = "http://127.0.0.1:28000"
+API_KEY = "curie-dev-key"
+FAILURE_MARKER = "[fake:runner-error]"
+MALFORMED_SENTINEL = "otel-malformed-carrier-private-value"
+REDACTION_SENTINEL = "sk-" + "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE0000"
+
+
+class ReplyCapture(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.updates: dict[str, list[str]] = {}
+        super().__init__(("127.0.0.1", 8155), handler())
+
+    def record(self, raw: bytes, content_type: str) -> str:
+        text = ""
+        ts = ""
+        if "json" in content_type:
+            payload = json.loads(raw or b"{}")
+            text = str(payload.get("text", ""))
+            ts = str(payload.get("ts", ""))
+        else:
+            payload = urllib.parse.parse_qs(raw.decode())
+            text = payload.get("text", [""])[0]
+            ts = payload.get("ts", [""])[0]
+        if ts:
+            with self.condition:
+                self.updates.setdefault(ts, []).append(text)
+                self.condition.notify_all()
+        return ts
+
+    def wait_for(self, ts: str, needle: str, timeout: float = 90.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while not any(needle in value for value in self.updates.get(ts, [])):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"no chat.update for {ts!r} contained {needle!r}; "
+                        f"observed={self.updates.get(ts, [])!r}"
+                    )
+                self.condition.wait(min(remaining, 0.25))
+
+
+def handler() -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            server = self.server
+            assert isinstance(server, ReplyCapture)
+            raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+            ts = server.record(raw, self.headers.get("content-type", ""))
+            body = json.dumps(
+                {"ok": True, "ts": ts or "stub-ts", "message": {"ts": ts or "stub-ts"}}
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    return Handler
+
+
+def api_request(path: str, method: str = "GET") -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{API}{path}", method=method, headers={"X-API-Key": API_KEY}
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
+        return json.loads(response.read())
+
+
+def release(thread: str) -> None:
+    encoded = urllib.parse.quote(thread, safe="")
+    path = f"/agents/{AGENT_ID}/threads/{encoded}/reset"
+    assert api_request(path, "POST")["requested"] is True
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if api_request(path)["requested"] is False:
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"sandbox release did not settle for thread {thread}")
+
+
+def turn(label: str, text: str) -> tuple[QueuedTurn, str]:
+    token = uuid.uuid4().hex[:12]
+    thread = f"otel-{label}-{token}"
+    placeholder = f"placeholder-{label}-{token}"
+    return (
+        QueuedTurn(
+            event_id=f"Ev-otel-{label}-{token}",
+            conversation_id=thread,
+            author=AUTHOR,
+            text=text,
+            source=TurnSource.SLACK,
+            reply_handle=ReplyHandle(
+                kind="slack",
+                channel=CHANNEL,
+                placeholder=placeholder,
+                endpoint=None,
+                adapter=None,
+            ),
+            received_at=datetime.now(UTC).isoformat(),
+        ),
+        placeholder,
+    )
+
+
+def enqueue(
+    client: redis.Redis,
+    capture: ReplyCapture,
+    label: str,
+    text: str,
+    *,
+    carrier: str | None = None,
+    final_contains: str = "all done",
+) -> str:
+    queued, placeholder = turn(label, text)
+    fields = {STREAM_PAYLOAD_FIELD: queued.model_dump_json()}
+    if carrier is not None:
+        fields[TRACE_CONTEXT_FIELD] = carrier
+    client.xadd(STREAM, fields)
+    capture.wait_for(placeholder, final_contains)
+    release(queued.conversation_id)
+    return queued.conversation_id
+
+
+client = redis.Redis(
+    host="127.0.0.1", port=26379, password="valkeypass", decode_responses=True
+)
+capture = ReplyCapture()
+server_thread = threading.Thread(target=capture.serve_forever, daemon=True)
+server_thread.start()
+results: dict[str, str] = {}
+try:
+    dispatcher_runtime = configure(
+        service_name="curie-dispatcher", service_version="e2e"
+    )
+    dispatcher_token = uuid.uuid4().hex[:12]
+    dispatcher_thread = f"otel-dispatcher-{dispatcher_token}"
+    dispatcher_placeholder = f"placeholder-dispatcher-{dispatcher_token}"
+
+    class WebClient:
+        def chat_postMessage(self, **_kwargs: object) -> dict[str, str]:
+            return {"ts": dispatcher_placeholder}
+
+    config = DispatcherConfig(
+        valkey_host="127.0.0.1",
+        valkey_port=26379,
+        valkey_password="valkeypass",
+        stream=STREAM,
+        dedupe_prefix=f"curie:e2e:dispatcher:{dispatcher_token}:",
+        api_base_url=API,
+        api_key=API_KEY,
+    )
+    stream_id = process_event(
+        body={"event_id": f"Ev-otel-dispatcher-{dispatcher_token}"},
+        event={
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "user": AUTHOR,
+            "text": "dispatcher propagation control",
+            "ts": dispatcher_thread,
+        },
+        web_client=WebClient(),  # type: ignore[arg-type]
+        redis_client=client,
+        config=config,
+        clock=lambda: datetime.now(UTC).isoformat(),
+        tracer=dispatcher_runtime.tracer,
+    )
+    assert stream_id
+    dispatcher_runtime.force_flush(timeout_millis=500)
+    capture.wait_for(dispatcher_placeholder, "all done")
+    release(dispatcher_thread)
+    dispatcher_runtime.shutdown(timeout_millis=2_000)
+    results["dispatcher"] = dispatcher_thread
+
+    results["missing"] = enqueue(
+        client,
+        capture,
+        "missing",
+        "missing carrier compatibility control",
+    )
+    results["malformed"] = enqueue(
+        client,
+        capture,
+        "malformed",
+        "malformed carrier compatibility control",
+        carrier=json.dumps(
+            {"traceparent": "00-not-valid", "unexpected": MALFORMED_SENTINEL}
+        ),
+    )
+    results["failure"] = enqueue(
+        client,
+        capture,
+        "failure",
+        FAILURE_MARKER,
+        final_contains="Flagging for a human",
+    )
+    results["recovery"] = enqueue(
+        client,
+        capture,
+        "recovery",
+        "ordinary input after the injected failure",
+    )
+    results["redaction"] = enqueue(
+        client,
+        capture,
+        "redaction",
+        f"prompt={REDACTION_SENTINEL}",
+    )
+finally:
+    capture.shutdown()
+    capture.server_close()
+    server_thread.join(timeout=2)
+    client.close()
+
+print(
+    json.dumps(
+        {
+            "threads": results,
+            "malformed_sentinel": MALFORMED_SENTINEL,
+            "redaction_sentinel": REDACTION_SENTINEL,
+        },
+        sort_keys=True,
+    )
+)
+PY
+}
+
+run_no_endpoint_runtime_probe() {
+    env \
+        -u OTEL_EXPORTER_OTLP_ENDPOINT \
+        -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
+        -u OTEL_EXPORTER_OTLP_LOGS_ENDPOINT \
+        -u OTEL_EXPORTER_OTLP_PROTOCOL \
+        -u OTEL_EXPORTER_OTLP_TRACES_PROTOCOL \
+        -u OTEL_EXPORTER_OTLP_LOGS_PROTOCOL \
+        uv run python - <<'PY'
+import logging
+
+from curie_telemetry import configure
+
+logging.basicConfig(level=logging.INFO)
+for service_name in (
+    "curie-api",
+    "curie-dispatcher",
+    "curie-worker",
+    "curie-runner",
+):
+    runtime = configure(service_name=service_name, service_version="e2e-no-endpoint")
+    with runtime.tracer.start_as_current_span("no-endpoint.control"):
+        logging.getLogger(service_name).info("no-endpoint diagnostic control")
+    runtime.force_flush(timeout_millis=100)
+    runtime.shutdown(timeout_millis=500)
+PY
+}
+
+otel_file_size() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        stat -c '%s' "$path"
+    else
+        printf '0'
+    fi
 }
 
 # The ONE place the fake/live asymmetry is stated. There is no shared
@@ -1800,31 +2152,64 @@ rung_local() {
 
     echo
     echo "=== assert the honest worker-rooted causal trace and correlated logs ==="
-    local thread session_id otel_ready=0
+    local thread session_id
     thread="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["thread"])')"
     session_id="agent-${agent_id}-thread-${thread}"
-    for _ in $(seq 1 25); do
-        if python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
-            --traces "$OTEL_E2E_OUTPUT/traces.json" \
-            --logs "$OTEL_E2E_OUTPUT/logs.json" \
-            --topology cli --outcome success --session-id "$session_id" \
-            >/dev/null 2>&1; then
-            otel_ready=1
-            break
-        fi
-        sleep 0.2
-    done
-    (( otel_ready )) || {
-        python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
-            --traces "$OTEL_E2E_OUTPUT/traces.json" \
-            --logs "$OTEL_E2E_OUTPUT/logs.json" \
-            --topology cli --outcome success --session-id "$session_id"
-        return 1
-    }
-    python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
-        --traces "$OTEL_E2E_OUTPUT/traces.json" \
-        --logs "$OTEL_E2E_OUTPUT/logs.json" \
-        --topology cli --outcome success --session-id "$session_id"
+    remember_otel_thread "$thread"
+    assert_local_otel_turn cli success "$session_id"
+
+    if [[ "$LIVE" == "0" ]]; then
+        echo
+        echo "=== drive dispatcher and transport-control turns through real Valkey ==="
+        assert_stub_port_free
+        local control_json malformed_sentinel redaction_sentinel
+        local label control_thread control_session
+        control_json="$(run_local_otel_transport_controls "$agent_id")"
+        printf '%s\n' "$control_json"
+        malformed_sentinel="$(printf '%s' "$control_json" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["malformed_sentinel"])')"
+        redaction_sentinel="$(printf '%s' "$control_json" | python3 -c \
+            'import json,sys; print(json.load(sys.stdin)["redaction_sentinel"])')"
+
+        while IFS=$'\t' read -r label control_thread; do
+            remember_otel_thread "$control_thread"
+            control_session="agent-${agent_id}-thread-${control_thread}"
+            case "$label" in
+                dispatcher)
+                    assert_local_otel_turn dispatcher success "$control_session"
+                    ;;
+                missing)
+                    assert_local_otel_turn cli success "$control_session"
+                    ;;
+                malformed)
+                    assert_local_otel_turn cli success "$control_session" \
+                        "$malformed_sentinel" "ignored malformed trace context"
+                    ;;
+                failure)
+                    assert_local_otel_turn cli failure "$control_session"
+                    ;;
+                recovery)
+                    # Falsifiable control for the injected failure: ordinary
+                    # input immediately afterward must still be explicitly OK.
+                    assert_local_otel_turn cli success "$control_session"
+                    ;;
+                redaction)
+                    assert_local_otel_turn cli success "$control_session" \
+                        "$redaction_sentinel"
+                    ;;
+                *)
+                    echo "unexpected OTEL control label: $label" >&2
+                    return 1
+                    ;;
+            esac
+        done < <(printf '%s' "$control_json" | python3 -c '
+import json, sys
+for label, thread in sorted(json.load(sys.stdin)["threads"].items()):
+    print(f"{label}\t{thread}")
+')
+    else
+        echo "OTEL injected-failure controls are sealed-fake-only; live mode keeps its real model unchanged"
+    fi
 
     echo
     echo "=== curie local eval --dry-run (suite parity) ==="
@@ -1838,6 +2223,55 @@ rung_local() {
         echo
         echo "=== curie local eval ==="
         (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
+    fi
+
+    if [[ "$LIVE" == "0" ]]; then
+        echo
+        echo "=== no-endpoint control ==="
+        if (( LOCAL_STACK_OWNED )); then
+            # Exercise the CLI's real minimal-profile env clearing. Keep the
+            # ownership flag set across this deliberate restart so any failure
+            # still drives the EXIT trap through local down.
+            "$BIN" local down
+            OTEL_E2E_COLLECTOR_MUTATED=0
+            OTEL_E2E_COLLECTOR_WAS_RUNNING=0
+            "$BIN" local up --minimal
+
+            OTEL_E2E_OUTPUT="$WORKDIR/otel-no-endpoint-output"
+            mkdir -p "$OTEL_E2E_OUTPUT"
+            chmod 0777 "$OTEL_E2E_OUTPUT"
+            export CURIE_OTEL_E2E_OUTPUT="$OTEL_E2E_OUTPUT"
+            # Start only the passive sink after the minimal services have
+            # inherited blank endpoints. It is an observer, not their config.
+            docker compose --profile full \
+                -f "$REPO_ROOT/compose.dev.yaml" \
+                -f "$REPO_ROOT/cli/tests/fixtures/otel/compose.override.yaml" \
+                up -d --no-deps --force-recreate otel-collector >/dev/null
+            OTEL_E2E_COLLECTOR_MUTATED=1
+
+            run_no_endpoint_runtime_probe
+            assert_stub_port_free
+            local no_endpoint_out no_endpoint_thread
+            no_endpoint_out="$("$BIN" --json local message \
+                "no endpoint runtime control" || true)"
+            printf '%s\n' "$no_endpoint_out"
+            assert_finalized_reply "local no-endpoint" "$no_endpoint_out"
+            no_endpoint_thread="$(printf '%s' "$no_endpoint_out" | python3 -c \
+                'import json,sys; print(json.load(sys.stdin)["thread"])')"
+            remember_otel_thread "$no_endpoint_thread"
+            sleep 0.5
+            python3 "$REPO_ROOT/cli/tests/otel_e2e_assert.py" \
+                --traces "$OTEL_E2E_OUTPUT/traces.json" \
+                --logs "$OTEL_E2E_OUTPUT/logs.json" \
+                --topology cli --outcome success --expect-empty
+        else
+            # An incumbent stack's app containers belong to its owner and must
+            # not be restarted merely to change env. Exercise the same candidate
+            # no-op runtime in-process and leave every incumbent service intact;
+            # the owned-stack branch above is the full CLI --minimal proof.
+            run_no_endpoint_runtime_probe
+            echo "no-endpoint runtime probe passed without mutating the reused stack"
+        fi
     fi
 
     if (( LOCAL_STACK_OWNED )); then
