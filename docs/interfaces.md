@@ -33,7 +33,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Harness package (declared contribution) | CLEAN | 1 (built-in Claude) behind the entry-point registry | not separately graded | #844 | [Harness package (declared contribution)](interfaces/harness-package/INTERFACE.md) |
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |
-| Third-party port adapter (deployed service) | NONE | 0 (intended line recorded, nothing built) | not separately graded | #19, #158 | [Third-party port adapter (deployed service)](interfaces/port-adapter-service/INTERFACE.md) |
+| Third-party port adapter (deployed service) | NONE | lifecycle unbuilt; generic HTTP edge shipped | not separately graded | #19, #158 | [Third-party port adapter (deployed service)](interfaces/port-adapter-service/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
