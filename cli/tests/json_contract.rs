@@ -1346,6 +1346,7 @@ fn doctor_output_validates() {
     let facts = curie::doctor::Facts {
         model_credential: Some("CURIE_CREDENTIALS".to_string()),
         model_credential_source: Some("environment".to_string()),
+        model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),
