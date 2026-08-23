@@ -8,7 +8,7 @@ from .. import crud
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
-from ..repository_credentials import resolve_repository_credential
+from ..repository_auth import resolve_repository_credential
 from ..schemas import RepositoryCredentialOut
 
 router = APIRouter(prefix="/v1/internal/workspaces", tags=["internal-workspaces"])
