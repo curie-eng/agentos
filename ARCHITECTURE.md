@@ -22,6 +22,11 @@ Decision Records) ([`docs/adr/`](docs/adr/)). This doc is the "what talks to
 what." It supersedes the pre-build plans that the MVP (Minimum Viable Product)
 was built from, which are preserved in git history.
 
+For a navigable version of this map, open the
+[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html).
+It overlays current and planned flows, maturity-rated seams, ADRs, implementation
+detail, and documentation drift on one version-selectable system diagram.
+
 ## Table of contents
 
 - [Overview](#overview)

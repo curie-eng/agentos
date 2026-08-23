@@ -42,7 +42,9 @@ Curie provides an environment guarantee while climbing the three tiers. It is no
 guarantee: production traffic can still behave differently than your test cases, and no platform can
 honestly promise otherwise.
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) for the platform architecture and how the pieces fit together.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) for the platform architecture and how the pieces fit together, or open the
+[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html)
+to explore current and planned flows, maturity-rated seams, ADRs, and versioned snapshots.
 See the [target table](#which-target-do-i-want) below for what each tier actually runs.
 
 ## Quickstart
