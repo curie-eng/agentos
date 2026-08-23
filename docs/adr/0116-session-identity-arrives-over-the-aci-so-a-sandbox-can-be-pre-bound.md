@@ -515,27 +515,54 @@ where the number does not move.
 The sub-second bind has now been measured four times across three clusters:
 0.19s, 0.196s, 0.17s, 0.18s.
 
-**A pre-warmed pod exposes an unauthenticated ACI.** The runner gates
-`/v1/event`, `/v1/steer`, `/v1/interrupt`, and `/v1/reset` on a bearer token, and
-that token is minted per claim by the worker and injected through
-`SandboxClaim.spec.env`. A pool pod is created by the pool controller from the
-template, so it receives the template's baked env and **no token at all** -- and
-the runner's documented behaviour with no token configured is to pass the gated
-paths through. Confirmed directly against a bound pool pod:
+**A pre-warmed pod's ACI is unauthenticated, which removes a layer rather than
+opening a door.** This was measured in both directions on a cluster with Calico,
+so NetworkPolicy is actually enforced rather than merely applied -- the distinction
+`curie dev netpol-check` exists to police.
+
+The gate itself works. Against a pod the **worker** created for a real
+`cluster message` turn, which carries `CURIE_RUNNER_TOKEN`:
 
 ```
-POST /v1/event, no Authorization header
--> HTTP 200 ACCEPTED WITHOUT AUTH
+POST /v1/event, no Authorization header  -> HTTP 401 {"error": "missing bearer token"}
+POST /v1/event, Bearer wrong             -> HTTP 401
 ```
 
-The turn then failed at the model boundary on a deliberately bogus credential,
-which is its own confirmation: **a pre-bound pod does serve ACI turns**, up to the
-model call, with no further work. But it serves them to anyone who can reach it.
+Against a **warm pool pod**, which the pool controller created from the template
+and which therefore never had a token minted for it:
 
-Today this is latent, because `warmPool.replicas` is 0 and no warm pod exists.
-Decision 3 is what makes it real: raising the pool ships one open ACI endpoint per
-warm pod inside the cluster network. That is why decision 2's per-pod token is a
-requirement of this ADR rather than an implementation detail of it.
+```
+CURIE_RUNNER_TOKEN present: false
+POST /v1/event, no Authorization header  -> HTTP 200 ACCEPTED
+```
+
+So the gap is real and it is exactly one layer deep. **A sandbox cannot exploit
+it**, because Rail 1's `runner-default-deny-egress` blocks a sandbox from dialling
+anything not on its allow list, and another sandbox is not on it:
+
+```
+sandbox -> another sandbox's ACI port 8080   -> BLOCKED (TimeoutError)
+sandbox -> DNS (an allowed egress)           -> OK          [non-vacuity control]
+```
+
+The control matters: the block is not vacuous, since the same pod reaches what it
+is permitted to reach. An earlier draft of this section described an injected
+agent reaching a warm pod and driving it, which the egress rail forecloses; that
+claim was wrong and is removed.
+
+What remains is a defence-in-depth loss, and it is still worth fixing. With no
+token the **network layer becomes the only barrier**, and the repository itself
+treats that layer as one that can silently not work: `netpol-check` exists
+because a CNI that ignores NetworkPolicy leaves every one of these policies as
+decoration, and minikube's default CNI is named in that gate as an example.
+`networkPolicy.enabled=false`, or an operator's `allowedEgress` CIDR drawn wide
+enough to include pod IPs, have the same effect. Under any of those, one
+configuration mistake becomes full exposure of every warm pod, where today it
+would still meet a 401.
+
+Today the gap is latent regardless, because `warmPool.replicas` is 0 and no warm
+pod exists. Decision 3 is what makes it reachable at all, which is why decision
+2's per-pod token is ordered before it rather than alongside it.
 
 ### Tuning the request cannot win, because of where the pod sits in the tree
 
@@ -930,9 +957,12 @@ counts it, which decision 6 is what fixes.
   obvious follow-up and is not part of this decision.
 
 - **Decision 3 cannot land before decision 2's per-pod token.** Shipping a warm
-  pool while pool pods carry no runner token would expose an unauthenticated ACI
-  on every warm pod, which is a reachability regression rather than the
-  performance change this ADR is arguing for. The ordering is not a preference.
+  pool while pool pods carry no runner token leaves Rail 1 as the only barrier in
+  front of every warm pod's ACI. Measured, a sandbox cannot cross that rail, so
+  this is a defence-in-depth loss rather than an exploitable hole; it becomes an
+  exploitable one on any cluster whose CNI does not enforce NetworkPolicy, which
+  `netpol-check` exists precisely because that happens quietly. The ordering is
+  not a preference.
 
 - Nothing here changes what a sandbox may *reach*. ADR-0006's rails and
   ADR-0008's tenant boundary are untouched, and a pre-bound runner is bound to
