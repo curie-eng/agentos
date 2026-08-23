@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::commands::OLLAMA_PORT;
 use crate::docker;
-use crate::ops::{plain, require_on_path, run_capture, run_step, OpsCommand};
+use crate::ops::{plain, require_on_path, run_capture, run_step, CmdArg, OpsCommand};
 
 /// Dev-channel local-candidate filename probed by the artifact resolver.
 pub const DEFAULT_COMPOSE_FILE: &str = "compose.dev.yaml";
@@ -275,7 +275,7 @@ pub fn up_command(o: &LocalOpts) -> OpsCommand {
     up_command_with_model(o, None)
 }
 
-fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
+fn compose_profile_args(o: &LocalOpts) -> Vec<CmdArg> {
     let profile = if o.minimal { "core" } else { "full" };
     let mut args = vec![plain("compose"), plain("--profile"), plain(profile)];
     if o.local_model.is_some() {
@@ -286,18 +286,15 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
         args.push(plain("--profile"));
         args.push(plain("slack"));
     }
-    args.extend([
-        plain("-f"),
-        plain(&o.file),
-        plain("up"),
-        plain("-d"),
-        plain("--wait"),
-    ]);
-    let mut cmd = OpsCommand::new("docker", args);
-    // `with_env` REPLACES the env vec, so build it once. `--local-model` and the
-    // credential-driven live injection are mutually exclusive: local-model
-    // carries its own live env (CURIE_FAKE_MODEL=0 + the ollama routing), so
-    // the parity injection only applies when no local model is requested.
+    args
+}
+
+// `with_env` REPLACES the env vec, so both compose builders construct the
+// model and OTel wiring once. `--local-model` and the credential-driven live
+// injection are mutually exclusive: local-model carries its own live env
+// (CURIE_FAKE_MODEL=0 + the ollama routing), so the parity injection only
+// applies when no local model is requested.
+fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = if let Some(model) = &o.local_model {
         vec![
             ("CURIE_FAKE_MODEL".into(), "0".into()),
@@ -333,6 +330,20 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
     // above, not inside it, because the `--local-model` arm does not fall
     // through to the else: `--minimal --local-model` needs suppressing too.
     env.extend(otel_endpoint_env_override(o.minimal));
+    env
+}
+
+fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
+    let mut args = compose_profile_args(o);
+    args.extend([
+        plain("-f"),
+        plain(&o.file),
+        plain("up"),
+        plain("-d"),
+        plain("--wait"),
+    ]);
+    let mut cmd = OpsCommand::new("docker", args);
+    let env = compose_model_env(o, model);
     if !env.is_empty() {
         cmd = cmd.with_env(env);
     }
@@ -353,16 +364,7 @@ fn up_command_with_model(o: &LocalOpts, model: Option<&str>) -> OpsCommand {
 /// keeps the blast radius to the one named service; `--build` picks up a local
 /// code change before recreating.
 pub fn rebuild_command(o: &LocalOpts, service: &str, model: Option<&str>) -> OpsCommand {
-    let profile = if o.minimal { "core" } else { "full" };
-    let mut args = vec![plain("compose"), plain("--profile"), plain(profile)];
-    if o.local_model.is_some() {
-        args.push(plain("--profile"));
-        args.push(plain("local-model"));
-    }
-    if o.slack {
-        args.push(plain("--profile"));
-        args.push(plain("slack"));
-    }
+    let mut args = compose_profile_args(o);
     args.extend([
         plain("-f"),
         plain(&o.file),
@@ -374,32 +376,7 @@ pub fn rebuild_command(o: &LocalOpts, service: &str, model: Option<&str>) -> Ops
         plain(service),
     ]);
     let mut cmd = OpsCommand::new("docker", args);
-    // Identical env-injection precedence to `up_command` (local-model env is
-    // mutually exclusive with the credential-driven live injection; see that
-    // function's comment for why) -- duplicated rather than shared because
-    // `up_command`'s tail differs (`--wait`, no per-service targeting) and this
-    // is the smaller, lower-risk change than reshaping a heavily-tested
-    // existing function's internals.
-    let mut env: Vec<(String, String)> = if let Some(model) = &o.local_model {
-        vec![
-            ("CURIE_FAKE_MODEL".into(), "0".into()),
-            (
-                "CURIE_MODEL_BASE_URL".into(),
-                format!("http://ollama:{OLLAMA_PORT}"),
-            ),
-            ("CURIE_MODEL".into(), model.clone()),
-            ("CURIE_DOCKER_NETWORK".into(), "curie_runner".into()),
-            ("COMPOSE_PROJECT_NAME".into(), COMPOSE_PROJECT.into()),
-        ]
-    } else {
-        let mut env: Vec<(String, String)> =
-            fake_model_env_override(o.model_mode).into_iter().collect();
-        if let Some(model) = model {
-            env.push(("CURIE_MODEL".into(), model.to_string()));
-        }
-        env
-    };
-    env.extend(otel_endpoint_env_override(o.minimal));
+    let env = compose_model_env(o, model);
     if !env.is_empty() {
         cmd = cmd.with_env(env);
     }
