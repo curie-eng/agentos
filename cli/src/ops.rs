@@ -718,7 +718,12 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 const CREDENTIAL_PREFIX_PROVIDERS: &[(&str, &str)] =
     &[("sk-ant-", "anthropic"), ("sk-or-", "openrouter")];
 
-fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
+/// Return the provider unambiguously selected by a credential prefix.
+///
+/// Callers that inspect a credential must discard it after deriving this
+/// non-secret provider name; it is safe to render the returned value but never
+/// the credential itself.
+pub fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
     CREDENTIAL_PREFIX_PROVIDERS
         .iter()
         .find(|(prefix, _)| credential.starts_with(prefix))
