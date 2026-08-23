@@ -171,10 +171,10 @@ services:
       - |
         aws configure set default.s3.addressing_style path
         for bucket in langfuse curie-bundles curie-workspaces; do
-          if ! aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
-            aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket "$bucket"
+          if ! aws --endpoint-url http://rustfs:9000 s3api head-bucket --bucket "$$bucket" >/dev/null 2>&1; then
+            aws --endpoint-url http://rustfs:9000 s3api create-bucket --bucket "$$bucket"
           fi
-          echo "bucket $bucket ready"
+          echo "bucket $$bucket ready"
         done
     restart: "no"
 

@@ -520,9 +520,10 @@ async def get_publication(
 async def get_publication_by_approval(
     session: AsyncSession, approval_id: uuid.UUID
 ) -> Publication | None:
-    return await session.scalar(
+    publication: Publication | None = await session.scalar(
         select(Publication).where(Publication.approval_id == approval_id)
     )
+    return publication
 
 
 async def list_publications(

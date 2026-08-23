@@ -17,7 +17,7 @@ truth (the committed JSON Schema and generated Rust/TS are derived from them).
 
 ## What "an ACI server" is
 
-An ACI server is an **HTTP process** inside the sandbox that exposes four POST
+An ACI server is an **HTTP process** inside the sandbox that exposes five POST
 routes and streams NDJSON back:
 
 | Route | Purpose |
