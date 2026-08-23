@@ -3,7 +3,7 @@
 
 mod support;
 
-use curie::api::{ApiClient, ChannelOutcome, DeployOutcome};
+use curie::api::{ApiClient, ChannelOutcome, DeployOutcome, WorkspaceIntent};
 use curie::bundle::pack_tar_gz;
 use curie::commands::{self, DeployOpts};
 use curie::scaffold::scaffold;
@@ -105,6 +105,7 @@ async fn run_command_deploy(server: &MockServer, plugin_dir: &Path) -> commands:
         api_key: "test-key".to_string(),
         slack_channel: Some("C0EXAMPLE1".to_string()),
         repo: None,
+        workspace: WorkspaceIntent::Preserve,
         env: None,
         label: Some("0.1.0-1".to_string()),
         secret: vec![],
@@ -352,6 +353,7 @@ async fn deploy_walks_the_full_contract_flow_with_auth() {
             &std::collections::BTreeMap::new(),
             None,
             None,
+            WorkspaceIntent::Preserve,
         )
         .await
         .unwrap();
@@ -524,6 +526,7 @@ async fn run_deploy(
             &std::collections::BTreeMap::new(),
             repo,
             None,
+            WorkspaceIntent::Preserve,
         )
         .await
         .unwrap()

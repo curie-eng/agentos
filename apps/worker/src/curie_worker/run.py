@@ -226,8 +226,8 @@ def _sandbox_client(
     ``CURIE_CREDENTIALS`` reference, which the runner maps onto an SDK var.
     """
     substrate = env.get("CURIE_SANDBOX_SUBSTRATE", "kubernetes").lower()
-    bundle_store = BundleStore(config)
     if substrate == "docker":
+        bundle_store = BundleStore(config)
         has_credential = bool(config.credentials) or any(v in env for v in _MODEL_CREDENTIAL_ENV)
         has_local_model = bool(config.model_base_url)
         if not config.fake_model and not has_credential and not has_local_model:
@@ -264,11 +264,7 @@ def _sandbox_client(
         # not gated on a cold pull. Best-effort inside ensure_image.
         client.ensure_image()
         return client
-    return KubernetesSandboxClient(
-        sub_config.namespace,
-        bundle_signer=bundle_store,
-        bundle_reference_ttl_seconds=config.workspace_reference_ttl_seconds,
-    )
+    return KubernetesSandboxClient(sub_config.namespace)
 
 
 def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:

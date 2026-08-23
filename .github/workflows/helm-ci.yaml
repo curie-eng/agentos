@@ -221,6 +221,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
 
+      - name: helm render assertions (remote dev capability)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remote-dev-capability-assertions.sh
+
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a
       # helper edit that weakens the lockdown -- or a container that skips it --

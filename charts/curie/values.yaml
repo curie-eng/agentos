@@ -1285,21 +1285,20 @@ agentSandbox:
         requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 64Mi }
         limits: { cpu: "1", memory: 512Mi, ephemeral-storage: 256Mi }
     # --- Bundle-fetch provisioning ---
-    # CURIE_BUNDLE_REF is a claim-scoped signed object URL the substrate injects
-    # into init containers (bound sandboxes carry it; warm/unbound pods do not).
-    # Before the runner
+    # CURIE_BUNDLE_REF is an S3 object key the substrate injects per claim.
+    # (bound sandboxes carry it; warm/unbound pods do not). Before the runner
     # starts, an init pair fetches that object and extracts it into the shared
     # bundle volume at <mountPath>/current, which the worker points
     # CURIE_PLUGIN_DIR at. Fail-closed: a set-but-unfetchable ref fails the pod
     # rather than booting the wrong (empty) capability set; a clean no-op (empty
-    # plugin dir) when the ref is unset. The fetcher receives no bucket identity;
-    # BusyBox extracts tar.gz, tar, and zip archives.
+    # plugin dir) when the ref is unset. Two images because no stock image ships
+    # both an authenticated S3 client and archive tools. AWS CLI fetches and
+    # BusyBox extracts tar.gz, tar, and zip archives. The endpoint and
+    # credentials come from the rustfs block, including BYO S3 configuration.
     bundleFetch:
       enabled: true
       bucket: curie-bundles
-      # CURIE_BUNDLE_REF is a worker-minted one-object signed URL. A curl-only
-      # image keeps object-store identity out of every sandbox container.
-      fetchImage: curlimages/curl:8.12.1
+      fetchImage: amazon/aws-cli:2.32.6
       extractImage: busybox:1.36
       # Shared bundle volume mount point in the sandbox pod. The plugin dir the
       # worker injects (CURIE_PLUGIN_DIR=/bundles/current) is `<mountPath>/current`.
@@ -1314,6 +1313,10 @@ agentSandbox:
       # pair it with the `runner.resources` `ephemeral-storage` request/limit
       # (ADR-0059 decision 1, tracked in #755) for the scheduling-time bound.
       sizeLimit: 2Gi
+      # Ceiling on the init only AWS configuration volume. The path addressing
+      # setting lives here. Credentials remain environment variables and are
+      # never written to this volume or the shared bundle volume.
+      awsConfigSizeLimit: 16Mi
     # ephemeral-storage alongside cpu/memory (ADR-0059 decision 1): this same
     # block is reused for the runner container AND both bundle init containers
     # (bundle-fetch, bundle-extract), matching how cpu/memory already work here.

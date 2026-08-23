@@ -12,7 +12,7 @@ the k8scratch e2e test.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any
 
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
@@ -71,10 +71,6 @@ CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
 # a local literal that drifted on a rename would stop matching the marker the
 # binding writes, and every connector secret would be persisted as plaintext.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
-
-
-class BundleSigner(Protocol):
-    def presign_get(self, key: str, *, expires_seconds: int) -> str: ...
 
 
 def _conditions_ready(status: dict[str, Any]) -> bool:
@@ -227,8 +223,6 @@ class KubernetesSandboxClient:
         namespace: str,
         *,
         kubeconfig: str | None = None,
-        bundle_signer: BundleSigner | None = None,
-        bundle_reference_ttl_seconds: int = 300,
     ) -> None:
         try:
             k8s_config.load_incluster_config()
@@ -236,8 +230,6 @@ class KubernetesSandboxClient:
             k8s_config.load_kube_config(config_file=kubeconfig)
         self._api = k8s_client.CustomObjectsApi()
         self._namespace = namespace
-        self._bundle_signer = bundle_signer
-        self._bundle_reference_ttl_seconds = bundle_reference_ttl_seconds
 
     # -- SandboxClaim (extensions group) ------------------------------------
 
@@ -276,21 +268,12 @@ class KubernetesSandboxClient:
             # Overrides policy does not touch without an explicit containerName.
             bundle_ref = env.get(BUNDLE_REF_ENV)
             if bundle_ref is not None:
-                signer = getattr(self, "_bundle_signer", None)
-                init_bundle_ref = (
-                    signer.presign_get(
-                        bundle_ref,
-                        expires_seconds=getattr(self, "_bundle_reference_ttl_seconds", 300),
-                    )
-                    if signer is not None
-                    else bundle_ref
-                )
                 for container in BUNDLE_INIT_CONTAINERS:
                     entries.append(
                         {
                             "containerName": container,
                             "name": BUNDLE_REF_ENV,
-                            "value": init_bundle_ref,
+                            "value": bundle_ref,
                         }
                     )
             # Workspace fetch/extract consumes only the short-lived exact-object
