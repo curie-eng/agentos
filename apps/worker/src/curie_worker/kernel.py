@@ -112,7 +112,14 @@ logger = logging.getLogger(__name__)
 # Exact runner-stamped permission provenance required before the worker captures
 # a patch. Kept local because the worker must not import the runner package.
 _PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
+_PUBLISH_PROVENANCE = ("permission", _PUBLISH_TOOL_NAME)
 _PUBLICATION_EXPIRES_IN_SECONDS = 24 * 60 * 60
+
+
+def _is_publish_provenance(gate_kind: str | None, granted_tool: str | None) -> bool:
+    """Require both trusted runner-held publication provenance fields."""
+
+    return (gate_kind, granted_tool) == _PUBLISH_PROVENANCE
 
 
 def _target_for(qevent: QueuedTurn) -> ReplyTarget:
@@ -1496,8 +1503,10 @@ class Kernel:
             outcome = await self._consume(qevent, route, routed.turn, nav)
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
-                and outcome.approval_gate_kind == "permission"
-                and outcome.approval_granted_tool == _PUBLISH_TOOL_NAME
+                and _is_publish_provenance(
+                    outcome.approval_gate_kind,
+                    outcome.approval_granted_tool,
+                )
             ):
                 try:
                     snapshot = await self._runner.snapshot(
@@ -1921,9 +1930,9 @@ class Kernel:
         # route identifier, a different concept from the turn's ``TargetRoute``
         # above, and one word for the two is what forced the old ``route_``.
         route_name = outcome.approval_route
-        is_publication = (
-            outcome.approval_gate_kind == "permission"
-            and outcome.approval_granted_tool == _PUBLISH_TOOL_NAME
+        is_publication = _is_publish_provenance(
+            outcome.approval_gate_kind,
+            outcome.approval_granted_tool,
         )
         if is_publication and route_name is not None:
             await self._escalate(

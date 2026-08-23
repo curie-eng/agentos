@@ -10,7 +10,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 
 from .. import crud
-from ..auth import require_api_key, verify_internal_worker_token
+from ..auth import (
+    require_api_key,
+    require_internal_worker_token,
+    verify_internal_worker_token,
+)
 from ..config import get_settings
 from ..deps import SessionDep
 from ..repository_credentials import resolve_repository_credential
@@ -28,21 +32,17 @@ internal_router = APIRouter(
 PATCH_LIMIT_BYTES = 900_000
 
 
-@internal_router.post("", response_model=PublicationOut, status_code=status.HTTP_201_CREATED)
+@internal_router.post(
+    "",
+    response_model=PublicationOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_internal_worker_token)],
+)
 async def create_publication(
     data: PublicationCreate,
     session: SessionDep,
     response: Response,
-    x_curie_worker_token: Annotated[
-        str | None, Header(alias="X-Curie-Worker-Token")
-    ] = None,
 ) -> PublicationOut:
-    if not verify_internal_worker_token(x_curie_worker_token):
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
-            "missing or invalid internal worker token",
-            headers={"Cache-Control": "no-store"},
-        )
     try:
         patch = data.decoded_patch()
     except ValueError as exc:
@@ -84,16 +84,38 @@ async def get_publication(
     return PublicationOut.model_validate(publication)
 
 
+async def _require_publication_credential_worker(
+    publication_id: uuid.UUID,
+    session: SessionDep,
+    x_curie_worker_token: Annotated[
+        str | None, Header(alias="X-Curie-Worker-Token")
+    ] = None,
+) -> None:
+    if verify_internal_worker_token(x_curie_worker_token):
+        return
+    publication = await crud.get_publication(session, publication_id)
+    repo = publication.repo_full_name if publication is not None else None
+    await crud.append_credential_redemption_audit(
+        session,
+        purpose="publication_push",
+        outcome="refused",
+        deployment_id=publication.deployment_id if publication is not None else None,
+        publication_id=publication.id if publication is not None else None,
+        repo_full_name=repo,
+        detail="missing or invalid internal worker token",
+    )
+    await require_internal_worker_token(x_curie_worker_token)
+
+
 @internal_router.post(
-    "/{publication_id}/credential", response_model=RepositoryCredentialOut
+    "/{publication_id}/credential",
+    response_model=RepositoryCredentialOut,
+    dependencies=[Depends(_require_publication_credential_worker)],
 )
 async def redeem_publication_credential(
     publication_id: uuid.UUID,
     session: SessionDep,
     response: Response,
-    x_curie_worker_token: Annotated[
-        str | None, Header(alias="X-Curie-Worker-Token")
-    ] = None,
 ) -> RepositoryCredentialOut:
     response.headers["Cache-Control"] = "no-store"
     publication = await crud.get_publication(session, publication_id)
@@ -112,8 +134,6 @@ async def redeem_publication_credential(
         )
         raise HTTPException(code, detail, headers={"Cache-Control": "no-store"})
 
-    if not verify_internal_worker_token(x_curie_worker_token):
-        await refused(status.HTTP_401_UNAUTHORIZED, "missing or invalid internal worker token")
     if publication is None:
         await refused(status.HTTP_404_NOT_FOUND, "publication not found")
     assert publication is not None and repo is not None
