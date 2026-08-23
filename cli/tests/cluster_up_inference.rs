@@ -323,6 +323,48 @@ fn repeated_bare_up_does_not_duplicate_the_recorded_inferred_provider_route() {
 }
 
 #[test]
+fn repeated_bare_up_preserves_the_inferred_gvisor_off_posture() {
+    // The successful recovery retry from the first install records this value.
+    // A second bare up must pass it to Helm before rendering the preflight, or
+    // the chart's default `auto` posture will recreate the rejected Job.
+    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"}}}"#);
+    let output = fixture.run(&[], VALID_RESOLVER, &[]);
+    assert_success(&fixture, &output);
+
+    let upgrade = fixture.upgrade_log();
+    assert!(
+        upgrade.contains("security.gvisor.mode=off"),
+        "the recorded inferred posture must be re-supplied on the second bare up: {upgrade}"
+    );
+    assert!(
+        !stderr(&output).contains("inferred that the cluster has no `gvisor` RuntimeClass"),
+        "a rerun with the recorded posture must not announce a fresh inference: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn explicit_gvisor_mode_replaces_the_recorded_inferred_posture() {
+    let fixture = Fixture::new(r#"{"security":{"gvisor":{"mode":"off"}}}"#);
+    let output = fixture.run(
+        &[],
+        VALID_RESOLVER,
+        &["--set", "security.gvisor.mode=require"],
+    );
+    assert_success(&fixture, &output);
+
+    let upgrade = fixture.upgrade_log();
+    assert!(
+        upgrade.contains("security.gvisor.mode=require"),
+        "the explicit operator posture must reach Helm: {upgrade}"
+    );
+    assert!(
+        !upgrade.contains("security.gvisor.mode=off"),
+        "the recorded inference must not override an explicit operator posture: {upgrade}"
+    );
+}
+
+#[test]
 fn explicit_provider_list_containing_the_detected_provider_wins_silently() {
     let fixture = Fixture::new("");
     let output = fixture.run(

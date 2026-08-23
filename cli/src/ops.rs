@@ -1561,6 +1561,27 @@ fn resolve_preserved_runner_identity_values(
     }
 }
 
+/// Carry an inferred gVisor posture into a later plain `cluster up`.
+///
+/// The RuntimeClass admission recovery writes `security.gvisor.mode=off` only
+/// on its retry. Helm records that successful retry, but a normal `up` is a
+/// full upgrade rather than `--reuse-values`; without re-supplying the recorded
+/// posture, the next run falls back to the chart's `auto` default and repeats
+/// the failed preflight. As with the other recorded-value families, an explicit
+/// operator setting owns the key and always wins.
+fn resolve_preserved_gvisor_mode_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(GVISOR_MODE_KEY) {
+        return;
+    }
+    if let Some(mode) = preserved_value(existing, GVISOR_MODE_KEY) {
+        opts.set.push(format!("{GVISOR_MODE_KEY}={mode}"));
+    }
+}
+
 /// Carry the worker environment recorded by a prior install into a plain rerun.
 /// Explicit inputs replace the recorded family.
 fn resolve_preserved_worker_extra_env_values(
@@ -1675,7 +1696,8 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`], and
+/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1695,6 +1717,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || key == GVISOR_MODE_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1736,7 +1759,12 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 /// is true of a renamed key, a legacy key, and an operator's own `--set`, none
 /// of which any list can enumerate in advance.
 pub fn is_secret_value_key(key: &str) -> bool {
-    if is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY {
+    // Most preserve-on-up keys are credentials, but an inferred gVisor posture
+    // is ordinary safety configuration and must remain visible in `curie diff`.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+        || key == GITHUB_TOKEN_KEY
+        || key == MODEL_CREDENTIAL_KEY
+    {
         return true;
     }
     let lowered = key.to_ascii_lowercase();
@@ -2822,6 +2850,7 @@ fn complete_up_opts_without_runner_egress(
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
