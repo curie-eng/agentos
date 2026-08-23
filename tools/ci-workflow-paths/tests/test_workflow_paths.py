@@ -12,6 +12,12 @@ on every tag and no GitHub Release was published at all. The gate encodes the
 invariant rather than the string, so the next workflow that acquires the same
 defect elsewhere reds too.
 
+Issue #1713 is intentionally co-located here because the `pr-body.yaml`
+workflow wiring is itself a repository-path contract: its PR-body checks must
+invoke the checked-in gate from the workspace it runs in. Keeping that wiring
+under the same real-workflow path sweep catches a moved or missing test path
+where CI would otherwise fail only after the workflow starts.
+
 The gate parses `.github/workflows/*.yaml` and `*.yml` directly and takes the
 tracked path set from `git ls-files`. There are no fixtures and no mocks: the
 whole value of this gate is that it reads what CI actually runs.
