@@ -153,6 +153,16 @@ class PublicationGitHub(Protocol):
     ) -> str | None | Awaitable[str | None]: ...
 
 
+class PublicationTranscript(Protocol):
+    def record_result(
+        self,
+        agent_id: uuid.UUID,
+        conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None | Awaitable[None]: ...
+
+
 async def _resolve[T](value: T | Awaitable[T]) -> T:
     if inspect.isawaitable(value):
         return await cast(Awaitable[T], value)
@@ -193,6 +203,7 @@ class PublicationReconciler:
         replies: ReplySink,
         job_settings: PublicationJobSettings,
         card_store: ApprovalCardStore | None = None,
+        transcript: PublicationTranscript | None = None,
     ) -> None:
         self._store = store
         self._credentials = credentials
@@ -201,6 +212,7 @@ class PublicationReconciler:
         self._replies = replies
         self._job_settings = job_settings
         self._card_store = card_store
+        self._transcript = transcript
 
     async def deliver_pending_card(self) -> bool:
         """Deliver one persisted publication approval card independently."""
@@ -395,6 +407,15 @@ class PublicationReconciler:
                         card_ref,
                     )
                     card_ref = None
+            if self._transcript is not None:
+                await _resolve(
+                    self._transcript.record_result(
+                        result.agent_id,
+                        result.target.conversation_id,
+                        result.publication_id,
+                        text,
+                    )
+                )
             await self._report(result.target, result.route, text)
             if card_ref is not None:
                 await self._settle_card(result, card_ref)

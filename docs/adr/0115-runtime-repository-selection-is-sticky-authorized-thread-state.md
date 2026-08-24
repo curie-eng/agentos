@@ -92,12 +92,18 @@ current allowlist. Denial still creates no Job and redeems no credential.
 Publication refuses changes under `.github/workflows/`: pushing such a branch
 can execute repository automation before a reviewer sees the pull request, so a
 warning on a self-approvable card would not be a sufficient boundary.
+The worker records the terminal publication outcome in the durable thread
+transcript before reporting it through the reply adapter. A deterministic
+publication marker makes retries idempotent, so a later turn knows whether the
+platform published, denied, expired, or failed the request instead of repeating
+the model's pre-approval view.
 
 The realizing paths are `apps/api/src/curie_api/models.py`, `crud.py`,
 `schemas.py`, `workspace_policy.py`, `routers/workspaces.py`, and
 `routers/publications.py`; `apps/worker/src/curie_worker/workspace.py`,
-`publication_validation.py`, `publication_k8s.py`, `binding.py`, and
-`kernel.py`; `cli/src/main.rs` and `cli/src/api.rs`; and `charts/curie`.
+`publication_validation.py`, `publication_k8s.py`, `publication_clients.py`,
+`binding.py`, and `kernel.py`; `cli/src/main.rs` and `cli/src/api.rs`; and
+`charts/curie`.
 
 ## Consequences
 

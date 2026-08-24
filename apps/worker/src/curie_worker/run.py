@@ -37,7 +37,11 @@ from .heartbeat import run_heartbeat
 from .kernel import Kernel
 from .killswitch import KillSwitch
 from .markers import Markers
-from .publication_clients import GitHubPublicationLookup, PublicationCredentialClient
+from .publication_clients import (
+    GitHubPublicationLookup,
+    PublicationCredentialClient,
+    PublicationTranscriptClient,
+)
 from .publication_k8s import KubernetesPublicationCluster, PublicationJobSettings
 from .publication_loop import (
     PublicationReconcileLoop,
@@ -528,6 +532,15 @@ def _build_publication_loop(
         github=GitHubPublicationLookup(http),
         replies=sink,
         card_store=card_store,
+        transcript=(
+            PublicationTranscriptClient(
+                api_base_url=config.api_base_url,
+                api_key=config.api_key,
+                client=http,
+            )
+            if config.api_key
+            else None
+        ),
         job_settings=PublicationJobSettings(
             namespace=namespace,
             runner_image=env.get("CURIE_RUNNER_IMAGE", "curie-runner"),

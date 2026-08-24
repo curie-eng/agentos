@@ -4,11 +4,91 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import UTC, datetime
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from .publication_loop import PublicationCredential, PublicationReconcileError
+
+
+class PublicationTranscriptClient:
+    """Idempotently expose a platform publication result to the next turn."""
+
+    def __init__(
+        self,
+        *,
+        api_base_url: str,
+        api_key: str,
+        client: httpx.AsyncClient,
+    ) -> None:
+        if not api_key:
+            raise ValueError("publication transcript recording requires platform auth")
+        self._base = api_base_url.rstrip("/")
+        self._headers = {"X-API-Key": api_key}
+        self._client = client
+
+    async def record_result(
+        self,
+        agent_id: uuid.UUID,
+        conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None:
+        key = quote(conversation_id, safe="")
+        url = f"{self._base}/agents/{agent_id}/state/transcript/{key}"
+        marker = str(publication_id)
+        try:
+            current = await self._client.get(
+                url,
+                headers=self._headers,
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError(
+                "publication transcript lookup was unreachable"
+            ) from exc
+        if current.status_code == 200:
+            try:
+                value = current.json()["value"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PublicationReconcileError(
+                    "publication transcript response was unusable"
+                ) from exc
+            if not isinstance(value, list):
+                raise PublicationReconcileError(
+                    "publication transcript is not an append-only log"
+                )
+            if any(
+                isinstance(item, dict) and item.get("publication_id") == marker
+                for item in value
+            ):
+                return
+        elif current.status_code != 404:
+            raise PublicationReconcileError(
+                f"publication transcript lookup returned HTTP {current.status_code}"
+            )
+        item = {
+            "user": "Platform publication outcome",
+            "assistant": text,
+            "ts": datetime.now(UTC).isoformat(),
+            "publication_id": marker,
+        }
+        try:
+            appended = await self._client.post(
+                f"{url}/append",
+                headers=self._headers,
+                json={"item": item},
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise PublicationReconcileError(
+                "publication transcript append was unreachable"
+            ) from exc
+        if appended.status_code != 200:
+            raise PublicationReconcileError(
+                f"publication transcript append returned HTTP {appended.status_code}"
+            )
 
 
 class PublicationCredentialClient:
