@@ -188,6 +188,7 @@ SELECT a.id AS agent_id,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
+       a.memory AS memory,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -245,6 +246,11 @@ class ResolvedDeployment(BaseModel):
     # together for any other kind (`agent_channels_route_pair_ck`).
     endpoint: str | None = None
     adapter: str | None = None
+    # Whether this agent's bindings share one general-state namespace, or each
+    # get their own (#1525 follow-up). Read fresh per resolve, so flipping it
+    # takes effect on the very next turn -- there is no cached copy anywhere
+    # to go stale.
+    memory: bool = False
 
 
 def warn_if_multiple_agents_bound(kind: str, address: str, rows: Sequence[Any]) -> None:
@@ -558,7 +564,14 @@ class BindingResolver:
             ),
         )
 
-    def boot_env(self, resolved: ResolvedDeployment, thread_key: str) -> dict[str, str]:
+    def boot_env(
+        self,
+        resolved: ResolvedDeployment,
+        thread_key: str,
+        *,
+        kind: str | None = None,
+        address: str | None = None,
+    ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
         Rendered from the declared contract (``BootEnv``, #488/ADR-0049) rather
@@ -567,6 +580,18 @@ class BindingResolver:
         dropped feature. ``render_worker`` emits only the worker-authoritative
         keys: it never writes CURIE_SANDBOX_ID or CURIE_RUNNER_PORT, which
         the substrate derives from the pod itself.
+
+        ``kind``/``address`` are THIS turn's own binding (the caller's
+        ``qevent.reply_handle``, never derived from ``thread_key`` -- that
+        string is only ever compared, per its own contract). They matter only
+        for the general state URL below (#1525 follow-up); memory and history
+        stay agent-wide regardless of ``resolved.memory``, since those two
+        reserved namespaces are a different port with no per-binding story
+        yet. Optional and defaulting to no scoping (the pre-#1525 shape)
+        because the real caller (``Kernel._attempt``) is the only one that has
+        a turn to name -- every other caller here is a fixture with no
+        channel to speak of, and there is no honest default binding to invent
+        for it.
         """
         # The memory ref (#264): the agent's scoped namespace on the durable
         # state store (#23/#248). The runner dereferences it at boot to load
@@ -594,7 +619,24 @@ class BindingResolver:
         # and any bundle script talking to the store directly compose
         # ``/<namespace>/<key>`` onto this. Memory and history are two reserved
         # namespaces UNDER it; a bundle skill gets the rest.
+        #
+        # Narrowed to THIS binding's own path segment, unless the agent has
+        # opted every binding into one shared namespace, or this caller has no
+        # binding to name (#1525 follow-up): a memory=False agent's bundle
+        # composes ``/<namespace>/<key>`` onto whichever base it was handed
+        # here, unaware which shape it got -- the scoping decision lives
+        # entirely in which URL the worker minted, never in a credential claim
+        # (rejected alternative: widening ``sandbox_token`` -- it authenticates
+        # WHICH agent, and a partition key within that agent's own,
+        # already-fully-accessible store has no privilege to carry, so the API
+        # verifies it against ``agent_channels`` directly instead of trusting
+        # an opaque claim). memory and history stay agent-wide either way.
         state_url = f"{base}/agents/{resolved.agent_id}/state"
+        if not resolved.memory and kind is not None and address is not None:
+            state_url = (
+                f"{base}/agents/{resolved.agent_id}/state/bindings/"
+                f"{quote(kind, safe='')}/{quote(address, safe='')}"
+            )
         # Mint scoped tokens (ADR-0033, #410) for this agent. Two scopes, because
         # the memory/history loaders and the bundle reach DIFFERENT namespaces:
         #  - the broad ``state`` token backs the memory and history tokens, whose

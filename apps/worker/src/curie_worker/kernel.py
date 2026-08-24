@@ -723,7 +723,12 @@ class Kernel:
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
-                boot_env = self._binding.boot_env(resolved, thread_key)
+                boot_env = self._binding.boot_env(
+                    resolved,
+                    thread_key,
+                    kind=qevent.reply_handle.kind,
+                    address=qevent.reply_handle.channel,
+                )
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
