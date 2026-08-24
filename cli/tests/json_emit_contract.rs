@@ -1403,7 +1403,8 @@ fn deploy_api_response(req: &support::Request, failure: DeployFixtureFailure) ->
                 json!({
                     "id": format!("agent-{target}"),
                     "name": name,
-                    "channels": [{"kind": "slack", "address": channel}]
+                    "channels": [{"kind": "slack", "address": channel}],
+                    "memory": false
                 }),
             )
         }
