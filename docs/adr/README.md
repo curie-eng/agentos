@@ -145,4 +145,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0114 | [Managed repository workspaces and approval-gated publication are platform capabilities](0114-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
 | 0115 | [Runtime repository selection is sticky authorized thread state](0115-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 | 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Draft |
+| 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
 <!-- END GENERATED: adr-index -->
