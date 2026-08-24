@@ -68,7 +68,7 @@ def _deploy(
         "environment": "dev",
     }
     if workspace is not ...:
-        body["workspace_repo"] = workspace
+        body["workspace_enabled"] = workspace
     response = client.post("/deployments", json=body, headers=auth_headers)
     assert response.status_code == 201, response.text
     return response.json()
@@ -130,31 +130,86 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
     get_settings.cache_clear()
 
 
-def test_deployment_workspace_is_sticky_and_explicit_null_disables_it(
+def test_deployment_workspace_capability_is_sticky_and_explicit_false_disables_it(
     client: TestClient, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     """Omitted, enabled, and disabled are three distinct deployment writes."""
 
     agent_id, version_id = _create_agent_version(client, auth_headers)
 
-    enabled = _deploy(client, auth_headers, agent_id, version_id, workspace=REPO)
+    enabled = _deploy(client, auth_headers, agent_id, version_id, workspace=True)
     carried = _deploy(client, auth_headers, agent_id, version_id)
-    disabled = _deploy(client, auth_headers, agent_id, version_id, workspace=None)
+    disabled = _deploy(client, auth_headers, agent_id, version_id, workspace=False)
     disabled_carried = _deploy(client, auth_headers, agent_id, version_id)
 
-    assert enabled["workspace_repo"] == REPO
-    assert carried["workspace_repo"] == REPO
-    assert disabled["workspace_repo"] is None
-    assert disabled_carried["workspace_repo"] is None
+    assert enabled["workspace_enabled"] is True
+    assert carried["workspace_enabled"] is True
+    assert disabled["workspace_enabled"] is False
+    assert disabled_carried["workspace_enabled"] is False
 
     listed = client.get("/deployments", params={"agent_id": agent_id}, headers=auth_headers)
     assert listed.status_code == 200, listed.text
-    assert [row["workspace_repo"] for row in listed.json()] == [
-        REPO,
-        REPO,
-        None,
-        None,
+    assert [row["workspace_enabled"] for row in listed.json()] == [
+        True,
+        True,
+        False,
+        False,
     ]
+
+
+def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
+    get_settings.cache_clear()
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+    url = f"/v1/internal/workspaces/{deployment['id']}/selection"
+
+    selected = worker_client.post(
+        url,
+        json={"conversation_id": "thread-1", "repo_full_name": REPO},
+        headers=WORKER_HEADERS,
+    )
+    reused = worker_client.post(
+        url,
+        json={"conversation_id": "thread-1", "repo_full_name": None},
+        headers=WORKER_HEADERS,
+    )
+    conflict = worker_client.post(
+        url,
+        json={"conversation_id": "thread-1", "repo_full_name": OTHER_REPO},
+        headers=WORKER_HEADERS,
+    )
+
+    assert selected.status_code == reused.status_code == 200
+    assert selected.json() == reused.json() == {"repo_full_name": REPO}
+    assert conflict.status_code == 409
+    assert "different repository" in conflict.json()["detail"]
+
+
+def test_repo_selection_denies_before_persistence_or_credential_mint(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/acme-bot"]')
+    get_settings.cache_clear()
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+
+    denied = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={"conversation_id": "thread-denied", "repo_full_name": OTHER_REPO},
+        headers=WORKER_HEADERS,
+    )
+
+    assert denied.status_code == 403
+    assert _audit_rows() == []
 
 
 @pytest.mark.parametrize(

@@ -136,20 +136,14 @@ fn workspace_enable_prefers_explicit_repo_and_sends_a_string() {
         "deploy failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        deployment_bodies(&server)[0]["workspace_repo"],
-        json!("acme-corp/acme-bot")
-    );
+    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
 }
 
 #[test]
 fn workspace_enable_infers_the_persisted_agent_repo_without_an_extra_flag() {
     let (output, server) = run_local(ExistingAgent::Bound("acme-corp/acme-bot"), &["--workspace"]);
     assert!(output.status.success());
-    assert_eq!(
-        deployment_bodies(&server)[0]["workspace_repo"],
-        json!("acme-corp/acme-bot")
-    );
+    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
 }
 
 #[test]
@@ -157,29 +151,20 @@ fn no_workspace_sends_explicit_null_while_omission_preserves_server_state() {
     let (disabled, disabled_server) = run_local(ExistingAgent::Unbound, &["--no-workspace"]);
     assert!(disabled.status.success());
     let disabled_body = &deployment_bodies(&disabled_server)[0];
-    assert!(disabled_body.get("workspace_repo").is_some());
-    assert!(disabled_body["workspace_repo"].is_null());
+    assert_eq!(disabled_body["workspace_enabled"], json!(false));
 
     let (omitted, omitted_server) = run_local(ExistingAgent::Unbound, &[]);
     assert!(omitted.status.success());
     assert!(deployment_bodies(&omitted_server)[0]
-        .get("workspace_repo")
+        .get("workspace_enabled")
         .is_none());
 }
 
 #[test]
-fn workspace_enable_fails_before_version_or_deployment_when_repo_is_underivable() {
+fn workspace_enable_needs_no_preconfigured_repository() {
     let (output, server) = run_local(ExistingAgent::Unbound, &["--workspace"]);
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--repo") && stderr.contains("workspace"),
-        "{stderr}"
-    );
-    assert!(server
-        .recorded()
-        .iter()
-        .all(|request| { request.path != "/deployments" && !request.path.ends_with("/versions") }));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
 }
 
 #[test]

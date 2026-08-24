@@ -121,8 +121,9 @@ class _FakeCredentialClient:
         self._workspace = workspace
         self.requested: list[uuid.UUID] = []
 
-    def redeem(self, deployment_id: uuid.UUID) -> Any:
+    def redeem(self, deployment_id: uuid.UUID, conversation_id: str) -> Any:
         self.requested.append(deployment_id)
+        assert conversation_id == "1700000000.000100"
         return self._workspace.WorkspaceCredential(
             repo_full_name="acme-corp/acme-bot",
             clone_url=CLEAN_URL,
@@ -327,17 +328,55 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
         worker_token=WORKER_AUTH,
         transport=transport,
     )
-    redeemed = client.redeem(DEPLOYMENT_ID)
+    redeemed = client.redeem(DEPLOYMENT_ID, "1700000000.000100")
     request = calls[0]
 
     assert request["method"] == "POST"
     assert request["url"].endswith(f"/v1/internal/workspaces/{DEPLOYMENT_ID}/credential")
     assert request["headers"] == {"X-Curie-Worker-Token": WORKER_AUTH}
-    assert request.get("body") in (None, b"")
+    assert json.loads(request["body"]) == {
+        "conversation_id": "1700000000.000100",
+    }
     assert request["allow_redirects"] is False
     assert "repo" not in request["url"]
     assert redeemed.repo_full_name == "acme-corp/acme-bot"
     assert redeemed.authorization_header == GIT_CREDENTIAL
+
+
+def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update <https://github.com/acme-corp/acme-bot.git> and add a test."
+    ) == "acme-corp/acme-bot"
+    assert workspace.parse_github_repo_fact(
+        "Keep working in this thread; the repository is already selected."
+    ) is None
+
+    with pytest.raises(workspace.WorkspacePreparationError, match="more than one"):
+        workspace.parse_github_repo_fact(
+            "Compare https://github.com/acme-corp/acme-bot with "
+            "https://github.com/acme-corp/acme-api before changing anything."
+        )
+
+
+def test_workspace_preparer_does_not_chmod_preexisting_mount_root(
+    workspace: Any, tmp_path: Path
+) -> None:
+    scratch_root = tmp_path / "fs-group-owned-workspace"
+    scratch_root.mkdir(mode=0o770)
+    os.chmod(scratch_root, 0o770)
+    preparer = workspace.WorkspacePreparer(
+        credentials=_FakeCredentialClient(workspace),
+        commands=_FakeCommands(),
+        objects=_StreamingObjectStore(),
+        scratch_root=scratch_root,
+        limits=_limits(workspace),
+    )
+
+    _prepare(preparer)
+
+    assert stat.S_IMODE(scratch_root.stat().st_mode) == 0o770
 
 
 def test_workspace_upload_is_streamed_and_reference_is_one_object_and_short_lived(
