@@ -15,7 +15,11 @@ follow-up can only steer the live turn and never fork a second one.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from types import TracebackType
 
 import aiohttp
@@ -50,6 +54,19 @@ def _auth_headers(token: str | None) -> dict[str, str] | None:
 
 class RunnerError(Exception):
     """The runner returned an unexpected HTTP status or an unreadable stream."""
+
+
+@dataclass(frozen=True)
+class RunnerWorkspaceSnapshot:
+    """Authenticated runner snapshot after strict boundary validation."""
+
+    repo_full_name: str
+    base_sha: str
+    patch: bytes
+    changed_paths: tuple[str, ...]
+    contains_workflow_files: bool
+    publication_title: str
+    publication_body: str
 
 
 class TurnStream:
@@ -89,8 +106,11 @@ class RunnerClient:
         connect_timeout_s: float = 10.0,
         total_timeout_s: float = 600.0,
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
+        snapshot_patch_max_bytes: int = 900_000,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
+        if snapshot_patch_max_bytes <= 0:
+            raise ValueError("snapshot patch byte limit must be positive")
         self._own_session = session is None
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -102,10 +122,12 @@ class RunnerClient:
         # ``/v1/interrupt`` gets its own short control-plane budget regardless of
         # how the streaming timeouts above are tuned.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
+        self._snapshot_patch_max_bytes = snapshot_patch_max_bytes
+        self._snapshot_body_max_bytes = (
+            4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
+        )
 
-    async def start_turn(
-        self, base_url: str, event: Event, token: str | None = None
-    ) -> TurnStream:
+    async def start_turn(self, base_url: str, event: Event, token: str | None = None) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
         resp = await self._session.post(
             f"{base_url}/v1/event", json=event.model_dump(), headers=_auth_headers(token)
@@ -158,12 +180,70 @@ class RunnerClient:
         never be live at reset time -- a 409 here is a real ordering bug, not a
         condition to swallow.
         """
-        async with self._session.post(
-            f"{base_url}/v1/reset", headers=_auth_headers(token)
-        ) as resp:
+        async with self._session.post(f"{base_url}/v1/reset", headers=_auth_headers(token)) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RunnerError(f"/v1/reset -> {resp.status}: {body}")
+
+    async def snapshot(self, base_url: str, token: str | None = None) -> RunnerWorkspaceSnapshot:
+        """Capture a bounded patch before a publication approval suspends.
+
+        This call is always runner-token authenticated. A missing token is a
+        worker invariant violation, not a request to try the unauthenticated
+        route; refusing it prevents a publication snapshot from becoming a
+        bearer-less sandbox endpoint on legacy claims.
+        """
+
+        if not token:
+            raise RunnerError("publication snapshot requires a runner token")
+        async with self._session.post(
+            f"{base_url}/v1/snapshot", headers=_auth_headers(token)
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
+            try:
+                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
+                if len(raw) > self._snapshot_body_max_bytes:
+                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                body = json.loads(raw)
+                encoded = body["patch_base64"]
+                if not isinstance(encoded, str):
+                    raise TypeError("patch_base64 is not a string")
+                patch = base64.b64decode(encoded, validate=True)
+                if len(patch) > self._snapshot_patch_max_bytes:
+                    raise ValueError(
+                        f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes"
+                    )
+                declared_size = body.get("patch_size_bytes")
+                if declared_size != len(patch):
+                    raise ValueError("patch size does not match decoded payload")
+                paths = body["changed_paths"]
+                if not isinstance(paths, list) or not all(
+                    isinstance(path, str) and path for path in paths
+                ):
+                    raise TypeError("changed_paths is not a string list")
+                title = body["publication_title"]
+                description = body["publication_body"]
+                if not isinstance(title, str) or not title.strip() or len(title) > 256:
+                    raise TypeError("publication_title is not a bounded non-empty string")
+                if (
+                    not isinstance(description, str)
+                    or not description.strip()
+                    or len(description) > 65_536
+                ):
+                    raise TypeError("publication_body is not a bounded non-empty string")
+                return RunnerWorkspaceSnapshot(
+                    repo_full_name=str(body["repo_full_name"]),
+                    base_sha=str(body["base_sha"]),
+                    patch=patch,
+                    changed_paths=tuple(paths),
+                    contains_workflow_files=bool(body["contains_workflow_files"]),
+                    publication_title=title,
+                    publication_body=description,
+                )
+            except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
+                raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
 
     async def status(self, base_url: str) -> dict[str, object]:
         async with self._session.get(f"{base_url}/status") as resp:

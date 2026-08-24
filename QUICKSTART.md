@@ -2,7 +2,9 @@
 
 Welcome. This gets you a first agent reply in about a minute — no credentials,
 no cluster, no Slack. It runs the `skill` target only: just the runner
-container on your host Docker daemon, talking straight to the agent. For the
+container on your host Docker daemon, talking straight to the agent. Here,
+`skill` names the runner only tier. The authored skill artifact lives at
+`skills/<name>/SKILL.md`. For the
 full tour across all three tiers through to production, see the
 [README Quickstart](README.md#quickstart); this doc goes deeper on the `skill`
 path itself — configuring a real model, alternate providers, and example
@@ -159,9 +161,12 @@ You should get a real answer instead of the canned loop.
 The most complete example in this repo is a production triage bot:
 [`examples/sre-bot/`](examples/sre-bot/README.md). Ask it in plain English
 whether anything is broken and it reads your Kubernetes cluster and answers.
-Out of the box it cannot change anything: every tool it holds is read-only and
-its credential cannot even read Secrets. One write verb, rolling a single named
-Deployment behind a human approval card, ships in the box switched off.
+Kubernetes read remains the default capability: its credential cannot read
+Secrets. The `k8s-write` connector and its exact approval gate ship declared
+together, but `K8S_WRITE_KUBECONFIG` does not. Connector bring up cannot
+complete, and no connector container starts, until that separate credential
+exists. This clean refusal is specific to connector bring up; other deployment
+steps can still fail independently or partially.
 
 This one runs on the **cluster** tier, so unlike the loop above it needs a
 Kubernetes cluster, `kubectl` pointed at it, a model credential, and this repo
@@ -190,14 +195,33 @@ current-context: prod
 YAML
 )"
 curie secrets set K8S_READONLY_KUBECONFIG --from-env K8S_READONLY_KUBECONFIG
-
-# 4. Deploy the bundle. This is also what provisions the secret from step 3
-#    into the namespace; nothing else does.
-curie cluster deploy --plugin-dir examples/sre-bot
-
-# 5. Ask it something.
-curie cluster message "Is any pod crashlooping right now?"
 ```
+
+4. **Complete the gated write prerequisites.** Follow
+   [Level up: the gated write path](examples/sre-bot/README.md#level-up-the-gated-write-path)
+   to scope the writer identity and allowlist and store the separate
+   `K8S_WRITE_KUBECONFIG`. Then build and lock the declared connector with one
+   command:
+
+   ```bash
+   curie build --plugin-dir examples/sre-bot --registry <registry-reference>
+   ```
+
+   Do not continue until those prerequisites and the build succeed. Connector
+   bring up cannot complete, and no connector container starts, without them.
+
+5. **Deploy the bundle.** This provisions the secrets from the earlier steps
+   into the namespace; nothing else does.
+
+   ```bash
+   curie cluster deploy --plugin-dir examples/sre-bot
+   ```
+
+6. **Ask it something.**
+
+   ```bash
+   curie cluster message "Is any pod crashlooping right now?"
+   ```
 
 **Step 1 comes first for a reason.** `read-access.yaml` puts a ServiceAccount
 and a token Secret in the `curie` namespace, which does not exist until

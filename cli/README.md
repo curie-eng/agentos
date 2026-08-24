@@ -308,7 +308,7 @@ HTTP surface directly. No platform, no queue, no API, no Slack, no cluster.
 | `curie skill approvals` | View the bundle's declared `approvalPolicy` gates, read straight from `.claude-plugin/plugin.json` (or `plugin.json`); no docker, no network.<br>• `--gate <TOOL>` (repeatable) or `--clear` mutate nothing -- they print the `CURIE_APPROVAL_REQUIRED_TOOLS=...` assignment to export, then re-run your original `skill up` invocation with `--secret CURIE_APPROVAL_REQUIRED_TOOLS` added, since the runner only resolves that env once at container boot. |
 | `curie skill versions` | Not available at this tier (exit 4): `skill up` runs a local snapshot of the bundle on disk (its digest is on `skill status`), and nothing is deployed, so no version is assigned. Use `curie local versions <agent>` or `curie cluster versions <agent>`. |
 | `curie skill memory` | Not available at this tier (exit 4): this tier configures no memory namespace. Use `curie local memory <agent>` or `curie cluster memory <agent>`. |
-| `curie skill message "..."` | Send a synthetic Slack event: POST an ACI `event` frame to the local runner and stream the NDJSON reply (text deltas, tool notes, side effect flags, final). Abort a live turn with Ctrl-C. |
+| `curie skill message "..."` | Send a synthetic Slack event in a fresh conversation by default: POST an ACI `event` frame to the local runner and stream the NDJSON reply (text deltas, tool notes, side effect flags, final). Use `--continue` to preserve the runner's current conversation. Abort a live turn with Ctrl-C. |
 | `curie skill eval` | Run `evals/cases.json` through the runner as `eval_case` events. When `evals/trajectory.json` exists, score the observed tool frames against its case keyed specs. Prints a per case result table plus a pass or fail rollup, with nonzero exit on failure. |
 | `curie skill status` | Show the local runner's session status. |
 | `curie skill down` | Stop and remove the local runner container. With no `.curie/runner.json` it falls back to container identity, so an orphaned runner is still clearable; `--name <NAME>` targets a container other than `curie-runner-local`. |
@@ -405,7 +405,7 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster comms --slack` | Connect or disconnect a real Slack workspace with a thin `helm upgrade --reuse-values`; env-backed tokens are masked in dry-run output. |
 | `curie cluster message "..."` | Drive the deployed release end to end. With a connected dispatcher, it posts a placeholder and routes the reply to the agent's bound Slack channel. Without a dispatcher, it uses the terminal reply stub and waits for the reply.<br>• Auto-discovers the release-generated API key and Valkey password from `<release>-secrets` when `--api-key` / `--valkey-password` (or their env vars) are omitted, so a default strong-secrets install needs no hand-exported credentials (#786). |
 | `curie cluster eval` | Run the deployed bundle's eval suite through the Kubernetes platform. Without a trajectory sidecar, it uses the reply stub path with the shared grader. With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709).<br>• Auto discovers the release generated API key and Valkey password from `<release>-secrets` when `--api-key` or `--valkey-password`, and their environment variables, are omitted. A default strong secrets install needs no hand exported credentials (#790). |
-| `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057).<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
+| `curie cluster deploy` | Package the bundle as tar.gz and push it to the platform API.<br>• `--workspace owner/repository` enables a managed checkout, `--no-workspace` disables it, and omitting both carries the active deployment value forward. The two flags are mutually exclusive.<br>• When `--api-url` is omitted, self-plumbs a `kubectl port-forward` (loopback tunnel) to the release API service and auto-discovers the release-generated key from `<release>-secrets`, so the strong key never crosses the cleartext UI proxy (ADR-0057).<br>• Pass `--api-url` / `CURIE_API_URL` to direct-dial a URL instead (no tunnel); an explicit `--api-key` / `CURIE_API_KEY` still wins over discovery. |
 | `curie cluster kill <agent> --yes` | Kill an agent (stop its runs) via the platform API (`POST /agents/{id}/kill`). Destructive: refuses without `--yes`. |
 | `curie cluster resume <agent>` | Resume a killed agent via the platform API (`POST /agents/{id}/resume`). |
 | `curie cluster budget <agent> --limit <n>` | Set the agent's daily spend cap in USD via the platform API (`PUT /agents/{id}/budget`, `BudgetConfig.max_usd_per_day`); the per-run token cap is left at the platform default. |
@@ -642,15 +642,19 @@ these forms:
 3. `charts/curie/ci/name.sh` for a chart check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
-non test files in a disposable worktree, then runs the selector again. `PINNED`
-is printed and exits successfully for any nonzero selector result after a clean
-reversal, including compile or import failures. `UNPINNED` is
-printed and exits nonzero when it remains green.
+non test files in a disposable worktree, then runs the selector again. It prints
+`PINNED` and exits successfully only when the changed selected test node owns the
+failure after a clean reversal. For Python, the selected pytest testcase must
+carry the sole JUnit failure element. For Rust, the exact selected test must fail
+at runtime, or a compile error must point inside the changed selected function.
+Chart checks must return nonzero. It prints `UNPINNED` and exits nonzero when the
+selector remains green.
 
 It refuses invalid commit or pull request references, root commits, changes
 without classified test files or product files, selectors outside the three
 forms or not changed by the reference, a red baseline, and reverse patch
-conflicts. Inline tests in product files are not inferred.
+conflicts. It also refuses unrelated collection, import, compile, setup, and
+teardown failures. Inline tests in product files are not inferred.
 
 ### Building the runner image from source
 
@@ -670,7 +674,7 @@ Two shortcuts for working with the repo's own `agents/` scratch directory:
 ### Verify
 
 ```bash
-cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 The scripted E2E (real runner container, fake model by default, offline):

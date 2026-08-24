@@ -1,5 +1,6 @@
 # The parity ladder's connector fixture: `examples/sre-bot/connectors.yaml` with
-# every connector the example ships commented out turned ON (ADR 0113, #1690).
+# Tempo enabled and unhosted URLs removed so every connector hosts for parity
+# proof (ADR 0113, #1690).
 #
 # WHY A CHECKED-IN WHOLE FILE rather than a scripted uncomment of the example.
 # `sed` against a comment block is fragile in exactly the direction that hides a
@@ -8,17 +9,14 @@
 # ladder goes green having asserted nothing at all. A whole file cannot degrade
 # that way -- it either parses with three connectors or it fails loudly.
 #
-# WHY IT LIVES HERE and never under `examples/sre-bot/`. The shipped example is
-# read-only by default and stays that way (#1691): the write connector is a
-# deliberate opt-in with a credential and an approval route in front of it. This
-# is a test input, so it lives with the test.
+# WHY IT LIVES HERE and never under `examples/sre-bot/`. The shipped example
+# declares the write connector with its approval gate, but missing its separate
+# credential keeps bring-up closed (#1691). This is a test input, so it lives
+# with the test.
 #
 # The ladder copies the example into a throwaway workdir and overwrites
-# `connectors.yaml` with this file, then applies the `approvalPolicy` gate the
-# example's README documents to the copy's `plugin.json`. The gate TRAVELS WITH
-# the connector: bundle validation rejects a gate naming an undeclared
-# connector, so a bundle enabling `k8s-write` without it would host an ungated
-# write verb, which contradicts the example's whole security shape.
+# `connectors.yaml` with this file. The shipped plugin manifest carries the
+# approval gate for the declared write connector.
 #
 # Every value here is a public-repo placeholder. The credentials the three
 # connectors declare are provisioned by the ladder into the scratch copy and the
@@ -76,7 +74,6 @@ connectors:
       platforms: [linux/amd64, linux/arm64]
     env:
       GRAFANA_URL: https://grafana.example.com
-      TEMPO_DATASOURCE_UID: __Tempo__
     secrets:
       # The server refuses to start without it. The ladder supplies a
       # rung-scoped placeholder: its tool call is an input-validation path that

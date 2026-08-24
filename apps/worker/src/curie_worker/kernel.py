@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 import aiohttp
@@ -70,6 +71,9 @@ from .approvals import (
     ApprovalCreator,
     ApprovalReader,
     ApprovalRequest,
+    CreatedApproval,
+    PublicationCreateRequest,
+    PublicationCreator,
 )
 from .behaviorpacks import (
     BehaviorPacks,
@@ -83,8 +87,14 @@ from .binding import DECISION_ENV, GRANT_TOOL_ENV, RESUMED_KIND_ENV, BindingReso
 from .config import WorkerConfig
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
+from .publication_validation import validate_snapshot_against_base
 from .reply_sink import ReplySink, TargetRoute
-from .runner_client import RunnerClient, RunnerError, TurnStream
+from .runner_client import (
+    RunnerClient,
+    RunnerError,
+    RunnerWorkspaceSnapshot,
+    TurnStream,
+)
 from .sandbox import SandboxSubstrate
 from .sandbox.types import (
     CapacityExhaustedError,
@@ -93,8 +103,49 @@ from .sandbox.types import (
     SuspendedThreadError,
 )
 from .threadlock import ThreadLock
+from .workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspacePreparationError,
+    WorkspaceSelectionRefused,
+    parse_github_repo_fact,
+)
 
 logger = logging.getLogger(__name__)
+
+# Exact runner-stamped permission provenance required before the worker captures
+# a patch. Kept local because the worker must not import the runner package.
+_PUBLISH_TOOL_NAME = "mcp__curie__publish_changes"
+_PUBLISH_PROVENANCE = ("permission", _PUBLISH_TOOL_NAME)
+_PUBLICATION_EXPIRES_IN_SECONDS = 24 * 60 * 60
+
+
+def _is_publish_provenance(gate_kind: str | None, granted_tool: str | None) -> bool:
+    """Require both trusted runner-held publication provenance fields."""
+
+    return (gate_kind, granted_tool) == _PUBLISH_PROVENANCE
+
+
+def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
+    """Build approval text from validated facts, labeling requester prose."""
+
+    visible_paths = list(snapshot.changed_paths[:20])
+    path_list = ", ".join(visible_paths)
+    if len(snapshot.changed_paths) > len(visible_paths):
+        path_list += f", and {len(snapshot.changed_paths) - len(visible_paths)} more"
+    workflow_note = " GitHub workflow files are not publishable and none are included."
+    requester_title = " ".join(snapshot.publication_title.split())[:256]
+    normalized_body = " ".join(snapshot.publication_body.split())
+    requester_body = normalized_body[:500]
+    if len(normalized_body) > len(requester_body):
+        requester_body += (
+            f" [description truncated; {len(normalized_body)} characters will be published]"
+        )
+    return (
+        f"Publish {snapshot.repo_full_name} from {snapshot.base_sha[:12]} with "
+        f"{len(snapshot.changed_paths)} changed path(s): {path_list}."
+        f"{workflow_note} Requester-provided title: {requester_title}. "
+        f"Requester-provided description: {requester_body}"
+    )
 
 
 def _target_for(qevent: QueuedTurn) -> ReplyTarget:
@@ -138,6 +189,7 @@ def _nav_affordance(nav: NavPack | None) -> NavAffordance | None:
         return None
     return NavAffordance(label=nav.hub_label, command=nav.hub_command)
 
+
 # Failure classifications that are worth retrying (transient). Everything else
 # (budget-exceeded, model/server errors) escalates rather than looping.
 RETRYABLE_CLASSIFICATIONS = frozenset({"rate-limit", "runner-error"})
@@ -179,6 +231,7 @@ def _approval_id_from_resume_event(event_id: str) -> str | None:
         return None
     middle = event_id[len("approval-") : -len("-resolved")]
     return middle or None
+
 
 # How long an operator-requested reset waits on the courtesy interrupt before
 # giving up and releasing anyway (#739). Deliberately seconds, not minutes: the
@@ -248,6 +301,8 @@ class TurnOutcome:
     # Threaded onto the durable record. None from an older runner.
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    publication_snapshot: RunnerWorkspaceSnapshot | None = None
+    publication_snapshot_error: str | None = None
 
 
 class ThreadBusyError(RuntimeError):
@@ -432,14 +487,18 @@ class Kernel:
         markers: Markers,
         config: WorkerConfig,
         binding: BindingResolver | None = None,
+        workspace: WorkspaceClaimCoordinator | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
+        publication_creator: PublicationCreator | None = None,
         # Separate from ``approvals`` on purpose (#1084): the pause path needs
         # only the create half, and a test fake for it should not have to grow a
         # read method it never calls. In production both are the one
         # ``ApprovalClient``.
         approval_reader: ApprovalReader | None = None,
         card_store: ApprovalCardStore | None = None,
+        route_ttl_seconds: int = 3600,
+        suspended_route_ttl_seconds: int = 86400,
     ) -> None:
         self._substrate = substrate
         self._runner = runner
@@ -451,16 +510,24 @@ class Kernel:
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
         self._binding = binding
+        # The trusted repository preparation lane.  It is optional for generic
+        # and legacy deployments, but a deployment that declares a workspace
+        # fails loudly if this lane was not wired instead of booting an empty
+        # directory and giving the appearance of success.
+        self._workspace = workspace
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
         # escalation instead of suspending a session nothing could ever resume.
         self._approvals = approvals
+        self._publication_creator = publication_creator
         self._approval_reader = approval_reader
         # Remembers where each suspended thread's approval card was posted so an
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
         self._card_store = card_store
+        self._route_ttl_seconds = route_ttl_seconds
+        self._suspended_route_ttl_seconds = suspended_route_ttl_seconds
         # Which threads are running which agent, so a kill interrupts the agent's
         # live turns. Populated while a turn owner streams.
         self._active_by_agent: dict[uuid.UUID, set[str]] = {}
@@ -643,6 +710,7 @@ class Kernel:
             # polite drop, not a crash.
             boot_env: dict[str, str] | None = None
             agent_id: uuid.UUID | None = None
+            workspace_deployment_id: uuid.UUID | None = None
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
             approval_routes: dict[str, Any] | None = None
@@ -687,6 +755,12 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 boot_env = self._binding.boot_env(resolved, thread)
+                if getattr(resolved, "workspace_enabled", False):
+                    workspace_deployment_id = getattr(resolved, "deployment_id", None)
+                    if workspace_deployment_id is None:
+                        raise WorkspacePreparationError(
+                            "binding", "workspace-enabled deployment has no deployment id"
+                        )
                 # One-shot post-approval allowance (#430, ADR-0035): when THIS turn is the
                 # resume of a genuinely-approved permission-gate approval, deliver a single
                 # gated-tool grant so the approved action completes once; the gate re-arms
@@ -759,7 +833,14 @@ class Kernel:
             while True:
                 attempt += 1
                 outcome = await self._attempt(
-                    qevent, route, release_order, boot_env, agent_id, nav, packs
+                    qevent,
+                    route,
+                    release_order,
+                    boot_env,
+                    agent_id,
+                    nav,
+                    packs,
+                    workspace_deployment_id,
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -767,7 +848,12 @@ class Kernel:
                     # suspend the session until a human resolves it. The event
                     # is done -- the resolution arrives as its own queued turn.
                     await self._pause_for_approval(
-                        qevent, route, outcome, agent_id, approval_routes
+                        qevent,
+                        route,
+                        outcome,
+                        agent_id,
+                        approval_routes,
+                        deployment_id=workspace_deployment_id,
                     )
                     await self._complete(qevent, route, "awaiting-approval")
                     return
@@ -843,7 +929,29 @@ class Kernel:
 
     async def reap_orphans(self) -> list[str]:
         """Periodic tick: delete substrate claims no live route references."""
-        return await asyncio.to_thread(self._substrate.reap_orphans)
+        reaped = await asyncio.to_thread(self._substrate.reap_orphans)
+        if self._workspace is not None:
+            expired_threads = await asyncio.to_thread(self._workspace.enumerate_expired)
+            for thread_key in expired_threads:
+                # Enumeration is advisory. Serialize with claim/touch/release,
+                # then re-read this exact ledger so an active base staged by a
+                # different worker after enumeration cannot be deleted.
+                async with self._lock.hold(self._config.lock_key(thread_key)) as lease:
+                    candidate = await asyncio.to_thread(
+                        self._workspace.begin_expired_reap,
+                        thread_key,
+                    )
+                    if candidate is not None:
+                        # The object deletes above can be slow. Fence the final
+                        # ledger delete with the still-current Valkey token; the
+                        # exact-ledger comparison is the second guard if a lease
+                        # is lost immediately after this check.
+                        await lease.ensure_owned()
+                        await asyncio.to_thread(
+                            self._workspace.finish_expired_reap,
+                            candidate,
+                        )
+        return reaped
 
     async def interrupt_thread(self, thread_key: str, reason: str) -> bool:
         """Hard-stop the thread's live turn. True if a live runner was signalled."""
@@ -963,10 +1071,13 @@ class Kernel:
         # inner one as `LockAcquireTimeout`), so the caller sees one shape.
         token = await asyncio.wait_for(self._lock.acquire(lock_key), _RESET_LOCK_ACQUIRE_TIMEOUT_S)
         try:
-            return await asyncio.wait_for(
+            released = await asyncio.wait_for(
                 asyncio.to_thread(self._substrate.release, thread_key),
                 _RESET_RELEASE_TIMEOUT_S,
             )
+            if released and self._workspace is not None:
+                await asyncio.to_thread(self._workspace.release, thread_key)
+            return released
         finally:
             await self._lock.release(lock_key, token)
 
@@ -1096,9 +1207,7 @@ class Kernel:
         await self._markers.mark_done(event_id)
         await self._deliver_completion(record, generation=generation)
 
-    async def _deliver_completion(
-        self, record: CompletionRecord, *, generation: str
-    ) -> bool:
+    async def _deliver_completion(self, record: CompletionRecord, *, generation: str) -> bool:
         """Emit a stored completion and clear it, or leave it owed. True on send.
 
         The clear is compare-and-checked against ``generation`` -- the identity of
@@ -1134,9 +1243,7 @@ class Kernel:
             return
         await self._deliver_completion(stored.record, generation=stored.generation)
 
-    async def _quarantine_completion(
-        self, event_id: str, exc: MalformedCompletionError
-    ) -> None:
+    async def _quarantine_completion(self, event_id: str, exc: MalformedCompletionError) -> None:
         """Refuse a malformed outbox record, loudly, and stop re-reading it.
 
         The outbox is new in this train, so every record in it was written by a
@@ -1197,9 +1304,7 @@ class Kernel:
         sent = 0
         now = time.time()
         deadline = now + self._config.completion_sweep_budget_s
-        batch = await self._markers.pending_completions(
-            self._config.completion_sweep_batch
-        )
+        batch = await self._markers.pending_completions(self._config.completion_sweep_batch)
         # ONE pipeline for the whole batch's records: the reads are independent
         # of each other and of every delivery decision below, so paying a round
         # trip per member (up to completion_sweep_batch of them, on the same
@@ -1240,9 +1345,7 @@ class Kernel:
                     record.route.adapter,
                     record.event.target.address,
                 )
-                await self._markers.clear_completion(
-                    event_id, generation=stored.generation
-                )
+                await self._markers.clear_completion(event_id, generation=stored.generation)
                 continue
             if not stored.done_flag:
                 continue
@@ -1251,9 +1354,7 @@ class Kernel:
             if await self._deliver_completion(record, generation=stored.generation):
                 sent += 1
         if sent:
-            logger.info(
-                "completion sweep delivered %d owed turn.completed event(s)", sent
-            )
+            logger.info("completion sweep delivered %d owed turn.completed event(s)", sent)
 
     async def _set_shimmer(
         self,
@@ -1292,9 +1393,7 @@ class Kernel:
             return
         await self._emit_status(self._target_for(qevent), route, caption)
 
-    async def _emit_status(
-        self, target: ReplyTarget, route: TargetRoute, status: str
-    ) -> None:
+    async def _emit_status(self, target: ReplyTarget, route: TargetRoute, status: str) -> None:
         """Raise or lower the channel's liveness caption. Never fails a turn.
 
         Best-effort is a property of the SHIMMER, not of Slack, so the swallow
@@ -1314,9 +1413,7 @@ class Kernel:
                 route=route,
             )
         except Exception as exc:  # noqa: BLE001 -- the caption never gates a turn
-            logger.debug(
-                "turn.status %r skipped for %s: %s", status, target.conversation_id, exc
-            )
+            logger.debug("turn.status %r skipped for %s: %s", status, target.conversation_id, exc)
 
     # -- internals ------------------------------------------------------------
 
@@ -1329,6 +1426,7 @@ class Kernel:
         agent_id: uuid.UUID | None = None,
         nav: NavAffordance | None = None,
         packs: BehaviorPacks | None = None,
+        workspace_deployment_id: uuid.UUID | None = None,
     ) -> TurnOutcome:
         thread = qevent.conversation_id
 
@@ -1359,7 +1457,12 @@ class Kernel:
         try:
             async with self._lock.hold(self._config.lock_key(thread)):
                 routed = await self._route_and_start(
-                    thread, event, boot_env, packs, source=qevent.source
+                    thread,
+                    event,
+                    boot_env,
+                    packs,
+                    workspace_deployment_id=workspace_deployment_id,
+                    source=qevent.source,
                 )
         except CapacityExhaustedError as exc:
             release_order()
@@ -1388,7 +1491,18 @@ class Kernel:
                 ),
             )
             return TurnOutcome(terminal_ok=True)
-        except (RunnerError, aiohttp.ClientError, TimeoutError, SandboxError) as exc:
+        except WorkspaceSelectionRefused as exc:
+            release_order()
+            await self._reply_for(qevent, route, exc.public_detail)
+            return TurnOutcome(terminal_ok=True)
+        except (
+            RunnerError,
+            aiohttp.ClientError,
+            TimeoutError,
+            OSError,
+            SandboxError,
+            WorkspacePreparationError,
+        ) as exc:
             # The turn was never accepted (transient runner 5xx, runner not ready,
             # claim timeout, route-lock acquire timeout). Convert to a retryable
             # outcome so process_event backs off and retries within max_attempts,
@@ -1443,7 +1557,46 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
-            return await self._consume(qevent, route, routed.turn, nav)
+            outcome = await self._consume(qevent, route, routed.turn, nav)
+            if (
+                outcome.status is SessionStatus.AWAITING_APPROVAL
+                and _is_publish_provenance(
+                    outcome.approval_gate_kind,
+                    outcome.approval_granted_tool,
+                )
+            ):
+                try:
+                    snapshot = await self._runner.snapshot(
+                        routed.handle.base_url, token=routed.handle.token or None
+                    )
+                    if self._workspace is None:
+                        raise WorkspacePreparationError(
+                            "publication-validation",
+                            "managed workspace coordinator is unavailable",
+                        )
+                    await asyncio.to_thread(
+                        validate_snapshot_against_base,
+                        self._workspace,
+                        thread_key=thread,
+                        snapshot=snapshot,
+                        max_patch_bytes=self._config.publication_patch_max_bytes,
+                        scratch_root=Path(self._config.workspace_scratch_root),
+                        git_timeout_seconds=(
+                            self._config.publication_git_command_timeout_seconds
+                        ),
+                    )
+                    outcome.publication_snapshot = snapshot
+                except (
+                    RunnerError,
+                    aiohttp.ClientError,
+                    TimeoutError,
+                    WorkspacePreparationError,
+                ) as exc:
+                    # A trusted publication request never falls through into an
+                    # ordinary approval when snapshotting fails. The pause path
+                    # reports this error and creates neither durable row.
+                    outcome.publication_snapshot_error = str(exc)
+            return outcome
         finally:
             self._unregister_run(agent_id, thread)
 
@@ -1454,8 +1607,27 @@ class Kernel:
         boot_env: dict[str, str] | None,
         packs: BehaviorPacks | None = None,
         *,
+        workspace_deployment_id: uuid.UUID | None = None,
         source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
+        # A workspace-enabled thread must establish (or confirm) its repository
+        # before any platform response path. This deliberately precedes the
+        # greeting/help shortcut: a canned reply must not create a thread whose
+        # repository remains ambiguous, and a conflicting repository must be
+        # refused before an existing sandbox can be adopted or steered.
+        if workspace_deployment_id is not None:
+            if self._workspace is None:
+                raise WorkspacePreparationError(
+                    "wiring", "workspace-enabled deployment has no trusted coordinator"
+                )
+            repo_fact = parse_github_repo_fact(event.text)
+            await asyncio.to_thread(
+                self._workspace.select_repository,
+                thread_key=thread,
+                deployment_id=workspace_deployment_id,
+                author=event.user,
+                repo_full_name=repo_fact,
+            )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -1484,7 +1656,11 @@ class Kernel:
         # all -- the runner's own per-turn logging starts only once its
         # process is already up, so it cannot see the wait that got it there.
         claim_started = time.monotonic()
-        handle = await self._claim_or_resume(thread, boot_env)
+        handle = await self._claim_or_resume(
+            thread,
+            boot_env,
+            workspace_deployment_id=workspace_deployment_id,
+        )
         claim_ms = round((time.monotonic() - claim_started) * 1000)
         logger.info("claim latency for %s: %d ms", thread, claim_ms)
         if source.is_job:
@@ -1545,7 +1721,47 @@ class Kernel:
             return True
         return active
 
-    async def _claim_or_resume(self, thread: str, boot_env: dict[str, str] | None) -> SandboxHandle:
+    async def _claim_or_resume(
+        self,
+        thread: str,
+        boot_env: dict[str, str] | None,
+        *,
+        workspace_deployment_id: uuid.UUID | None = None,
+    ) -> SandboxHandle:
+        # A live route is an adopt/steer, not a session start. Preparing before
+        # this check would clone on every threaded steer and could even replace
+        # the base object while the existing sandbox is still using it. The
+        # substrate's adopt primitive both validates and touches an existing
+        # route without ever cold-creating one; this avoids the old
+        # lookup-then-claim gap, where the route could disappear and ``claim``
+        # would create a sandbox without a freshly prepared workspace ref.
+        if workspace_deployment_id is not None:
+            if self._workspace is None:
+                raise WorkspacePreparationError(
+                    "wiring", "workspace-enabled deployment has no trusted preparer"
+                )
+            existing = await asyncio.to_thread(self._substrate.adopt, thread)
+            if existing is not None:
+                await asyncio.to_thread(
+                    self._workspace.touch,
+                    thread,
+                    ttl_seconds=self._route_ttl_seconds,
+                )
+                return existing
+            # Prepare once, then let the substrate decide cold claim versus
+            # suspended-route resume. Either branch materializes the same fresh,
+            # verified archive before the runner can start.
+            workspace_claim = await asyncio.to_thread(
+                self._workspace.claim_or_resume_with_handle,
+                thread_key=thread,
+                deployment_id=workspace_deployment_id,
+                env=boot_env,
+            )
+            if not isinstance(workspace_claim.handle, SandboxHandle):
+                raise WorkspacePreparationError(
+                    "claim", "workspace substrate returned an invalid sandbox handle"
+                )
+            return workspace_claim.handle
         try:
             return await asyncio.to_thread(self._substrate.claim, thread, env=boot_env)
         except SuspendedThreadError:
@@ -1773,6 +1989,8 @@ class Kernel:
         outcome: TurnOutcome,
         agent_id: uuid.UUID | None,
         approval_routes: dict[str, Any] | None = None,
+        *,
+        deployment_id: uuid.UUID | None = None,
     ) -> None:
         """Persist the approval, suspend the session, and leave the pending notice.
 
@@ -1801,6 +2019,18 @@ class Kernel:
         # route identifier, a different concept from the turn's ``TargetRoute``
         # above, and one word for the two is what forced the old ``route_``.
         route_name = outcome.approval_route
+        is_publication = _is_publish_provenance(
+            outcome.approval_gate_kind,
+            outcome.approval_granted_tool,
+        )
+        if is_publication and route_name is not None:
+            await self._escalate(
+                qevent,
+                route,
+                "The platform publication request carried an unexpected approval route; "
+                "nothing was published and no approval was created.",
+            )
+            return
         # The card's destination is a (kind, address) PAIR, never an address on
         # its own: the schema permits the same address string under two kinds,
         # so an address-only comparison misreads an email turn whose address
@@ -1832,12 +2062,21 @@ class Kernel:
                 )
                 return
 
-        if self._approvals is None:
+        if not is_publication and self._approvals is None:
             await self._escalate(
                 qevent,
                 route,
                 "The run requested an approval, but no approval backend is "
                 "configured on this worker; flagging for a human instead of pausing.",
+            )
+            return
+
+        if is_publication and self._publication_creator is None:
+            await self._escalate(
+                qevent,
+                route,
+                "Repository publication is unavailable on this installation; nothing was "
+                "published and no approval was created.",
             )
             return
 
@@ -1852,40 +2091,81 @@ class Kernel:
                 raise RuntimeError("approval reply ref was not minted")
 
         try:
-            created = await self._approvals.create(
-                ApprovalRequest(
-                    agent_id=agent_id,
-                    conversation_id=thread,
-                    author=qevent.author,
-                    summary=summary,
-                    # The durable twin of this turn's routing pair and egress
-                    # selector (ADR-0096 phase 2). Copied off THIS turn at
-                    # creation time, never looked up at resume: an operator may
-                    # re-bind the address between suspension and resume, and the
-                    # persisted values are facts about the original turn.
-                    reply_kind=qevent.reply_handle.kind,
-                    reply_channel=qevent.reply_handle.channel,
-                    # The ref this turn actually DELIVERED on, not the one the wire
-                    # carried. On a placeholder-less turn (ADR-0079) the two differ:
-                    # the wire says null and the turn has since posted its own
-                    # message. Persisting the null would leave the resume with
-                    # nothing to edit, so the approval's outcome would land on a
-                    # second message beside the request it answers.
-                    reply_placeholder=self._target_for(qevent).reply_ref,
-                    reply_endpoint=qevent.reply_handle.endpoint,
-                    reply_adapter=qevent.reply_handle.adapter,
-                    dedupe_key=qevent.event_id,
-                    route=route_name,
-                    card_channel=card_channel,
-                    # The ACI ``final`` frame types this as a bare ``str``, so an
-                    # unrecognized value only fails when the shared model
-                    # validates it (#492/#544: it is authority-bearing, so it is
-                    # rejected, never degraded to None). The cast defers to that
-                    # validation; ValidationError below is the rejection path.
-                    gate_kind=cast("GateKind | None", outcome.approval_gate_kind),
-                    granted_tool=outcome.approval_granted_tool,
+            if is_publication:
+                publication_creator = self._publication_creator
+                assert publication_creator is not None
+                snapshot = outcome.publication_snapshot
+                if outcome.publication_snapshot_error is not None:
+                    raise ApprovalBackendError(
+                        f"publication snapshot failed: {outcome.publication_snapshot_error}"
+                    )
+                if deployment_id is None or snapshot is None:
+                    raise ApprovalBackendError(
+                        "publication requires a deployment-managed repository workspace"
+                    )
+                summary = _publication_approval_summary(snapshot)
+                published = await publication_creator.create_publication(
+                    PublicationCreateRequest(
+                        deployment_id=deployment_id,
+                        conversation_id=thread,
+                        repo_full_name=snapshot.repo_full_name,
+                        author=qevent.author,
+                        summary=summary,
+                        reply_kind=qevent.reply_handle.kind,
+                        reply_channel=qevent.reply_handle.channel,
+                        reply_placeholder=self._target_for(qevent).reply_ref,
+                        reply_endpoint=qevent.reply_handle.endpoint,
+                        reply_adapter=qevent.reply_handle.adapter,
+                        dedupe_key=qevent.event_id,
+                        base_sha=snapshot.base_sha,
+                        patch=snapshot.patch,
+                        changed_paths=snapshot.changed_paths,
+                        expires_in_seconds=_PUBLICATION_EXPIRES_IN_SECONDS,
+                        title=snapshot.publication_title,
+                        body=snapshot.publication_body,
+                        max_patch_bytes=self._config.publication_patch_max_bytes,
+                    )
                 )
-            )
+                created = CreatedApproval(
+                    id=published.approval_id,
+                    status=published.status,
+                )
+            else:
+                assert self._approvals is not None
+                created = await self._approvals.create(
+                    ApprovalRequest(
+                        agent_id=agent_id,
+                        conversation_id=thread,
+                        author=qevent.author,
+                        summary=summary,
+                        # The durable twin of this turn's routing pair and egress
+                        # selector (ADR-0096 phase 2). Copied off THIS turn at
+                        # creation time, never looked up at resume: an operator may
+                        # re-bind the address between suspension and resume, and the
+                        # persisted values are facts about the original turn.
+                        reply_kind=qevent.reply_handle.kind,
+                        reply_channel=qevent.reply_handle.channel,
+                        # The ref this turn actually DELIVERED on, not the one the wire
+                        # carried. On a placeholder-less turn (ADR-0079) the two differ:
+                        # the wire says null and the turn has since posted its own
+                        # message. Persisting the null would leave the resume with
+                        # nothing to edit, so the approval's outcome would land on a
+                        # second message beside the request it answers.
+                        reply_placeholder=self._target_for(qevent).reply_ref,
+                        reply_endpoint=qevent.reply_handle.endpoint,
+                        reply_adapter=qevent.reply_handle.adapter,
+                        dedupe_key=qevent.event_id,
+                        route=route_name,
+                        card_channel=card_channel,
+                        # The ACI ``final`` frame types this as a bare ``str``, so an
+                        # unrecognized value only fails when the shared model
+                        # validates it (#492/#544: it is authority-bearing, so it is
+                        # rejected, never degraded to None). The cast defers to that
+                        # validation; ValidationError below is the rejection path.
+                        gate_kind=cast("GateKind | None", outcome.approval_gate_kind),
+                        granted_tool=outcome.approval_granted_tool,
+                    )
+                )
         except (ApprovalBackendError, ValidationError) as exc:
             # ValidationError: the shared model rejected the payload at
             # construction (#492) -- an unknown gate_kind, or an empty
@@ -1902,6 +2182,25 @@ class Kernel:
             )
             return
 
+        if self._workspace is not None:
+            async with self._lock.hold(self._config.lock_key(thread)):
+                retain_workspace = not is_publication
+                if is_publication:
+                    try:
+                        await asyncio.to_thread(self._workspace.release, thread)
+                    except Exception as exc:  # noqa: BLE001 - patch is already durable
+                        retain_workspace = True
+                        logger.warning(
+                            "publication base-object cleanup failed for thread %s: %s",
+                            thread,
+                            exc,
+                        )
+                if retain_workspace:
+                    await asyncio.to_thread(
+                        self._workspace.touch,
+                        thread,
+                        ttl_seconds=self._suspended_route_ttl_seconds,
+                    )
         try:
             await asyncio.to_thread(self._substrate.suspend, thread, history_ref=None)
         except SandboxError as exc:
@@ -1918,14 +2217,32 @@ class Kernel:
         # logical line -- the notice is always a single clean block. The durable
         # ``Approval`` record and the Block Kit card keep the original summary.
         notice_summary = " ".join(summary.split())
-        notice = (
-            f"Awaiting approval ({created.id}): {notice_summary}\n"
-            "The session is paused and will resume once an authorized member "
-            "resolves this request."
-        )
-        await self._reply_for(
-            qevent, route, f"{base}\n\n{notice}" if base else notice
-        )
+        if is_publication:
+            notice = (
+                f"Awaiting approval ({created.id}): {notice_summary}\n"
+                "The session is paused. The platform will publish or decline the "
+                "captured patch and report the result here; the sandbox will not "
+                "receive a publication credential."
+            )
+        else:
+            notice = (
+                f"Awaiting approval ({created.id}): {notice_summary}\n"
+                "The session is paused and will resume once an authorized member "
+                "resolves this request."
+            )
+        await self._reply_for(qevent, route, f"{base}\n\n{notice}" if base else notice)
+
+        if is_publication:
+            # The atomic Approval+Publication insert is also the durable initial
+            # card outbox. The publication reconciler posts and remembers that
+            # card independently, so this turn can be acknowledged now and is
+            # never reclaimed through the model merely because Slack is down.
+            logger.info(
+                "thread %s suspended awaiting publication approval %s; card queued",
+                thread,
+                created.id,
+            )
+            return
 
         # The card's destination -- kind AND route -- is selected from the
         # channel it POSTS TO, never from the turn that requested it. In the
@@ -2124,15 +2441,9 @@ class Kernel:
             acc.text_parts.append(frame.text)
             await reply.stream(acc.rendered())
         elif isinstance(frame, ToolNote):
-            # Surfaced for context but not part of the answer buffer.
-            note = (
-                f"  -> [{frame.tool}] {frame.text}"
-                if frame.tool is not None
-                else f"  -> {frame.text}"
-            )
-            answer = acc.rendered()
-            preview = f"{answer}\n{note}" if answer else note
-            await reply.context(preview)
+            # Tool notes remain available on the ACI stream for internal
+            # consumers, but they are not part of the user-facing reply.
+            pass
         elif isinstance(frame, SideEffectFlag):
             acc.saw_side_effect = True
             # Persist immediately so a crash before done still blocks auto-retry.

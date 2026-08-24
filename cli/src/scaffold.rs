@@ -64,6 +64,7 @@ fn manifest(name: &str) -> String {
     serde_json::to_string_pretty(&serde_json::json!({
         "name": name,
         "description": format!("The {name} agent plugin."),
+        "systemPrompt": format!("You are the {name} agent. Help users with {name} requests."),
         "version": "0.1.0",
     }))
     .expect("static manifest serializes")
@@ -312,6 +313,13 @@ pub fn scaffold_from_spec(dir: &Path, spec: &AgentSpec) -> Result<Vec<PathBuf>> 
     let mut manifest_obj = serde_json::Map::new();
     manifest_obj.insert("name".into(), serde_json::json!(spec.name));
     manifest_obj.insert("description".into(), serde_json::json!(spec.description));
+    manifest_obj.insert(
+        "systemPrompt".into(),
+        serde_json::json!(format!(
+            "You are the {} agent. Help users with {} requests.",
+            spec.name, spec.name
+        )),
+    );
     manifest_obj.insert("version".into(), serde_json::json!("0.1.0"));
     if !spec.secrets.is_empty() {
         manifest_obj.insert("secrets".into(), serde_json::json!(spec.secrets));
@@ -526,6 +534,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(manifest["name"], "deal-desk");
+        assert_eq!(
+            manifest["systemPrompt"],
+            "You are the deal-desk agent. Help users with deal-desk requests."
+        );
 
         // Genericized starter skill for <name>: no weather anywhere.
         let skill = std::fs::read_to_string(dir.path().join("skills/deal-desk/SKILL.md")).unwrap();

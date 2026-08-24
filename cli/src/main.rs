@@ -4,6 +4,7 @@
 //! platform API. Task I1; contracts are frozen in packages/aci-protocol and
 //! packages/plugin-format.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -101,47 +102,6 @@ struct ClusterAgentTarget {
     conn: ClusterConn,
     #[arg(long)]
     dry_run: bool,
-}
-
-/// Stand up the connectors this version declares, and prune what it dropped.
-///
-/// Split across the two components on purpose (ADR-0086): the API RENDERS the
-/// Kubernetes objects -- a pure function of the bundle, so it needs no cluster
-/// access and keeps its read-only RBAC on the service that receives internet
-/// webhooks -- and the CLI APPLIES them under the operator's own kubectl
-/// credentials, where cluster-write authority already lived.
-///
-/// A bundle with no `connectors.yaml` still reaches the prune: that is the case
-/// where a connector was REMOVED, and leaving it running with a credential
-/// mounted and nothing referencing it is the leak nobody notices.
-async fn sync_connectors(
-    api_url: &str,
-    api_key: &str,
-    namespace: &str,
-    release: &str,
-    agent_id: &str,
-    agent_name: &str,
-    version_id: &str,
-) -> anyhow::Result<()> {
-    let app_name = curie::connectors::discover_app_name(namespace, release).await?;
-    let client = curie::api::ApiClient::new(api_url, api_key)?;
-    let rendered = client
-        .version_connectors(agent_id, version_id, release, namespace, &app_name)
-        .await?;
-    let synced = curie::connectors::sync(
-        &rendered.manifests,
-        &rendered.mcp_entries,
-        &rendered.owned_secret_name,
-        &rendered.owned_secret_keys,
-        namespace,
-        agent_name,
-    )
-    .await?;
-    let ui = curie::ui::ui();
-    for (name, url) in &synced.urls {
-        ui.note(&format!("connector {name}: {url}"));
-    }
-    Ok(())
 }
 
 /// Resolve a cluster verb's `(api_url, api_key)`: an explicit flag/env value wins;
@@ -243,7 +203,8 @@ enum Command {
         )]
         adopt: Option<PathBuf>,
     },
-    /// Work with a local runner session for a plugin bundle:
+    /// Work with the runner only tier for a plugin bundle. `skill` names that tier, not a
+    /// bundle skill artifact at `skills/<name>/SKILL.md`. Subcommands:
     /// `skill <up|down|status|message|eval|approvals>`. `versions` and `memory`
     /// are answered here too, reporting that this tier has neither.
     Skill {
@@ -259,6 +220,11 @@ enum Command {
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
+    },
+    /// Install a complete first party example workflow.
+    Example {
+        #[command(subcommand)]
+        action: ExampleAction,
     },
     /// List locally-authored agent bundles under `agents/` (source checkout
     /// only) -- a personal, gitignored directory (sibling of `examples/`) for
@@ -514,6 +480,31 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ExampleAction {
+    /// Install the self referential SRE bot example.
+    SreBot {
+        #[command(subcommand)]
+        action: SreBotAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SreBotAction {
+    /// Install Curie, its observability stack, and the SRE bot bundle.
+    Install {
+        /// Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack.
+        #[arg(long, required = true)]
+        observability: bool,
+        /// Print the ordered plan without mutating the cluster.
+        #[arg(long)]
+        dry_run: bool,
+        /// Bind the installed bot to this Slack channel.
+        #[arg(long, value_name = "CHANNEL")]
+        slack_channel: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum DevAction {
     /// Check the frozen contracts (`bash scripts/check-contracts.sh`).
     Contracts,
@@ -558,6 +549,10 @@ enum DevAction {
     /// downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`).
     /// Offline, no credential.
     EmitParity,
+    /// Assert sibling CLI verbs expose matching conversation controls across
+    /// the skill, local, and cluster tiers (#1666,
+    /// `bash cli/scripts/check-verb-parity.sh`). Offline, no credential.
+    VerbParity,
     /// Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/).
     /// Refuses when a schema changed shape without a version bump.
     SchemaBaseline,
@@ -782,6 +777,9 @@ enum SkillAction {
         /// Runner base URL (defaults to the started runner, then localhost).
         #[arg(long)]
         url: Option<String>,
+        /// Reuse the runner's current conversation instead of starting fresh.
+        #[arg(long = "continue")]
+        r#continue: bool,
     },
     /// Run the bundle's eval cases through the local runner.
     Eval {
@@ -1121,6 +1119,13 @@ enum LocalAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
+        /// Let each new session select an allowed GitHub repository from the
+        /// opening message and materialize it as managed /workspace.
+        #[arg(long, conflicts_with = "no_workspace")]
+        workspace: bool,
+        /// Explicitly disable a previously configured managed workspace.
+        #[arg(long, conflicts_with = "workspace")]
+        no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
         /// instead, and an explicit value here still wins over the target.
         #[arg(long, value_enum)]
@@ -1780,6 +1785,13 @@ enum ClusterAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
+        /// Let sessions on each deployment select an allowed GitHub repository
+        /// from the opening message and materialize it as managed /workspace.
+        #[arg(long, conflicts_with = "no_workspace")]
+        workspace: bool,
+        /// Explicitly disable a previously configured managed workspace.
+        #[arg(long, conflicts_with = "workspace")]
+        no_workspace: bool,
         /// Target environment. Defaults to dev; a `--target` supplies it
         /// instead, and an explicit value here still wins over the target.
         #[arg(long, value_enum)]
@@ -2048,6 +2060,26 @@ async fn run(command: Option<Command>) -> Result<()> {
             from_spec,
             adopt,
         }) => commands::init(name, dir, from_spec, adopt),
+        Some(Command::Example {
+            action:
+                ExampleAction::SreBot {
+                    action:
+                        SreBotAction::Install {
+                            observability,
+                            dry_run,
+                            slack_channel,
+                        },
+                },
+        }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
+            observability,
+            dry_run,
+            slack_channel,
+        })
+        .await?
+        {
+            curie::examples::SreBotInstallResult::DryRun(plan) => emit(plan),
+            curie::examples::SreBotInstallResult::Installed(deployed) => emit(*deployed),
+        },
         Some(Command::Build {
             tag,
             plugin_dir,
@@ -2101,6 +2133,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             }
             DevAction::EmitParity => {
                 commands::dev_script("cli/scripts/check-emit-parity.sh", &[]).await
+            }
+            DevAction::VerbParity => {
+                commands::dev_script("cli/scripts/check-verb-parity.sh", &[]).await
             }
             DevAction::SchemaBaseline => {
                 commands::dev_script("cli/scripts/refresh-schema-baseline.sh", &[]).await
@@ -2216,9 +2251,10 @@ async fn run(command: Option<Command>) -> Result<()> {
                 user,
                 event_type,
                 url,
+                r#continue,
             } => {
                 let classified_failure =
-                    commands::send(&text, &user, event_type.into(), url).await?;
+                    commands::send(&text, &user, event_type.into(), url, r#continue).await?;
                 if classified_failure {
                     std::process::exit(1);
                 }
@@ -2496,6 +2532,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_key,
                 slack_channel,
                 repo,
+                workspace,
+                no_workspace,
                 env,
                 label,
                 secret,
@@ -2512,6 +2550,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key,
                         slack_channel,
                         repo,
+                        workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
                         env,
                         label,
                         secret,
@@ -3068,6 +3107,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 api_key,
                 slack_channel,
                 repo,
+                workspace,
+                no_workspace,
                 env,
                 label,
                 secret,
@@ -3205,6 +3246,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         api_key: api_key.clone(),
                         slack_channel: slack_channel.clone(),
                         repo: repo.clone(),
+                        workspace: commands::WorkspaceIntent::from_flags(workspace, no_workspace),
                         env,
                         label: label.clone(),
                         // Cluster connector-secret delivery is deferred to #440; no
@@ -3242,14 +3284,13 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
                     // secret delivery #440 tracks.
-                    if let Err(err) = sync_connectors(
+                    if let Err(err) = curie::connectors::sync_deployed_version(
                         &api_url,
                         &api_key,
                         &namespace,
                         &release,
-                        &deployed.agent_id,
-                        &deployed.agent_name,
-                        &deployed.version_id,
+                        &deployed,
+                        &BTreeMap::new(),
                     )
                     .await
                     {

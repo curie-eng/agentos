@@ -21,10 +21,13 @@ from aci_protocol import (
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .workspace_policy import valid_allowlist_entry
+
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
 _DEV_DEFAULT_API_KEY = "curie-dev-key"
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
+_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
 
 
 class Settings(BaseSettings):
@@ -42,6 +45,14 @@ class Settings(BaseSettings):
 
     # Single shared API key. Dev-only default; override in any shared deployment.
     api_key: str = "curie-dev-key"
+    # Separate trust boundary for credential redemption. The operator/CLI API
+    # key can administer deployments but cannot redeem the GitHub identity.
+    internal_worker_token: str = Field(
+        default=_DEV_DEFAULT_INTERNAL_WORKER_TOKEN,
+        validation_alias=AliasChoices(
+            "CURIE_INTERNAL_WORKER_TOKEN", "INTERNAL_WORKER_TOKEN"
+        ),
+    )
 
     # Human-readable org/workspace name the UI reads (open /config endpoint) to
     # brand the app. Overridable via ORG_NAME for a white-labeled deployment.
@@ -130,6 +141,11 @@ class Settings(BaseSettings):
     # never place it in argv.
     github_app_private_key: str = ""
     github_app_timeout_seconds: float = 15.0
+    # Repositories the runtime workspace selector may bind to a thread. Exact
+    # owner/repository entries and owner-wide owner/* entries are supported.
+    # Empty is fail-closed: enabling workspace capability alone grants no
+    # repository access.
+    github_repo_allowlist: tuple[str, ...] = ()
     # Commit polling (issue #1239). A self-hosted cluster that accepts no
     # inbound traffic cannot receive a GitHub webhook, so without this it has
     # no push-to-deploy at all. Outbound always works, so the API asks GitHub
@@ -205,6 +221,20 @@ class Settings(BaseSettings):
     # resumes their stranded sessions. Values <= 0 disable the sweeper (the
     # operator kill lever and the fully-inert-app escape hatch for tests).
     approval_sweep_interval_s: float = 30.0
+    # Publication patches are private control-plane inputs. The ingress bound
+    # and terminal retention are operator-owned, and the periodic approval
+    # sweeper also reaps terminal bytes after this retention window.
+    publication_patch_max_bytes: int = Field(
+        default=900_000,
+        gt=0,
+        le=900_000,
+        validation_alias="CURIE_PUBLICATION_PATCH_MAX_BYTES",
+    )
+    publication_patch_retention_seconds: int = Field(
+        default=3600,
+        gt=0,
+        validation_alias="CURIE_PUBLICATION_RETENTION_SECONDS",
+    )
 
     # Resume reconciler (#411): the backstop that re-enqueues resume turns for
     # resolved approvals whose inline enqueue failed. enabled is the off-switch
@@ -340,6 +370,17 @@ class Settings(BaseSettings):
         return f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
 
     @model_validator(mode="after")
+    def _validate_github_repo_allowlist(self) -> "Settings":
+        invalid = [
+            entry for entry in self.github_repo_allowlist if not valid_allowlist_entry(entry)
+        ]
+        if invalid:
+            raise ValueError(
+                "GITHUB_REPO_ALLOWLIST entries must be owner/repository or owner/*"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":
         """Production boot gate (#57): with ENVIRONMENT=prod, refuse to start if a
         shared secret is unset or still the shipped dev default, so a prod deploy
@@ -351,6 +392,8 @@ class Settings(BaseSettings):
             offenders.append("API_KEY")
         if self.github_webhook_secret in ("", _DEV_DEFAULT_WEBHOOK_SECRET):
             offenders.append("GITHUB_WEBHOOK_SECRET")
+        if self.internal_worker_token in ("", _DEV_DEFAULT_INTERNAL_WORKER_TOKEN):
+            offenders.append("CURIE_INTERNAL_WORKER_TOKEN")
         if offenders:
             raise ValueError(
                 "ENVIRONMENT=prod but these secrets are unset or still the dev "

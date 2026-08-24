@@ -119,7 +119,7 @@ export const commandManifest = {
       "name": "init"
     },
     {
-      "about": "Work with a local runner session for a plugin bundle: `skill <up|down|status|message|eval|approvals>`. `versions` and `memory` are answered here too, reporting that this tier has neither",
+      "about": "Work with the runner only tier for a plugin bundle. `skill` names that tier, not a bundle skill artifact at `skills/<name>/SKILL.md`. Subcommands: `skill <up|down|status|message|eval|approvals>`. `versions` and `memory` are answered here too, reporting that this tier has neither",
       "hidden": false,
       "name": "skill",
       "subcommands": [
@@ -516,6 +516,18 @@ export const commandManifest = {
               "id": "url",
               "long": "url",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Reuse the runner's current conversation instead of starting fresh",
+              "id": "continue",
+              "long": "continue",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             }
           ],
@@ -1269,6 +1281,30 @@ export const commandManifest = {
               "id": "repo",
               "long": "repo",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Let each new session select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "id": "workspace",
+              "long": "workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Explicitly disable a previously configured managed workspace",
+              "id": "no_workspace",
+              "long": "no-workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {
@@ -2990,6 +3026,30 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Let sessions on each deployment select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "id": "workspace",
+              "long": "workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Explicitly disable a previously configured managed workspace",
+              "id": "no_workspace",
+              "long": "no-workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
               "id": "env",
               "long": "env",
@@ -3840,6 +3900,59 @@ export const commandManifest = {
       ]
     },
     {
+      "about": "Install a complete first party example workflow",
+      "hidden": false,
+      "name": "example",
+      "subcommands": [
+        {
+          "about": "Install the self referential SRE bot example",
+          "hidden": false,
+          "name": "sre-bot",
+          "subcommands": [
+            {
+              "about": "Install Curie, its observability stack, and the SRE bot bundle",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Install the fixed self referential Grafana, Loki, Alloy, Tempo, and Prometheus stack",
+                  "id": "observability",
+                  "long": "observability",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Print the ordered plan without mutating the cluster",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Bind the installed bot to this Slack channel",
+                  "id": "slack_channel",
+                  "long": "slack-channel",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "install"
+            }
+          ]
+        }
+      ]
+    },
+    {
       "about": "List locally-authored agent bundles under `agents/` (source checkout only) -- a personal, gitignored directory (sibling of `examples/`) for in-progress agent projects ready to hand to `deploy-local`. Empty, not an error, when the directory doesn't exist",
       "hidden": false,
       "name": "list-agents"
@@ -4143,6 +4256,11 @@ export const commandManifest = {
           "about": "Assert every declared `emits` projection in `cli/api-mirrors.json` -- a `CliOutput::to_json` that hand-projects a mirror struct into a `json!` literal -- covers that struct's fields (#699, one hop downstream of `field-parity`, `bash cli/scripts/check-emit-parity.sh`). Offline, no credential",
           "hidden": false,
           "name": "emit-parity"
+        },
+        {
+          "about": "Assert sibling CLI verbs expose matching conversation controls across the skill, local, and cluster tiers (#1666, `bash cli/scripts/check-verb-parity.sh`). Offline, no credential",
+          "hidden": false,
+          "name": "verb-parity"
         },
         {
           "about": "Refresh the ADR-0101 schema compatibility baseline (cli/schema/baseline/). Refuses when a schema changed shape without a version bump",

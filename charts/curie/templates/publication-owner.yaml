@@ -1,0 +1,109 @@
+{{- if and .Values.worker.deploy .Values.worker.publication.enabled }}
+{{- $namespace := include "curie.publicationNamespace" . -}}
+{{- $serviceAccountName := .Values.worker.publication.serviceAccountName | default (printf "%s-publication" (include "curie.fullname" .)) -}}
+{{- $ownerName := .Values.worker.publication.ownerName | default (printf "%s-publication-owner" (include "curie.fullname" .)) -}}
+{{- if .Values.worker.publication.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication-namespace
+---
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $serviceAccountName }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication
+automountServiceAccountToken: false
+---
+# Stable Helm-owned anchor for dynamic ConfigMap, Secret, and Job owner refs.
+# It has no data and grants no authority; uninstall deletes it and Kubernetes
+# garbage-collects every publication object the worker attached to its UID.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $ownerName }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication-owner
+data: {}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-publication-worker
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication-worker
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-publication-worker
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-publication-worker
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+---
+# Publication jobs accept no ingress and are isolated from all other egress.
+# The tokenless job may resolve DNS and connect over HTTPS only to the
+# operator-declared GitHub ranges.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-publication-egress
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publication
+spec:
+  podSelector:
+    matchLabels:
+      curietech.ai/component: publication
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.security.networkPolicy.dnsNamespace }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+      {{- range .Values.worker.publication.githubHttpsCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+      {{- end }}
+      ports:
+        - { protocol: TCP, port: 443 }
+{{- end }}

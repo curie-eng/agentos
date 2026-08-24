@@ -1,0 +1,16 @@
+otelCollector:
+  extraExporters:
+    otlphttp/tempo:
+      endpoint: http://tempo.observability.svc.cluster.local:4318
+  extraPipelineExporters:
+    - otlphttp/tempo
+grafanaConnector:
+  enabled: true
+  url: http://grafana.observability.svc.cluster.local
+  namespace: observability
+  adminSecretName: grafana-admin
+  secretName: curie-grafana-connector
+  secretKey: GRAFANA_SERVICE_ACCOUNT_TOKEN
+  restartDeploymentNames:
+    - curie-sre-bot-grafana
+    - curie-sre-bot-tempo

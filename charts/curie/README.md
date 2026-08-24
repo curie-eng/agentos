@@ -150,6 +150,27 @@ App services emit OTLP (OpenTelemetry Protocol) to the **collector**, never
 straight to Langfuse (Langfuse OTLP ingest is HTTP-only): `curie-otel-collector:4317` (gRPC) /
 `:4318` (HTTP). The collector forwards to Langfuse over HTTP.
 
+Additional trace destinations are configured through
+`otelCollector.extraExporters`, a map of exporter names to collector exporter
+configuration, and `otelCollector.extraPipelineExporters`, an ordered list of
+those names. The map is rendered under `exporters` and the list is appended to
+the traces pipeline; built-in `otlphttp/langfuse` and `debug` exporters may
+also be named. Helm fails with the missing exporter name if a pipeline entry is
+undefined. For example, this adds a Tempo exporter:
+
+```yaml
+otelCollector:
+  extraExporters:
+    otlp/tempo:
+      endpoint: tempo:4317
+      tls:
+        insecure: true
+  extraPipelineExporters: [otlp/tempo]
+```
+
+Changes to either value roll the collector Deployment through its config
+checksum, so the configured pipeline is applied on `helm upgrade`.
+
 ## Components
 
 | Component | Image | Notes |
@@ -864,8 +885,41 @@ etcd entirely, as below.
 
 ### The GitHub App private key
 
-This is the most sensitive value the chart handles: it can mint read tokens for
-every repository the App is installed on. Two ways to supply it.
+This is the most sensitive value the chart handles: it can mint tokens carrying
+the App's configured permissions for every repository where it is installed.
+Two ways to supply it.
+
+Managed repository workspaces need App **Contents: Read** permission. Approval-
+gated publication additionally needs **Contents: Read and write** and **Pull
+requests: Read and write**. Curie prefers a repository-scoped installation token
+when the App is configured and falls back to `api.githubToken`; neither
+credential is mounted into a sandbox. Publication Jobs run in the dedicated
+namespace named by `worker.publication.namespace` (release-scoped when empty).
+For a private runner image, create the referenced image pull Secret in that
+namespace separately; the chart deliberately does not copy the platform Secret.
+
+Deployment workspace capability is tri-state: `curie ... deploy --workspace`
+enables runtime selection, `--no-workspace` explicitly disables it, and
+omitting both carries the active deployment's value forward. The first root
+GitHub repository URL that establishes selection in a Slack thread is pinned to
+that agent and thread. A later message can establish selection when no earlier
+message did; later messages may omit the URL. Choosing another repository
+requires a new thread.
+
+Set `api.githubRepoAllowlist` to exact `owner/repository` entries or explicit
+owner-wide `owner/*` entries. Empty is deny-all. Curie checks this policy before
+selection or credential resolution and again before publication, including for
+already-selected threads. The GitHub App path mints a token narrowed to the
+selected repository. The `api.githubToken` fallback may carry broader authority
+than one repository, so scope it narrowly; the allowlist controls where Curie
+may present it, and credential audit rows record which path was used.
+
+```yaml
+api:
+  githubRepoAllowlist:
+    - acme-corp/acme-bot
+    - acme-labs/*
+```
 
 **Recommended — a Secret you manage.** The chart only references it, so the key
 never passes through helm values and never lands in release history (helm

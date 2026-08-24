@@ -5,12 +5,14 @@ bundle columns; J1 added the git-flow columns (agents.repo_full_name,
 agent_versions.commit_sha, deployments.bot_identity/commit_sha).
 """
 
+from __future__ import annotations
+
 import enum
 import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Enum, ForeignKey, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, LargeBinary, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -112,7 +114,7 @@ class Agent(Base):
     hook_generation: Mapped[int] = mapped_column(default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
-    versions: Mapped[list["AgentVersion"]] = relationship(
+    versions: Mapped[list[AgentVersion]] = relationship(
         back_populates="agent", cascade="all, delete-orphan"
     )
     # The agent's channel binding (ADR-0096, #1459). SINGULAR: one agent binds
@@ -124,7 +126,7 @@ class Agent(Base):
     # the default lazy strategy RAISES on attribute access outside an await under
     # asyncio instead of loading. Dropping it turns all three read endpoints into
     # 500s while the crud-level tests, which hold a live session, stay green.
-    channel: Mapped["AgentChannel"] = relationship(
+    channel: Mapped[AgentChannel] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
         uselist=False,
@@ -231,8 +233,36 @@ class Deployment(Base):
         Enum(Environment, name="environment", schema=SCHEMA)
     )
     commit_sha: Mapped[str | None] = mapped_column(default=None)
+    # A deployment-level capability. The concrete repository is selected from
+    # the opening thread message and stored in ThreadWorkspace only after the
+    # operator allowlist authorizes it.
+    workspace_enabled: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(server_default="active")
     deployed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ThreadWorkspace(Base):
+    """One immutable repository selection for an agent conversation."""
+
+    __tablename__ = "thread_workspaces"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    selected_by_deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"), default=None
+    )
+    conversation_id: Mapped[str]
+    repo_full_name: Mapped[str]
+    selected_by: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "conversation_id", name="thread_workspaces_agent_conversation_key"
+        ),
+    )
 
 
 class Approval(Base):
@@ -316,6 +346,126 @@ class Approval(Base):
     # which is the rolling-deploy window the worker's prefix fallback covers.
     gate_kind: Mapped[str | None] = mapped_column(default=None)
     granted_tool: Mapped[str | None] = mapped_column(default=None)
+    # Server-owned purpose. Only ``publication`` enables the narrowly scoped
+    # requester self-approval rule and suppresses the ordinary model wake.
+    purpose: Mapped[str] = mapped_column(server_default="session", default="session")
+
+    publication: Mapped[Publication | None] = relationship(back_populates="approval", uselist=False)
+
+
+class Publication(Base):
+    """Private patch state settled by the platform publication reconciler."""
+
+    __tablename__ = "publications"
+    __table_args__ = (
+        Index("ix_publications_status_lease", "status", "lease_expires_at"),
+        Index("ix_publications_deployment_id", "deployment_id"),
+        Index(
+            "ix_publications_approval_card_delivery",
+            "approval_card_reported_at",
+            "approval_card_delivery_dead_lettered_at",
+            "approval_card_lease_expires_at",
+        ),
+        Index(
+            "ix_publications_resource_cleanup",
+            "resource_cleanup_completed_at",
+            "resource_cleanup_lease_expires_at",
+        ),
+        Index(
+            "ix_publications_result_delivery",
+            "result_reported_at",
+            "result_delivery_dead_lettered_at",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="CASCADE"),
+        unique=True,
+    )
+    deployment_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="CASCADE")
+    )
+    repo_full_name: Mapped[str]
+    status: Mapped[str] = mapped_column(server_default="pending")
+    version: Mapped[int] = mapped_column(server_default="1", default=1)
+    base_sha: Mapped[str]
+    # Deliberately excluded from every public DTO. Terminal retention clears
+    # these bytes while preserving the audit/result metadata.
+    patch_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB)
+    title: Mapped[str]
+    body: Mapped[str] = mapped_column(Text)
+    reply_kind: Mapped[str]
+    reply_channel: Mapped[str]
+    reply_placeholder: Mapped[str | None] = mapped_column(default=None)
+    reply_endpoint: Mapped[str | None] = mapped_column(default=None)
+    reply_adapter: Mapped[str | None] = mapped_column(default=None)
+    # Durable initial approval-card outbox. Its lease/version are separate from
+    # publication mutation, while claim_next gates Job creation on delivery so
+    # even an immediate CLI approval cannot race ahead of the required card.
+    approval_card_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    approval_card_delivery_started_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_delivery_attempts: Mapped[int] = mapped_column(
+        server_default="0", default=0
+    )
+    approval_card_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    approval_card_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    approval_card_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        default=None
+    )
+    approval_card_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    approval_card_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    # Resource cleanup is an unbounded durable obligation, separate from the
+    # bounded human-facing result outbox. A Slack outage can dead-letter its
+    # report; credentials and publication resources can never be abandoned.
+    resource_cleanup_completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    resource_cleanup_error: Mapped[str | None] = mapped_column(Text, default=None)
+    resource_cleanup_version: Mapped[int] = mapped_column(server_default="1", default=1)
+    resource_cleanup_lease_owner: Mapped[str | None] = mapped_column(default=None)
+    resource_cleanup_lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    lease_owner: Mapped[str | None] = mapped_column(default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_url: Mapped[str | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Terminalization and credential/resource cleanup happen before reply
+    # delivery. These fields form the durable result outbox so a transient
+    # adapter failure cannot resurrect publication work or retain patch bytes.
+    result_reported_at: Mapped[datetime | None] = mapped_column(default=None)
+    result_delivery_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    result_delivery_error: Mapped[str | None] = mapped_column(Text, default=None)
+    result_delivery_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
+    reconcile_attempts: Mapped[int] = mapped_column(server_default="0", default=0)
+    reconcile_dead_lettered_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    terminal_at: Mapped[datetime | None] = mapped_column(default=None)
+
+    approval: Mapped[Approval] = relationship(back_populates="publication")
+
+
+class CredentialRedemptionAuditEntry(Base):
+    """Credential-boundary audit containing names and outcomes, never material."""
+
+    __tablename__ = "credential_redemption_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    purpose: Mapped[str]
+    outcome: Mapped[str]
+    deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"),
+        default=None,
+    )
+    publication_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.publications.id", ondelete="SET NULL"),
+        default=None,
+    )
+    repo_full_name: Mapped[str | None] = mapped_column(default=None)
+    detail: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class ApprovalAuditEntry(Base):
@@ -404,17 +554,13 @@ class ConsoleSession(Base):
 
     __tablename__ = "console_sessions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # SHA-256 hex of the single-use login code. Unique so a hash collision or a
     # duplicate mint cannot produce two rows one code could satisfy.
     login_code_hash: Mapped[str] = mapped_column(unique=True, index=True)
     login_code_expires_at: Mapped[datetime]
     # Set at exchange, so NULL means "minted, never redeemed".
-    session_token_hash: Mapped[str | None] = mapped_column(
-        default=None, unique=True, index=True
-    )
+    session_token_hash: Mapped[str | None] = mapped_column(default=None, unique=True, index=True)
     session_expires_at: Mapped[datetime | None] = mapped_column(default=None)
     # Stamped at exchange; its presence is what makes the code single-use.
     consumed_at: Mapped[datetime | None] = mapped_column(default=None)

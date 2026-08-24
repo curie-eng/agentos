@@ -134,6 +134,7 @@ roleRef:
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
 {{- $bf := $runner.bundleFetch }}
+{{- $wf := $runner.workspace }}
 {{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
 {{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
 {{- if $agent }}
@@ -216,7 +217,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $runner.hardening.enabled $runner.liteLLM.enabled }}
+      {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled $runner.liteLLM.enabled }}
       volumes:
         {{- if $runner.liteLLM.enabled }}
         # LiteLLM proxy config (model_list + router/fallback), mounted read-only
@@ -248,6 +249,13 @@ spec:
           emptyDir:
             sizeLimit: {{ $bf.awsConfigSizeLimit | quote }}
         {{- end }}
+        {{- if $wf.enabled }}
+        # One claim-scoped managed checkout. It is separate from writablePaths
+        # so the workspace has one explicit size and lifetime boundary.
+        - name: workspace
+          emptyDir:
+            sizeLimit: {{ $wf.sizeLimit | quote }}
+        {{- end }}
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
         # sizeLimit is ADR-0059 decision 2 (see hardening.writablePathSizeLimit
@@ -258,27 +266,26 @@ spec:
         {{- end }}
         {{- end }}
       {{- end }}
-      {{- if $bf.enabled }}
+      {{- if or $bf.enabled $wf.enabled }}
       {{/*
-      Bundle provisioning. CURIE_BUNDLE_REF is injected per-claim (the
-      substrate's Overrides policy); baked empty here so a warm/unbound pod
-      no-ops. Split in two because no single stock image carries both an
-      authenticated S3 client and archive tools. AWS CLI fetches the object and
-      BusyBox extracts it. A ref that is set but cannot be
-      fetched/extracted fails the pod instead of booting an empty plugin dir.
-      Egress to RustFS is opened by the runner NetworkPolicy carve out.
+      Claim-scoped provisioning. The bundle path retains its S3 object-key
+      contract and object-store identity; the workspace path consumes only a
+      worker-minted, exact-object signed URL. Baked empty refs keep warm/unbound
+      pods as no-ops. A set-but-invalid ref fails the pod instead of booting
+      stale or empty content. Egress to RustFS is opened by the runner
+      NetworkPolicy carve out.
       */}}
       initContainers:
+        {{- if $bf.enabled }}
         - name: bundle-fetch
           image: {{ $bf.fetchImage }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           {{- if $runner.hardening.enabled }}
-          # Same container-level lockdown as the runner: these init containers
-          # run an authenticated S3 fetch and archive extract of operator-supplied
-          # input in the untrusted pod, so they must not run looser than it. Every
-          # write targets a mounted emptyDir. The fetched archive goes to
-          # `bundles` and AWS config goes to the dedicated `aws-config` volume, so a
-          # read-only rootfs is safe.
+          # Same container-level lockdown as the runner: this init container
+          # runs an authenticated S3 fetch of operator-supplied input in the
+          # untrusted pod, so it must not run looser than it. Every write targets
+          # a mounted emptyDir: the archive goes to `bundles` and AWS config to
+          # the dedicated `aws-config` volume, so a read-only rootfs is safe.
           {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
           {{- end }}
           command:
@@ -364,12 +371,16 @@ spec:
               STAGE={{ $bf.mountPath }}/.stage
               rm -rf "$STAGE"
               mkdir -p "$STAGE"
-              case "$REF" in
-                *.tar.gz|*.tgz) tar -xzf "$ARCHIVE" -C "$STAGE" ;;
-                *.tar)          tar -xf  "$ARCHIVE" -C "$STAGE" ;;
-                *.zip)          unzip -o "$ARCHIVE" -d "$STAGE" ;;
-                *) echo "FATAL: unsupported bundle extension for '$REF'" >&2; exit 1 ;;
-              esac
+              if tar -xzf "$ARCHIVE" -C "$STAGE" 2>/dev/null; then
+                :
+              elif tar -xf "$ARCHIVE" -C "$STAGE" 2>/dev/null; then
+                :
+              elif unzip -o "$ARCHIVE" -d "$STAGE" >/dev/null; then
+                :
+              else
+                echo "FATAL: bundle is not a supported archive" >&2
+                exit 1
+              fi
               # Unwrap a single top-level wrapper dir so the plugin manifest sits
               # at the plugin-dir root, matching the API's bundle_root validation
               # (a `tar czf b.tgz myplugin/` wraps everything in one folder). The
@@ -393,6 +404,104 @@ spec:
               mountPath: {{ $bf.mountPath }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
+        {{- end }}
+        {{- if $wf.enabled }}
+        - name: workspace-init
+          image: {{ include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: {{ $runner.imagePullPolicy }}
+          {{- if $runner.hardening.enabled }}
+          {{- include "curie.sandboxHardening.securityContext" . | nindent 10 }}
+          {{- end }}
+          command:
+            - python
+            - -c
+            - |
+              import base64, hashlib, json, os, pathlib, shutil, signal, subprocess, sys, time, urllib.request
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, request, fp, code, message, headers, new_url):
+                      return None
+              ref = os.environ.get("CURIE_WORKSPACE_REF", "")
+              root = pathlib.Path("{{ $wf.mountPath }}")
+              destination = root / ".curie-workspace.tar.gz"
+              stage = root / ".curie-stage"
+              if not ref:
+                  sys.exit(0)
+              # An init-container restart must never overlay a partial prior
+              # extraction. The signed archive is fetched again after cleanup.
+              for child in root.iterdir():
+                  if child.is_dir() and not child.is_symlink():
+                      shutil.rmtree(child)
+                  else:
+                      child.unlink()
+              try:
+                  raw = base64.urlsafe_b64decode(ref + "=" * (-len(ref) % 4))
+                  claim = json.loads(raw)
+                  url, expected, expires = claim["u"], claim["s"], int(claim["e"])
+              except Exception as exc:
+                  raise SystemExit(f"workspace-fetch: invalid workspace reference: {exc}")
+              if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                  raise SystemExit("workspace-fetch: signed reference is not HTTP(S)")
+              if expires <= int(time.time()):
+                  raise SystemExit("workspace-fetch: signed reference expired")
+              if expected != os.environ.get("CURIE_WORKSPACE_SHA256"):
+                  raise SystemExit("workspace-fetch: claim digest mismatch")
+              signal.alarm({{ $wf.fetchTimeoutSeconds }})
+              digest, size = hashlib.sha256(), 0
+              opener = urllib.request.build_opener(NoRedirect())
+              with opener.open(url, timeout={{ $wf.fetchTimeoutSeconds }}) as source, destination.open("wb") as target:
+                  while chunk := source.read(1024 * 1024):
+                      size += len(chunk)
+                      if size > {{ .Values.worker.workspace.maxArchiveBytes }}:
+                          raise SystemExit("workspace-fetch: archive exceeds compressed-size limit")
+                      digest.update(chunk)
+                      target.write(chunk)
+              if digest.hexdigest() != expected:
+                  destination.unlink(missing_ok=True)
+                  raise SystemExit("workspace-fetch: archive digest mismatch")
+              signal.alarm(0)
+              try:
+                  subprocess.run(["git", "--version"], check=True, stdout=subprocess.DEVNULL)
+              except (FileNotFoundError, subprocess.CalledProcessError):
+                  raise SystemExit("workspace-init: git is required")
+              try:
+                  stage.mkdir(mode=0o700)
+                  subprocess.run(
+                      [
+                          "tar", "--no-same-owner", "--no-same-permissions",
+                          "-xzf", str(destination), "-C", str(stage),
+                      ],
+                      check=True,
+                      timeout={{ $wf.extractTimeoutSeconds }},
+                  )
+              except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                  raise SystemExit("workspace-init: archive extraction failed")
+              try:
+                  origin = subprocess.check_output(
+                      [
+                          "git", "-C", str(stage), "remote", "get-url", "origin",
+                      ],
+                      text=True,
+                      timeout={{ $wf.extractTimeoutSeconds }},
+                  ).strip()
+              except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                  raise SystemExit("workspace-init: checkout origin is unreadable")
+              if not origin.startswith("https://github.com/") or not origin.endswith(".git") or "@" in origin:
+                  raise SystemExit("workspace-init: checkout origin is not credential-free")
+              for child in stage.iterdir():
+                  os.replace(child, root / child.name)
+              stage.rmdir()
+              destination.unlink(missing_ok=True)
+          env:
+            - name: CURIE_WORKSPACE_REF
+              value: ""
+            - name: CURIE_WORKSPACE_SHA256
+              value: ""
+          volumeMounts:
+            - name: workspace
+              mountPath: {{ $wf.mountPath }}
+          resources:
+            {{- toYaml $runner.resources | nindent 12 }}
+        {{- end }}
       {{- end }}
       containers:
         {{- if $runner.liteLLM.enabled }}
@@ -505,6 +614,16 @@ spec:
               value: {{ printf "{\"max_output_tokens_per_run\":%d,\"max_usd_per_day\":%v}" (int $runner.budget.maxOutputTokensPerRun) $runner.budget.maxUsdPerDay | quote }}
             - name: CURIE_RUNNER_PORT
               value: {{ $runner.port | quote }}
+            {{- if $wf.enabled }}
+            # Kubernetes owns the emptyDir mount root; make the intended checkout
+            # explicit without mutating repository config or carrying a secret.
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: safe.directory
+            - name: GIT_CONFIG_VALUE_0
+              value: {{ $wf.mountPath | quote }}
+            {{- end }}
             {{- if .Values.otelCollector.deploy }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
@@ -521,11 +640,15 @@ spec:
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
-          {{- if or $bf.enabled $runner.hardening.enabled }}
+          {{- if or $bf.enabled $wf.enabled $runner.hardening.enabled }}
           volumeMounts:
             {{- if $bf.enabled }}
             - name: bundles
               mountPath: {{ $bf.mountPath }}
+            {{- end }}
+            {{- if $wf.enabled }}
+            - name: workspace
+              mountPath: {{ $wf.mountPath }}
             {{- end }}
             {{- if $runner.hardening.enabled }}
             {{- range $i, $p := $runner.hardening.writablePaths }}

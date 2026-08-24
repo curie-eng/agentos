@@ -13,6 +13,7 @@ on:
     branches: [main, next]
     paths:
       - "charts/curie/**"
+      - "examples/sre-bot/observability/**"
       - ".github/workflows/helm-ci.yaml"
       # The object-store web-identity gate below EXECUTES these repository
       # files, so a change to one of them can break the gate without touching
@@ -140,6 +141,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      - name: helm render assertions (SRE bot observability stack)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/observability-stack-assertions.sh
+
       # Prove the collector's Langfuse credential and the Secret that carries it
       # stay the same decision (issue #1563): under `langfuse.existingSecret` the
       # collector follows the operator's Secret, the chart-managed Secret ships no
@@ -214,6 +220,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/connector-reconciler-rbac-assertions.sh
+
+      - name: helm render assertions (remote dev capability)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remote-dev-capability-assertions.sh
 
       # Prove every container in the untrusted sandbox pod renders the identical
       # Rail 3 hardened securityContext from the shared helper (issue #493), so a

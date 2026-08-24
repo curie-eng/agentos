@@ -616,6 +616,35 @@ def test_post_renders_the_approval_card_from_a_confirm_intent() -> None:
     assert reject["style"] == "danger"
 
 
+def test_uuid_approval_post_uses_the_record_id_as_slack_idempotency_key() -> None:
+    # Slack's chat.postMessage contract associates duplicate messages with
+    # client_msg_id, including duplicate-specific errors. Keeping the durable
+    # approval UUID in that field closes crash-after-post retries without a
+    # second visible card. Provider contract:
+    # https://docs.slack.dev/reference/methods/chat.postMessage/
+    approval_id = "33333333-3333-4333-8333-333333333333"
+    sink = SlackReplyAdapter("xoxb-test")
+    calls: list[dict[str, object]] = []
+
+    async def _fake_post(**kwargs: object):
+        calls.append(kwargs)
+        return {"ok": True, "ts": "9.9"}
+
+    sink._client_for(None).chat_postMessage = _fake_post  # type: ignore[method-assign]
+
+    asyncio.run(
+        _post(
+            sink,
+            channel="C1",
+            message=_approval_message(approval_id, "Publish repository changes"),
+            requested_by="U_AE",
+            thread="th-card",
+        )
+    )
+
+    assert calls[0]["client_msg_id"] == approval_id
+
+
 def test_post_falls_back_to_text_only_when_card_blocks_rejected() -> None:
     # Mirrors update(): a rejected Block Kit payload retries text-only so the
     # notice still lands rather than losing the message (the API resolve path

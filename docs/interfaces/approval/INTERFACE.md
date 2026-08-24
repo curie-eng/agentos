@@ -10,6 +10,15 @@ order: 13
 
 # INTERFACE: Approval / authorizer
 
+Repository publication uses this same approval plane but does not wake the
+sandbox after resolution. The trusted worker atomically creates the approval
+and private publication row through `POST /v1/internal/publications`; requester
+self-approval is allowed only for records whose server-owned purpose is
+`publication`. Approve schedules the platform publication reconciler, while
+deny and expiry terminalize without redeeming a write credential. Terminal
+results are delivered from a bounded durable outbox, independently of patch and
+credential cleanup, so adapter retries cannot repeat a GitHub mutation.
+
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->

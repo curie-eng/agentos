@@ -7,9 +7,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .config import get_settings
 from .models import (
     Agent,
     AgentChannel,
@@ -18,16 +21,85 @@ from .models import (
     ApprovalAuditEntry,
     ApprovalStatus,
     ConsoleSession,
+    CredentialRedemptionAuditEntry,
     Deployment,
     Environment,
+    Publication,
+    ThreadWorkspace,
 )
 from .schemas import (
     AgentCreate,
     ApprovalRequest,
     ChannelBindingWrite,
     DeploymentCreate,
+    PublicationCreate,
     VersionCreate,
 )
+from .workspace_policy import repository_is_allowed
+
+_WORKSPACE_UNSET = object()
+
+
+class PublicationReplayConflict(RuntimeError):
+    """A publication dedupe key was replayed with different private facts."""
+
+
+async def _adopt_publication_replay(
+    session: AsyncSession,
+    data: PublicationCreate,
+    patch: bytes,
+    *,
+    agent_id: uuid.UUID,
+) -> Publication | None:
+    approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
+    if approval is None:
+        return None
+    publication = await get_publication_by_approval(session, approval.id)
+    if publication is None:
+        raise PublicationReplayConflict(
+            "publication dedupe key belongs to a non-publication approval"
+        )
+    if (
+        approval.agent_id != agent_id
+        or approval.conversation_id != data.conversation_id
+        or publication.deployment_id != data.deployment_id
+        or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
+        or publication.base_sha != data.base_sha
+        or publication.patch_bytes != patch
+        or publication.changed_paths != data.changed_paths
+        or publication.title != (data.title or data.summary)
+        or publication.body != (data.body or "Approved platform publication.")
+    ):
+        raise PublicationReplayConflict(
+            "publication dedupe key was replayed with different snapshot facts"
+        )
+    return publication
+
+
+async def _require_current_publication_workspace(
+    session: AsyncSession, data: PublicationCreate
+) -> tuple[Deployment, ThreadWorkspace]:
+    """Authorize the request against current deployment and thread policy."""
+
+    deployment = await get_deployment(session, data.deployment_id)
+    if deployment is None:
+        raise LookupError("deployment not found")
+    if not deployment.workspace_enabled:
+        raise ValueError("deployment does not declare a repository workspace")
+    thread_workspace = await get_thread_workspace(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+    )
+    if thread_workspace is None:
+        raise ValueError("conversation has no selected repository workspace")
+    if thread_workspace.repo_full_name.casefold() != data.repo_full_name.casefold():
+        raise ValueError("publication repository differs from the thread workspace")
+    if not repository_is_allowed(
+        thread_workspace.repo_full_name, get_settings().github_repo_allowlist
+    ):
+        raise ValueError("thread workspace repository is no longer allowed")
+    return deployment, thread_workspace
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
@@ -334,12 +406,23 @@ async def create_deployment_row(
     environment: Environment,
     commit_sha: str | None = None,
     status: str = "active",
+    workspace_enabled: bool | object = _WORKSPACE_UNSET,
 ) -> Deployment:
+    resolved_workspace_enabled: bool
+    if workspace_enabled is _WORKSPACE_UNSET:
+        current = await get_active_deployment(session, agent_id, environment)
+        resolved_workspace_enabled = (
+            current.workspace_enabled if current is not None else False
+        )
+    else:
+        assert isinstance(workspace_enabled, bool)
+        resolved_workspace_enabled = workspace_enabled
     deployment = Deployment(
         agent_id=agent_id,
         version_id=version_id,
         environment=environment,
         commit_sha=commit_sha,
+        workspace_enabled=resolved_workspace_enabled,
         status=status,
     )
     session.add(deployment)
@@ -356,7 +439,59 @@ async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> De
         environment=data.environment,
         commit_sha=data.commit_sha,
         status=data.status,
+        workspace_enabled=(
+            data.workspace_enabled
+            if "workspace_enabled" in data.model_fields_set
+            else _WORKSPACE_UNSET
+        ),
     )
+
+
+async def get_thread_workspace(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> ThreadWorkspace | None:
+    selected: ThreadWorkspace | None = await session.scalar(
+        select(ThreadWorkspace).where(
+            ThreadWorkspace.agent_id == agent_id,
+            ThreadWorkspace.conversation_id == conversation_id,
+        )
+    )
+    return selected
+
+
+async def select_thread_workspace(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    deployment_id: uuid.UUID,
+    conversation_id: str,
+    repo_full_name: str,
+    selected_by: str,
+) -> tuple[ThreadWorkspace, bool]:
+    """Insert the first selection or atomically adopt the concurrent winner."""
+
+    candidate_id = uuid.uuid4()
+    inserted = await session.scalar(
+        insert(ThreadWorkspace)
+        .values(
+            id=candidate_id,
+            agent_id=agent_id,
+            selected_by_deployment_id=deployment_id,
+            conversation_id=conversation_id,
+            repo_full_name=repo_full_name,
+            selected_by=selected_by,
+        )
+        .on_conflict_do_nothing(
+            constraint="thread_workspaces_agent_conversation_key"
+        )
+        .returning(ThreadWorkspace.id)
+    )
+    await session.commit()
+    selected = await get_thread_workspace(
+        session, agent_id=agent_id, conversation_id=conversation_id
+    )
+    assert selected is not None
+    return selected, inserted == candidate_id
 
 
 async def get_active_deployment(
@@ -401,6 +536,173 @@ async def end_deployment(session: AsyncSession, deployment: Deployment) -> None:
 
 
 # -- approvals (#244, ADR-0010) -------------------------------------------------
+
+
+async def create_publication(
+    session: AsyncSession,
+    data: PublicationCreate,
+    *,
+    patch: bytes,
+) -> tuple[Publication, bool]:
+    """Atomically create the durable approval and its private publication.
+
+    ``dedupe_key`` belongs to Approval, so the replay lookup starts there. An
+    exact replay adopts both rows; a changed patch or snapshot fact is a hard
+    conflict and can never replace bytes that were already approved.
+    """
+
+    deployment, thread_workspace = await _require_current_publication_workspace(
+        session, data
+    )
+    existing = await _adopt_publication_replay(
+        session, data, patch, agent_id=deployment.agent_id
+    )
+    if existing is not None:
+        return existing, False
+
+    expires_at = None
+    if data.expires_in_seconds is not None:
+        expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=data.expires_in_seconds
+        )
+    approval = Approval(
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+        author=data.author,
+        summary=data.summary,
+        reply_kind=data.reply_kind,
+        reply_channel=data.reply_channel,
+        reply_placeholder=data.reply_placeholder,
+        reply_endpoint=data.reply_endpoint,
+        reply_adapter=data.reply_adapter,
+        dedupe_key=data.dedupe_key,
+        route=None,
+        card_channel=data.reply_channel,
+        gate_kind="permission",
+        granted_tool="mcp__curie__publish_changes",
+        purpose="publication",
+        expires_at=expires_at,
+    )
+    session.add(approval)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
+        if existing is None:
+            raise
+        return existing, False
+    publication = Publication(
+        approval_id=approval.id,
+        deployment_id=deployment.id,
+        repo_full_name=thread_workspace.repo_full_name,
+        status="pending",
+        version=1,
+        base_sha=data.base_sha,
+        patch_bytes=patch,
+        changed_paths=data.changed_paths,
+        title=data.title or data.summary,
+        body=data.body or "Approved platform publication.",
+        reply_kind=data.reply_kind,
+        reply_channel=data.reply_channel,
+        reply_placeholder=data.reply_placeholder,
+        reply_endpoint=data.reply_endpoint,
+        reply_adapter=data.reply_adapter,
+    )
+    session.add(publication)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Two reclaimed deliveries can both miss the optimistic pre-read. The
+        # unique approval dedupe key is the arbiter; after rolling back the
+        # losing INSERT, re-read and adopt only an exact private-fact replay.
+        await session.rollback()
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
+        if existing is None:
+            raise
+        return existing, False
+    await session.refresh(publication)
+    return publication, True
+
+
+async def get_publication(
+    session: AsyncSession, publication_id: uuid.UUID
+) -> Publication | None:
+    return await session.get(Publication, publication_id)
+
+
+async def get_publication_by_approval(
+    session: AsyncSession, approval_id: uuid.UUID
+) -> Publication | None:
+    publication: Publication | None = await session.scalar(
+        select(Publication).where(Publication.approval_id == approval_id)
+    )
+    return publication
+
+
+async def list_publications(
+    session: AsyncSession, *, limit: int = 100
+) -> list[Publication]:
+    result = await session.scalars(
+        select(Publication).order_by(Publication.created_at.desc()).limit(limit)
+    )
+    return list(result)
+
+
+async def append_credential_redemption_audit(
+    session: AsyncSession,
+    *,
+    purpose: str,
+    outcome: str,
+    deployment_id: uuid.UUID | None,
+    publication_id: uuid.UUID | None,
+    repo_full_name: str | None,
+    detail: str | None,
+) -> None:
+    session.add(
+        CredentialRedemptionAuditEntry(
+            purpose=purpose,
+            outcome=outcome,
+            deployment_id=deployment_id,
+            publication_id=publication_id,
+            repo_full_name=repo_full_name,
+            detail=detail,
+        )
+    )
+    await session.commit()
+
+
+async def reap_terminal_publication_patches(
+    session: AsyncSession, *, terminal_before: datetime, limit: int
+) -> int:
+    ids = list(
+        await session.scalars(
+            select(Publication.id)
+            .where(
+                Publication.status.in_(("denied", "expired", "succeeded", "failed")),
+                Publication.terminal_at.is_not(None),
+                Publication.terminal_at <= terminal_before,
+                Publication.patch_bytes.is_not(None),
+            )
+            .order_by(Publication.terminal_at)
+            .limit(limit)
+        )
+    )
+    if not ids:
+        return 0
+    await session.execute(
+        update(Publication)
+        .where(Publication.id.in_(ids))
+        .values(patch_bytes=None, updated_at=func.now())
+    )
+    await session.commit()
+    return len(ids)
 
 
 async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> Approval:
@@ -515,18 +817,48 @@ async def claim_approval_resolution(
     tells them who won). This is the claim-race primitive of ADR-0010.
     """
 
+    values: dict[str, Any] = {
+        "status": decision,
+        "resolved_by": resolved_by,
+        "resolution_note": note,
+        "resolved_at": func.now(),
+    }
+    # Publication outcomes are reported by the platform worker, never by a
+    # resumed model turn. Mark the approval as owing no wake in the same CAS.
+    publication = await get_publication_by_approval(session, approval_id)
+    if publication is not None:
+        values["resumed_at"] = func.now()
+
     result = await session.execute(
         update(Approval)
         .where(Approval.id == approval_id, Approval.status == ApprovalStatus.pending)
-        .values(
-            status=decision,
-            resolved_by=resolved_by,
-            resolution_note=note,
-            resolved_at=func.now(),
-        )
+        .values(**values)
         .returning(Approval.id)
     )
     claimed = result.scalar_one_or_none()
+    if claimed is not None and publication is not None:
+        publication_status = "approved" if decision == ApprovalStatus.approved else "denied"
+        publication_values: dict[str, Any] = {
+            "status": publication_status,
+            "version": Publication.version + 1,
+            "updated_at": func.now(),
+        }
+        if publication_status == "denied":
+            publication_values["terminal_at"] = func.now()
+            publication_values["patch_bytes"] = None
+        changed = await session.execute(
+            update(Publication)
+            .where(
+                Publication.id == publication.id,
+                Publication.status == "pending",
+                Publication.version == publication.version,
+            )
+            .values(**publication_values)
+            .returning(Publication.id)
+        )
+        if changed.scalar_one_or_none() is None:
+            await session.rollback()
+            return None
     await session.commit()
     if claimed is None:
         return None
@@ -565,13 +897,32 @@ async def expire_approval(session: AsyncSession, approval_id: uuid.UUID) -> Appr
     """Flip a pending approval past its SLA to expired (same CAS guard, so an
     in-flight resolution that already won is never overwritten)."""
 
+    publication = await get_publication_by_approval(session, approval_id)
+    approval_values: dict[str, Any] = {
+        "status": ApprovalStatus.expired,
+        "resolved_at": func.now(),
+    }
+    if publication is not None:
+        approval_values["resumed_at"] = func.now()
     result = await session.execute(
         update(Approval)
         .where(Approval.id == approval_id, Approval.status == ApprovalStatus.pending)
-        .values(status=ApprovalStatus.expired, resolved_at=func.now())
+        .values(**approval_values)
         .returning(Approval.id)
     )
     claimed = result.scalar_one_or_none()
+    if claimed is not None and publication is not None:
+        await session.execute(
+            update(Publication)
+            .where(Publication.id == publication.id, Publication.status == "pending")
+            .values(
+                status="expired",
+                patch_bytes=None,
+                version=Publication.version + 1,
+                updated_at=func.now(),
+                terminal_at=func.now(),
+            )
+        )
     await session.commit()
     if claimed is None:
         return None
@@ -627,6 +978,7 @@ async def reopen_dead_lettered_resume(
         update(Approval)
         .where(
             Approval.id == approval_id,
+            Approval.purpose != "publication",
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resumed_at.is_not(None),
             Approval.resumed_at < dead_lettered_after,
@@ -670,6 +1022,7 @@ async def claim_resume_row(session: AsyncSession, approval_id: uuid.UUID) -> App
         select(Approval)
         .where(
             Approval.id == approval_id,
+            Approval.purpose != "publication",
             Approval.resumed_at.is_(None),
             Approval.status.in_(_RESUMABLE_STATUSES),
         )
@@ -702,6 +1055,7 @@ async def list_resolved_unresumed(
     result = await session.scalars(
         select(Approval.id)
         .where(
+            Approval.purpose != "publication",
             Approval.status.in_(_RESUMABLE_STATUSES),
             Approval.resolved_at.is_not(None),
             Approval.resumed_at.is_(None),

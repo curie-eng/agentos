@@ -1,0 +1,52 @@
+image:
+  tag: 13.2.0
+admin:
+  existingSecret: grafana-admin
+  userKey: admin-user
+  passwordKey: admin-password
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClassName: local-path
+service:
+  type: ClusterIP
+testFramework:
+  enabled: false
+rbac:
+  pspEnabled: false
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 384Mi
+grafana.ini:
+  analytics:
+    reporting_enabled: false
+    check_for_updates: false
+  users:
+    allow_sign_up: false
+  auth.anonymous:
+    enabled: false
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        uid: loki
+        url: http://loki.observability.svc.cluster.local:3100
+        access: proxy
+        isDefault: true
+      - name: Tempo
+        type: tempo
+        uid: __Tempo__
+        url: http://tempo.observability.svc.cluster.local:3200
+        access: proxy
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        url: http://prometheus-server.observability.svc.cluster.local
+        access: proxy
+        jsonData:
+          timeInterval: 60s

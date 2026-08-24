@@ -48,6 +48,11 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
 {{- end -}}
 
+{{/* Dedicated namespace for short-lived publication resources. */}}
+{{- define "curie.publicationNamespace" -}}
+{{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
      The non-CURIE_-prefixed runner credential keys a per-agent connector
      secret must never declare, kept in list-parity with the Python source of
@@ -240,6 +245,12 @@ true
 {{- end -}}
 
 {{- define "curie.otelCollector.config" -}}
+{{- $builtInExporters := dict "otlphttp/langfuse" true "debug" true -}}
+{{- range $exporter := .Values.otelCollector.extraPipelineExporters }}
+{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) }}
+{{- fail (printf "otelCollector.extraPipelineExporters references undefined exporter %q. Add it under otelCollector.extraExporters." $exporter) }}
+{{- end }}
+{{- end }}
 # Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
 # forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
 # silently unsupported), so the collector is the adapter. Langfuse appends
@@ -260,6 +271,9 @@ exporters:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
   debug:
     verbosity: normal
+{{- with .Values.otelCollector.extraExporters }}
+{{ toYaml . | nindent 2 }}
+{{- end }}
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
@@ -272,7 +286,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlphttp/langfuse, debug]
+      exporters: [otlphttp/langfuse, debug{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
 {{/* ---- Default-credential gate (issue #198) ----

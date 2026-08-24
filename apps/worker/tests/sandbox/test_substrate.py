@@ -76,6 +76,23 @@ def test_lookup_returns_none_when_sandbox_gone(
     assert substrate.lookup("T1") is None
 
 
+def test_adopt_reuses_only_a_ready_route_and_never_cold_claims(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient
+) -> None:
+    """Workspace callers must reprepare rather than bind a stale workspace ref."""
+
+    handle = substrate.claim("T1")
+    created_before_adoption = list(fake_k8s.created)
+
+    assert substrate.adopt("T1") == handle
+    assert fake_k8s.created == created_before_adoption
+
+    fake_k8s.sandboxes.pop(handle.sandbox_name)
+
+    assert substrate.adopt("T1") is None
+    assert fake_k8s.created == created_before_adoption
+
+
 def test_claim_timeout_cleans_up_claim(
     fake_k8s: FakeSandboxClient, affinity: AffinityStore, config: SubstrateConfig
 ) -> None:

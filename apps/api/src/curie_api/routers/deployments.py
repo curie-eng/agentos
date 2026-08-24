@@ -20,8 +20,17 @@ router = APIRouter(
 async def create_deployment(
     data: DeploymentCreate, session: SessionDep, store: StoreDep
 ) -> DeploymentOut:
-    if await crud.get_agent(session, data.agent_id) is None:
+    agent = await crud.get_agent(session, data.agent_id)
+    if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if (
+        "workspace_enabled" in data.model_fields_set
+        and data.workspace_enabled is None
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "workspace_enabled must be true or false when provided",
+        )
     version = await crud.get_version(session, data.version_id)
     if version is None or version.agent_id != data.agent_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")

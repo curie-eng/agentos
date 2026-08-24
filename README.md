@@ -34,6 +34,9 @@ the same plugin bundle climbs three tiers.
 
 - `cluster` runs it through that same full platform on Kubernetes.
 
+Here, `skill` names the runner only tier. An authored bundle skill is the
+artifact at `skills/<name>/SKILL.md`.
+
 An environment difference then shows up as a bug while progressing through these tiers, not a surprise
 your users hit - letting you iterate fast locally and ship with confidence.
 

@@ -962,7 +962,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                 select_channel(&agents, None)?
             }
         };
-        ui.note(&format!(
+        ui.plumbing(&format!(
             "routing to channel {channel} over the connected Slack transport"
         ));
         return enqueue_over_connected_transport(
@@ -989,7 +989,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         &binding.advertise_host,
     )
     .await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "slack stub listening; the worker posts to {}",
         stub.base_api_url()
     ));
@@ -1011,7 +1011,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             (channel, agents.first().map(|a| a.name.clone()))
         }
     };
-    ui.note(&format!("routing to channel {channel}"));
+    ui.plumbing(&format!("routing to channel {channel}"));
 
     // This turn carries its own reply endpoint (issue #19), so the compose worker
     // finalizes it against this stub without relying on a worker-global setting.
@@ -1028,11 +1028,11 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
         Some(reply_endpoint),
     );
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "waiting up to {}s for the worker to finalize the turn...",
         opts.timeout_secs
     ));
@@ -1591,7 +1591,7 @@ pub async fn enqueue_over_connected_transport(
 
     let event = connected_turn(channel, opts, explicit_thread, &placeholder_ts);
     let stream_id = xadd(conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
@@ -1698,7 +1698,7 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
     .await?;
 
     let (channel, _agent_hint) = resolve_cluster_channel(&opts).await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "routing to channel {channel} over the connected Slack transport"
     ));
 
@@ -1783,7 +1783,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     let advertise_host = resolve_advertise_host(opts.listen_host.as_deref()).await?;
     let mut stub = SlackStub::start("0.0.0.0", opts.listen_port, &advertise_host).await?;
     let url = stub.base_api_url().to_string();
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "slack stub listening; the worker will post to {url}"
     ));
 
@@ -1804,7 +1804,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // Channel: explicit --channel, else the sole deployed agent via a
     // short-lived API port-forward (#766). Shared with the connected path.
     let (channel, agent_hint) = resolve_cluster_channel(&opts).await?;
-    ui.note(&format!("routing to channel {channel}"));
+    ui.plumbing(&format!("routing to channel {channel}"));
 
     // Enqueue the exact event the dispatcher would produce and wait for the ack.
     // The turn carries its reply endpoint (this stub's advertised URL) on the
@@ -1828,11 +1828,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
         Some(url),
     );
     let stream_id = xadd(&mut conn, &opts.stream, &event).await?;
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "enqueued {} on {} as {stream_id}",
         event.event_id, opts.stream
     ));
-    ui.note(&format!(
+    ui.plumbing(&format!(
         "waiting up to {}s for the worker to finalize the turn...",
         opts.timeout_secs
     ));

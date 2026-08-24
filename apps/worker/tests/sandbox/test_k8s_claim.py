@@ -18,6 +18,7 @@ import pytest
 from curie_worker.sandbox import QuotaRejection
 from curie_worker.sandbox.k8s import (
     BUNDLE_INIT_CONTAINERS,
+    WORKSPACE_INIT_CONTAINERS,
     KubernetesSandboxClient,
     _claim_view,
 )
@@ -114,6 +115,34 @@ def test_no_named_env_without_bundle_ref() -> None:
     entries = _env_entries(api)
     assert entries  # the main-container env is still present
     assert all("containerName" not in e for e in entries)
+
+
+def test_workspace_capability_targets_only_workspace_init_containers() -> None:
+    api = _FakeApi()
+    workspace_ref = "opaque-presigned-workspace-reference"
+    workspace_sha256 = "a" * 64
+    _client(api).create_claim(
+        "claim-workspace",
+        pool="pool",
+        env={
+            "CURIE_BUDGET": "{}",
+            "CURIE_WORKSPACE_REF": workspace_ref,
+            "CURIE_WORKSPACE_SHA256": workspace_sha256,
+        },
+    )
+    entries = _env_entries(api)
+
+    unnamed = {entry["name"] for entry in entries if "containerName" not in entry}
+    assert "CURIE_WORKSPACE_REF" not in unnamed
+    assert "CURIE_WORKSPACE_SHA256" not in unnamed
+    named = {
+        (entry["containerName"], entry["name"]): entry["value"]
+        for entry in entries
+        if "containerName" in entry
+    }
+    for container in WORKSPACE_INIT_CONTAINERS:
+        assert named[(container, "CURIE_WORKSPACE_REF")] == workspace_ref
+        assert named[(container, "CURIE_WORKSPACE_SHA256")] == workspace_sha256
 
 
 def test_credential_is_never_written_to_the_claim() -> None:

@@ -11,8 +11,10 @@ green at deploy resolves identically at runtime (#453).
 """
 
 import json
+import shutil
 from pathlib import Path
 
+import yaml
 from plugin_format import ApprovalGate, grantable_routes, validate_bundle
 
 
@@ -106,6 +108,58 @@ def test_route_matching_is_case_sensitive() -> None:
 # A gate may only name a connector the bundle declares -- #1495, and #1691's
 # constraint that it must keep holding once a third connector form exists
 # --------------------------------------------------------------------------- #
+def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) -> None:
+    source = Path(__file__).resolve().parents[3] / "examples" / "sre-bot"
+    plugin = json.loads(
+        (source / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    connectors = yaml.safe_load(
+        (source / "connectors.yaml").read_text(encoding="utf-8")
+    )
+
+    assert plugin["approvalPolicy"]["gates"] == [
+        {
+            "gate": "mcp__k8s-write__restart_deployment",
+            "route": "sre-approvals",
+        }
+    ]
+    assert connectors["connectors"]["k8s-write"]["build"] == {
+        "context": "connectors/k8s-write",
+        "platforms": ["linux/amd64", "linux/arm64"],
+    }
+    assert "unhosted_url" not in connectors["connectors"]["k8s-write"]
+    assert connectors["connectors"]["k8s-write"]["secret_files"] == {
+        "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig"
+    }
+
+    from plugin_format import connector_lock
+    from plugin_format.connectors import ConnectorBuild
+
+    bundle = tmp_path / "sre-bot"
+    shutil.copytree(source, bundle)
+    locked_connectors = {}
+    for name, declaration in connectors["connectors"].items():
+        if "build" not in declaration:
+            continue
+        build = ConnectorBuild.model_validate(declaration["build"])
+        context = bundle / declaration["build"]["context"]
+        locked_connectors[name] = {
+            "image": _LOCAL_IMAGE,
+            "delivery": "local-daemon",
+            "platforms": declaration["build"]["platforms"],
+            "source_digest": connector_lock.source_digest_of(context, build),
+        }
+    (bundle / connector_lock.CONNECTOR_LOCK_FILE).write_text(
+        yaml.safe_dump(
+            {"version": 1, "connectors": locked_connectors}, sort_keys=False
+        ),
+        encoding="utf-8",
+    )
+
+    result = validate_bundle(str(bundle))
+    assert result.valid, [(error.code, error.message) for error in result.errors]
+
+
 def _gated_bundle(root: Path, connectors_yaml: str, gate: str) -> Path:
     (root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
     (root / ".claude-plugin" / "plugin.json").write_text(

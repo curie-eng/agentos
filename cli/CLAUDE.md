@@ -208,7 +208,7 @@ Helm and the deployed release with `up`, `status`, `down`, `comms`, `message`,
 ## Verify
 
 ```bash
-cd cli && cargo fmt --check && cargo clippy -- -D warnings && cargo test
+cd cli && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
 Scripted E2E (real runner container, fake model, fully offline by default):

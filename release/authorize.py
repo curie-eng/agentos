@@ -80,6 +80,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build dispatcher image (no push)",
         "Build worker image (no push)",
         "Build ui image (no push)",
+        "Build sre-bot-tempo image (no push)",
         "Build worker-local overlay image (no push)",
         "Dispatcher image imports resolve",
         "Eval falsifiability gate (fake model, offline)",

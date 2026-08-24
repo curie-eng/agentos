@@ -215,6 +215,31 @@ fn process_help_top_level_lists_new_surface_and_hides_retired_verbs() {
     }
 }
 
+#[test]
+fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
+    let output = run_help(&["skill"]);
+    assert!(
+        output.status.success(),
+        "expected success for skill help\n{}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    let distinction =
+        "`skill` names that tier, not a bundle skill artifact at `skills/<name>/SKILL.md`.";
+    assert!(
+        text.contains(distinction),
+        "skill help must clearly distinguish its runner tier from the bundle artifact\n{text}"
+    );
+    assert!(
+        text.contains("Subcommands: `skill <up|down|status|message|eval|approvals>`"),
+        "skill help must introduce its subcommand list separately\n{text}"
+    );
+    assert!(
+        !text.contains("skills/<name>/SKILL.md`: `skill <up|down|status|message|eval|approvals>"),
+        "skill help must not attach the subcommand list to the artifact distinction\n{text}"
+    );
+}
+
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
 /// Claude-Code-compatibility gate (see the bundle-format seam doc). If the verb
 /// stops being reachable, the gate is still in CI but nobody can run it locally
@@ -287,6 +312,51 @@ fn command_manifest_matches_committed_artifact() {
         generated, committed,
         "cli/command-manifest.json is stale; regenerate with \
          `cargo run -- schema > cli/command-manifest.json`"
+    );
+}
+
+#[test]
+fn message_tiers_share_the_conversation_flag_and_default() {
+    let manifest = live_command_manifest();
+    let mut contracts = Vec::new();
+
+    for tier in ["skill", "local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .expect("manifest has top level subcommands")
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap_or_else(|| panic!("manifest has the {tier} tier"));
+        let message = tier_command["subcommands"]
+            .as_array()
+            .expect("tier has subcommands")
+            .iter()
+            .find(|command| command["name"] == "message")
+            .unwrap_or_else(|| panic!("{tier} has the message verb"));
+        let conversation = message["args"]
+            .as_array()
+            .expect("message has arguments")
+            .iter()
+            .find(|arg| arg["id"] == "continue")
+            .unwrap_or_else(|| panic!("{tier} message exposes --continue"));
+
+        contracts.push(serde_json::json!({
+            "id": conversation["id"],
+            "long": conversation["long"],
+            "positional": conversation["positional"],
+            "required": conversation["required"],
+            "possible_values": conversation["possible_values"],
+            "default_values": conversation["default_values"],
+        }));
+    }
+
+    assert!(
+        contracts.windows(2).all(|pair| pair[0] == pair[1]),
+        "skill, local, and cluster message must share conversation flag semantics: {contracts:?}"
+    );
+    assert!(
+        contracts[0]["default_values"].is_null(),
+        "message must start a fresh conversation unless --continue is present"
     );
 }
 
