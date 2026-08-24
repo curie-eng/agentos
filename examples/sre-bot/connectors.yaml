@@ -154,9 +154,12 @@ connectors:
 #      platform and records the resolved digests in `connectors.lock.yaml`.
 #      There is no `image:` line to edit: the digest lives in the lock.
 #
-# The missing separate kubeconfig is load-bearing. An untouched bring-up
-# refuses before either connector starts instead of silently running a writer
-# with the read credential or an unreviewed target.
+# The missing separate kubeconfig is load-bearing -- but only once a lock file
+# exists. On a genuinely untouched bring-up, the unbuilt connectors.lock.yaml
+# refuses deploy before the secret check is ever reached; once built, the
+# still-missing kubeconfig refuses just as cleanly before either connector
+# starts, instead of silently running a writer with the read credential or an
+# unreviewed target.
 #
 # Full walkthrough: README.md, "Level up: the gated write path".
 #
@@ -202,6 +205,15 @@ connectors:
       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
 
+  # Both grafana and tempo below read GRAFANA_SERVICE_ACCOUNT_TOKEN from the
+  # curie-grafana-connector Secret. Nothing in this bundle creates that
+  # Secret -- `curie example sre-bot install --observability` provisions the
+  # observability stack (see examples/sre-bot/observability/curie-values.yaml)
+  # and the chart mints it from there. A manual `cluster deploy` against a
+  # cluster that never ran that install leaves both connectors in
+  # CreateContainerConfigError with no matching Secret to mount -- and the
+  # deploy still exits 0, so "applied N object(s)" reads as success while
+  # these two are broken.
   grafana:
     image: docker.io/grafana/mcp-grafana@sha256:5efeafd01cd7e1aea9c4b0f03305951f2944db8f43e5ae290cce9578c977f241
     args:
