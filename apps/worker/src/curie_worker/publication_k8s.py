@@ -242,15 +242,24 @@ def validate_pull(row, expected_base):
             else None
         ),
     }
-    if actual != expected:
+    repo_fields = ("head_repo", "base_repo")
+    if any(
+        not isinstance(actual[field], str)
+        or actual[field].casefold() != expected[field].casefold()
+        for field in repo_fields
+    ) or any(
+        actual[field] != expected[field]
+        for field in expected
+        if field not in repo_fields
+    ):
         raise SystemExit(
             "GitHub pull request does not match the approved publication contract"
         )
     url = row.get("html_url")
     prefix = f"https://github.com/{repo}/pull/"
-    if not isinstance(url, str) or not url.startswith(prefix):
+    if not isinstance(url, str) or not url.casefold().startswith(prefix.casefold()):
         raise SystemExit("GitHub did not return a usable pull request URL")
-    number = url.removeprefix(prefix)
+    number = url[len(prefix):]
     if not number.isdigit() or int(number) <= 0:
         raise SystemExit("GitHub did not return a usable pull request URL")
     return url
@@ -786,7 +795,11 @@ class KubernetesPublicationCluster:
             pods = self._core.list_namespaced_pod(
                 self.namespace, label_selector=f"job-name={job_name}"
             )
-            items = getattr(pods, "items", None) or []
+            items = (
+                pods.get("items")
+                if isinstance(pods, dict)
+                else getattr(pods, "items", None)
+            ) or []
             owned = []
             for pod in items:
                 pod_metadata = (

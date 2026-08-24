@@ -132,7 +132,7 @@ def test_publication_schema_refuses_github_workflow_changes() -> None:
     payload = _publication_payload(str(uuid.uuid4()))
     payload["changed_paths"] = [".github/workflows/publish.yml"]
 
-    with pytest.raises(ValidationError, match="safe repository-relative paths"):
+    with pytest.raises(ValidationError, match="workflow changes cannot be published"):
         PublicationCreate.model_validate(payload)
 
 

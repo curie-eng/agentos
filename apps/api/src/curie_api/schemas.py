@@ -1132,14 +1132,19 @@ class PublicationCreate(BaseModel):
     @classmethod
     def _safe_changed_paths(cls, value: list[str]) -> list[str]:
         for path in value:
+            if tuple(part.casefold() for part in path.split("/")[:2]) == (
+                ".github",
+                "workflows",
+            ):
+                raise ValueError(
+                    "GitHub workflow changes cannot be published by this capability"
+                )
             if (
                 not path
                 or path.startswith("/")
                 or path == ".git"
                 or path.startswith(".git/")
                 or any(part in ("", ".", "..") for part in path.split("/"))
-                or tuple(part.casefold() for part in path.split("/")[:2])
-                == (".github", "workflows")
             ):
                 raise ValueError("changed_paths must contain safe repository-relative paths")
         return value

@@ -409,13 +409,31 @@ def scrubbed_git_environment(
         if name in {
             "GITHUB_TOKEN",
             "GH_TOKEN",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_ASKPASS",
             "SSH_ASKPASS",
+            "GIT_SSH_COMMAND",
+            "GIT_PROXY_COMMAND",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ALLOW_PROTOCOL",
             "GIT_CONFIG_PARAMETERS",
             "GIT_TERMINAL_PROMPT",
         } or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
             process_env.pop(name, None)
     process_env.pop("GIT_CONFIG_COUNT", None)
+    process_env.update(
+        {
+            "HOME": "/nonexistent",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ALLOW_PROTOCOL": "https",
+        }
+    )
     process_env.update(overrides or {})
     return process_env
 

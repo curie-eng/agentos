@@ -329,6 +329,24 @@ def test_job_rejects_mutated_pull_request_metadata(
     assert "approved publication contract" in rejected.stderr
 
 
+def test_job_accepts_github_canonical_repository_casing(publication_k8s: Any) -> None:
+    script = _resources(publication_k8s).config_map["data"]["publish.sh"]
+    row = _job_pull_row()
+    row["html_url"] = "https://github.com/Acme-Corp/Acme-Bot/pull/123"
+    row["head"] = {
+        "ref": "curie/publication-22222222222242228222222222222222",
+        "repo": {"full_name": "Acme-Corp/Acme-Bot"},
+    }
+    row["base"] = {
+        "ref": "main",
+        "repo": {"full_name": "Acme-Corp/Acme-Bot"},
+    }
+
+    accepted = _run_job_pull_validator(script, row)
+
+    assert accepted.returncode == 0, accepted.stderr
+
+
 def test_every_dynamic_resource_has_the_helm_owner_reference(
     publication_k8s: Any,
 ) -> None:
@@ -537,7 +555,7 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
         }
     )
     cluster._core = SimpleNamespace(
-        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(items=[])
+        list_namespaced_pod=lambda *_args, **_kwargs: {"items": []}
     )
 
     observed = cluster.observe("curie-publication-22222222222242228222")

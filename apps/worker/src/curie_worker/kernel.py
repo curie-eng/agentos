@@ -132,17 +132,18 @@ def _publication_approval_summary(snapshot: RunnerWorkspaceSnapshot) -> str:
     path_list = ", ".join(visible_paths)
     if len(snapshot.changed_paths) > len(visible_paths):
         path_list += f", and {len(snapshot.changed_paths) - len(visible_paths)} more"
-    workflow_warning = (
-        " WARNING: this patch changes GitHub workflow files."
-        if any(path.startswith(".github/workflows/") for path in snapshot.changed_paths)
-        else " No GitHub workflow files are changed."
-    )
+    workflow_note = " GitHub workflow files are not publishable and none are included."
     requester_title = " ".join(snapshot.publication_title.split())[:256]
-    requester_body = " ".join(snapshot.publication_body.split())[:500]
+    normalized_body = " ".join(snapshot.publication_body.split())
+    requester_body = normalized_body[:500]
+    if len(normalized_body) > len(requester_body):
+        requester_body += (
+            f" [description truncated; {len(normalized_body)} characters will be published]"
+        )
     return (
         f"Publish {snapshot.repo_full_name} from {snapshot.base_sha[:12]} with "
         f"{len(snapshot.changed_paths)} changed path(s): {path_list}."
-        f"{workflow_warning} Requester-provided title: {requester_title}. "
+        f"{workflow_note} Requester-provided title: {requester_title}. "
         f"Requester-provided description: {requester_body}"
     )
 

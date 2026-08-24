@@ -174,6 +174,26 @@ if set(publication_policy["spec"].get("policyTypes") or []) != {"Ingress", "Egre
     fail("publication NetworkPolicy must deny ingress and restrict egress")
 if publication_policy["spec"].get("ingress") != []:
     fail("publication NetworkPolicy ingress must be an explicit deny-all list")
+egress = publication_policy["spec"].get("egress") or []
+if len(egress) != 2 or any(not rule.get("to") for rule in egress):
+    fail("publication NetworkPolicy must render two non-empty egress destinations")
+dns_rules = [
+    rule for rule in egress
+    if {port.get("port") for port in rule.get("ports") or []} == {53}
+]
+github_rules = [
+    rule for rule in egress
+    if rule.get("ports") == [{"protocol": "TCP", "port": 443}]
+]
+if len(dns_rules) != 1 or len(github_rules) != 1:
+    fail("publication egress must contain one DNS rule and one GitHub HTTPS rule")
+rendered_cidrs = {
+    target.get("ipBlock", {}).get("cidr")
+    for target in github_rules[0]["to"]
+}
+expected_cidrs = set(values["worker"]["publication"]["githubHttpsCidrs"])
+if rendered_cidrs != expected_cidrs:
+    fail(f"publication GitHub CIDR egress drifted: {sorted(rendered_cidrs)!r}")
 
 
 # Worker scratch is private and bounded; worker resources include explicit

@@ -47,6 +47,26 @@ def _safe_changed_path(path: str) -> bool:
     )
 
 
+def _validate_changed_paths(paths: tuple[str, ...]) -> None:
+    if not paths:
+        raise WorkspacePreparationError(
+            "publication-validation", "snapshot contains no changed paths"
+        )
+    if any(
+        tuple(part.casefold() for part in PurePosixPath(path).parts[:2])
+        == (".github", "workflows")
+        for path in paths
+    ):
+        raise WorkspacePreparationError(
+            "publication-validation",
+            "GitHub workflow changes cannot be published by this capability",
+        )
+    if not all(_safe_changed_path(path) for path in paths):
+        raise WorkspacePreparationError(
+            "publication-validation", "snapshot contains an unsafe repository path"
+        )
+
+
 def validate_snapshot_against_base(
     coordinator: WorkspaceClaimCoordinator,
     *,
@@ -75,12 +95,7 @@ def validate_snapshot_against_base(
         raise WorkspacePreparationError(
             "publication-validation", f"patch exceeds {max_patch_bytes} raw bytes"
         )
-    if not snapshot.changed_paths or not all(
-        _safe_changed_path(path) for path in snapshot.changed_paths
-    ):
-        raise WorkspacePreparationError(
-            "publication-validation", "snapshot contains no changes or an unsafe path"
-        )
+    _validate_changed_paths(snapshot.changed_paths)
 
     scratch = Path(
         tempfile.mkdtemp(

@@ -97,6 +97,11 @@ transcript before reporting it through the reply adapter. A deterministic
 publication marker makes retries idempotent, so a later turn knows whether the
 platform published, denied, expired, or failed the request instead of repeating
 the model's pre-approval view.
+Publication Jobs run in a dedicated namespace under a tokenless service account.
+A default-deny ingress policy and two-rule egress policy permit only cluster DNS
+and operator-supplied GitHub HTTPS CIDRs. GitHub address rotation can therefore
+fail publication closed until an operator refreshes those install-time CIDRs;
+publication pods never inherit the sandbox NetworkPolicy selector.
 
 The realizing paths are `apps/api/src/curie_api/models.py`, `crud.py`,
 `schemas.py`, `workspace_policy.py`, `routers/workspaces.py`, and
