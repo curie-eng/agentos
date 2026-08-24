@@ -466,8 +466,9 @@ The claim that pre-binding removes the deadline from reach was tested on a secon
 dedicated cluster with a controlled neighbour rather than a hoped-for ClickHouse
 burst. The neighbour is a Deployment of busy-loop pods requesting `200m` each,
 which is what ClickHouse requests, against the runner and bundle containers'
-`50m`. Two full runs, and the harness and its recording are in
-[`prototypes/adr-0116-residency/`](../../prototypes/adr-0116-residency/):
+`50m`. Two full runs, recorded in
+[`docs/demo/adr-0116-residency.gif`](../demo/adr-0116-residency.gif) with the raw
+asciicast beside it:
 
 |                      | quiet node | under contention |
 | -------------------- | ---------- | ---------------- |

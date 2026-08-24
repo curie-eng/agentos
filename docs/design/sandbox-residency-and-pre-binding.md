@@ -285,9 +285,8 @@ cache-cold and a scaffolded bundle already re-sends 20,875 input tokens per turn
 
 The claim that matters is not "faster". It is that **the deadline stops being
 reachable**. That is what the recording shows, in
-[`docs/demo/adr-0116-residency.gif`](../demo/adr-0116-residency.gif) (the raw
-asciicast is beside it, and the harness is in
-[`prototypes/adr-0116-residency/`](../../prototypes/adr-0116-residency/)):
+[`docs/demo/adr-0116-residency.gif`](../demo/adr-0116-residency.gif), with the raw
+asciicast beside it:
 
 |                      | quiet node | under contention |
 | -------------------- | ---------- | ---------------- |

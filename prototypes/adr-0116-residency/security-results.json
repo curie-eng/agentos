@@ -1,9 +1,0 @@
-{
- "cni_calico_ready": 0,
- "bound_has_token": false,
- "bound_unauth_result": "HTTP 200",
- "warm_has_token": false,
- "warm_unauth_result": "HTTP 200",
- "sandbox_to_sandbox": "BLOCKED TimeoutError",
- "dns_control": "DNS_OK"
-}
