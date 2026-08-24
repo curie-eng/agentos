@@ -107,7 +107,7 @@ spec:
             storage: {{ .Values.rustfs.persistence.size }}
   {{- end }}
 ---
-{{/* Creates the Langfuse bucket after RustFS accepts S3 requests. */}}
+{{/* Creates every first-party bucket after RustFS accepts S3 requests. */}}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -139,17 +139,22 @@ spec:
               aws configure set default.s3.addressing_style path
               endpoint="http://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}"
               echo "waiting for RustFS at $endpoint"
-              for i in $(seq 1 60); do
-                if aws --endpoint-url "$endpoint" s3api head-bucket --bucket {{ .Values.rustfs.bucket | quote }} >/dev/null 2>&1; then
-                  break
-                fi
-                if aws --endpoint-url "$endpoint" s3api create-bucket --bucket {{ .Values.rustfs.bucket | quote }} >/dev/null 2>&1; then
-                  break
-                fi
-                sleep 3
+              for bucket in \
+                {{ .Values.rustfs.bucket | quote }} \
+                {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }} \
+                {{ .Values.worker.workspace.bucket | quote }}; do
+                for i in $(seq 1 60); do
+                  if aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket" >/dev/null 2>&1; then
+                    break
+                  fi
+                  if aws --endpoint-url "$endpoint" s3api create-bucket --bucket "$bucket" >/dev/null 2>&1; then
+                    break
+                  fi
+                  sleep 3
+                done
+                aws --endpoint-url "$endpoint" s3api head-bucket --bucket "$bucket"
+                echo "bucket $bucket ready"
               done
-              aws --endpoint-url "$endpoint" s3api head-bucket --bucket {{ .Values.rustfs.bucket | quote }}
-              echo "bucket {{ .Values.rustfs.bucket }} ready"
           env:
             - name: AWS_ACCESS_KEY_ID
               value: {{ .Values.rustfs.auth.accessKey | quote }}

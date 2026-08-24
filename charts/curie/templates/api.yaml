@@ -73,11 +73,22 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: apiKey
+            - name: CURIE_INTERNAL_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: internalWorkerToken
+            - name: CURIE_PUBLICATION_PATCH_MAX_BYTES
+              value: {{ .Values.worker.publication.patchMaxBytes | quote }}
+            - name: CURIE_PUBLICATION_RETENTION_SECONDS
+              value: {{ .Values.worker.publication.retentionSeconds | quote }}
             - name: GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubWebhookSecret
+            - name: GITHUB_API_URL
+              value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the
             # git-flow bundle clone, without which a private repo cannot
             # deploy (#1058).
@@ -86,6 +97,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubToken
+            - name: GITHUB_REPO_ALLOWLIST
+              value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:

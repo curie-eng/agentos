@@ -1285,6 +1285,30 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Let each new session select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "id": "workspace",
+              "long": "workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Explicitly disable a previously configured managed workspace",
+              "id": "no_workspace",
+              "long": "no-workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Target environment. Defaults to dev; a `--target` supplies it instead, and an explicit value here still wins over the target",
               "id": "env",
               "long": "env",
@@ -2998,6 +3022,30 @@ export const commandManifest = {
               "id": "repo",
               "long": "repo",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Let sessions on each deployment select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
+              "id": "workspace",
+              "long": "workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Explicitly disable a previously configured managed workspace",
+              "id": "no_workspace",
+              "long": "no-workspace",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {

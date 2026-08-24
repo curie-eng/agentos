@@ -33,7 +33,7 @@ redefine them.
 ## Current contract
 
 A second implementation is an **ACI server**, an HTTP process serving
-the four POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
+the five POST endpoints (`runner/src/curie_runner/server.py`): `POST /v1/event` opens a
 turn, `POST /v1/steer` injects into the live turn (409 if none running),
 `POST /v1/interrupt` hard-stops it, and `POST /v1/reset` discards the conversation so the
 next turn starts fresh (409 while a turn is active). Two GETs sit alongside them and stay

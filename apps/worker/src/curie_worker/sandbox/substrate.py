@@ -140,6 +140,43 @@ class SandboxSubstrate:
             return None
         return record.handle
 
+    def adopt(self, thread_key: str) -> SandboxHandle | None:
+        """Adopt an existing ready live route without ever creating one.
+
+        This is the workspace-safe route primitive: callers can distinguish a
+        reusable sandbox from every state that needs a freshly prepared
+        workspace reference without a ``lookup()`` then ``claim()`` gap.  A
+        suspended route is preserved for ``resume()``; a live route whose
+        claim or sandbox is stale or unready is evicted so a subsequent fresh
+        claim cannot accidentally inherit it.
+        """
+
+        record = self._affinity.get(thread_key)
+        if record is None or record.state is not RouteState.LIVE:
+            return None
+
+        claim = self._k8s.get_claim(record.handle.claim_name)
+        if (
+            claim is None
+            or not claim.ready
+            or claim.sandbox_name != record.handle.sandbox_name
+        ):
+            self._evict_stale(thread_key, record)
+            return None
+
+        sandbox = self._k8s.get_sandbox(record.handle.sandbox_name)
+        if (
+            sandbox is None
+            or not sandbox.ready
+            or sandbox.operating_mode != "Running"
+        ):
+            self._evict_stale(thread_key, record)
+            return None
+
+        if not self._affinity.touch(thread_key, self._config.route_ttl_seconds):
+            return None
+        return record.handle
+
     # -- suspend / resume -------------------------------------------------------
 
     def suspend(self, thread_key: str, *, history_ref: str | None) -> None:

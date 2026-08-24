@@ -635,6 +635,10 @@ api:
   # to helm, but a token typed on the command line is still in curie's own
   # argv, so it does reach your shell history and the process table.
   githubToken: ""
+  # Runtime repository workspaces are fail-closed independently of credential
+  # reach. Each entry is owner/repository or owner/*; an empty list allows no
+  # opening-message repository selections.
+  githubRepoAllowlist: []
   # GitHub App identity (ADR-0092). The scalable alternative to githubToken
   # above: the platform mints a one-hour token scoped to the single repository
   # being cloned, so there is nothing to rotate, no human owner, and adding the
@@ -685,6 +689,8 @@ api:
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
   # base to deploy from GHE.
   githubCloneBase: "https://github.com"
+  # REST base used by credential minting, polling, and managed publication.
+  githubApiUrl: "https://api.github.com"
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
@@ -832,6 +838,12 @@ worker:
     digest: ""
     pullPolicy: Always
   imagePullSecrets: []
+  # Own mounted scratch volumes as the same uid the worker image runs under.
+  # Without this, the kubelet-created emptyDir root is not writable by the
+  # non-root clone process.
+  podSecurityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
   # The worker drives the Kubernetes API to claim/manage agent-sandbox CRDs, so
   # it gets a ServiceAccount + a namespaced Role scoped to exactly those verbs
   # (see templates/worker.yaml). Its token IS mounted (unlike the runner SA).
@@ -841,6 +853,95 @@ worker:
     # path (#1325) binds its IAM role here, e.g.
     # `eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>`.
     annotations: {}
+  # Dedicated API credential-redemption identity. The published value is for
+  # local/dev installs only; sealed installs generate and retain a distinct
+  # strong value. It is mounted into API + worker and nowhere else.
+  internalWorkerToken: curie-dev-worker-token
+  workspace:
+    maxConcurrentClones: 2
+    cloneTimeoutSeconds: 90
+    archiveTimeoutSeconds: 30
+    uploadTimeoutSeconds: 30
+    totalTimeoutSeconds: 150
+    maxCheckoutBytes: 536870912
+    maxArchiveBytes: 268435456
+    maxMembers: 50000
+    maxCompressionRatio: 20
+    referenceTtlSeconds: 300
+    bucket: curie-workspaces
+    cloneVolumeSize: 4Gi
+    mountPath: /var/lib/curie/workspaces
+  publication:
+    enabled: true
+    # Short-lived Jobs and their scoped token Secret live outside the platform
+    # and sandbox namespaces. Empty derives a release-scoped namespace.
+    namespace: ""
+    createNamespace: true
+    patchMaxBytes: 900000
+    retentionSeconds: 3600
+    reconcileIntervalSeconds: 2
+    leaseSeconds: 60
+    resultMaxAttempts: 5
+    reconcileMaxAttempts: 10
+    jobActiveDeadlineSeconds: 300
+    gitCommandTimeoutSeconds: 120
+    # GitHub publishes these address sets from https://api.github.com/meta.
+    # Override for GitHub Enterprise or refresh when GitHub changes the set.
+    githubHttpsCidrs:
+      - 192.30.252.0/22
+      - 185.199.108.0/22
+      - 140.82.112.0/20
+      - 143.55.64.0/20
+      - 2a0a:a440::/29
+      - 2606:50c0::/32
+      - 20.201.28.151/32
+      - 20.201.28.148/32
+      - 20.205.243.166/32
+      - 20.205.243.168/32
+      - 20.87.245.0/32
+      - 20.87.245.6/32
+      - 4.237.22.38/32
+      - 4.237.22.34/32
+      - 4.228.31.150/32
+      - 4.228.31.149/32
+      - 20.207.73.82/32
+      - 20.207.73.85/32
+      - 20.27.177.113/32
+      - 20.27.177.116/32
+      - 20.200.245.247/32
+      - 20.200.245.245/32
+      - 20.175.192.147/32
+      - 20.175.192.149/32
+      - 20.233.83.145/32
+      - 20.233.83.146/32
+      - 20.29.134.23/32
+      - 20.29.134.17/32
+      - 20.199.39.232/32
+      - 20.199.39.228/32
+      - 20.217.135.5/32
+      - 20.217.135.0/32
+      - 4.225.11.194/32
+      - 4.225.11.201/32
+      - 4.208.26.197/32
+      - 4.208.26.200/32
+      - 20.26.156.215/32
+      - 20.26.156.210/32
+      - 172.182.252.133/32
+      - 172.182.252.137/32
+      - 4.249.131.164/32
+      - 4.249.131.166/32
+      - 48.202.248.40/32
+      - 48.202.248.39/32
+      - 48.204.201.5/32
+      - 48.204.201.2/32
+    # Empty derives release-scoped `<fullname>-publication` names.
+    serviceAccountName: ""
+    ownerName: ""
+    gitUserName: Curie Publisher
+    gitUserEmail: publisher@example.com
+    resources:
+      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
+      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 4Gi }
   # Declarative connector hosting (ADR-0090): the worker converges each agent's
   # connector Deployment/Service/Secret/NetworkPolicy toward what its in-force
   # bundle declares, so an agent repo needs no CLI near the cluster.
@@ -964,8 +1065,8 @@ worker:
   # worker override the fixed env block does not cover.
   extraEnv: []
   resources:
-    requests: { cpu: 100m, memory: 192Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    requests: { cpu: 500m, memory: 512Mi, ephemeral-storage: 2Gi }
+    limits: { cpu: "2", memory: 1Gi, ephemeral-storage: 8Gi }
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/worker/Dockerfile). This pod mounts a Kubernetes API token and drives
   # the sandbox lifecycle, so the hardening matters most here. readOnlyRootFilesystem
@@ -1203,6 +1304,14 @@ agentSandbox:
     # Per-claim env injection (the resume path injects CURIE_HISTORY_REF and
     # CURIE_SESSION_ID) must be able to override the template's baked env.
     envVarsInjectionPolicy: Overrides
+    # Deployment workspaces arrive as a claim-scoped, one-object signed read
+    # reference. The sandbox never receives an object-store or GitHub identity.
+    workspace:
+      enabled: true
+      mountPath: /workspace
+      sizeLimit: 1Gi
+      fetchTimeoutSeconds: 45
+      extractTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     extraEnv: []
     # --- BYO model: LiteLLM Anthropic-format sidecar (part of #24) ---

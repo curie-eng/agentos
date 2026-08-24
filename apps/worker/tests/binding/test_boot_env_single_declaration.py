@@ -108,6 +108,59 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # and consumed by ``build_reply_sink``. It is an egress-trust decision
         # made on the worker; nothing about it reaches a sandbox.
         "CURIE_SLACK_TRUSTED_ORIGINS",
+        # Managed-workspace operator settings, read from the WORKER's env by
+        # WorkerConfig and consumed by WorkspacePreparer, WorkspaceObjectStore,
+        # and the internal credential client. They govern worker-side clone,
+        # archive, upload, and capability-minting policy; none is runner boot
+        # configuration.
+        "CURIE_INTERNAL_WORKER_TOKEN",
+        "CURIE_WORKSPACE_ENABLED",
+        "CURIE_WORKSPACE_BUCKET",
+        "CURIE_WORKSPACE_OBJECT_PREFIX",
+        "CURIE_WORKSPACE_SCRATCH_ROOT",
+        "CURIE_WORKSPACE_CLONE_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_ARCHIVE_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_TOTAL_TIMEOUT_SECONDS",
+        "CURIE_WORKSPACE_MAX_CHECKOUT_BYTES",
+        "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES",
+        "CURIE_WORKSPACE_MAX_MEMBERS",
+        "CURIE_WORKSPACE_MAX_COMPRESSION_RATIO",
+        "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
+        "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
+        # WorkspaceClaimCoordinator injects these exact-object handoff values
+        # into a claim for the workspace-init container
+        # to consume. They are substrate-local delivery inputs, not fields read
+        # by the sandbox runner and therefore not part of frozen BootEnv.
+        "CURIE_WORKSPACE_REF",
+        "CURIE_WORKSPACE_SHA256",
+        # Publication-Job operator settings, read from the WORKER's env by
+        # WorkerConfig and consumed by PublicationReconcileLoop and its
+        # Kubernetes Job builder. They configure the platform-side publisher,
+        # never a runner sandbox boot.
+        "CURIE_PUBLICATION_ENABLED",
+        "CURIE_PUBLICATION_NAMESPACE",
+        "CURIE_PUBLICATION_PATCH_MAX_BYTES",
+        "CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
+        "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
+        "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
+        "CURIE_PUBLICATION_GITHUB_API_URL",
+        "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
+        "CURIE_PUBLICATION_LEASE_SECONDS",
+        "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
+        "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
+        "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
+        "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
+        "CURIE_PUBLICATION_OWNER_NAME",
+        "CURIE_PUBLICATION_GIT_USER_NAME",
+        "CURIE_PUBLICATION_GIT_USER_EMAIL",
+        "CURIE_PUBLICATION_CPU_REQUEST",
+        "CURIE_PUBLICATION_CPU_LIMIT",
+        "CURIE_PUBLICATION_MEMORY_REQUEST",
+        "CURIE_PUBLICATION_MEMORY_LIMIT",
+        "CURIE_PUBLICATION_EPHEMERAL_REQUEST",
+        "CURIE_PUBLICATION_EPHEMERAL_LIMIT",
         # The Slack shimmer caption. Read from the WORKER's env since #1312 moved
         # the whole shimmer to this side; it reaches Slack, never a sandbox.
         "CURIE_STATUS_TEXT",

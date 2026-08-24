@@ -62,6 +62,7 @@ use std::path::{Path, PathBuf};
 use curie::commands::{
     lock_preflight, manifest_platforms, node_architectures, node_architectures_argv,
     registry_manifest_argv, registry_preflight, registry_preflight_targets, DeployOpts, DeployTier,
+    WorkspaceIntent,
 };
 use curie::connector_build::{
     ConnectorBuildDecl, ConnectorLockEntryDecl, ConnectorLockFileDecl, ConnectorSpecDecl,
@@ -320,6 +321,7 @@ fn deploy_opts_carries_an_explicit_tier() {
         api_key: "curie-dev-key".to_string(),
         slack_channel: None,
         repo: None,
+        workspace: WorkspaceIntent::Preserve,
         env: None,
         label: None,
         secret: Vec::new(),

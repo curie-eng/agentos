@@ -1,0 +1,10 @@
+{
+  "name": "coder",
+  "description": "A minimal consumer of Curie's managed repository workspace and publication capability.",
+  "version": "0.1.0",
+  "starterPrompts": [
+    "What is checked out in this session?",
+    "Add a short usage section to the README and tell me exactly what changed.",
+    "Publish the focused changes in this workspace."
+  ]
+}

@@ -175,6 +175,7 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
     except ValueError:
         return None
 
+
 _RESOLVE_SQL = """
 SELECT a.id AS agent_id,
        a.name AS agent_name,
@@ -186,6 +187,8 @@ SELECT a.id AS agent_id,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
+       d.id AS deployment_id,
+       d.workspace_enabled AS workspace_enabled,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -208,6 +211,11 @@ class ResolvedDeployment(BaseModel):
     # (#1116) and use the name, so the runner needs it to derive a URL that
     # matches the Service that exists.
     agent_name: str
+    # The active deployment is the sole selector the trusted worker may redeem
+    # through the internal workspace credential endpoint.  Optional defaults
+    # keep old worker doubles and rolling-deploy rows source-compatible.
+    deployment_id: uuid.UUID | None = None
+    workspace_enabled: bool = False
     version_id: uuid.UUID
     version_label: str
     bundle_ref: str | None
@@ -342,9 +350,7 @@ class BindingResolver:
         value: str | None = row[0]
         return value
 
-    async def approval_grant_tool(
-        self, event_id: str, agent_id: uuid.UUID
-    ) -> str | None:
+    async def approval_grant_tool(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The one-shot post-approval grant for a resume turn (#430, ADR-0035).
 
         When ``event_id`` is the deterministic resume id of a genuinely
@@ -422,12 +428,10 @@ class BindingResolver:
         summary: str | None = row["summary"]
         if not summary or not summary.startswith(_PERMISSION_GATE_SUMMARY_PREFIX):
             return None
-        tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX):].split(" ", 1)[0]
+        tool = summary[len(_PERMISSION_GATE_SUMMARY_PREFIX) :].split(" ", 1)[0]
         return tool or None
 
-    async def approval_resumed_kind(
-        self, event_id: str, agent_id: uuid.UUID
-    ) -> str | None:
+    async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
         Decision A2), or None.
 
@@ -649,9 +653,7 @@ class BindingResolver:
             # Same precedence as the model above (#1182): the agent's value wins,
             # then the platform default, then nothing at all -- and "nothing at
             # all" is what makes an unconfigured install behave as it always has.
-            thinking=(
-                resolved.thinking if resolved.thinking is not None else self._config.thinking
-            )
+            thinking=(resolved.thinking if resolved.thinking is not None else self._config.thinking)
             or None,
             fake_model=self._config.fake_model,
             credentials_ref=self._config.credentials,
@@ -689,9 +691,7 @@ class BindingResolver:
         # Runs AFTER the render so the reserved-name filter sees the rendered
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
-        inject_connector_secrets(
-            env, resolved.secrets, agent_label=resolved.agent_id
-        )
+        inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
         return env
 
 

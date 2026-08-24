@@ -1048,6 +1048,7 @@ async fn deploy_embedded_sre_bot(
         api_key: connection.api_key.clone(),
         slack_channel: slack_channel.map(str::to_string),
         repo: None,
+        workspace: commands::WorkspaceIntent::Preserve,
         env: None,
         label: None,
         secret: vec![],

@@ -11,6 +11,7 @@ def _settings(**overrides: str) -> Settings:
         "environment": "prod",
         "api_key": "a-real-key",
         "github_webhook_secret": "a-real-secret",
+        "internal_worker_token": "a-real-worker-token",
     }
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -34,6 +35,8 @@ def test_prod_with_real_secrets_boots() -> None:
         ({"api_key": ""}, "API_KEY"),
         ({"github_webhook_secret": "dev-webhook-secret"}, "GITHUB_WEBHOOK_SECRET"),
         ({"github_webhook_secret": ""}, "GITHUB_WEBHOOK_SECRET"),
+        ({"internal_worker_token": "curie-dev-worker-token"}, "CURIE_INTERNAL_WORKER_TOKEN"),
+        ({"internal_worker_token": ""}, "CURIE_INTERNAL_WORKER_TOKEN"),
     ],
 )
 def test_prod_refuses_dev_default_or_empty_secret(

@@ -547,7 +547,12 @@ class SlackReplyAdapter:
         # into the approval card's Approve/Reject buttons. A message with no
         # interaction degrades to a plain text post (the mandatory text fallback).
         intent = message.interaction
+        client_msg_id: str | None = None
         if isinstance(intent, ConfirmIntent):
+            # Platform approvals carry UUID ids. Reusing that durable identity
+            # lets Slack adopt an ambiguous crash-after-post retry instead of
+            # rendering a second externally visible approval card.
+            client_msg_id = intent.id
             text, blocks = approval_card(
                 approval_id=intent.id,
                 summary=message.text,
@@ -567,10 +572,17 @@ class SlackReplyAdapter:
             try:
                 if blocks is not None:
                     return await client.chat_postMessage(
-                        channel=channel, text=text, blocks=blocks, thread_ts=thread_ts
+                        channel=channel,
+                        text=text,
+                        blocks=blocks,
+                        thread_ts=thread_ts,
+                        client_msg_id=client_msg_id,
                     )
                 return await client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
+                    channel=channel,
+                    text=text,
+                    thread_ts=thread_ts,
+                    client_msg_id=client_msg_id,
                 )
             except SlackApiError:
                 if blocks is None:
@@ -579,7 +591,10 @@ class SlackReplyAdapter:
                     "chat_postMessage with blocks rejected; retrying text-only"
                 )
                 return await client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
+                    channel=channel,
+                    text=text,
+                    thread_ts=thread_ts,
+                    client_msg_id=client_msg_id,
                 )
 
         response = await self._with_transport_fallback(

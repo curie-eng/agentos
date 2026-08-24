@@ -778,7 +778,7 @@
         "type": "object"
       },
       "ApprovalResolve": {
-        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: self-approval is blocked, and channel membership is proven\nby ``actor_channel`` -- the channel the resolution attempt was made from\n(the card click's channel, relayed by the dispatcher; asserted explicitly\nby API-key operators).",
+        "description": "One resolution attempt. Exactly one attempt wins (compare-and-set), and\nthe server-side authorizer (#246) decides first whether this actor may\nresolve at all: ordinary self-approval is blocked, while a server-linked\npublication requester must still prove membership. ``actor_channel`` is the\nchannel the resolution attempt was made from (the card click's channel,\nrelayed by the dispatcher; asserted explicitly by API-key operators).",
         "properties": {
           "actor_channel": {
             "anyOf": [
@@ -1262,6 +1262,17 @@
             "format": "uuid",
             "title": "Version Id",
             "type": "string"
+          },
+          "workspace_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Enabled"
           }
         },
         "required": [
@@ -1311,6 +1322,10 @@
             "format": "uuid",
             "title": "Version Id",
             "type": "string"
+          },
+          "workspace_enabled": {
+            "title": "Workspace Enabled",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1319,6 +1334,7 @@
           "version_id",
           "environment",
           "commit_sha",
+          "workspace_enabled",
           "status",
           "deployed_at"
         ],
@@ -2395,6 +2411,337 @@
         "title": "PodLogs",
         "type": "object"
       },
+      "PublicationCreate": {
+        "description": "Trusted snapshot facts used to atomically create approval + publication.",
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "body": {
+            "anyOf": [
+              {
+                "maxLength": 65536,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
+          "changed_paths": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "dedupe_key": {
+            "minLength": 1,
+            "title": "Dedupe Key",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "expires_in_seconds": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires In Seconds"
+          },
+          "patch_b64": {
+            "minLength": 1,
+            "title": "Patch B64",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "minLength": 1,
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_kind": {
+            "minLength": 1,
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "repo_full_name": {
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$",
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "summary": {
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "conversation_id",
+          "repo_full_name",
+          "author",
+          "summary",
+          "reply_kind",
+          "reply_channel",
+          "dedupe_key",
+          "base_sha",
+          "patch_b64",
+          "changed_paths"
+        ],
+        "title": "PublicationCreate",
+        "type": "object"
+      },
+      "PublicationOut": {
+        "description": "Patch-free publication metadata safe for operator and worker reads.",
+        "properties": {
+          "approval_id": {
+            "format": "uuid",
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "base_sha": {
+            "title": "Base Sha",
+            "type": "string"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "changed_paths": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Changed Paths",
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reply_adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Adapter"
+          },
+          "reply_channel": {
+            "title": "Reply Channel",
+            "type": "string"
+          },
+          "reply_endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Endpoint"
+          },
+          "reply_kind": {
+            "title": "Reply Kind",
+            "type": "string"
+          },
+          "reply_placeholder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Placeholder"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "result_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Url"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "terminal_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal At"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "approval_id",
+          "deployment_id",
+          "repo_full_name",
+          "status",
+          "version",
+          "base_sha",
+          "changed_paths",
+          "title",
+          "body",
+          "reply_kind",
+          "reply_channel",
+          "reply_placeholder",
+          "reply_endpoint",
+          "reply_adapter",
+          "result_url",
+          "error",
+          "created_at",
+          "updated_at",
+          "terminal_at"
+        ],
+        "title": "PublicationOut",
+        "type": "object"
+      },
+      "RepositoryCredentialOut": {
+        "description": "One server-derived Git credential returned only to the trusted worker.",
+        "properties": {
+          "authorization_header": {
+            "title": "Authorization Header",
+            "type": "string"
+          },
+          "clone_url": {
+            "title": "Clone Url",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name",
+          "clone_url",
+          "authorization_header"
+        ],
+        "title": "RepositoryCredentialOut",
+        "type": "object"
+      },
       "ResolveTargetRequest": {
         "description": "A bundle's ``deploy.yaml`` text plus the target to resolve (ADR-0089).\n\nThe CLI sends the file CONTENT rather than parsing it, so there is exactly\none parser for this format. Two would be a drift hazard on a file whose\nwhole job is to be unambiguous about where a deploy lands -- and the Rust\nYAML ecosystem has no maintained successor to serde_yaml to pick from.",
         "properties": {
@@ -3000,6 +3347,64 @@
           "status"
         ],
         "title": "WebhookResult",
+        "type": "object"
+      },
+      "WorkspaceCredentialRequest": {
+        "properties": {
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "conversation_id"
+        ],
+        "title": "WorkspaceCredentialRequest",
+        "type": "object"
+      },
+      "WorkspaceSelectionOut": {
+        "properties": {
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name"
+        ],
+        "title": "WorkspaceSelectionOut",
+        "type": "object"
+      },
+      "WorkspaceSelectionRequest": {
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "author"
+        ],
+        "title": "WorkspaceSelectionRequest",
         "type": "object"
       }
     }
@@ -7053,6 +7458,385 @@
         "summary": "Runner Logs",
         "tags": [
           "observability"
+        ]
+      }
+    },
+    "/publications": {
+      "get": {
+        "operationId": "list_publications_publications_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/PublicationOut"
+                  },
+                  "title": "Response List Publications Publications Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Publications",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/publications/{publication_id}": {
+      "get": {
+        "operationId": "get_publication_publications__publication_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Publication",
+        "tags": [
+          "publications"
+        ]
+      }
+    },
+    "/v1/internal/publications": {
+      "post": {
+        "operationId": "create_publication_v1_internal_publications_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Publication",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/credential": {
+      "post": {
+        "operationId": "redeem_publication_credential_v1_internal_publications__publication_id__credential_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem Publication Credential",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/workspaces/{deployment_id}/credential": {
+      "post": {
+        "operationId": "redeem_workspace_credential_v1_internal_workspaces__deployment_id__credential_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem Workspace Credential",
+        "tags": [
+          "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/internal/workspaces/{deployment_id}/selection": {
+      "post": {
+        "description": "Select once per agent/thread, or validate and reuse the winner.",
+        "operationId": "select_workspace_repository_v1_internal_workspaces__deployment_id__selection_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceSelectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Select Workspace Repository",
+        "tags": [
+          "internal-workspaces"
         ]
       }
     }

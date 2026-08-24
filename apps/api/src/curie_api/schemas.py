@@ -1,5 +1,7 @@
 """Pydantic v2 request/response models for the API surface."""
 
+import base64
+import binascii
 import json
 import logging
 import re
@@ -29,6 +31,7 @@ from pydantic import (
 
 from .config import get_settings
 from .models import GIT_FLOW_CREATED_BY, Environment
+from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -1023,10 +1026,13 @@ class DeploymentCreate(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None = None
+    # Three states are distinguished by ``model_fields_set`` in the router:
+    # omitted carries the last active deployment value, true enables runtime
+    # repository selection, and false disables it.
+    workspace_enabled: bool | None = None
     status: str = "active"
 
     _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
-
 
 class DeploymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1036,17 +1042,156 @@ class DeploymentOut(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None
+    workspace_enabled: bool
     status: str
     deployed_at: datetime
+
+
+class RepositoryCredentialOut(BaseModel):
+    """One server-derived Git credential returned only to the trusted worker."""
+
+    repo_full_name: str
+    clone_url: str
+    authorization_header: str
+
+
+class WorkspaceSelectionRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    repo_full_name: str | None = None
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_repo(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
+
+
+class WorkspaceSelectionOut(BaseModel):
+    repo_full_name: str
+
+
+class WorkspaceCredentialRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+
+
+class PublicationCreate(BaseModel):
+    """Trusted snapshot facts used to atomically create approval + publication."""
+
+    deployment_id: uuid.UUID
+    conversation_id: str = Field(min_length=1)
+    repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
+    author: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    reply_kind: str = Field(min_length=1)
+    reply_channel: str = Field(min_length=1)
+    reply_placeholder: str | None = None
+    reply_endpoint: str | None = None
+    reply_adapter: str | None = None
+    dedupe_key: str = Field(min_length=1)
+    base_sha: str
+    patch_b64: str = Field(min_length=1)
+    changed_paths: list[str] = Field(min_length=1, max_length=4096)
+    expires_in_seconds: int | None = Field(default=None, ge=1)
+    title: str | None = Field(default=None, max_length=256)
+    body: str | None = Field(default=None, max_length=65_536)
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_publication_repo(cls, value: str) -> str:
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
+
+    @field_validator("base_sha")
+    @classmethod
+    def _full_base_sha(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            raise ValueError("base_sha must be one full 40-character hexadecimal commit id")
+        return value.lower()
+
+    @model_validator(mode="after")
+    def _valid_reply_route(self) -> "PublicationCreate":
+        _validate_channel_binding(self.reply_kind, self.reply_channel)
+        if (self.reply_endpoint is None) != (self.reply_adapter is None):
+            raise ValueError(
+                "publication reply route must set endpoint and adapter together"
+            )
+        if self.reply_adapter is not None and not _CHANNEL_KIND.match(
+            self.reply_adapter
+        ):
+            raise ValueError("publication reply adapter must be a lowercase slug")
+        if self.reply_endpoint is not None:
+            _validate_channel_endpoint(self.reply_endpoint)
+        return self
+
+    @field_validator("changed_paths")
+    @classmethod
+    def _safe_changed_paths(cls, value: list[str]) -> list[str]:
+        for path in value:
+            parts = path.split("/")
+            if tuple(part.casefold() for part in parts[:2]) == (
+                ".github",
+                "workflows",
+            ):
+                raise ValueError(
+                    "GitHub workflow changes cannot be published by this capability"
+                )
+            if (
+                not path
+                or path.startswith("/")
+                or parts[0].casefold() == ".git"
+                or any(part in ("", ".", "..") for part in parts)
+            ):
+                raise ValueError(
+                    "changed_paths must contain safe repository-relative paths"
+                )
+        return value
+
+    def decoded_patch(self) -> bytes:
+        try:
+            return base64.b64decode(self.patch_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("patch_b64 must be canonical base64") from exc
+
+
+class PublicationOut(BaseModel):
+    """Patch-free publication metadata safe for operator and worker reads."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    approval_id: uuid.UUID
+    deployment_id: uuid.UUID
+    repo_full_name: str
+    status: str
+    version: int
+    base_sha: str
+    changed_paths: list[str]
+    title: str
+    body: str
+    reply_kind: str
+    reply_channel: str
+    reply_placeholder: str | None
+    reply_endpoint: str | None
+    reply_adapter: str | None
+    result_url: str | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+    terminal_at: datetime | None
 
 
 class ApprovalResolve(BaseModel):
     """One resolution attempt. Exactly one attempt wins (compare-and-set), and
     the server-side authorizer (#246) decides first whether this actor may
-    resolve at all: self-approval is blocked, and channel membership is proven
-    by ``actor_channel`` -- the channel the resolution attempt was made from
-    (the card click's channel, relayed by the dispatcher; asserted explicitly
-    by API-key operators)."""
+    resolve at all: ordinary self-approval is blocked, while a server-linked
+    publication requester must still prove membership. ``actor_channel`` is the
+    channel the resolution attempt was made from (the card click's channel,
+    relayed by the dispatcher; asserted explicitly by API-key operators)."""
 
     decision: Literal["approved", "rejected"]
     resolved_by: str = Field(min_length=1)

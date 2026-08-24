@@ -192,6 +192,11 @@ async def resolve_approval(
                 authorized=True,
                 reason=f"approval expired at {expires_at}",
             )
+            if expired.purpose == "publication":
+                raise HTTPException(
+                    status.HTTP_410_GONE,
+                    f"approval expired at {expires_at} and can no longer be resolved",
+                )
             # This resolver lost the SLA (it still gets 410), but the session is
             # suspended and must be woken down its timeout branch. This resolver
             # won the expiry CAS (expire_approval returned non-None), so it is
@@ -275,6 +280,11 @@ async def resolve_approval(
         )
 
     await _audit("resolved", authorized=True, reason=decision.reason or None)
+
+    if claimed.purpose == "publication":
+        # Publication outcomes are consumed by the trusted worker and emitted
+        # directly through the stored reply route. No model wake or grant is owed.
+        return ApprovalOut.model_validate(claimed)
 
     # Wake the suspended session: the resume turn rides the normal runs stream,
     # so the kernel's ordinary consume -> claim path rehydrates the thread

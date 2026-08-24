@@ -1058,6 +1058,7 @@ pub async fn deploy_named(folder: &str, opts: DeployNamedOpts) -> Result<DeployO
         api_key: opts.api_key,
         slack_channel: opts.slack_channel,
         repo: opts.repo,
+        workspace: WorkspaceIntent::Preserve,
         env: Some(opts.env),
         label: opts.label,
         secret: opts.secret,
@@ -3565,6 +3566,9 @@ pub struct DeployOpts {
     /// repository is left alone and warned about, because a deploy does not
     /// reroute an existing binding.
     pub repo: Option<String>,
+    /// Deployment-level managed workspace intent. Preserve deliberately omits
+    /// the workspace field so the server can carry the previous value forward.
+    pub workspace: WorkspaceIntent,
     /// None means the caller did not pass --env, so a declared target may
     /// supply it. An explicit flag still wins (ADR-0089).
     pub env: Option<DeployEnv>,
@@ -3601,6 +3605,8 @@ pub enum DeployTier {
     Local,
     Cluster,
 }
+
+pub use crate::api::WorkspaceIntent;
 
 /// The declared connector-secret NAMES not present in the operator's bound
 /// `--secret` set (#464). A non-empty result is a deploy-time gap: the bundle
@@ -3869,6 +3875,7 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             &secrets,
             opts.repo.as_deref(),
             commit_sha.as_deref(),
+            opts.workspace,
         )
         .await
     {
@@ -6966,6 +6973,7 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
@@ -7039,6 +7047,7 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec!["GH_TOKEN".to_string()],
@@ -7076,6 +7085,7 @@ mod tests {
             api_key: "k".to_string(),
             slack_channel: None,
             repo: None,
+            workspace: super::WorkspaceIntent::Preserve,
             env: Some(super::DeployEnv::Dev),
             label: Some("v0".to_string()),
             secret: vec![],
@@ -7145,6 +7155,7 @@ mod tests {
             status: status.into(),
             version_id: Some(version.into()),
             deployed_at: Some(ts.into()),
+            workspace_enabled: false,
         }
     }
 

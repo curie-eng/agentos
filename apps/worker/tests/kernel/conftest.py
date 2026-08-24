@@ -533,6 +533,7 @@ async def kernel_harness(
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
+    publication_creator: object | None = None,
     sink: object | None = None,
     claim_timeout_seconds: float = 3.0,
     **config_overrides: object,
@@ -580,6 +581,7 @@ async def kernel_harness(
         binding=binding,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
+        publication_creator=publication_creator,  # type: ignore[arg-type]
         card_store=card_store,
     )
     killswitch = None
