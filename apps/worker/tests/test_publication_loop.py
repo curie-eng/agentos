@@ -16,6 +16,8 @@ from curie_worker.reply_sink import TargetRoute
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 APPROVAL_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
 PR_URL = "https://github.com/acme-corp/acme-bot/pull/123"
+RESOLVER = "U0APPROVE1"
+RESOLUTION_NOTE = "Ready to publish."
 
 pytestmark = pytest.mark.anyio
 
@@ -107,6 +109,11 @@ class _Store:
             and publication_id in self.cleanup_pending
         ):
             return None
+        result = {
+            "resolved_by": None,
+            "resolution_note": None,
+            **value,
+        }
         return SimpleNamespace(
             publication_id=publication_id,
             approval_id=APPROVAL_ID,
@@ -114,7 +121,7 @@ class _Store:
             route=self.route,
             attempt=1,
             version=1,
-            **value,
+            **result,
         )
 
     def persist_result(
@@ -132,6 +139,8 @@ class _Store:
             "outcome": outcome,
             "pr_url": pr_url,
             "error": error,
+            "resolved_by": RESOLVER if outcome != "expired" else None,
+            "resolution_note": RESOLUTION_NOTE if outcome != "expired" else None,
         }
         if outcome in {"published", "failed"}:
             self.cleanup_pending.add(publication_id)
@@ -585,7 +594,7 @@ async def test_non_slack_publication_result_uses_the_stored_adapter_route_withou
         ("expired", None, None, None, "approval expired"),
     ],
 )
-async def test_terminal_result_settles_matching_approval_card(
+async def test_terminal_result_settles_card_with_durable_resolution_identity(
     publication: Any,
     outcome: str,
     pr_url: str | None,
@@ -600,6 +609,8 @@ async def test_terminal_result_settles_matching_approval_card(
         "outcome": outcome,
         "pr_url": pr_url,
         "error": error,
+        "resolved_by": RESOLVER if decision is not None else None,
+        "resolution_note": RESOLUTION_NOTE if decision is not None else None,
     }
 
     await loop.deliver_pending_result(PUBLICATION_ID)
@@ -610,6 +621,12 @@ async def test_terminal_result_settles_matching_approval_card(
     assert card_update.message.text == "Publish these repository changes?"
     assert card_update.settled.decision == decision
     assert card_update.settled.requested_by == "requester@example.test"
+    assert card_update.settled.resolver == (
+        RESOLVER if decision is not None else None
+    )
+    assert card_update.settled.note == (
+        RESOLUTION_NOTE if decision is not None else None
+    )
     assert card_route == TargetRoute(endpoint=None, adapter=None)
     assert cards.ref is None
     assert cards.restored == []
@@ -676,6 +693,8 @@ async def test_terminal_result_is_persisted_and_credentials_removed_before_reply
     assert credentials.calls == [PUBLICATION_ID]
     assert len(replies.events) == 2
     assert replies.events[1][0].settled.decision == "approved"
+    assert replies.events[1][0].settled.resolver == RESOLVER
+    assert replies.events[1][0].settled.note == RESOLUTION_NOTE
     assert cards.ref is None
     assert store.delivery_retries == [(PUBLICATION_ID, "reply transport unavailable")]
 

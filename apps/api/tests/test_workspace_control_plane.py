@@ -11,7 +11,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import threading
+import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -21,9 +24,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
+from curie_api.workspace_policy import repository_is_allowed
+from fastapi import Response
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 REPO = "acme-corp/acme-bot"
 OTHER_REPO = "attacker/other-bot"
@@ -113,6 +119,24 @@ def _credential_audit_columns() -> set[str]:
     return asyncio.run(run())
 
 
+def _selection_rows() -> list[dict[str, Any]]:
+    async def run() -> list[dict[str, Any]]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT agent_id, conversation_id, repo_full_name, selected_by "
+                        "FROM curie.thread_workspaces ORDER BY created_at, id"
+                    )
+                )
+                return [dict(row._mapping) for row in result]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
 @pytest.fixture
 def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
@@ -122,6 +146,7 @@ def worker_client(_disposable_db: Any, monkeypatch: pytest.MonkeyPatch) -> Itera
     monkeypatch.setenv("GITHUB_APP_ID", "")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_operator_workspace")
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
     get_settings.cache_clear()
     _RESOLVERS.clear()
     with TestClient(create_app()) as test_client:
@@ -171,17 +196,17 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
 
     selected = worker_client.post(
         url,
-        json={"conversation_id": "thread-1", "repo_full_name": REPO},
+        json={"conversation_id": "thread-1", "author": "U0REQUEST1", "repo_full_name": REPO},
         headers=WORKER_HEADERS,
     )
     reused = worker_client.post(
         url,
-        json={"conversation_id": "thread-1", "repo_full_name": None},
+        json={"conversation_id": "thread-1", "author": "U0REQUEST1", "repo_full_name": None},
         headers=WORKER_HEADERS,
     )
     conflict = worker_client.post(
         url,
-        json={"conversation_id": "thread-1", "repo_full_name": OTHER_REPO},
+        json={"conversation_id": "thread-1", "author": "U0REQUEST1", "repo_full_name": OTHER_REPO},
         headers=WORKER_HEADERS,
     )
 
@@ -189,6 +214,79 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     assert selected.json() == reused.json() == {"repo_full_name": REPO}
     assert conflict.status_code == 409
     assert "different repository" in conflict.json()["detail"]
+    assert _selection_rows() == [
+        {
+            "agent_id": uuid.UUID(agent_id),
+            "conversation_id": "thread-1",
+            "repo_full_name": REPO,
+            "selected_by": "U0REQUEST1",
+        }
+    ]
+
+
+def test_selection_survives_redeployment_for_the_same_agent_thread(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    first = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{first['id']}/selection",
+        json={
+            "conversation_id": "thread-redeploy",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+    replacement = _deploy(worker_client, auth_headers, agent_id, version_id)
+
+    reused = worker_client.post(
+        f"/v1/internal/workspaces/{replacement['id']}/selection",
+        json={
+            "conversation_id": "thread-redeploy",
+            "author": "U0REQUEST2",
+            "repo_full_name": None,
+        },
+        headers=WORKER_HEADERS,
+    )
+
+    assert reused.status_code == 200, reused.text
+    assert reused.json() == {"repo_full_name": REPO}
+    assert len(_selection_rows()) == 1
+
+
+def test_concurrent_different_repo_selection_has_one_database_winner(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+    url = f"/v1/internal/workspaces/{deployment['id']}/selection"
+    barrier = threading.Barrier(2)
+
+    def choose(repo: str) -> int:
+        barrier.wait()
+        return worker_client.post(
+            url,
+            json={
+                "conversation_id": "thread-race",
+                "author": "U0REQUEST1",
+                "repo_full_name": repo,
+            },
+            headers=WORKER_HEADERS,
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(
+            pool.map(choose, [REPO, "acme-corp/acme-api"])
+        )
+
+    assert sorted(statuses) == [200, 409]
+    assert len(_selection_rows()) == 1
 
 
 def test_repo_selection_denies_before_persistence_or_credential_mint(
@@ -204,7 +302,11 @@ def test_repo_selection_denies_before_persistence_or_credential_mint(
 
     denied = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
-        json={"conversation_id": "thread-denied", "repo_full_name": OTHER_REPO},
+        json={
+            "conversation_id": "thread-denied",
+            "author": "U0REQUEST1",
+            "repo_full_name": OTHER_REPO,
+        },
         headers=WORKER_HEADERS,
     )
 
@@ -212,35 +314,18 @@ def test_repo_selection_denies_before_persistence_or_credential_mint(
     assert _audit_rows() == []
 
 
-@pytest.mark.parametrize(
-    "workspace_repo",
-    [
-        "https://github.com/acme-corp/acme-bot.git",
-        "x-access-token:secret@acme-corp/acme-bot",
-        "acme-corp/acme-bot/extra",
-        " acme-corp/acme-bot ",
-        "acme corp/acme-bot",
-        "acme-corp/.git",
-    ],
-)
-def test_workspace_repo_accepts_only_one_canonical_owner_repo(
-    client: TestClient,
-    auth_headers: dict[str, str],
-    clean_db: None,
-    workspace_repo: str,
-) -> None:
-    agent_id, version_id = _create_agent_version(client, auth_headers)
-    response = client.post(
-        "/deployments",
-        json={
-            "agent_id": agent_id,
-            "version_id": version_id,
-            "environment": "dev",
-            "workspace_repo": workspace_repo,
-        },
-        headers=auth_headers,
-    )
-    assert response.status_code == 422, response.text
+def test_repository_allowlist_matches_casefolded_whole_repositories_or_owners_only() -> None:
+    assert repository_is_allowed(REPO, ("ACME-CORP/ACME-BOT",))
+    assert repository_is_allowed(REPO, ("AcMe-CoRp/*",))
+    assert not repository_is_allowed(REPO, ("acme-corp/acme-bot-extra",))
+    assert not repository_is_allowed(REPO, ("other-corp/*",))
+
+
+def test_malformed_workspace_allowlist_refuses_settings_boot() -> None:
+    from curie_api.config import Settings
+
+    with pytest.raises(ValidationError, match="GITHUB_REPO_ALLOWLIST"):
+        Settings(github_repo_allowlist=("acme-corp/*/extra",))
 
 
 def test_workspace_credential_is_worker_only_server_derived_and_no_store(
@@ -249,10 +334,12 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=REPO)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
     url = f"/v1/internal/workspaces/{deployment['id']}/credential"
 
-    refused = worker_client.post(url, headers=auth_headers)
+    refused = worker_client.post(
+        url, json={"conversation_id": "thread-credential"}, headers=auth_headers
+    )
     assert refused.status_code == 401
     assert refused.headers["cache-control"] == "no-store"
     assert "internal worker token" in refused.json()["detail"]
@@ -261,9 +348,19 @@ def test_workspace_credential_is_worker_only_server_derived_and_no_store(
     # access log; it cannot grow the durable credential audit table.
     assert _audit_rows() == []
 
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "thread-credential",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
     issued = worker_client.post(
         url,
-        json={"repo_full_name": OTHER_REPO, "clone_url": "https://evil.example/repo.git"},
+        json={"conversation_id": "thread-credential"},
         headers=WORKER_HEADERS,
     )
     assert issued.status_code == 200, issued.text
@@ -295,10 +392,17 @@ def test_workspace_credential_pat_fallback_is_redeemed_through_the_endpoint(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=REPO)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={"conversation_id": "thread-pat", "author": "U0REQUEST1", "repo_full_name": REPO},
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
 
     response = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/credential",
+        json={"conversation_id": "thread-pat"},
         headers=WORKER_HEADERS,
     )
     assert response.status_code == 200, response.text
@@ -306,6 +410,68 @@ def test_workspace_credential_pat_fallback_is_redeemed_through_the_endpoint(
         response.json()["authorization_header"]
         == "Basic " + base64.b64encode(b"x-access-token:ghp_operator_workspace").decode()
     )
+
+
+def test_workspace_credential_resolution_does_not_block_the_event_loop(
+    worker_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synchronous installation-token mint must run outside FastAPI's loop."""
+
+    from curie_api.routers.workspaces import redeem_workspace_credential
+    from curie_api.schemas import WorkspaceCredentialRequest
+
+    agent_id, version_id = _create_agent_version(worker_client, auth_headers)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
+    selected = worker_client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={"conversation_id": "thread-nonblocking", "author": "U0REQUEST1", "repo_full_name": REPO},
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+
+    resolver_started = threading.Event()
+    loop_progressed = threading.Event()
+
+    def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
+        resolver_started.set()
+        if not loop_progressed.wait(timeout=0.5):
+            raise AssertionError("credential resolver blocked the event loop")
+        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+
+    monkeypatch.setattr(
+        "curie_api.routers.workspaces.resolve_repository_credential", blocking_resolver
+    )
+
+    async def exercise() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+            async with sessionmaker() as session:
+                call = asyncio.create_task(
+                    redeem_workspace_credential(
+                        uuid.UUID(deployment["id"]),
+                        WorkspaceCredentialRequest(conversation_id="thread-nonblocking"),
+                        session,
+                        Response(),
+                    )
+                )
+
+                async def prove_progress() -> None:
+                    await asyncio.to_thread(resolver_started.wait)
+                    await asyncio.sleep(0)
+                    loop_progressed.set()
+
+                progress = asyncio.create_task(prove_progress())
+                result = await asyncio.wait_for(call, timeout=2)
+                await progress
+                return result.authorization_header
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == "Basic test"
 
 
 def test_workspace_credential_prefers_app_installation_token_over_pat(
@@ -323,6 +489,7 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     monkeypatch.setenv("GITHUB_APP_ID", "12345")
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", pem)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_must_not_win")
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
@@ -354,10 +521,17 @@ def test_workspace_credential_prefers_app_installation_token_over_pat(
     )
     with TestClient(create_app()) as app_client:
         agent_id, version_id = _create_agent_version(app_client, auth_headers)
-        deployment = _deploy(app_client, auth_headers, agent_id, version_id, workspace=REPO)
+        deployment = _deploy(app_client, auth_headers, agent_id, version_id, workspace=True)
+        selected = app_client.post(
+            f"/v1/internal/workspaces/{deployment['id']}/selection",
+            json={"conversation_id": "thread-app", "author": "U0REQUEST1", "repo_full_name": REPO},
+            headers=WORKER_HEADERS,
+        )
+        assert selected.status_code == 200, selected.text
 
         response = app_client.post(
             f"/v1/internal/workspaces/{deployment['id']}/credential",
+            json={"conversation_id": "thread-app"},
             headers=WORKER_HEADERS,
         )
         assert response.status_code == 200, response.text
@@ -377,10 +551,11 @@ def test_workspace_credential_requires_a_workspace_enabled_deployment(
     clean_db: None,
 ) -> None:
     agent_id, version_id = _create_agent_version(worker_client, auth_headers)
-    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=None)
+    deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=False)
 
     response = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/credential",
+        json={"conversation_id": "thread-disabled"},
         headers=WORKER_HEADERS,
     )
     assert response.status_code == 409

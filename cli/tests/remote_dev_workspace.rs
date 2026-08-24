@@ -81,11 +81,12 @@ fn deploy_response(req: &support::Request, existing: ExistingAgent) -> Response 
                 "agent_id": "agent-acme-bot",
                 "version_id": "version-acme-bot",
                 "environment": "dev",
+                "workspace_enabled": false,
                 "status": "active",
                 "deployed_at": "2026-08-23T00:00:00Z"
             });
-            if let Some(workspace) = body.get("workspace_repo") {
-                result["workspace_repo"] = workspace.clone();
+            if let Some(workspace) = body.get("workspace_enabled") {
+                result["workspace_enabled"] = workspace.clone();
             }
             Response::json(201, &result.to_string())
         }
@@ -126,7 +127,7 @@ fn deployment_bodies(server: &MockServer) -> Vec<Value> {
 }
 
 #[test]
-fn workspace_enable_prefers_explicit_repo_and_sends_a_string() {
+fn workspace_enable_is_independent_of_git_flow_repo_binding() {
     let (output, server) = run_local(
         ExistingAgent::None,
         &["--workspace", "--repo", "acme-corp/acme-bot"],
@@ -136,18 +137,24 @@ fn workspace_enable_prefers_explicit_repo_and_sends_a_string() {
         "deploy failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
+    assert_eq!(
+        deployment_bodies(&server)[0]["workspace_enabled"],
+        json!(true)
+    );
 }
 
 #[test]
-fn workspace_enable_infers_the_persisted_agent_repo_without_an_extra_flag() {
+fn workspace_enable_with_existing_git_flow_binding_still_sends_capability_only() {
     let (output, server) = run_local(ExistingAgent::Bound("acme-corp/acme-bot"), &["--workspace"]);
     assert!(output.status.success());
-    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
+    assert_eq!(
+        deployment_bodies(&server)[0]["workspace_enabled"],
+        json!(true)
+    );
 }
 
 #[test]
-fn no_workspace_sends_explicit_null_while_omission_preserves_server_state() {
+fn no_workspace_sends_explicit_false_while_omission_preserves_server_state() {
     let (disabled, disabled_server) = run_local(ExistingAgent::Unbound, &["--no-workspace"]);
     assert!(disabled.status.success());
     let disabled_body = &deployment_bodies(&disabled_server)[0];
@@ -163,8 +170,15 @@ fn no_workspace_sends_explicit_null_while_omission_preserves_server_state() {
 #[test]
 fn workspace_enable_needs_no_preconfigured_repository() {
     let (output, server) = run_local(ExistingAgent::Unbound, &["--workspace"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(deployment_bodies(&server)[0]["workspace_enabled"], json!(true));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        deployment_bodies(&server)[0]["workspace_enabled"],
+        json!(true)
+    );
 }
 
 #[test]
@@ -273,11 +287,12 @@ fn fanout_response(
                 "agent_id": agent,
                 "version_id": body["version_id"],
                 "environment": body["environment"],
+                "workspace_enabled": false,
                 "status": "active",
                 "deployed_at": "2026-08-23T00:00:00Z"
             });
-            if let Some(value) = body.get("workspace_repo") {
-                response["workspace_repo"] = value.clone();
+            if let Some(value) = body.get("workspace_enabled") {
+                response["workspace_enabled"] = value.clone();
             }
             Response::json(201, &response.to_string())
         }
@@ -343,7 +358,7 @@ fn run_fanout(
 }
 
 #[test]
-fn all_targets_infers_each_agents_repo_independently() {
+fn all_targets_enables_runtime_workspace_selection_independently() {
     let (output, server) = run_fanout(
         Some("acme-corp/acme-dev"),
         Some("acme-corp/acme-prod"),
@@ -356,22 +371,23 @@ fn all_targets_infers_each_agents_repo_independently() {
     );
     let bodies = deployment_bodies(&server);
     assert_eq!(bodies.len(), 2);
-    assert_eq!(bodies[0]["workspace_repo"], json!("acme-corp/acme-dev"));
-    assert_eq!(bodies[1]["workspace_repo"], json!("acme-corp/acme-prod"));
+    assert_eq!(bodies[0]["workspace_enabled"], json!(true));
+    assert_eq!(bodies[1]["workspace_enabled"], json!(true));
 }
 
 #[test]
-fn all_targets_names_the_underivable_target_and_stops_before_its_deployment() {
+fn all_targets_needs_no_repo_binding_on_either_target() {
     let (output, server) = run_fanout(Some("acme-corp/acme-dev"), None, Some(true));
-    assert_eq!(output.status.code(), Some(2));
-    let value: Value = serde_json::from_slice(&output.stdout).expect("failure JSON");
-    assert_eq!(value["failed_target"], json!("prod"));
-    assert!(value["error"]
-        .as_str()
-        .is_some_and(|text| text.contains("--repo")));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let bodies = deployment_bodies(&server);
-    assert_eq!(bodies.len(), 1);
-    assert_eq!(bodies[0]["workspace_repo"], json!("acme-corp/acme-dev"));
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies
+        .iter()
+        .all(|body| body["workspace_enabled"] == json!(true)));
 }
 
 #[test]
@@ -382,13 +398,13 @@ fn all_targets_applies_disable_to_each_target_and_omission_to_none() {
     assert_eq!(disabled_bodies.len(), 2);
     assert!(disabled_bodies
         .iter()
-        .all(|body| { body.get("workspace_repo").is_some() && body["workspace_repo"].is_null() }));
+        .all(|body| body["workspace_enabled"] == json!(false)));
 
     let (omitted, omitted_server) = run_fanout(None, None, None);
     assert!(omitted.status.success());
     assert!(deployment_bodies(&omitted_server)
         .iter()
-        .all(|body| body.get("workspace_repo").is_none()));
+        .all(|body| body.get("workspace_enabled").is_none()));
 }
 
 fn deploy_args(manifest: &Value, tier: &str) -> Vec<Value> {

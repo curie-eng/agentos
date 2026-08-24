@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 from aci_protocol import (
@@ -32,6 +33,7 @@ from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import TargetRoute
 from curie_worker.runner_client import RunnerError
 from curie_worker.sandbox import QuotaRejection
+from curie_worker.workspace import WorkspaceSelectionRefused
 
 DONE = SessionStatus.DONE
 IDLE = SessionStatus.IDLE_AWAITING_INPUT
@@ -87,11 +89,136 @@ def test_new_turn_streams_to_slack_and_acks(make_harness) -> None:
     asyncio.run(go())
 
 
-def test_tool_context_streams_immediately_without_polluting_final_reply(
+def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
+    make_harness,
+) -> None:
+    class WorkspaceResolved(_FakeResolved):
+        def __init__(self) -> None:
+            super().__init__(uuid.uuid4())
+            self.deployment_id = uuid.uuid4()
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks()
+
+    async def go() -> None:
+        async with make_harness(binding=WorkspaceBinding()) as h:
+            class WorkspaceProbe:
+                selected: str | None = None
+                claims = 0
+
+                def select_repository(
+                    self,
+                    *,
+                    thread_key: str,
+                    deployment_id: uuid.UUID,
+                    author: str,
+                    repo_full_name: str | None,
+                ) -> str:
+                    assert thread_key == "tRepo"
+                    assert author == "U1"
+                    if self.selected is None:
+                        assert repo_full_name is not None
+                        self.selected = repo_full_name
+                    elif repo_full_name is not None and repo_full_name != self.selected:
+                        raise WorkspaceSelectionRefused(
+                            "This thread is already bound to a different repository."
+                        )
+                    return self.selected
+
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    self.claims += 1
+                    return SimpleNamespace(
+                        handle=h.substrate.claim("tRepo", env={}), prepared=None
+                    )
+
+                def touch(self, thread_key: str, *, ttl_seconds: int) -> bool:
+                    return True
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            await h.kernel.process_event(
+                _qevent(
+                    "Change https://github.com/acme-corp/acme-bot",
+                    thread="tRepo",
+                )
+            )
+            await h.kernel.process_event(
+                _qevent(
+                    "Switch to https://github.com/acme-corp/acme-api",
+                    thread="tRepo",
+                )
+            )
+
+            assert probe.claims == 1
+            assert h.runner.opened == [
+                "Change https://github.com/acme-corp/acme-bot"
+            ]
+            assert h.sink.last_text == (
+                "This thread is already bound to a different repository."
+            )
+
+    asyncio.run(go())
+
+
+def test_workspace_selection_precedes_fresh_thread_greeting(make_harness) -> None:
+    class WorkspaceResolved(_FakeResolved):
+        def __init__(self) -> None:
+            super().__init__(uuid.uuid4())
+            self.deployment_id = uuid.uuid4()
+            self.workspace_enabled = True
+
+    class WorkspaceBinding:
+        async def resolve(self, _kind: str, _channel: str) -> WorkspaceResolved:
+            return WorkspaceResolved()
+
+        def boot_env(self, _resolved: object, _thread_key: str) -> dict[str, str]:
+            return {}
+
+        def packs_for(self, _resolved: object) -> BehaviorPacks:
+            return BehaviorPacks.from_config(
+                {
+                    "greeting": {
+                        "enabled": True,
+                        "phrases": ["hi"],
+                        "reply": "Hello from the greeting pack.",
+                    }
+                }
+            )
+
+    async def go() -> None:
+        async with make_harness(binding=WorkspaceBinding()) as h:
+            class WorkspaceProbe:
+                def select_repository(self, **kwargs: object) -> str:
+                    assert kwargs["repo_full_name"] is None
+                    raise WorkspaceSelectionRefused(
+                        "Name an allowed GitHub repository in the opening message."
+                    )
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            await h.kernel.process_event(_qevent("hi", thread="tGreetingRepo"))
+
+            assert h.sink.last_text == (
+                "Name an allowed GitHub repository in the opening message."
+            )
+            assert h.runner.opened == []
+            assert h.fake_k8s.claim_envs == []
+
+    asyncio.run(go())
+
+
+def test_tool_notes_are_consumed_without_reaching_user_facing_updates(
     make_harness,
 ) -> None:
     async def go() -> None:
-        async with make_harness(slack_edit_min_interval_s=60.0) as h:
+        async with make_harness(slack_edit_min_interval_s=0.0) as h:
             h.runner.default_script = [
                 TextDelta(text="Answer so far"),
                 ToolNote(text="searching...", tool="WebSearch"),
@@ -104,20 +231,17 @@ def test_tool_context_streams_immediately_without_polluting_final_reply(
             await h.kernel.process_event(event)
 
             texts = [text for _, _, text in h.sink.updates]
-            preview = "Answer so far\n  -> [WebSearch] searching..."
-            assert preview in texts
-            assert texts.index(preview) == texts.index("Answer so far") + 1
-            assert [text for text in texts if "  -> " in text] == [preview]
-            assert "Answer so far and more" not in texts
+            assert "Answer so far" in texts
+            assert "Answer so far and more" in texts
+            assert h.sink.last_text == "Final answer"
+            assert all("WebSearch" not in text for text in texts)
+            assert all("searching..." not in text for text in texts)
             assert all("opening result" not in text for text in texts)
-            final_text = h.sink.last_text
-            assert final_text == "Final answer"
-            assert "WebSearch" not in final_text
 
     asyncio.run(go())
 
 
-def test_tool_context_distinguishes_empty_and_absent_tool_names(
+def test_tool_notes_with_empty_or_absent_names_remain_internal(
     make_harness,
 ) -> None:
     async def go() -> None:
@@ -132,14 +256,15 @@ def test_tool_context_distinguishes_empty_and_absent_tool_names(
             await h.kernel.process_event(_qevent("research this"))
 
             texts = [text for _, _, text in h.sink.updates]
-            assert "Answer so far\n  -> [] empty name" in texts
-            assert "Answer so far\n  -> unnamed" in texts
+            assert "Answer so far" in texts
             assert h.sink.last_text == "Final answer"
+            assert all("empty name" not in text for text in texts)
+            assert all("unnamed" not in text for text in texts)
 
     asyncio.run(go())
 
 
-def test_tool_context_delivery_failure_is_fail_soft(make_harness) -> None:
+def test_tool_notes_never_attempt_a_user_facing_sink_delivery(make_harness) -> None:
     async def go() -> None:
         async with make_harness(slack_edit_min_interval_s=60.0) as h:
             h.runner.default_script = [
@@ -148,39 +273,40 @@ def test_tool_context_delivery_failure_is_fail_soft(make_harness) -> None:
                 ToolNote(text="reading output", tool="Bash"),
                 Final(text="Completed answer", status=DONE),
             ]
-            context_preview = "Partial answer\n  -> [Bash] running command"
             original_emit = h.sink.emit
-            context_attempts: list[str] = []
+            leaked_attempts: list[str] = []
 
-            async def fail_context_emit(
+            async def reject_tool_note_emit(
                 reply_event: ReplyEvent,
                 *,
                 route: TargetRoute,
                 best_effort_unreachable: bool = False,
             ) -> ReplyAck:
                 text = getattr(reply_event, "text", None)
-                if isinstance(text, str) and "\n  -> " in text:
-                    context_attempts.append(text)
-                    raise RuntimeError("injected context delivery failure")
+                if isinstance(text, str) and (
+                    "running command" in text or "reading output" in text
+                ):
+                    leaked_attempts.append(text)
+                    raise RuntimeError("tool note reached the user-facing sink")
                 return await original_emit(
                     reply_event,
                     route=route,
                     best_effort_unreachable=best_effort_unreachable,
                 )
 
-            h.sink.emit = fail_context_emit  # type: ignore[method-assign]
+            h.sink.emit = reject_tool_note_emit  # type: ignore[method-assign]
             event = _qevent("run it")
 
             await h.kernel.process_event(event)
 
-            assert context_attempts == [context_preview]
+            assert leaked_attempts == []
             assert h.sink.last_text == "Completed answer"
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
 
-def test_failed_context_edit_does_not_suppress_identical_final_delivery(
+def test_final_response_is_not_filtered_when_it_matches_tool_note_formatting(
     make_harness,
 ) -> None:
     async def go() -> None:
@@ -191,41 +317,18 @@ def test_failed_context_edit_does_not_suppress_identical_final_delivery(
                 ToolNote(text="running command", tool="Bash"),
                 Final(text=final_text, status=DONE),
             ]
-            original_emit = h.sink.emit
-            matching_attempts = 0
-
-            async def fail_first_matching_emit(
-                reply_event: ReplyEvent,
-                *,
-                route: TargetRoute,
-                best_effort_unreachable: bool = False,
-            ) -> ReplyAck:
-                nonlocal matching_attempts
-                if getattr(reply_event, "text", None) == final_text:
-                    matching_attempts += 1
-                    if matching_attempts == 1:
-                        raise RuntimeError("injected context delivery failure")
-                return await original_emit(
-                    reply_event,
-                    route=route,
-                    best_effort_unreachable=best_effort_unreachable,
-                )
-
-            h.sink.emit = fail_first_matching_emit  # type: ignore[method-assign]
             event = _qevent("run it")
 
             await h.kernel.process_event(event)
 
-            assert matching_attempts == 2, (
-                "final delivery was not attempted after the failed context edit"
-            )
             assert h.sink.last_text == final_text
+            assert [text for _, _, text in h.sink.updates].count(final_text) == 1
             assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 
 
-def test_message_creating_tool_context_delivery_failure_stays_loud(
+def test_placeholderless_turn_does_not_create_a_message_from_a_tool_note(
     make_harness,
 ) -> None:
     async def go() -> None:
@@ -234,39 +337,15 @@ def test_message_creating_tool_context_delivery_failure_stays_loud(
                 ToolNote(text="running command", tool="Bash"),
                 Final(text="Completed answer", status=DONE),
             ]
-            context_preview = "  -> [Bash] running command"
-            booting = h.config.booting_text
-            original_emit = h.sink.emit
-            failed_updates: list[str] = []
-
-            async def fail_context_emit(
-                reply_event: ReplyEvent,
-                *,
-                route: TargetRoute,
-                best_effort_unreachable: bool = False,
-            ) -> ReplyAck:
-                text = getattr(reply_event, "text", None)
-                if text == booting:
-                    failed_updates.append(text)
-                    raise RuntimeError("injected booting delivery failure")
-                if text == context_preview:
-                    failed_updates.append(text)
-                    raise RuntimeError("injected message creation failure")
-                return await original_emit(
-                    reply_event,
-                    route=route,
-                    best_effort_unreachable=best_effort_unreachable,
-                )
-
-            h.sink.emit = fail_context_emit  # type: ignore[method-assign]
             event = _qevent("run it", placeholder=None)
 
-            with pytest.raises(RuntimeError, match="message creation failure"):
-                await h.kernel.process_event(event)
+            await h.kernel.process_event(event)
 
-            assert failed_updates == [booting, context_preview]
-            assert not await h.async_redis.exists(h.config.done_key(event.event_id))
-            assert h.sink.last_text is None
+            texts = [text for _, _, text in h.sink.updates]
+            assert h.sink.last_text == "Completed answer"
+            assert all("running command" not in text for text in texts)
+            assert all("Bash" not in text for text in texts)
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
 
     asyncio.run(go())
 

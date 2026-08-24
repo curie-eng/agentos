@@ -186,6 +186,21 @@ def test_publish_script_uses_clean_remote_file_askpass_rest_and_redacted_marker(
     assert WRITE_CREDENTIAL not in serialized_job
 
 
+def test_publish_job_refuses_redirects_for_git_and_github_rest(
+    publication_k8s: Any,
+) -> None:
+    """Neither credential-bearing transport may follow an attacker-controlled redirect."""
+
+    script = _resources(publication_k8s).config_map["data"]["publish.sh"]
+
+    assert 'git -c http.followRedirects=false "$@"' in script
+    assert "from urllib.request import HTTPRedirectHandler, Request, build_opener" in script
+    assert "class _NoRedirect(HTTPRedirectHandler):" in script
+    assert "opener = build_opener(_NoRedirect())" in script
+    assert "opener.open(req, timeout=int(os.environ[\"GITHUB_TIMEOUT_SECONDS\"]))" in script
+    assert "urlopen(req" not in script
+
+
 def test_job_injects_a_non_default_github_api_base_without_baking_it_into_script(
     publication_k8s: Any,
 ) -> None:

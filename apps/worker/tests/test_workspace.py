@@ -333,7 +333,10 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
 
     assert request["method"] == "POST"
     assert request["url"].endswith(f"/v1/internal/workspaces/{DEPLOYMENT_ID}/credential")
-    assert request["headers"] == {"X-Curie-Worker-Token": WORKER_AUTH}
+    assert request["headers"] == {
+        "X-Curie-Worker-Token": WORKER_AUTH,
+        "Content-Type": "application/json",
+    }
     assert json.loads(request["body"]) == {
         "conversation_id": "1700000000.000100",
     }
@@ -353,11 +356,111 @@ def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
         "Keep working in this thread; the repository is already selected."
     ) is None
 
-    with pytest.raises(workspace.WorkspacePreparationError, match="more than one"):
+    with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one"):
         workspace.parse_github_repo_fact(
             "Compare https://github.com/acme-corp/acme-bot with "
             "https://github.com/acme-corp/acme-api before changing anything."
         )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "http://github.com/acme-corp/acme-bot",
+        "https://token@github.com/acme-corp/acme-bot",
+        "https://github.com:8443/acme-corp/acme-bot",
+        "https://github.com.evil.example/acme-corp/acme-bot",
+        "https://github.com/acme-corp/acme-bot/pull/1",
+        "https://github.com/acme-corp/acme-bot?tab=readme",
+        "https://github.com/acme-corp/acme-bot#readme",
+    ],
+)
+def test_runtime_repo_parser_rejects_non_root_or_credentialed_urls(
+    workspace: Any, message: str
+) -> None:
+    assert workspace.parse_github_repo_fact(message) is None
+
+
+def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
+    workspace: Any,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        return SimpleNamespace(
+            status=200,
+            headers={},
+            body=b'{"repo_full_name":"acme-corp/acme-bot"}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+    selected = client.select(
+        DEPLOYMENT_ID,
+        "1700000000.000100",
+        "U0REQUEST1",
+        "acme-corp/acme-bot",
+    )
+
+    assert selected == "acme-corp/acme-bot"
+    assert calls[0]["url"].endswith(f"/{DEPLOYMENT_ID}/selection")
+    assert json.loads(calls[0]["body"]) == {
+        "conversation_id": "1700000000.000100",
+        "author": "U0REQUEST1",
+        "repo_full_name": "acme-corp/acme-bot",
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_detail"),
+    [
+        (
+            "workspace.deployment_disabled",
+            "This deployment does not enable repository workspaces.",
+        ),
+        (
+            "workspace.repository_required",
+            "Start the thread by naming one allowed root GitHub repository URL.",
+        ),
+        (
+            "workspace.selection_conflict",
+            "This thread is already bound to a different repository.",
+        ),
+    ],
+)
+def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
+    workspace: Any, code: str, expected_detail: str
+) -> None:
+    """The worker must not infer a control-plane decision from mutable prose."""
+
+    def transport(**_request: Any) -> Any:
+        return SimpleNamespace(
+            status=409,
+            headers={},
+            body=json.dumps(
+                {
+                    "detail": {
+                        "code": code,
+                        "message": "wording intentionally shares no legacy match text",
+                    }
+                }
+            ).encode(),
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspaceSelectionRefused) as excinfo:
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", None)
+
+    assert excinfo.value.public_detail == expected_detail
 
 
 def test_workspace_preparer_does_not_chmod_preexisting_mount_root(

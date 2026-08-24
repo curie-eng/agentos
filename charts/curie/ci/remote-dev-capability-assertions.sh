@@ -14,6 +14,22 @@ helm template remote-dev "$CHART" -f "$CHART/values-dev.yaml" \
   --set agentSandbox.controller.deploy=false > "$RENDERED"
 helm template remote-dev "$CHART" --show-only templates/secrets.yaml > "$SEALED"
 
+# The chart's install-time schema is the first rejection point for this API
+# setting. Keep it no broader than the API's canonical owner/repository policy:
+# in particular, a repository name cannot end in a dot.
+for invalid_allowlist_entry in \
+  "acme-corp/acme-bot." \
+  "acme-corp/.acme-bot" \
+  "acme-corp/acme-bot/" \
+  "acme-corp/*/"; do
+  if helm template remote-dev "$CHART" \
+    --set-json "api.githubRepoAllowlist=[\"${invalid_allowlist_entry}\"]" \
+    >/dev/null 2>&1; then
+    echo "api.githubRepoAllowlist accepted invalid API value: ${invalid_allowlist_entry}" >&2
+    exit 1
+  fi
+done
+
 python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" <<'PY'
 import sys
 from pathlib import Path
@@ -76,6 +92,9 @@ if sealed_worker_auth == (sealed_secret.get("stringData") or {}).get("apiKey"):
 
 api = one("Deployment", component="api")
 worker = one("Deployment", component="worker")
+api_env = env_map(containers(api)[0])
+if api_env.get("GITHUB_REPO_ALLOWLIST", {}).get("value") != "[]":
+    fail("runtime repository allowlist must render explicitly and default deny-all")
 for workload in (api, worker):
     env = env_map(containers(workload)[0])
     ref = env.get("CURIE_INTERNAL_WORKER_TOKEN", {}).get("valueFrom", {}).get("secretKeyRef", {})
@@ -133,9 +152,14 @@ if owner["metadata"].get("namespace") != publication_namespace:
     fail("publication owner is outside the publication namespace")
 publication_binding = one("RoleBinding", component="publication-worker")
 subjects = publication_binding.get("subjects") or []
+worker_service_account = worker["spec"]["template"]["spec"].get("serviceAccountName")
+release_fullname = worker["metadata"]["name"].removesuffix("-worker")
+release_namespace = publication_namespace.removesuffix(
+    f"-{release_fullname}-publication"
+)
 if not any(
-    subject.get("name") == worker["metadata"]["name"]
-    and subject.get("namespace") == worker["metadata"].get("namespace", "default")
+    subject.get("name") == worker_service_account
+    and subject.get("namespace") == release_namespace
     for subject in subjects
 ):
     fail("publication RoleBinding must bind the release worker ServiceAccount")
@@ -151,6 +175,11 @@ if publication_selector != {"curietech.ai/component": "publication"}:
 # Worker scratch is private and bounded; worker resources include explicit
 # memory/CPU/ephemeral limits for clone/archive work.
 worker_pod = worker["spec"]["template"]["spec"]
+if worker_pod.get("securityContext") != {
+    "fsGroup": 1000,
+    "fsGroupChangePolicy": "OnRootMismatch",
+}:
+    fail("worker pod must give the non-root clone process fsGroup ownership")
 clone_volume = next((v for v in worker_pod.get("volumes", []) if v.get("name") == "workspace-clone"), None)
 if clone_volume is None or clone_volume.get("emptyDir", {}).get("sizeLimit") != "4Gi":
     fail("worker workspace-clone emptyDir must be bounded to 4Gi")
@@ -158,6 +187,8 @@ worker_container = containers(worker)[0]
 if not any(m.get("name") == "workspace-clone" for m in worker_container.get("volumeMounts", [])):
     fail("worker must mount the workspace-clone volume")
 worker_env = env_map(worker_container)
+if worker_env.get("CURIE_WORKSPACE_SCRATCH_ROOT", {}).get("value") != "/var/lib/curie/workspaces/worker":
+    fail("worker scratch must use an owned child below the fsGroup-owned mount root")
 for name, expected in {
     "CURIE_WORKSPACE_MAX_CHECKOUT_BYTES": "536870912",
     "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES": "268435456",
@@ -173,8 +204,8 @@ if worker_container.get("resources") != expected_worker_resources:
     fail(f"worker clone resources differ: {worker_container.get('resources')!r}")
 
 
-# Sandbox workspace consumers receive only claim-scoped workspace facts. Both
-# workspace init stages and the runner share a dedicated 1Gi /workspace; no
+# Sandbox workspace consumers receive only claim-scoped workspace facts. The
+# workspace init stage and runner share a dedicated 1Gi /workspace; no
 # workspace/GitHub/internal-worker identity reaches those consumers and
 # /workspace is not a general writable-root path. The established bundle-fetch
 # S3 identity is covered independently by object-store-web-identity-assertions.
@@ -187,17 +218,15 @@ init_containers = list(pod.get("initContainers") or [])
 runner = next((c for c in pod.get("containers") or [] if c.get("name") == "runner"), None)
 if runner is None:
     fail("sandbox is missing runner")
-workspace_fetch = next(
-    (container for container in init_containers if container.get("name") == "workspace-fetch"),
+workspace_init = next(
+    (container for container in init_containers if container.get("name") == "workspace-init"),
     None,
 )
-workspace_extract = next(
-    (container for container in init_containers if container.get("name") == "workspace-extract"),
-    None,
-)
-if workspace_fetch is None or workspace_extract is None:
-    fail("sandbox must render workspace-fetch and workspace-extract init stages")
-workspace_inits = [workspace_fetch, workspace_extract]
+if workspace_init is None:
+    fail("sandbox must render one workspace-init download-and-extract stage")
+if any(container.get("name") in {"workspace-fetch", "workspace-extract"} for container in init_containers):
+    fail("workspace download and extraction must not cross an init-container handoff")
+workspace_inits = [workspace_init]
 for container in workspace_inits:
     if not any(
         mount.get("name") == "workspace" and mount.get("mountPath") == "/workspace"
@@ -209,14 +238,14 @@ if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
     fail("runner must share workspace at /workspace")
 
 signed_workspace_facts = {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
-fetch_env = set(env_map(workspace_fetch))
+fetch_env = set(env_map(workspace_init))
 if fetch_env != signed_workspace_facts:
     fail(
-        "workspace-fetch must carry only the signed exact-object reference and digest; "
+        "workspace-init must carry only the signed exact-object reference and digest; "
         f"rendered env was {sorted(fetch_env)}"
     )
 
-for container in workspace_inits + [runner]:
+for container in workspace_inits:
     names = set(env_map(container))
     forbidden = {
         "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
@@ -233,6 +262,31 @@ for container in workspace_inits + [runner]:
             f"workspace consumer {container.get('name')} receives credential env "
             f"{sorted(leaked)}"
         )
+
+runner_env = env_map(runner)
+forbidden_runner = {
+    "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY", "CURIE_INTERNAL_WORKER_TOKEN",
+}
+if forbidden_runner & set(runner_env):
+    fail("runner receives repository or worker credentials")
+safe_directory = {
+    name: runner_env.get(name, {}).get("value")
+    for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+}
+if safe_directory != {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "safe.directory",
+    "GIT_CONFIG_VALUE_0": "/workspace",
+}:
+    fail(f"runner safe.directory wiring drifted: {safe_directory!r}")
+if any(
+    name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    and name not in {"GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
+    for name in runner_env
+):
+    fail("runner receives unexpected process-scoped git configuration")
 
 writable = values["agentSandbox"]["runner"]["hardening"]["writablePaths"]
 paths = [item["path"] if isinstance(item, dict) else item for item in writable]

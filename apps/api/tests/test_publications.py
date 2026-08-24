@@ -26,7 +26,9 @@ from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
 from curie_api.sweeper import sweep_expired_approvals
 from curie_test_support.valkey import connect_or_skip
+from fastapi import Response
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -48,6 +50,7 @@ def publication_stack(
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_publication_operator")
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
     get_settings.cache_clear()
     _RESOLVERS.clear()
     with TestClient(create_app()) as test_client:
@@ -86,7 +89,7 @@ def _create_deployment(
             "agent_id": agent_id,
             "version_id": version_response.json()["id"],
             "environment": "dev",
-            "workspace_repo": REPO,
+            "workspace_enabled": True,
         },
         headers=auth_headers,
     )
@@ -105,6 +108,7 @@ def _publication_payload(
     return {
         "deployment_id": deployment_id,
         "conversation_id": f"thread-{uuid.uuid4().hex[:8]}",
+        "repo_full_name": REPO,
         "author": author,
         "summary": "Publish the repository changes",
         "reply_kind": "slack",
@@ -119,6 +123,16 @@ def _publication_payload(
 
 
 def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    selected = client.post(
+        f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": payload["repo_full_name"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
     response = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
     assert response.status_code in (200, 201), response.text
     return response.status_code, response.json()
@@ -237,6 +251,190 @@ def test_publication_create_is_atomic_private_and_idempotent(
     )
     assert conflict.status_code == 409
     assert _counts() == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo_full_name", REPO + "\n"),
+        ("title", "t" * 257),
+        ("body", "b" * 65_537),
+    ],
+)
+def test_publication_create_rejects_noncanonical_or_oversized_text(
+    field: str, value: str
+) -> None:
+    from curie_api.schemas import PublicationCreate
+
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        PublicationCreate.model_validate(payload)
+
+
+def test_publication_replay_refuses_a_changed_conversation_or_agent_identity(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="identity-replay")
+    _create_publication(client, payload)
+
+    wrong_thread = dict(payload, conversation_id="thread-other")
+    rejected_thread = client.post(
+        "/v1/internal/publications", json=wrong_thread, headers=WORKER_HEADERS
+    )
+    assert rejected_thread.status_code == 409
+
+    other_deployment = _create_deployment(client, auth_headers)
+    wrong_agent = dict(payload, deployment_id=other_deployment["id"])
+    rejected_agent = client.post(
+        "/v1/internal/publications", json=wrong_agent, headers=WORKER_HEADERS
+    )
+    assert rejected_agent.status_code == 409
+
+
+def test_exact_publication_replay_rechecks_the_current_thread_selection(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="selection-revocation-replay")
+    _create_publication(client, payload)
+
+    async def revoke_then_reselect() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "DELETE FROM curie.thread_workspaces "
+                        "WHERE selected_by_deployment_id = :deployment_id "
+                        "AND conversation_id = :conversation_id"
+                    ),
+                    {"deployment_id": deployment["id"], "conversation_id": payload["conversation_id"]},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(revoke_then_reselect())
+    reselected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": "acme-corp/acme-api",
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert reselected.status_code == 200, reselected.text
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert replay.status_code == 409
+
+
+def test_exact_publication_replay_rechecks_the_current_allowlist(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], dedupe_key="allowlist-revocation-replay")
+    _create_publication(client, payload)
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", "[]")
+    get_settings.cache_clear()
+
+    replay = client.post("/v1/internal/publications", json=payload, headers=WORKER_HEADERS)
+    assert replay.status_code == 409
+
+
+def test_publication_credential_resolution_does_not_block_the_event_loop(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synchronous installation-token mint must run outside FastAPI's loop."""
+
+    from curie_api.routers.publications import redeem_publication_credential
+
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+
+    resolver_started = threading.Event()
+    loop_progressed = threading.Event()
+
+    def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
+        resolver_started.set()
+        if not loop_progressed.wait(timeout=0.5):
+            raise AssertionError("credential resolver blocked the event loop")
+        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+
+    monkeypatch.setattr(
+        "curie_api.routers.publications.resolve_repository_credential", blocking_resolver
+    )
+
+    async def exercise() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessionmaker() as session:
+                call = asyncio.create_task(
+                    redeem_publication_credential(
+                        uuid.UUID(publication["id"]), session, Response()
+                    )
+                )
+
+                async def prove_progress() -> None:
+                    await asyncio.to_thread(resolver_started.wait)
+                    await asyncio.sleep(0)
+                    loop_progressed.set()
+
+                progress = asyncio.create_task(prove_progress())
+                result = await asyncio.wait_for(call, timeout=2)
+                await progress
+                return result.authorization_header
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == "Basic test"
+
+
+def test_publication_repo_must_match_the_thread_selection(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
+    payload["repo_full_name"] = "acme-corp/acme-api"
+
+    refused = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+
+    assert refused.status_code == 409
+    assert "differs" in refused.json()["detail"]
+    assert _counts() == (0, 0)
 
 
 def test_publication_card_outbox_acks_original_turn_before_job_claim(
@@ -657,6 +855,16 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         "sandbox_prefix": f"test:curie:publication-sandbox:{token}:",
     }
     sync_redis = connect_or_skip(decode_responses=True)
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": "1700000000.000100",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
 
     class DatabasePublicationCreator:
         def __init__(self, engine: Any) -> None:
@@ -683,7 +891,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 agent_id=uuid.UUID(deployment["agent_id"]),
                 agent_name="acme-bot",
                 deployment_id=uuid.UUID(deployment["id"]),
-                workspace_repo=REPO,
+                workspace_enabled=True,
                 version_id=uuid.UUID(deployment["version_id"]),
                 version_label="v1",
                 bundle_ref=None,
@@ -818,10 +1026,21 @@ def test_publication_insert_failure_rolls_back_the_approval(
 
     asyncio.run(install_trigger())
     try:
+        payload = _publication_payload(deployment["id"])
+        selected = client.post(
+            f"/v1/internal/workspaces/{deployment['id']}/selection",
+            json={
+                "conversation_id": payload["conversation_id"],
+                "author": payload["author"],
+                "repo_full_name": REPO,
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert selected.status_code == 200, selected.text
         with pytest.raises(Exception, match="forced publication insert failure"):
             client.post(
                 "/v1/internal/publications",
-                json=_publication_payload(deployment["id"]),
+                json=payload,
                 headers=WORKER_HEADERS,
             )
     finally:
@@ -842,9 +1061,20 @@ def test_publication_patch_cap_counts_decoded_raw_bytes_exactly(
 ) -> None:
     client, _ = publication_stack
     deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"], patch=b"x" * size)
+    selected = client.post(
+        f"/v1/internal/workspaces/{deployment['id']}/selection",
+        json={
+            "conversation_id": payload["conversation_id"],
+            "author": payload["author"],
+            "repo_full_name": REPO,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert selected.status_code == 200, selected.text
     response = client.post(
         "/v1/internal/publications",
-        json=_publication_payload(deployment["id"], patch=b"x" * size),
+        json=payload,
         headers=WORKER_HEADERS,
     )
     assert response.status_code == expected_status, response.text
@@ -1120,6 +1350,30 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
     assert all(str(row["deployment_id"]) == deployment["id"] for row in audit)
     assert all(row["repo_full_name"] == REPO for row in audit)
     assert "ghp_publication_operator" not in json.dumps(audit, default=str)
+
+
+def test_allowlist_revocation_stops_an_approved_publication_credential(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", "[]")
+    get_settings.cache_clear()
+
+    refused = client.post(
+        f"/v1/internal/publications/{publication['id']}/credential",
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 403
+    assert refused.headers["cache-control"] == "no-store"
+    assert "authorized" in refused.json()["detail"]
 
 
 def test_terminal_patch_retention_reaps_bytes_but_keeps_public_metadata(

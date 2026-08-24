@@ -129,7 +129,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_WORKSPACE_REFERENCE_TTL_SECONDS",
         "CURIE_WORKSPACE_MAX_CONCURRENT_CLONES",
         # WorkspaceClaimCoordinator injects these exact-object handoff values
-        # into a claim for the workspace-fetch/workspace-extract init containers
+        # into a claim for the workspace-init container
         # to consume. They are substrate-local delivery inputs, not fields read
         # by the sandbox runner and therefore not part of frozen BootEnv.
         "CURIE_WORKSPACE_REF",
