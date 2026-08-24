@@ -74,8 +74,9 @@ subjects:
     name: {{ include "curie.fullname" . }}-worker
     namespace: {{ .Release.Namespace }}
 ---
-# Publication jobs are isolated from all other egress. The tokenless job may
-# resolve DNS and connect over HTTPS only to the operator-declared GitHub ranges.
+# Publication jobs accept no ingress and are isolated from all other egress.
+# The tokenless job may resolve DNS and connect over HTTPS only to the
+# operator-declared GitHub ranges.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -88,7 +89,8 @@ spec:
   podSelector:
     matchLabels:
       curietech.ai/component: publication
-  policyTypes: [Egress]
+  policyTypes: [Ingress, Egress]
+  ingress: []
   egress:
     - to:
         - namespaceSelector:

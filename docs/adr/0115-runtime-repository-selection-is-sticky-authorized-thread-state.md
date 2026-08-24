@@ -78,17 +78,26 @@ its authority may be broader than one repository, so the allowlist controls
 where the platform may present it and the audit records which credential path
 was used.
 
+The init container verifies the archive in a staging directory it creates and
+owns, then moves the verified files into the mounted workspace. It therefore
+does not receive process-scoped Git configuration. The runner, which consumes
+the transferred checkout under a different process identity, receives only a
+protected `safe.directory=/workspace` declaration and no repository credential.
+
 Publication carries the repository observed in the trusted workspace snapshot.
 The API compares that fact with the sticky thread selection before atomically
 creating the approval and Publication, repeats the comparison on deduplicated
 replay, and derives the Job credential only after rechecking both selection and
 current allowlist. Denial still creates no Job and redeems no credential.
+Publication refuses changes under `.github/workflows/`: pushing such a branch
+can execute repository automation before a reviewer sees the pull request, so a
+warning on a self-approvable card would not be a sufficient boundary.
 
 The realizing paths are `apps/api/src/curie_api/models.py`, `crud.py`,
-`workspace_policy.py`, `routers/workspaces.py`, and
+`schemas.py`, `workspace_policy.py`, `routers/workspaces.py`, and
 `routers/publications.py`; `apps/worker/src/curie_worker/workspace.py`,
-`binding.py`, and `kernel.py`; `cli/src/main.rs` and `cli/src/api.rs`; and
-`charts/curie`.
+`publication_validation.py`, `publication_k8s.py`, `binding.py`, and
+`kernel.py`; `cli/src/main.rs` and `cli/src/api.rs`; and `charts/curie`.
 
 ## Consequences
 

@@ -89,6 +89,7 @@ class PostgresPublicationStore:
         self._result_max_attempts = result_max_attempts
         self._reconcile_max_attempts = reconcile_max_attempts
         self._versions: dict[uuid.UUID, int] = {}
+        self._result_versions: dict[uuid.UUID, int] = {}
         self._card_versions: dict[uuid.UUID, int] = {}
         self._cleanup_versions: dict[uuid.UUID, int] = {}
 
@@ -215,7 +216,7 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             raise PublicationStoreError("publication card delivery acknowledgement was lost")
-        self._card_versions[publication_id] = int(updated)
+        self._card_versions.pop(publication_id, None)
 
     async def retry_card_delivery(
         self, publication_id: uuid.UUID, *, error: str
@@ -298,7 +299,7 @@ class PostgresPublicationStore:
             ).mappings().first()
             if row is None:
                 raise PublicationStoreError("publication card retry acknowledgement was lost")
-            self._card_versions[publication_id] = int(row["approval_card_version"])
+            self._card_versions.pop(publication_id, None)
             if bool(row["terminal"]) and str(row["status"]) == "failed":
                 await connection.execute(
                     text(
@@ -549,7 +550,7 @@ class PostgresPublicationStore:
             if updated is None:
                 raise PublicationStoreError("publication result claim CAS was lost")
             version = int(updated["version"])
-            self._versions[result_id] = version
+            self._result_versions[result_id] = version
         status = str(row["status"])
         return PublicationResult(
             publication_id=result_id,
@@ -595,7 +596,7 @@ class PostgresPublicationStore:
     async def _result_delivery_cas(
         self, publication_id: uuid.UUID, *, delivered: bool, error: str | None
     ) -> None:
-        version = self._versions.get(publication_id)
+        version = self._result_versions.get(publication_id)
         if version is None:
             raise PublicationStoreError("publication result has no owned lease version")
         async with self._engine.begin() as connection:
@@ -637,7 +638,7 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             raise PublicationStoreError("publication result delivery CAS was lost")
-        self._versions[publication_id] = int(updated)
+        self._result_versions.pop(publication_id, None)
 
     async def claim_pending_cleanup(self) -> PublicationCleanupWork | None:
         """Lease one terminal publication resource cleanup without a retry cap."""
@@ -746,7 +747,7 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             raise PublicationStoreError("publication cleanup acknowledgement was lost")
-        self._cleanup_versions[publication_id] = int(updated)
+        self._cleanup_versions.pop(publication_id, None)
 
     async def retry(self, publication_id: uuid.UUID, *, error: str) -> None:
         """Release reconcile work, or dead-letter it into a reportable failure."""
@@ -791,7 +792,7 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             raise PublicationStoreError("publication retry CAS was lost")
-        self._versions[publication_id] = int(updated)
+        self._versions.pop(publication_id, None)
 
     async def _terminal_cas(
         self,
@@ -837,6 +838,7 @@ class PostgresPublicationStore:
             ).scalar_one_or_none()
         if updated is None:
             if await self.is_terminal(publication_id):
+                self._versions.pop(publication_id, None)
                 return
             raise PublicationStoreError("publication terminal CAS was lost")
-        self._versions[publication_id] = int(updated)
+        self._versions.pop(publication_id, None)

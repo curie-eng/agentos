@@ -458,12 +458,10 @@ class CredentialRedemptionAuditEntry(Base):
     deployment_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"),
         default=None,
-        index=True,
     )
     publication_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey(f"{SCHEMA}.publications.id", ondelete="SET NULL"),
         default=None,
-        index=True,
     )
     repo_full_name: Mapped[str | None] = mapped_column(default=None)
     detail: Mapped[str | None] = mapped_column(default=None)

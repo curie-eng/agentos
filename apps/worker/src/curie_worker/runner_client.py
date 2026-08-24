@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import TracebackType
@@ -105,8 +106,11 @@ class RunnerClient:
         connect_timeout_s: float = 10.0,
         total_timeout_s: float = 600.0,
         interrupt_timeout_s: float = _DEFAULT_INTERRUPT_TIMEOUT_S,
+        snapshot_patch_max_bytes: int = 900_000,
         session: aiohttp.ClientSession | None = None,
     ) -> None:
+        if snapshot_patch_max_bytes <= 0:
+            raise ValueError("snapshot patch byte limit must be positive")
         self._own_session = session is None
         self._session = session or aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -118,6 +122,10 @@ class RunnerClient:
         # ``/v1/interrupt`` gets its own short control-plane budget regardless of
         # how the streaming timeouts above are tuned.
         self._interrupt_timeout = aiohttp.ClientTimeout(total=interrupt_timeout_s)
+        self._snapshot_patch_max_bytes = snapshot_patch_max_bytes
+        self._snapshot_body_max_bytes = (
+            4 * ((snapshot_patch_max_bytes + 2) // 3) + 131_072
+        )
 
     async def start_turn(self, base_url: str, event: Event, token: str | None = None) -> TurnStream:
         """Open a turn. Returns once the runner has accepted it (turn active)."""
@@ -195,13 +203,18 @@ class RunnerClient:
                 body = await resp.text()
                 raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
             try:
-                body = await resp.json()
+                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
+                if len(raw) > self._snapshot_body_max_bytes:
+                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                body = json.loads(raw)
                 encoded = body["patch_base64"]
                 if not isinstance(encoded, str):
                     raise TypeError("patch_base64 is not a string")
                 patch = base64.b64decode(encoded, validate=True)
-                if len(patch) > 900_000:
-                    raise ValueError("patch exceeds 900000 raw bytes")
+                if len(patch) > self._snapshot_patch_max_bytes:
+                    raise ValueError(
+                        f"patch exceeds {self._snapshot_patch_max_bytes} raw bytes"
+                    )
                 declared_size = body.get("patch_size_bytes")
                 if declared_size != len(patch):
                     raise ValueError("patch size does not match decoded payload")
@@ -229,7 +242,7 @@ class RunnerClient:
                     publication_title=title,
                     publication_body=description,
                 )
-            except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+            except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
                 raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
 
     async def status(self, base_url: str) -> dict[str, object]:

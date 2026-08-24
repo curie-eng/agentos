@@ -127,6 +127,8 @@ class PublicationCredentialSource(Protocol):
 class PublicationCluster(Protocol):
     def apply(self, resources: Any) -> None | Awaitable[None]: ...
 
+    def validate_existing(self, resources: Any) -> None | Awaitable[None]: ...
+
     def observe(
         self, job_name: str
     ) -> PublicationJobObservation | Awaitable[PublicationJobObservation]: ...
@@ -168,7 +170,8 @@ def _validated_pr_url(work: PublicationWork, url: str | None) -> str | None:
     if url is None:
         return None
     expected = re.compile(
-        rf"https://github\.com/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*"
+        rf"https://github\.com/{re.escape(work.repo_full_name)}/pull/[1-9][0-9]*",
+        re.IGNORECASE,
     )
     if expected.fullmatch(url) is None:
         raise PublicationReconcileError(
@@ -463,13 +466,9 @@ class PublicationReconciler:
         if await _resolve(self._store.is_terminal(work.publication_id)):
             return
 
-        if work.decision == "denied":
-            await self._terminalize(work, outcome="denied", names=names)
-            return
-
         # Pending, expired, and unknown states are never authority. Expiry is
-        # terminalized by the API/store lane; it still creates no cluster or
-        # GitHub side effect here.
+        # terminalized by the API/store lane, as is denial; neither creates a
+        # cluster or GitHub side effect here.
         if work.decision != "approved":
             return
 
@@ -478,6 +477,30 @@ class PublicationReconciler:
             observation = await _resolve(self._cluster.observe(names.job))
         except Exception as exc:
             await self._bounded_setup_failure(work, exc)
+            return
+
+        if observation.exists and observation.phase in {"pending", "running"}:
+            # Validate deterministic collisions without minting another write
+            # credential or calling GitHub on every poll. The placeholder is
+            # used only to construct the expected immutable Secret shape.
+            try:
+                probe_resources = build_publication_resources(
+                    PublicationPayload(
+                        publication_id=work.publication_id,
+                        repo_full_name=work.repo_full_name,
+                        clean_clone_url=f"https://github.com/{work.repo_full_name}.git",
+                        base_sha=work.base_sha,
+                        patch=work.patch,
+                        branch=branch,
+                        title=work.title,
+                        body=work.body,
+                    ),
+                    credential="validation-placeholder",
+                    settings=self._job_settings,
+                )
+                await _resolve(self._cluster.validate_existing(probe_resources))
+            except Exception as exc:
+                await self._bounded_setup_failure(work, exc)
             return
 
         credential: PublicationCredential
@@ -643,7 +666,6 @@ class PublicationReconcileLoop:
                         "publication reconciliation failed publication_id=%s",
                         work.publication_id,
                     )
-                    continue
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=self._interval)
             except TimeoutError:

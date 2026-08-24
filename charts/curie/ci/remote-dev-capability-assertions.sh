@@ -170,6 +170,10 @@ publication_policy = one("NetworkPolicy", component="publication")
 publication_selector = publication_policy["spec"]["podSelector"]["matchLabels"]
 if publication_selector != {"curietech.ai/component": "publication"}:
     fail(f"publication NetworkPolicy selector drifted: {publication_selector!r}")
+if set(publication_policy["spec"].get("policyTypes") or []) != {"Ingress", "Egress"}:
+    fail("publication NetworkPolicy must deny ingress and restrict egress")
+if publication_policy["spec"].get("ingress") != []:
+    fail("publication NetworkPolicy ingress must be an explicit deny-all list")
 
 
 # Worker scratch is private and bounded; worker resources include explicit
@@ -226,13 +230,11 @@ if workspace_init is None:
     fail("sandbox must render one workspace-init download-and-extract stage")
 if any(container.get("name") in {"workspace-fetch", "workspace-extract"} for container in init_containers):
     fail("workspace download and extraction must not cross an init-container handoff")
-workspace_inits = [workspace_init]
-for container in workspace_inits:
-    if not any(
-        mount.get("name") == "workspace" and mount.get("mountPath") == "/workspace"
-        for mount in container.get("volumeMounts", [])
-    ):
-        fail(f"{container['name']} must share /workspace")
+if not any(
+    mount.get("name") == "workspace" and mount.get("mountPath") == "/workspace"
+    for mount in workspace_init.get("volumeMounts", [])
+):
+    fail("workspace-init must share /workspace")
 if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
            for m in runner.get("volumeMounts", [])):
     fail("runner must share workspace at /workspace")
@@ -245,23 +247,22 @@ if fetch_env != signed_workspace_facts:
         f"rendered env was {sorted(fetch_env)}"
     )
 
-for container in workspace_inits:
-    names = set(env_map(container))
-    forbidden = {
-        "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
-        "GITHUB_APP_PRIVATE_KEY", "CURIE_INTERNAL_WORKER_TOKEN", "GIT_CONFIG_COUNT",
-    }
-    leaked = names & forbidden
-    leaked.update(
-        name for name in names
-        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+names = set(env_map(workspace_init))
+forbidden = {
+    "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
+    "GITHUB_APP_PRIVATE_KEY", "CURIE_INTERNAL_WORKER_TOKEN", "GIT_CONFIG_COUNT",
+}
+leaked = names & forbidden
+leaked.update(
+    name for name in names
+    if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+)
+if leaked:
+    fail(
+        "workspace consumer workspace-init receives credential env "
+        f"{sorted(leaked)}"
     )
-    if leaked:
-        fail(
-            f"workspace consumer {container.get('name')} receives credential env "
-            f"{sorted(leaked)}"
-        )
 
 runner_env = env_map(runner)
 forbidden_runner = {
@@ -309,9 +310,6 @@ for policy in policies:
     }
     if labels != expected_runner_labels:
         fail(f"runner policy selector widened: {policy['metadata']['name']}")
-    publication_pod_labels = {"curietech.ai/component": "publication"}
-    if all(publication_pod_labels.get(key) == value for key, value in labels.items()):
-        fail("publication pods were selected by sandbox NetworkPolicy")
 
 print("remote-dev capability render assertions passed")
 PY

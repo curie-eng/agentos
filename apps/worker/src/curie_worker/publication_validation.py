@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tarfile
@@ -9,10 +10,27 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from .runner_client import RunnerWorkspaceSnapshot
-from .workspace import WorkspaceClaimCoordinator, WorkspacePreparationError
+from .workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspacePreparationError,
+    scrubbed_git_environment,
+)
 
 MAX_PATCH_BYTES = 900_000
 _SAFE_GIT_MODES = {"000000", "100644", "100755"}
+
+
+def publication_git_environment(home: Path) -> dict[str, str]:
+    """Return a credential-free, configuration-free Git subprocess environment."""
+
+    return scrubbed_git_environment(
+        {
+            "HOME": str(home),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
 
 
 def _safe_changed_path(path: str) -> bool:
@@ -24,6 +42,8 @@ def _safe_changed_path(path: str) -> bool:
         and not pure.is_absolute()
         and all(part not in ("", ".", "..") for part in pure.parts)
         and pure.parts[0] != ".git"
+        and tuple(part.casefold() for part in pure.parts[:2])
+        != (".github", "workflows")
     )
 
 
@@ -90,10 +110,12 @@ def validate_snapshot_against_base(
             ) from exc
         patch_file = scratch / "changes.patch"
         patch_file.write_bytes(snapshot.patch)
+        git_env = publication_git_environment(scratch)
         try:
             subprocess.run(
                 ["git", "init", "--quiet"],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -103,6 +125,7 @@ def validate_snapshot_against_base(
             subprocess.run(
                 ["git", "add", "-A"],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -112,6 +135,7 @@ def validate_snapshot_against_base(
             base_tree = subprocess.run(
                 ["git", "write-tree"],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=git_timeout_seconds,
@@ -120,6 +144,7 @@ def validate_snapshot_against_base(
             subprocess.run(
                 ["git", "apply", "--check", "--binary", str(patch_file)],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -129,6 +154,7 @@ def validate_snapshot_against_base(
             subprocess.run(
                 ["git", "apply", "--binary", str(patch_file)],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -138,6 +164,7 @@ def validate_snapshot_against_base(
             subprocess.run(
                 ["git", "add", "-A"],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -147,6 +174,7 @@ def validate_snapshot_against_base(
             derived_raw = subprocess.run(
                 ["git", "diff", "--cached", "--name-only", "-z", "--no-renames", base_tree],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=git_timeout_seconds,
@@ -164,6 +192,7 @@ def validate_snapshot_against_base(
             raw_diff = subprocess.run(
                 ["git", "diff", "--cached", "--raw", "-z", "--no-renames", base_tree],
                 cwd=checkout,
+                env=git_env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=git_timeout_seconds,
@@ -192,9 +221,8 @@ def validate_snapshot_against_base(
                 f"publication git validation exceeded {git_timeout_seconds} seconds",
             ) from exc
         except subprocess.CalledProcessError as exc:
-            diagnostic = exc.stderr.decode("utf-8", errors="replace").strip()
             raise WorkspacePreparationError(
-                "publication-validation", f"patch does not apply to sanitized base: {diagnostic}"
+                "publication-validation", "patch does not apply to sanitized base"
             ) from exc
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

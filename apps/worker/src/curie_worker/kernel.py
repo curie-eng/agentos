@@ -2183,20 +2183,23 @@ class Kernel:
 
         if self._workspace is not None:
             async with self._lock.hold(self._config.lock_key(thread)):
+                retain_workspace = not is_publication
                 if is_publication:
                     try:
                         await asyncio.to_thread(self._workspace.release, thread)
                     except Exception as exc:  # noqa: BLE001 - patch is already durable
+                        retain_workspace = True
                         logger.warning(
                             "publication base-object cleanup failed for thread %s: %s",
                             thread,
                             exc,
                         )
-                await asyncio.to_thread(
-                    self._workspace.touch,
-                    thread,
-                    ttl_seconds=self._suspended_route_ttl_seconds,
-                )
+                if retain_workspace:
+                    await asyncio.to_thread(
+                        self._workspace.touch,
+                        thread,
+                        ttl_seconds=self._suspended_route_ttl_seconds,
+                    )
         try:
             await asyncio.to_thread(self._substrate.suspend, thread, history_ref=None)
         except SandboxError as exc:

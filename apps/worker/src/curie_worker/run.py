@@ -293,6 +293,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
     runner = RunnerClient(
         connect_timeout_s=config.runner_connect_timeout_s,
         total_timeout_s=config.runner_total_timeout_s,
+        snapshot_patch_max_bytes=config.publication_patch_max_bytes,
     )
     engine = create_async_engine(config.database_url, pool_pre_ping=True)
     binding = BindingResolver(engine, config)

@@ -25,6 +25,7 @@ from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.main import create_app
 from curie_api.resumequeue import ResumeQueue
+from curie_api.schemas import PublicationCreate
 from curie_api.sweeper import sweep_expired_approvals
 from curie_test_support.valkey import connect_or_skip
 from fastapi import Response
@@ -125,6 +126,14 @@ def _publication_payload(
         "changed_paths": ["README.md"],
         "expires_in_seconds": expires_in_seconds,
     }
+
+
+def test_publication_schema_refuses_github_workflow_changes() -> None:
+    payload = _publication_payload(str(uuid.uuid4()))
+    payload["changed_paths"] = [".github/workflows/publish.yml"]
+
+    with pytest.raises(ValidationError, match="safe repository-relative paths"):
+        PublicationCreate.model_validate(payload)
 
 
 def _create_publication(client: TestClient, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:

@@ -511,7 +511,7 @@ async def test_approved_publication_launches_job_and_reports_pr_url(
     assert not hasattr(loop, "runner") and not hasattr(loop, "model")
 
 
-async def test_denied_publication_does_not_create_job_or_push(publication: Any) -> None:
+async def test_nonapproved_work_is_inert_in_the_job_reconciler(publication: Any) -> None:
     loop, store, credentials, cluster, github, replies = _loop(publication)
     work = _work(publication, decision="denied")
 
@@ -522,10 +522,8 @@ async def test_denied_publication_does_not_create_job_or_push(publication: Any) 
     assert cluster.credentials_cleaned == []
     assert cluster.terminals_cleaned == []
     assert github.calls == []
-    assert store.completed == {PUBLICATION_ID: ("denied", None)}
-    assert len(replies.events) == 1
-    assert "not published" in replies.events[0][0].text.lower()
-    assert "push" in replies.events[0][0].text.lower()
+    assert store.completed == {}
+    assert replies.events == []
 
 
 async def test_worker_crash_reuses_the_same_job_and_cannot_duplicate_publication(
@@ -858,6 +856,24 @@ async def test_foreign_repository_pr_url_is_bounded_instead_of_reported(
         )
     ]
     assert replies.events == []
+
+
+async def test_result_url_accepts_github_canonical_repository_casing(
+    publication: Any,
+) -> None:
+    loop, store, _, cluster, _, replies = _loop(publication)
+    work = _work(publication)
+    work = publication.PublicationWork(
+        **{**work.__dict__, "repo_full_name": "Acme-Corp/Acme-Bot"}
+    )
+    cluster.observation = publication.PublicationJobObservation(
+        phase="succeeded", pr_url=PR_URL, logs=f"CURIE_PR_URL={PR_URL}\n"
+    )
+
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert PR_URL in replies.events[0][0].text
 
 
 async def test_repeated_apiserver_failure_after_apply_is_dead_lettered(

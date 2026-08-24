@@ -399,6 +399,27 @@ class CommandPort(Protocol):
     ) -> CommandResult: ...
 
 
+def scrubbed_git_environment(
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Drop ambient credentials/config before adding explicit Git settings."""
+
+    process_env = os.environ.copy()
+    for name in tuple(process_env):
+        if name in {
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_TERMINAL_PROMPT",
+        } or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            process_env.pop(name, None)
+    process_env.pop("GIT_CONFIG_COUNT", None)
+    process_env.update(overrides or {})
+    return process_env
+
+
 class SubprocessCommands:
     """Subprocess adapter that never invokes a shell or echoes credentials."""
 
@@ -414,22 +435,10 @@ class SubprocessCommands:
         env: dict[str, str] | None = None,
         timeout_seconds: float,
     ) -> CommandResult:
-        process_env = os.environ.copy()
         # Ambient developer credentials and git process configuration are not
         # part of this trust boundary. The caller supplies the one redeemed
         # header explicitly after this scrub.
-        for name in tuple(process_env):
-            if name in {
-                "GITHUB_TOKEN",
-                "GH_TOKEN",
-                "GIT_ASKPASS",
-                "SSH_ASKPASS",
-                "GIT_CONFIG_PARAMETERS",
-                "GIT_TERMINAL_PROMPT",
-            } or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
-                process_env.pop(name, None)
-        process_env.pop("GIT_CONFIG_COUNT", None)
-        process_env.update(env or {})
+        process_env = scrubbed_git_environment(env)
         try:
             completed = subprocess.run(  # noqa: S603 -- fixed argv, no shell.
                 list(argv),

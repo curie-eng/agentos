@@ -263,12 +263,28 @@ class GitHubPublicationLookup:
                 else None
             ),
         }
-        if actual != expected:
+
+        def same_repository(value: object, expected_value: object) -> bool:
+            return isinstance(value, str) and value.casefold() == str(
+                expected_value
+            ).casefold()
+
+        repo_fields = ("head_repo", "base_repo")
+        if any(
+            not same_repository(actual[field], expected[field])
+            for field in repo_fields
+        ) or any(
+            actual[field] != expected[field]
+            for field in expected
+            if field not in repo_fields
+        ):
             raise PublicationReconcileError(
                 "GitHub pull request does not match the approved publication contract"
             )
         if not isinstance(url, str) or re.fullmatch(
-            rf"https://github\.com/{re.escape(repo_full_name)}/pull/[1-9][0-9]*", url
+            rf"https://github\.com/{re.escape(repo_full_name)}/pull/[1-9][0-9]*",
+            url,
+            re.IGNORECASE,
         ) is None:
             raise PublicationReconcileError("GitHub returned an invalid pull request URL")
         return url

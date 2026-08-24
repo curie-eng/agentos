@@ -314,6 +314,12 @@ def build_publication_resources(
         raise PublicationResourceError(
             "publication base SHA must be 40-64 lowercase hexadecimal characters"
         )
+    if payload.clean_clone_url.casefold() != (
+        f"https://github.com/{payload.repo_full_name}.git".casefold()
+    ):
+        raise PublicationResourceError(
+            "publication clone URL does not match the requested repository"
+        )
     if not credential.strip():
         raise PublicationResourceError("publication credential is empty")
     if min(
@@ -691,6 +697,32 @@ class KubernetesPublicationCluster:
         if existing["Job"] is None:
             self._create("Job", job)
 
+    def validate_existing(self, resources: PublicationResources) -> None:
+        """Validate an in-flight deterministic resource set without mutation."""
+
+        owner_name = resources.config_map["metadata"]["ownerReferences"][0]["name"]
+        live_uid = self.owner_uid(str(owner_name))
+        objects = [
+            copy.deepcopy(resources.config_map),
+            copy.deepcopy(resources.secret),
+            copy.deepcopy(resources.job),
+        ]
+        for obj in objects:
+            obj["metadata"]["ownerReferences"][0]["uid"] = live_uid
+        for obj in objects:
+            kind = str(obj["kind"])
+            observed = self._read_existing(kind, obj)
+            if observed is None:
+                raise PublicationResourceError(
+                    f"in-flight publication is missing deterministic {kind}"
+                )
+            validate_adopted_resource(
+                kind,
+                obj,
+                observed,
+                compare_secret_value=kind != "Secret",
+            )
+
     def observe(self, job_name: str) -> PublicationJobObservation:
         # Local import avoids a module import cycle: publication_loop owns the
         # neutral observation DTO while this module owns Kubernetes shapes.
@@ -714,19 +746,37 @@ class KubernetesPublicationCluster:
             raise PublicationResourceError(
                 f"publication Job {job_name!r} has no stable UID"
             )
-        status = getattr(job, "status", None)
+        status = job.get("status") if isinstance(job, dict) else getattr(job, "status", None)
+
+        def status_value(name: str, default: Any = None) -> Any:
+            if isinstance(status, dict):
+                return status.get(name, default)
+            return getattr(status, name, default)
+
         phase = "running"
         error: str | None = None
-        if getattr(status, "succeeded", 0):
+        if status_value("succeeded", 0):
             phase = "succeeded"
-        elif getattr(status, "failed", 0):
+        elif status_value("failed", 0):
             phase = "failed"
-            conditions = getattr(status, "conditions", None) or []
+            conditions = status_value("conditions", []) or []
             error = (
                 "; ".join(
-                    str(getattr(condition, "message", "") or getattr(condition, "reason", ""))
+                    str(
+                        (condition.get("message", "") or condition.get("reason", ""))
+                        if isinstance(condition, dict)
+                        else (
+                            getattr(condition, "message", "")
+                            or getattr(condition, "reason", "")
+                        )
+                    )
                     for condition in conditions
-                    if getattr(condition, "status", None) == "True"
+                    if (
+                        condition.get("status")
+                        if isinstance(condition, dict)
+                        else getattr(condition, "status", None)
+                    )
+                    == "True"
                 )
                 or "publication Job failed"
             )
