@@ -37,6 +37,20 @@ class ApprovalStatus(enum.StrEnum):
     expired = "expired"
 
 
+class ActionStatus(enum.StrEnum):
+    """Lifecycle of one recorded action (ADR-0117).
+
+    Two frames make one record. ``pending`` is the opening frame: the call was
+    made and its result has not arrived. A turn that dies here leaves the row at
+    ``pending`` forever, which is the honest state -- something may have changed
+    and nothing came back to say what.
+    """
+
+    pending = "pending"
+    succeeded = "succeeded"
+    failed = "failed"
+
+
 class Agent(Base):
     __tablename__ = "agents"
 
@@ -500,6 +514,113 @@ class ApprovalAuditEntry(Base):
     # Nullable because writers that make no membership decision (the expiry
     # sweeper) must leave it NULL rather than fabricate one, and because rows
     # written before this column existed have none.
+    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class AgentAction(Base):
+    """One thing an agent did to the world, and what it takes to put it back.
+
+    Curie already classified every tool absent from a harness-declared read-only
+    allowlist as side-effecting and reduced the whole stream to one boolean, for
+    one purpose: refusing to auto-retry. This is that same classification
+    recorded rather than reduced (ADR-0117).
+
+    Shaped after ``Approval`` because the needs are the same ones that table
+    already answers: routing by conversation, a lifecycle resolved once, and an
+    audit trail beside it. ``dedupe_key`` (the triggering event id and the call
+    id) makes record creation idempotent under at-least-once redelivery, exactly
+    as it does there.
+
+    One CALL is one row. The ACI emits an opening frame when the call is made and
+    a closing frame when its result arrives, joined on ``call_id``; the second
+    completes this row rather than minting another.
+    """
+
+    __tablename__ = "agent_actions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Nullable for the same reason ``Approval.agent_id`` is: a run without a
+    # deployment binding still acts on the world and still owes a record.
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"),
+        index=True,
+        default=None,
+    )
+    conversation_id: Mapped[str] = mapped_column(index=True)
+    # The harness's own id for the call, carried on both ACI frames. The join
+    # key, not a display value.
+    call_id: Mapped[str]
+    tool: Mapped[str]
+    # What the call was made with, and what the tool answered. ``result`` is
+    # present only for a structured reply: a connector that answers in prose has
+    # none, because guessing structure out of a sentence is how a restore ends up
+    # acting on a guess.
+    arguments: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The state the connector read immediately before it wrote, and the resource
+    # it wrote to. These two are what a restore replays; without either, there is
+    # nothing to put back or nowhere to put it.
+    prior_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    target: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # The frame's human-readable note. On a record that is not undoable this is
+    # the stated reason the receipt shows instead of a control.
+    detail: Mapped[str | None] = mapped_column(default=None)
+    status: Mapped[str] = mapped_column(server_default=ActionStatus.pending, index=True)
+    dedupe_key: Mapped[str] = mapped_column(unique=True)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    # When the closing frame arrived, and when a restore was performed. Both are
+    # written by later slices; they live here because they are lifecycle of this
+    # row, and a two-column migration later buys nothing.
+    completed_at: Mapped[datetime | None] = mapped_column(default=None)
+    undone_at: Mapped[datetime | None] = mapped_column(default=None)
+    undone_by: Mapped[str | None] = mapped_column(default=None)
+
+    @property
+    def undoable(self) -> bool:
+        """Whether this record holds what a restore needs -- derived, never stored.
+
+        A stored flag can be set by a writer that captured nothing, and the
+        platform would then offer an undo it cannot honor. Deny-by-default falls
+        out of this: a third-party tool that reports neither a prior state nor a
+        target lands on ``False`` without anyone declaring anything.
+        """
+
+        return (
+            self.status == ActionStatus.succeeded
+            and self.prior_state is not None
+            and self.target is not None
+            and self.undone_at is None
+        )
+
+
+class ActionAuditEntry(Base):
+    """The platform audit log for actions (ADR-0117), append-only.
+
+    One row per authorization-relevant event on a recorded action: an undo that
+    ran, an undo refused because the world had moved, an undo refused because the
+    actor could not have permitted the forward change. A refusal is as much of a
+    record as a restore -- more, since a refused undo leaves no trace anywhere
+    else.
+    """
+
+    __tablename__ = "action_audit_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_actions.id", ondelete="CASCADE"), index=True
+    )
+    # What happened: undone / refused_conflict / refused_unauthorized.
+    action: Mapped[str]
+    actor: Mapped[str]
+    actor_channel: Mapped[str | None] = mapped_column(default=None)
+    # The authorizer snapshot, as on an approval: which implementation decided,
+    # its verdict, and its stated reason at the time of the attempt.
+    authorizer: Mapped[str]
+    authorized: Mapped[bool]
+    reason: Mapped[str | None] = mapped_column(default=None)
+    # For a conflict refusal, the two states that disagreed. Naming both is the
+    # point: an operator has to see that their manual fix is what stopped it.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
