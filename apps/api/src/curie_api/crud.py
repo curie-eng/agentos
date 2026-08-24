@@ -14,7 +14,9 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .models import (
+    ActionStatus,
     Agent,
+    AgentAction,
     AgentChannel,
     AgentVersion,
     Approval,
@@ -28,6 +30,8 @@ from .models import (
     ThreadWorkspace,
 )
 from .schemas import (
+    ActionComplete,
+    ActionRecord,
     AgentCreate,
     ApprovalRequest,
     ChannelBindingWrite,
@@ -703,6 +707,82 @@ async def reap_terminal_publication_patches(
     )
     await session.commit()
     return len(ids)
+
+
+async def create_action(session: AsyncSession, data: ActionRecord) -> AgentAction:
+    """Insert a pending action record.
+
+    Raises IntegrityError on a ``dedupe_key`` replay; the router maps that to the
+    existing record, so a redelivered turn adopts what it already wrote.
+    """
+
+    action = AgentAction(
+        agent_id=data.agent_id,
+        conversation_id=data.conversation_id,
+        call_id=data.call_id,
+        tool=data.tool,
+        arguments=data.arguments,
+        detail=data.detail,
+        dedupe_key=data.dedupe_key,
+        status=ActionStatus.pending,
+    )
+    session.add(action)
+    await session.commit()
+    await session.refresh(action)
+    return action
+
+
+async def get_action(session: AsyncSession, action_id: uuid.UUID) -> AgentAction | None:
+    return await session.get(AgentAction, action_id)
+
+
+async def get_action_by_dedupe_key(session: AsyncSession, key: str) -> AgentAction | None:
+    result = await session.execute(select(AgentAction).where(AgentAction.dedupe_key == key))
+    return result.scalar_one_or_none()
+
+
+async def list_actions(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None = None,
+    agent_id: uuid.UUID | None = None,
+    limit: int = 50,
+) -> list[AgentAction]:
+    """A conversation's actions, oldest first -- the order a receipt lists them."""
+
+    query = select(AgentAction)
+    if conversation_id is not None:
+        query = query.where(AgentAction.conversation_id == conversation_id)
+    if agent_id is not None:
+        query = query.where(AgentAction.agent_id == agent_id)
+    query = query.order_by(AgentAction.created_at, AgentAction.call_id).limit(limit)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def complete_action(
+    session: AsyncSession, action: AgentAction, data: ActionComplete
+) -> AgentAction:
+    """Record what came back, once.
+
+    A completion that arrives for an already-completed record is a redelivery,
+    not a correction: the first account of a call is the one that was true when
+    it happened, and overwriting it with a second would silently move a prior
+    state a restore is about to replay. Returned unchanged.
+    """
+
+    if action.status != ActionStatus.pending:
+        return action
+    action.status = ActionStatus.failed if data.failed else ActionStatus.succeeded
+    action.result = data.result
+    action.prior_state = data.prior_state
+    action.target = data.target
+    if data.detail is not None:
+        action.detail = data.detail
+    action.completed_at = datetime.now(UTC).replace(tzinfo=None)
+    await session.commit()
+    await session.refresh(action)
+    return action
 
 
 async def create_approval(session: AsyncSession, data: "ApprovalRequest") -> Approval:
