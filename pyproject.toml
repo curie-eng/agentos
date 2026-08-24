@@ -149,6 +149,7 @@ testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
+    "packages/test-support/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/worker/tests",

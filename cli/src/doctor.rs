@@ -67,6 +67,9 @@ pub struct Facts {
     pub model_credential: Option<String>,
     /// Where it came from, for the detail line.
     pub model_credential_source: Option<String>,
+    /// Non-secret provider inferred from the bound `CURIE_CREDENTIALS` value.
+    /// The credential itself is deliberately discarded during observation.
+    pub model_credential_provider: Option<&'static str>,
     pub docker_ok: bool,
     /// Plugin name from `.claude-plugin/plugin.json` in the working directory.
     pub bundle_name: Option<String>,
@@ -120,6 +123,17 @@ fn skipped(id: &'static str, title: &'static str, detail: impl Into<String>) -> 
         detail: detail.into(),
         fix: None,
     }
+}
+
+/// The recovery command for a missing cluster release. Provider egress follows
+/// the same credential-prefix map as `cluster up`; an absent or unrecognized
+/// credential leaves egress sealed rather than guessing Anthropic.
+fn missing_release_recovery(provider: Option<&str>) -> String {
+    let mut command = "curie cluster up --namespace <ns> --release <name>".to_string();
+    if let Some(provider) = provider {
+        command.push_str(&format!(" --allow-egress-host {provider}"));
+    }
+    command
 }
 
 /// Judge the gathered facts. Pure.
@@ -190,7 +204,7 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             "release",
             "Curie release",
             "not installed in this namespace",
-            "curie cluster up --namespace <ns> --release <name> --allow-egress-host anthropic",
+            missing_release_recovery(f.model_credential_provider),
         ));
         for (id, title) in [
             ("slack", "Slack"),
@@ -482,15 +496,25 @@ mod tests {
     /// This output gets pasted into issues and chat.
     #[test]
     fn no_check_can_carry_a_credential_value() {
+        let credential = "sk-or-PLACEHOLDER";
         let f = Facts {
             model_credential: Some("CURIE_CREDENTIALS".into()),
             model_credential_source: Some("environment".into()),
+            model_credential_provider: crate::ops::provider_from_credential_prefix(credential),
             clone_credential: Some("github app (app_id=4475970)".into()),
             slack_configured: true,
             ..laptop()
         };
         let rendered = format!("{:?}", evaluate(&f));
-        for leaked in ["sk-ant-", "xoxb-", "xapp-", "ghp_", "-----BEGIN"] {
+        for leaked in [
+            credential,
+            "sk-or-",
+            "sk-ant-",
+            "xoxb-",
+            "xapp-",
+            "ghp_",
+            "-----BEGIN",
+        ] {
             assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
         }
     }
@@ -742,9 +766,18 @@ pub async fn gather(namespace: &str, release: &str, api: Option<(&str, &str)>) -
     };
 
     for name in crate::commands::MODEL_CREDENTIAL_ENV_NAMES {
-        if std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false) {
+        if let Ok(value) = std::env::var(name) {
+            if value.is_empty() {
+                continue;
+            }
             f.model_credential = Some(name.to_string());
             f.model_credential_source = Some("environment".into());
+            // `cluster up` binds its real-model credential from the canonical
+            // CURIE_CREDENTIALS variable. Derive only its safe provider name
+            // for the recovery command, then drop the credential value.
+            f.model_credential_provider = (name == "CURIE_CREDENTIALS")
+                .then(|| crate::ops::provider_from_credential_prefix(&value))
+                .flatten();
             break;
         }
         if crate::secrets::is_saved(name).unwrap_or(false) {

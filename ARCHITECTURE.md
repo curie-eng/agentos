@@ -22,6 +22,11 @@ Decision Records) ([`docs/adr/`](docs/adr/)). This doc is the "what talks to
 what." It supersedes the pre-build plans that the MVP (Minimum Viable Product)
 was built from, which are preserved in git history.
 
+For a navigable version of this map, open the
+[interactive architecture atlas](https://htmlpreview.github.io/?https://github.com/curie-eng/curie/blob/main/docs/architecture-atlas/index.html).
+It overlays current and planned flows, maturity-rated seams, ADRs, implementation
+detail, and documentation drift on one version-selectable system diagram.
+
 ## Table of contents
 
 - [Overview](#overview)
@@ -184,7 +189,7 @@ sequenceDiagram
 
     W->>V: XREADGROUP (consumer group)
     W->>V: SET NX PX thread lock (routing CAS)
-    W->>W: binding: resolve agent+version+bundle_ref by channel address
+    W->>W: binding: resolve agent+version+bundle_ref by (kind, address)
     alt no live turn for this thread
         W->>S: claim(thread_ts) / resume
         S-->>W: SandboxHandle (pod cold-created from SandboxTemplate)
@@ -222,7 +227,7 @@ The pieces, cited:
 
   The Socket Mode handler is at [`apps/dispatcher/src/curie_dispatcher/app.py::SocketModeConnection`](apps/dispatcher/src/curie_dispatcher/app.py). The stream name is configured on [`apps/dispatcher/src/curie_dispatcher/config.py::DispatcherConfig`](apps/dispatcher/src/curie_dispatcher/config.py) (default `curie:runs`), and the payload model is the channel-neutral [`packages/aci-protocol/src/aci_protocol/turn.py::QueuedTurn`](packages/aci-protocol/src/aci_protocol/turn.py).
 - **The kernel** consumes at [`apps/worker/src/curie_worker/consumer.py::Consumer.run`](apps/worker/src/curie_worker/consumer.py) and processes at [`apps/worker/src/curie_worker/kernel.py::Kernel.process_event`](apps/worker/src/curie_worker/kernel.py). It talks to the runner over `POST /v1/event`, `/v1/steer`, `/v1/interrupt` ([`apps/worker/src/curie_worker/runner_client.py::RunnerClient`](apps/worker/src/curie_worker/runner_client.py)). These are the same routes the runner serves at [`runner/src/curie_runner/server.py::create_app`](runner/src/curie_runner/server.py).
-- **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on the channel address against the active deployment, joining `agents` -> `agent_channels` -> `deployments` -> `agent_versions` ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). This is how one worker serves many agents: the channel selects the bundle.
+- **Deployment binding**: a run resolves its agent, version, and `bundle_ref` by exact-match on the required `(kind, address)` channel-routing pair against the active deployment, joining `agents` -> `agent_channels` -> `deployments` -> `agent_versions` ([`apps/worker/src/curie_worker/binding.py::BindingResolver`](apps/worker/src/curie_worker/binding.py)). Neither half has a fallback: the same address may be bound under different kinds. This is how one worker serves many agents: the routing pair selects the bundle.
 
 ### The four kernel invariants
 
@@ -623,8 +628,6 @@ The following are built and verified:
 
 **Deferred:**
 
-- ripping out the UI fixture/showroom surface (the code is still in the tree; wired-and-live is the target, [the UI section](#the-ui-always-the-real-api-no-demo-mode))
-- binding the UI's eval matrix view to the live `GET /evals/matrix` endpoint ([Pushing agent versions with git](#pushing-agent-versions-with-git-deploy-flow))
 - **running** the soak/chaos suite at N1 scale (the suite itself is 762 lines of real Python, env-gated on `CURIE_SOAK` — what is deferred is the run, not the code)
 - the Interview-Me onboarding compiler
 - automatic memory generation

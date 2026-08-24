@@ -35,6 +35,10 @@
 # repos only") and an explicit value must render verbatim. The negative control
 # routes it through the generating helper and requires the assert to fire.
 #
+# Issue #1762 (quiet API migration startup), Assertion 14 and its negative
+# control. The migration init container must wait for Postgres with bounded,
+# quiet retries before preserving the original Alembic upgrade command.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -56,19 +60,42 @@ KEYS=(
   apiKey
   githubWebhookSecret
 )
-declare -A DEFAULTS=(
-  [postgresPassword]="postgres"
-  [valkeyPassword]="valkeypass"
-  [clickhousePassword]="clickhouse"
-  [rustfsSecretKey]="rustfssecret"
-  [langfuseSalt]="dev-salt-change-me"
-  [langfuseEncryptionKey]="0000000000000000000000000000000000000000000000000000000000000000"
-  [langfuseNextauthSecret]="dev-nextauth-secret-change-me"
-  [langfuseInitProjectSecretKey]="sk-lf-curie-dev"
-  [langfuseInitUserPassword]="curie-dev-password"
-  [apiKey]="curie-dev-key"
-  [githubWebhookSecret]="dev-webhook-secret"
-)
+# The published dev default for each of those keys. A `case` lookup rather than
+# `declare -A`: associative arrays are bash 4+, and macOS ships bash 3.2 (the
+# last GPLv2 release) as /bin/bash, which `#!/usr/bin/env bash` finds unless the
+# contributor installed a newer one. Under `set -u` the unsupported `declare -A`
+# made the first key look like an unbound variable, so `curie dev chart-check`
+# failed on every stock Mac with "postgresPassword: unbound variable" -- an error
+# that named nothing real and pointed at no fix. The other twenty-one assertion
+# scripts already run on 3.2; this was the only one that did not.
+default_for() {
+  case "$1" in
+    postgresPassword)             printf '%s\n' "postgres" ;;
+    valkeyPassword)               printf '%s\n' "valkeypass" ;;
+    clickhousePassword)           printf '%s\n' "clickhouse" ;;
+    rustfsSecretKey)              printf '%s\n' "rustfssecret" ;;
+    langfuseSalt)                 printf '%s\n' "dev-salt-change-me" ;;
+    langfuseEncryptionKey)        printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" ;;
+    langfuseNextauthSecret)       printf '%s\n' "dev-nextauth-secret-change-me" ;;
+    langfuseInitProjectSecretKey) printf '%s\n' "sk-lf-curie-dev" ;;
+    langfuseInitUserPassword)     printf '%s\n' "curie-dev-password" ;;
+    apiKey)                       printf '%s\n' "curie-dev-key" ;;
+    githubWebhookSecret)          printf '%s\n' "dev-webhook-secret" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prove the lookup is total over KEYS here, at startup, rather than relying on a
+# failure at the point of use. `default_for` is called inside a command
+# substitution, where a nonzero exit cannot abort the script the way the old
+# `set -u` array miss did -- and one call site sits under `||`, which suspends
+# `set -e` for the whole function body. Checking up front keeps the old property
+# that a key with no published default is a hard error, not a silent empty
+# string that makes the generation detector pass by accident.
+for key in "${KEYS[@]}"; do
+  default_for "$key" >/dev/null \
+    || { echo "FAIL: default_for() has no published default for key '$key'" >&2; exit 1; }
+done
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -106,7 +133,7 @@ check_generated_key() {
   # $1 = rendered Secret, $2 = key, $3 = render label
   local out="$1" key="$2" label="$3" val def
   val="$(read_key "$out" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" == "$def" ]]; then
     echo "$label still emits the published dev default for '$key' (value == '$def'); expected a generated value." >&2
     return 1
@@ -156,7 +183,7 @@ echo "  ok: langfuseEncryptionKey is 64 lowercase-hex chars"
 echo "=== Assertion 3: dev overlay keeps the deterministic published defaults ==="
 for key in "${KEYS[@]}"; do
   val="$(read_key "$DEV" "$key")"
-  def="${DEFAULTS[$key]}"
+  def="$(default_for "$key")"
   if [[ "$val" != "$def" ]]; then
     fail "dev overlay must keep the published default for '$key'; expected '$def', got '$val'."
   fi
@@ -1164,7 +1191,11 @@ assert_worker_api() {
   [[ -f "$manifest" ]] || fail "$name: worker.yaml did not render"
   [[ -f "$secret_manifest" ]] || fail "$name: secrets.yaml did not render"
   local error
-  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" "${key_args[@]}" 2>&1)"; then
+  # `${a[@]+"${a[@]}"}` rather than a bare `"${key_args[@]}"`: expanding an EMPTY
+  # array under `set -u` is an "unbound variable" error until bash 4.4, and macOS
+  # ships 3.2. key_args is empty for every non-operator key source, which is most
+  # of the call sites below.
+  if ! error="$(python3 "$WORKER_API_CHECK" "$manifest" "$secret_manifest" "$expected_url" "$key_source" ${key_args[@]+"${key_args[@]}"} 2>&1)"; then
     fail "$name: $error"
   fi
 }
@@ -1259,5 +1290,284 @@ if failures:
 print(f"  ok: DATATIER_TARGETS includes {expected!r} and excludes {forbidden!r}")
 PYEOF
 
+echo "=== Assertion 14: API migration waits quietly for Postgres before Alembic (#1762) ==="
+API_MIGRATE_OUT="$TMP/api_migrate"
+helm template curie "$CHART" --output-dir "$API_MIGRATE_OUT" >/dev/null
+API_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_RENDER" ]] || fail "api.yaml did not render"
+
+API_MIGRATE_CHECK="$TMP/check_api_migrate_wait.py"
+cat > "$API_MIGRATE_CHECK" <<'PYEOF'
+"""Execute the rendered API migration init command with fake dependencies."""
+
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def migrate_container(manifest):
+    matches = []
+    for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
+        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+            continue
+        containers = (
+            doc.get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("initContainers", [])
+        )
+        matches.extend(item for item in containers if item.get("name") == "migrate")
+    if len(matches) != 1:
+        fail(f"expected exactly one migrate init container, found {len(matches)}")
+    return matches[0]
+
+
+def shell_process(container):
+    process = list(container.get("command") or []) + list(container.get("args") or [])
+    if len(process) < 3 or pathlib.Path(process[0]).name not in {"sh", "bash"}:
+        fail(
+            "migrate init container must use a shell readiness wait before "
+            "exec alembic; a direct Alembic command is not retry-safe"
+        )
+    if process[1] != "-c":
+        fail("migrate init container shell command must use -c")
+    script = process[2]
+    migration = "exec alembic -c alembic.ini upgrade head"
+    if migration not in script:
+        fail(f"migrate init command must preserve {migration!r}")
+    if not any(token in script[: script.index(migration)] for token in ("python", "python3")):
+        fail("migrate init command has no supported Postgres readiness probe before Alembic")
+    env_names = {item.get("name") for item in container.get("env", [])}
+    if "DATABASE_URL" not in env_names:
+        fail("migrate init container must receive DATABASE_URL from the Postgres environment")
+    return process
+
+
+def write_program(path, text):
+    path.write_text("#!/bin/sh\n" + text)
+    path.chmod(0o755)
+
+
+def run_case(process, readiness_failures):
+    with tempfile.TemporaryDirectory() as temp:
+        root = pathlib.Path(temp)
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "python").symlink_to(sys.executable)
+        fake_modules = root / "modules"
+        fake_modules.mkdir()
+        attempts = root / "readiness-attempts"
+        alembic_calls = root / "alembic-calls"
+
+        write_program(fake_bin / "sleep", "exit 0\n")
+        write_program(
+            fake_bin / "alembic",
+            "printf '%s\\n' \"$*\" >> \"$ALEMBIC_CALLS\"\n",
+        )
+        (fake_modules / "asyncpg.py").write_text(
+            """\
+import os
+import pathlib
+
+
+class InvalidPasswordError(Exception):
+    pass
+
+
+class Connection:
+    async def close(self):
+        pass
+
+
+async def connect(database_url, timeout):
+    attempts = pathlib.Path(os.environ["READINESS_ATTEMPTS"])
+    lines = attempts.read_text().splitlines() if attempts.exists() else []
+    count = int(lines[-1]) + 1 if lines else 1
+    with attempts.open("a") as stream:
+        stream.write(f"{count}\\n")
+    if count <= int(os.environ["READINESS_FAILURES"]):
+        raise InvalidPasswordError("asyncpg-password-sentinel-must-not-leak")
+    return Connection()
+"""
+        )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "ALEMBIC_CALLS": str(alembic_calls),
+                "DATABASE_URL": (
+                    "postgresql+asyncpg://curie:EXAMPLE_NOT_A_SECRET@postgres:5432/curie"
+                ),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "PYTHONPATH": (
+                    f"{fake_modules}{os.pathsep}{env['PYTHONPATH']}"
+                    if env.get("PYTHONPATH")
+                    else str(fake_modules)
+                ),
+                "READINESS_ATTEMPTS": str(attempts),
+                "READINESS_FAILURES": str(readiness_failures),
+            }
+        )
+        try:
+            result = subprocess.run(
+                process,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            fail("migrate readiness wait did not terminate within 60 seconds with fake sleep")
+
+        attempt_lines = attempts.read_text().splitlines() if attempts.exists() else []
+        calls = alembic_calls.read_text().splitlines() if alembic_calls.exists() else []
+        return result, attempt_lines, calls
+
+
+container = migrate_container(sys.argv[1])
+process = shell_process(container)
+
+ready, ready_attempts, ready_calls = run_case(process, 0)
+if ready.returncode != 0:
+    fail(f"immediate readiness exited {ready.returncode}: {ready.stdout}{ready.stderr}")
+if len(ready_attempts) != 1:
+    fail(f"immediate readiness ran the probe {len(ready_attempts)} times, expected once")
+if ready_calls != ["-c alembic.ini upgrade head"]:
+    fail(f"immediate readiness did not invoke the original Alembic command: {ready_calls!r}")
+
+delayed, delayed_attempts, delayed_calls = run_case(process, 2)
+if delayed.returncode != 0:
+    fail(f"delayed readiness exited {delayed.returncode}: {delayed.stdout}{delayed.stderr}")
+if len(delayed_attempts) != 3:
+    fail(f"delayed readiness ran the probe {len(delayed_attempts)} times, expected three")
+if delayed_calls != ["-c alembic.ini upgrade head"]:
+    fail(f"delayed readiness did not invoke the original Alembic command: {delayed_calls!r}")
+delayed_output = [
+    line.strip()
+    for line in (delayed.stdout + delayed.stderr).splitlines()
+    if line.strip()
+]
+if delayed_output != ["Waiting for Postgres readiness"]:
+    fail(f"delayed readiness must log one concise wait line: {delayed_output!r}")
+
+exhausted, exhausted_attempts, exhausted_calls = run_case(process, 60)
+if exhausted.returncode == 0:
+    fail("readiness exhaustion must exit nonzero so the init container can restart")
+if len(exhausted_attempts) != 60:
+    fail(f"readiness exhaustion must make exactly 60 attempts; observed {len(exhausted_attempts)}")
+if exhausted_calls:
+    fail(f"readiness exhaustion must not invoke Alembic; got {exhausted_calls!r}")
+
+output_lines = [
+    line.strip()
+    for line in (exhausted.stdout + exhausted.stderr).splitlines()
+    if line.strip()
+]
+if not output_lines:
+    fail("readiness exhaustion must emit one concise terminal message")
+if len(output_lines) > 2:
+    fail(f"readiness exhaustion emitted {len(output_lines)} lines, expected at most 2")
+if output_lines[0] != "Waiting for Postgres readiness":
+    fail(f"first readiness failure must emit one concise wait message: {output_lines!r}")
+lower_output = " ".join(output_lines).lower()
+if "postgres" not in lower_output or not any(
+    word in lower_output for word in ("ready", "wait", "timeout", "unavailable")
+):
+    fail(f"readiness exhaustion message must explain the Postgres wait: {output_lines!r}")
+if "InvalidPasswordError" not in " ".join(output_lines):
+    fail(f"readiness exhaustion must retain the final probe error class: {output_lines!r}")
+if "traceback" in lower_output or "sqlalchemy.exc" in lower_output:
+    fail(f"readiness exhaustion emitted a traceback: {output_lines!r}")
+if any(
+    secret in lower_output
+    for secret in (
+        "example_not_a_secret",
+        "postgresql+asyncpg://",
+        "asyncpg-password-sentinel-must-not-leak",
+    )
+):
+    fail(f"readiness exhaustion exposed database credentials: {output_lines!r}")
+
+print(
+    "  ok: immediate and delayed readiness run the original migration; bounded "
+    "exhaustion stays concise, exits nonzero, and never invokes Alembic"
+)
+PYEOF
+
+python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
+  || fail "API migrate init command does not implement the bounded quiet readiness contract."
+
+echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
+API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
+cp -a "$CHART" "$API_MIGRATE_BOUND_MUTANT"
+python3 - "$API_MIGRATE_BOUND_MUTANT/templates/api.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+old = "              max_attempts=60\n"
+if text.count(old) != 1:
+    sys.stderr.write("bound negative control could not find the readiness bound\n")
+    sys.exit(1)
+path.write_text(text.replace(old, "              max_attempts=4\n", 1))
+PYEOF
+API_MIGRATE_BOUND_MUTANT_OUT="$TMP/api_migrate_bound_mutant"
+helm template curie "$API_MIGRATE_BOUND_MUTANT" \
+  --output-dir "$API_MIGRATE_BOUND_MUTANT_OUT" >/dev/null
+API_MIGRATE_BOUND_MUTANT_RENDER="$API_MIGRATE_BOUND_MUTANT_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_BOUND_MUTANT_RENDER" ]] || fail "bound mutant api.yaml did not render"
+api_migrate_bound_negative_output=""
+if api_migrate_bound_negative_output="$(python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_BOUND_MUTANT_RENDER" 2>&1)"; then
+  fail "negative control did not fire: a changed readiness bound passed the contract."
+fi
+if [[ "$api_migrate_bound_negative_output" != *"must make exactly 60 attempts"* ]]; then
+  fail "readiness-bound negative control failed unexpectedly: $api_migrate_bound_negative_output"
+fi
+echo "  ok: a changed readiness bound is rejected (the boundedness assert can fail)"
+
+echo "=== Assertion 14 negative control: direct Alembic migration FAILS ==="
+# Mutate a temporary chart copy to the pre-fix command and require the same
+# rendered-command checker to reject it.
+API_MIGRATE_MUTANT="$TMP/mutant-api-migrate"
+cp -a "$CHART" "$API_MIGRATE_MUTANT"
+python3 - "$API_MIGRATE_MUTANT/templates/api.yaml" <<'PYEOF'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+start_marker = '          command: ["/bin/sh", "-c"]\n'
+end_marker = "          env:\n"
+start = text.find(start_marker)
+end = text.find(end_marker, start)
+if start == -1 or end == -1:
+    sys.stderr.write("negative control could not find the migration readiness command\n")
+    sys.exit(1)
+direct_command = '          command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]\n'
+path.write_text(text[:start] + direct_command + text[end:])
+PYEOF
+API_MIGRATE_MUTANT_OUT="$TMP/api_migrate_mutant"
+helm template curie "$API_MIGRATE_MUTANT" --output-dir "$API_MIGRATE_MUTANT_OUT" >/dev/null
+API_MIGRATE_MUTANT_RENDER="$API_MIGRATE_MUTANT_OUT/curie/templates/api.yaml"
+[[ -f "$API_MIGRATE_MUTANT_RENDER" ]] || fail "mutant api.yaml did not render"
+api_migrate_negative_output=""
+if api_migrate_negative_output="$(python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_MUTANT_RENDER" 2>&1)"; then
+  fail "negative control did not fire: the pre-fix direct Alembic command passed the readiness contract."
+fi
+if [[ "$api_migrate_negative_output" != *"direct Alembic command is not retry-safe"* ]]; then
+  fail "direct-Alembic negative control failed unexpectedly: $api_migrate_negative_output"
+fi
+echo "  ok: the reverted direct-Alembic command is rejected (the assert can fail)"
+
 echo
-echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; and the security probe uses the configured RustFS port in DATATIER_TARGETS."
+echo "PASS: sealed render generates strong values for all 11 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every control-plane pod, the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API migration init command waits quietly with bounded retries before preserving the original Alembic upgrade, with readiness exhaustion proven to exit nonzero without invoking Alembic."

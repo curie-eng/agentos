@@ -58,8 +58,8 @@ spec:
       {{- end }}
       {{- if .Values.api.migrate.enabled }}
       # Bring the schema to head before the server boots. The init container
-      # re-runs until it succeeds, so it also serves as a wait-for-Postgres gate
-      # on a fresh install (migration 0001 creates the `curie` schema).
+      # waits quietly for Postgres before migrating. Kubernetes restarts remain
+      # the backstop after bounded readiness attempts or migration failure.
       initContainers:
         - name: migrate
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -67,7 +67,44 @@ spec:
           {{- with .Values.api.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
-          command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              attempt=1
+              max_attempts=60
+              probe_error_class=""
+              while [ "$attempt" -le "$max_attempts" ]; do
+                if probe_error_class=$(python -c '
+              import asyncio
+              import os
+
+              try:
+                  import asyncpg
+
+                  async def probe():
+                      database_url = os.environ["DATABASE_URL"].replace(
+                          "postgresql+asyncpg://", "postgresql://", 1
+                      )
+                      connection = await asyncpg.connect(database_url, timeout=2)
+                      await connection.close()
+
+                  asyncio.run(probe())
+              except Exception as error:
+                  print(type(error).__name__)
+                  raise SystemExit(1)
+              ' 2>/dev/null); then
+                  exec alembic -c alembic.ini upgrade head
+                fi
+                if [ "$attempt" -eq 1 ]; then
+                  echo "Waiting for Postgres readiness"
+                fi
+                if [ "$attempt" -lt "$max_attempts" ]; then
+                  sleep 2
+                fi
+                attempt=$((attempt + 1))
+              done
+              echo "Postgres unavailable after $max_attempts readiness attempts; final probe error class: $probe_error_class; exiting for init container restart" >&2
+              exit 1
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
       {{- end }}

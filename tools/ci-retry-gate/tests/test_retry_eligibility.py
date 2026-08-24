@@ -187,7 +187,7 @@ def _load_workflows() -> dict[str, dict[str, Any]]:
     """Parse every workflow file. Also a free structural check on the YAML.
 
     Memoised: the argument list is empty and the input is immutable on disk for
-    the length of a run, so the six rules would otherwise reparse all eight
+    the length of a run, so the six rules would otherwise reparse all nine
     files once each. Every consumer treats the parsed documents as read only,
     and the one place that needs to alter a step (`_iter_steps`, folding a job
     level `continue-on-error`) builds a shallow copy rather than writing back.

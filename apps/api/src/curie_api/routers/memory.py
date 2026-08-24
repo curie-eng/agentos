@@ -65,6 +65,30 @@ def _records_of(entry: WorkflowStateEntry | None) -> list[dict[str, Any]]:
     return [r for r in entry.value if isinstance(r, dict) and "content" in r]
 
 
+async def _locked_log(
+    session: SessionDep, agent_id: uuid.UUID, expected_version: int
+) -> tuple[WorkflowStateEntry, list[dict[str, Any]]]:
+    """Load and lock the memory log, then validate its expected parent version."""
+    await _require_agent(session, agent_id)
+    entry: WorkflowStateEntry | None = await session.scalar(
+        select(WorkflowStateEntry)
+        .where(
+            WorkflowStateEntry.agent_id == agent_id,
+            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.key == MEMORY_LOG_KEY,
+        )
+        .with_for_update()
+    )
+    if entry is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
+    if expected_version != entry.version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"version mismatch: expected {expected_version}, stored {entry.version}",
+        )
+    return entry, _records_of(entry)
+
+
 def _provenance_of(record: dict[str, Any]) -> dict[str, Any]:
     prov = record.get("provenance")
     return prov if isinstance(prov, dict) else {}
@@ -136,25 +160,7 @@ async def edit_memory(
     provenance is carried through unchanged. A stale version conflicts before
     the positional index can address a changed or reordered log.
     """
-    await _require_agent(session, agent_id)
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
-            WorkflowStateEntry.key == MEMORY_LOG_KEY,
-        )
-        .with_for_update()
-    )
-    if entry is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
-    if data.expected_version != entry.version:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"version mismatch: expected {data.expected_version}, "
-            f"stored {entry.version}",
-        )
-    records = _records_of(entry)
+    entry, records = await _locked_log(session, agent_id, data.expected_version)
     if index < 0 or index >= len(records):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     updated = {**records[index], "content": data.content}
@@ -187,24 +193,7 @@ async def delete_memory(
     Remaining entries keep their order. A stale version conflicts before the
     positional index can address a changed or reordered log.
     """
-    await _require_agent(session, agent_id)
-    entry: WorkflowStateEntry | None = await session.scalar(
-        select(WorkflowStateEntry)
-        .where(
-            WorkflowStateEntry.agent_id == agent_id,
-            WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
-            WorkflowStateEntry.key == MEMORY_LOG_KEY,
-        )
-        .with_for_update()
-    )
-    if entry is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
-    if expected_version != entry.version:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"version mismatch: expected {expected_version}, stored {entry.version}",
-        )
-    records = _records_of(entry)
+    entry, records = await _locked_log(session, agent_id, expected_version)
     if index < 0 or index >= len(records):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "memory entry not found")
     entry.value = [*records[:index], *records[index + 1 :]]

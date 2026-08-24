@@ -952,13 +952,10 @@ worker:
   # per-agent behavior-pack load line intact.
   statusText: "is working on your request..."
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
-  # worker Deployment so the worker's Slack sink posts placeholder edits at this
-  # base URL instead of real Slack -- the seam `curie cluster message` drives when it
-  # points the deployed worker at its local Slack Web API stub. Empty (the
-  # default) leaves the worker on real Slack. `curie cluster message --wire` sets this
-  # via `helm upgrade --reuse-values`; connecting real Slack (a `helm upgrade
-  # --reuse-values` that sets the dispatcher tokens) clears it back to empty in
-  # the same command, so that upgrade un-wires any stub routing.
+  # worker Deployment so its Slack sink uses that global base URL instead of real
+  # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
+  # message` does not change this value: its synthetic turn carries a per-turn
+  # reply endpoint for the command's local Slack Web API stub.
   slackApiBaseUrl: ""
   # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
   # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
@@ -966,12 +963,12 @@ worker:
   # Slack) is the only endpoint the worker will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
-  # DEV ONLY. `curie cluster message` uses an EPHEMERAL callback port by
-  # default. To trust a LAN or kind callback host, set a portless origin such as
-  # `http://10.0.0.7` or `http://host.docker.internal`; omitting the port admits
-  # the kernel assigned port. This trusts ANY port on that exact host, so it can
-  # widen where the platform bot token can go and belongs only in development.
-  # The empty default above remains the fail closed production posture.
+  # DEV ONLY. `curie cluster message` temporarily adds the exact advertised stub
+  # host as a portless origin, waits for the worker rollout, and removes it when
+  # the command exits. Omitting the port admits the kernel-assigned callback
+  # port. Manual entries trust ANY port on that exact host, so they can widen
+  # where the platform bot token can go and belong only in development. The
+  # empty default remains the fail-closed production posture.
   # Rendered only when non-empty.
   slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->

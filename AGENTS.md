@@ -563,6 +563,10 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
+- PR bodies must contain real line breaks. The PR body guard rejects escaped
+  newline sequences because GitHub treats them as text, making closing keywords
+  inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
+  PR.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
   CI enforces this on every PR (issue #962); check before pushing with:

@@ -20,6 +20,8 @@ jobs:
   python:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
+    env:
+      CI_REQUIRE_VALKEY_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,8 +103,8 @@ jobs:
             langfuse-web langfuse-worker otel-collector
       # Langfuse web has no compose healthcheck, so --wait returns once its
       # container is merely running. Poll its public health endpoint until it is
-      # actually serving; the Langfuse-backed tests skip themselves when the
-      # stack is unreachable, so this gate is what keeps them running for real.
+      # actually serving, so the full-stack readiness gate fails fast with an
+      # actionable error before integration tests begin.
       - name: Wait for Langfuse to serve
         run: |
           for i in $(seq 1 60); do
@@ -331,6 +333,8 @@ jobs:
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
         run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+      - name: Architecture atlas preview route test
+        run: node --test docs/architecture-atlas/test-update-hash.mjs
 
   ui:
     name: UI (lint + vitest + build + Playwright)

@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -142,6 +142,27 @@ def _nav_pack(nav: NavAffordance | None) -> NavPack | None:
     if nav is None:
         return None
     return NavPack(enabled=True, hub_label=nav.label, hub_command=nav.command)
+
+
+async def _post_with_block_fallback(
+    client: AsyncWebClient,
+    *,
+    channel: str,
+    text: str,
+    blocks: list[dict[str, Any]] | None,
+    thread_ts: str | None,
+) -> AsyncSlackResponse:
+    try:
+        if blocks is not None:
+            return await client.chat_postMessage(
+                channel=channel, text=text, blocks=blocks, thread_ts=thread_ts
+            )
+        return await client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
+    except SlackApiError:
+        if blocks is None:
+            raise
+        logger.warning("chat_postMessage with blocks rejected; retrying text-only")
+        return await client.chat_postMessage(channel=channel, text=text, thread_ts=thread_ts)
 
 
 # "Unreachable" reply-endpoint errors (#530): the endpoint's HOST did not answer
@@ -497,29 +518,15 @@ class SlackReplyAdapter:
         """
         rendered_text, blocks = render(text, _nav_pack(nav))
 
-        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
-            try:
-                if blocks is not None:
-                    return await client.chat_postMessage(
-                        channel=channel,
-                        text=rendered_text,
-                        blocks=blocks,
-                        thread_ts=thread_ts,
-                    )
-                return await client.chat_postMessage(
-                    channel=channel, text=rendered_text, thread_ts=thread_ts
-                )
-            except SlackApiError:
-                if blocks is None:
-                    raise
-                logger.warning("chat_postMessage with blocks rejected; retrying text-only")
-                return await client.chat_postMessage(
-                    channel=channel, text=rendered_text, thread_ts=thread_ts
-                )
-
         response = await self._with_transport_fallback(
             endpoint,
-            op,
+            lambda client: _post_with_block_fallback(
+                client,
+                channel=channel,
+                text=rendered_text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            ),
             describe="chat_postMessage",
             best_effort_unreachable=best_effort_unreachable,
         )
@@ -563,27 +570,12 @@ class SlackReplyAdapter:
         # A rejected Block Kit payload falls back to text-only, mirroring
         # ``update``: the card is the resolve UI, but a plain-text notice still
         # beats losing the message (the API resolve path works regardless).
-        async def op(client: AsyncWebClient) -> AsyncSlackResponse:
-            try:
-                if blocks is not None:
-                    return await client.chat_postMessage(
-                        channel=channel, text=text, blocks=blocks, thread_ts=thread_ts
-                    )
-                return await client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
-                )
-            except SlackApiError:
-                if blocks is None:
-                    raise
-                logger.warning(
-                    "chat_postMessage with blocks rejected; retrying text-only"
-                )
-                return await client.chat_postMessage(
-                    channel=channel, text=text, thread_ts=thread_ts
-                )
-
         response = await self._with_transport_fallback(
-            endpoint, op, describe="chat_postMessage"
+            endpoint,
+            lambda client: _post_with_block_fallback(
+                client, channel=channel, text=text, blocks=blocks, thread_ts=thread_ts
+            ),
+            describe="chat_postMessage",
         )
         ts = response.get("ts")
         return str(ts) if ts else None

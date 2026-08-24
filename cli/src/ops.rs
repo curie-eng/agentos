@@ -718,7 +718,12 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 const CREDENTIAL_PREFIX_PROVIDERS: &[(&str, &str)] =
     &[("sk-ant-", "anthropic"), ("sk-or-", "openrouter")];
 
-fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
+/// Return the provider unambiguously selected by a credential prefix.
+///
+/// Callers that inspect a credential must discard it after deriving this
+/// non-secret provider name; it is safe to render the returned value but never
+/// the credential itself.
+pub fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
     CREDENTIAL_PREFIX_PROVIDERS
         .iter()
         .find(|(prefix, _)| credential.starts_with(prefix))
@@ -1582,6 +1587,27 @@ fn resolve_preserved_runner_identity_values(
     }
 }
 
+/// Carry an inferred gVisor posture into a later plain `cluster up`.
+///
+/// The RuntimeClass admission recovery writes `security.gvisor.mode=off` only
+/// on its retry. Helm records that successful retry, but a normal `up` is a
+/// full upgrade rather than `--reuse-values`; without re-supplying the recorded
+/// posture, the next run falls back to the chart's `auto` default and repeats
+/// the failed preflight. As with the other recorded-value families, an explicit
+/// operator setting owns the key and always wins.
+fn resolve_preserved_gvisor_mode_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(GVISOR_MODE_KEY) {
+        return;
+    }
+    if let Some(mode) = preserved_value(existing, GVISOR_MODE_KEY) {
+        opts.set.push(format!("{GVISOR_MODE_KEY}={mode}"));
+    }
+}
+
 /// Carry the worker environment recorded by a prior install into a plain rerun.
 /// Explicit inputs replace the recorded family.
 fn resolve_preserved_worker_extra_env_values(
@@ -1696,7 +1722,8 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`], and
+/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1716,6 +1743,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || key == GVISOR_MODE_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1757,7 +1785,12 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 /// is true of a renamed key, a legacy key, and an operator's own `--set`, none
 /// of which any list can enumerate in advance.
 pub fn is_secret_value_key(key: &str) -> bool {
-    if is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY {
+    // Most preserve-on-up keys are credentials, but an inferred gVisor posture
+    // is ordinary safety configuration and must remain visible in `curie diff`.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+        || key == GITHUB_TOKEN_KEY
+        || key == MODEL_CREDENTIAL_KEY
+    {
         return true;
     }
     let lowered = key.to_ascii_lowercase();
@@ -2843,6 +2876,7 @@ fn complete_up_opts_without_runner_egress(
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
     resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
@@ -6427,6 +6461,12 @@ enum ServiceUrlKind {
 }
 
 impl ServiceUrl {
+    /// Build the shared port-forward text after the caller chooses whether the
+    /// URL target is plain (JSON) or styled (human output).
+    fn port_forward_hint(&self, local: u16, port: u16, target: &str) -> String {
+        port_forward_hint_with(&self.namespace, &self.name, local, port, target)
+    }
+
     fn to_json(&self) -> serde_json::Value {
         let (url, note): (Option<String>, Option<String>) = match &self.kind {
             ServiceUrlKind::NodePortUrl(url) => (Some(url.clone()), None),
@@ -6442,9 +6482,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 (
                     None,
-                    Some(port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    Some(self.port_forward_hint(
                         *local,
                         *port,
                         &format!("http://localhost:{local}{suffix_path}"),
@@ -6475,9 +6513,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 ui.kv(
                     &self.label,
-                    &port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    &self.port_forward_hint(
                         *local,
                         *port,
                         &ui.url(&format!("http://localhost:{local}{suffix_path}")),
@@ -6563,7 +6599,8 @@ pub enum ServiceEndpoint {
     /// Type NodePort but no nodePort assigned yet.
     UnassignedNodePort,
     /// ClusterIP/other: reachable only via a port-forward.
-    /// `local = if port == 0 { 8080 } else { port }`.
+    /// `local` is non-privileged: service ports below 1024 are offset by
+    /// 18000, while an absent service port falls back to 8080.
     PortForwardHint { local: u16, port: u16 },
     /// `parse_service` returned None (malformed/unreadable JSON).
     Unreadable,
@@ -6589,7 +6626,11 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: if port == 0 { 8080 } else { port },
+            local: match port {
+                0 => 8080,
+                1..=1023 => port + 18000,
+                _ => port,
+            },
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -9402,16 +9443,40 @@ mod tests {
 
     #[test]
     fn resolve_service_endpoint_clusterip_yields_a_port_forward_hint() {
-        // ClusterIP: not node-exposed, so the caller must port-forward. The local
-        // port mirrors the service port.
-        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        assert_eq!(
-            resolve_service_endpoint(clusterip, "10.0.0.5", true),
-            ServiceEndpoint::PortForwardHint {
-                local: 80,
-                port: 80
-            }
+        // ClusterIP: not node-exposed, so the caller must port-forward. Each
+        // privileged service port maps to a deterministic non-privileged local port.
+        let http_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let http_endpoint = resolve_service_endpoint(http_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: http_local,
+            port: http_port,
+        } = http_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(http_local, 18080);
+        assert_eq!(http_port, 80);
+        assert!(
+            http_local >= 1024,
+            "the local port must be bindable by a non-root user"
         );
+
+        let https_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":443}]}}"#;
+        let https_endpoint = resolve_service_endpoint(https_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: https_local,
+            port: https_port,
+        } = https_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(https_local, 18443);
+        assert_eq!(https_port, 443);
+        assert!(
+            https_local >= 1024,
+            "the local port must be bindable by a non-root user"
+        );
+
         // An absent port parses as 0, which falls back to local port 8080.
         let no_port = r#"{"spec":{"type":"ClusterIP","ports":[{}]}}"#;
         assert_eq!(
@@ -9452,13 +9517,75 @@ mod tests {
         // The exact hint `cluster status` prints today for a ClusterIP service
         // (PR#34 visual-parity guard): two spaces before `then`.
         assert_eq!(
-            port_forward_hint("curie", "curie-ui", 80, 80, "/?api=1"),
-            "kubectl -n curie port-forward svc/curie-ui 80:80  then http://localhost:80/?api=1"
+            port_forward_hint("curie", "curie-ui", 18080, 80, "/?api=1"),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
         // The 0-port fallback surfaces local 8080 while still forwarding to 0.
         assert_eq!(
             port_forward_hint("curie", "curie-langfuse-web", 8080, 0, ""),
             "kubectl -n curie port-forward svc/curie-langfuse-web 8080:0  then http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn service_url_json_uses_the_privileged_port_forward_hint() {
+        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward { local, port },
+        };
+
+        assert_eq!(
+            service_url.to_json(),
+            serde_json::json!({
+                "name": "UI",
+                "url": null,
+                "note": "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1",
+            })
+        );
+    }
+
+    #[test]
+    fn service_url_port_forward_hint_preserves_a_human_identity_target() {
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward {
+                local: 18080,
+                port: 80,
+            },
+        };
+        let ui = crate::ui::Ui::resolve(
+            crate::ui::ColorFlag::Never,
+            false,
+            false,
+            false,
+            &crate::ui::UiEnv {
+                no_color: false,
+                clicolor_zero: false,
+                clicolor_force: false,
+                term_dumb: false,
+                ci: false,
+                stderr_tty: true,
+                stdout_tty: true,
+                utf8: true,
+                truecolor: false,
+            },
+        );
+        let target = ui.url("http://localhost:18080/?api=1");
+        assert_eq!(target, "http://localhost:18080/?api=1");
+        assert_eq!(
+            service_url.port_forward_hint(18080, 80, &target),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
     }
 
