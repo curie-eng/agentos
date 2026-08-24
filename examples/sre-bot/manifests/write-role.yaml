@@ -7,9 +7,18 @@
 # before any connector starts. Apply this as step 2 of README.md's
 # "Level up: the gated write path".
 #
-# EDIT TWO THINGS BEFORE APPLYING: the namespace (four occurrences) and the
+# EDIT TWO THINGS BEFORE APPLYING: the namespace (five occurrences -- one of
+# them is the RoleBinding's `subjects[0].namespace`, indented under `subjects:`
+# rather than sitting at `metadata.namespace`, so it's easy to miss) and the
 # `resourceNames` list. Re-applying is safe and idempotent; changing what it
 # grants is not, so read the two sections below first.
+#
+# Missing the `subjects[0].namespace` occurrence does NOT fail `kubectl apply`
+# -- every object still reports `created`. It fails silently instead: the
+# RoleBinding points at a ServiceAccount in the wrong namespace, so the
+# identity grants nothing. The tell is the first `can-i` ceiling proof below
+# printing `no` where it should print `yes` -- don't mistake it for one of the
+# reassuring `no`s the next two lines want.
 #
 # ---------------------------------------------------------------------------
 # The thing to understand before widening anything here

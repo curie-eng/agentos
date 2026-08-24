@@ -18,9 +18,11 @@ yourself.
 
 **Read-only operation remains the default.** The Kubernetes read connector is
 on. The one write connector and its exact approval gate ship declared together,
-so the tool cannot be enabled without its gate. Its separate
-`K8S_WRITE_KUBECONFIG` does not ship, so an untouched bring-up refuses cleanly
-before any connector starts instead of silently acquiring write access.
+so the tool cannot be enabled without its gate. On a genuinely untouched
+bring-up, `cluster deploy` refuses on the unbuilt `connectors.lock.yaml` before
+it ever reaches the secret check; once built, the still-missing separate
+`K8S_WRITE_KUBECONFIG` refuses just as cleanly before any connector starts,
+instead of silently acquiring write access.
 
 Completing the deliberate setup gives the bot exactly one thing it can change:
 rolling one allowlisted Deployment behind a human approval card. See
@@ -132,6 +134,21 @@ and deploy from the declaration.
 Read the four-layer table above before starting, and
 [`manifests/write-role.yaml`](manifests/write-role.yaml) before applying it.
 
+**Prerequisite: both kubeconfigs must be available to a manual `cluster
+deploy`.** `cluster deploy` refuses unless BOTH `K8S_READONLY_KUBECONFIG` and
+`K8S_WRITE_KUBECONFIG` are available -- exported in the environment or stored
+with `curie secrets set` -- the bundle declares both `secret_files` entries
+regardless of which path you're bringing up. This holds even on an
+install where `curie example sre-bot install` already ran: Quick-deploy mints
+the read-only kubeconfig and passes it to its own deploy as a one-off secret
+override, but never persists it to the host vault, so a later manual `cluster
+deploy` still needs `K8S_READONLY_KUBECONFIG` supplied in the environment or
+stored yourself. Apply
+[`manifests/read-access.yaml`](manifests/read-access.yaml) if it isn't already
+applied, then assemble and store `K8S_READONLY_KUBECONFIG` from its
+`sre-bot-reader-token` Secret the same way step 2 below builds the write
+kubeconfig from `sre-bot-writer-token`.
+
 **1. Scope and create the write identity.**
 
 Edit the namespace and the `resourceNames` list in
@@ -182,11 +199,21 @@ kubectl auth can-i --as=system:serviceaccount:"$NS":sre-bot-writer \
 ```
 
 **The credential comes before bring-up, and that order is load-bearing.** The
-declared `secret_files` entry has no bundled value. Without a stored
-`K8S_WRITE_KUBECONFIG`, bring-up refuses cleanly before any connector starts.
-The writer can never fall back to the read-only connector's credential.
+declared `secret_files` entry has no bundled value. On a genuinely untouched
+bring-up -- before `curie build` has ever run -- `cluster deploy` refuses on
+the unbuilt `connectors.lock.yaml` before it reaches the secret check at all.
+Once built (next step) with `K8S_WRITE_KUBECONFIG` still unstored, the bundle
+publishes to the API first and only then does deploy refuse cleanly on the
+missing secret, before any connector object is applied. The writer can never
+fall back to the read-only connector's credential.
 
 **3. Build the connector image.**
+
+**Needs a buildx driver that supports multi-platform builds.** The declaration
+builds both `linux/amd64` and `linux/arm64`, and the stock `docker` driver
+refuses that with `Multi-platform build is not supported for the docker
+driver`. Unblock it once with `docker buildx create --driver docker-container
+--use` (or enable the containerd image store).
 
 ```bash
 curie build --plugin-dir examples/sre-bot --registry <registry-reference>
@@ -251,6 +278,16 @@ curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> --ac
 
 `--as` must not name the requester. Raise `--timeout-secs` further if a human is
 doing the deciding rather than you in the next terminal.
+
+To reject instead, add `--reject`:
+
+```bash
+curie cluster approvals sre-bot --resolve <approval-id> --as <someone-else> \
+  --actor-channel C0EXAMPLE1 --reject
+```
+
+Shell 1's requester gets a no-action reply ("I won't retry it -- no rollout was
+triggered, and the deployment is unchanged") and nothing rolls.
 
 The resumed reply must verify with Kubernetes reads: new pods, their ages, and
 relevant events. A successful write response proves only that the patch was
@@ -404,13 +441,30 @@ failure than the one you were fixing.
 
 **`curie cluster message` hangs for the whole timeout, and the worker log says
 `UntrustedSlackEndpointError: refusing to send the Slack bot token to
-http://...`.** A previous `curie cluster comms --slack` recorded a bot token in
-the release, and `cluster up` preserves it across upgrades. `cluster message`
-serves its reply through a per-turn stub on your machine, and the worker will
-not hand a Slack bot token to an endpoint that is not Slack, so it refuses to
-deliver and the CLI waits forever. This is a platform bug rather than anything in
-this bundle, and it bites anyone who tries Slack first and the CLI second. Clear
-the recorded tokens:
+http://...`.** `cluster message` serves its reply through a per-turn stub on
+your machine, and the worker refuses to hand the Slack bot token to *any*
+reply endpoint whose origin is not in `CURIE_SLACK_TRUSTED_ORIGINS` -- it does
+not matter whether a token is even recorded. The guard fires on the endpoint
+origin, not on token presence. Diagnose by reading the origin the worker log
+names and comparing it against the configured list:
+
+```bash
+kubectl -n curie logs deployment/curie-worker --tail=60 | grep UntrustedSlackEndpointError
+kubectl -n curie exec deployment/curie-worker -- printenv CURIE_SLACK_TRUSTED_ORIGINS
+```
+
+The usual cause on a multi-interface box: `cluster message` auto-detects a
+local IP for its stub -- e.g. a Tailscale address -- that isn't in the
+trusted-origins list. Pin the stub to an address that is:
+
+```bash
+curie cluster message --listen-host <ip-in-CURIE_SLACK_TRUSTED_ORIGINS> ...
+```
+
+`curie cluster comms --slack --disconnect` is not a fix for this error -- the
+guard fires purely on the reply endpoint's origin, never on whether a token is
+stale or even present, so disconnecting cannot clear the refusal. It remains
+useful only for removing Slack comms from the install entirely:
 
 ```bash
 curie cluster comms --slack --disconnect
@@ -420,6 +474,10 @@ That rolls the worker for you (`kubectl -n curie rollout restart
 deployment/curie-worker`, then waits on the rollout), so the running pod picks
 up the cleared tokens. If you cleared them some other way, run that restart by
 hand or the pod keeps serving the stale Secret.
+
+A timed-out turn's entry on the `curie:runs` valkey stream is reclaimed by the
+platform's bounded-delivery/dead-letter backstop -- no manual XACK or other
+stream surgery is needed.
 
 **The bot says it escalated and no approval card appeared.** The route named in
 `approvalPolicy` is not bound for that agent. Bind it with
