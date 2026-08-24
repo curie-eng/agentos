@@ -333,6 +333,8 @@ jobs:
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
         run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+      - name: Architecture atlas preview route test
+        run: node --test docs/architecture-atlas/test-update-hash.mjs
 
   ui:
     name: UI (lint + vitest + build + Playwright)
