@@ -100,3 +100,54 @@ def test_awaiting_approval_wire_value_and_final_round_trip() -> None:
     # summary to None -- the additive-change guarantee.
     legacy = Final.model_validate({"type": "final", "text": "ok", "status": "done"})
     assert legacy.approval_summary is None
+
+
+# --- What a side-effecting call reports (ADR-0117) -----------------------------
+
+
+def test_side_effect_flag_carries_the_call_its_arguments_and_its_result() -> None:
+    """The frame is the only place the platform learns what a call did.
+
+    Before ADR-0117 it carried a tool name and a constant ``detail`` string, so a
+    consumer could know that something mutated and never what.
+    """
+
+    flag = SideEffectFlag(
+        tool="scale_deployment",
+        call_id="toolu_01",
+        arguments={"name": "api", "replicas": 10},
+        result={"ok": True, "prior": {"spec": {"replicas": 3}}},
+        failed=False,
+    )
+    assert flag.call_id == "toolu_01"
+    assert flag.arguments == {"name": "api", "replicas": 10}
+    assert flag.result == {"ok": True, "prior": {"spec": {"replicas": 3}}}
+    assert flag.failed is False
+
+
+def test_side_effect_flag_fields_are_optional_for_an_older_producer() -> None:
+    """ADR-0036's reader policy: an additive optional field costs readers nothing.
+
+    A producer that predates ADR-0117 emits neither, and the frame it wrote still
+    decodes -- which is what makes this a patch bump and not a minor.
+    """
+
+    decoded = _OUTBOUND.validate_python({"type": "side_effect_flag", "version": "0.4.1"})
+    assert decoded.call_id is None
+    assert decoded.arguments is None
+    assert decoded.result is None
+    assert decoded.failed is None
+
+
+def test_two_frames_of_one_call_are_joinable_by_call_id() -> None:
+    """One call, two frames, one record.
+
+    The opening frame is emitted when the call is made, so the no-retry rule
+    latches even if the turn dies mid-call; the closing frame carries what came
+    back. Without a shared call id a consumer cannot join them, and a turn that
+    calls the same tool twice would collapse into one record or three.
+    """
+
+    opened = SideEffectFlag(tool="scale_deployment", call_id="toolu_01", arguments={"replicas": 10})
+    closed = SideEffectFlag(tool="scale_deployment", call_id="toolu_01", result={"ok": True})
+    assert opened.call_id == closed.call_id

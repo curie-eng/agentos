@@ -64,7 +64,9 @@ Import everything from `aci_protocol`; do not hand-roll JSON.
 - `Final` → `final` `{version, text, status}` where `status ∈ {done,
   idle-awaiting-input, classified-failure}`
 - `ErrorEvent` → `error` `{version, message, classification?}`
-- `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?}`
+- `SideEffectFlag` → `side_effect_flag` `{version, tool?, detail?, call_id?,
+  arguments?, result?, failed?}`, emitted once when a side-effecting call is
+  made and once when its result arrives, joined on `call_id` (ADR-0117)
 
 **Version gate (strict producer, tolerant consumer).** Your producer emits its
 **exact build `PROTOCOL_VERSION`** (currently `0.2.0`) on every outbound event and

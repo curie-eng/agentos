@@ -1185,8 +1185,33 @@
       "type": "string"
     },
     "SideEffectFlag": {
-      "description": "Marks that a non-idempotent tool call executed during the run.\n\nIts presence gates the no-retry-after-side-effects rule (section 2b): a\nfailed run carrying this flag escalates to a human instead of retrying.",
+      "description": "Marks that a non-idempotent tool call executed during the run.\n\nIts presence gates the no-retry-after-side-effects rule (section 2b): a\nfailed run carrying this flag escalates to a human instead of retrying.\n\nIt also reports WHAT the call did (ADR-0117). The information was already in\nhand where the frame is built and was being replaced by a constant ``detail``\nstring, so a consumer could know that something mutated and never what. Every\nfield below is optional with a ``None`` default, which is why carrying them\nis a patch under ADR-0036: a reader that predates them decodes the frame\nunchanged.\n\nOne CALL produces two frames -- an opening one when the call is made, so the\nno-retry rule latches even if the turn dies mid-call, and a closing one\ncarrying what came back. ``call_id`` is what joins them into one record; a\nturn that calls the same tool twice is otherwise indistinguishable from one\nthat called it once.",
       "properties": {
+        "arguments": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Arguments"
+        },
+        "call_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Call Id"
+        },
         "detail": {
           "anyOf": [
             {
@@ -1198,6 +1223,31 @@
           ],
           "default": null,
           "title": "Detail"
+        },
+        "failed": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failed"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result"
         },
         "tool": {
           "anyOf": [
@@ -1306,6 +1356,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.4.1",
-  "title": "ACI Protocol v0.4.1"
+  "protocolVersion": "0.4.2",
+  "title": "ACI Protocol v0.4.2"
 }
