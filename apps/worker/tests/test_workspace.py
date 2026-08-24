@@ -363,6 +363,21 @@ def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
         )
 
 
+def test_runtime_repo_parser_deduplicates_repeated_repository_facts(
+    workspace: Any,
+) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Update https://github.com/acme-corp/acme-bot and keep the notes at "
+        "https://github.com/acme-corp/acme-bot.git current."
+    ) == "acme-corp/acme-bot"
+
+
+def test_runtime_repo_parser_strips_sentence_punctuation(workspace: Any) -> None:
+    assert workspace.parse_github_repo_fact(
+        "Please update https://github.com/acme-corp/acme-bot."
+    ) == "acme-corp/acme-bot"
+
+
 @pytest.mark.parametrize(
     "message",
     [

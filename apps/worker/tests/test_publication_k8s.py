@@ -519,6 +519,52 @@ def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
     assert observed.pr_url == "https://github.com/acme-corp/acme-bot/pull/123"
 
 
+def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
+    publication_k8s: Any,
+) -> None:
+    cluster = object.__new__(publication_k8s.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    cluster._batch = SimpleNamespace(
+        read_namespaced_job=lambda *_args: {
+            "metadata": {"uid": "job-uid-123"},
+            "status": {
+                "succeeded": 0,
+                "failed": 1,
+                "conditions": [
+                    {"status": "True", "reason": "DeadlineExceeded"}
+                ],
+            },
+        }
+    )
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: SimpleNamespace(items=[])
+    )
+
+    observed = cluster.observe("curie-publication-22222222222242228222")
+
+    assert observed.phase == "failed"
+    assert observed.error == "DeadlineExceeded"
+
+
+def test_resource_builder_binds_clone_url_to_publication_repository(
+    publication_k8s: Any,
+) -> None:
+    payload = _payload(publication_k8s)
+    payload = publication_k8s.PublicationPayload(
+        **{
+            **payload.__dict__,
+            "clean_clone_url": "https://github.com/other-corp/other-repo.git",
+        }
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="clone URL"):
+        publication_k8s.build_publication_resources(
+            payload,
+            credential="publication-write-credential",
+            settings=_settings(publication_k8s),
+        )
+
+
 def test_publication_cluster_has_no_legacy_combined_cleanup_shim(
     publication_k8s: Any,
 ) -> None:

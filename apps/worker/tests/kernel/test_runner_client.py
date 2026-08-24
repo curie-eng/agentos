@@ -13,7 +13,7 @@ import pytest
 from aci_protocol import Event, Final, SessionStatus, TextDelta
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from curie_worker.runner_client import RunnerClient
+from curie_worker.runner_client import RunnerClient, RunnerError
 
 DONE = SessionStatus.DONE
 
@@ -212,6 +212,32 @@ def test_interrupt_is_bounded_by_its_own_timeout_not_the_streaming_budget() -> N
             assert elapsed < 5.0  # nowhere near the 30s streaming budget
         finally:
             runner.hang.set()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
+    async def go() -> None:
+        app = web.Application()
+
+        async def oversized(_request: web.Request) -> web.Response:
+            return web.Response(
+                body=b'{"patch_base64":"' + (b"A" * 140_000) + b'"}',
+                content_type="application/json",
+            )
+
+        app.add_routes([web.post("/v1/snapshot", oversized)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0, snapshot_patch_max_bytes=16)
+        try:
+            with pytest.raises(RunnerError, match="invalid bounded payload"):
+                await client.snapshot(
+                    f"http://127.0.0.1:{server.port}", token="runner-token"
+                )
+        finally:
             await client.close()
             await server.close()
 

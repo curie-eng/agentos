@@ -199,6 +199,7 @@ class _Cluster:
         self.observe_after_apply_error: Exception | None = None
         self.terminal_cleanup_fail_once = False
         self.terminal_cleanup_failures_remaining = 0
+        self.validated_existing: list[Any] = []
 
     def apply(self, resources: Any) -> None:
         self.applied.append(resources)
@@ -207,6 +208,9 @@ class _Cluster:
         if self.raise_after_apply:
             self.raise_after_apply = False
             raise RuntimeError("worker stopped after apiserver accepted resources")
+
+    def validate_existing(self, resources: Any) -> None:
+        self.validated_existing.append(resources)
 
     def observe(self, job_name: str) -> Any:
         if self.applied and self.observe_after_apply_error is not None:
@@ -747,6 +751,24 @@ async def test_terminal_job_recovers_remote_branch_or_lost_rest_response_before_
     assert cluster.applied == []
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert PR_URL in replies.events[0][0].text
+
+
+async def test_running_job_is_validated_without_redeeming_another_credential(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    cluster.preexisting_observation = publication.PublicationJobObservation(
+        phase="running", pr_url=None, logs=""
+    )
+
+    await loop.reconcile(_work(publication))
+
+    assert len(cluster.validated_existing) == 1
+    assert credentials.calls == []
+    assert github.calls == []
+    assert cluster.applied == []
+    assert store.completed == {}
+    assert replies.events == []
 
 
 async def test_credential_setup_failure_is_bounded_and_terminalized(publication: Any) -> None:
