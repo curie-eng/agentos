@@ -15,8 +15,9 @@ translation serve both the live HTTP turn and the conformance producer.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aci_protocol import (
     ErrorEvent,
@@ -32,12 +33,22 @@ from claude_agent_sdk import (
     RateLimitEvent,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
 from .otel import _GenerationSpan
 from .side_effects import SideEffectClassifier
+
+# Longest raw tool reply this will parse into a recordable ``result``. The reply
+# travels the wire and lands in a durable record, so an unbounded connector
+# response would be an unbounded row; the existing analogue is the approval
+# summary's 300-char input rendering, which is far tighter because a human reads
+# it. A prior-state snapshot of a Kubernetes object is tens of kilobytes, so this
+# is set to clear a realistic snapshot and refuse a blob.
+RESULT_MAX_BYTES = 64_000
 
 
 @dataclass
@@ -80,6 +91,12 @@ class TurnState:
     # reply recorded into the conversation transcript (#20); left None on a
     # failure/budget/auth final so those turns are not persisted as history.
     final_text: str | None = None
+    # Call id -> tool name, for side-effecting calls whose result has not arrived
+    # yet. A tool result lands on a LATER message, so the name has to be
+    # remembered to attribute it, and the id is what joins the two frames of one
+    # call into one record (ADR-0117). An entry is popped when its result
+    # arrives; one left standing is a call that never came back.
+    pending_actions: dict[str, str] = field(default_factory=dict)
 
 
 def translate_message(
@@ -94,6 +111,8 @@ def translate_message(
         return _translate_assistant(message, state, classifier, gen)
     if isinstance(message, ResultMessage):
         return _translate_result(message, state, gen)
+    if isinstance(message, UserMessage):
+        return _translate_user(message, state)
     if isinstance(message, RateLimitEvent):
         # status is one of allowed / allowed_warning / rejected; only a hard
         # rejection is an ACI error. The warning states are advisory (the model
@@ -159,12 +178,108 @@ def _translate_assistant(
                     # approval_granted_tool None so the worker can never mint a
                     # bypass grant from a model-authored request (#430).
                     state.approval_gate_kind = "policy"
-            if classifier.is_side_effecting(block.name) and not state.side_effect_emitted:
+            if classifier.is_side_effecting(block.name):
+                # One frame per CALL, not per turn. The cap was once-per-turn
+                # because the only consumer was a boolean, so a turn that called
+                # three mutating tools reported one; a consumer that records what
+                # happened needs each call (ADR-0117). ``side_effect_emitted``
+                # still latches below, so ADR-0013's no-retry rule and the
+                # false-completion check read exactly the signal they read before.
+                #
+                # This frame is emitted when the call is MADE, before its result
+                # exists, so a turn that dies mid-call has still reported that
+                # something mutated. Its result arrives on a later message and
+                # closes it in ``_translate_user``.
+                state.pending_actions[block.id] = block.name
                 events.append(
-                    SideEffectFlag(tool=block.name, detail="non-idempotent tool executed")
+                    SideEffectFlag(
+                        tool=block.name,
+                        detail="non-idempotent tool executed",
+                        call_id=block.id,
+                        arguments=block.input if isinstance(block.input, dict) else None,
+                    )
                 )
                 state.side_effect_emitted = True
     return events
+
+
+def _translate_user(message: UserMessage, state: TurnState) -> list[OutboundEvent]:
+    """Close a side-effecting call with what its tool answered, and nothing else.
+
+    A tool result arrives on a ``UserMessage``, which the v0.1 contract dropped
+    whole ("carry no outbound-visible content"). Read-only results stay dropped:
+    file contents are the model's working material, and forwarding them would put
+    a repository on the wire. A side-effecting call is different -- its reply is
+    the only place a connector can report what the call did to the world, which is
+    what makes the action recordable at all (ADR-0117).
+    """
+
+    if isinstance(message.content, str):
+        # UserMessage.content is a plain string OR a block list. A string carries
+        # no tool result, and iterating it would walk single characters.
+        return []
+    events: list[OutboundEvent] = []
+    for block in message.content:
+        if not isinstance(block, ToolResultBlock):
+            continue
+        tool = state.pending_actions.pop(block.tool_use_id, None)
+        if tool is None:
+            # Read-only, or a result for a call this turn never saw, or a second
+            # result for a call already closed. There is nothing to attribute it
+            # to, and minting a frame anyway would mint a second record.
+            continue
+        payload, oversized = _result_payload(block)
+        events.append(
+            SideEffectFlag(
+                tool=tool,
+                detail=(
+                    "tool result too large to record"
+                    if oversized
+                    else "non-idempotent tool completed"
+                ),
+                call_id=block.tool_use_id,
+                result=payload,
+                failed=bool(block.is_error),
+            )
+        )
+    return events
+
+
+def _result_payload(block: ToolResultBlock) -> tuple[dict[str, object] | None, bool]:
+    """The tool's structured reply, or None, plus whether size is why it is None.
+
+    Deliberately not a parse of prose. A connector that answers in a sentence has
+    no structured reply, and guessing one out of the sentence is how something
+    downstream ends up restoring a guess. No JSON object means no result, which
+    downstream means not undoable.
+    """
+
+    content = block.content
+    if isinstance(content, list):
+        # The SDK wraps an MCP tool's reply in content blocks.
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            parsed, oversized = _loads_object(part.get("text"))
+            if parsed is not None or oversized:
+                return parsed, oversized
+        return None, False
+    return _loads_object(content)
+
+
+def _loads_object(raw: object) -> tuple[dict[str, object] | None, bool]:
+    if not isinstance(raw, str):
+        return None, False
+    if len(raw.encode()) > RESULT_MAX_BYTES:
+        # Dropped, never truncated. A truncated JSON object either fails to parse
+        # or parses into a smaller object that is not what the tool said, and a
+        # restore would act on the difference.
+        return None, True
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, False
+    return (parsed if isinstance(parsed, dict) else None), False
 
 
 def _translate_result(

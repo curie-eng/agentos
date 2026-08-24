@@ -1,5 +1,7 @@
 """SDK-message to ACI-outbound-event translation."""
 
+import json
+
 from aci_protocol import SessionStatus
 from claude_agent_sdk import (
     AssistantMessage,
@@ -7,11 +9,13 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import SideEffectClassifier
-from curie_runner.translate import TurnState, translate_message
+from curie_runner.translate import RESULT_MAX_BYTES, TurnState, translate_message
 
 
 def _translate(message: object, state: TurnState | None = None) -> list:
@@ -25,7 +29,7 @@ def test_text_block_becomes_text_delta() -> None:
     assert events[0].text == "hi there"
 
 
-def test_tool_use_emits_note_and_side_effect_once() -> None:
+def test_tool_use_emits_a_note_and_a_flag_per_side_effecting_call() -> None:
     state = TurnState()
     msg = AssistantMessage(
         content=[
@@ -36,9 +40,11 @@ def test_tool_use_emits_note_and_side_effect_once() -> None:
     )
     events = _translate(msg, state)
     types = [e.type for e in events]
-    # Two tool notes, but the side-effect flag fires once per run (dedup).
+    # A note and a flag for each call. The flag was capped at once per run while
+    # its only consumer was a boolean; the action is the unit now (ADR-0117), and
+    # ``side_effect_emitted`` still latches for the consumers that read presence.
     assert types.count("tool_note") == 2
-    assert types.count("side_effect_flag") == 1
+    assert types.count("side_effect_flag") == 2
     assert state.side_effect_emitted
 
 
@@ -166,3 +172,153 @@ def test_rate_limit_warning_is_dropped() -> None:
         info = RateLimitInfo(status=status)
         events = _translate(RateLimitEvent(rate_limit_info=info, uuid="u", session_id="s"))
         assert events == []
+
+
+# --- One frame per call, and what each carries (ADR-0117) ----------------------
+
+
+def _tool_result(
+    tool_use_id: str,
+    content: object,
+    *,
+    is_error: bool | None = None,
+) -> UserMessage:
+    return UserMessage(
+        content=[
+            ToolResultBlock(tool_use_id=tool_use_id, content=content, is_error=is_error)
+        ]
+    )
+
+
+def test_each_side_effecting_call_gets_its_own_flag() -> None:
+    """The cap was once-per-turn because a boolean cannot be set twice.
+
+    A turn that calls three mutating tools reported one. The record, the receipt
+    line and the undo are all per action, so the frame is too.
+    """
+
+    state = TurnState()
+    msg = AssistantMessage(
+        content=[
+            ToolUseBlock(id="1", name="Bash", input={"command": "ls"}),
+            ToolUseBlock(id="2", name="Write", input={"file_path": "/tmp/x"}),
+        ],
+        model="m",
+    )
+    flags = [e for e in _translate(msg, state) if e.type == "side_effect_flag"]
+    assert [f.call_id for f in flags] == ["1", "2"]
+    assert [f.arguments for f in flags] == [{"command": "ls"}, {"file_path": "/tmp/x"}]
+
+
+def test_the_no_retry_signal_still_latches() -> None:
+    """ADR-0013's rule reads presence, not count, and kernel.py is sacred."""
+
+    state = TurnState()
+    msg = AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m")
+    _translate(msg, state)
+    assert state.side_effect_emitted
+
+
+def test_a_side_effecting_result_closes_its_call() -> None:
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m"),
+        state,
+    )
+    events = _translate(_tool_result("1", '{"ok": true, "prior": {"replicas": 3}}'), state)
+    assert [e.type for e in events] == ["side_effect_flag"]
+    assert events[0].call_id == "1"
+    assert events[0].result == {"ok": True, "prior": {"replicas": 3}}
+    assert events[0].failed is False
+
+
+def test_a_read_only_result_is_still_dropped_whole() -> None:
+    """File contents are the model's working material, not wire traffic."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Read", input={})], model="m"),
+        state,
+    )
+    assert _translate(_tool_result("1", "the whole file"), state) == []
+
+
+def test_a_prose_reply_carries_no_structured_result() -> None:
+    """Guessing structure out of a sentence is how a restore acts on a guess."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m"),
+        state,
+    )
+    events = _translate(_tool_result("1", "restarted the deployment"), state)
+    assert events[0].result is None
+
+
+def test_a_failed_call_says_so() -> None:
+    """A record is undoable only on a successful outcome, so the outcome travels."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m"),
+        state,
+    )
+    events = _translate(_tool_result("1", '{"ok": false}', is_error=True), state)
+    assert events[0].failed is True
+
+
+def test_an_oversized_result_is_dropped_not_truncated() -> None:
+    """A truncated JSON object is a lie a restore would act on."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m"),
+        state,
+    )
+    huge = json.dumps({"prior": {"blob": "x" * (RESULT_MAX_BYTES + 1)}})
+    events = _translate(_tool_result("1", huge), state)
+    assert events[0].result is None
+    assert events[0].detail == "tool result too large to record"
+
+
+def test_a_result_for_an_unknown_call_is_ignored() -> None:
+    state = TurnState()
+    assert _translate(_tool_result("nope", '{"ok": true}'), state) == []
+
+
+def test_a_call_is_closed_exactly_once() -> None:
+    """A duplicate result must not mint a second record for one call."""
+
+    state = TurnState()
+    _translate(
+        AssistantMessage(content=[ToolUseBlock(id="1", name="Bash", input={})], model="m"),
+        state,
+    )
+    assert len(_translate(_tool_result("1", '{"ok": true}'), state)) == 1
+    assert _translate(_tool_result("1", '{"ok": true}'), state) == []
+
+
+def test_a_string_user_message_is_not_iterated_as_characters() -> None:
+    """UserMessage.content is str OR a block list; the str case has no results."""
+
+    assert _translate(UserMessage(content="just text"), TurnState()) == []
+
+
+def test_a_call_whose_result_never_arrives_leaves_its_opening_frame() -> None:
+    """A turn that died mid-call still reported that something mutated.
+
+    The opening frame is the honest record of an attempt: arguments, no result,
+    and therefore not undoable downstream.
+    """
+
+    state = TurnState()
+    events = _translate(
+        AssistantMessage(
+            content=[ToolUseBlock(id="1", name="Bash", input={"command": "rm"})], model="m"
+        ),
+        state,
+    )
+    flags = [e for e in events if e.type == "side_effect_flag"]
+    assert len(flags) == 1
+    assert flags[0].result is None
+    assert state.pending_actions == {"1": "Bash"}
