@@ -1544,7 +1544,10 @@
         return actions;
       }
 
-      function updateHash(type, id) { history.replaceState(null, '', `#${encodeURIComponent(type)}/${encodeURIComponent(id)}`); }
+      function updateHash(type, id) {
+        const hash = `#${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
+        history.replaceState(null, '', `${location.origin}${location.pathname}${location.search}${hash}`);
+      }
 
       function applyHash() {
         const match = location.hash.match(/^#(node|seam|adr)\/(.+)$/);
