@@ -15,6 +15,7 @@ from curie_worker.reply_sink import TargetRoute
 
 PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 APPROVAL_ID = uuid.UUID("33333333-3333-4333-8333-333333333333")
+AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 PR_URL = "https://github.com/acme-corp/acme-bot/pull/123"
 RESOLVER = "U0APPROVE1"
 RESOLUTION_NOTE = "Ready to publish."
@@ -117,6 +118,7 @@ class _Store:
         return SimpleNamespace(
             publication_id=publication_id,
             approval_id=APPROVAL_ID,
+            agent_id=AGENT_ID,
             target=self.target,
             route=self.route,
             attempt=1,
@@ -324,6 +326,20 @@ class _Cards:
         )
 
 
+class _Transcript:
+    def __init__(self) -> None:
+        self.records: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
+
+    async def record_result(
+        self,
+        agent_id: uuid.UUID,
+        conversation_id: str,
+        publication_id: uuid.UUID,
+        text: str,
+    ) -> None:
+        self.records.append((agent_id, conversation_id, publication_id, text))
+
+
 def _card(*, approval_id: str = str(APPROVAL_ID)) -> ApprovalCardRef:
     return ApprovalCardRef(
         channel="C0EXAMPLE1",
@@ -385,6 +401,7 @@ def _card_work() -> Any:
 def _loop(
     module: Any,
     cards: _Cards | None = None,
+    transcript: _Transcript | None = None,
 ) -> tuple[Any, _Store, _Credentials, _Cluster, _GitHub, _Replies]:
     k8s = importlib.import_module("curie_worker.publication_k8s")
     store = _Store()
@@ -400,6 +417,7 @@ def _loop(
         github=github,
         replies=replies,
         card_store=cards,
+        transcript=transcript,
         job_settings=k8s.PublicationJobSettings(
             namespace="curie",
             runner_image="ghcr.io/curie-eng/curie-runner:v0.7.0",
@@ -439,6 +457,31 @@ async def test_publication_card_outbox_posts_and_remembers_before_ack(
     assert event.event == "reply.post"
     assert event.target.conversation_id == "1700000000.000100"
     assert event.message.interaction.id == str(APPROVAL_ID)
+
+
+async def test_terminal_result_is_recorded_for_the_next_model_turn(
+    publication: Any,
+) -> None:
+    transcript = _Transcript()
+    loop, store, _, _, _, replies = _loop(publication, transcript=transcript)
+    store.completed[PUBLICATION_ID] = ("published", PR_URL)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert transcript.records == [
+        (
+            AGENT_ID,
+            "1700000000.000100",
+            PUBLICATION_ID,
+            f"Published the approved changes: {PR_URL}",
+        )
+    ]
+    assert PR_URL in replies.events[0][0].text
 
 
 async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(

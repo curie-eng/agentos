@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Callable
 
 import httpx
 import pytest
-from curie_worker.publication_clients import GitHubPublicationLookup
+from curie_worker.publication_clients import (
+    GitHubPublicationLookup,
+    PublicationTranscriptClient,
+)
 from curie_worker.publication_loop import PublicationReconcileError
 
 REPO = "acme-corp/acme-bot"
@@ -60,6 +64,65 @@ async def test_recovery_adopts_exact_approved_pull_request() -> None:
         )
 
     assert recovered == PR_URL
+
+
+async def test_publication_result_is_appended_once_to_the_durable_transcript() -> None:
+    publication_id = "22222222-2222-4222-8222-222222222222"
+    agent_id = "11111111-1111-4111-8111-111111111111"
+    posts: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-API-Key"] == "platform-key"
+        if request.method == "GET":
+            return httpx.Response(404)
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"value": [posts[-1]["item"]]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        await transcript.record_result(
+            uuid.UUID(agent_id),
+            "1700000000.000100",
+            uuid.UUID(publication_id),
+            f"Published the approved changes: {PR_URL}",
+        )
+
+    assert len(posts) == 1
+    item = posts[0]["item"]
+    assert isinstance(item, dict)
+    assert item["publication_id"] == publication_id
+    assert item["assistant"] == f"Published the approved changes: {PR_URL}"
+
+
+async def test_existing_publication_transcript_record_is_not_appended_again() -> None:
+    publication_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(
+            200,
+            json={"value": [{"publication_id": str(publication_id)}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        await transcript.record_result(
+            uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            "1700000000.000100",
+            publication_id,
+            f"Published the approved changes: {PR_URL}",
+        )
+
+    assert calls == ["GET"]
 
 
 @pytest.mark.parametrize(
