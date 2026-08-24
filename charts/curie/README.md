@@ -928,6 +928,6 @@ by the CLI's preserved-values mechanism (the same one `COMMS_MANAGED_KEYS` and
 `GITHUB_APP_MANAGED_KEYS` give the Slack tokens and the GitHub App identity in
 `cli/src/ops.rs`). A plain `curie cluster up` runs a full `helm upgrade
 --install` with no `--reuse-values`, so it resets any values key it does not
-explicitly re-supply — set one of these fields today and keep it declared in
+explicitly re-supply -- set one of these fields today and keep it declared in
 the values file you pass to every `cluster up`/`helm upgrade`, the same way you
 would for any other values key the CLI does not manage yet.

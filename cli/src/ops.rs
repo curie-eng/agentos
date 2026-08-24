@@ -1269,6 +1269,32 @@ fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<St
     lookup_dotted(existing?, key).filter(|current| !current.is_empty())
 }
 
+/// Which Secret and key a direct-passthrough credential (issue #1759) should
+/// be read from, given the release's recorded Helm values: the operator's own
+/// `existingSecret` when one is configured for this key, otherwise `None` (the
+/// caller falls back to the chart's own release Secret and the published key
+/// name for this credential).
+///
+/// MUST stay the same decision as the chart's own BYO-wins precedence
+/// (`curie.secretRef.*` and the per-key if/else in
+/// `charts/curie/templates/{worker,dispatcher,api,agent-sandbox}.yaml`): a CLI
+/// read that resolves a different Secret than the workload's own env would
+/// report a plausible but wrong value, which is worse than reporting none.
+/// Pure and testable; the actual `helm get values` read stays in the async
+/// caller.
+fn resolve_existing_secret_ref(
+    existing: Option<&serde_json::Value>,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+    default_data_key: &str,
+) -> Option<(String, String)> {
+    let secret_name = lookup_dotted(existing?, existing_secret_key).filter(|s| !s.is_empty())?;
+    let data_key = lookup_dotted(existing?, existing_secret_key_key)
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| default_data_key.to_string());
+    Some((secret_name, data_key))
+}
+
 /// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
 ///
 /// An operator `--set` for a key always wins, and a key helm has no record of
@@ -6037,19 +6063,27 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
-/// Discover a Helm release's Slack bot token from the same chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`). In connected mode
-/// `cluster message` posts a real placeholder to the workspace with this token so
-/// the approval card and resumed reply ride the connected transport, instead of
-/// the throwaway stub (#770/ADR-0078). Only reached when a `<release>-dispatcher`
-/// is present (a workspace IS connected), so the token is expected to be set; an
-/// empty or unreadable value is an actionable error. The value is never printed
-/// -- it flows only into the `chat.postMessage` auth header.
+/// Discover a Helm release's Slack bot token from the chart Secret
+/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
+/// In connected mode `cluster message` posts a real placeholder to the
+/// workspace with this token so the approval card and resumed reply ride the
+/// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
+/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// connected), so the token is expected to be set; an empty or unreadable
+/// value is an actionable error. The value is never printed -- it flows only
+/// into the `chat.postMessage` auth header.
 pub async fn discover_slack_bot_token(namespace: &str, release: &str) -> Result<String> {
-    read_release_secret(namespace, release, "slackBotToken")
-        .await
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
+    read_direct_passthrough_secret(
+        namespace,
+        release,
+        "slackBotToken",
+        "dispatcher.slack.botTokenExistingSecret",
+        "dispatcher.slack.botTokenExistingSecretKey",
+    )
+    .await
+    .filter(|token| !token.is_empty())
+    .ok_or_else(|| {
             slack_bot_token_usage_err(format!(
                 "could not read a Slack bot token from the chart Secret for release {release} in namespace \
                  {namespace}; the workspace may not be connected (run `curie cluster comms \
@@ -6172,7 +6206,9 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
-/// if a rotation is in progress.
+/// if a rotation is in progress. Follows the operator's own
+/// `sealing.{privateKey,previousPrivateKey}ExistingSecret` when configured
+/// (#1759), otherwise the chart's own Secret.
 ///
 /// Returns whatever is present. An empty vector means this release has no
 /// sealing key, which the caller must report rather than work around -- sealing
@@ -6180,8 +6216,27 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 /// that starts and then fails every call.
 pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
     let mut keys = Vec::new();
-    for data_key in ["sealingPrivateKey", "sealingPreviousPrivateKey"] {
-        if let Some(value) = read_release_secret(namespace, release, data_key).await {
+    for (default_data_key, existing_secret_key, existing_secret_key_key) in [
+        (
+            "sealingPrivateKey",
+            "sealing.privateKeyExistingSecret",
+            "sealing.privateKeyExistingSecretKey",
+        ),
+        (
+            "sealingPreviousPrivateKey",
+            "sealing.previousPrivateKeyExistingSecret",
+            "sealing.previousPrivateKeyExistingSecretKey",
+        ),
+    ] {
+        if let Some(value) = read_direct_passthrough_secret(
+            namespace,
+            release,
+            default_data_key,
+            existing_secret_key,
+            existing_secret_key_key,
+        )
+        .await
+        {
             if !value.trim().is_empty() {
                 keys.push(value);
             }
@@ -6196,6 +6251,15 @@ pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
 /// that into an actionable error naming its own escape-hatch flag.
 async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> Option<String> {
     let secret = release_secret_name(namespace, release).await?;
+    read_secret_key(namespace, &secret, data_key).await
+}
+
+/// Read one data key out of a NAMED Secret -- not necessarily the release's own
+/// chart Secret, since a direct-passthrough credential's `existingSecret` names
+/// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
+/// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
+/// when the Secret, the key, or the cluster is unreachable.
+async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6203,7 +6267,7 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
             plain(namespace),
             plain("get"),
             plain("secret"),
-            plain(secret),
+            plain(secret_name),
             plain("-o"),
             plain(format!(
                 "go-template={{{{ index .data \"{data_key}\" | base64decode }}}}"
@@ -6213,6 +6277,39 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
     match run_capture(&cmd).await {
         Ok((true, out, _)) if !out.trim().is_empty() => Some(out.trim().to_string()),
         _ => None,
+    }
+}
+
+/// Read a direct-passthrough credential (issue #1759), following the operator's
+/// own `existingSecret` when one is configured for this key and otherwise
+/// falling back to the chart's own Secret and its published key name -- the
+/// same BYO-wins precedence the chart templates themselves use.
+///
+/// Without this, a CLI verb that reads the credential straight from the
+/// chart's own Secret (as every one of these did before the BYO escape
+/// existed) silently reads nothing for anyone who adopts it, even though the
+/// deployed workload resolves correctly from the operator's Secret.
+async fn read_direct_passthrough_secret(
+    namespace: &str,
+    release: &str,
+    default_data_key: &str,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+) -> Option<String> {
+    let common = CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    let existing = fetch_existing_values(&common).await.ok().flatten();
+    match resolve_existing_secret_ref(
+        existing.as_ref(),
+        existing_secret_key,
+        existing_secret_key_key,
+        default_data_key,
+    ) {
+        Some((secret_name, data_key)) => read_secret_key(namespace, &secret_name, &data_key).await,
+        None => read_release_secret(namespace, release, default_data_key).await,
     }
 }
 
@@ -8700,6 +8797,77 @@ mod tests {
         );
         assert_eq!(lookup_dotted(&v, "postgres.auth.missing"), None);
         assert_eq!(lookup_dotted(&serde_json::Value::Null, "api.apiKey"), None);
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_prefers_operator_secret_and_custom_key() {
+        // #1759 follow-up: a release with a BYO existingSecret configured must
+        // resolve to that Secret and its (possibly overridden) key name, not
+        // the chart's own Secret -- this is the read-path half of the bug
+        // `curie seal`/`curie cluster message` hit before this fix, where they
+        // read straight from the chart's own Secret and never checked for a
+        // BYO override.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sealing":{"privateKeyExistingSecret":"my-sealing-secret","privateKeyExistingSecretKey":"customKey"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            Some(("my-sealing-secret".to_string(), "customKey".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_defaults_key_when_key_field_absent() {
+        // The chart's own default for *ExistingSecretKey is the published key
+        // name (e.g. `botTokenExistingSecretKey: slackBotToken`), so a release
+        // that set only the Secret name and left the key at its default must
+        // still resolve to the published key, not an empty/missing key.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"dispatcher":{"slack":{"botTokenExistingSecret":"my-slack-secret"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "dispatcher.slack.botTokenExistingSecret",
+                "dispatcher.slack.botTokenExistingSecretKey",
+                "slackBotToken"
+            ),
+            Some(("my-slack-secret".to_string(), "slackBotToken".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_none_when_not_configured() {
+        // Negative control: no release at all, and a release that only set the
+        // plain value (no BYO escape) -- both must fall through to None so the
+        // caller reads the chart's own Secret, exactly as it did before #1759.
+        assert_eq!(
+            resolve_existing_secret_ref(
+                None,
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sealing":{"privateKey":"plain-value"}}"#).unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
     }
 
     #[test]

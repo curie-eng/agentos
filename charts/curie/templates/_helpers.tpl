@@ -741,7 +741,7 @@ true
 {{- end -}}
 {{- end -}}
 
-{{/* ---- BYO existingSecret escapes for direct-passthrough credentials
+{{/* ---- BYO existingSecret escape for a direct-passthrough credential
      (issue #1759) ----
 
      Eight keys (agentCredentials, adapterCredentials, githubToken,
@@ -752,34 +752,34 @@ true
      value and the consumer's secretKeyRef points straight at the operator's
      Secret, so a BYO Secret missing the key fails that pod loudly with
      CreateContainerConfigError instead of the chart emitting an empty
-     credential. Six of the eight have exactly one consumer template and are
-     inlined there with the same if/else githubAppPrivateKey uses; the two
-     with more than one consumer get a shared helper here so the consumers
-     cannot resolve the escape differently -- exactly the parity-seam trap
+     credential.
+
+     One generic helper for all eight, following the dict-argument pattern
+     `curie.image`/`curie.managedSecret` already use in this file, rather than
+     a bespoke per-key helper or a hand-copied if/else at each consumer: every
+     consumer of the SAME key -- there are three for slackBotToken, two for
+     agentCredentials -- calls this with the same arguments and so cannot
+     resolve the escape differently, exactly the parity-seam trap
      `curie.env.postgres`/`curie.env.valkey` already exist to avoid for the
-     backing stores. */}}
+     backing stores; a single-consumer key gets the same guarantee for free
+     if it ever grows a second one.
 
-{{/* agentCredentials: read by both agent-sandbox.yaml (the warm-pod
-     fallback) and worker.yaml (the per-claim injection). */}}
-{{- define "curie.secretRef.agentCredentials" -}}
-{{- if .Values.agentSandbox.runner.credentialsExistingSecret -}}
-name: {{ .Values.agentSandbox.runner.credentialsExistingSecret | quote }}
-key: {{ .Values.agentSandbox.runner.credentialsExistingSecretKey | quote }}
+     Pass a dict:
+       root               the top context
+       existingSecret     .Values.<field>ExistingSecret
+       existingSecretKey  .Values.<field>ExistingSecretKey
+       defaultKey         this credential's published key in the chart's own
+                           Secret (secrets.yaml), used when existingSecret is
+                           empty
+     Renders the two lines a secretKeyRef needs (`name:` / `key:`); include
+     with `nindent 18` to land at a container's secretKeyRef column. */}}
+{{- define "curie.secretRef" -}}
+{{- if .existingSecret -}}
+name: {{ .existingSecret | quote }}
+key: {{ .existingSecretKey | quote }}
 {{- else -}}
-name: {{ include "curie.secretName" . }}
-key: agentCredentials
-{{- end -}}
-{{- end -}}
-
-{{/* slackBotToken: read by dispatcher.yaml, api.yaml (the approval
-     user-group authorizer), and worker.yaml (the Slack placeholder editor). */}}
-{{- define "curie.secretRef.slackBotToken" -}}
-{{- if .Values.dispatcher.slack.botTokenExistingSecret -}}
-name: {{ .Values.dispatcher.slack.botTokenExistingSecret | quote }}
-key: {{ .Values.dispatcher.slack.botTokenExistingSecretKey | quote }}
-{{- else -}}
-name: {{ include "curie.secretName" . }}
-key: slackBotToken
+name: {{ include "curie.secretName" .root }}
+key: {{ .defaultKey }}
 {{- end -}}
 {{- end -}}
 

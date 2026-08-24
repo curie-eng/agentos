@@ -15,9 +15,10 @@
 #        resolve to the named Secret instead -- not just one consumer, for the
 #        two keys with more than one (agentCredentials: agent-sandbox.yaml +
 #        worker.yaml; slackBotToken: dispatcher.yaml + api.yaml + worker.yaml).
-#   3.   For two of those keys, the *ExistingSecret wins even when a stale
-#        inline value is left in place (mirrors github-app-credential-
-#        assertions.sh assertion (f)).
+#        Group 2's render also carries a stale inline value on every field, so
+#        it already proves "BYO wins over stale" for all eight, not just the
+#        two multi-consumer ones (mirrors github-app-credential-assertions.sh
+#        assertion (f)).
 #   4.   curie.dispatcher.enabled (_helpers.tpl) must treat an *ExistingSecret
 #        as "token present" too, so a dispatcher wired entirely via BYO
 #        secrets still deploys -- with a negative control proving the gate
@@ -27,14 +28,18 @@
 #        "credentials OR credentialsExistingSecret", in both places -- with a
 #        negative control proving CURIE_CREDENTIALS still renders in neither
 #        when both are empty.
-#   6.   NOT asserted here: a BYO Secret missing the referenced key must fail
+#   7.   worker.yaml's checksum/adapter-credentials annotation must change
+#        when adapterCredentialsExistingSecret changes (inline value held
+#        constant), so switching which BYO Secret backs the credential still
+#        rolls the worker Deployment.
+#   8.   NOT asserted here: a BYO Secret missing the referenced key must fail
 #        the pod loudly (CreateContainerConfigError). `helm template` cannot
 #        exercise real Kubernetes admission, so that property is a cluster-
 #        tier property, verified separately against a real cluster (the same
 #        caveat secrets.yaml already documents for the otlpAuthHeader key).
 #
 # This script is expected to FAIL against the chart as it stands before the
-# *ExistingSecret escape lands (assertions 2, 3, 4a and 5a/5b), and to pass
+# *ExistingSecret escape lands (assertions 2, 4a, 5a/5b and 7), and to pass
 # once it does. Accumulates every failure instead of stopping at the first, so
 # a single run reports the complete list.
 set -uo pipefail
@@ -46,7 +51,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAILED=0
-ASSERTION_COUNT=30
+ASSERTION_COUNT=29
 
 # Render the whole chart (never `-s`/--show-only for a template that can
 # render to nothing: under this environment's helm, `-s` on a template whose
@@ -248,7 +253,10 @@ check_ref("1k", f"{d}/dispatcher.yaml", "dispatcher", "SLACK_SIGNING_SECRET",
 
 # ---- 2: *ExistingSecret makes every consumer resolve to the named Secret
 #         instead, winning over the stale inline value the same render also
-#         carries (assertion 3 is folded in below under its own IDs). ----
+#         carries for every field -- so this group already IS the "wins over
+#         stale" proof for all eight keys, not just the two multi-consumer
+#         ones; a separate assertion 3 repeating 2b/2h byte-for-byte would add
+#         no coverage of its own. ----
 b = BYO_DIR
 check_ref("2a", f"{b}/agent-sandbox.yaml", "runner", "CURIE_CREDENTIALS",
           "byo-agentcreds", "agentCredentials", "agentCredentials via agent-sandbox.yaml")
@@ -273,17 +281,6 @@ check_ref("2j", f"{b}/worker.yaml", "worker", "SLACK_BOT_TOKEN",
 check_ref("2k", f"{b}/dispatcher.yaml", "dispatcher", "SLACK_SIGNING_SECRET",
           "byo-signingsecret", "slackSigningSecret", "slackSigningSecret via dispatcher.yaml")
 
-# ---- 3: BYO wins over a stale inline value, named explicitly for the two
-#         multi-consumer keys (mirrors github-app-credential-assertions.sh
-#         assertion (f)). Reuses the byo render above -- every field there
-#         already carries both a stale inline value and an *ExistingSecret. ----
-check_ref("3a", f"{b}/worker.yaml", "worker", "CURIE_CREDENTIALS",
-          "byo-agentcreds", "agentCredentials",
-          "agentCredentialsExistingSecret must win over inline STALE-agentcreds (worker.yaml)")
-check_ref("3b", f"{b}/dispatcher.yaml", "dispatcher", "SLACK_BOT_TOKEN",
-          "byo-bottoken", "slackBotToken",
-          "botTokenExistingSecret must win over inline STALE-bottoken (dispatcher.yaml)")
-
 # ---- 5: the agentCredentials gate (agent-sandbox.yaml AND worker.yaml) must
 #         also open on credentialsExistingSecret alone. ----
 p = AGENTCRED_POS_DIR
@@ -303,10 +300,10 @@ check_absent("5d", f"{n}/worker.yaml", "worker", "CURIE_CREDENTIALS",
 if failures:
     for msg in failures:
         print(f"FAIL {msg}", file=sys.stderr)
-    print(f"{len(failures)} of 28 python-side assertions failed "
-          "(assertions 1-3 and 5a-5d; 4a-4b run separately in bash)", file=sys.stderr)
+    print(f"{len(failures)} of 26 python-side assertions failed "
+          "(assertions 1, 2 and 5a-5d; 4a-4b and 7 run separately in bash)", file=sys.stderr)
     sys.exit(1)
-print("OK: all 28 python-side assertions passed (1a-1k, 2a-2k, 3a-3b, 5a-5d)")
+print("OK: all 26 python-side assertions passed (1a-1k, 2a-2k, 5a-5d)")
 PY
 [ $? -eq 0 ] || FAILED=1
 
@@ -343,7 +340,33 @@ else
   echo "OK [4b] dispatcher stays undeployed when only one Slack token is present by any means"
 fi
 
-# ---- 6 (note, not an assertion): a BYO Secret missing the referenced key
+# ------------------------------------------------------------------------
+# Assertion 7: worker.yaml's checksum/adapter-credentials annotation must
+# change when adapterCredentialsExistingSecret changes, holding the inline
+# adapterCredentials value constant -- otherwise switching (or clearing)
+# which BYO Secret backs this credential never rolls the worker Deployment,
+# silently narrowing the rollout guarantee this annotation exists for.
+# ------------------------------------------------------------------------
+render checksum-base \
+  --set worker.adapterCredentials.myadapter=constant-value
+render checksum-existing-secret \
+  --set worker.adapterCredentials.myadapter=constant-value \
+  --set worker.adapterCredentialsExistingSecret=my-adapter-secret
+CHECKSUM_BASE="$(grep -o 'checksum/adapter-credentials: .*' "$TMP/checksum-base/curie/templates/worker.yaml")"
+CHECKSUM_WITH_SECRET="$(grep -o 'checksum/adapter-credentials: .*' "$TMP/checksum-existing-secret/curie/templates/worker.yaml")"
+if [ -z "$CHECKSUM_BASE" ] || [ -z "$CHECKSUM_WITH_SECRET" ]; then
+  echo "FAIL [7] checksum/adapter-credentials annotation missing from a rendered worker.yaml" >&2
+  FAILED=1
+elif [ "$CHECKSUM_BASE" = "$CHECKSUM_WITH_SECRET" ]; then
+  echo "FAIL [7] checksum/adapter-credentials did not change when" \
+       "worker.adapterCredentialsExistingSecret was set (inline value held constant)." \
+       "Switching which BYO Secret backs this credential must roll the worker Deployment." >&2
+  FAILED=1
+else
+  echo "OK [7] checksum/adapter-credentials changes when adapterCredentialsExistingSecret changes"
+fi
+
+# ---- 8 (note, not an assertion): a BYO Secret missing the referenced key
 # must fail the pod loudly with CreateContainerConfigError. `helm template`
 # never talks to the API server, so it cannot exercise that admission-time
 # behaviour -- it is verified separately against a real cluster, the same

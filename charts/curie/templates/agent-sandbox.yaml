@@ -510,11 +510,11 @@ spec:
             # Warm-pod fallback credential; the worker's per-claim Overrides
             # injection carries the (per-agent) credential on a bound run.
             # Same shared secret reference worker.yaml resolves (issue #1759,
-            # curie.secretRef.agentCredentials), so the two cannot drift apart.
+            # curie.secretRef), so the two cannot drift apart.
             - name: CURIE_CREDENTIALS
               valueFrom:
                 secretKeyRef:
-                  {{- include "curie.secretRef.agentCredentials" . | nindent 18 }}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" $runner.credentialsExistingSecret "existingSecretKey" $runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | nindent 18 }}
             {{- end }}
             - name: CURIE_PLUGIN_DIR
               value: {{ $runner.pluginDir | quote }}
