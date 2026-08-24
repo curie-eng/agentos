@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import threading
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -63,14 +64,18 @@ def publication_stack(
 
 
 def _create_deployment(
-    client: TestClient, auth_headers: dict[str, str], *, name: str | None = None
+    client: TestClient,
+    auth_headers: dict[str, str],
+    *,
+    name: str | None = None,
+    channel: str = "C0EXAMPLE1",
 ) -> dict[str, Any]:
     suffix = uuid.uuid4().hex[:8]
     agent_response = client.post(
         "/agents",
         json={
             "name": name or f"publisher-{suffix}",
-            "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+            "channel": {"kind": "slack", "address": channel},
             "repo_full_name": REPO,
         },
         headers=auth_headers,
@@ -175,12 +180,14 @@ def _resolve(
     decision: str = "approved",
     actor: str = "U0REQUEST1",
     channel: str = "C0EXAMPLE1",
+    note: str | None = None,
 ) -> Any:
     return client.post(
         f"/approvals/{approval_id}/resolve",
         json={
             "decision": decision,
             "resolved_by": actor,
+            "note": note,
             "actor_channel": channel,
         },
         headers=auth_headers,
@@ -288,7 +295,9 @@ def test_publication_replay_refuses_a_changed_conversation_or_agent_identity(
     )
     assert rejected_thread.status_code == 409
 
-    other_deployment = _create_deployment(client, auth_headers)
+    other_deployment = _create_deployment(
+        client, auth_headers, channel="C0EXAMPLE2"
+    )
     wrong_agent = dict(payload, deployment_id=other_deployment["id"])
     rejected_agent = client.post(
         "/v1/internal/publications", json=wrong_agent, headers=WORKER_HEADERS
@@ -590,7 +599,12 @@ def test_publication_card_and_result_claims_survive_process_replacement(
             assert reclaimed_card is not None
             await replacement.mark_card_delivered(reclaimed_card.publication_id)
 
-            approved = _resolve(client, auth_headers, publication["approval_id"])
+            approved = _resolve(
+                client,
+                auth_headers,
+                publication["approval_id"],
+                note="Approved for the release fixture",
+            )
             assert approved.status_code == 200, approved.text
             job = await replacement.claim_next()
             assert job is not None
@@ -606,6 +620,11 @@ def test_publication_card_and_result_claims_survive_process_replacement(
 
             abandoned_result = await first.pending_result(job.publication_id)
             assert abandoned_result is not None
+            assert abandoned_result.resolved_by == "U0REQUEST1"
+            assert (
+                abandoned_result.resolution_note
+                == "Approved for the release fixture"
+            )
             async with engine.begin() as connection:
                 await connection.execute(
                     text(

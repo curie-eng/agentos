@@ -172,7 +172,10 @@ def test_publish_script_uses_clean_remote_file_askpass_rest_and_redacted_marker(
     )
     assert "git_with_timeout apply --check" in script
     assert "git_with_timeout push" in script
-    assert 'timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git "$@"' in script
+    assert (
+        'timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" '
+        'git -c http.followRedirects=false "$@"' in script
+    )
     assert 'timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])' in script
     assert PR_API_URL not in script, "repository-specific URLs must be derived at runtime"
     assert 'github_api = os.environ["GITHUB_API_URL"].rstrip("/")' in script

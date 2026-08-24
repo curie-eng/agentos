@@ -213,7 +213,7 @@ def test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe(
     assert selected.status_code == reused.status_code == 200
     assert selected.json() == reused.json() == {"repo_full_name": REPO}
     assert conflict.status_code == 409
-    assert "different repository" in conflict.json()["detail"]
+    assert conflict.json()["detail"]["code"] == "workspace.selection_conflict"
     assert _selection_rows() == [
         {
             "agent_id": uuid.UUID(agent_id),
