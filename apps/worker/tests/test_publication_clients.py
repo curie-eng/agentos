@@ -12,7 +12,10 @@ from curie_worker.publication_clients import (
     GitHubPublicationLookup,
     PublicationTranscriptClient,
 )
-from curie_worker.publication_loop import PublicationReconcileError
+from curie_worker.publication_loop import (
+    PublicationReconcileError,
+    PublicationTranscriptPermanentError,
+)
 
 REPO = "acme-corp/acme-bot"
 BRANCH = "curie/publication-22222222222242228222222222222222"
@@ -69,14 +72,16 @@ async def test_recovery_adopts_exact_approved_pull_request() -> None:
 async def test_publication_result_is_appended_once_to_the_durable_transcript() -> None:
     publication_id = "22222222-2222-4222-8222-222222222222"
     agent_id = "11111111-1111-4111-8111-111111111111"
-    posts: list[dict[str, object]] = []
+    appends: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-API-Key"] == "platform-key"
         if request.method == "GET":
             return httpx.Response(404)
-        posts.append(json.loads(request.content))
-        return httpx.Response(200, json={"value": [posts[-1]["item"]]})
+        assert request.method == "POST"
+        assert request.url.path.endswith("/append")
+        appends.append(json.loads(request.content))
+        return httpx.Response(200, json={"value": [appends[-1]["item"]]})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         transcript = PublicationTranscriptClient(
@@ -91,8 +96,8 @@ async def test_publication_result_is_appended_once_to_the_durable_transcript() -
             f"Published the approved changes: {PR_URL}",
         )
 
-    assert len(posts) == 1
-    item = posts[0]["item"]
+    assert len(appends) == 1
+    item = appends[0]["item"]
     assert isinstance(item, dict)
     assert item["publication_id"] == publication_id
     assert item["assistant"] == f"Published the approved changes: {PR_URL}"
@@ -106,7 +111,10 @@ async def test_existing_publication_transcript_record_is_not_appended_again() ->
         calls.append(request.method)
         return httpx.Response(
             200,
-            json={"value": [{"publication_id": str(publication_id)}]},
+            json={
+                "value": [{"publication_id": str(publication_id)}],
+                "version": 4,
+            },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -123,6 +131,105 @@ async def test_existing_publication_transcript_record_is_not_appended_again() ->
         )
 
     assert calls == ["GET"]
+
+
+async def test_atomic_append_never_replaces_a_preexisting_transcript_item() -> None:
+    publication_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    prior: dict[str, object] = {
+        "user": "Earlier turn",
+        "assistant": "Earlier answer",
+    }
+    stored: list[dict[str, object]] = [prior]
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"value": list(stored), "version": 7})
+        assert request.method == "POST"
+        assert request.url.path.endswith("/append")
+        body = json.loads(request.content)
+        assert set(body) == {"item"}
+        stored.append(body["item"])
+        return httpx.Response(200, json={"value": list(stored), "version": 8})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        await transcript.record_result(
+            uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            "1700000000.000100",
+            publication_id,
+            f"Published the approved changes: {PR_URL}",
+        )
+
+    assert calls == ["GET", "POST"]
+    assert stored[0] == prior
+    assert len(stored) == 2
+    assert stored[1]["publication_id"] == str(publication_id)
+
+
+async def test_lost_append_response_is_absorbed_by_recovery_get() -> None:
+    publication_id = uuid.UUID("22222222-2222-4222-8222-222222222222")
+    stored: list[dict[str, object]] = []
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            if not stored:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"value": list(stored), "version": 1})
+        assert request.method == "POST"
+        assert request.url.path.endswith("/append")
+        body = json.loads(request.content)
+        stored.append(body["item"])
+        raise httpx.ReadError("append response was lost", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        await transcript.record_result(
+            uuid.UUID("11111111-1111-4111-8111-111111111111"),
+            "1700000000.000100",
+            publication_id,
+            f"Published the approved changes: {PR_URL}",
+        )
+
+    assert calls == ["GET", "POST", "GET"]
+    assert len(stored) == 1
+    assert stored[0]["publication_id"] == str(publication_id)
+
+
+async def test_transcript_capacity_refusal_is_classified_as_permanent() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"value": [], "version": 7})
+        assert request.method == "POST"
+        return httpx.Response(413)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        transcript = PublicationTranscriptClient(
+            api_base_url="https://api.example.com",
+            api_key="platform-key",
+            client=client,
+        )
+        with pytest.raises(
+            PublicationTranscriptPermanentError,
+            match="exceeded durable state capacity",
+        ):
+            await transcript.record_result(
+                uuid.UUID("11111111-1111-4111-8111-111111111111"),
+                "1700000000.000100",
+                uuid.UUID("22222222-2222-4222-8222-222222222222"),
+                f"Published the approved changes: {PR_URL}",
+            )
 
 
 @pytest.mark.parametrize(

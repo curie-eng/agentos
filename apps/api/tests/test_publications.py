@@ -173,6 +173,25 @@ def _counts() -> tuple[int, int]:
     return int(row["approvals"]), int(row["publications"])
 
 
+def test_publication_persistence_refuses_casefolded_git_metadata_path(
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, _ = publication_stack
+    deployment = _create_deployment(client, auth_headers)
+    payload = _publication_payload(deployment["id"])
+    payload["changed_paths"] = [".GIT/config"]
+
+    refused = client.post(
+        "/v1/internal/publications", json=payload, headers=WORKER_HEADERS
+    )
+
+    assert refused.status_code == 422
+    assert "safe repository-relative paths" in refused.text
+    assert _counts() == (0, 0)
+
+
 def _stream_entries(stream: str) -> list[Any]:
     valkey: redis.Redis = connect_or_skip(decode_responses=True)
     try:
@@ -576,7 +595,7 @@ def test_publication_card_and_result_claims_survive_process_replacement(
     auth_headers: dict[str, str],
     clean_db: None,
 ) -> None:
-    """Expired leases are reclaimable because claims do not consume attempts."""
+    """Expired leases reclaim, while failed result delivery observes backoff."""
 
     from curie_worker.publication_store import PostgresPublicationStore
 
@@ -587,7 +606,7 @@ def test_publication_card_and_result_claims_survive_process_replacement(
         _publication_payload(deployment["id"], dedupe_key="process-replacement"),
     )
 
-    async def exercise() -> tuple[int, int, int, int]:
+    async def exercise() -> tuple[int, int, int, int, int]:
         engine = create_async_engine(get_settings().database_url)
         first = PostgresPublicationStore(
             engine, schema="curie", lease_owner="replaced-worker", lease_seconds=60
@@ -651,16 +670,41 @@ def test_publication_card_and_result_claims_survive_process_replacement(
             await replacement.retry_result_delivery(
                 reclaimed_result.publication_id, error="reply unavailable"
             )
+            assert await first.pending_result(job.publication_id) is None
+            async with engine.begin() as connection:
+                backoff_active = (
+                    await connection.execute(
+                        text(
+                            "SELECT lease_owner IS NULL "
+                            "AND lease_expires_at > now() "
+                            "FROM curie.publications WHERE id = :id"
+                        ),
+                        {"id": job.publication_id},
+                    )
+                ).scalar_one()
+                assert backoff_active is True
+                await connection.execute(
+                    text(
+                        "UPDATE curie.publications "
+                        "SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job.publication_id},
+                )
+            retried_result = await first.pending_result(job.publication_id)
+            assert retried_result is not None
+            await first.mark_result_delivered(retried_result.publication_id)
             return (
                 abandoned_card.attempt,
                 reclaimed_card.attempt,
                 abandoned_result.attempt,
                 reclaimed_result.attempt,
+                retried_result.attempt,
             )
         finally:
             await engine.dispose()
 
-    assert asyncio.run(exercise()) == (0, 0, 0, 0)
+    assert asyncio.run(exercise()) == (0, 0, 0, 0, 1)
     attempts = _rows(
         "SELECT approval_card_delivery_attempts, result_delivery_attempts "
         "FROM curie.publications WHERE id = :id",

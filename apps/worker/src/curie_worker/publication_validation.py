@@ -41,7 +41,7 @@ def _safe_changed_path(path: str) -> bool:
         and "\\" not in path
         and not pure.is_absolute()
         and all(part not in ("", ".", "..") for part in pure.parts)
-        and pure.parts[0] != ".git"
+        and pure.parts[0].casefold() != ".git"
         and tuple(part.casefold() for part in pure.parts[:2])
         != (".github", "workflows")
     )

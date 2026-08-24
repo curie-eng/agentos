@@ -7,7 +7,7 @@ import inspect
 import logging
 import re
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, cast
 
@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 class PublicationReconcileError(RuntimeError):
     """A durable publication could not reach a safe terminal state."""
+
+
+class PublicationTranscriptPermanentError(PublicationReconcileError):
+    """A transcript result cannot be recorded by retrying the same payload."""
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,16 @@ async def _resolve[T](value: T | Awaitable[T]) -> T:
     return value
 
 
+async def _cluster_call[T](
+    operation: Callable[..., T | Awaitable[T]],
+    *args: Any,
+) -> T:
+    """Run the synchronous Kubernetes seam without blocking the worker loop."""
+
+    result = await asyncio.to_thread(operation, *args)
+    return await _resolve(result)
+
+
 def _marker_url(logs: str) -> str | None:
     match = _PR_MARKER.search(logs)
     return match.group(1) if match else None
@@ -213,6 +227,12 @@ class PublicationReconciler:
         self._job_settings = job_settings
         self._card_store = card_store
         self._transcript = transcript
+        self._retained_card_refs: dict[str, ApprovalCardRef] = {}
+        if transcript is None:
+            logger.error(
+                "publication transcript recording is not configured; "
+                "terminal results will be reported without durable turn history"
+            )
 
     async def deliver_pending_card(self) -> bool:
         """Deliver one persisted publication approval card independently."""
@@ -330,10 +350,10 @@ class PublicationReconciler:
         )
 
     async def _cleanup_credentials(self, names: PublicationResourceNames) -> None:
-        await _resolve(self._cluster.cleanup_credentials(names))
+        await _cluster_call(self._cluster.cleanup_credentials, names)
 
     async def _cleanup_terminal(self, names: PublicationResourceNames) -> None:
-        await _resolve(self._cluster.cleanup_terminal(names))
+        await _cluster_call(self._cluster.cleanup_terminal, names)
 
     async def _settle_card(self, result: Any, ref: ApprovalCardRef) -> None:
         decision: Literal["approved", "rejected"] | None
@@ -397,43 +417,92 @@ class PublicationReconciler:
             )
         else:
             text = f"Publication failed safely after approval: {result.error}"
+        conversation_id = result.target.conversation_id
         card_ref: ApprovalCardRef | None = None
+        transcript_retry_error: Exception | None = None
         try:
             if self._card_store is not None:
-                card_ref = await self._card_store.pop(result.target.conversation_id)
-                if card_ref is not None and card_ref.approval_id != str(result.approval_id):
+                card_ref = self._retained_card_refs.pop(conversation_id, None)
+                if card_ref is None:
+                    card_ref = await self._card_store.pop(conversation_id)
+                if card_ref is not None and card_ref.approval_id != str(
+                    result.approval_id
+                ):
                     await self._card_store.restore(
-                        result.target.conversation_id,
+                        conversation_id,
                         card_ref,
                     )
                     card_ref = None
             if self._transcript is not None:
-                await _resolve(
-                    self._transcript.record_result(
-                        result.agent_id,
-                        result.target.conversation_id,
-                        result.publication_id,
-                        text,
+                try:
+                    await _resolve(
+                        self._transcript.record_result(
+                            result.agent_id,
+                            conversation_id,
+                            result.publication_id,
+                            text,
+                        )
                     )
-                )
+                except PublicationTranscriptPermanentError:
+                    logger.exception(
+                        "publication transcript permanently refused result "
+                        "publication_id=%s; continuing with routed delivery",
+                        result.publication_id,
+                    )
+                except Exception as exc:
+                    transcript_retry_error = exc
+                    logger.warning(
+                        "publication transcript recording failed transiently "
+                        "publication_id=%s; delivering the routed result before retry",
+                        result.publication_id,
+                        exc_info=True,
+                    )
             await self._report(result.target, result.route, text)
             if card_ref is not None:
                 await self._settle_card(result, card_ref)
         except Exception as exc:
-            try:
-                if card_ref is not None and self._card_store is not None:
+            if card_ref is not None and self._card_store is not None:
+                try:
                     await self._card_store.restore(
-                        result.target.conversation_id,
+                        conversation_id,
                         card_ref,
                     )
-            finally:
+                except Exception:
+                    # Keep the only surviving copy available to this process.
+                    # The routed-delivery error remains the failure charged to
+                    # the outbox instead of being masked by a Valkey outage.
+                    self._retained_card_refs[conversation_id] = card_ref
+                    logger.exception(
+                        "publication approval card restore failed after result "
+                        "delivery error publication_id=%s original_error=%s",
+                        result.publication_id,
+                        str(exc)[:2000] or type(exc).__name__,
+                    )
+            try:
                 await _resolve(
                     self._store.retry_result_delivery(
                         result.publication_id,
                         error=(str(exc)[:2000] or type(exc).__name__),
                     )
                 )
+            except Exception as retry_exc:
+                raise exc from retry_exc
             raise
+        if transcript_retry_error is not None:
+            transcript_error = (
+                str(transcript_retry_error)[:1950]
+                or type(transcript_retry_error).__name__
+            )
+            await _resolve(
+                self._store.retry_result_delivery(
+                    result.publication_id,
+                    error=(
+                        "publication transcript recording failed: "
+                        f"{transcript_error}"
+                    ),
+                )
+            )
+            return True
         await _resolve(self._store.mark_result_delivered(result.publication_id))
         return True
 
@@ -495,7 +564,7 @@ class PublicationReconciler:
 
         branch = deterministic_publication_branch(work.publication_id)
         try:
-            observation = await _resolve(self._cluster.observe(names.job))
+            observation = await _cluster_call(self._cluster.observe, names.job)
         except Exception as exc:
             await self._bounded_setup_failure(work, exc)
             return
@@ -519,7 +588,7 @@ class PublicationReconciler:
                     credential="validation-placeholder",
                     settings=self._job_settings,
                 )
-                await _resolve(self._cluster.validate_existing(probe_resources))
+                await _cluster_call(self._cluster.validate_existing, probe_resources)
             except Exception as exc:
                 await self._bounded_setup_failure(work, exc)
             return
@@ -570,7 +639,7 @@ class PublicationReconciler:
         # and make its marker authoritative without passing the full spec and
         # ownership contract.
         try:
-            await _resolve(self._cluster.apply(resources))
+            await _cluster_call(self._cluster.apply, resources)
         except PublicationResourceError as exc:
             await self._bounded_setup_failure(work, exc)
             return
@@ -579,7 +648,9 @@ class PublicationReconciler:
             # response. Observe the deterministic name, then recover the
             # deterministic remote head, before charging a bounded retry.
             try:
-                observation = await _resolve(self._cluster.observe(resources.names.job))
+                observation = await _cluster_call(
+                    self._cluster.observe, resources.names.job
+                )
                 if observation.exists and observation.phase in {"pending", "running"}:
                     return
                 pr_url = _validated_pr_url(
@@ -610,7 +681,9 @@ class PublicationReconciler:
             return
 
         try:
-            observation = await _resolve(self._cluster.observe(resources.names.job))
+            observation = await _cluster_call(
+                self._cluster.observe, resources.names.job
+            )
             if observation.exists and observation.phase in {"pending", "running"}:
                 return
             pr_url = _validated_pr_url(
@@ -699,6 +772,7 @@ __all__ = [
     "PublicationReconcileError",
     "PublicationReconciler",
     "PublicationReconcileLoop",
+    "PublicationTranscriptPermanentError",
     "PublicationWork",
     "deterministic_publication_branch",
 ]

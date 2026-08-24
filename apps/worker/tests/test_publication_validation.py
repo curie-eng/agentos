@@ -42,6 +42,7 @@ def test_publication_validation_refuses_workflow_changes() -> None:
     validation = importlib.import_module("curie_worker.publication_validation")
 
     assert not validation._safe_changed_path(".github/workflows/publish.yml")
+    assert not validation._safe_changed_path(".GIT/config")
     assert validation._safe_changed_path("src/main.py")
 
 

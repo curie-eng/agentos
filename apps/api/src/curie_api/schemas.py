@@ -1132,7 +1132,8 @@ class PublicationCreate(BaseModel):
     @classmethod
     def _safe_changed_paths(cls, value: list[str]) -> list[str]:
         for path in value:
-            if tuple(part.casefold() for part in path.split("/")[:2]) == (
+            parts = path.split("/")
+            if tuple(part.casefold() for part in parts[:2]) == (
                 ".github",
                 "workflows",
             ):
@@ -1142,11 +1143,12 @@ class PublicationCreate(BaseModel):
             if (
                 not path
                 or path.startswith("/")
-                or path == ".git"
-                or path.startswith(".git/")
-                or any(part in ("", ".", "..") for part in path.split("/"))
+                or parts[0].casefold() == ".git"
+                or any(part in ("", ".", "..") for part in parts)
             ):
-                raise ValueError("changed_paths must contain safe repository-relative paths")
+                raise ValueError(
+                    "changed_paths must contain safe repository-relative paths"
+                )
         return value
 
     def decoded_patch(self) -> bytes:

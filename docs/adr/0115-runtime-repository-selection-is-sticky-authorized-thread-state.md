@@ -92,11 +92,15 @@ current allowlist. Denial still creates no Job and redeems no credential.
 Publication refuses changes under `.github/workflows/`: pushing such a branch
 can execute repository automation before a reviewer sees the pull request, so a
 warning on a self-approvable card would not be a sufficient boundary.
-The worker records the terminal publication outcome in the durable thread
-transcript before reporting it through the reply adapter. A deterministic
-publication marker makes retries idempotent, so a later turn knows whether the
-platform published, denied, expired, or failed the request instead of repeating
-the model's pre-approval view.
+The worker first checks the durable thread transcript for a deterministic
+publication marker, then uses the transcript store's atomic append endpoint
+before reporting the outcome through the routed reply adapter. A recovery read
+absorbs a lost append response, and a later retry no-ops when it finds the same
+marker. A transient transcript failure does not veto Slack result delivery or
+approval-card settlement: the durable result outbox backs off before retrying
+the transcript. If durable state capacity permanently refuses the append, the
+worker logs the degradation and continues routed delivery rather than hiding a
+pull request that was already created.
 Publication Jobs run in a dedicated namespace under a tokenless service account.
 A default-deny ingress policy and two-rule egress policy permit only cluster DNS
 and operator-supplied GitHub HTTPS CIDRs. GitHub address rotation can therefore

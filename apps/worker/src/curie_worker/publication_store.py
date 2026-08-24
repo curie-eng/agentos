@@ -91,6 +91,7 @@ class PostgresPublicationStore:
         self._reconcile_max_attempts = reconcile_max_attempts
         self._versions: dict[uuid.UUID, int] = {}
         self._result_versions: dict[uuid.UUID, int] = {}
+        self._result_attempts: dict[uuid.UUID, int] = {}
         self._card_versions: dict[uuid.UUID, int] = {}
         self._cleanup_versions: dict[uuid.UUID, int] = {}
 
@@ -552,6 +553,9 @@ class PostgresPublicationStore:
                 raise PublicationStoreError("publication result claim CAS was lost")
             version = int(updated["version"])
             self._result_versions[result_id] = version
+            self._result_attempts[result_id] = int(
+                updated["result_delivery_attempts"]
+            )
         status = str(row["status"])
         return PublicationResult(
             publication_id=result_id,
@@ -589,7 +593,7 @@ class PostgresPublicationStore:
     async def retry_result_delivery(
         self, publication_id: uuid.UUID, *, error: str
     ) -> None:
-        """Release a failed reply lease, dead-lettering at the delivery cap."""
+        """Back off a failed result lease, dead-lettering at the delivery cap."""
 
         await self._result_delivery_cas(
             publication_id, delivered=False, error=error[:2000]
@@ -601,6 +605,12 @@ class PostgresPublicationStore:
         version = self._result_versions.get(publication_id)
         if version is None:
             raise PublicationStoreError("publication result has no owned lease version")
+        attempt = self._result_attempts.get(publication_id)
+        if attempt is None:
+            raise PublicationStoreError("publication result has no owned lease attempt")
+        retry_delay = timedelta(
+            seconds=min(self._lease_seconds * (2 ** min(attempt, 6)), 3600)
+        )
         async with self._engine.begin() as connection:
             updated = (
                 await connection.execute(
@@ -621,7 +631,10 @@ class PostgresPublicationStore:
                                    ELSE result_delivery_dead_lettered_at
                                END,
                                lease_owner = NULL,
-                               lease_expires_at = NULL,
+                               lease_expires_at = CASE
+                                   WHEN :delivered THEN NULL
+                                   ELSE now() + :retry_delay
+                               END,
                                version = version + 1,
                                updated_at = now()
                          WHERE id = :id AND version = :version AND lease_owner = :owner
@@ -632,6 +645,7 @@ class PostgresPublicationStore:
                         "delivered": delivered,
                         "error": error,
                         "max_attempts": self._result_max_attempts,
+                        "retry_delay": retry_delay,
                         "id": publication_id,
                         "version": version,
                         "owner": self._lease_owner,
@@ -641,6 +655,7 @@ class PostgresPublicationStore:
         if updated is None:
             raise PublicationStoreError("publication result delivery CAS was lost")
         self._result_versions.pop(publication_id, None)
+        self._result_attempts.pop(publication_id, None)
 
     async def claim_pending_cleanup(self) -> PublicationCleanupWork | None:
         """Lease one terminal publication resource cleanup without a retry cap."""

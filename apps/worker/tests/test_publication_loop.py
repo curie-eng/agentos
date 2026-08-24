@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
+import threading
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -202,6 +204,8 @@ class _Cluster:
         self.terminal_cleanup_fail_once = False
         self.terminal_cleanup_failures_remaining = 0
         self.validated_existing: list[Any] = []
+        self.observe_release: threading.Event | None = None
+        self.observe_timed_out = False
 
     def apply(self, resources: Any) -> None:
         self.applied.append(resources)
@@ -215,6 +219,10 @@ class _Cluster:
         self.validated_existing.append(resources)
 
     def observe(self, job_name: str) -> Any:
+        if self.observe_release is not None and not self.observe_release.wait(
+            timeout=0.2
+        ):
+            self.observe_timed_out = True
         if self.applied and self.observe_after_apply_error is not None:
             raise self.observe_after_apply_error
         if not self.applied:
@@ -287,6 +295,7 @@ class _Cards:
         self.popped: list[str] = []
         self.restored: list[tuple[str, ApprovalCardRef]] = []
         self.remember_fail_once = False
+        self.restore_failures_remaining = 0
 
     async def pop(self, thread: str) -> ApprovalCardRef | None:
         self.popped.append(thread)
@@ -295,6 +304,9 @@ class _Cards:
 
     async def restore(self, thread: str, ref: ApprovalCardRef) -> None:
         self.restored.append((thread, ref))
+        if self.restore_failures_remaining:
+            self.restore_failures_remaining -= 1
+            raise RuntimeError("card ref restore unavailable")
         if self.ref is None:
             self.ref = ref
 
@@ -329,6 +341,8 @@ class _Cards:
 class _Transcript:
     def __init__(self) -> None:
         self.records: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
+        self.failures_remaining = 0
+        self.error: Exception = RuntimeError("transcript API unavailable")
 
     async def record_result(
         self,
@@ -337,6 +351,9 @@ class _Transcript:
         publication_id: uuid.UUID,
         text: str,
     ) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise self.error
         self.records.append((agent_id, conversation_id, publication_id, text))
 
 
@@ -482,6 +499,92 @@ async def test_terminal_result_is_recorded_for_the_next_model_turn(
         )
     ]
     assert PR_URL in replies.events[0][0].text
+
+
+async def test_transient_transcript_failure_delivers_and_settles_before_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    transcript = _Transcript()
+    transcript.failures_remaining = 1
+    loop, store, _, _, _, replies = _loop(
+        publication,
+        cards,
+        transcript=transcript,
+    )
+    cards.ref = _card()
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert [event.event for event, _ in replies.events] == [
+        "reply.update",
+        "reply.update",
+    ]
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+    assert PUBLICATION_ID not in store.delivered
+    assert store.delivery_retries == [
+        (
+            PUBLICATION_ID,
+            "publication transcript recording failed: transcript API unavailable",
+        )
+    ]
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert len(transcript.records) == 1
+    assert len(replies.events) == 3
+    assert replies.events[2][0].settled is None
+
+
+async def test_transcript_capacity_refusal_cannot_veto_result_or_card(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    transcript = _Transcript()
+    transcript.failures_remaining = 1
+    transcript.error = publication.PublicationTranscriptPermanentError(
+        "publication transcript append exceeded durable state capacity"
+    )
+    loop, store, _, _, _, replies = _loop(
+        publication,
+        cards,
+        transcript=transcript,
+    )
+    cards.ref = _card()
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert store.delivery_retries == []
+    assert PR_URL in replies.events[0][0].text
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+
+
+async def test_missing_transcript_wiring_is_logged_loudly(
+    publication: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.ERROR, logger="curie_worker.publication_loop"):
+        _loop(publication)
+
+    assert "publication transcript recording is not configured" in caplog.text
 
 
 async def test_publication_card_crash_after_post_adopts_same_ref_on_retry(
@@ -744,6 +847,35 @@ async def test_terminal_result_is_persisted_and_credentials_removed_before_reply
     assert store.delivery_retries == [(PUBLICATION_ID, "reply transport unavailable")]
 
 
+async def test_card_restore_failure_preserves_original_error_and_ref_for_retry(
+    publication: Any,
+) -> None:
+    cards = _Cards()
+    cards.ref = _card()
+    cards.restore_failures_remaining = 1
+    loop, store, _, _, _, replies = _loop(publication, cards)
+    store.pending[PUBLICATION_ID] = {
+        "outcome": "published",
+        "pr_url": PR_URL,
+        "error": None,
+        "resolved_by": RESOLVER,
+        "resolution_note": RESOLUTION_NOTE,
+    }
+    replies.fail_once = True
+
+    with pytest.raises(RuntimeError, match="reply transport unavailable"):
+        await loop.deliver_pending_result(PUBLICATION_ID)
+
+    assert cards.ref is None
+    assert store.delivery_retries == [(PUBLICATION_ID, "reply transport unavailable")]
+
+    assert await loop.deliver_pending_result(PUBLICATION_ID) is True
+
+    assert PUBLICATION_ID in store.delivered
+    assert replies.events[1][0].settled.decision == "approved"
+    assert cards.ref is None
+
+
 async def test_supervisor_drains_terminal_result_outbox_without_job_work(
     publication: Any,
 ) -> None:
@@ -810,6 +942,26 @@ async def test_running_job_is_validated_without_redeeming_another_credential(
     assert cluster.applied == []
     assert store.completed == {}
     assert replies.events == []
+
+
+async def test_blocking_cluster_client_does_not_stall_event_loop_ticker(
+    publication: Any,
+) -> None:
+    loop, _, _, cluster, _, _ = _loop(publication)
+    release = threading.Event()
+    cluster.observe_release = release
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        await asyncio.sleep(0)
+        ticks += 1
+        release.set()
+
+    await asyncio.gather(loop.reconcile(_work(publication)), ticker())
+
+    assert ticks == 1
+    assert cluster.observe_timed_out is False
 
 
 async def test_credential_setup_failure_is_bounded_and_terminalized(publication: Any) -> None:
