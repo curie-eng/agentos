@@ -328,6 +328,14 @@ class PublicationReconciler:
             decision = "rejected"
         else:
             decision = None
+        resolver = result.resolved_by if decision is not None else None
+        note = result.resolution_note if decision is not None else None
+        if decision is not None and (
+            not isinstance(resolver, str) or not resolver.strip()
+        ):
+            raise PublicationReconcileError(
+                "resolved publication approval has no durable resolver identity"
+            )
         await self._replies.emit(
             ReplyUpdate(
                 version=REPLY_WIRE_VERSION,
@@ -342,6 +350,8 @@ class PublicationReconciler:
                 settled=SettledOutcome(
                     requested_by=ref.requested_by,
                     decision=decision,
+                    resolver=resolver,
+                    note=note,
                 ),
             ),
             route=TargetRoute(

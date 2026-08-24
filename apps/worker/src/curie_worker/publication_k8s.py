@@ -114,7 +114,10 @@ redact() {
 }
 
 git_with_timeout() {
-  timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git "$@"
+  # Git must not forward an operator credential to a redirected origin. Keep
+  # this invocation-scoped so no credential or transport setting is persisted
+  # in the checkout configuration.
+  timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git -c http.followRedirects=false "$@"
 }
 
 cleanup_auth() {
@@ -179,7 +182,7 @@ import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 repo = os.environ["REPO_FULL_NAME"]
 branch = os.environ["BRANCH"]
@@ -198,11 +201,16 @@ headers = {
     "X-GitHub-Api-Version": "2022-11-28",
     "User-Agent": "curie-publication-job",
 }
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+opener = build_opener(_NoRedirect())
 
 def request(method, url, payload=None):
     data = None if payload is None else json.dumps(payload).encode()
     req = Request(url, data=data, headers=headers, method=method)
-    with urlopen(req, timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])) as response:
+    with opener.open(req, timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])) as response:
         return json.load(response)
 
 def validate_pull(row, expected_base):

@@ -97,6 +97,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: githubToken
+            - name: GITHUB_REPO_ALLOWLIST
+              value: {{ .Values.api.githubRepoAllowlist | toJson | quote }}
             # GitHub App identity (ADR-0092). When both are set the platform
             # mints a one-hour token scoped to the single repository it is
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:

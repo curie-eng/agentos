@@ -23,13 +23,13 @@ async def create_deployment(
     agent = await crud.get_agent(session, data.agent_id)
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
-    if data.workspace_repo is not None and (
-        agent.repo_full_name is None
-        or data.workspace_repo.casefold() != agent.repo_full_name.casefold()
+    if (
+        "workspace_enabled" in data.model_fields_set
+        and data.workspace_enabled is None
     ):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "workspace_repo must match the agent repository binding",
+            "workspace_enabled must be true or false when provided",
         )
     version = await crud.get_version(session, data.version_id)
     if version is None or version.agent_id != data.agent_id:

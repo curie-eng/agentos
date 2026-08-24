@@ -898,11 +898,28 @@ namespace named by `worker.publication.namespace` (release-scoped when empty).
 For a private runner image, create the referenced image pull Secret in that
 namespace separately; the chart deliberately does not copy the platform Secret.
 
-Deployment workspace selection is tri-state: `curie ... deploy --workspace
-owner/repository` enables or replaces it, `--no-workspace` explicitly disables
-it, and omitting both carries the active deployment's value forward. The API
-accepts only the repository already bound to the agent, so this cannot redirect
-the operator credential to an arbitrary repository.
+Deployment workspace capability is tri-state: `curie ... deploy --workspace`
+enables runtime selection, `--no-workspace` explicitly disables it, and
+omitting both carries the active deployment's value forward. The first root
+GitHub repository URL that establishes selection in a Slack thread is pinned to
+that agent and thread. A later message can establish selection when no earlier
+message did; later messages may omit the URL. Choosing another repository
+requires a new thread.
+
+Set `api.githubRepoAllowlist` to exact `owner/repository` entries or explicit
+owner-wide `owner/*` entries. Empty is deny-all. Curie checks this policy before
+selection or credential resolution and again before publication, including for
+already-selected threads. The GitHub App path mints a token narrowed to the
+selected repository. The `api.githubToken` fallback may carry broader authority
+than one repository, so scope it narrowly; the allowlist controls where Curie
+may present it, and credential audit rows record which path was used.
+
+```yaml
+api:
+  githubRepoAllowlist:
+    - acme-corp/acme-bot
+    - acme-labs/*
+```
 
 **Recommended — a Secret you manage.** The chart only references it, so the key
 never passes through helm values and never lands in release history (helm

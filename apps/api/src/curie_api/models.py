@@ -233,11 +233,36 @@ class Deployment(Base):
         Enum(Environment, name="environment", schema=SCHEMA)
     )
     commit_sha: Mapped[str | None] = mapped_column(default=None)
-    # A deployment-level managed checkout. NULL means no repository workspace;
-    # the value is canonical owner/repo and is never a URL or credential.
-    workspace_repo: Mapped[str | None] = mapped_column(default=None)
+    # A deployment-level capability. The concrete repository is selected from
+    # the opening thread message and stored in ThreadWorkspace only after the
+    # operator allowlist authorizes it.
+    workspace_enabled: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(server_default="active")
     deployed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ThreadWorkspace(Base):
+    """One immutable repository selection for an agent conversation."""
+
+    __tablename__ = "thread_workspaces"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), index=True
+    )
+    selected_by_deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(f"{SCHEMA}.deployments.id", ondelete="SET NULL"), default=None
+    )
+    conversation_id: Mapped[str]
+    repo_full_name: Mapped[str]
+    selected_by: Mapped[str]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "conversation_id", name="thread_workspaces_agent_conversation_key"
+        ),
+    )
 
 
 class Approval(Base):

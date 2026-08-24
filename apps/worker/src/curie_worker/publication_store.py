@@ -30,6 +30,8 @@ class PublicationResult:
     outcome: str
     pr_url: str | None
     error: str | None
+    resolved_by: str | None
+    resolution_note: str | None
     target: ReplyTarget
     route: TargetRoute
     attempt: int
@@ -470,7 +472,7 @@ class PostgresPublicationStore:
             SELECT p.id, p.approval_id, p.status, p.result_url, p.error, p.version,
                    p.result_delivery_attempts, p.reply_kind, p.reply_channel,
                    p.reply_placeholder, p.reply_endpoint, p.reply_adapter,
-                   a.conversation_id
+                   a.conversation_id, a.resolved_by, a.resolution_note
               FROM {self._table} p
               JOIN {self._approvals} a ON a.id = p.approval_id
              WHERE p.status IN ('denied', 'expired', 'succeeded', 'failed')
@@ -555,6 +557,14 @@ class PostgresPublicationStore:
             outcome="published" if status == "succeeded" else status,
             pr_url=row["result_url"],
             error=row["error"],
+            resolved_by=(
+                str(row["resolved_by"]) if row["resolved_by"] is not None else None
+            ),
+            resolution_note=(
+                str(row["resolution_note"])
+                if row["resolution_note"] is not None
+                else None
+            ),
             target=ReplyTarget(
                 kind=str(row["reply_kind"]),
                 address=str(row["reply_channel"]),

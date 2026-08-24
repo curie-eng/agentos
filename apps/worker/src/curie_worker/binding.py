@@ -188,7 +188,7 @@ SELECT a.id AS agent_id,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
        d.id AS deployment_id,
-       d.workspace_repo AS workspace_repo,
+       d.workspace_enabled AS workspace_enabled,
        v.id AS version_id,
        v.version_label AS version_label,
        v.bundle_ref AS bundle_ref,
@@ -215,7 +215,7 @@ class ResolvedDeployment(BaseModel):
     # through the internal workspace credential endpoint.  Optional defaults
     # keep old worker doubles and rolling-deploy rows source-compatible.
     deployment_id: uuid.UUID | None = None
-    workspace_repo: str | None = None
+    workspace_enabled: bool = False
     version_id: uuid.UUID
     version_label: str
     bundle_ref: str | None

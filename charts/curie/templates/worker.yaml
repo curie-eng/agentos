@@ -124,6 +124,10 @@ spec:
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      {{- with .Values.worker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- if .Values.worker.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-worker
       {{- end }}
@@ -190,7 +194,7 @@ spec:
             - name: CURIE_WORKSPACE_BUCKET
               value: {{ .Values.worker.workspace.bucket | quote }}
             - name: CURIE_WORKSPACE_SCRATCH_ROOT
-              value: {{ .Values.worker.workspace.mountPath | quote }}
+              value: {{ printf "%s/worker" (trimSuffix "/" .Values.worker.workspace.mountPath) | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE

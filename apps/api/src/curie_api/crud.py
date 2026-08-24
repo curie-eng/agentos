@@ -7,10 +7,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from .config import get_settings
 from .models import (
     Agent,
     AgentChannel,
@@ -23,6 +25,7 @@ from .models import (
     Deployment,
     Environment,
     Publication,
+    ThreadWorkspace,
 )
 from .schemas import (
     AgentCreate,
@@ -32,6 +35,7 @@ from .schemas import (
     PublicationCreate,
     VersionCreate,
 )
+from .workspace_policy import repository_is_allowed
 
 _WORKSPACE_UNSET = object()
 
@@ -41,7 +45,11 @@ class PublicationReplayConflict(RuntimeError):
 
 
 async def _adopt_publication_replay(
-    session: AsyncSession, data: PublicationCreate, patch: bytes
+    session: AsyncSession,
+    data: PublicationCreate,
+    patch: bytes,
+    *,
+    agent_id: uuid.UUID,
 ) -> Publication | None:
     approval = await get_approval_by_dedupe_key(session, data.dedupe_key)
     if approval is None:
@@ -52,7 +60,10 @@ async def _adopt_publication_replay(
             "publication dedupe key belongs to a non-publication approval"
         )
     if (
-        publication.deployment_id != data.deployment_id
+        approval.agent_id != agent_id
+        or approval.conversation_id != data.conversation_id
+        or publication.deployment_id != data.deployment_id
+        or publication.repo_full_name.casefold() != data.repo_full_name.casefold()
         or publication.base_sha != data.base_sha
         or publication.patch_bytes != patch
         or publication.changed_paths != data.changed_paths
@@ -63,6 +74,32 @@ async def _adopt_publication_replay(
             "publication dedupe key was replayed with different snapshot facts"
         )
     return publication
+
+
+async def _require_current_publication_workspace(
+    session: AsyncSession, data: PublicationCreate
+) -> tuple[Deployment, ThreadWorkspace]:
+    """Authorize the request against current deployment and thread policy."""
+
+    deployment = await get_deployment(session, data.deployment_id)
+    if deployment is None:
+        raise LookupError("deployment not found")
+    if not deployment.workspace_enabled:
+        raise ValueError("deployment does not declare a repository workspace")
+    thread_workspace = await get_thread_workspace(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=data.conversation_id,
+    )
+    if thread_workspace is None:
+        raise ValueError("conversation has no selected repository workspace")
+    if thread_workspace.repo_full_name.casefold() != data.repo_full_name.casefold():
+        raise ValueError("publication repository differs from the thread workspace")
+    if not repository_is_allowed(
+        thread_workspace.repo_full_name, get_settings().github_repo_allowlist
+    ):
+        raise ValueError("thread workspace repository is no longer allowed")
+    return deployment, thread_workspace
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
@@ -369,21 +406,23 @@ async def create_deployment_row(
     environment: Environment,
     commit_sha: str | None = None,
     status: str = "active",
-    workspace_repo: str | None | object = _WORKSPACE_UNSET,
+    workspace_enabled: bool | object = _WORKSPACE_UNSET,
 ) -> Deployment:
-    resolved_workspace_repo: str | None
-    if workspace_repo is _WORKSPACE_UNSET:
+    resolved_workspace_enabled: bool
+    if workspace_enabled is _WORKSPACE_UNSET:
         current = await get_active_deployment(session, agent_id, environment)
-        resolved_workspace_repo = current.workspace_repo if current is not None else None
+        resolved_workspace_enabled = (
+            current.workspace_enabled if current is not None else False
+        )
     else:
-        assert workspace_repo is None or isinstance(workspace_repo, str)
-        resolved_workspace_repo = workspace_repo
+        assert isinstance(workspace_enabled, bool)
+        resolved_workspace_enabled = workspace_enabled
     deployment = Deployment(
         agent_id=agent_id,
         version_id=version_id,
         environment=environment,
         commit_sha=commit_sha,
-        workspace_repo=resolved_workspace_repo,
+        workspace_enabled=resolved_workspace_enabled,
         status=status,
     )
     session.add(deployment)
@@ -400,12 +439,59 @@ async def create_deployment(session: AsyncSession, data: DeploymentCreate) -> De
         environment=data.environment,
         commit_sha=data.commit_sha,
         status=data.status,
-        workspace_repo=(
-            data.workspace_repo
-            if "workspace_repo" in data.model_fields_set
+        workspace_enabled=(
+            data.workspace_enabled
+            if "workspace_enabled" in data.model_fields_set
             else _WORKSPACE_UNSET
         ),
     )
+
+
+async def get_thread_workspace(
+    session: AsyncSession, *, agent_id: uuid.UUID, conversation_id: str
+) -> ThreadWorkspace | None:
+    selected: ThreadWorkspace | None = await session.scalar(
+        select(ThreadWorkspace).where(
+            ThreadWorkspace.agent_id == agent_id,
+            ThreadWorkspace.conversation_id == conversation_id,
+        )
+    )
+    return selected
+
+
+async def select_thread_workspace(
+    session: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    deployment_id: uuid.UUID,
+    conversation_id: str,
+    repo_full_name: str,
+    selected_by: str,
+) -> tuple[ThreadWorkspace, bool]:
+    """Insert the first selection or atomically adopt the concurrent winner."""
+
+    candidate_id = uuid.uuid4()
+    inserted = await session.scalar(
+        insert(ThreadWorkspace)
+        .values(
+            id=candidate_id,
+            agent_id=agent_id,
+            selected_by_deployment_id=deployment_id,
+            conversation_id=conversation_id,
+            repo_full_name=repo_full_name,
+            selected_by=selected_by,
+        )
+        .on_conflict_do_nothing(
+            constraint="thread_workspaces_agent_conversation_key"
+        )
+        .returning(ThreadWorkspace.id)
+    )
+    await session.commit()
+    selected = await get_thread_workspace(
+        session, agent_id=agent_id, conversation_id=conversation_id
+    )
+    assert selected is not None
+    return selected, inserted == candidate_id
 
 
 async def get_active_deployment(
@@ -465,15 +551,14 @@ async def create_publication(
     conflict and can never replace bytes that were already approved.
     """
 
-    existing = await _adopt_publication_replay(session, data, patch)
+    deployment, thread_workspace = await _require_current_publication_workspace(
+        session, data
+    )
+    existing = await _adopt_publication_replay(
+        session, data, patch, agent_id=deployment.agent_id
+    )
     if existing is not None:
         return existing, False
-
-    deployment = await get_deployment(session, data.deployment_id)
-    if deployment is None:
-        raise LookupError("deployment not found")
-    if deployment.workspace_repo is None:
-        raise ValueError("deployment does not declare a repository workspace")
 
     expires_at = None
     if data.expires_in_seconds is not None:
@@ -503,14 +588,17 @@ async def create_publication(
         await session.flush()
     except IntegrityError:
         await session.rollback()
-        existing = await _adopt_publication_replay(session, data, patch)
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
         if existing is None:
             raise
         return existing, False
     publication = Publication(
         approval_id=approval.id,
         deployment_id=deployment.id,
-        repo_full_name=deployment.workspace_repo,
+        repo_full_name=thread_workspace.repo_full_name,
         status="pending",
         version=1,
         base_sha=data.base_sha,
@@ -532,7 +620,10 @@ async def create_publication(
         # unique approval dedupe key is the arbiter; after rolling back the
         # losing INSERT, re-read and adopt only an exact private-fact replay.
         await session.rollback()
-        existing = await _adopt_publication_replay(session, data, patch)
+        deployment, _ = await _require_current_publication_workspace(session, data)
+        existing = await _adopt_publication_replay(
+            session, data, patch, agent_id=deployment.agent_id
+        )
         if existing is None:
             raise
         return existing, False

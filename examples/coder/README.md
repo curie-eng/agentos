@@ -14,18 +14,20 @@ export CURIE_GITHUB_TOKEN=<operator-token>
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_BOT_TOKEN=xoxb-...
 
-curie cluster up
+curie cluster up --set 'api.githubRepoAllowlist[0]=acme-corp/acme-bot'
 curie cluster comms --slack
 curie cluster deploy --plugin-dir examples/coder \
   --agent acme-dev --env dev --slack-channel C0EXAMPLE1 \
-  --repo acme-corp/acme-bot --workspace
+  --workspace
 ```
 
-Invite the bot to the channel, mention it with a focused change, steer in its
-thread if needed, then ask it to publish. Curie posts the publication approval
-card in that same thread. The requester may approve this publication card; the
-platform publishes from outside the sandbox and posts the pull-request URL back
-to the thread.
+Invite the bot to the channel. Mention it in a thread with a focused change and
+the root repository URL, for example
+`https://github.com/acme-corp/acme-bot`. Steer in that thread if needed, then
+ask it to publish. Curie posts the publication approval card in that same
+thread. If no earlier message established a repository, a later message may do
+so. The requester may approve this publication card; the platform publishes
+from outside the sandbox and posts the pull-request URL back to the thread.
 
 The sandbox receives a credential-free checkout at `/workspace`. It never
 receives the operator GitHub credential, and publication does not depend on a

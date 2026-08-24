@@ -1119,8 +1119,8 @@ enum LocalAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Materialize this deployment's repository as a managed /workspace.
-        /// The repository is inferred from --repo, then the agent binding.
+        /// Let each new session select an allowed GitHub repository from the
+        /// opening message and materialize it as managed /workspace.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
         /// Explicitly disable a previously configured managed workspace.
@@ -1785,8 +1785,8 @@ enum ClusterAction {
         /// it; a warning names the binding it kept.
         #[arg(long = "repo", value_name = "OWNER/NAME")]
         repo: Option<String>,
-        /// Materialize each deployment's repository as a managed /workspace.
-        /// With --all-targets, each target derives its own agent binding.
+        /// Let sessions on each deployment select an allowed GitHub repository
+        /// from the opening message and materialize it as managed /workspace.
         #[arg(long, conflicts_with = "no_workspace")]
         workspace: bool,
         /// Explicitly disable a previously configured managed workspace.

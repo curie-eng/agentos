@@ -7,6 +7,7 @@ GitHub side effects belong to the trusted worker publication reconciler.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from starlette.concurrency import run_in_threadpool
 
 from .. import crud
 from ..auth import (
@@ -17,6 +18,7 @@ from ..config import get_settings
 from ..deps import SessionDep
 from ..repository_auth import resolve_repository_credential
 from ..schemas import PublicationCreate, PublicationOut, RepositoryCredentialOut
+from ..workspace_policy import credential_mode, repository_is_allowed
 
 router = APIRouter(
     prefix="/publications",
@@ -26,6 +28,7 @@ router = APIRouter(
 internal_router = APIRouter(
     prefix="/v1/internal/publications", tags=["internal-publications"]
 )
+
 
 @internal_router.post(
     "",
@@ -115,9 +118,29 @@ async def redeem_publication_credential(
             status.HTTP_409_CONFLICT,
             "publication must be approved before a write credential can be redeemed",
         )
+    deployment = await crud.get_deployment(session, publication.deployment_id)
+    approval = await crud.get_approval(session, publication.approval_id)
+    if deployment is None or approval is None:
+        await refused(status.HTTP_409_CONFLICT, "publication workspace binding is absent")
+    assert deployment is not None and approval is not None
+    selected = await crud.get_thread_workspace(
+        session,
+        agent_id=deployment.agent_id,
+        conversation_id=approval.conversation_id,
+    )
+    settings = get_settings()
+    if (
+        selected is None
+        or selected.repo_full_name.casefold() != repo.casefold()
+        or not repository_is_allowed(repo, settings.github_repo_allowlist)
+    ):
+        await refused(
+            status.HTTP_403_FORBIDDEN,
+            "publication repository is no longer authorized for this thread",
+        )
     try:
-        clone_url, authorization_header = resolve_repository_credential(
-            repo, get_settings()
+        clone_url, authorization_header = await run_in_threadpool(
+            resolve_repository_credential, repo, settings
         )
     except Exception as exc:
         await crud.append_credential_redemption_audit(
@@ -141,7 +164,14 @@ async def redeem_publication_credential(
         deployment_id=publication.deployment_id,
         publication_id=publication.id,
         repo_full_name=repo,
-        detail="server-derived repository credential issued",
+        detail=(
+            "server-derived repository credential issued via "
+            + credential_mode(
+                app_id=settings.github_app_id,
+                app_private_key=settings.github_app_private_key,
+                token=settings.github_token,
+            )
+        ),
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,

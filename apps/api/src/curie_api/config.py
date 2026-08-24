@@ -21,6 +21,8 @@ from aci_protocol import (
 from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .workspace_policy import valid_allowlist_entry
+
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
 _DEV_DEFAULT_API_KEY = "curie-dev-key"
@@ -139,6 +141,11 @@ class Settings(BaseSettings):
     # never place it in argv.
     github_app_private_key: str = ""
     github_app_timeout_seconds: float = 15.0
+    # Repositories the runtime workspace selector may bind to a thread. Exact
+    # owner/repository entries and owner-wide owner/* entries are supported.
+    # Empty is fail-closed: enabling workspace capability alone grants no
+    # repository access.
+    github_repo_allowlist: tuple[str, ...] = ()
     # Commit polling (issue #1239). A self-hosted cluster that accepts no
     # inbound traffic cannot receive a GitHub webhook, so without this it has
     # no push-to-deploy at all. Outbound always works, so the API asks GitHub
@@ -361,6 +368,17 @@ class Settings(BaseSettings):
         if self.valkey_url:
             return self.valkey_url
         return f"redis://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
+
+    @model_validator(mode="after")
+    def _validate_github_repo_allowlist(self) -> "Settings":
+        invalid = [
+            entry for entry in self.github_repo_allowlist if not valid_allowlist_entry(entry)
+        ]
+        if invalid:
+            raise ValueError(
+                "GITHUB_REPO_ALLOWLIST entries must be owner/repository or owner/*"
+            )
+        return self
 
     @model_validator(mode="after")
     def _refuse_dev_defaults_in_prod(self) -> "Settings":

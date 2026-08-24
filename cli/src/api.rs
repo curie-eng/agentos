@@ -303,13 +303,13 @@ pub struct Deployment {
     pub version_id: Option<String>,
     #[serde(default)]
     pub deployed_at: Option<String>,
-    /// Deployment-level managed checkout; absent or null means disabled.
+    /// Deployment-level runtime workspace capability; absent defaults to disabled.
     #[serde(default)]
-    pub workspace_repo: Option<String>,
+    pub workspace_enabled: bool,
 }
 
 /// Tri-state deployment intent. Preserve omits the request key, Disable sends
-/// JSON null, and Enable derives a canonical repository from known facts.
+/// `false`, and Enable sends `true`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceIntent {
     Preserve,
@@ -865,7 +865,7 @@ impl ApiClient {
         version_id: &str,
         environment: &str,
         commit_sha: Option<&str>,
-        workspace_repo: Option<Option<&str>>,
+        workspace_enabled: Option<bool>,
     ) -> Result<Deployment> {
         let mut body = json!({
             "agent_id": agent_id,
@@ -873,8 +873,8 @@ impl ApiClient {
             "environment": environment,
             "commit_sha": commit_sha,
         });
-        if let Some(repo) = workspace_repo {
-            body["workspace_repo"] = json!(repo);
+        if let Some(enabled) = workspace_enabled {
+            body["workspace_enabled"] = json!(enabled);
         }
         let resp = self
             .http
@@ -910,18 +910,10 @@ impl ApiClient {
         let (agent, channel, repo_note) = self
             .resolve_agent(agent_name, slack_channel, repo_full_name)
             .await?;
-        let workspace_repo = match workspace {
+        let workspace_enabled = match workspace {
             WorkspaceIntent::Preserve => None,
-            WorkspaceIntent::Disable => Some(None),
-            WorkspaceIntent::Enable => Some(Some(
-                repo_full_name
-                    .or(agent.repo_full_name.as_deref())
-                    .ok_or_else(|| {
-                        crate::exit::usage(
-                            "--workspace needs a repository, but this agent has no repository binding; pass --repo OWNER/NAME",
-                        )
-                    })?,
-            )),
+            WorkspaceIntent::Disable => Some(false),
+            WorkspaceIntent::Enable => Some(true),
         };
         // Bind per-agent connector secrets (ADR-0009, #429). A PATCH covers both
         // a freshly created agent and a redeploy that rotates a value; an empty
@@ -939,7 +931,7 @@ impl ApiClient {
                 &version.id,
                 environment,
                 commit_sha,
-                workspace_repo,
+                workspace_enabled,
             )
             .await?;
         Ok(DeployOutcome {

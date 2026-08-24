@@ -143,4 +143,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0114 | [Managed repository workspaces and approval-gated publication are platform capabilities](0114-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
+| 0115 | [Runtime repository selection is sticky authorized thread state](0115-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
 <!-- END GENERATED: adr-index -->

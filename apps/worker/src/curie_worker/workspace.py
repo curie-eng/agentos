@@ -20,6 +20,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -34,11 +35,28 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
+from urllib.parse import urlsplit
 
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"
 WORKSPACE_SHA256_ENV = "CURIE_WORKSPACE_SHA256"
 WORKSPACE_MOUNT_PATH = "/workspace"
+_GITHUB_URL = re.compile(r"https://github\.com/[^\s<>|]+", re.IGNORECASE)
+_REPO_FULL_NAME = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
+)
+_SELECTION_REFUSAL_MESSAGES = {
+    "workspace.deployment_disabled": (
+        "This deployment does not enable repository workspaces."
+    ),
+    "workspace.repository_required": (
+        "Start the thread by naming one allowed root GitHub repository URL."
+    ),
+    "workspace.selection_conflict": (
+        "This thread is already bound to a different repository."
+    ),
+}
 
 
 class WorkspacePreparationError(RuntimeError):
@@ -62,6 +80,14 @@ class WorkspaceArchiveError(WorkspacePreparationError):
 
     def __init__(self, detail: str) -> None:
         super().__init__("archive-validation", detail)
+
+
+class WorkspaceSelectionRefused(WorkspacePreparationError):
+    """A deliberate repository-selection refusal that must not be retried."""
+
+    def __init__(self, detail: str) -> None:
+        self.public_detail = detail
+        super().__init__("repository-selection", detail)
 
 
 class _OwnershipWriteUncertain(WorkspacePreparationError):
@@ -134,6 +160,46 @@ class WorkspaceCredential:
             raise ValueError("workspace authorization header contains control characters")
 
 
+def parse_github_repo_fact(message: str) -> str | None:
+    """Extract one canonical root GitHub repository URL from trusted turn text."""
+
+    repositories: dict[str, str] = {}
+    for matched in _GITHUB_URL.finditer(message):
+        raw = matched.group(0).rstrip(".,;:!?)]}")
+        parsed = urlsplit(raw)
+        try:
+            invalid_authority = (
+                parsed.hostname is None
+                or parsed.hostname.casefold() != "github.com"
+                or parsed.port is not None
+                or parsed.username is not None
+                or parsed.password is not None
+            )
+        except ValueError:
+            invalid_authority = True
+        if (
+            parsed.scheme.casefold() != "https"
+            or invalid_authority
+            or parsed.query
+            or parsed.fragment
+        ):
+            continue
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2:
+            continue
+        owner, repository = parts
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+        candidate = f"{owner}/{repository}"
+        if _REPO_FULL_NAME.fullmatch(candidate):
+            repositories.setdefault(candidate.casefold(), candidate)
+    if len(repositories) > 1:
+        raise WorkspaceSelectionRefused(
+            "Please name only one root GitHub repository URL in this thread."
+        )
+    return next(iter(repositories.values()), None)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(  # type: ignore[override]
         self,
@@ -197,13 +263,89 @@ class WorkspaceCredentialClient:
         self._worker_token = worker_token
         self._transport = transport
 
-    def redeem(self, deployment_id: uuid.UUID) -> WorkspaceCredential:
+    def select(
+        self,
+        deployment_id: uuid.UUID,
+        conversation_id: str,
+        author: str,
+        repo_full_name: str | None,
+    ) -> str:
+        body = json.dumps(
+            {
+                "conversation_id": conversation_id,
+                "author": author,
+                "repo_full_name": repo_full_name,
+            }
+        ).encode()
+        try:
+            response = self._transport(
+                method="POST",
+                url=f"{self._api_url}/v1/internal/workspaces/{deployment_id}/selection",
+                headers={
+                    "X-Curie-Worker-Token": self._worker_token,
+                    "Content-Type": "application/json",
+                },
+                body=body,
+                allow_redirects=False,
+            )
+        except Exception as exc:
+            raise WorkspacePreparationError(
+                "repository-selection", "worker could not reach the internal workspace API"
+            ) from exc
+        if response.status == 403:
+            raise WorkspaceSelectionRefused(
+                "That repository is not authorized for this installation."
+            )
+        if response.status == 409:
+            try:
+                payload = json.loads(response.body)
+                api_detail = payload["detail"]
+                if not isinstance(api_detail, Mapping):
+                    raise TypeError("detail is not an object")
+                code = api_detail["code"]
+                if not isinstance(code, str):
+                    raise TypeError("detail.code is not a string")
+                public_detail = _SELECTION_REFUSAL_MESSAGES[code]
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+            ) as exc:
+                raise WorkspacePreparationError(
+                    "repository-selection",
+                    "API returned an invalid selection refusal response",
+                ) from exc
+            raise WorkspaceSelectionRefused(public_detail)
+        if response.status != 200:
+            raise WorkspacePreparationError(
+                "repository-selection", f"API returned HTTP {response.status}"
+            )
+        try:
+            selected = str(json.loads(response.body)["repo_full_name"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorkspacePreparationError(
+                "repository-selection", "API returned an invalid selection response"
+            ) from exc
+        if not _REPO_FULL_NAME.fullmatch(selected):
+            raise WorkspacePreparationError(
+                "repository-selection", "API returned an invalid repository selection"
+            )
+        return selected
+
+    def redeem(
+        self, deployment_id: uuid.UUID, conversation_id: str
+    ) -> WorkspaceCredential:
+        body = json.dumps({"conversation_id": conversation_id}).encode()
         try:
             response = self._transport(
                 method="POST",
                 url=f"{self._api_url}/v1/internal/workspaces/{deployment_id}/credential",
-                headers={"X-Curie-Worker-Token": self._worker_token},
-                body=None,
+                headers={
+                    "X-Curie-Worker-Token": self._worker_token,
+                    "Content-Type": "application/json",
+                },
+                body=body,
                 allow_redirects=False,
             )
         except Exception as exc:
@@ -717,7 +859,6 @@ class WorkspacePreparer:
         real_started = time.monotonic()
         object_key: str | None = None
         self.scratch_root.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(self.scratch_root, 0o700)
         scratch = Path(tempfile.mkdtemp(prefix="claim-", dir=self.scratch_root))
         os.chmod(scratch, 0o700)
         checkout = scratch / "checkout"
@@ -734,7 +875,7 @@ class WorkspacePreparer:
                 f"{thread_key}:{generation}",
                 timeout_seconds=self._real_remaining(real_started),
             ):
-                credential = self.credentials.redeem(deployment_id)
+                credential = self.credentials.redeem(deployment_id, thread_key)
                 clone_env = {
                     "GIT_TERMINAL_PROMPT": "0",
                     # Kept alongside the count/key/value form so older supported
@@ -1086,6 +1227,23 @@ class WorkspaceClaimCoordinator:
             elif not ownership_staged:
                 self.preparer.delete(prepared)
             raise
+
+    def select_repository(
+        self,
+        *,
+        thread_key: str,
+        deployment_id: uuid.UUID,
+        author: str,
+        repo_full_name: str | None,
+    ) -> str:
+        """Authorize or reuse the immutable server-side thread selection."""
+
+        return cast(
+            "str",
+            self.preparer.credentials.select(
+                deployment_id, thread_key, author, repo_full_name
+            ),
+        )
 
     def _stage_ownership(
         self, thread_key: str, prepared: PreparedWorkspace

@@ -22,7 +22,45 @@ SCHEMA = "curie"
 def upgrade() -> None:
     op.add_column(
         "deployments",
-        sa.Column("workspace_repo", sa.String(), nullable=True),
+        sa.Column(
+            "workspace_enabled",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
+        schema=SCHEMA,
+    )
+    op.create_table(
+        "thread_workspaces",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("agent_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column(
+            "selected_by_deployment_id", postgresql.UUID(as_uuid=True), nullable=True
+        ),
+        sa.Column("conversation_id", sa.String(), nullable=False),
+        sa.Column("repo_full_name", sa.String(), nullable=False),
+        sa.Column("selected_by", sa.String(), nullable=False),
+        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["agent_id"], [f"{SCHEMA}.agents.id"], ondelete="CASCADE"
+        ),
+        sa.ForeignKeyConstraint(
+            ["selected_by_deployment_id"],
+            [f"{SCHEMA}.deployments.id"],
+            ondelete="SET NULL",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "agent_id",
+            "conversation_id",
+            name="thread_workspaces_agent_conversation_key",
+        ),
+        schema=SCHEMA,
+    )
+    op.create_index(
+        "ix_thread_workspaces_agent_id",
+        "thread_workspaces",
+        ["agent_id"],
         schema=SCHEMA,
     )
     op.add_column(
@@ -215,4 +253,5 @@ def downgrade() -> None:
         "approvals_purpose_ck", "approvals", schema=SCHEMA, type_="check"
     )
     op.drop_column("approvals", "purpose", schema=SCHEMA)
-    op.drop_column("deployments", "workspace_repo", schema=SCHEMA)
+    op.drop_table("thread_workspaces", schema=SCHEMA)
+    op.drop_column("deployments", "workspace_enabled", schema=SCHEMA)

@@ -427,7 +427,11 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
     deployment = _deploy(worker_client, auth_headers, agent_id, version_id, workspace=True)
     selected = worker_client.post(
         f"/v1/internal/workspaces/{deployment['id']}/selection",
-        json={"conversation_id": "thread-nonblocking", "author": "U0REQUEST1", "repo_full_name": REPO},
+        json={
+            "conversation_id": "thread-nonblocking",
+            "author": "U0REQUEST1",
+            "repo_full_name": REPO,
+        },
         headers=WORKER_HEADERS,
     )
     assert selected.status_code == 200, selected.text

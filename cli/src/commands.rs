@@ -7155,7 +7155,7 @@ mod tests {
             status: status.into(),
             version_id: Some(version.into()),
             deployed_at: Some(ts.into()),
-            workspace_repo: None,
+            workspace_enabled: false,
         }
     }
 

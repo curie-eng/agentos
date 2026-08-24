@@ -1282,7 +1282,7 @@
             },
             {
               "global": false,
-              "help": "Materialize this deployment's repository as a managed /workspace. The repository is inferred from --repo, then the agent binding",
+              "help": "Let each new session select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
               "id": "workspace",
               "long": "workspace",
               "positional": false,
@@ -3023,7 +3023,7 @@
             },
             {
               "global": false,
-              "help": "Materialize each deployment's repository as a managed /workspace. With --all-targets, each target derives its own agent binding",
+              "help": "Let sessions on each deployment select an allowed GitHub repository from the opening message and materialize it as managed /workspace",
               "id": "workspace",
               "long": "workspace",
               "positional": false,

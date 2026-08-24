@@ -325,7 +325,10 @@ def test_exact_publication_replay_rechecks_the_current_thread_selection(
                         "WHERE selected_by_deployment_id = :deployment_id "
                         "AND conversation_id = :conversation_id"
                     ),
-                    {"deployment_id": deployment["id"], "conversation_id": payload["conversation_id"]},
+                    {
+                        "deployment_id": deployment["id"],
+                        "conversation_id": payload["conversation_id"],
+                    },
                 )
         finally:
             await engine.dispose()

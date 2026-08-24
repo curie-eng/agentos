@@ -31,6 +31,7 @@ from pydantic import (
 
 from .config import get_settings
 from .models import GIT_FLOW_CREATED_BY, Environment
+from .workspace_policy import REPOSITORY_FULL_NAME_PATTERN, valid_repository_name
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
 # private group) followed by uppercase-alphanumeric chars. Allowlist-shaped on
@@ -44,14 +45,6 @@ _SLACK_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{7,}$")
 # distinction between a user group and a channel.
 _SLACK_USERGROUP_ID = re.compile(r"^S[A-Z0-9]{7,}$")
 _SLACK_USER_ID = re.compile(r"^[UW][A-Z0-9]{7,}$")
-
-# A repository selector, not a URL. Keeping this allowlist deliberately narrow
-# prevents credentials, origins, and path traversal from entering durable
-# deployment state and later becoming a target for the operator credential.
-_REPO_FULL_NAME = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
-    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$"
-)
 
 # Channel kinds are lowercase slugs: the value names the owning adapter, and
 # `Slack`, `slack ` and `slack` must not be three different kinds. Shape only --
@@ -1034,25 +1027,12 @@ class DeploymentCreate(BaseModel):
     environment: Environment
     commit_sha: str | None = None
     # Three states are distinguished by ``model_fields_set`` in the router:
-    # omitted carries the last active deployment value, a canonical owner/repo
-    # enables the workspace, and explicit null disables it.
-    workspace_repo: str | None = None
+    # omitted carries the last active deployment value, true enables runtime
+    # repository selection, and false disables it.
+    workspace_enabled: bool | None = None
     status: str = "active"
 
     _check_commit_sha = field_validator("commit_sha")(_validate_optional_commit_sha)
-
-    @field_validator("workspace_repo")
-    @classmethod
-    def _canonical_workspace_repo(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if not _REPO_FULL_NAME.fullmatch(value) or value.endswith("/.git"):
-            raise ValueError(
-                "workspace_repo must be one canonical GitHub owner/repository "
-                "name (for example acme-corp/acme-bot), not a URL or credential"
-            )
-        return value
-
 
 class DeploymentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1062,7 +1042,7 @@ class DeploymentOut(BaseModel):
     version_id: uuid.UUID
     environment: Environment
     commit_sha: str | None
-    workspace_repo: str | None
+    workspace_enabled: bool
     status: str
     deployed_at: datetime
 
@@ -1075,11 +1055,35 @@ class RepositoryCredentialOut(BaseModel):
     authorization_header: str
 
 
+class WorkspaceSelectionRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+    author: str = Field(min_length=1)
+    repo_full_name: str | None = None
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_repo(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
+
+
+class WorkspaceSelectionOut(BaseModel):
+    repo_full_name: str
+
+
+class WorkspaceCredentialRequest(BaseModel):
+    conversation_id: str = Field(min_length=1)
+
+
 class PublicationCreate(BaseModel):
     """Trusted snapshot facts used to atomically create approval + publication."""
 
     deployment_id: uuid.UUID
     conversation_id: str = Field(min_length=1)
+    repo_full_name: str = Field(pattern=REPOSITORY_FULL_NAME_PATTERN)
     author: str = Field(min_length=1)
     summary: str = Field(min_length=1)
     reply_kind: str = Field(min_length=1)
@@ -1092,8 +1096,15 @@ class PublicationCreate(BaseModel):
     patch_b64: str = Field(min_length=1)
     changed_paths: list[str] = Field(min_length=1, max_length=4096)
     expires_in_seconds: int | None = Field(default=None, ge=1)
-    title: str | None = None
-    body: str | None = None
+    title: str | None = Field(default=None, max_length=256)
+    body: str | None = Field(default=None, max_length=65_536)
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _canonical_publication_repo(cls, value: str) -> str:
+        if not valid_repository_name(value):
+            raise ValueError("repo_full_name must be one canonical owner/repository name")
+        return value
 
     @field_validator("base_sha")
     @classmethod

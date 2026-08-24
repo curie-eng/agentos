@@ -57,6 +57,7 @@ class PublicationCreateRequest:
 
     deployment_id: uuid.UUID
     conversation_id: str
+    repo_full_name: str
     author: str
     summary: str
     reply_kind: str
@@ -81,6 +82,7 @@ class PublicationCreateRequest:
         return {
             "deployment_id": str(self.deployment_id),
             "conversation_id": self.conversation_id,
+            "repo_full_name": self.repo_full_name,
             "author": self.author,
             "summary": self.summary,
             "reply_kind": self.reply_kind,

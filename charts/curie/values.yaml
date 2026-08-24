@@ -635,6 +635,10 @@ api:
   # to helm, but a token typed on the command line is still in curie's own
   # argv, so it does reach your shell history and the process table.
   githubToken: ""
+  # Runtime repository workspaces are fail-closed independently of credential
+  # reach. Each entry is owner/repository or owner/*; an empty list allows no
+  # opening-message repository selections.
+  githubRepoAllowlist: []
   # GitHub App identity (ADR-0092). The scalable alternative to githubToken
   # above: the platform mints a one-hour token scoped to the single repository
   # being cloned, so there is nothing to rotate, no human owner, and adding the
@@ -834,6 +838,12 @@ worker:
     digest: ""
     pullPolicy: Always
   imagePullSecrets: []
+  # Own mounted scratch volumes as the same uid the worker image runs under.
+  # Without this, the kubelet-created emptyDir root is not writable by the
+  # non-root clone process.
+  podSecurityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
   # The worker drives the Kubernetes API to claim/manage agent-sandbox CRDs, so
   # it gets a ServiceAccount + a namespaced Role scoped to exactly those verbs
   # (see templates/worker.yaml). Its token IS mounted (unlike the runner SA).

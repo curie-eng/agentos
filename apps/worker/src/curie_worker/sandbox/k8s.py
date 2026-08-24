@@ -46,7 +46,7 @@ EXT_VERSION = "v1beta1"
 # and answer, with the bundle simply absent.
 BUNDLE_REF_ENV = BootEnv.env_key("bundle_ref")
 BUNDLE_INIT_CONTAINERS = ("bundle-fetch", "bundle-extract")
-WORKSPACE_INIT_CONTAINERS = ("workspace-fetch", "workspace-extract")
+WORKSPACE_INIT_CONTAINERS = ("workspace-init",)
 
 # The SandboxClaim env schema is value-only (no secretKeyRef), so anything put
 # here is stored in plain text on the claim object. The model credential must NOT

@@ -106,6 +106,8 @@ from .threadlock import ThreadLock
 from .workspace import (
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
+    WorkspaceSelectionRefused,
+    parse_github_repo_fact,
 )
 
 logger = logging.getLogger(__name__)
@@ -752,7 +754,7 @@ class Kernel:
                     return
                 agent_id = resolved.agent_id
                 boot_env = self._binding.boot_env(resolved, thread)
-                if getattr(resolved, "workspace_repo", None) is not None:
+                if getattr(resolved, "workspace_enabled", False):
                     workspace_deployment_id = getattr(resolved, "deployment_id", None)
                     if workspace_deployment_id is None:
                         raise WorkspacePreparationError(
@@ -1488,10 +1490,15 @@ class Kernel:
                 ),
             )
             return TurnOutcome(terminal_ok=True)
+        except WorkspaceSelectionRefused as exc:
+            release_order()
+            await self._reply_for(qevent, route, exc.public_detail)
+            return TurnOutcome(terminal_ok=True)
         except (
             RunnerError,
             aiohttp.ClientError,
             TimeoutError,
+            OSError,
             SandboxError,
             WorkspacePreparationError,
         ) as exc:
@@ -1602,6 +1609,24 @@ class Kernel:
         workspace_deployment_id: uuid.UUID | None = None,
         source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
+        # A workspace-enabled thread must establish (or confirm) its repository
+        # before any platform response path. This deliberately precedes the
+        # greeting/help shortcut: a canned reply must not create a thread whose
+        # repository remains ambiguous, and a conflicting repository must be
+        # refused before an existing sandbox can be adopted or steered.
+        if workspace_deployment_id is not None:
+            if self._workspace is None:
+                raise WorkspacePreparationError(
+                    "wiring", "workspace-enabled deployment has no trusted coordinator"
+                )
+            repo_fact = parse_github_repo_fact(event.text)
+            await asyncio.to_thread(
+                self._workspace.select_repository,
+                thread_key=thread,
+                deployment_id=workspace_deployment_id,
+                author=event.user,
+                repo_full_name=repo_fact,
+            )
         # Greeting/help pre-model short-circuit (ADR-0018): under the per-thread
         # route lock, if an enabled greeting/help pack matches the message text AND
         # the thread has no existing route, it is provably a NEW turn (it cannot be
@@ -1702,25 +1727,26 @@ class Kernel:
         *,
         workspace_deployment_id: uuid.UUID | None = None,
     ) -> SandboxHandle:
-        # A live route is an adopt/steer, not a session start.  Preparing before
+        # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
-        # the base object while the existing sandbox is still using it.
+        # the base object while the existing sandbox is still using it. The
+        # substrate's adopt primitive both validates and touches an existing
+        # route without ever cold-creating one; this avoids the old
+        # lookup-then-claim gap, where the route could disappear and ``claim``
+        # would create a sandbox without a freshly prepared workspace ref.
         if workspace_deployment_id is not None:
             if self._workspace is None:
                 raise WorkspacePreparationError(
                     "wiring", "workspace-enabled deployment has no trusted preparer"
                 )
-            existing = await asyncio.to_thread(self._substrate.lookup, thread)
+            existing = await asyncio.to_thread(self._substrate.adopt, thread)
             if existing is not None:
-                existing_handle = await asyncio.to_thread(
-                    self._substrate.claim, thread, env=boot_env
-                )
                 await asyncio.to_thread(
                     self._workspace.touch,
                     thread,
                     ttl_seconds=self._route_ttl_seconds,
                 )
-                return existing_handle
+                return existing
             # Prepare once, then let the substrate decide cold claim versus
             # suspended-route resume. Either branch materializes the same fresh,
             # verified archive before the runner can start.
@@ -2081,6 +2107,7 @@ class Kernel:
                     PublicationCreateRequest(
                         deployment_id=deployment_id,
                         conversation_id=thread,
+                        repo_full_name=snapshot.repo_full_name,
                         author=qevent.author,
                         summary=summary,
                         reply_kind=qevent.reply_handle.kind,
@@ -2410,15 +2437,9 @@ class Kernel:
             acc.text_parts.append(frame.text)
             await reply.stream(acc.rendered())
         elif isinstance(frame, ToolNote):
-            # Surfaced for context but not part of the answer buffer.
-            note = (
-                f"  -> [{frame.tool}] {frame.text}"
-                if frame.tool is not None
-                else f"  -> {frame.text}"
-            )
-            answer = acc.rendered()
-            preview = f"{answer}\n{note}" if answer else note
-            await reply.context(preview)
+            # Tool notes remain available on the ACI stream for internal
+            # consumers, but they are not part of the user-facing reply.
+            pass
         elif isinstance(frame, SideEffectFlag):
             acc.saw_side_effect = True
             # Persist immediately so a crash before done still blocks auto-retry.

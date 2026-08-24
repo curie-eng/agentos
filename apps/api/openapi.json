@@ -1263,16 +1263,16 @@
             "title": "Version Id",
             "type": "string"
           },
-          "workspace_repo": {
+          "workspace_enabled": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "boolean"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Workspace Repo"
+            "title": "Workspace Enabled"
           }
         },
         "required": [
@@ -1323,16 +1323,9 @@
             "title": "Version Id",
             "type": "string"
           },
-          "workspace_repo": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Workspace Repo"
+          "workspace_enabled": {
+            "title": "Workspace Enabled",
+            "type": "boolean"
           }
         },
         "required": [
@@ -1341,7 +1334,7 @@
           "version_id",
           "environment",
           "commit_sha",
-          "workspace_repo",
+          "workspace_enabled",
           "status",
           "deployed_at"
         ],
@@ -2433,6 +2426,7 @@
           "body": {
             "anyOf": [
               {
+                "maxLength": 65536,
                 "type": "string"
               },
               {
@@ -2525,6 +2519,11 @@
             ],
             "title": "Reply Placeholder"
           },
+          "repo_full_name": {
+            "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?$",
+            "title": "Repo Full Name",
+            "type": "string"
+          },
           "summary": {
             "minLength": 1,
             "title": "Summary",
@@ -2533,6 +2532,7 @@
           "title": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
@@ -2545,6 +2545,7 @@
         "required": [
           "deployment_id",
           "conversation_id",
+          "repo_full_name",
           "author",
           "summary",
           "reply_kind",
@@ -3346,6 +3347,64 @@
           "status"
         ],
         "title": "WebhookResult",
+        "type": "object"
+      },
+      "WorkspaceCredentialRequest": {
+        "properties": {
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "conversation_id"
+        ],
+        "title": "WorkspaceCredentialRequest",
+        "type": "object"
+      },
+      "WorkspaceSelectionOut": {
+        "properties": {
+          "repo_full_name": {
+            "title": "Repo Full Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo_full_name"
+        ],
+        "title": "WorkspaceSelectionOut",
+        "type": "object"
+      },
+      "WorkspaceSelectionRequest": {
+        "properties": {
+          "author": {
+            "minLength": 1,
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation_id": {
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "repo_full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repo Full Name"
+          }
+        },
+        "required": [
+          "conversation_id",
+          "author"
+        ],
+        "title": "WorkspaceSelectionRequest",
         "type": "object"
       }
     }
@@ -7673,6 +7732,16 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -7696,6 +7765,76 @@
           }
         },
         "summary": "Redeem Workspace Credential",
+        "tags": [
+          "internal-workspaces"
+        ]
+      }
+    },
+    "/v1/internal/workspaces/{deployment_id}/selection": {
+      "post": {
+        "description": "Select once per agent/thread, or validate and reuse the winner.",
+        "operationId": "select_workspace_repository_v1_internal_workspaces__deployment_id__selection_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceSelectionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Select Workspace Repository",
         "tags": [
           "internal-workspaces"
         ]
