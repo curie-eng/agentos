@@ -868,12 +868,46 @@ counts it, which decision 6 is what fixes.
   as hygiene; it does not remove a wall-clock deadline from a proportionally
   starved path.
 
-- **Process checkpoint/restore (`runsc checkpoint`) to preserve a live session
-  and its prompt cache across idleness.** Deferred, not rejected. It is the
-  natural extension of decision 5 and gVisor is already the default sandbox
-  runtime, but restoring a process holding an open ACI socket, and a checkpoint
-  image containing a live runner token, are each their own decision. This ADR
-  deliberately buys most of the benefit without them.
+- **Process checkpoint/restore (`runsc checkpoint`).** Spiked and **not
+  pursued**, because the half that would pay is not something this repository can
+  build.
+
+  The motivation was this ADR's own measured ceiling: a warm pod that gets taken
+  has to be replaced, and replacing it costs the same full boot, so a burst
+  larger than the pool empties it and throughput is unchanged. Making a
+  *replacement* cheap is what would lift that, and checkpoint/restore is the
+  obvious way -- 13.46 of the boot's 17.39 seconds is work that is identical for
+  every pod of a given version.
+
+  Measured on a cluster with containerd and the gvisor addon, `runsc
+  release-20260817.0`:
+
+  - **Taking a checkpoint is nearly free**: 47ms on the runner container, 38ms on
+    the pod sandbox, a 59 MB image either way, and `-leave-running` genuinely
+    leaves the container serving. An earlier estimate here of roughly 505 MiB was
+    wrong by an order of magnitude, because most of a runner's footprint is
+    file-backed page cache a checkpoint need not carry.
+  - **Restoring has no path.** Three separate walls. A sub-container cannot be
+    restored alone, because in gVisor a pod is one sandbox hosting `pause` and
+    `runner` as sub-containers of a single sandbox process, so the unit is the
+    sandbox. A sandbox restored out of band fails to start, because `runsc` given
+    an image and a preserved `config.json` does not rebuild the network
+    namespace, mounts, and rootfs that containerd constructs around it. And
+    containerd's CRI `CheckpointContainer` -- the standard path -- calls CRIU and
+    does not delegate to `runsc`, so for this runtime the door exists and the room
+    behind it does not.
+
+  So the work is not "checkpoint at deploy, restore on refill" but "build
+  sandbox-level restore integration", owned by either the Agent Sandbox controller
+  (which ADR-0007 adopts rather than builds) or containerd itself. Neither is a
+  change Curie can make, which is why this is recorded as tested-and-parked rather
+  than deferred: **it is not waiting on our capacity, it is waiting on someone
+  else's.** If either grows a restore path, the expensive half is already known to
+  cost 47 milliseconds.
+
+  The two design questions the earlier draft raised -- restoring a process holding
+  an open ACI socket, and a checkpoint image containing a live runner token --
+  remain unanswered and would still need answering.
 
 - **Replacing the adopted harness to shrink the 259.5 MiB per session.**
   Rejected under ADR-0007: `claude-agent-sdk` and the Claude Code plugin format
@@ -1002,4 +1036,5 @@ counts it, which decision 6 is what fixes.
   bundled MCP server. It affects node scale-out rather than per-pod boot once
   decision 4 lands, and it is a separate concern.
 
-- **Checkpoint/restore**, per the alternatives above.
+- **Checkpoint/restore**, per the alternatives above, where it is recorded as
+  spiked and parked on an upstream dependency rather than merely deferred.
