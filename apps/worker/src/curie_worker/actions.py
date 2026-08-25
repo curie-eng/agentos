@@ -56,7 +56,7 @@ class ActionRecorder(Protocol):
         gate_approval_id: str | None = None,
     ) -> RecordedAction: ...
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> None: ...
+    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]: ...
 
 
 def _snapshot(
@@ -131,11 +131,17 @@ class ActionClient:
         payload = await self._post(self._url, body, "action record")
         return RecordedAction(id=str(payload["id"]), status=str(payload["status"]))
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> None:
-        """Close the record with what came back."""
+    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
+        """Close the record with what came back, and return the row as stored.
+
+        Returned rather than discarded because the receipt is rendered from what
+        the LEDGER holds, not from what the worker sent: ``undoable`` is derived
+        on the record, so reading it back is what keeps a receipt from claiming a
+        reversibility the row does not have.
+        """
 
         prior, post, target = _snapshot(frame)
-        await self._post(
+        return await self._post(
             f"{self._url}/{action_id}/complete",
             {
                 "failed": bool(frame.failed),

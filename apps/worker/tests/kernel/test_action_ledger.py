@@ -63,8 +63,15 @@ class FakeRecorder:
         )
         return RecordedAction(id=f"a{len(self.recorded)}", status="pending")
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> None:
+    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
         self.completed.append((action_id, frame))
+        return {
+            "tool": frame.tool,
+            "result": frame.result,
+            "detail": frame.detail,
+            "status": "failed" if frame.failed else "succeeded",
+            "undoable": bool(frame.result and frame.result.get("prior")),
+        }
 
 
 def _call(call_id: str, tool: str = "scale_deployment") -> list[SideEffectFlag]:
@@ -235,5 +242,63 @@ def test_an_ordinary_turn_records_no_gate(make_harness) -> None:
             await h.kernel.process_event(_qevent("scale it"))
 
             assert recorder.recorded[0]["gate_approval_id"] is None
+
+    asyncio.run(go())
+
+
+def test_a_turn_that_changed_the_world_says_so_in_its_reply(make_harness) -> None:
+    """ADR-0117 decision 7: the person who asked gets an account of what happened.
+
+    Before this, the platform's entire account of an agent changing production
+    was prose the model wrote about itself.
+    """
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("scale it"))
+
+            assert h.sink.last_text is not None
+            assert "What I changed" in h.sink.last_text
+            assert "can be undone" in h.sink.last_text
+            # The model's own answer is still the answer; the receipt is added to
+            # it rather than replacing it.
+            assert h.sink.last_text.startswith("done")
+
+    asyncio.run(go())
+
+
+def test_a_read_only_turn_gets_no_receipt(make_harness) -> None:
+    """Most turns are reads, and a receipt on every one of them is noise."""
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [Final(text="nothing to do", status=DONE)]
+            await h.kernel.process_event(_qevent("how are things"))
+
+            assert h.sink.last_text == "nothing to do"
+
+    asyncio.run(go())
+
+
+def test_a_call_that_never_came_back_is_not_on_the_receipt(make_harness) -> None:
+    """An open record is an attempt, not an account of what changed.
+
+    Its result never arrived, so there is nothing truthful to say about what it
+    did; the row stands in the ledger and a human reads it there.
+    """
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [
+                _call("toolu_01")[0],
+                Final(text="done", status=DONE),
+            ]
+            await h.kernel.process_event(_qevent("scale it"))
+
+            assert h.sink.last_text == "done"
 
     asyncio.run(go())

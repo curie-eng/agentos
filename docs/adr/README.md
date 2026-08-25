@@ -141,10 +141,12 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
+| 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0114 | [Managed repository workspaces and approval-gated publication are platform capabilities](0114-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
 | 0115 | [Runtime repository selection is sticky authorized thread state](0115-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |
-| 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Draft |
+| 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Accepted |
 | 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
+| 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
 <!-- END GENERATED: adr-index -->

@@ -1,7 +1,7 @@
 {
   "name": "sre-bot",
   "version": "0.1.0",
-  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. Read-only by default: the Kubernetes read connector exposes only read tools, and its credential cannot read Secrets or mutate resources. Grafana and Tempo connectors add observability reads. The one declared write verb rolls a single allowlisted Deployment using a separate credential and the exact human approval gate mcp__k8s-write__restart_deployment.",
+  "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. Read-only by default: the Kubernetes read connector exposes only read tools, and its credential cannot read Secrets or mutate resources. Grafana and Tempo connectors add observability reads. The one declared write verb rolls a single allowlisted Deployment using a separate credential and the exact human approval gate mcp__k8s-write__restart_deployment. A second gated verb scales a single allowlisted Deployment through the `deployments/scale` subresource with its own credential and the gate mcp__k8s-scale__scale_deployment; it reports the replica count it read before writing, so the platform can offer an undo.",
   "license": "Apache-2.0",
   "author": {
     "name": "CurieTech"
@@ -33,6 +33,10 @@
     "gates": [
       {
         "gate": "mcp__k8s-write__restart_deployment",
+        "route": "sre-approvals"
+      },
+      {
+        "gate": "mcp__k8s-scale__scale_deployment",
         "route": "sre-approvals"
       }
     ]

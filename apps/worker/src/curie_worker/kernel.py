@@ -90,6 +90,7 @@ from .config import WorkerConfig
 from .killswitch import KillSwitch
 from .markers import CompletionRecord, MalformedCompletionError, Markers
 from .publication_validation import validate_snapshot_against_base
+from .receipt import render_receipt
 from .reply_sink import ReplySink, TargetRoute
 from .runner_client import (
     RunnerClient,
@@ -396,9 +397,29 @@ class _StreamAccumulator:
     # than minting a second. A turn that calls the same tool twice is only
     # distinguishable here by the call id.
     open_actions: dict[str, str] = field(default_factory=dict)
+    # Completed ledger rows, in the order their calls closed -- the receipt
+    # (ADR-0117 decision 7). Read back from the ledger rather than assembled
+    # here, because ``undoable`` is derived on the record and a receipt built
+    # from what the worker SENT could claim a reversibility the row lacks.
+    receipt_rows: list[dict[str, Any]] = field(default_factory=list)
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
+
+    def rendered_with_receipt(self) -> str:
+        """The turn's answer, then what it did to the world.
+
+        Appended rather than replacing: the model's answer is what the person
+        asked for, and the receipt is the platform's own account beneath it. A
+        turn that changed nothing adds nothing, because most turns are reads and
+        a receipt on every one of them is noise.
+        """
+
+        text = self.rendered()
+        receipt = render_receipt(self.receipt_rows)
+        if receipt is None:
+            return text
+        return f"{text}\n\n{receipt}" if text else receipt
 
 
 class _ThrottledReply:
@@ -2588,11 +2609,13 @@ class Kernel:
             )
             acc.open_actions[frame.call_id] = recorded.id
             return
-        await self._actions.complete(opened, frame)
+        completed = await self._actions.complete(opened, frame)
+        if completed:
+            acc.receipt_rows.append(completed)
 
     async def _finish(self, acc: _StreamAccumulator, reply: _ThrottledReply) -> TurnOutcome:
         if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
-            text = acc.rendered()
+            text = acc.rendered_with_receipt()
             await reply.finalize(text)
             return TurnOutcome(
                 terminal_ok=True,
