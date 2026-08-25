@@ -296,7 +296,7 @@ def test_expired_completion_lease_is_reclaimed_after_sigkill_reopen(
         assert wait_until(lambda: ingress.delivery_ids() == ["msg-lease"])
         status, _ = post_event(
             f"http://127.0.0.1:{first_port}/",
-            update("durable answer", conversation_id="thr-lease"),
+            update("durable answer", conversation_id="thr-lease", reply_ref=None),
         )
         assert status == 200
         mail.fail_next_reply = 500
@@ -348,7 +348,7 @@ def test_crash_after_provider_accept_uses_thread_witness_before_resend(
         assert wait_until(lambda: ingress.delivery_ids() == ["msg-ambiguous"])
         assert post_event(
             f"http://127.0.0.1:{first_port}/",
-            update("one answer", conversation_id="thr-ambiguous"),
+            update("one answer", conversation_id="thr-ambiguous", reply_ref=None),
         )[0] == 200
         mail.accept_then_drop_next_reply = True
         assert post_event(

@@ -394,8 +394,22 @@ mailAdapter:
 ```
 
 An empty `mailAdapter.agentmail.httpsCidrs` refuses to render when the adapter is
-enabled. Do not use `0.0.0.0/0` as a substitute for provider ranges; that turns a
-named egress exception into arbitrary internet access.
+enabled. Prefix-0 and prefix-1 routes refuse to render, including IPv4 or IPv6
+split default routes; surrounding whitespace and expanded IPv6 spelling do not
+bypass that gate. Use narrow current provider or controlled-proxy ranges.
+
+For a bring-your-own platform API, declare the URL and its NetworkPolicy peer
+independently; the chart cannot safely infer IP ranges from a hostname:
+
+```yaml
+api:
+  deploy: false
+mailAdapter:
+  apiBaseUrl: https://api.example.com:8443
+  apiEgress:
+    httpsCidrs: [198.51.100.0/24] # placeholder; use the real narrow API range
+    port: 8443
+```
 
 | Value | What it does |
 |---|---|
@@ -408,6 +422,7 @@ named egress exception into arbitrary internet access.
 | `mailAdapter.ingressEnabled` | `false` serves egress while sending nothing inbound. That is the staged-cutover position while the platform side of a new binding is being wired. |
 | `mailAdapter.egressSecret` | The shared secret the worker presents on `X-Curie-Adapter-Secret` and the adapter checks before any side effect. |
 | `mailAdapter.agentmail.httpsCidrs` | Required provider/proxy destination CIDRs on TCP 443. The mail pod's egress policy otherwise allows only DNS and this release's API pods. |
+| `mailAdapter.apiEgress.httpsCidrs` / `port` | Required narrow destination peers when `api.deploy=false`; default port `8000`. Ignored for the in-chart API, whose pod selector and service port are used instead. |
 | `mailAdapter.persistence.size` / `storageClass` | Chart-managed RWO SQLite PVC. The default size is `1Gi`; empty storage class inherits `global.storageClass` and then the cluster default. |
 | `mailAdapter.persistence.existingClaim` | Mount an existing same-namespace RWO Filesystem PVC instead of rendering one. An install/upgrade hook checks the exact claim before replacing the pod. |
 

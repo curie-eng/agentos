@@ -1,3 +1,72 @@
+{{/*
+Validate and normalize one CIDR before it is allowed into the credential-bearing
+mail pod's NetworkPolicy. Kubernetes validates CIDR syntax only after Helm has
+already accepted the release, so this render gate keeps malformed and broad
+routes from becoming an install-time surprise or an egress escape hatch.
+
+The chart has no general IP-network parser. This deliberately accepts the two
+NetworkPolicy families Kubernetes accepts: strict dotted-quad IPv4 and IPv6
+hextets with at most one `::` compression. Prefix 0 and 1 are rejected outright;
+that also rejects the two-/1 spellings of a default route without depending on
+list order or an exact string comparison.
+*/}}
+{{- define "curie.mailAdapter.narrowCidr" -}}
+{{- $key := .key -}}
+{{- $cidr := trim (printf "%v" .cidr) -}}
+{{- if eq $cidr "" -}}
+{{- fail (printf "%s entries must be non-empty narrow CIDRs" $key) -}}
+{{- end -}}
+{{- $parts := splitList "/" $cidr -}}
+{{- if ne (len $parts) 2 -}}
+{{- fail (printf "%s entry %q is not a valid IPv4 or IPv6 CIDR" $key $cidr) -}}
+{{- end -}}
+{{- $ip := index $parts 0 -}}
+{{- $prefixText := index $parts 1 -}}
+{{- if not (regexMatch "^(0|[1-9][0-9]{0,2})$" $prefixText) -}}
+{{- fail (printf "%s entry %q has an invalid prefix length" $key $cidr) -}}
+{{- end -}}
+{{- $prefix := int $prefixText -}}
+{{- if contains ":" $ip -}}
+  {{- if or (gt $prefix 128) (not (regexMatch "^[0-9A-Fa-f:]+$" $ip)) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- $compressed := splitList "::" $ip -}}
+  {{- if gt (len $compressed) 2 -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- $hextets := 0 -}}
+  {{- range $side := $compressed -}}
+    {{- if ne $side "" -}}
+      {{- range $hextet := splitList ":" $side -}}
+        {{- if not (regexMatch "^[0-9A-Fa-f]{1,4}$" $hextet) -}}
+        {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+        {{- end -}}
+        {{- $hextets = add1 $hextets -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if and (eq (len $compressed) 1) (ne $hextets 8) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- if and (eq (len $compressed) 2) (gt $hextets 7) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv6 CIDR" $key $cidr) -}}
+  {{- end -}}
+{{- else -}}
+  {{- if or (gt $prefix 32) (not (regexMatch "^(0|[1-9][0-9]{0,2})([.](0|[1-9][0-9]{0,2})){3}$" $ip)) -}}
+  {{- fail (printf "%s entry %q is not a valid IPv4 CIDR" $key $cidr) -}}
+  {{- end -}}
+  {{- range $octet := splitList "." $ip -}}
+    {{- if gt (int $octet) 255 -}}
+    {{- fail (printf "%s entry %q is not a valid IPv4 CIDR" $key $cidr) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if le $prefix 1 -}}
+{{- fail (printf "%s entry %q is a default or equivalently broad route; use narrow provider/API ranges" $key $cidr) -}}
+{{- end -}}
+{{- $cidr -}}
+{{- end -}}
+
 {{- if .Values.mailAdapter.deploy }}
 {{- if not .Values.mailAdapter.agentmail.httpsCidrs }}
 {{- fail "mailAdapter.deploy is true: set at least one mailAdapter.agentmail.httpsCidrs entry for AgentMail (or a controlled HTTPS egress proxy); provider egress fails closed" }}
@@ -5,10 +74,26 @@
 {{- if not (hasPrefix "https://" .Values.mailAdapter.agentmail.baseUrl) }}
 {{- fail "mailAdapter.deploy is true: mailAdapter.agentmail.baseUrl must use https:// because the mail egress policy permits provider traffic only on TCP 443" }}
 {{- end }}
+{{- $agentmailCidrs := list }}
 {{- range .Values.mailAdapter.agentmail.httpsCidrs }}
-{{- if or (not .) (eq . "0.0.0.0/0") (eq . "::/0") }}
-{{- fail "mailAdapter.agentmail.httpsCidrs entries must be non-empty provider/proxy ranges; 0.0.0.0/0 and ::/0 are not fail-closed provider egress" }}
+{{- $agentmailCidrs = append $agentmailCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.agentmail.httpsCidrs" "cidr" .) | trim) }}
 {{- end }}
+{{- $apiCidrs := list }}
+{{- if not .Values.api.deploy }}
+  {{- if not .Values.mailAdapter.apiBaseUrl }}
+  {{- fail "api.deploy is false: set mailAdapter.apiBaseUrl to the bring-your-own API URL" }}
+  {{- end }}
+  {{- if not .Values.mailAdapter.apiEgress.httpsCidrs }}
+  {{- fail "api.deploy is false: set at least one narrow mailAdapter.apiEgress.httpsCidrs entry for the bring-your-own API; API egress fails closed" }}
+  {{- end }}
+  {{- range .Values.mailAdapter.apiEgress.httpsCidrs }}
+  {{- $apiCidrs = append $apiCidrs (include "curie.mailAdapter.narrowCidr" (dict "key" "mailAdapter.apiEgress.httpsCidrs" "cidr" .) | trim) }}
+  {{- end }}
+  {{- $apiPortText := printf "%v" .Values.mailAdapter.apiEgress.port }}
+  {{- $apiPort := int $apiPortText }}
+  {{- if or (not (regexMatch "^[0-9]+$" $apiPortText)) (lt $apiPort 1) (gt $apiPort 65535) }}
+  {{- fail "mailAdapter.apiEgress.port must be an integer from 1 through 65535" }}
+  {{- end }}
 {{- end }}
 {{/*
 The first-party email channel (#1515): the adapter polls an AgentMail inbox,
@@ -234,13 +319,23 @@ spec:
             matchLabels:
               {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
       ports:
-        - { protocol: TCP, port: 8000 }
+        - { protocol: TCP, port: {{ .Values.api.service.port }} }
+    {{- else }}
+    # A bring-your-own API has no in-chart pod labels to select. The operator
+    # must declare its narrow IP peer and port explicitly at render time.
+    - to:
+        {{- range $apiCidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.mailAdapter.apiEgress.port }} }
     {{- end }}
     # AgentMail, or an operator-controlled HTTPS egress proxy. NetworkPolicy is
     # IP based, so operators must keep these CIDRs aligned with the configured
     # AGENTMAIL_BASE_URL destination.
     - to:
-        {{- range .Values.mailAdapter.agentmail.httpsCidrs }}
+        {{- range $agentmailCidrs }}
         - ipBlock:
             cidr: {{ . | quote }}
         {{- end }}

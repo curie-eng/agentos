@@ -14,11 +14,11 @@ the enforceable-rule summary.
   stolen from it, and re-minting an expired `chn` token is an operator step for
   exactly that reason. Its local SQLite file is delivery state, not a platform
   capability, and must never contain any of the three credentials.
-- **The reply target is `target.reply_ref` off the event, never the conversation
-  record.** The record is overwritten by every inbound message in the thread, so
-  deriving the target from it sends turn one's answer to message two. The record
-  exists for two things only: the accumulated reply text, and as the existence
-  gate that gives the inbound checks their transitive reach into egress.
+- **Reply text and its send target are owned at `(conversation_id, reply_ref)`.**
+  Every update and completion uses that exact durable pair, and the send target
+  is only the event's `target.reply_ref`. Never derive a target or accumulated
+  text from conversation-global state: two turns in one thread must not clear,
+  inherit, or redirect one another's reply.
 - **Nothing is recorded as replied until the provider has accepted the send.**
   A `turn.completed` whose AgentMail send failed acks 502 and one whose duplicate
   is still in flight acks 503. Acking 200 in either case makes the worker clear

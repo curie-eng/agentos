@@ -23,7 +23,6 @@ EVENT_MARKER = "X-Curie-Event:"
 EMPTY_REPLY_TEXT = "Curie processed your message but produced no text"
 
 SEEN_MAX = 5000
-REPLIED_MAX = 1000
 BODY_ATTEMPT_MAX = 5
 PRIME_LIMIT = 50
 POLL_LIMIT = 20
@@ -31,35 +30,6 @@ POLL_MAX_PAGES = 5
 BACKOFF_STEP_SECONDS = 5.0
 BACKOFF_MAX_SECONDS = 60.0
 REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
-
-
-class _ConversationMirror(dict[str, dict[str, str | None]]):
-    """Compatibility view for the original focused tests.
-
-    SQLite is authoritative. Explicit ``clear()`` in the pre-durable tests is a
-    test-only request to model an erased record, so mirror that request into the
-    store; an actual process restart never calls it and retains the records.
-    """
-
-    def __init__(self, state: MailState) -> None:
-        super().__init__()
-        self._state = state
-
-    def clear(self) -> None:
-        super().clear()
-        self._state.forget_reply_records()
-
-
-class _RepliedMirror(OrderedDict[str, bool]):
-    """Bounded fast cache whose explicit test clear also removes durable success."""
-
-    def __init__(self, state: MailState) -> None:
-        super().__init__()
-        self._state = state
-
-    def clear(self) -> None:
-        super().clear()
-        self._state.forget_event_successes()
 
 
 class MailAdapter:
@@ -80,8 +50,6 @@ class MailAdapter:
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
             self._mark_seen(message_id)
-        self.conversations = _ConversationMirror(self.state)
-        self.replied_event_ids = _RepliedMirror(self.state)
         self.in_flight: set[str] = set()
         # Opaque pagination is a discovery hint only. Durable pending ids, never
         # this cursor, are the source of truth across a restart.
@@ -128,14 +96,21 @@ class MailAdapter:
                 for message in staged:
                     if "sent" in _labels(message):
                         continue
-                    admission = self.state.admit(message)
+                    message_id = str(message.get("message_id") or "")
+                    if not message_id:
+                        logger.warning("prime: ignoring provider item without a message id")
+                        continue
+                    rejection = self._listing_rejection(message)
+                    admission = self.state.record_terminal(
+                        message_id, "rejected" if rejection is not None else "primed"
+                    )
                     if admission == "full":
                         succeeded = False
                         logger.error("prime: durable state capacity reached before completion")
                         break
-                    message_id = str(message["message_id"])
-                    self.state.settle_without_turn(message_id, "primed")
                     self._mark_seen(message_id)
+                    if admission == "admitted" and rejection is not None:
+                        self._log_listing_rejection(message_id, rejection)
             if succeeded:
                 self.state.finish_prime()
                 logger.info("prime: %d pre-existing message(s) recorded", len(staged))
@@ -199,6 +174,19 @@ class MailAdapter:
                 continue
             message_id = str(message.get("message_id") or "")
             if not message_id or message_id in self.seen:
+                continue
+            rejection = self._listing_rejection(message)
+            if rejection is not None:
+                admission = self.state.record_terminal(message_id, "rejected")
+                if admission == "full":
+                    logger.warning(
+                        "back-pressure: refusing correlation=%s before acceptance or mark-seen",
+                        _correlation(message_id),
+                    )
+                    continue
+                self._mark_seen(message_id)
+                if admission == "admitted":
+                    self._log_listing_rejection(message_id, rejection)
                 continue
             admission = self.state.admit(message)
             if admission == "full":
@@ -301,10 +289,34 @@ class MailAdapter:
             "reply_ref": message_id,
         }
         self.state.store_turn(message_id, turn)
-        with self.lock:
-            self.conversations.setdefault(conversation_id, {"text": None})
         logger.info("inbound admitted correlation=%s", _correlation(message_id))
         return self._deliver_turn(message_id, turn)
+
+    def _listing_rejection(self, message: dict[str, Any]) -> tuple[str, str] | None:
+        """Return the first failed listing gate without retaining its payload."""
+        labels = _labels(message)
+        rejected_labels = ", ".join(sorted(set(labels) & REJECTED_LABELS))
+        if rejected_labels:
+            return ("provider", rejected_labels)
+        if not self.sender_allowed(str(message.get("from") or "")):
+            return ("sender", "")
+        return None
+
+    def _log_listing_rejection(
+        self, message_id: str, rejection: tuple[str, str]
+    ) -> None:
+        gate, detail = rejection
+        if gate == "provider":
+            logger.warning(
+                "rejected correlation=%s: provider labels %s",
+                _correlation(message_id),
+                detail,
+            )
+            return
+        logger.warning(
+            "rejected correlation=%s: sender is not on CURIE_MAIL_ALLOWED_SENDERS",
+            _correlation(message_id),
+        )
 
     def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
         settled = self.post_turn(turn)
@@ -387,22 +399,6 @@ class MailAdapter:
                 )
                 return 503
             chosen_ref = refs[0]
-        else:
-            refs = self.state.live_reply_refs(conversation_id)
-            if chosen_ref not in refs:
-                # A replacement can receive a streamed update carrying a stale
-                # handle while exactly one durably admitted turn owns this
-                # conversation. Resolve that one owner now and persist against
-                # its exact ref. Two candidates remain ambiguous and must never
-                # cross-associate text between turns.
-                if len(refs) == 1:
-                    chosen_ref = refs[0]
-                else:
-                    logger.info(
-                        "reply update ignored: correlation=%s has no unique owner",
-                        _correlation(conversation_id),
-                    )
-                    return 200
         outcome = self.state.record_text(
             conversation_id,
             chosen_ref,
@@ -414,14 +410,10 @@ class MailAdapter:
             return 413
         if outcome == "missing":
             logger.info(
-                "no inbound record for correlation=%s; ignoring",
+                "reply update deferred: no active admitted owner for correlation=%s",
                 _correlation(f"{conversation_id}\0{chosen_ref}"),
             )
-            return 200
-        with self.lock:
-            record = self.conversations.setdefault(conversation_id, {"text": None})
-            existing = record["text"]
-            record["text"] = f"{existing}\n\n{text}" if append and existing else text
+            return 503
         return 200
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
@@ -448,7 +440,6 @@ class MailAdapter:
             return 200
         claim = self.state.claim_event(event_id, conversation_id, reply_ref, self.owner)
         if claim == "done":
-            self._mark_replied(event_id)
             return 200
         if claim == "busy":
             return 503
@@ -461,21 +452,14 @@ class MailAdapter:
             if carries:
                 self.state.finish_event(event_id)
                 self.state.finish_reply(conversation_id, reply_ref)
-                self._mark_replied(event_id)
                 return 200
             exists, text = self.state.reply_text(conversation_id, reply_ref)
             if not exists:
-                # Preserve the explicit egress-only staging fixture without
-                # turning a provider listing into an egress authorization gate.
-                with self.lock:
-                    mirror = self.conversations.get(conversation_id)
-                if mirror is None:
-                    logger.warning(
-                        "reply not sent: no admitted record for correlation=%s",
-                        _correlation(f"{conversation_id}\0{reply_ref}"),
-                    )
-                    return 502
-                text = mirror.get("text")
+                logger.warning(
+                    "reply not sent: no admitted record for correlation=%s",
+                    _correlation(f"{conversation_id}\0{reply_ref}"),
+                )
+                return 502
             body = f"{text or EMPTY_REPLY_TEXT}\n\n{EVENT_MARKER} {event_id}"
             if len(body.encode("utf-8")) > self.config.max_reply_bytes:
                 logger.warning(
@@ -488,11 +472,6 @@ class MailAdapter:
                 self.state.finish_event(event_id)
                 if exists:
                     self.state.finish_reply(conversation_id, reply_ref)
-                self._mark_replied(event_id)
-                with self.lock:
-                    record = self.conversations.get(conversation_id)
-                    if record is not None:
-                        record["text"] = None
                 logger.info("reply sent correlation=%s", _correlation(event_id))
                 return 200
             logger.warning(
@@ -513,12 +492,6 @@ class MailAdapter:
             self.seen[message_id] = True
             while len(self.seen) > SEEN_MAX:
                 self.seen.popitem(last=False)
-
-    def _mark_replied(self, event_id: str) -> None:
-        with self.lock:
-            self.replied_event_ids[event_id] = True
-            while len(self.replied_event_ids) > REPLIED_MAX:
-                self.replied_event_ids.popitem(last=False)
 
     def close(self) -> None:
         self.state.close()

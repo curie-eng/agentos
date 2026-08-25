@@ -95,16 +95,34 @@ spec:
         {{- include "curie.selectorLabels" (dict "root" . "component" "mail-persistence-preflight") | nindent 8 }}
     spec:
       serviceAccountName: {{ include "curie.fullname" . }}-mail-persistence-preflight
+      automountServiceAccountToken: false
       restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: claim-check
           image: {{ .Values.security.probe.kubectlImage }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
           env:
             - name: CLAIM
               value: {{ .Values.mailAdapter.persistence.existingClaim | quote }}
             - name: NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            - name: HOME
+              value: /tmp
           command:
             - /bin/sh
             - -c
@@ -112,10 +130,13 @@ spec:
               set -eu
               modes=$(kubectl get persistentvolumeclaim "$CLAIM" -n "$NAMESPACE" -o jsonpath='{.spec.accessModes[*]}')
               volume_mode=$(kubectl get persistentvolumeclaim "$CLAIM" -n "$NAMESPACE" -o jsonpath='{.spec.volumeMode}')
-              [ "$modes" = "ReadWriteOnce" ] || {
-                echo "mailAdapter.persistence.existingClaim must name a same-namespace PVC with exactly accessModes: [ReadWriteOnce]; got: $modes" >&2
-                exit 1
-              }
+              case "$modes" in
+                ReadWriteOnce|ReadWriteOncePod) ;;
+                *)
+                  echo "mailAdapter.persistence.existingClaim must name a same-namespace PVC with exactly one access mode, ReadWriteOnce or ReadWriteOncePod; got: $modes" >&2
+                  exit 1
+                  ;;
+              esac
               case "$volume_mode" in
                 ""|Filesystem) ;;
                 *)
@@ -123,7 +144,33 @@ spec:
                   exit 1
                   ;;
               esac
-              echo "mail persistence claim is same-namespace, RWO, and Filesystem"
+              echo "mail persistence claim is same-namespace, single-writer, and Filesystem"
           resources:
             {{- toYaml .Values.mailAdapter.persistence.preflight.resources | nindent 12 }}
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: kube-api-access
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+        - name: tmp
+          emptyDir: {}
 {{- end }}

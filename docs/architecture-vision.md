@@ -225,9 +225,10 @@ routing in SQLite. Email (#1515) is `apps/mail-adapter`,
 one process outside the core that speaks only the HTTP wire: it POSTs each polled
 message to `POST /channels/turns` under a scoped `chn` token and serves the four
 reply events on its own endpoint behind `X-Curie-Adapter-Secret`, holding no
-platform key, queue credential or database access. Another channel follows
-[Building a channel adapter](guides/building-a-channel-adapter.md) and needs no
-patch to this repo.
+platform API key, queue credential or platform database access. Durable delivery
+and per-reply ownership state lives in local SQLite on the chart's one-writer
+RWO volume. Another channel follows [Building a channel
+adapter](guides/building-a-channel-adapter.md) and needs no patch to this repo.
 
 **Evidence the channel is already semi-swappable:** `curie local message` and
 `curie cluster message` (`cli/src/chat.rs`, `cli/src/message.rs`) drive the entire

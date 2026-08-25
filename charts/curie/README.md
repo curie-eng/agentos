@@ -303,15 +303,19 @@ pipeline and environment are applied on `helm upgrade`.
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
-| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on RWO storage; no platform key/database credential or ServiceAccount token. |
+| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. |
 
 The mail adapter's `mailAdapter.persistence` block renders a 1 GiB RWO PVC by
-default or mounts a named same-namespace RWO Filesystem `existingClaim`. Its
+default or mounts a named same-namespace single-writer Filesystem `existingClaim`
+with exactly one `ReadWriteOnce` or `ReadWriteOncePod` access mode. Its
 root filesystem remains read-only; only the state mount and an `emptyDir` at
 `/tmp` are writable. Enabling it also requires an explicit
 `mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
-allows DNS, this release's API pods, and those provider/proxy CIDRs on TCP 443;
-it has no Kubernetes API carve-out and never selects runner sandboxes. See
+allows DNS, this release's API pods, and those provider/proxy CIDRs on TCP 443.
+When `api.deploy=false`, the in-chart API selector is replaced by the required
+`mailAdapter.apiEgress.httpsCidrs` peers on `mailAdapter.apiEgress.port`; the
+chart does not infer IPs from `apiBaseUrl`. The policy has no Kubernetes API
+carve-out and never selects runner sandboxes. See
 [`docs/operations.md`](../../docs/operations.md#connecting-email) for the
 mode-0600 credential workflow, retention, erase, and recovery procedure.
 

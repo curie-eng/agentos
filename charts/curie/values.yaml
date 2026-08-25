@@ -889,6 +889,14 @@ mailAdapter:
   # authenticates with its own channel token (below), which is scoped to the one
   # channel binding it serves.
   apiBaseUrl: ""
+  # NetworkPolicy peer for a bring-your-own API. This block is ignored while
+  # api.deploy is true because the policy selects this release's API pods by
+  # label. With api.deploy=false, at least one narrow CIDR is required and the
+  # chart renders only those peers on this TCP port. The default port matches
+  # the Curie API image; override it when apiBaseUrl names a different port.
+  apiEgress:
+    httpsCidrs: []
+    port: 8000
   image:
     repository: ghcr.io/curie-eng/curie-mail-adapter
     # Empty -> chart appVersion (immutable). Set to pin an explicit version tag.

@@ -13,7 +13,8 @@ component and rail detail in `charts/curie/README.md`.
   on a smaller install.
   - **One recorded exception: `templates/mail-adapter.yaml`**, which hardcodes
     `replicas: 1` and `strategy: type: Recreate`. The reason is correctness, not
-    sizing: the adapter is one serialized SQLite writer on a ReadWriteOnce PVC.
+    sizing: the adapter is one serialized SQLite writer on a single-writer
+    `ReadWriteOnce` or `ReadWriteOncePod` PVC.
     A second replica or a rolling update creates two writers and defeats the
     ownership/lease invariant even on storage that happens to multi-attach. Any
     count other than 1 is wrong at every cluster size, which is exactly what
@@ -32,11 +33,14 @@ component and rail detail in `charts/curie/README.md`.
 - **Mail-adapter egress is a separate fail-closed rail.** Enabling
   `mailAdapter.deploy` requires at least one
   `mailAdapter.agentmail.httpsCidrs` entry. Its single egress-only policy allows
-  DNS, this release's API pods, and those CIDRs on TCP 443; it never selects a
-  runner sandbox and never allows the Kubernetes API. The runtime pod mounts no
-  ServiceAccount token and has no RBAC. Do not turn provider DNS into a broad
-  CIDR or add a private-network allow: use current provider ranges or a
-  controlled egress proxy with a stable range.
+  DNS, this release's API pods, and those CIDRs on TCP 443; with `api.deploy`
+  false, `mailAdapter.apiEgress.httpsCidrs` and `.port` replace the pod selector
+  with an explicit narrow BYO-API peer. It never selects a runner sandbox and
+  never allows the Kubernetes API. The runtime pod mounts no ServiceAccount
+  token and has no RBAC. Prefix-0 and prefix-1 routes fail render, including
+  split default routes. Do not turn provider DNS into a broad CIDR or add a
+  private-network allow: use current provider ranges or a controlled egress
+  proxy with a stable range.
 - **Every backing store follows the same toggle + BYO idiom.** `<store>.deploy`
   (default `true`) gates whether the in-chart resource renders; flipping it
   to `false` repoints consumers (Langfuse env, the collector config) at the

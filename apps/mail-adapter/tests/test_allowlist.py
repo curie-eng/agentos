@@ -204,9 +204,6 @@ def test_ingress_disabled_does_not_authorize_an_unadmitted_egress_ref(
     adapter = make_adapter(ingress_enabled=False, allowed_senders=())
     url = serve_egress(adapter) + "/"
     mail.add_inbound("msg-9", "thr-9")
-    # This process-local mirror used to bypass the durable per-ref admission
-    # gate. Keep it populated to prove the fallback cannot authorize a send.
-    adapter.conversations["thr-9"] = {"text": "the answer"}
 
     status, _ = post_event(url, completed("ev-off", conversation_id="thr-9", reply_ref="msg-9"))
 
@@ -236,7 +233,7 @@ def test_the_label_check_catches_what_a_widened_provider_would_deliver(
     assert ingress.attempts == 0
     assert mail.body_calls == {}, "provider verdict labels must run before the body GET"
     assert mail.replies == []
-    assert adapter.conversations == {}
+    assert adapter.state.reply_text("thr-bad", "msg-bad") == (False, None)
     assert "msg-bad" in adapter.seen  # rejected once, not re-evaluated forever
 
 

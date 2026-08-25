@@ -118,8 +118,9 @@ Three: Slack, Discord, and email.
   platform's channel ingress under a scoped `chn` token, then serves the four neutral
   reply events on its own HTTP endpoint and sends one threaded reply per `turn.completed`,
   addressed by the event's `target.reply_ref`. It holds no platform API key, no queue
-  credential and no database access, which is what makes it the seam's proof: everything
-  it needs is on the wire.
+  credential and no platform database access. Its ingress and egress contract is the HTTP
+  wire; local SQLite holds durable delivery and `(conversation_id, reply_ref)` ownership
+  on one RWO writer.
 
 The swap proof that the protocol (not just the service) is the seam: the Rust CLI mints the exact
 `QueuedTurn` wire payload with the same channel-neutral fields
@@ -144,8 +145,8 @@ Two ends and the binding surface were cleaned; what remains is egress semantics.
   Slack's `chat.update` against the message the ingress already posted, so a channel with no
   in-place edit must emulate it. That is no longer the whole egress model: the adapter also
   posts platform-owned messages such as approval cards and settles them in place afterwards.
-  Email is another datapoint: it accumulates reply events per conversation and sends one
-  threaded mail on `turn.completed`
+  Email is another datapoint: it accumulates reply events per
+  `(conversation_id, reply_ref)` and sends one threaded mail on `turn.completed`
   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.send_reply`).
 - **Fixed (#1459, ADR-0096).** The binding surface was Slack-typed in the control plane, not
   just at the channel edges: the agents table carried a `slack_channel` column, and agent

@@ -21,6 +21,19 @@ from typing import Any, Literal
 SCHEMA_VERSION = 1
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
+TERMINAL_RECEIPT_MAX = 4096
+
+_TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected")
+_ADMISSION_BACKPRESSURE_CODES = frozenset(
+    {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+        sqlite3.SQLITE_READONLY,
+        sqlite3.SQLITE_IOERR,
+        sqlite3.SQLITE_FULL,
+        sqlite3.SQLITE_CANTOPEN,
+    }
+)
 
 DeliveryAdmission = Literal["admitted", "known", "full"]
 EventClaim = Literal["claimed", "busy", "done"]
@@ -65,6 +78,14 @@ class MailState:
             self._migrate(version)
             page_size = int(self.connection.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(self.connection.execute("PRAGMA page_count").fetchone()[0])
+            # A terminal receipt is deliberately tiny, but it still consumes a
+            # b-tree slot. Bound those receipts by both a fixed ceiling and a
+            # fraction of the configured page budget so rejected public-mailbox
+            # traffic cannot claim the journal needed by live deliveries.
+            self.terminal_receipt_max = max(
+                8,
+                min(TERMINAL_RECEIPT_MAX, max(1, max_bytes // page_size) // 4),
+            )
             page_limit = max(page_count, max_bytes // page_size)
             self.connection.execute(f"PRAGMA max_page_count={page_limit}")
             # A replacement is the sole writer. A lease left behind by SIGKILL
@@ -128,11 +149,11 @@ class MailState:
             self.connection.execute("BEGIN IMMEDIATE")
             try:
                 yield self.connection
-            except BaseException:
-                self.connection.rollback()
-                raise
-            else:
                 self.connection.commit()
+            except BaseException:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
 
     def close(self) -> None:
         with self.lock:
@@ -164,46 +185,107 @@ class MailState:
         message_id = str(message["message_id"])
         conversation_id = str(message.get("thread_id") or message_id)
         now = time.time()
-        with self.transaction() as connection:
-            if connection.execute(
-                "SELECT 1 FROM deliveries WHERE message_id=?", (message_id,)
-            ).fetchone():
-                return "known"
-            pending = int(
+        try:
+            with self.transaction() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM deliveries WHERE message_id=?", (message_id,)
+                ).fetchone():
+                    return "known"
+                self._compact_terminal_receipts(connection)
+                pending = int(
+                    connection.execute(
+                        "SELECT count(*) FROM deliveries "
+                        "WHERE state IN ('body_pending', 'ingress_pending')"
+                    ).fetchone()[0]
+                )
+                if pending >= self.max_pending or self._at_size_limit(connection):
+                    return "full"
                 connection.execute(
-                    "SELECT count(*) FROM deliveries "
-                    "WHERE state IN ('body_pending', 'ingress_pending')"
-                ).fetchone()[0]
-            )
-            if pending >= self.max_pending or self._at_size_limit(connection):
+                    "INSERT INTO deliveries("
+                    "message_id, conversation_id, reply_ref, summary_json, state, "
+                    "created_at, updated_at"
+                    ") VALUES(?, ?, ?, ?, 'body_pending', ?, ?)",
+                    (
+                        message_id,
+                        conversation_id,
+                        message_id,
+                        json.dumps(message, separators=(",", ":"), sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+                return "admitted"
+        except sqlite3.Error as error:
+            if _is_admission_backpressure(error):
                 return "full"
+            raise
+
+    def record_terminal(self, message_id: str, state: str) -> DeliveryAdmission:
+        """Record an id-only terminal receipt without retaining listing PII."""
+        if state not in _TERMINAL_STATES:
+            raise ValueError(f"{state!r} is not a terminal delivery state")
+        now = time.time()
+        try:
+            with self.transaction() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM deliveries WHERE message_id=?", (message_id,)
+                ).fetchone():
+                    return "known"
+                self._compact_terminal_receipts(connection, incoming=1)
+                connection.execute(
+                    "INSERT INTO deliveries("
+                    "message_id, conversation_id, reply_ref, summary_json, state, "
+                    "created_at, updated_at"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        message_id,
+                        message_id,
+                        message_id,
+                        _receipt_json(message_id),
+                        state,
+                        now,
+                        now,
+                    ),
+                )
+                return "admitted"
+        except sqlite3.Error as error:
+            if _is_admission_backpressure(error):
+                return "full"
+            raise
+
+    def _compact_terminal_receipts(
+        self, connection: sqlite3.Connection, *, incoming: int = 0
+    ) -> None:
+        count = int(
             connection.execute(
-                "INSERT INTO deliveries("
-                "message_id, conversation_id, reply_ref, summary_json, state, "
-                "created_at, updated_at"
-                ") VALUES(?, ?, ?, ?, 'body_pending', ?, ?)",
-                (
-                    message_id,
-                    conversation_id,
-                    message_id,
-                    json.dumps(message, separators=(",", ":"), sort_keys=True),
-                    now,
-                    now,
-                ),
-            )
-            return "admitted"
+                "SELECT count(*) FROM deliveries WHERE state IN (?, ?, ?, ?)",
+                _TERMINAL_STATES,
+            ).fetchone()[0]
+        )
+        excess = count + incoming - self.terminal_receipt_max
+        if excess <= 0:
+            return
+        connection.execute(
+            "DELETE FROM deliveries WHERE message_id IN ("
+            "SELECT message_id FROM deliveries WHERE state IN (?, ?, ?, ?) "
+            "ORDER BY updated_at, message_id LIMIT ?)",
+            (*_TERMINAL_STATES, excess),
+        )
 
     def _at_size_limit(self, connection: sqlite3.Connection) -> bool:
         page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
         page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
-        return page_size * page_count >= self.max_bytes
+        free_pages = int(connection.execute("PRAGMA freelist_count").fetchone()[0])
+        return page_size * (page_count - free_pages) >= self.max_bytes
 
     def settle_without_turn(self, message_id: str, state: str) -> None:
         with self.transaction() as connection:
             connection.execute(
-                "UPDATE deliveries SET state=?, updated_at=? WHERE message_id=?",
-                (state, time.time(), message_id),
+                "UPDATE deliveries SET state=?, summary_json=?, turn_json=NULL, updated_at=? "
+                "WHERE message_id=?",
+                (state, _receipt_json(message_id), time.time(), message_id),
             )
+            self._compact_terminal_receipts(connection)
 
     def body_failed(self, message_id: str, *, abandon_after: int) -> bool:
         """Spend one attempt, then park persistent failures without burning them."""
@@ -280,6 +362,7 @@ class MailState:
                 "WHERE message_id=?",
                 (time.time(), message_id),
             )
+            self._compact_terminal_receipts(connection)
 
     def known_message_ids(self) -> list[str]:
         with self.lock:
@@ -392,12 +475,11 @@ class MailState:
                 (time.time(), event_id),
             )
 
-    def forget_event_successes(self) -> None:
-        """Compatibility hook for tests that model loss of the fast dedupe map."""
-        with self.transaction() as connection:
-            connection.execute("DELETE FROM completion_events WHERE delivered=1")
 
-    def forget_reply_records(self) -> None:
-        """Compatibility hook for tests that explicitly model erased process state."""
-        with self.transaction() as connection:
-            connection.execute("DELETE FROM reply_state")
+def _receipt_json(message_id: str) -> str:
+    return json.dumps({"message_id": message_id}, separators=(",", ":"), sort_keys=True)
+
+
+def _is_admission_backpressure(error: sqlite3.Error) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    return code is not None and code & 0xFF in _ADMISSION_BACKPRESSURE_CODES
