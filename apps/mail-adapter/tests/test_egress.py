@@ -10,6 +10,7 @@ worker's durable completion record and loses the email.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -84,6 +85,23 @@ def test_egress_rejects_a_bad_or_missing_secret_before_any_side_effect(
 
     ((_in_reply_to, text),) = mail.replies
     assert "streamed reply" not in text
+
+
+def test_egress_rejection_log_names_only_the_outcome(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Credential material and even its transport name stay out of retained logs."""
+    seed(mail, adapter)
+
+    with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.egress"):
+        assert post_event(egress_url, completed("ev-1"), secret="attacker-value")[0] == 401
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "request refused: invalid adapter credential"
+    ]
 
 
 def test_egress_accepts_the_configured_secret_and_acks_without_a_ref(

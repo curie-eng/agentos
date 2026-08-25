@@ -106,7 +106,7 @@ class EgressHandler(BaseHTTPRequestHandler):
         secret = self.adapter.config.egress_secret
         presented = (self.headers.get(ADAPTER_SECRET_HEADER) or "").encode("utf-8", "replace")
         if not secret or not hmac.compare_digest(presented, secret.encode()):
-            logger.warning("request refused: missing or invalid %s", ADAPTER_SECRET_HEADER)
+            logger.warning("request refused: invalid adapter credential")
             return self._respond(401, {"detail": "missing or invalid credential"})
         if self.headers.get("Transfer-Encoding"):
             return self._respond(400, {"detail": "transfer encoding is not supported"})
