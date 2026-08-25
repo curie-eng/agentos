@@ -46,3 +46,12 @@ jobs:
         run: npm install --global @anthropic-ai/claude-code
       - name: Validate every examples/ bundle
         run: bash scripts/check-plugin-compat.sh
+
+      # A write connector is enabled by uncommenting it; its gate is declared in
+      # a different file. Nothing made those two edits happen together, and on a
+      # real install they did not -- the connector ran for four and a half days
+      # with no gate in front of it, healthy the whole time. This is that check,
+      # plus the two write allowlists (connector env, RBAC resourceNames)
+      # agreeing, which drifted apart on the same install.
+      - name: Assert every write path is gated
+        run: python3 scripts/check-write-path-gated.py
