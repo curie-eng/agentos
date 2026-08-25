@@ -47,19 +47,29 @@ protocol is Anthropic Messages because the current Claude harness speaks that
 protocol. A later OpenAI or Responses harness may add another declared protocol
 without changing this ownership boundary.
 
+Alias names are installation configuration, not a frozen Curie-wide vocabulary.
+An installation may use arbitrary aliases that its compatible gateway supports,
+including LiteLLM model aliases. Curie recommends the conventional names
+`fast`, `code`, `reasoning`, and `auto` as useful defaults, but does not require
+or reserve them. An installation may map those conventions, or any other
+allowed alias, to its own model pools and routing policy.
+
 Curie delivers only the gateway credential and gateway base URL to a gateway
 backed sandbox. Provider credentials remain on the gateway side. A direct
 provider credential and a gateway credential are distinct installation secrets;
 neither is stored in a bundle, agent row, ACI event, command output, or trace.
 
 An agent uses the existing model selection surface to request an allowed alias,
-for example `fast`, `code`, `reasoning`, or `auto`. An agent with no model
-selection uses the installation default. The worker validates an override
-against the selected installation's allowed aliases before a claim is created.
-It never accepts a bundle supplied gateway URL, gateway credential reference,
-or arbitrary alias. This keeps endpoint and credential authority with the
-operator and prevents an agent declaration from becoming a request forgery or
-credential redirection primitive.
+for example the conventional `fast`, `code`, `reasoning`, or `auto`, or an
+installation-defined alias. An agent with no model selection uses the
+installation default. The worker validates an override against the selected
+installation's allowed aliases before a claim is created. A portable bundle
+therefore requires an installation to map and permit every alias it uses; an
+absent alias is a validation error and must never fall through to the default,
+another alias, or a direct provider. It never accepts a bundle supplied gateway
+URL or gateway credential reference, or an alias outside that allowed set. This
+keeps endpoint and credential authority with the operator and prevents an agent
+declaration from becoming a request forgery or credential redirection primitive.
 
 An automatic alias is permitted, including a LiteLLM automatic router or
 classifier, only under this contract:
@@ -94,7 +104,9 @@ platform dependency or as a Python library embedded in the runner.
 ## Consequences
 
 The easy operator path becomes: configure the gateway once, declare an allowed
-set of model aliases, and set an agent's model override to one alias. The easy
+set of model aliases, and set an agent's model override to one alias. The
+recommended aliases make common bundles easier to install, while the allowed
+set preserves an installation's freedom to name and map its own pools. The easy
 agent path contains no provider URL and no provider key.
 
 Implementation must extend the installation configuration and render an
