@@ -1603,7 +1603,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // sentinel), post a real placeholder and enqueue against its ts with no
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
-    if let Some(bot_token) = local_connected_bot_token().await {
+    if let Some(transport) = local_connected_transport().await {
         let channel = match opts.channel.as_deref() {
             Some(channel) => channel.to_string(),
             None => {
@@ -1622,7 +1622,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             &mut conn,
             TurnVerb::Local,
             &channel,
-            &bot_token,
+            &transport,
         )
         .await;
     }
@@ -2117,8 +2117,15 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// authoring bot `chat.update` a message, so two different tokens would leave the
 /// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
 ///
+/// Returning the base ALONGSIDE the token is what closes #1030 at this tier. Both
+/// values were already read out of the same container here; only the token was
+/// kept, and the base was then re-read from the CLI's own process environment at
+/// post time. Carrying the pair means the placeholder goes exactly where the
+/// worker that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
+/// operator's shell has nothing left to decide.
+///
 /// Pure, so both conditions are unit-testable without Docker.
-fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
+fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
     let api_base = api_base.unwrap_or_default();
     // Wired to the stub (or to nothing resolvable) means not connected.
@@ -2126,7 +2133,8 @@ fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
         return None;
     }
     let token = token?.trim().to_string();
-    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN).then_some(token)
+    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
+        .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
 /// Read the running compose worker's Slack transport out of the container.
@@ -2154,9 +2162,9 @@ async fn running_worker_transport() -> WorkerTransport {
     (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
 }
 
-/// Process-level wrapper: the token to post with, or `None` for the stub path.
-async fn local_connected_bot_token() -> Option<String> {
-    connected_worker_bot_token(running_worker_transport().await)
+/// Process-level wrapper: the transport to post over, or `None` for the stub path.
+async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
+    connected_worker_transport(running_worker_transport().await)
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -2190,7 +2198,7 @@ pub async fn enqueue_over_connected_transport(
     conn: &mut MultiplexedConnection,
     verb: TurnVerb,
     channel: &str,
-    bot_token: &str,
+    transport: &crate::slack::SlackTransport,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // An empty `--thread` is normalized away at the [`message`] entry point, and
@@ -2201,7 +2209,7 @@ pub async fn enqueue_over_connected_transport(
     let explicit_thread = opts.thread.as_deref().filter(|ts| !ts.is_empty());
 
     let placeholder_ts =
-        crate::slack::post_placeholder(bot_token, channel, "\u{2026}", explicit_thread)
+        crate::slack::post_placeholder(transport, channel, "\u{2026}", explicit_thread)
             .await
             .with_context(|| {
                 let mut context =
@@ -2357,13 +2365,46 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
         }
         None => crate::ops::discover_slack_bot_token(&opts.namespace, &opts.release).await?,
     };
+    // The base comes from the same release as the token (#1030), never from the
+    // CLI's own environment. A `CURIE_SLACK_BOT_TOKEN` override changes only the
+    // identity, not the destination: an operator working around a stale Secret is
+    // still posting into this release's workspace, and letting the override drag
+    // the URL along would restore exactly the split this issue is about.
+    let transport = match crate::ops::discover_slack_api_base_url(&opts.namespace, &opts.release)
+        .await
+    {
+        crate::ops::SlackApiBase::Configured(base) => {
+            ui.note(&format!(
+                "posting over the release's configured Slack base {base}"
+            ));
+            crate::slack::SlackTransport::new(Some(base), bot_token)
+        }
+        crate::ops::SlackApiBase::RealSlack => crate::slack::SlackTransport::new(None, bot_token),
+        // Refusing here rather than defaulting is the whole point of the tri-state.
+        // "Could not look" is not evidence that the worker talks to real Slack, and
+        // acting as if it were would post a real placeholder somewhere the worker
+        // can never edit -- an orphaned ellipsis in a real channel, which is the
+        // #957 mode A failure arriving by a different road.
+        crate::ops::SlackApiBase::Unknown => {
+            anyhow::bail!(
+                "could not read the Slack API base from the worker Deployment for release \
+                 {} in namespace {}; refusing to guess where a real workspace token should be \
+                 sent. Check `kubectl -n {} get deployment -l \
+                 app.kubernetes.io/instance={},app.kubernetes.io/component=worker`.",
+                opts.release,
+                opts.namespace,
+                opts.namespace,
+                opts.release
+            );
+        }
+    };
 
     let valkey_url = format!(
         "redis://:{}@127.0.0.1:{valkey_local_port}",
         opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
-    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &bot_token)
+    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
 }
 
@@ -4256,18 +4297,22 @@ mod tests {
     #[test]
     fn connected_only_when_the_worker_itself_talks_to_real_slack() {
         let t = |s: &str| Some(s.to_string());
+        let token = |r: Option<crate::slack::SlackTransport>| r.map(|t| t.bot_token);
 
         // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("xoxb-real"))).as_deref(),
-            Some("xoxb-real")
+            token(connected_worker_transport((
+                t("https://slack.com/api/"),
+                t("xoxb-real")
+            ))),
+            Some("xoxb-real".to_string())
         );
 
         // #957 mode A, the failure this replaced: a REAL token is present but the
         // worker is wired to the stub, so posting would orphan a "..." in a real
         // channel that the worker can never edit. Not connected.
         assert_eq!(
-            connected_worker_bot_token((
+            connected_worker_transport((
                 t("http://localhost:8155/api/"),
                 t("xoxb-real-from-the-vault")
             )),
@@ -4276,20 +4321,47 @@ mod tests {
 
         // The stub sentinel is not a workspace token even if the base URL is odd.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
         // No stack running / nothing resolvable -> stub path, never a real post.
-        assert_eq!(connected_worker_bot_token((None, None)), None);
-        assert_eq!(connected_worker_bot_token((t(""), t("xoxb-real"))), None);
+        assert_eq!(connected_worker_transport((None, None)), None);
+        assert_eq!(connected_worker_transport((t(""), t("xoxb-real"))), None);
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), None)),
+            connected_worker_transport((t("https://slack.com/api/"), None)),
             None
         );
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("  "))),
+            connected_worker_transport((t("https://slack.com/api/"), t("  "))),
             None
         );
+    }
+
+    #[test]
+    fn the_local_transport_carries_the_workers_own_base_not_the_shells() {
+        // The #1030 regression at local tier. The base and the token are read from
+        // the same `docker inspect`, so the placeholder goes where the worker that
+        // will edit it is pointed. Before this, only the token survived and the base
+        // came from whatever the operator happened to have exported.
+        let resolved = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("a real base and a real token are a connected transport");
+        assert_eq!(resolved.api_base, "https://proxy.example/api");
+        assert_eq!(resolved.bot_token, "xoxb-worker-actual");
+
+        std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
+        let again = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("still connected");
+        assert_eq!(
+            again.api_base, "https://proxy.example/api",
+            "an ambient SLACK_API_BASE_URL must not redirect a resolved token"
+        );
+        std::env::remove_var("SLACK_API_BASE_URL");
     }
 
     #[test]
