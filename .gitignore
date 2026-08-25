@@ -28,6 +28,13 @@ oauth.env
 # render-assertion script, not secret material. Without this the `*secret*` rule
 # drops it and the CI step that runs it goes red on a missing file.
 !charts/curie/ci/otel-collector-langfuse-secret-assertions.sh
+# Same exception for the desktop shell's secrets bridge (apps/desktop): it
+# delegates to `curie secrets` and only ever handles secret NAMES, never
+# material, and hands a value to the CLI through the environment rather than
+# argv. Without this the `*secret*` rule above silently drops the file, `git
+# add` skips it without a word, and the desktop build fails in CI on a missing
+# import.
+!apps/desktop/electron/ipc/secrets.ts
 
 # Python
 __pycache__/
