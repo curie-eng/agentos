@@ -178,6 +178,13 @@ a constraint rather than only a selling point: the moment this decision requires
 a third party, it is the wrong decision and should be revisited rather than
 extended.
 
+**There is no private bot-to-bot bypass.** An authorized call from A to B, and
+any exchange that follows it, happens entirely on this surface -- mediated,
+authorized, attributed, and persisted the same way from the first message to
+the last. A must not reach B through an internal or direct path that skips it;
+the surface is not just how a call starts, it is where the whole interaction
+lives.
+
 ### 2. A call rides the message lane, not the job lane
 
 Mechanical, and recorded because an implementer would otherwise have to derive
@@ -263,7 +270,8 @@ otherwise have to guess:
   key on the caller being an agent, which is a kernel change and is called out in
   Consequences.
 
-There is a real gap under this part. #1049's requirement 2 -- each agent
+**V1 identity is payload-level agent identity, not IdP-backed, and that is a
+decision rather than a placeholder.** #1049's requirement 2 -- each agent
 authenticating as its own IdP-issued identity -- is not built, and neither is a
 structured agent identity in telemetry (ADR-0107 records that the closed span
 attribute enum carries `curie.session_id` and `curie.sandbox_id` but no agent
@@ -285,6 +293,15 @@ operator carries is not a bundle's to set. The same split as
 bundle states intent, the platform decides.
 
 The allowlist is directional. A grant that A may call B does not let B call A.
+
+**Authorization is per-bot, not per-request-chain.** The question the platform
+answers is "may A call B", never "could this particular human do what B can do
+directly". A user who can talk to A but has no grant to reach B may still cause
+A to call B, precisely because A itself holds that grant -- that is the intended
+delegation path this ADR builds, not the authority-laundering failure mode from
+Context. Laundering is a caller reaching a capability with no grant behind it at
+all; a human's request passing through an agent that is itself authorized is the
+feature.
 
 ### 6. Bounded depth, refused cycles, one recorded refusal
 
