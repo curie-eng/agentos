@@ -234,11 +234,11 @@ spec:
             - name: CURIE_MAIL_MAX_PENDING_DELIVERIES
               value: {{ .Values.mailAdapter.maxPendingDeliveries | quote }}
             - name: CURIE_MAIL_MAX_BODY_BYTES
-              value: {{ .Values.mailAdapter.maxBodyBytes | quote }}
+              value: {{ .Values.mailAdapter.maxBodyBytes | int64 | quote }}
             - name: CURIE_MAIL_MAX_REPLY_BYTES
-              value: {{ .Values.mailAdapter.maxReplyBytes | quote }}
+              value: {{ .Values.mailAdapter.maxReplyBytes | int64 | quote }}
             - name: CURIE_MAIL_MAX_STATE_BYTES
-              value: {{ .Values.mailAdapter.maxStateBytes | quote }}
+              value: {{ .Values.mailAdapter.maxStateBytes | int64 | quote }}
             - name: HOME
               value: /tmp
             - name: TMPDIR

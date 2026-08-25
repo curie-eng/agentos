@@ -9,54 +9,55 @@
 #   1  Default install renders no mail-adapter Deployment and no Service.
 #   2  mailAdapter.deploy=true renders both, and the Service port tracks
 #      mailAdapter.service.port.
-#   3  CURIE_API_URL derives the in-chart API Service, tracks api.service.port,
+#   3  Byte-limit defaults and overrides render as exact base-10 integer strings.
+#   4  CURIE_API_URL derives the in-chart API Service, tracks api.service.port,
 #      and mailAdapter.apiBaseUrl overrides it verbatim.
-#   4  No CURIE_API_KEY env exists on the container AT ALL. The adapter holds no
+#   5  No CURIE_API_KEY env exists on the container AT ALL. The adapter holds no
 #      platform key; this is what keeps curie.env.api from being "helpfully"
 #      included later.
-#   5  CURIE_CHANNEL_TOKEN, CURIE_EGRESS_SECRET and AGENTMAIL_API_KEY each arrive
+#   6  CURIE_CHANNEL_TOKEN, CURIE_EGRESS_SECRET and AGENTMAIL_API_KEY each arrive
 #      by secretKeyRef to the chart Secret, never as inline literals.
-#   6  The chart Secret carries mailChannelToken, mailEgressSecret and
+#   7  The chart Secret carries mailChannelToken, mailEgressSecret and
 #      mailAgentmailApiKey, and the worker's adapterCredentials entry for the
 #      same slug renders alongside them in the same render.
-#   7  priorityClassName is the platform class (asserted here, not in
+#   8  priorityClassName is the platform class (asserted here, not in
 #      render-assertions.sh, whose assertion 8 would break on the default render
 #      where this Deployment deliberately does not exist).
-#   8  CURIE_MAIL_ALLOWED_SENDERS renders from mailAdapter.allowedSenders, and an
+#   9  CURIE_MAIL_ALLOWED_SENDERS renders from mailAdapter.allowedSenders, and an
 #      EMPTY list renders an empty value rather than being omitted, so the
 #      adapter's boot gate fires instead of the variable silently defaulting.
-#   9  Every configured knob arrives under the exact name MailAdapterConfig
+#   10 Every configured knob arrives under the exact name MailAdapterConfig
 #      reads. A typo in an env NAME renders green and is then ignored at runtime.
-#   10 replicas is 1, --set mailAdapter.replicas=3 does not change it (the knob
+#   11 replicas is 1, --set mailAdapter.replicas=3 does not change it (the knob
 #      must not exist), and the rollout strategy is Recreate. All routing state
 #      is process-local, and a rolling update runs two pods for the duration of
 #      every upgrade.
-#   11 checksum/mail-adapter-credentials tracks ALL THREE credentials, proven by
+#   12 checksum/mail-adapter-credentials tracks ALL THREE credentials, proven by
 #      three independent one-credential pairs. A one-credential assertion passes
 #      against a two-thirds-correct checksum, which is the bug.
-#   12 The egress pair cannot diverge: derived from mailAdapter.egressSecret when
+#   13 The egress pair cannot diverge: derived from mailAdapter.egressSecret when
 #      the operator writes only that half, unchanged when both halves agree, and
 #      a hard `helm template` FAILURE naming both keys when they differ -- and
 #      that failure message names the two KEYS without printing either live
 #      credential VALUE into terminal scrollback or a CI log.
-#   13 The worker's checksum/adapter-credentials sees the DERIVED entry, so
+#   14 The worker's checksum/adapter-credentials sees the DERIVED entry, so
 #      rotating mailAdapter.egressSecret actually rolls the workers.
-#   14 The default render is untouched: with mailAdapter.deploy false the Secret's
+#   15 The default render is untouched: with mailAdapter.deploy false the Secret's
 #      adapterCredentials and the worker's checksum are byte-identical to what the
 #      chart rendered before this change.
-#   15 The build path exists: mail-adapter is a built cell in ci.yaml's `images`
+#   16 The build path exists: mail-adapter is a built cell in ci.yaml's `images`
 #      job and in EVERY release.yaml matrix that defines a `name` list. An
 #      include-only entry publishes nothing, and a build matrix without the
 #      manifest-merge matrix publishes per-arch digests with no manifest or tag.
-#   16 A BYO API (`api.deploy=false`) fails closed without an explicit API
+#   17 A BYO API (`api.deploy=false`) fails closed without an explicit API
 #      egress CIDR and renders only that CIDR on the configured TCP port.
-#   17 AgentMail and BYO-API CIDR controls reject equivalent default routes,
+#   18 AgentMail and BYO-API CIDR controls reject equivalent default routes,
 #      including IPv4/IPv6 /1 splits and alternate /0 spellings, while valid
 #      IPv4 and IPv6 provider ranges still render.
-#   18 The existing-claim preflight accepts exactly RWO or RWOP and rejects RWX
+#   19 The existing-claim preflight accepts exactly RWO or RWOP and rejects RWX
 #      by executing the rendered hook command against a deterministic kubectl
 #      fixture, rather than merely grepping its shell source.
-#   19 The preflight Job opts out of token mounting and satisfies the Restricted
+#   20 The preflight Job opts out of token mounting and satisfies the Restricted
 #      Pod Security Standard at both pod and container scope.
 #
 # NOTE ON `--output-dir`: copied deliberately from
@@ -278,7 +279,23 @@ actual="$(field "$port_dir" Service "$SERVICE_NAME" spec.ports.0.port)"
   || fail "with mailAdapter.service.port=9091 the Service port is '$actual'; the port is hardcoded in the template instead of read from the value"
 
 # ---------------------------------------------------------------------------
-# 3: CURIE_API_URL derivation. Unwired, the adapter falls back to its code
+# 3: integer-valued env must be rendered as exact base-10 strings. YAML scientific
+# notation (for example 1.048576e+06) reaches the container as text and is then
+# rejected by the adapter's integer parser even though Helm accepted the value.
+# ---------------------------------------------------------------------------
+assert_env_value "$on_dir" CURIE_MAIL_MAX_BODY_BYTES "1048576" \
+  "The default integer must render in base 10, never scientific notation."
+assert_env_value "$on_dir" CURIE_MAIL_MAX_REPLY_BYTES "1048576" \
+  "The default integer must render in base 10, never scientific notation."
+assert_env_value "$on_dir" CURIE_MAIL_MAX_STATE_BYTES "268435456" \
+  "The default integer must render in base 10, never scientific notation."
+integer_override_dir="$(render integer-override "${ON[@]}" "${CREDS[@]}" \
+  --set mailAdapter.maxStateBytes=314572800)"
+assert_env_value "$integer_override_dir" CURIE_MAIL_MAX_STATE_BYTES "314572800" \
+  "An explicit integer override must render as an exact base-10 string."
+
+# ---------------------------------------------------------------------------
+# 4: CURIE_API_URL derivation. Unwired, the adapter falls back to its code
 #    default (itself) and every turn it starts is never posted.
 # ---------------------------------------------------------------------------
 assert_env_value "$on_dir" CURIE_API_URL "http://curie-api:8000" \
@@ -295,7 +312,7 @@ assert_env_value "$byo_api_dir" CURIE_API_URL "https://byo-api.example:8443" \
   "mailAdapter.apiBaseUrl must override verbatim (the api.deploy=false path)."
 
 # ---------------------------------------------------------------------------
-# 4: NO CURIE_API_KEY on the container, at all. Hard security assertion.
+# 5: NO CURIE_API_KEY on the container, at all. Hard security assertion.
 # ---------------------------------------------------------------------------
 set +e
 env_field "$on_dir" "$DEPLOY_NAME" CURIE_API_KEY name >/dev/null 2>&1
@@ -309,14 +326,14 @@ if [ "$rc" -ne 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5: all three credentials arrive by secretKeyRef, never inline.
+# 6: all three credentials arrive by secretKeyRef, never inline.
 # ---------------------------------------------------------------------------
 assert_env_secret_ref "$on_dir" CURIE_CHANNEL_TOKEN mailChannelToken
 assert_env_secret_ref "$on_dir" CURIE_EGRESS_SECRET mailEgressSecret
 assert_env_secret_ref "$on_dir" AGENTMAIL_API_KEY mailAgentmailApiKey
 
 # ---------------------------------------------------------------------------
-# 6: the Secret carries the three keys, and the worker's adapterCredentials
+# 7: the Secret carries the three keys, and the worker's adapterCredentials
 #    entry for the same slug renders in the SAME render, so both halves of the
 #    egress pair are present at once.
 # ---------------------------------------------------------------------------
@@ -342,7 +359,7 @@ if got != want:
   || fail "the worker half of the egress pair is missing or wrong; the worker will present nothing (or the wrong secret) and every reply delivery 401s"
 
 # ---------------------------------------------------------------------------
-# 7: priorityClassName is the platform class. The control plane must outrank
+# 8: priorityClassName is the platform class. The control plane must outrank
 #    sandbox pods for node-pressure eviction.
 # ---------------------------------------------------------------------------
 actual="$(field "$on_dir" Deployment "$DEPLOY_NAME" spec.template.spec.priorityClassName || true)"
@@ -350,7 +367,7 @@ actual="$(field "$on_dir" Deployment "$DEPLOY_NAME" spec.template.spec.priorityC
   || fail "mail-adapter pod priorityClassName is '$actual', expected 'curie-platform' (.Values.priorityClasses.platform.name)"
 
 # ---------------------------------------------------------------------------
-# 8: CURIE_MAIL_ALLOWED_SENDERS renders, and an EMPTY list renders an EMPTY
+# 9: CURIE_MAIL_ALLOWED_SENDERS renders, and an EMPTY list renders an EMPTY
 #    VALUE rather than being omitted, so the adapter's boot gate fires instead of
 #    the variable silently defaulting.
 # ---------------------------------------------------------------------------
@@ -361,7 +378,7 @@ assert_env_value "$senders_dir" CURIE_MAIL_ALLOWED_SENDERS "ops@example.com,dev@
   "The configured allow-list must reach the process comma-joined."
 
 # ---------------------------------------------------------------------------
-# 9: every configured knob arrives under the exact name MailAdapterConfig reads.
+# 10: every configured knob arrives under the exact name MailAdapterConfig reads.
 #    Non-default sentinels throughout: a template that hardcodes the default
 #    passes an equals-the-default assertion while ignoring the operator.
 # ---------------------------------------------------------------------------
@@ -389,7 +406,7 @@ assert_env_value "$knobs_dir" CURIE_MAIL_MAX_STATE_BYTES "1048576" \
   "mailAdapter.maxStateBytes must cap SQLite pages/queued bytes."
 
 # ---------------------------------------------------------------------------
-# 10: one replica, no knob that changes it, and Recreate. Every routing map in
+# 11: one replica, no knob that changes it, and Recreate. Every routing map in
 #     the adapter is process-local and the Service has no session affinity, so a
 #     second pod answers turn.completed for a conversation it never saw.
 # ---------------------------------------------------------------------------
@@ -613,7 +630,7 @@ case "$missing_cidr_out" in
 esac
 
 # ---------------------------------------------------------------------------
-# 16: a BYO API is reachable only through an explicitly configured, narrow
+# 17: a BYO API is reachable only through an explicitly configured, narrow
 #     NetworkPolicy peer. apiBaseUrl alone must never render a Ready pod whose
 #     ingress remains pending forever because its API destination is denied.
 # ---------------------------------------------------------------------------
@@ -690,7 +707,7 @@ assert_api_rule(sys.argv[2], "198.51.100.128/25", 8000)
 PY
 
 # ---------------------------------------------------------------------------
-# 17: equivalent default routes fail closed after CIDR parsing, not fragile
+# 18: equivalent default routes fail closed after CIDR parsing, not fragile
 #     string comparison. The two /1 entries cover the same address family as
 #     /0; whitespace and the expanded IPv6 zero address are equivalent /0s.
 # ---------------------------------------------------------------------------
@@ -760,7 +777,7 @@ if not expected.issubset(cidrs):
 PY
 
 # ---------------------------------------------------------------------------
-# 11: checksum/mail-adapter-credentials tracks ALL THREE credentials. Three
+# 12: checksum/mail-adapter-credentials tracks ALL THREE credentials. Three
 #     independent one-credential pairs: a checksum over the channel token alone
 #     passes a one-credential assertion while rotating the egress secret or the
 #     AgentMail key leaves the pod running on stale environment credentials.
@@ -786,7 +803,7 @@ assert_checksum_tracks "mailAdapter.egressSecret" --set mailAdapter.egressSecret
 assert_checksum_tracks "mailAdapter.agentmail.apiKey" --set mailAdapter.agentmail.apiKey=am-rotated
 
 # ---------------------------------------------------------------------------
-# 12: the egress pair cannot diverge. (a) derived from mailAdapter.egressSecret
+# 13: the egress pair cannot diverge. (a) derived from mailAdapter.egressSecret
 #     alone, (b) unchanged when the operator also writes an agreeing worker half,
 #     (c) `helm template` FAILS, naming both keys, when they disagree. A mismatch
 #     is not a preference: it is an operator who believes two different things,
@@ -859,7 +876,7 @@ case "$leak_out" in
 esac
 
 # ---------------------------------------------------------------------------
-# 13: the worker's rotation trigger sees the DERIVED entry. Without this the
+# 14: the worker's rotation trigger sees the DERIVED entry. Without this the
 #     annotation is constant across the two renders and every worker keeps
 #     presenting the revoked secret while the operator believes it is rotated.
 # ---------------------------------------------------------------------------
@@ -873,7 +890,7 @@ rot2="$(field "$rot2_dir" Deployment curie-worker "$WORKER_ANNOTATION")"
   || fail "rotating mailAdapter.egressSecret left the WORKER's 'checksum/adapter-credentials' unchanged ('$rot1'); the annotation still hashes .Values.worker.adapterCredentials instead of the coalesced map, so no worker restarts and every one keeps presenting the revoked secret"
 
 # ---------------------------------------------------------------------------
-# 14: the default render is untouched. This is what keeps the coalescing helper
+# 15: the default render is untouched. This is what keeps the coalescing helper
 #     from being a behavior change for every existing install.
 # ---------------------------------------------------------------------------
 actual="$(field "$default_dir" Secret "$SECRET_NAME" stringData.adapterCredentials)"
@@ -894,7 +911,7 @@ expected="$(sha256_of "$actual")"
   || fail "the worker checksum '$checksum' is not sha256 of the Secret value it is supposed to track ('$actual' hashes to '$expected'); the two have drifted apart"
 
 # ---------------------------------------------------------------------------
-# 15: the build path. The chart defaults to an image tag no workflow publishes
+# 16: the build path. The chart defaults to an image tag no workflow publishes
 #     unless mail-adapter is a cell in ci.yaml's images matrix AND in every
 #     release.yaml matrix that iterates a `name` list. An include-only entry
 #     attaches a dockerfile to a cell that is never iterated and publishes
@@ -980,4 +997,4 @@ python3 "$MATRIX_PY" \
   mail-adapter \
   || fail "the mail-adapter image is not wired into the standard build path; see the message above"
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (19 assertions)"
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (20 assertions)"
