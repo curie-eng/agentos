@@ -1650,18 +1650,39 @@ start_local_otel_sink() {
         }
     ' "$REPO_ROOT/cli/scripts/fixtures/otel-e2e-sink-config.yaml" > "$sink_config"
     LOCAL_OTEL_SINK_OWNED=1
-    docker run -d \
-        --name "$LOCAL_OTEL_SINK_NAME" \
-        --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
-        --network "$network" \
-        --user 0 \
-        -p 0.0.0.0::4318 \
-        -p 127.0.0.1::13133 \
-        -p 127.0.0.1::8888 \
-        -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
-        -v "$output_dir:/var/lib/otel-e2e" \
-        otel/opentelemetry-collector-contrib:0.119.0 \
-        --config=/etc/otelcol-contrib/config.yaml >/dev/null
+    local start_log="$WORKDIR/otel-sink-start.log" attempt started=0
+    # Docker's ephemeral host-port allocator can race the kernel's current
+    # listeners even on a fresh CI runner. Retry only that explicit bind race;
+    # configuration/image failures remain immediately loud.
+    for attempt in $(seq 1 5); do
+        if docker run -d \
+            --name "$LOCAL_OTEL_SINK_NAME" \
+            --label "curietech.ai/e2e-owner=$LOCAL_OTEL_SINK_NAME" \
+            --network "$network" \
+            --user 0 \
+            -p 0.0.0.0::4318 \
+            -p 127.0.0.1::13133 \
+            -p 127.0.0.1::8888 \
+            -v "$sink_config:/etc/otelcol-contrib/config.yaml:ro" \
+            -v "$output_dir:/var/lib/otel-e2e" \
+            otel/opentelemetry-collector-contrib:0.119.0 \
+            --config=/etc/otelcol-contrib/config.yaml >"$start_log" 2>&1; then
+            started=1
+            break
+        fi
+        if ! grep -Fq 'address already in use' "$start_log"; then
+            cat "$start_log" >&2
+            return 1
+        fi
+        docker rm -f "$LOCAL_OTEL_SINK_NAME" >/dev/null 2>&1 || true
+        echo "local: Docker host-port allocation raced on attempt $attempt; retrying task-owned sink" >&2
+        sleep 1
+    done
+    if (( ! started )); then
+        cat "$start_log" >&2
+        echo "local: Docker could not allocate private sink ports after 5 attempts" >&2
+        return 1
+    fi
 
     local gateway otlp_port health_port metrics_port
     gateway="$(docker network inspect "$network" --format '{{(index .IPAM.Config 0).Gateway}}')"
@@ -2495,7 +2516,8 @@ rung_local_release() {
             echo "error: image '$image' is required by compose.release.yaml's $compose_profile profile and is not present locally." >&2
             missing=1
         fi
-    done < <(docker compose -f "$release_compose" --profile "$compose_profile" config --images)
+    done < <(docker compose -f "$release_compose" \
+        --profile "$compose_profile" --profile slack config --images)
     if (( missing )); then
         echo "fix: build and tag the missing image(s) locally under the tag compose.release.yaml pins (see .github/workflows/ci.yaml's e2e-ladder job for the exact build+tag steps CI uses), then re-run." >&2
         return 1
