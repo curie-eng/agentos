@@ -435,11 +435,12 @@ services:
   # The image is fixture-by-default, so the CLI advertises the wired
   # `http://localhost:28080/?api=1` URL and `local up` opens it connected to the API.
   curie-ui:
-    # Same override as api/migrate/worker. Pinned to `latest` before #1915, which
-    # meant `CURIE_BASE_TAG=dev` moved three services and silently left this one
-    # on whatever the registry last published -- so a stack "built from source"
-    # was partly not.
-    image: ghcr.io/curie-eng/curie-ui:${CURIE_BASE_TAG:-latest}
+    # Its OWN variable, defaulting to the `latest` this line used to hardcode
+    # (#1915). NOT CURIE_BASE_TAG: that variable means "the platform images this
+    # caller built", and CI sets it while building only api and worker -- so
+    # reading it here made compose pull a `curie-ui:ci-local` that does not
+    # exist and fail the whole stack with `manifest unknown`.
+    image: ${CURIE_UI_IMAGE:-ghcr.io/curie-eng/curie-ui:latest}
     profiles: *full_profiles
     depends_on:
       curie-api:
@@ -661,11 +662,11 @@ services:
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
   curie-dispatcher:
-    # Same override as every other published image (#1915). This one bit
-    # hardest: the CLI invoked `curie_dispatcher.enqueue_once`, the published
-    # image predated that module, and the failure surfaced as a bare
+    # Its own variable, same reasoning as curie-ui above (#1915). This one bit
+    # hardest locally: the CLI invoked `curie_dispatcher.enqueue_once`, the
+    # published image predated that module, and the failure surfaced as a bare
     # `No module named` from inside a container.
-    image: ghcr.io/curie-eng/curie-dispatcher:${CURIE_BASE_TAG:-latest}
+    image: ${CURIE_DISPATCHER_IMAGE:-ghcr.io/curie-eng/curie-dispatcher:latest}
     profiles: [slack]
     depends_on:
       valkey:

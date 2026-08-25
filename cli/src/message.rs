@@ -1034,10 +1034,39 @@ fn container_image_command(container: &str) -> OpsCommand {
     )
 }
 
-/// The image tag the running stack was started with, or None when it cannot be
-/// read. Best-effort by design: an unreadable tag leaves compose's own default
-/// in force, which is the behaviour that existed before #1915.
-async fn running_stack_tag() -> Option<String> {
+/// `docker image inspect <ref>` -- succeeds only if the image is present.
+fn image_present_command(image: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("image"),
+            plain("inspect"),
+            plain("--format"),
+            plain("{{ .Id }}"),
+            plain(image),
+        ],
+    )
+}
+
+/// The dispatcher image the one-shot producer should run, or None to leave
+/// compose's default alone.
+///
+/// Derived from the RUNNING api container's tag, then checked for existence, and
+/// both halves are load-bearing:
+///
+/// - Derived, because the tag is a property of the stack rather than of this
+///   invocation. Compose substitutes its variables from each caller's own
+///   environment, so after `local up --build` the stack ran `:dev` while this
+///   verb resolved `:latest` and died on `No module named
+///   curie_dispatcher.enqueue_once`.
+/// - Checked, because a tag that exists for the platform images need not exist
+///   for the dispatcher. CI runs the ladder with `CURIE_BASE_TAG=ci-local` and
+///   builds its dispatcher as `:latest`, so pointing this at `:ci-local` asked
+///   for an image nothing had built and failed the stack.
+///
+/// Best-effort throughout: any unreadable step leaves compose's default in
+/// force, which is the behaviour that existed before #1915.
+async fn one_shot_dispatcher_image() -> Option<String> {
     let (ok, stdout, _) = run_capture(&api_ps_command()).await.ok()?;
     if !ok {
         return None;
@@ -1049,7 +1078,10 @@ async fn running_stack_tag() -> Option<String> {
     if !ok {
         return None;
     }
-    image_tag(image.trim()).map(str::to_string)
+    let tag = image_tag(image.trim())?;
+    let candidate = format!("ghcr.io/curie-eng/curie-dispatcher:{tag}");
+    let (present, _, _) = run_capture(&image_present_command(&candidate)).await.ok()?;
+    present.then_some(candidate)
 }
 
 fn worker_compose_config_command(container: &str) -> OpsCommand {
@@ -1128,8 +1160,9 @@ fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
 
 struct LocalDispatcherContext {
     compose_files: Vec<String>,
-    /// The image tag the RUNNING stack uses, when it is readable.
-    base_tag: Option<String>,
+    /// The dispatcher image the running stack would use, when it can be
+    /// determined and is actually present.
+    dispatcher_image: Option<String>,
     otel_env: Vec<(String, String)>,
 }
 
@@ -1158,12 +1191,12 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
     // #1915: the stack's own image tag, so the one-shot producer below runs what
     // the stack runs. Best-effort: an unreadable image is not worth failing an
     // enqueue over, and compose's default then applies exactly as before.
-    let base_tag = running_stack_tag().await;
+    let dispatcher_image = one_shot_dispatcher_image().await;
 
     Ok(LocalDispatcherContext {
         compose_files,
         otel_env,
-        base_tag,
+        dispatcher_image,
     })
 }
 
@@ -1176,7 +1209,7 @@ fn dispatcher_enqueue_command(
     stream: &str,
     valkey_password: &str,
     otel_env: &[(String, String)],
-    base_tag: Option<&str>,
+    dispatcher_image: Option<&str>,
 ) -> OpsCommand {
     // The dispatcher service lives in the slack profile but depends on core
     // services (notably the API and Valkey). Compose resolves that dependency
@@ -1237,8 +1270,8 @@ fn dispatcher_enqueue_command(
     // Only when the running stack has one. Passing nothing leaves compose's
     // `${CURIE_BASE_TAG:-latest}` default in force, so a published stack behaves
     // exactly as it did.
-    if let Some(tag) = base_tag {
-        env.push(("CURIE_BASE_TAG".to_string(), tag.to_string()));
+    if let Some(image) = dispatcher_image {
+        env.push(("CURIE_DISPATCHER_IMAGE".to_string(), image.to_string()));
     }
     OpsCommand::new("docker", args)
         .with_env(env)
@@ -1293,7 +1326,7 @@ async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Resu
         &opts.stream,
         &opts.valkey_password,
         &context.otel_env,
-        context.base_tag.as_deref(),
+        context.dispatcher_image.as_deref(),
     );
     crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
     let payload = queue::payload_json(turn)?;
@@ -5144,39 +5177,38 @@ mod tests {
         );
     }
 
-    /// #1915: the one-shot producer must run the SAME image tag the stack is
-    /// running, not whatever this shell resolves.
+    /// #1915: the one-shot producer must run the dispatcher image the STACK
+    /// runs, not whatever this shell resolves.
     ///
-    /// Compose substitutes `${CURIE_BASE_TAG:-latest}` from the invocation's own
-    /// environment, so after `local up --build` the stack ran `:dev` while
-    /// `local message` pulled `:latest` and died on `No module named
+    /// Compose substitutes its variables from each invocation's own environment,
+    /// so after `local up --build` the stack ran `:dev` while `local message`
+    /// resolved `:latest` and died on `No module named
     /// curie_dispatcher.enqueue_once` -- the module the published image predates.
-    /// The tag is READ off the running worker rather than remembered, so it is
-    /// right even for a stack this process did not start.
     #[test]
-    fn the_one_shot_producer_inherits_the_running_stack_tag() {
+    fn the_one_shot_producer_runs_the_stacks_dispatcher_image() {
         let cmd = dispatcher_enqueue_command(
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
             "curie:runs",
             "pw",
             &[],
-            Some("dev"),
+            Some("ghcr.io/curie-eng/curie-dispatcher:dev"),
         );
 
         assert!(
-            cmd.env
-                .iter()
-                .any(|(k, v)| k == "CURIE_BASE_TAG" && v == "dev"),
-            "expected the running tag in the child env, got {:?}",
+            cmd.env.iter().any(|(k, v)| k == "CURIE_DISPATCHER_IMAGE"
+                && v == "ghcr.io/curie-eng/curie-dispatcher:dev"),
+            "expected the stack's dispatcher image in the child env, got {:?}",
             cmd.env
         );
     }
 
     /// A stack on the published images passes nothing, so compose's own default
-    /// still applies and a non-contributor sees no behaviour change.
+    /// still applies. This is also what keeps CI working: the ladder builds its
+    /// dispatcher as `:latest` while setting CURIE_BASE_TAG=ci-local, so a
+    /// derived-but-unchecked tag would ask for an image nothing built.
     #[test]
-    fn a_published_stack_leaves_the_tag_to_compose() {
+    fn a_published_stack_leaves_the_image_to_compose() {
         let cmd = dispatcher_enqueue_command(
             &["compose.dev.yaml".to_string()],
             "enqueue-1",
@@ -5186,7 +5218,7 @@ mod tests {
             None,
         );
 
-        assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_BASE_TAG"));
+        assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_DISPATCHER_IMAGE"));
     }
 
     #[test]

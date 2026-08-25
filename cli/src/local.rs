@@ -259,6 +259,14 @@ pub struct SourceImage {
     pub image: &'static str,
     /// Dockerfile path, relative to the repo root.
     pub dockerfile: &'static str,
+    /// The compose variable that points at this image, when it has its own.
+    ///
+    /// `None` means the image rides `CURIE_BASE_TAG` (the api, and the worker
+    /// overlay's base). Everything else gets a variable of its own, because
+    /// `CURIE_BASE_TAG` means "the platform images THIS caller built" and CI sets
+    /// it while building only those two -- widening its reach made compose pull
+    /// tags nothing had built and fail the stack with `manifest unknown`.
+    pub env: Option<&'static str>,
 }
 
 /// The images `--build` builds for this invocation, in dependency-ish order.
@@ -281,14 +289,17 @@ pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
         SourceImage {
             image: "curie-api",
             dockerfile: "apps/api/Dockerfile",
+            env: None,
         },
         SourceImage {
             image: "curie-worker",
             dockerfile: "apps/worker/Dockerfile",
+            env: None,
         },
         SourceImage {
             image: "curie-dispatcher",
             dockerfile: "apps/dispatcher/Dockerfile",
+            env: Some("CURIE_DISPATCHER_IMAGE"),
         },
         // The one that decides whether the AGENT runs this checkout. The worker
         // spawns it per turn from CURIE_RUNNER_IMAGE, so leaving it out rebuilt
@@ -298,12 +309,14 @@ pub fn source_images(o: &LocalOpts) -> Vec<SourceImage> {
         SourceImage {
             image: "curie-runner",
             dockerfile: "runner/Dockerfile",
+            env: Some("CURIE_RUNNER_IMAGE"),
         },
     ];
     if !o.minimal {
         images.push(SourceImage {
             image: "curie-ui",
             dockerfile: "apps/ui/Dockerfile",
+            env: Some("CURIE_UI_IMAGE"),
         });
     }
     images
@@ -403,16 +416,20 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
     // api, migrate, worker, ui and dispatcher uniformly -- which is why the two
     // that were pinned to `latest` were changed to read it.
     if o.build {
+        // The two that ride the base tag (the api, and the worker overlay's
+        // base), then one explicit reference per image that has its own variable.
+        // Named outright rather than derived: CURIE_BASE_TAG means "the platform
+        // images this caller built", and CI sets it while building only those
+        // two, so anything else reading it goes looking for a tag nothing built.
         env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
-        // Named outright rather than derived from the tag above. The runner is
-        // spawned by the worker rather than being a compose service, and it is
-        // tagged on its own axis -- CI sets CURIE_BASE_TAG for the platform
-        // images while building a plain `curie-runner`, so borrowing the base tag
-        // sent the worker after an image nothing had built.
-        env.push((
-            "CURIE_RUNNER_IMAGE".into(),
-            format!("ghcr.io/curie-eng/curie-runner:{SOURCE_IMAGE_TAG}"),
-        ));
+        for image in source_images(o) {
+            if let Some(name) = image.env {
+                env.push((
+                    name.into(),
+                    format!("ghcr.io/curie-eng/{}:{SOURCE_IMAGE_TAG}", image.image),
+                ));
+            }
+        }
     }
     env
 }
@@ -2049,7 +2066,9 @@ mod tests {
             let line = line.trim();
             let interpolates = line.contains("${CURIE_BASE_TAG")
                 || line.contains("${BASE_TAG")
-                || line.contains("${CURIE_RUNNER_IMAGE");
+                || line.contains("${CURIE_RUNNER_IMAGE")
+                || line.contains("${CURIE_UI_IMAGE")
+                || line.contains("${CURIE_DISPATCHER_IMAGE");
             if !interpolates {
                 continue;
             }
