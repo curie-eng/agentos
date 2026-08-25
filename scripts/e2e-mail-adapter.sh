@@ -90,7 +90,9 @@ PY
 }
 
 create_inbox() {
-  local role="$1" response="$TMP/create-$role.json" status id_file email_file
+  local role="$1"
+  local response="$TMP/create-$role.json"
+  local status id_file email_file
   id_file="$TMP/$role-id"
   email_file="$TMP/$role-email"
   status="$(curl --silent --show-error --max-time 30 -o "$response" -w '%{http_code}' \
@@ -271,7 +273,9 @@ assert not any(env.get("name") == "CURIE_API_KEY" for env in container.get("env"
 PY
 
 send_mail() {
-  local from_role="$1" correlation="$2" response="$TMP/send-$correlation.json"
+  local from_role="$1"
+  local correlation="$2"
+  local response="$TMP/send-$correlation.json"
   python3 - "$TMP/send-body.json" "$TMP/adapter-email" "$correlation" <<'PY'
 import json, sys
 json.dump({"to": open(sys.argv[2]).read(), "subject": sys.argv[3], "text": "Reply with the deterministic plumbing result."}, open(sys.argv[1], "w"))
@@ -286,7 +290,9 @@ PY
 }
 
 thread_has_marker() {
-  local correlation="$1" out="$TMP/thread.json" status
+  local correlation="$1"
+  local out="$TMP/thread.json"
+  local status
   status="$(curl --silent --show-error --max-time 20 -o "$out" -w '%{http_code}' \
     -H "Authorization: Bearer $(<"$KEY_FILE")" \
     "https://api.agentmail.to/v0/inboxes/$(<"$TMP/adapter-id")/threads/$(<"$TMP/thread-$correlation")")"
