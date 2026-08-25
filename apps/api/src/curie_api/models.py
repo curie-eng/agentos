@@ -563,6 +563,13 @@ class AgentAction(Base):
     # nothing to put back or nowhere to put it.
     prior_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     target: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    # What the call LEFT, reported by the same reply that reported what it read.
+    # The world-moved check compares the live resource against this, never
+    # against ``prior_state`` -- that is where the resource came from, not where
+    # the action put it. It cannot be derived from ``arguments``: a PATCH's
+    # result is not its request body, and deriving it is the mapping-DSL
+    # approach ADR-0117 rejects.
+    post_state: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # The frame's human-readable note. On a record that is not undoable this is
     # the stated reason the receipt shows instead of a control.
     detail: Mapped[str | None] = mapped_column(default=None)

@@ -1256,6 +1256,7 @@ class ActionComplete(BaseModel):
     failed: bool = False
     result: dict[str, Any] | None = None
     prior_state: dict[str, Any] | None = None
+    post_state: dict[str, Any] | None = None
     target: dict[str, Any] | None = None
     detail: str | None = None
 
@@ -1271,6 +1272,7 @@ class ActionOut(BaseModel):
     arguments: dict[str, Any] | None
     result: dict[str, Any] | None
     prior_state: dict[str, Any] | None
+    post_state: dict[str, Any] | None
     target: dict[str, Any] | None
     detail: str | None
     status: str
@@ -1282,6 +1284,56 @@ class ActionOut(BaseModel):
     # Derived on the model, never stored, so a record cannot claim a
     # reversibility nothing captured the state for (ADR-0117).
     undoable: bool
+
+
+class ActionUndo(BaseModel):
+    """A request to put back what an action changed.
+
+    ``observed_state`` is the resource as it looks NOW, read by whoever will
+    perform the restore. The platform cannot read it itself -- nothing here can
+    reach a connector -- and it will not assume: an absent observation is refused
+    rather than treated as "unchanged".
+    """
+
+    actor: str
+    actor_channel: str | None = None
+    observed_state: dict[str, Any] | None = None
+
+
+class ActionRestore(BaseModel):
+    """The call an authorized undo permits: put this state back on that target."""
+
+    target: dict[str, Any]
+    prior_state: dict[str, Any]
+
+
+class ActionUndoOut(BaseModel):
+    """An authorization, not a receipt.
+
+    The API rules and returns; something else performs the restore (ADR-0117
+    leaves where that executor lives undecided). So this names the call to make
+    rather than claiming it was made.
+    """
+
+    action: ActionOut
+    restore: ActionRestore
+
+
+class ActionAuditOut(BaseModel):
+    """One entry in an action's audit trail: an authorized undo, or a refused one."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    action_id: uuid.UUID
+    action: str
+    actor: str
+    actor_channel: str | None
+    authorizer: str
+    authorized: bool
+    reason: str | None
+    evidence: dict[str, Any] | None
+    created_at: datetime
 
 
 class ApprovalAuditOut(BaseModel):

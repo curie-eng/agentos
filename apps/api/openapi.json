@@ -1,6 +1,90 @@
 {
   "components": {
     "schemas": {
+      "ActionAuditOut": {
+        "description": "One entry in an action's audit trail: an authorized undo, or a refused one.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "action_id": {
+            "format": "uuid",
+            "title": "Action Id",
+            "type": "string"
+          },
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "actor_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Channel"
+          },
+          "authorized": {
+            "title": "Authorized",
+            "type": "boolean"
+          },
+          "authorizer": {
+            "title": "Authorizer",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "evidence": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "id",
+          "action_id",
+          "action",
+          "actor",
+          "actor_channel",
+          "authorizer",
+          "authorized",
+          "reason",
+          "evidence",
+          "created_at"
+        ],
+        "title": "ActionAuditOut",
+        "type": "object"
+      },
       "ActionComplete": {
         "description": "The closing frame: what came back, and what it takes to put it back.\n\n``prior_state`` and ``target`` are what a restore replays. Both are optional\nbecause a connector that answers in prose reports neither, and a record that\nholds neither is not undoable -- which is the honest answer rather than a\nmissing one.",
         "properties": {
@@ -19,6 +103,18 @@
             "default": false,
             "title": "Failed",
             "type": "boolean"
+          },
+          "post_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post State"
           },
           "prior_state": {
             "anyOf": [
@@ -131,6 +227,18 @@
             "title": "Id",
             "type": "string"
           },
+          "post_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post State"
+          },
           "prior_state": {
             "anyOf": [
               {
@@ -212,6 +320,7 @@
           "arguments",
           "result",
           "prior_state",
+          "post_state",
           "target",
           "detail",
           "status",
@@ -287,6 +396,81 @@
           "dedupe_key"
         ],
         "title": "ActionRecord",
+        "type": "object"
+      },
+      "ActionRestore": {
+        "description": "The call an authorized undo permits: put this state back on that target.",
+        "properties": {
+          "prior_state": {
+            "additionalProperties": true,
+            "title": "Prior State",
+            "type": "object"
+          },
+          "target": {
+            "additionalProperties": true,
+            "title": "Target",
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "prior_state"
+        ],
+        "title": "ActionRestore",
+        "type": "object"
+      },
+      "ActionUndo": {
+        "description": "A request to put back what an action changed.\n\n``observed_state`` is the resource as it looks NOW, read by whoever will\nperform the restore. The platform cannot read it itself -- nothing here can\nreach a connector -- and it will not assume: an absent observation is refused\nrather than treated as \"unchanged\".",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "actor_channel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Channel"
+          },
+          "observed_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed State"
+          }
+        },
+        "required": [
+          "actor"
+        ],
+        "title": "ActionUndo",
+        "type": "object"
+      },
+      "ActionUndoOut": {
+        "description": "An authorization, not a receipt.\n\nThe API rules and returns; something else performs the restore (ADR-0117\nleaves where that executor lives undecided). So this names the call to make\nrather than claiming it was made.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ActionOut"
+          },
+          "restore": {
+            "$ref": "#/components/schemas/ActionRestore"
+          }
+        },
+        "required": [
+          "action",
+          "restore"
+        ],
+        "title": "ActionUndoOut",
         "type": "object"
       },
       "AgentCreate": {
@@ -3917,6 +4101,70 @@
         ]
       }
     },
+    "/actions/{action_id}/audit": {
+      "get": {
+        "description": "The action's audit trail, oldest first.\n\nA refused undo leaves no trace anywhere else -- the world did not change and\nthe record did not move -- so this is the only place the reason survives.",
+        "operationId": "get_action_audit_actions__action_id__audit_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ActionAuditOut"
+                  },
+                  "title": "Response Get Action Audit Actions  Action Id  Audit Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Action Audit",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
     "/actions/{action_id}/complete": {
       "post": {
         "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.",
@@ -3982,6 +4230,76 @@
           }
         },
         "summary": "Complete Action",
+        "tags": [
+          "actions"
+        ]
+      }
+    },
+    "/actions/{action_id}/undo": {
+      "post": {
+        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nWho may undo is not decided here yet. ADR-0117 decision 3 makes an undo\nrequire the authorization the forward action required and no more, which\nneeds the gating approval recorded on the action; that lands separately.\nUntil then this endpoint is authenticated like every other router and gated\nby the conflict rule alone.",
+        "operationId": "undo_action_actions__action_id__undo_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Action Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActionUndo"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionUndoOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Undo Action",
         "tags": [
           "actions"
         ]
