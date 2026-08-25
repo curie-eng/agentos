@@ -140,12 +140,20 @@ spec:
       {{- end }}
       {{- $hasWorkerApiUrl := false }}
       {{- $hasWorkerApiKey := false }}
+      {{- $hasWorkerOtelEndpoint := false }}
+      {{- $hasWorkerOtelProtocol := false }}
       {{- range .Values.worker.extraEnv }}
       {{- if eq .name "CURIE_API_URL" }}
       {{- $hasWorkerApiUrl = true }}
       {{- end }}
       {{- if eq .name "CURIE_API_KEY" }}
       {{- $hasWorkerApiKey = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_ENDPOINT" }}
+      {{- $hasWorkerOtelEndpoint = true }}
+      {{- end }}
+      {{- if eq .name "OTEL_EXPORTER_OTLP_PROTOCOL" }}
+      {{- $hasWorkerOtelProtocol = true }}
       {{- end }}
       {{- end }}
       containers:
@@ -243,6 +251,14 @@ spec:
               value: {{ index .Values.worker.publication.resources.requests "ephemeral-storage" | quote }}
             - name: CURIE_PUBLICATION_EPHEMERAL_LIMIT
               value: {{ index .Values.worker.publication.resources.limits "ephemeral-storage" | quote }}
+            {{- if and .Values.otelCollector.deploy (not $hasWorkerOtelEndpoint) }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://{{ include "curie.fullname" . }}-otel-collector:{{ .Values.otelCollector.service.httpPort }}
+            {{- end }}
+            {{- if and .Values.otelCollector.deploy (not $hasWorkerOtelProtocol) }}
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            {{- end }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:

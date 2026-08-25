@@ -12,6 +12,7 @@ dependencies = [
     "curie-discord-adapter",
     "curie-worker",
     "curie-runner",
+    "curie-telemetry",
 ]
 
 [tool.uv]
@@ -23,6 +24,7 @@ members = [
     "packages/channel-protocol",
     "packages/plugin-format",
     "packages/test-support",
+    "packages/telemetry",
     "apps/api",
     "apps/dispatcher",
     "adapters/discord",
@@ -42,6 +44,7 @@ curie-dispatcher = { workspace = true }
 curie-discord-adapter = { workspace = true }
 curie-worker = { workspace = true }
 curie-runner = { workspace = true }
+curie-telemetry = { workspace = true }
 curie-doclint = { workspace = true }
 curie-wire-tolerance-gate = { workspace = true }
 
@@ -74,6 +77,7 @@ root_packages = [
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_runner",
+    "curie_telemetry",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -131,6 +135,7 @@ testpaths = [
     "packages/aci-protocol/tests",
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
+    "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
     "apps/worker/tests",
@@ -174,6 +179,7 @@ mypy_path = [
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/test-support/src",
+    "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
@@ -187,6 +193,7 @@ files = [
     "packages/channel-protocol/src",
     "packages/plugin-format/src",
     "packages/test-support/src",
+    "packages/telemetry/src",
     "apps/api/src",
     "apps/dispatcher/src",
     "adapters/discord/src",
