@@ -111,7 +111,7 @@ def test_a_repeated_event_id_produces_exactly_one_email(
 ) -> None:
     """Completion delivery is at-least-once, so the fast path dedupes on event_id."""
     seed(mail, adapter)
-    post_event(egress_url, update("answer one"))
+    post_event(egress_url, update("answer one", reply_ref="msg-1"))
 
     post_event(egress_url, completed("ev-1"))
     post_event(egress_url, completed("ev-1"))
@@ -224,7 +224,7 @@ def test_interleaved_turns_each_reply_to_their_own_message(
 
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1", conversation_id="thr-1", reply_ref="msg-1"))
-    post_event(egress_url, update("answer two"))
+    post_event(egress_url, update("answer two", reply_ref="msg-2"))
     post_event(egress_url, completed("ev-2", conversation_id="thr-1", reply_ref="msg-2"))
 
     assert [mid for mid, _text in mail.replies] == ["msg-1", "msg-2"]
@@ -250,7 +250,7 @@ def test_a_second_message_does_not_erase_an_answer_already_emitted(
     """
     mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
     adapter.poll_once()
-    post_event(egress_url, update("answer one"))
+    post_event(egress_url, update("answer one", reply_ref="msg-1"))
 
     mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="and this?")
     adapter.poll_once()
@@ -268,12 +268,30 @@ def test_a_completion_with_a_null_reply_ref_sends_nothing(
 ) -> None:
     """There is no fallback to a stored message id, because that fallback is the bug."""
     seed(mail, adapter)
-    post_event(egress_url, update("answer one"))
+    post_event(egress_url, update("answer one", reply_ref="msg-1"))
 
     status, _ = post_event(egress_url, completed("ev-1", reply_ref=None))
 
     assert status == 200
     assert mail.replies == []
+
+
+def test_a_null_ref_reply_post_is_503_when_two_live_replies_are_ambiguous(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """A platform-owned post may attach implicitly only to one live reply ref."""
+    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
+    mail.add_inbound("msg-2", "thr-1", subject="Second", text="two")
+    adapter.poll_once()
+    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+
+    status, _ = post_event(egress_url, reply_post("must not cross turns"))
+
+    assert status == 503
+    assert mail.replies == []
+    post_event(egress_url, update("first answer", reply_ref="msg-1"))
+    assert post_event(egress_url, completed("ev-1", reply_ref="msg-1"))[0] == 200
+    assert "must not cross turns" not in mail.replies[0][1]
 
 
 def test_a_completion_for_an_unknown_conversation_is_a_retryable_failure(

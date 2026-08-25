@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from _support import (
@@ -109,6 +110,32 @@ def test_a_non_positive_poll_interval_refuses_to_boot(
 
     assert code != 0
     assert "CURIE_MAIL_POLL_INTERVAL_SECONDS" in output
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CURIE_MAIL_MAX_PENDING_DELIVERIES",
+        "CURIE_MAIL_MAX_BODY_BYTES",
+        "CURIE_MAIL_MAX_REPLY_BYTES",
+        "CURIE_MAIL_MAX_STATE_BYTES",
+    ],
+)
+def test_a_non_positive_durable_bound_refuses_to_boot(
+    mail: MailState, ingress: IngressState, name: str, tmp_path: Path
+) -> None:
+    env = adapter_env(
+        agentmail_base_url=mail.base_url,
+        api_url=ingress.url,
+        port=free_port(),
+        CURIE_MAIL_STATE_PATH=str(tmp_path / "mail-state.sqlite3"),
+        **{name: "0"},
+    )
+
+    code, output = exit_of(spawn_adapter(env))
+
+    assert code != 0
+    assert name in output
 
 
 def test_healthz_is_open_to_get_and_closed_to_post(

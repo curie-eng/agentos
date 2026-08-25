@@ -65,18 +65,52 @@ def test_ingress_ids_are_verbatim_agentmail_ids(
     assert body["reply_ref"] == "am-msg-XYZ"
 
 
-@pytest.mark.parametrize("status", [200, 202])
-def test_a_duplicate_ingress_response_is_not_reposted(
-    mail: MailState, ingress: IngressState, adapter: MailAdapter, status: int
+def test_a_200_duplicate_ingress_response_is_not_reposted(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter
 ) -> None:
-    """A response that arrived is final, duplicate or not; only transport failures retry."""
-    ingress.response = (status, {"event_id": "chn-1-dup", "stream_id": None, "duplicate": True})
+    """A documented terminal duplicate settles the durable delivery id."""
+    ingress.response = (
+        200,
+        {"event_id": "chn-1-dup", "stream_id": None, "duplicate": True},
+    )
     mail.add_inbound("msg-1", "thr-1")
 
     adapter.poll_once()
 
     assert ingress.attempts == 1
     assert len(ingress.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "headers"),
+    [(202, {}), (401, {}), (429, {"Retry-After": "0.05"}), (500, {})],
+)
+def test_retryable_ingress_responses_eventually_settle_the_same_pending_id(
+    mail: MailState,
+    ingress: IngressState,
+    adapter: MailAdapter,
+    status: int,
+    headers: dict[str, str],
+) -> None:
+    """Only terminal success burns an AgentMail delivery.
+
+    The platform may return 202 before durable admission, 401 while an operator
+    rotates the scoped token, 429 with provider-directed backoff, or 5xx. Each
+    leaves the same delivery pending and retries its verbatim id. This drives
+    the real local HTTP seam; the fake controls only the external response.
+    """
+    ingress.responses = [
+        (status, {"detail": "retry"}, headers),
+        (200, {"event_id": "chn-1", "stream_id": "1-0", "duplicate": False}, {}),
+    ]
+    mail.add_inbound("msg-1", "thr-1")
+
+    adapter.poll_once()
+    adapter.poll_once()
+
+    assert ingress.delivery_ids() == ["msg-1", "msg-1"]
+    if status == 429:
+        assert ingress.attempt_times[1] - ingress.attempt_times[0] >= 0.045
 
 
 def test_a_transport_failure_is_retried_and_the_delivery_lands_once(
@@ -89,6 +123,32 @@ def test_a_transport_failure_is_retried_and_the_delivery_lands_once(
 
     assert ingress.attempts == 3
     assert ingress.delivery_ids() == ["msg-1"]
+
+
+def test_pending_capacity_refuses_before_accepting_or_burning_new_mail(
+    mail: MailState,
+    ingress: IngressState,
+    make_adapter: Callable[..., MailAdapter],
+) -> None:
+    """At capacity, later provider mail remains recoverable rather than evicted."""
+    adapter = make_adapter(max_pending_deliveries=1)
+    ingress.response = (401, {"detail": "token rotation in progress"})
+    mail.add_inbound("msg-first", "thr-first")
+    mail.add_inbound("msg-later", "thr-later")
+
+    adapter.poll_once()
+
+    assert set(ingress.delivery_ids()) == {"msg-first"}
+
+    ingress.requests.clear()
+    ingress.response = (
+        200,
+        {"event_id": "chn-ok", "stream_id": "1-0", "duplicate": False},
+    )
+    for _ in range(4):
+        adapter.poll_once()
+
+    assert set(ingress.delivery_ids()) == {"msg-first", "msg-later"}
 
 
 def test_seen_is_bounded_and_evicts_the_oldest_first(
@@ -145,6 +205,20 @@ def test_a_message_pushed_off_the_first_page_still_reaches_ingress(
     adapter.poll_once()  # the starvation is permanent, not a one-poll delay
 
     assert "msg-legit" in ingress.delivery_ids()
+
+
+def test_invalid_page_token_recovers_without_losing_unclaimed_ids(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter
+) -> None:
+    """An opaque cursor refusal restarts discovery; it is never durable truth."""
+    mail.add_inbound("msg-unclaimed", "thr-unclaimed")
+    mail.next_page_token_override_once = "provider-rejects-this-token"
+    mail.invalid_page_tokens.add("provider-rejects-this-token")
+
+    adapter.poll_once()
+    adapter.poll_once()
+
+    assert ingress.delivery_ids() == ["msg-unclaimed"]
 
 
 def test_a_transient_body_fetch_failure_does_not_post_a_subject_only_turn(

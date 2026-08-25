@@ -132,6 +132,7 @@ def test_a_rejected_sender_posts_nothing_and_is_marked_seen(
         adapter.poll_once()
 
     assert ingress.attempts == 0
+    assert mail.body_calls == {}, "the allow-list must run before the body GET"
     assert "msg-junk" in adapter.seen
     warnings = _warnings_about(caplog, "msg-junk")
     assert len(warnings) == 1, warnings
@@ -230,6 +231,7 @@ def test_the_label_check_catches_what_a_widened_provider_would_deliver(
     adapter.poll_once()
 
     assert ingress.attempts == 0
+    assert mail.body_calls == {}, "provider verdict labels must run before the body GET"
     assert mail.replies == []
     assert adapter.conversations == {}
     assert "msg-bad" in adapter.seen  # rejected once, not re-evaluated forever
@@ -275,6 +277,7 @@ def test_a_sent_label_keeps_its_self_echo_meaning(
     adapter.poll_once()
 
     assert ingress.delivery_ids() == ["msg-theirs"]
+    assert mail.body_calls.get("msg-ours", 0) == 0
 
 
 def test_the_list_request_states_the_exclusions_explicitly(

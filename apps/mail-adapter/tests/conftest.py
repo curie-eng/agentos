@@ -88,7 +88,9 @@ def redirect(sink: SinkState) -> Iterator[RedirectState]:
 
 
 @pytest.fixture
-def make_config(mail: MailState, ingress: IngressState) -> Callable[..., MailAdapterConfig]:
+def make_config(
+    mail: MailState, ingress: IngressState, tmp_path: Path
+) -> Callable[..., MailAdapterConfig]:
     """A config pointed at the two fake servers. Overrides are field-name kwargs."""
 
     def _make(**overrides: Any) -> MailAdapterConfig:
@@ -104,6 +106,7 @@ def make_config(mail: MailState, ingress: IngressState) -> Callable[..., MailAda
             "ingress_retry_delay_seconds": 0.01,
             "port": 0,
             "allowed_senders": (ALLOWED_SENDER,),
+            "state_path": str(tmp_path / "mail-state.sqlite3"),
         }
         kwargs.update(overrides)
         return MailAdapterConfig(**kwargs)

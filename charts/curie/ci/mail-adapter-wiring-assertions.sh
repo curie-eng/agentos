@@ -82,7 +82,10 @@ SLUG=mail-adapter
 
 # Turning the adapter on, plus the three credentials, is the render most
 # assertions below want.
-ON=(--set mailAdapter.deploy=true)
+ON=(
+  --set mailAdapter.deploy=true
+  --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24'
+)
 CREDS=(
   --set mailAdapter.channelToken=chn-assert-token
   --set mailAdapter.egressSecret=egress-assert-secret
@@ -351,6 +354,10 @@ assert_env_value "$senders_dir" CURIE_MAIL_ALLOWED_SENDERS "ops@example.com,dev@
 knobs_dir="$(render knobs "${ON[@]}" "${CREDS[@]}" \
   --set mailAdapter.inbox=assert-inbox@example.com \
   --set mailAdapter.pollIntervalSeconds=37 \
+  --set mailAdapter.maxPendingDeliveries=17 \
+  --set mailAdapter.maxBodyBytes=4096 \
+  --set mailAdapter.maxReplyBytes=8192 \
+  --set mailAdapter.maxStateBytes=1048576 \
   --set mailAdapter.ingressEnabled=false)"
 assert_env_value "$knobs_dir" AGENTMAIL_INBOX "assert-inbox@example.com" \
   "mailAdapter.inbox must reach the process; a name typo renders green and is ignored at runtime."
@@ -358,6 +365,14 @@ assert_env_value "$knobs_dir" CURIE_MAIL_POLL_INTERVAL_SECONDS "37" \
   "mailAdapter.pollIntervalSeconds must reach the process as a quoted string."
 assert_env_value "$knobs_dir" ADAPTER_INGRESS_ENABLED "false" \
   "mailAdapter.ingressEnabled must reach the process as a quoted string; an unquoted YAML bool is rejected by the API server."
+assert_env_value "$knobs_dir" CURIE_MAIL_MAX_PENDING_DELIVERIES "17" \
+  "mailAdapter.maxPendingDeliveries must reach the durable admission bound."
+assert_env_value "$knobs_dir" CURIE_MAIL_MAX_BODY_BYTES "4096" \
+  "mailAdapter.maxBodyBytes must bound provider bodies before allocation/storage."
+assert_env_value "$knobs_dir" CURIE_MAIL_MAX_REPLY_BYTES "8192" \
+  "mailAdapter.maxReplyBytes must bound egress text before allocation/storage."
+assert_env_value "$knobs_dir" CURIE_MAIL_MAX_STATE_BYTES "1048576" \
+  "mailAdapter.maxStateBytes must cap SQLite pages/queued bytes."
 
 # ---------------------------------------------------------------------------
 # 10: one replica, no knob that changes it, and Recreate. Every routing map in
@@ -374,6 +389,136 @@ actual="$(field "$replicas_dir" Deployment "$DEPLOY_NAME" spec.replicas)"
 actual="$(field "$on_dir" Deployment "$DEPLOY_NAME" spec.strategy.type || true)"
 [ "$actual" = "Recreate" ] \
   || fail "mail-adapter spec.strategy.type is '$actual', expected 'Recreate'; the default rolling update runs two pods at once for the duration of every upgrade, which is the same split-brain replicas:1 exists to prevent"
+
+# ---------------------------------------------------------------------------
+# 10b: durable single-writer storage and least-capability pod wiring. The root
+# filesystem remains read-only; only the SQLite directory and /tmp are writable.
+# ---------------------------------------------------------------------------
+STRUCTURE_PY="$TMP/mail-structure.py"
+cat > "$STRUCTURE_PY" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+rendered, expected_claim, expect_pvc, expected_cidr = sys.argv[1:]
+docs = []
+for path in pathlib.Path(rendered).rglob("*.yaml"):
+    docs.extend(d for d in yaml.safe_load_all(path.read_text()) if isinstance(d, dict))
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+deployments = [d for d in docs if d.get("kind") == "Deployment" and d.get("metadata", {}).get("name") == "curie-mail-adapter"]
+if len(deployments) != 1:
+    fail(f"expected one mail Deployment, found {len(deployments)}")
+deployment = deployments[0]
+pod = deployment["spec"]["template"]["spec"]
+container = pod["containers"][0]
+
+if pod.get("automountServiceAccountToken") is not False:
+    fail("mail pod must set automountServiceAccountToken: false")
+if pod.get("securityContext", {}).get("fsGroup") != 1000:
+    fail("mail pod must own the RWO volume through fsGroup 1000")
+if container.get("securityContext", {}).get("readOnlyRootFilesystem") is not True:
+    fail("mail container root filesystem must remain read-only")
+if container.get("readinessProbe", {}).get("httpGet", {}).get("path") != "/readyz":
+    fail("mail readiness must use /readyz after durable startup")
+if container.get("livenessProbe", {}).get("httpGet", {}).get("path") != "/healthz":
+    fail("mail liveness must remain /healthz")
+
+env = {entry["name"]: entry for entry in container.get("env", [])}
+state_path = env.get("CURIE_MAIL_STATE_PATH", {}).get("value", "")
+if not state_path.endswith(".sqlite3"):
+    fail(f"CURIE_MAIL_STATE_PATH is absent or not a SQLite file: {state_path!r}")
+if "CURIE_API_KEY" in env:
+    fail("mail pod gained CURIE_API_KEY")
+
+volumes = {volume["name"]: volume for volume in pod.get("volumes", [])}
+mounts = {mount["name"]: mount for mount in container.get("volumeMounts", [])}
+state_mounts = [
+    (name, mount)
+    for name, mount in mounts.items()
+    if state_path.startswith(mount.get("mountPath", "").rstrip("/") + "/")
+]
+if len(state_mounts) != 1:
+    fail(f"state path must sit under exactly one volume mount, got {state_mounts!r}")
+state_volume = volumes.get(state_mounts[0][0], {})
+pvcs = [d for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+if expected_claim == "__managed__":
+    if len(pvcs) != 1:
+        fail(f"managed state must render one PVC, found {len(pvcs)}")
+    expected_claim = pvcs[0]["metadata"]["name"]
+if state_volume.get("persistentVolumeClaim", {}).get("claimName") != expected_claim:
+    fail(f"state volume does not mount expected claim {expected_claim!r}: {state_volume!r}")
+tmp_mounts = [name for name, mount in mounts.items() if mount.get("mountPath") == "/tmp"]
+if len(tmp_mounts) != 1 or "emptyDir" not in volumes.get(tmp_mounts[0], {}):
+    fail("/tmp must be a writable emptyDir under the read-only root")
+
+if (len(pvcs) == 1) != (expect_pvc == "yes"):
+    fail(f"managed/BYO PVC rendering drifted: expect_pvc={expect_pvc}, found={len(pvcs)}")
+if pvcs and pvcs[0].get("spec", {}).get("accessModes") != ["ReadWriteOnce"]:
+    fail(f"managed mail state must be RWO: {pvcs[0].get('spec', {}).get('accessModes')!r}")
+
+policies = [d for d in docs if d.get("kind") == "NetworkPolicy" and d.get("spec", {}).get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "mail-adapter"]
+if len(policies) != 1:
+    fail(f"expected one mail-only NetworkPolicy, found {len(policies)}")
+policy = policies[0]
+selector = policy["spec"]["podSelector"].get("matchLabels", {})
+if selector.get("app.kubernetes.io/component") != "mail-adapter":
+    fail(f"policy selector could include runner-sandbox: {selector!r}")
+if policy["spec"].get("policyTypes") != ["Egress"]:
+    fail(f"mail policy must be egress-only: {policy['spec'].get('policyTypes')!r}")
+cidrs = {
+    peer.get("ipBlock", {}).get("cidr")
+    for rule in policy["spec"].get("egress", [])
+    for peer in rule.get("to", [])
+    if peer.get("ipBlock")
+}
+if expected_cidr not in cidrs:
+    fail(f"configured AgentMail CIDR absent from policy: {sorted(cidrs)!r}")
+
+for doc in docs:
+    if doc.get("kind") in {"Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"} and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "mail-adapter":
+        fail(f"mail adapter must not gain Kubernetes RBAC: {doc['kind']} {doc['metadata'].get('name')}")
+PY
+
+python3 "$STRUCTURE_PY" "$on_dir" __managed__ yes 203.0.113.0/24 \
+  || fail "managed durable mail storage/security wiring is incomplete"
+
+byo_dir="$(render byo-state "${ON[@]}" "${CREDS[@]}" --set mailAdapter.persistence.existingClaim=mail-state-existing)"
+python3 "$STRUCTURE_PY" "$byo_dir" mail-state-existing no 203.0.113.0/24 \
+  || fail "existingClaim must mount the named same-namespace RWO claim without rendering a second PVC"
+
+non_rwo_dir="$(render non-rwo-knob "${ON[@]}" "${CREDS[@]}" --set 'mailAdapter.persistence.accessModes[0]=ReadWriteMany')"
+actual="$(python3 - "$non_rwo_dir" <<'PY'
+import pathlib, sys, yaml
+pvcs = [
+    doc
+    for path in pathlib.Path(sys.argv[1]).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict) and doc.get("kind") == "PersistentVolumeClaim"
+]
+if len(pvcs) != 1:
+    raise SystemExit("expected exactly one managed mail PVC")
+print(pvcs[0]["spec"]["accessModes"][0], end="")
+PY
+)"
+[ "$actual" = "ReadWriteOnce" ] \
+  || fail "mailAdapter.persistence.accessModes changed the managed claim to '$actual'; RWO is a correctness invariant, not an operator knob"
+
+set +e
+missing_cidr_out="$(helm template "$RELEASE" "$CHART" --set mailAdapter.deploy=true "${CREDS[@]}" 2>&1)"
+missing_cidr_rc=$?
+set -e
+[ "$missing_cidr_rc" -ne 0 ] \
+  || fail "mailAdapter.deploy=true rendered with no AgentMail HTTPS CIDR; provider egress must fail closed"
+case "$missing_cidr_out" in
+  *"mailAdapter.agentmail.httpsCidrs"*) : ;;
+  *) fail "missing-CIDR render failed without naming mailAdapter.agentmail.httpsCidrs; output was: $missing_cidr_out" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 11: checksum/mail-adapter-credentials tracks ALL THREE credentials. Three

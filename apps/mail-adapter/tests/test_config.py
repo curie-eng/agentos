@@ -40,6 +40,15 @@ _OVERRIDES: dict[str, tuple[str, str, object]] = {
     "CURIE_MAIL_INGRESS_ATTEMPTS": ("ingress_attempts", "7", 7),
     "CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS": ("ingress_retry_delay_seconds", "1.5", 1.5),
     "CURIE_MAIL_PORT": ("port", "8123", 8123),
+    "CURIE_MAIL_STATE_PATH": (
+        "state_path",
+        "/tmp/sentinel-mail-state.sqlite3",
+        "/tmp/sentinel-mail-state.sqlite3",
+    ),
+    "CURIE_MAIL_MAX_PENDING_DELIVERIES": ("max_pending_deliveries", "17", 17),
+    "CURIE_MAIL_MAX_BODY_BYTES": ("max_body_bytes", "4096", 4096),
+    "CURIE_MAIL_MAX_REPLY_BYTES": ("max_reply_bytes", "8192", 8192),
+    "CURIE_MAIL_MAX_STATE_BYTES": ("max_state_bytes", "1048576", 1048576),
     "CURIE_MAIL_ALLOWED_SENDERS": (
         "allowed_senders",
         "alice@example.com,example.org",
@@ -59,6 +68,11 @@ _DEFAULTS: dict[str, object] = {
     "ingress_attempts": 3,
     "ingress_retry_delay_seconds": 2.0,
     "port": 8080,
+    "state_path": "/var/lib/curie-mail/state.sqlite3",
+    "max_pending_deliveries": 1000,
+    "max_body_bytes": 1048576,
+    "max_reply_bytes": 1048576,
+    "max_state_bytes": 268435456,
     "allowed_senders": (),
 }
 

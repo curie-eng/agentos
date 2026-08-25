@@ -20,11 +20,13 @@ about production. See `MailState.visible` for the behavior and its sources.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -59,6 +61,7 @@ STRANGER = "stranger@evil.example"
 # as a provider verdict: it is an operator action on their own mailbox, and the
 # adapter deliberately does not reject on it.
 WITHHELD_LABELS = ("spam", "blocked", "unauthenticated")
+_PROCESS_STATE_ROOT = tempfile.TemporaryDirectory(prefix="curie-mail-tests-")
 
 
 # --- the fake AgentMail API ---------------------------------------------------
@@ -90,6 +93,13 @@ class MailState:
         self.fail_next_list: int | None = None
         self.fail_next_body: int | None = None
         self.fail_next_thread: int | None = None
+        # Provider accepted the reply and exposed it in the thread, but the
+        # HTTP response disappeared. Recovery must resolve this from the
+        # provider-visible event witness rather than sending again.
+        self.accept_then_drop_next_reply = False
+        # Opaque pagination tokens that the fake provider refuses.
+        self.invalid_page_tokens: set[str] = set()
+        self.next_page_token_override_once: str | None = None
         # Sticky, per-message body failure: every Get Message for an id in this
         # set answers 500 until the test removes it. One-shot cannot express
         # either half of what the poller has to survive - a message the provider
@@ -170,6 +180,9 @@ class MailState:
         `limit` is what lets a test see a message pushed off the first page: a
         fake that serves the whole inbox on every call hides that entirely.
         """
+        if query.get("page_token") in self.invalid_page_tokens:
+            self.invalid_page_tokens.discard(query["page_token"])
+            raise ValueError("invalid page token")
         newest_first = list(reversed(self.visible(query)))
         start = int(query.get("page_token") or 0)
         limit = int(query["limit"]) if query.get("limit") else len(newest_first)
@@ -177,6 +190,9 @@ class MailState:
         page: dict[str, Any] = {"messages": window, "count": len(window), "limit": limit}
         if start + len(window) < len(newest_first):
             page["next_page_token"] = str(start + len(window))
+        if self.next_page_token_override_once is not None:
+            page["next_page_token"] = self.next_page_token_override_once
+            self.next_page_token_override_once = None
         return page
 
     def hold_replies(self) -> None:
@@ -198,11 +214,13 @@ class IngressState:
         self.url = ""
         self.requests: list[tuple[Any, dict[str, Any]]] = []  # (headers, body)
         self.attempts = 0  # includes the ones dropped mid-flight
+        self.attempt_times: list[float] = []
         self.drop_next = 0  # simulate N transport failures before answering
         self.response: tuple[int, dict[str, Any]] = (
             200,
             {"event_id": "chn-1-abc", "stream_id": "1-0", "duplicate": False},
         )
+        self.responses: list[tuple[int, dict[str, Any], dict[str, str]]] = []
 
     def delivery_ids(self) -> list[str]:
         return [body["delivery_id"] for _headers, body in self.requests]
@@ -312,6 +330,10 @@ class MailHandler(_JsonHandler):
                     "labels": ["sent"],
                 }
             )
+            if state.accept_then_drop_next_reply:
+                state.accept_then_drop_next_reply = False
+                self.close_connection = True
+                return
             return self._send(200, {"message_id": reply_id, "thread_id": thread_id})
         self._send(404, {"detail": "not found"})
 
@@ -324,6 +346,7 @@ class IngressHandler(_JsonHandler):
     def do_POST(self) -> None:
         state = self.state
         state.attempts += 1
+        state.attempt_times.append(time.monotonic())
         if state.drop_next > 0:
             state.drop_next -= 1
             self.close_connection = True  # a real transport failure at the client
@@ -332,8 +355,19 @@ class IngressHandler(_JsonHandler):
         # Kept as the parsed message so header lookups stay case-insensitive,
         # exactly as HTTP (and Starlette on the platform side) treats them.
         state.requests.append((self.headers, body))
-        status, payload = state.response
-        self._send(status, payload)
+        if state.responses:
+            status, payload, headers = state.responses.pop(0)
+        else:
+            status, payload = state.response
+            headers = {}
+        body_bytes = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(body_bytes)
 
 
 # --- a redirecting origin, and the origin it points at ------------------------
@@ -430,11 +464,13 @@ def completed(
     }
 
 
-def update(text: str, conversation_id: str = "thr-1") -> dict[str, Any]:
+def update(
+    text: str, conversation_id: str = "thr-1", reply_ref: str | None = "msg-1"
+) -> dict[str, Any]:
     return {
         "version": "1.0",
         "event": "reply.update",
-        "target": target(conversation_id),
+        "target": target(conversation_id, reply_ref),
         "text": text,
     }
 
@@ -476,6 +512,24 @@ def post_event(
     return _send(req)
 
 
+def post_bytes(
+    url: str,
+    body: bytes,
+    *,
+    secret: str | None = EGRESS_SECRET,
+    content_type: str = "application/json",
+    headers: dict[str, str] | None = None,
+) -> tuple[int, Any]:
+    """POST exact bytes so framing and parser guards are exercised over HTTP."""
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", content_type)
+    if secret is not None:
+        req.add_header(ADAPTER_SECRET_HEADER, secret)
+    for name, value in (headers or {}).items():
+        req.add_header(name, value)
+    return _send(req)
+
+
 def post_raw(url: str, *, secret: str | None = None) -> tuple[int, Any]:
     """POST an empty body, for the paths that must refuse before reading one."""
     req = urllib.request.Request(url, data=b"{}", method="POST")
@@ -495,6 +549,8 @@ def _send(req: urllib.request.Request) -> tuple[int, Any]:
             return response.status, _decode(response.read().decode())
     except urllib.error.HTTPError as exc:
         return exc.code, _decode(exc.read().decode())
+    except (http.client.RemoteDisconnected, urllib.error.URLError, TimeoutError) as exc:
+        return 0, {"transport_error": type(exc).__name__}
 
 
 def _decode(raw: str) -> Any:
@@ -546,6 +602,9 @@ def adapter_env(
         "CURIE_MAIL_POLL_INTERVAL_SECONDS": poll_interval_seconds,
         "CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS": "0.01",
         "CURIE_MAIL_PORT": str(port),
+        "CURIE_MAIL_STATE_PATH": os.path.join(
+            _PROCESS_STATE_ROOT.name, f"mail-state-{port}.sqlite3"
+        ),
         "CURIE_MAIL_ALLOWED_SENDERS": allowed_senders,
     }
     env.update(overrides)
@@ -611,3 +670,22 @@ def wait_for_healthz(port: int, proc: subprocess.Popen[str], timeout: float = 30
         raise AssertionError(f"the adapter exited during boot:\n{stop(proc)}")
     status, _ = get(url)
     assert status == 200, f"GET /healthz -> {status}"
+
+
+def wait_for_readyz(port: int, proc: subprocess.Popen[str], timeout: float = 30.0) -> None:
+    """Wait for completed durable startup, not merely a live HTTP thread."""
+    url = f"http://127.0.0.1:{port}/readyz"
+
+    def answered() -> bool:
+        if proc.poll() is not None:
+            return True
+        try:
+            return get(url)[0] == 200
+        except OSError:
+            return False
+
+    wait_until(answered, timeout)
+    if proc.poll() is not None:
+        raise AssertionError(f"the adapter exited during boot:\n{stop(proc)}")
+    status, _ = get(url)
+    assert status == 200, f"GET /readyz -> {status}"
