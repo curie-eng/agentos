@@ -682,13 +682,31 @@ def test_sustained_throttling_is_reported_above_a_per_branch_warning(monkeypatch
 
     tip = GitHubBranchTip(Settings(), Creds())
     with caplog.at_level(logging.WARNING, logger="curie_api.commitpoller"):
+        # The noise that actually broke this test in CI, kept as a fixture. It
+        # is what makes the assertion below a claim about THIS logger rather
+        # than about whatever happened to log first.
+        logging.getLogger("asyncio").error(
+            "Future exception was never retrieved: ConnectionError"
+        )
         for _ in range(3):
             with pytest.raises(RateLimited):
                 tip.sha_for(REPO, "dev")
 
-    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    # Filtered by logger and searched rather than indexed. `caplog.at_level`
+    # raises the level for ONE logger but `caplog.records` holds everything the
+    # root handler captured, so an unrelated ERROR from elsewhere in the process
+    # lands in this list too -- asyncio's "Future exception was never retrieved"
+    # is the one that actually did it, and `errors[0]` then decides the outcome
+    # of a test about GitHub throttling.
+    errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name == "curie_api.commitpoller"
+    ]
     assert errors, "sustained throttling must escalate above a per-branch warning"
-    assert "NOT happening" in errors[0].getMessage()
+    assert any("NOT happening" in r.getMessage() for r in errors), [
+        r.getMessage() for r in errors
+    ]
 
 
 def test_a_throttled_repository_does_not_stop_the_others(monkeypatch) -> None:
