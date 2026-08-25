@@ -149,5 +149,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
 | 0119 | [A resumed thread rebuilds its prefix so the prompt cache still hits](0119-a-resumed-thread-rebuilds-its-prefix-so-the-prompt-cache-still-hits.md) | Draft |
-| 0121 | [A restore is the connector's own verb, run where the forward call ran](0121-a-restore-is-the-connectors-own-verb-run-where-the-forward-call-ran.md) | Draft |
+| 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
 <!-- END GENERATED: adr-index -->
