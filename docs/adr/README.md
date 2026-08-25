@@ -147,5 +147,4 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0116 | [Session identity arrives over the ACI so a sandbox can be pre-bound](0116-session-identity-arrives-over-the-aci-so-a-sandbox-can-be-pre-bound.md) | Draft |
 | 0117 | [A tool that changes the world reports what it changed, and the platform can put it back](0117-a-tool-that-changes-the-world-reports-what-it-changed.md) | Accepted |
 | 0118 | [Binding cardinality is the multi surface opt in](0118-binding-cardinality-is-the-multi-surface-opt-in.md) | Accepted |
-| 0121 | [A restore is the connector's own verb, run where the forward call ran](0121-a-restore-is-the-connectors-own-verb-run-where-the-forward-call-ran.md) | Draft |
 <!-- END GENERATED: adr-index -->
