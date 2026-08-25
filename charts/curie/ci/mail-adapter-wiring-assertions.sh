@@ -477,7 +477,13 @@ state_mounts = [
 if len(state_mounts) != 1:
     fail(f"state path must sit under exactly one volume mount, got {state_mounts!r}")
 state_volume = volumes.get(state_mounts[0][0], {})
-pvcs = [d for d in docs if d.get("kind") == "PersistentVolumeClaim"]
+pvcs = [
+    d
+    for d in docs
+    if d.get("kind") == "PersistentVolumeClaim"
+    and d.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+    == "mail-adapter-state"
+]
 if expected_claim == "__managed__":
     if len(pvcs) != 1:
         fail(f"managed state must render one PVC, found {len(pvcs)}")
@@ -530,7 +536,10 @@ pvcs = [
     doc
     for path in pathlib.Path(sys.argv[1]).rglob("*.yaml")
     for doc in yaml.safe_load_all(path.read_text())
-    if isinstance(doc, dict) and doc.get("kind") == "PersistentVolumeClaim"
+    if isinstance(doc, dict)
+    and doc.get("kind") == "PersistentVolumeClaim"
+    and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")
+    == "mail-adapter-state"
 ]
 if len(pvcs) != 1:
     raise SystemExit("expected exactly one managed mail PVC")
