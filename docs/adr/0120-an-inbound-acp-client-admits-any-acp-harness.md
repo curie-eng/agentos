@@ -18,7 +18,10 @@ Tracked by [#1609](https://github.com/curie-eng/curie/issues/1609). Per
 by [ADR-0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
 this Draft authorizes no implementation. No ACP client, harness package, or
 runner entry point is written until it is Accepted with explicit maintainer
-approval.
+approval. This ADR builds on ADR-0119's full, prefix-preserving structured
+message replay. Its implementation is blocked by that ADR's top-of-backlog
+implementation ticket [#1902](https://github.com/curie-eng/curie/issues/1902):
+durable ACP suspend/replay cannot be implemented until #1902 lands.
 
 ## Context
 
@@ -93,23 +96,29 @@ compiler. It also keeps ADR-0060's fail-closed guard rules meaningful, because
 one contribution claiming one key cannot silently shadow a built-in by fanning
 out into fifty.
 
-**4. The approval reverse-request is relayed inbound, never answered at the
-adapter.** An ACP agent driven as an engine will issue `session/request_permission`
-back at Curie. That request is routed into the gate Curie already owns — the
-runner's permission callback, the durable `Approval`, the worker suspend, and the
-API-side authorizer of ADR-0034 and ADR-0035 — and the adapter returns the answer
-only once that plane has produced it. The ACP client holds no local policy, no
-allowlist, and no default answer. ADR-0040's decision 4 is unchanged and is
-restated here in the inbound direction: **an ACP peer's opinion is input, never
-authority**, in whichever direction the request travels.
+**4. The approval reverse-request enters Curie's durable suspend/replay
+lifecycle, never an adapter-local policy.** An ACP agent driven as an engine
+will issue `session/request_permission` back at Curie. The adapter persists a
+durable `Approval` through the runner permission callback, worker suspend, and
+the API-side authorizer of ADR-0034 and ADR-0035; it then cancels and terminates
+the current ACP invocation without executing the requested operation, and
+releases the process and sandbox. It never holds an ACP JSON-RPC request open
+for human-shaped time. After approval, Curie starts a fresh turn with the
+ADR-0035 one-shot grant; the rehydrated ACP agent must reissue the operation,
+at which point that grant may authorize it. The ACP client holds no local
+policy, no allowlist, and no default answer. ADR-0040's decision 4 is unchanged
+and is restated here in the inbound direction: **an ACP peer's opinion is
+input, never authority**, in whichever direction the request travels.
 
-**5. Session persistence and version negotiation inherit ADR-0040 unchanged.**
-ADR-0040's decision 5 stands: no file-per-session JSONL, and the adapter is
-stateless with respect to durable state. Rehydration uses the existing
-harness-agnostic path — `CURIE_HISTORY_REF` replayed as a boot-time preamble
-(`runner/src/curie_runner/history.py::format_conversation_preamble`, ADR-0029) —
-and not an ACP-native resume identifier. ADR-0040's decision 6 stands: negotiate
-the protocol version at `initialize`, accept the compatible range, and fail loud
+**5. Session persistence uses ADR-0119 structured replay; ACP-native resume is
+optional.** ADR-0040's decision 5 stands: no file-per-session JSONL, and the
+adapter is stateless with respect to durable state. Fresh ACP processes rehydrate
+from ADR-0119's full, prefix-preserving structured message replay — not the
+current text preamble path — so the resumed turn has the durable context needed
+to reissue an approved operation. An ACP-native resume identifier may be used as
+an engine-specific optimization where available, but is not required and is not
+Curie's portable session contract. ADR-0040's decision 6 stands: negotiate the
+protocol version at `initialize`, accept the compatible range, and fail loud
 naming both versions on an incompatible peer. An inbound permission request is
 control-bearing in the ADR-0036 sense, so an unmodelable token is a loud error,
 never a silent degrade.
@@ -118,10 +127,13 @@ never a silent degrade.
 is conformant only when it passes ADR-0062's extended suite — the ACI checks
 (`packages/aci-protocol/src/aci_protocol/conformance.py::run_conformance`,
 exercised by `runner/tests/test_conformance.py`) plus the read-only tool set,
-credential resolution, bundle compile, and telemetry seams. Passing makes an ACP
-agent *wireable*, not *shippable*: per ADR-0062 decision 4, parity evals under
-ADR-0022 remain the bar before any ACP-driven harness is elevated past spike
-status.
+credential resolution, bundle compile, and telemetry seams. Its permission
+conformance case must prove, with a real ACP agent: permission request, process
+end, approval, fresh process, ADR-0119 rehydration, reissue of the same operation,
+and exactly-once execution. Rejection and grant expiry must prove zero execution.
+Passing makes an ACP agent *wireable*, not *shippable*: per ADR-0062 decision 4,
+parity evals under ADR-0022 remain the bar before any ACP-driven harness is
+elevated past spike status.
 
 **7. Explicit non-goals.** This ADR does not replace the ACP server path of
 ADR-0040 decision 2, which continues to serve editor embedding. It does not
@@ -157,7 +169,14 @@ not fork or vendor any third-party adapter.
    is an in-process Protocol or an out-of-process app; decision 2 is written to
    survive either outcome. Implementation still waits on a port to plug into, the
    same way ADR-0040's projector waits on a seam to project from.
-6. **Do nothing.** Rejected. Curie stays a one-harness platform whose second
+6. **Keep the ACP JSON-RPC request or process alive while a person decides.**
+   Rejected. Human approval time is unbounded compared with a turn, retains a
+   sandbox and process that must be releasable, and cannot survive their failure.
+   Decision 4 instead cancels safely and replays after durable approval.
+7. **Use the current text conversation preamble as replay.** Rejected. It
+   cannot reconstruct the structured prefix and exact turn context needed for a
+   portable post-approval reissue; ADR-0119 and #1902 establish that prerequisite.
+8. **Do nothing.** Rejected. Curie stays a one-harness platform whose second
    harness is permanently priced at an ACI server plus an installer plus a bundle
    compiler, while the engines it wants already export a normalized wire.
 
@@ -176,9 +195,14 @@ not fork or vendor any third-party adapter.
   gated by a plane it does not know exists.** ADR-0040 already recorded this cost
   outbound, where a client's UX assumes local authority and gets a round trip
   instead. Inbound it lands on the engine: an ACP agent expecting a fast local
-  permission answer will see Curie's durable approval latency, and sometimes a
-  denial. Decision 4 is not negotiable, so this cost is accepted rather than
-  designed away.
+  permission answer will be cancelled and later rehydrated to reissue the
+  operation after Curie's durable approval latency, or receive no grant on
+  rejection or expiry. Decision 4 is not negotiable, so this cost is accepted
+  rather than designed away.
+- The adapter remains durably stateless and does not reserve a sandbox during an
+  approval wait. Its writable permission path is consequently unavailable until
+  #1902 implements ADR-0119's structured replay; no ACP client implementation
+  begins from this Draft.
 - ACP normalizes the turn and permission wire. It does **not** normalize the
   installer, the credential shapes, or the bundle format. Anyone reading this ADR
   as "a second harness is now free" is reading it wrong; the claim is that the
