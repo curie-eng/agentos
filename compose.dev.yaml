@@ -528,11 +528,16 @@ services:
       - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
-      # Reads the same override as every other published image (#1915). This is
-      # the one that decides whether the AGENT runs your checkout: the worker
-      # spawns this image per turn, so a `latest` here meant `local up --build`
-      # rebuilt the platform and left the sandbox on the registry's runner.
-      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:${CURIE_BASE_TAG:-latest}
+      # The image the worker spawns per turn -- the one that decides whether the
+      # AGENT runs your checkout, which is why `local up --build` sets it (#1915).
+      #
+      # Its OWN variable, deliberately NOT CURIE_BASE_TAG. The runner is not a
+      # compose service: it is spawned by the worker, and it is built and tagged
+      # on a different axis from the published platform images. Reading the base
+      # tag here broke the e2e ladder, which sets CURIE_BASE_TAG=ci-local for the
+      # platform and builds its runner as a plain `curie-runner` -- so the worker
+      # went looking for a `curie-runner:ci-local` nothing had built.
+      - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
       - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379

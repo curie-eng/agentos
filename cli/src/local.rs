@@ -404,6 +404,15 @@ fn compose_model_env(o: &LocalOpts, model: Option<&str>) -> Vec<(String, String)
     // that were pinned to `latest` were changed to read it.
     if o.build {
         env.push(("CURIE_BASE_TAG".into(), SOURCE_IMAGE_TAG.into()));
+        // Named outright rather than derived from the tag above. The runner is
+        // spawned by the worker rather than being a compose service, and it is
+        // tagged on its own axis -- CI sets CURIE_BASE_TAG for the platform
+        // images while building a plain `curie-runner`, so borrowing the base tag
+        // sent the worker after an image nothing had built.
+        env.push((
+            "CURIE_RUNNER_IMAGE".into(),
+            format!("ghcr.io/curie-eng/curie-runner:{SOURCE_IMAGE_TAG}"),
+        ));
     }
     env
 }
@@ -2021,11 +2030,12 @@ mod tests {
         )
         .expect("compose file");
 
-        // Two forms carry the override, and missing the second is how this test
-        // first went wrong: an `image:` line that interpolates the variable, and
-        // the worker overlay, which takes it as a build ARG and puts it in its
-        // own `FROM`. Both are scanned, so a service added in either style has
-        // to appear in the build set.
+        // Three forms carry an override, and missing one is how this test went
+        // wrong twice: an `image:` line interpolating CURIE_BASE_TAG, the worker
+        // overlay taking it as a build ARG for its own `FROM`, and the runner,
+        // which is not a compose service at all -- the worker spawns it from
+        // CURIE_RUNNER_IMAGE, on its own axis. All three are scanned, so an
+        // image the stack can be pointed at cannot escape the build set.
         let overlay = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -2037,7 +2047,9 @@ mod tests {
         let mut overridable = std::collections::BTreeSet::new();
         for line in compose.lines().chain(overlay.lines()) {
             let line = line.trim();
-            let interpolates = line.contains("${CURIE_BASE_TAG") || line.contains("${BASE_TAG");
+            let interpolates = line.contains("${CURIE_BASE_TAG")
+                || line.contains("${BASE_TAG")
+                || line.contains("${CURIE_RUNNER_IMAGE");
             if !interpolates {
                 continue;
             }
@@ -2059,5 +2071,38 @@ mod tests {
             overridable, buildable,
             "compose can override these images but --build does not build them all"
         );
+    }
+
+    /// Regression, caught by CI rather than by reasoning: the runner is a
+    /// SEPARATE axis from the published platform images, and coupling it to
+    /// CURIE_BASE_TAG broke the e2e ladder.
+    ///
+    /// CI sets `CURIE_BASE_TAG=ci-local` for the platform images and builds its
+    /// runner as a plain `curie-runner`, so making CURIE_RUNNER_IMAGE read that
+    /// variable sent the worker looking for `curie-runner:ci-local`, which
+    /// nothing had built. `--build` names the runner image outright instead.
+    #[test]
+    fn build_names_the_runner_image_without_borrowing_the_base_tag() {
+        let mut o = opts(DEFAULT_COMPOSE_FILE);
+        o.build = true;
+
+        let display = up_command(&o).display();
+
+        assert!(
+            display.contains(&format!(
+                "CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:{SOURCE_IMAGE_TAG}"
+            )),
+            "got: {display}"
+        );
+    }
+
+    /// The other half: without `--build`, the runner variable is untouched, so a
+    /// caller that sets CURIE_BASE_TAG for the platform images (CI does) keeps
+    /// whatever runner it built.
+    #[test]
+    fn without_build_the_runner_image_is_left_alone() {
+        let display = up_command(&opts(DEFAULT_COMPOSE_FILE)).display();
+
+        assert!(!display.contains("CURIE_RUNNER_IMAGE"), "got: {display}");
     }
 }
