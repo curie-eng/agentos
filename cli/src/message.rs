@@ -984,6 +984,74 @@ fn compose_config_files(label: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// The tag in an image reference, or None when it carries none.
+///
+/// Not a naive rsplit on ':'. A digest pin (`repo@sha256:...`) and a registry
+/// host with a port (`localhost:5000/repo`) both contain a colon that is not a
+/// tag separator, and reading either as one would pin the one-shot producer to
+/// a tag that does not exist.
+fn image_tag(image: &str) -> Option<&str> {
+    let last_segment = image.rsplit('/').next().unwrap_or(image);
+    if last_segment.contains('@') {
+        return None;
+    }
+    last_segment.split_once(':').map(|(_, tag)| tag)
+}
+
+/// `docker ps` for the running API container, by compose service label.
+///
+/// The API, deliberately, not the worker. The worker is `build:` in
+/// `compose.dev.yaml` (an overlay over the published base), so its
+/// `.Config.Image` is the compose-built `curie-curie-worker` with no tag at all
+/// -- reading a tag there yields nothing useful, and reading `latest` off it
+/// would pin the producer to the very image the override exists to avoid. The
+/// API container's image IS `ghcr.io/curie-eng/curie-api:${CURIE_BASE_TAG}`, so
+/// it carries the answer directly.
+fn api_ps_command() -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("ps"),
+            plain("--filter"),
+            plain("label=com.docker.compose.service=curie-api"),
+            plain("--format"),
+            plain("{{.Names}}"),
+        ],
+    )
+}
+
+/// `docker inspect --format {{.Config.Image}} <container>`: the image reference
+/// the running container was created from.
+fn container_image_command(container: &str) -> OpsCommand {
+    OpsCommand::new(
+        "docker",
+        vec![
+            plain("inspect"),
+            plain("--format"),
+            plain("{{ .Config.Image }}"),
+            plain(container),
+        ],
+    )
+}
+
+/// The image tag the running stack was started with, or None when it cannot be
+/// read. Best-effort by design: an unreadable tag leaves compose's own default
+/// in force, which is the behaviour that existed before #1915.
+async fn running_stack_tag() -> Option<String> {
+    let (ok, stdout, _) = run_capture(&api_ps_command()).await.ok()?;
+    if !ok {
+        return None;
+    }
+    let container = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let (ok, image, _) = run_capture(&container_image_command(container))
+        .await
+        .ok()?;
+    if !ok {
+        return None;
+    }
+    image_tag(image.trim()).map(str::to_string)
+}
+
 fn worker_compose_config_command(container: &str) -> OpsCommand {
     OpsCommand::new(
         "docker",
@@ -1060,6 +1128,8 @@ fn parse_worker_otel_env(stdout: &str) -> Result<Vec<(String, String)>> {
 
 struct LocalDispatcherContext {
     compose_files: Vec<String>,
+    /// The image tag the RUNNING stack uses, when it is readable.
+    base_tag: Option<String>,
     otel_env: Vec<(String, String)>,
 }
 
@@ -1084,9 +1154,16 @@ async fn local_dispatcher_context() -> Result<LocalDispatcherContext> {
         );
     }
     let otel_env = parse_worker_otel_env(&telemetry_stdout)?;
+
+    // #1915: the stack's own image tag, so the one-shot producer below runs what
+    // the stack runs. Best-effort: an unreadable image is not worth failing an
+    // enqueue over, and compose's default then applies exactly as before.
+    let base_tag = running_stack_tag().await;
+
     Ok(LocalDispatcherContext {
         compose_files,
         otel_env,
+        base_tag,
     })
 }
 
@@ -1099,6 +1176,7 @@ fn dispatcher_enqueue_command(
     stream: &str,
     valkey_password: &str,
     otel_env: &[(String, String)],
+    base_tag: Option<&str>,
 ) -> OpsCommand {
     // The dispatcher service lives in the slack profile but depends on core
     // services (notably the API and Valkey). Compose resolves that dependency
@@ -1149,14 +1227,21 @@ fn dispatcher_enqueue_command(
             .filter(|(name, _)| OTEL_EXPORTER_ENV_KEYS.contains(&name.as_str()))
             .cloned(),
     );
+    let mut env = vec![
+        (
+            "COMPOSE_PROJECT_NAME".to_string(),
+            crate::local::COMPOSE_PROJECT.to_string(),
+        ),
+        ("CURIE_STREAM".to_string(), stream.to_string()),
+    ];
+    // Only when the running stack has one. Passing nothing leaves compose's
+    // `${CURIE_BASE_TAG:-latest}` default in force, so a published stack behaves
+    // exactly as it did.
+    if let Some(tag) = base_tag {
+        env.push(("CURIE_BASE_TAG".to_string(), tag.to_string()));
+    }
     OpsCommand::new("docker", args)
-        .with_env(vec![
-            (
-                "COMPOSE_PROJECT_NAME".to_string(),
-                crate::local::COMPOSE_PROJECT.to_string(),
-            ),
-            ("CURIE_STREAM".to_string(), stream.to_string()),
-        ])
+        .with_env(env)
         .with_secret_env(secret_env)
 }
 
@@ -1208,6 +1293,7 @@ async fn dispatcher_enqueue_local(opts: &MessageOpts, turn: &QueuedTurn) -> Resu
         &opts.stream,
         &opts.valkey_password,
         &context.otel_env,
+        context.base_tag.as_deref(),
     );
     crate::ui::ui().plumbing(&format!("+ {}", cmd.display()));
     let payload = queue::payload_json(turn)?;
@@ -3574,6 +3660,7 @@ mod tests {
             "test:curie:runs",
             secret,
             &otel_env,
+            None,
         );
         let argv = command.argv();
 
@@ -5055,5 +5142,64 @@ mod tests {
             fix.contains("--cases") && fix.contains("--model"),
             "the fix points at both the drop-flag and the in-CLI path: {fix}"
         );
+    }
+
+    /// #1915: the one-shot producer must run the SAME image tag the stack is
+    /// running, not whatever this shell resolves.
+    ///
+    /// Compose substitutes `${CURIE_BASE_TAG:-latest}` from the invocation's own
+    /// environment, so after `local up --build` the stack ran `:dev` while
+    /// `local message` pulled `:latest` and died on `No module named
+    /// curie_dispatcher.enqueue_once` -- the module the published image predates.
+    /// The tag is READ off the running worker rather than remembered, so it is
+    /// right even for a stack this process did not start.
+    #[test]
+    fn the_one_shot_producer_inherits_the_running_stack_tag() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            Some("dev"),
+        );
+
+        assert!(
+            cmd.env
+                .iter()
+                .any(|(k, v)| k == "CURIE_BASE_TAG" && v == "dev"),
+            "expected the running tag in the child env, got {:?}",
+            cmd.env
+        );
+    }
+
+    /// A stack on the published images passes nothing, so compose's own default
+    /// still applies and a non-contributor sees no behaviour change.
+    #[test]
+    fn a_published_stack_leaves_the_tag_to_compose() {
+        let cmd = dispatcher_enqueue_command(
+            &["compose.dev.yaml".to_string()],
+            "enqueue-1",
+            "curie:runs",
+            "pw",
+            &[],
+            None,
+        );
+
+        assert!(!cmd.env.iter().any(|(k, _)| k == "CURIE_BASE_TAG"));
+    }
+
+    #[test]
+    fn an_image_reference_yields_its_tag() {
+        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker:dev"), Some("dev"));
+        assert_eq!(
+            image_tag("ghcr.io/curie-eng/curie-worker:latest"),
+            Some("latest")
+        );
+        // A digest pin has no tag, and the colon inside it must not be read as
+        // one -- the registry host's port must not either.
+        assert_eq!(image_tag("ghcr.io/curie-eng/curie-worker@sha256:abc"), None);
+        assert_eq!(image_tag("localhost:5000/curie-worker"), None);
+        assert_eq!(image_tag("localhost:5000/curie-worker:dev"), Some("dev"));
     }
 }

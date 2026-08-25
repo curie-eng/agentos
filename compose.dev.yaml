@@ -435,7 +435,11 @@ services:
   # The image is fixture-by-default, so the CLI advertises the wired
   # `http://localhost:28080/?api=1` URL and `local up` opens it connected to the API.
   curie-ui:
-    image: ghcr.io/curie-eng/curie-ui:latest
+    # Same override as api/migrate/worker. Pinned to `latest` before #1915, which
+    # meant `CURIE_BASE_TAG=dev` moved three services and silently left this one
+    # on whatever the registry last published -- so a stack "built from source"
+    # was partly not.
+    image: ghcr.io/curie-eng/curie-ui:${CURIE_BASE_TAG:-latest}
     profiles: *full_profiles
     depends_on:
       curie-api:
@@ -524,7 +528,11 @@ services:
       - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
-      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:latest
+      # Reads the same override as every other published image (#1915). This is
+      # the one that decides whether the AGENT runs your checkout: the worker
+      # spawns this image per turn, so a `latest` here meant `local up --build`
+      # rebuilt the platform and left the sandbox on the registry's runner.
+      - CURIE_RUNNER_IMAGE=ghcr.io/curie-eng/curie-runner:${CURIE_BASE_TAG:-latest}
       - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
@@ -648,7 +656,11 @@ services:
   # Use one dispatcher per app. This is why the service is behind the `slack`
   # profile and disabled by default.
   curie-dispatcher:
-    image: ghcr.io/curie-eng/curie-dispatcher:latest
+    # Same override as every other published image (#1915). This one bit
+    # hardest: the CLI invoked `curie_dispatcher.enqueue_once`, the published
+    # image predated that module, and the failure surfaced as a bare
+    # `No module named` from inside a container.
+    image: ghcr.io/curie-eng/curie-dispatcher:${CURIE_BASE_TAG:-latest}
     profiles: [slack]
     depends_on:
       valkey:
