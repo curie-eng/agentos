@@ -1,12 +1,33 @@
 # Write path permission map
 
-Every write this bot can perform, what each one actually grants, and where its
-ceiling really is. Written because "give it write access" is not a decision —
-it is the absence of one, and the interesting question is always *which* write,
-bounded by *what*.
+Every write this bot can perform, what each one actually grants, and which layer
+decides it. Written because "give it write access" is not a decision — it is the
+absence of one, and the interesting question is always *which* write, permitted
+by *whom*, bounded by *what*.
 
-Two entries. The first ships and is off by default. The second is proposed and
-is a different kind of problem, which is most of why this file exists.
+## Two axes, kept apart on purpose
+
+Most confusion about agent write access comes from collapsing these into one
+word, "ceiling":
+
+- **Capability surface** — what a connector *can express* against an external
+  system. A parameter list, a constant request body, a scoped credential,
+  `resourceNames`. This bounds what is reachable at all.
+- **Authorization decision** — whether this agent *may call* a published tool,
+  and under what conditions. Denied, approval-required, or allowed. This is the
+  builder's decision, held in agent config, over the connector's published tool
+  surface.
+
+They are not substitutes. A narrow capability surface with no authorization
+decision is an ungated write — that is exactly the incident behind
+`scripts/check-write-path-gated.py`. An authorization decision over a
+capability surface wide enough to do something else is a gate on the wrong
+thing. Both entries below are read on both axes.
+
+A connector publishes capabilities against an external system. A skill owns
+deterministic workflow logic and sequencing. Neither may widen the builder's
+authorization: a skill that could grant itself a tool would make the config
+advisory.
 
 ---
 
@@ -17,7 +38,7 @@ is a different kind of problem, which is most of why this file exists.
 | Tool | `mcp__k8s-write__restart_deployment(namespace, name)` |
 | Kubernetes verbs | `get`, `patch` on `apps/deployments` |
 | Scoped by | `resourceNames`, one namespace |
-| Gate | `approvalPolicy`, human approves each call |
+| Authorization | `approvalPolicy` gate — a human approves each call |
 | Status | Implemented, ships commented out |
 
 ### What that grant actually permits
@@ -34,107 +55,187 @@ kubectl patch     deploy/<name> -p '{"spec":{"template":{"spec":{"containers":[{
 
 **A grant that permits a restart permits replacing what runs.** Kubernetes RBAC
 cannot express "patch only this one field", so nothing at the RBAC layer
-separates them.
+separates them. This is the fact that makes the credential's breadth invisible
+if you read only the verb list.
 
-### Where the ceiling really is
+### Capability surface
 
-Ranked by strength, because the weakest one is the easiest to mistake for the
-whole answer:
+The tool takes `namespace` and `name` and nothing else; the patch body is a
+constant in the source. There is no parameter through which a caller reaches an
+image, a command, or an env var. `resourceNames` bounds which workloads, and the
+connector's own allowlist states that bound a second time so an edit to one is
+visible against the other (`scripts/check-write-path-gated.py` compares them).
 
-1. **The connector.** The tool takes `namespace` and `name` and nothing else, and
-   the patch body is a constant in the source. There is no parameter through
-   which a caller reaches an image, a command, or an env var. The agent is
-   prompt-injectable; this process is not.
-2. **`resourceNames`.** Bounds which workloads, so even a compromised connector
-   reaches only what an operator named. The only narrowing RBAC offers here.
-3. **The allowlist.** The same bound stated again in the connector's own config,
-   because a ceiling written in one place moves when someone edits the other.
-   These two must agree; `scripts/check-write-path-gated.py` enforces that.
-4. **The approval gate.** Stops a call before it executes — but it is a control
-   on the *agent*, not on the *credential*. If the credential leaks the gate is
-   irrelevant, so the Role is scoped as though the gate did not exist.
+This is defense in depth and it is worth having: the agent is prompt-injectable
+and this process is not, so a narrow surface limits what a compromised *agent*
+can reach. What it is **not** is the authorization decision. A connector that
+publishes exactly one narrow write tool still writes when called, and nothing in
+the connector decides whether this agent may call it.
+
+### Authorization decision
+
+The `approvalPolicy` gate, which is the builder's, not the connector's: a human
+approves each call before it executes. Verified end to end on a real install —
+approval produced the restart (`restartedAt` and `metadata.generation` both
+advanced), rejection left both unchanged, and a target outside the allowlist was
+refused by the connector *and* independently by RBAC.
+
+Two limits to state rather than imply:
+
+- The gate is a control on the **agent**, not on the **credential**. If the
+  credential leaks, the gate is irrelevant. The Role is therefore scoped as
+  though the gate did not exist.
+- Curie's posture today is approval-required plus **allow-by-omission**. A tool
+  no gate names is callable. So "which tools are gated" is the whole policy, and
+  a forgotten gate is a silent grant rather than a refusal. See the prerequisite
+  in entry 2.
 
 ### Deliberately not granted
 
 - `pods delete` — a restart with worse failure modes: no surge, no rollback, no
   record on the Deployment. `rollout restart` covers the same intent safely.
-- `deployments scale` — a separate blast radius; scale-to-zero is an outage.
-  Add it with its own gate when someone asks, not pre-emptively.
 - Anything cluster-scoped, anything in `kube-system`, any `create` or `delete`.
 
 ---
 
-## 2. `upgrade_release` — moving Curie from one version to the next
+## 2. Upgrading Curie — a workflow, not a tool
 
-**PROPOSED. Not implemented. The design question below is the reason this file
-exists rather than a Role.**
+**PROPOSED. Not implemented.** Superseded as a weekly requirement — issue #1857
+asks for "rollback or recovery behavior", not a named-version upgrade — so this
+entry is the design record for when it is wanted, not a plan for this week.
 
-### Why this one does not fit the pattern above
+### Why the entry-1 shape does not extend here
 
-The first entry is narrow because the *credential* is narrow. That is not
-available here. Upgrading a Curie release touches, in one operation:
+Entry 1 is narrow because the *credential* is narrow. That is not available
+here. One Helm operation updates essentially every namespaced object the release
+owns — Deployments, StatefulSets, Services, ServiceAccounts, Roles,
+RoleBindings, Jobs, ConfigMaps, the release Secret — plus schema migrations and
+Helm's own release state. The exact inventory moves with which components are
+enabled, so it is worth re-deriving rather than quoting:
 
 ```
-Deployments 6   StatefulSets 4   Services 7   PVCs 4
-ServiceAccounts/Roles/RoleBindings 3 each      Jobs 3
-ConfigMaps 2    Secrets 1
-+ 4 cluster-scoped CRDs (agents.x-k8s.io)
-+ database schema migrations
-+ Helm release state
+helm template curie charts/curie | grep -c '^kind:'
 ```
 
-There is no RBAC expression for "may upgrade Curie". The nearest honest
-expression is **namespace-admin plus CRD write**, which is an unbounded
-credential in every sense the acceptance criteria are trying to exclude.
+Two corrections to what an earlier draft of this file asserted, both of which
+change the argument rather than decorate it:
 
-So the ceiling cannot come from RBAC. It has to come from somewhere else, and
-that choice should be explicit rather than discovered later.
+- **The `agents.x-k8s.io` CRDs are not in this chart.** They are installed
+  outside it, so a release upgrade does not carry them. A version pair that needs
+  a newer CRD needs a separate, cluster-scoped step — which is a separate
+  authorization question, and a stronger one, not a line item inside this tool's
+  breadth.
+- **Storage is the part an upgrade cannot change.** The four PVCs come from
+  StatefulSet `volumeClaimTemplates`, which Kubernetes treats as immutable on
+  update. That is reassuring for the data and is exactly why recovery is not
+  symmetric with upgrade: see the migration finding under "measured".
 
-### The proposal
+There is still no RBAC expression for "may upgrade Curie". The nearest honest
+expression is **namespace-admin over the release's namespace**, which is an
+unbounded credential in every sense the acceptance criteria exclude.
 
-Move the boundary entirely into the connector, and say so plainly rather than
-implying RBAC is doing work it cannot do.
+The tempting move is to absorb that breadth into a bespoke connector: one tool,
+`upgrade_release(target_version)`, validating the version against a list it
+holds itself. **That is the wrong abstraction** and this document previously
+proposed it. It makes the connector the policy holder — the version allowlist,
+the sequencing, and the decision to proceed all live in a process the builder
+does not edit and cannot inspect per-agent. Every future agent wanting a
+different upgrade policy needs a different connector image.
 
-| | |
-|---|---|
-| Tool | `upgrade_release(target_version)` — one parameter |
-| Parameter | Validated against an allowlist of versions, not free-form |
-| Credential | Broad within one namespace. **This is the honest part.** |
-| Gate | `approvalPolicy`, and the card must show from-version and to-version |
-| Ceiling | The connector, which constructs the operation and accepts no other input |
+### The shape that keeps the boundaries where they belong
 
-The credential being broad is not a compromise to hide; it is a fact about what
-an upgrade is. What bounds the bot is that the only thing it can *say* is "go to
-this version", chosen from a list, with a human approving the specific pair.
+**Connectors publish external capabilities.** A Helm connector publishes what
+Helm does — `helm_upgrade(release, chart, version, values_ref)`,
+`helm_history(release)`, `helm_rollback(release, revision)`,
+`helm_status(release)` — and a Kubernetes read connector publishes the reads used
+for verification. These are ordinary tools against an external system, carrying
+no opinion about which versions are acceptable or in what order to call them.
 
-### Open questions, which need answering before anything is built
+**The skill owns the workflow.** Preflight, change record, execution order,
+health verification, and recovery instructions are deterministic sequencing, so
+they belong in the skill where they are readable, reviewable, and versioned with
+the bundle:
 
-1. **How does the connector perform the upgrade?** It talks to the Kubernetes
-   API today. An upgrade is a Helm operation. Either the connector ships the
-   `curie`/`helm` binary and shells out with a constructed argv, or it applies
-   rendered manifests directly. The first is closer to how upgrades are actually
-   done and easier to verify; the second avoids a binary in the image but
-   reimplements release bookkeeping, which is a bad trade.
+1. Preflight — record chart and app version, Helm revision, image digests, pod
+   inventory, schema revision; confirm the target's images are pullable;
+   back up before anything that migrates.
+2. Change record — the Helm revision history *is* the record, with the caveat in
+   "measured" below.
+3. Execute — the connector's `helm_upgrade`, one call.
+4. Verify — pods ready is necessary and not sufficient; verify a real turn
+   completes, because that is what the upgrade was for.
+5. Recover — named-revision rollback, or restore-from-backup where a migration
+   is not reversible.
 
-2. **What does rollback mean, and can the bot do it?** The acceptance criteria
-   ask for "rollback or recovery posture demonstrated". `helm rollback` is
-   another broad operation, and a schema migration may not be reversible — 0.7.0
-   moved `agents.slack_channel` into its own table. Rollback may be *restore
-   from backup*, not a Helm verb, and if so the bot's role in it should be
-   stated as "cannot" rather than left ambiguous.
+**Agent config makes the authorization decision.** Per published tool:
 
-3. **What happens when the bot upgrades the platform it runs on?** The three
-   Deployments in entry 1 are Curie's own. An upgrade replaces the worker
-   mid-turn, including the turn performing the upgrade. The approval resumes
-   through the worker being restarted. Whether that survives is a question to
-   answer by testing, not by reasoning — and if it does not, the upgrade may
-   need to be initiated from outside the bot even though the bot requests it.
+| Tool | Classification | Why |
+|---|---|---|
+| `helm_upgrade` | approval-required | the operation with the breadth |
+| `helm_rollback` | approval-required | equally broad; also a recovery path, so denying it strands the bot mid-incident |
+| `helm_history`, `helm_status`, reads | allowed | needed for preflight and verification, no mutation |
+| `helm_uninstall`, `helm_install` | denied | not in this workflow's scope at any approval level |
 
-4. **Which versions belong on the allowlist, and who edits it?** "Latest" is not
+The version allowlist is builder config too, not connector state — it is an
+authorization question ("may this agent move to that version"), not a capability
+question ("can Helm express it").
+
+**Defense in depth, still worth having, still not the policy.** A scoped
+credential, `resourceNames` where they apply, connector-side validation, and
+narrow parameter surfaces all reduce what a compromised agent or connector
+reaches. None of them decides whether this agent may upgrade, and none should be
+read as if it had.
+
+### Prerequisite, stated rather than worked around
+
+Curie today has approval-required gates and **allow-by-omission**: a published
+tool no gate names is callable, and nothing reports the omission. There is no
+builder-owned deny / approval-required / allow contract with unclassified
+denied by default.
+
+For entry 1 that gap is survivable, because a repository lint can compare a
+small set of source-carried connectors against the declared gates. For this
+workflow it is not: the tool surface is a general-purpose Helm connector, where
+"every tool not explicitly classified is callable" means one added tool in a
+future connector version silently widens the agent. **The tri-state contract is
+a prerequisite for shipping this workflow**, and the right order is to build it
+in the platform rather than to route around it with a policy-bearing connector.
+
+### Measured, so these are no longer open questions
+
+Run on a local install, curie `0.7.0` → `0.7.1` → `0.7.0` → `0.7.1`:
+
+- **Does a turn survive the upgrade restarting the worker running it?** Yes,
+  when approval comes first. Approval-suspended sessions are resumed by the
+  **API**, not the worker (`approvalSweepIntervalSeconds`, 30s default), and the
+  API is a separate process from the worker being replaced. Demonstrated in
+  miniature: the bot restarted `curie-api` — the component hosting that sweeper —
+  through the gated write path, and its own turn still completed. An in-flight
+  turn *not* suspended on an approval is a different story: a queue entry held by
+  a dead worker's consumer sat idle 808s and 428s before a new consumer picked it
+  up with delivery-count 2. So the ordering is load-bearing — approve, then
+  execute, then resume — and the skill's sequencing must not invert it.
+- **What does rollback mean?** For this version pair, a Helm operation: schema
+  revision was `0027` before and after, so nothing migrated. In general it is
+  not, and the reason is structural — migrations run as an api initContainer
+  (`alembic upgrade head`) and `helm rollback` does not run `alembic downgrade`.
+  Where a version pair migrates, recovery is restore-from-backup and the bot's
+  role in it should be written as "cannot".
+- **Is the Helm history a usable change record?** Not on its own. Every
+  `cluster up` against a cluster with no `runsc` records a *failed* revision
+  before its successful one, so history alternates and a bare `helm rollback`
+  targets a failed revision (curie#1899). Rollback must name a revision, and the
+  runbook step above says so.
+- Timings, for scale rather than as a guarantee: upgrade 34s, rollback 35s, both
+  preserving the recorded model credential.
+
+### Still open
+
+1. **Which versions belong on the allowlist, and who edits it?** "Latest" is not
    an allowlist. A pinned list is safe and goes stale; a range is convenient and
-   is how you upgrade into something untested.
-
-### Status
-
-Not built. Questions 1 and 3 in particular decide whether the shape above is
-right at all, and question 3 is answerable in an afternoon on a staging install.
+   is how you upgrade into something untested. This is builder config, so the
+   answer is a policy owner, not a mechanism.
+2. **Where does the Helm connector's credential live, and is one shared across
+   clusters?** Connector secrets currently have no cluster scope, so a deploy can
+   inject another cluster's credential (curie#1913). A broad upgrade credential
+   makes that considerably less academic than it was for entry 1.
