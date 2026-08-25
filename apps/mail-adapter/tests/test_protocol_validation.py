@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import socket
+import threading
+import urllib.parse
+from collections.abc import Callable
 
 import pytest
-from _support import INBOX, MailState, completed, post_bytes, post_event, update
+from _support import INBOX, MailState, completed, get, post_bytes, post_event, update, wait_until
 from curie_mail_adapter.adapter import MailAdapter
+from curie_mail_adapter.egress import MAX_CONCURRENT_REQUESTS
 
 
 def _seed(mail: MailState, adapter: MailAdapter) -> None:
@@ -79,6 +84,58 @@ def test_oversize_authenticated_body_is_rejected_before_json_allocation(
 
     assert status in {400, 413}
     assert mail.replies == []
+
+
+def test_oversize_rejection_survives_a_raised_configured_limit(
+    mail: MailState,
+    make_adapter: Callable[..., MailAdapter],
+    serve_egress: Callable[[MailAdapter], str],
+) -> None:
+    instance = make_adapter(max_reply_bytes=16 * 1024 * 1024)
+    try:
+        _seed(mail, instance)
+        url = serve_egress(instance) + "/"
+
+        status, _ = post_bytes(url, b"x" * (17 * 1024 * 1024))
+
+        assert status == 413
+        assert mail.replies == []
+    finally:
+        instance.shutdown.set()
+
+
+def test_incomplete_headers_release_the_bounded_request_slots(
+    egress_url: str,
+) -> None:
+    parsed = urllib.parse.urlsplit(egress_url)
+    sockets: list[socket.socket] = []
+    stop = threading.Event()
+    tricklers: list[threading.Thread] = []
+
+    def trickle(connection: socket.socket) -> None:
+        while not stop.wait(0.25):
+            try:
+                connection.sendall(b"x")
+            except OSError:
+                return
+
+    try:
+        for _ in range(MAX_CONCURRENT_REQUESTS):
+            connection = socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port))
+            connection.sendall(b"POST / HTTP/1.1\r\nHost: adapter\r\n")
+            sockets.append(connection)
+            thread = threading.Thread(target=trickle, args=(connection,), daemon=True)
+            thread.start()
+            tricklers.append(thread)
+
+        assert wait_until(lambda: get(egress_url)[0] == 503)
+        assert wait_until(lambda: get(egress_url + "healthz")[0] == 200, timeout=4.0)
+    finally:
+        stop.set()
+        for connection in sockets:
+            connection.close()
+        for thread in tricklers:
+            thread.join(timeout=1)
 
 
 def test_chunked_authenticated_body_is_rejected(

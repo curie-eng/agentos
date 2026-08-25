@@ -5,7 +5,9 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import socket
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
@@ -21,6 +23,8 @@ ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 HEALTH_PATH = "/healthz"
 READY_PATH = "/readyz"
 MAX_CONCURRENT_REQUESTS = 16
+REJECT_DRAIN_SECONDS = 1.0
+REQUEST_HEADER_SECONDS = 2.0
 _REPLY_EVENT_ADAPTER: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
 
 
@@ -72,6 +76,33 @@ class EgressHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.0"
 
+    def handle(self) -> None:
+        """Close an incomplete request-line/header block at an absolute deadline."""
+        self._headers_complete = threading.Event()
+        self._header_timer = threading.Timer(REQUEST_HEADER_SECONDS, self._expire_headers)
+        self._header_timer.daemon = True
+        self._header_timer.start()
+        try:
+            super().handle()
+        finally:
+            self._headers_complete.set()
+            self._header_timer.cancel()
+
+    def parse_request(self) -> bool:
+        try:
+            return super().parse_request()
+        finally:
+            self._headers_complete.set()
+            self._header_timer.cancel()
+
+    def _expire_headers(self) -> None:
+        if self._headers_complete.is_set():
+            return
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
     def log_message(self, format: str, *args: Any) -> None:
         """Silence the stdlib access log; this package logs through ``logging``."""
 
@@ -89,6 +120,23 @@ class EgressHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except OSError:
             logger.warning("writing the response failed")
+
+    def _drain_rejected_body(self, length: int) -> None:
+        """Bound unread bytes so closing the socket does not erase a sent 413."""
+        remaining = length
+        deadline = time.monotonic() + REJECT_DRAIN_SECONDS
+        try:
+            while remaining > 0:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    return
+                self.connection.settimeout(timeout)
+                chunk = self.rfile.read1(min(remaining, 65_536))
+                if not chunk:
+                    return
+                remaining -= len(chunk)
+        except OSError:
+            return
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
@@ -120,7 +168,9 @@ class EgressHandler(BaseHTTPRequestHandler):
         if length <= 0:
             return self._respond(400, {"detail": "request body is required"})
         if length > self.adapter.config.max_reply_bytes + 65_536:
-            return self._respond(413, {"detail": "request body is too large"})
+            self._respond(413, {"detail": "request body is too large"})
+            self._drain_rejected_body(length)
+            return
         content_type = (
             (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
         )
