@@ -132,6 +132,67 @@ def test_envelope_acked_placeholder_posted_and_enqueued(
     assert queued.reply_handle.placeholder == BOT_TS
 
 
+def test_a_leading_self_mention_is_stripped_from_the_enqueued_text(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    # Slack delivers the raw `<@BOT_USER_ID>` token still embedded in `text`
+    # (never pre-stripped), so the dispatcher must remove its OWN mention --
+    # `_authorize`'s bot_user_id is "U0BOT" (conftest.py) -- before the text
+    # becomes the turn a bundle sees.
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(
+        sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT> hi there"))
+    )
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == "hi there"
+
+
+def test_a_mention_only_message_strips_to_empty_text(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """A message that is JUST the mention -- the composer's forced trailing
+    space and nothing else -- must reach the worker as an EMPTY string, not as
+    the mention markup itself. Left unstripped this is invisible to a
+    model-backed agent (prompt noise) but wrong for anything that branches on
+    emptiness (a stack's push-vs-pop, #1525)."""
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT> ")))
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == ""
+
+
+def test_a_mention_with_a_display_label_is_also_stripped(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    # Some Slack surfaces render/echo a mention as `<@ID|label>` rather than
+    # the bare `<@ID>` the composer normally sends; both forms name the same
+    # bot and both must strip.
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    handler.handle(
+        sock, _events_api_request("env-1", "Ev-100", _mention_event("<@U0BOT|Squawk> hi"))
+    )
+    _drain(app)
+
+    _, fields = redis_client.xrange(config.stream)[0]
+    queued = from_stream_fields(fields)
+    assert queued.text == "hi"
+
+
 def test_the_dispatcher_makes_no_assistant_status_call(
     redis_client: redis.Redis, config: DispatcherConfig
 ) -> None:
@@ -316,6 +377,68 @@ def test_both_mint_sites_stamp_kind_slack_and_no_adapter(
     for event_id, turn in by_event.items():
         assert turn.reply_handle.kind == "slack", event_id
         assert turn.reply_handle.adapter is None, event_id
+
+
+CHANNEL_A = "C0EXAMPLE1"
+CHANNEL_B = "C0EXAMPLE2"
+
+
+def test_the_mint_keeps_the_thread_ts_bare_on_every_channel(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """BASELINE-GREEN. The conversation id on the wire is Slack's own thread_ts.
+
+    A Slack ``thread_ts`` is unique only within a channel, so with one agent
+    bound to two channels the same id can arrive for two unrelated
+    conversations. The tempting fix is to make it unique HERE, by folding the
+    channel into the minted ``conversation_id``. That fix is wrong and this test
+    is what refuses it: the worker sends ``ReplyTarget.conversation_id`` straight
+    back to Slack as ``thread_ts`` (``slack_sink.py``), so a channel-scoped id
+    addresses a thread that does not exist and every reply is lost. The
+    disambiguation belongs in the worker's own keys, where it never reaches a
+    Slack API call.
+
+    Both channels are driven with the SAME ``ts`` -- the collision itself -- so
+    the pin is that the mint is channel-independent, not merely that one
+    conversation id happens to round-trip.
+    """
+
+    app, web_client = _build(config, redis_client)
+    handler = SocketModeHandler(app, app_token="xapp-test")
+    sock = FakeSocketClient()
+
+    thread_ts = "1700.0001"
+    for index, channel in enumerate((CHANNEL_A, CHANNEL_B)):
+        event = {
+            "type": "app_mention",
+            "channel": channel,
+            "user": "U123",
+            "text": "hi there",
+            "ts": thread_ts,
+        }
+        handler.handle(sock, _events_api_request(f"env-bare-{index}", f"Ev-bare-{index}", event))
+    _drain(app)
+
+    entries = redis_client.xrange(config.stream)
+    assert len(entries) == 2, entries
+    minted = [from_stream_fields(fields) for _, fields in entries]
+    by_channel = {turn.reply_handle.channel: turn for turn in minted}
+    assert set(by_channel) == {CHANNEL_A, CHANNEL_B}, by_channel.keys()
+
+    for channel, turn in by_channel.items():
+        # Bare and identical across the two channels: the id is Slack's, verbatim.
+        assert turn.conversation_id == thread_ts, channel
+        assert channel not in turn.conversation_id, channel
+        # The reply handle is likewise bare -- the placeholder is the raw ts of
+        # the message the worker will edit, nothing composed around it.
+        assert turn.reply_handle.placeholder == BOT_TS, channel
+
+    # And the placeholder itself was posted into the bare thread on each channel.
+    posted = [
+        (call.kwargs["channel"], call.kwargs["thread_ts"])
+        for call in web_client.chat_postMessage.call_args_list
+    ]
+    assert posted == [(CHANNEL_A, thread_ts), (CHANNEL_B, thread_ts)]
 
 
 def test_button_click_prefers_value_over_action_id(
