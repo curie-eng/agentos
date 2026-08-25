@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Status: Draft
+Status: Accepted
 
 Extends [ADR-0059](0059-sandbox-is-a-bounded-resource-envelope.md) into the
 dimension it deliberately left out of scope -- **throughput and the wall-clock
