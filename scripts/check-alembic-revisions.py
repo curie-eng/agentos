@@ -1,4 +1,5 @@
 import argparse
+import ast
 import re
 import sys
 from collections import defaultdict
@@ -10,6 +11,35 @@ FILENAME_PATTERN = re.compile(r"^(\d+[a-z]?)_.+\.py$")
 DEFAULT_SCRIPT_LOCATION = (
     Path(__file__).resolve().parents[1] / "apps" / "api" / "alembic"
 )
+
+
+def _revision_id(path: Path) -> str | None:
+    """Return a migration's module-level ``revision`` value.
+
+    Reads the value statically so a duplicate is reported without importing
+    (and therefore executing) the migration module. Returns None when the value
+    is absent or not a literal string; the graph load below reports those.
+    """
+    try:
+        module = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return None
+    for node in module.body:
+        if isinstance(node, ast.AnnAssign):
+            targets: list[ast.expr] = [node.target]
+        elif isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        else:
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "revision"
+            for target in targets
+        ):
+            continue
+        value = node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+    return None
 
 
 def main() -> int:
@@ -98,6 +128,36 @@ def main() -> int:
             )
         print(
             "Rename migrations so every leading revision token is unique.",
+            file=sys.stderr,
+        )
+        return 1
+
+    filenames_by_revision: dict[str, list[str]] = defaultdict(list)
+    for filenames in filenames_by_token.values():
+        for filename in filenames:
+            revision_id = _revision_id(versions / filename)
+            if revision_id is not None:
+                filenames_by_revision[revision_id].append(filename)
+
+    duplicate_revisions = {
+        revision_id: sorted(filenames)
+        for revision_id, filenames in filenames_by_revision.items()
+        if len(filenames) > 1
+    }
+    if duplicate_revisions:
+        print(
+            "Alembic revision gate failed: duplicate revision ids found:",
+            file=sys.stderr,
+        )
+        for revision_id in sorted(duplicate_revisions):
+            print(
+                f"  {revision_id}: "
+                f"{', '.join(duplicate_revisions[revision_id])}",
+                file=sys.stderr,
+            )
+        print(
+            "Give every migration a unique revision id, then repoint the "
+            "down_revision of whatever followed it.",
             file=sys.stderr,
         )
         return 1

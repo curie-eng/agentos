@@ -143,6 +143,33 @@ def test_multi_letter_suffixed_revision_filename_is_rejected(tmp_path: Path) -> 
     assert "0001ab_bad.py" in result.stderr
 
 
+def test_duplicate_revision_ids_fail_and_name_the_colliding_files(
+    tmp_path: Path,
+) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    _write_revision(tmp_path, "0002_first.py", "collision", "base")
+    _write_revision(tmp_path, "0003_second.py", "collision", "base")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stderr
+    assert "duplicate revision id" in result.stderr.lower()
+    assert "collision" in result.stderr
+    assert "0002_first.py" in result.stderr
+    assert "0003_second.py" in result.stderr
+
+
+def test_duplicate_revision_ids_fail_before_graph_validation(tmp_path: Path) -> None:
+    _write_revision(tmp_path, "0001_base.py", "base", None)
+    _write_revision(tmp_path, "0002_first.py", "collision", "base")
+    _write_revision(tmp_path, "0003_second.py", "collision", "base")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stderr
+    assert "expected exactly one alembic head" not in result.stderr.lower()
+
+
 def test_unique_numbered_sibling_revisions_fail_with_both_heads(tmp_path: Path) -> None:
     _write_revision(tmp_path, "0001_base.py", "base", None)
     _write_revision(tmp_path, "0002_left.py", "left_branch", "base")
