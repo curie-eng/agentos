@@ -2123,6 +2123,62 @@ mod release_secret_name_tests {
 
 #[cfg(test)]
 mod api_key_discovery_tests {
+
+    // --- #1030: the worker Deployment lookup ---------------------------------
+
+    #[test]
+    fn the_worker_selector_does_not_guess_the_deployment_name() {
+        // The chart names it `{{ curie.fullname }}-worker`, which equals
+        // `<release>-worker` only when the release name contains the chart name.
+        // `acme-prod` renders `acme-prod-curie-worker`, and nameOverride moves it
+        // again. Selecting on labels is what `release_secret_name` already does.
+        let selector = worker_deployment_selector("acme-prod");
+        assert!(selector.contains("app.kubernetes.io/instance=acme-prod"));
+        assert!(selector.contains("app.kubernetes.io/component=worker"));
+        assert!(
+            !selector.contains("acme-prod-worker"),
+            "the selector must not encode a guessed name: {selector}"
+        );
+    }
+
+    #[test]
+    fn a_failed_lookup_is_unknown_and_never_reads_as_real_slack() {
+        // The distinction that keeps #1030 from returning in another shape. A
+        // kubectl failure is not evidence that the worker talks to real Slack, and
+        // treating it as such posts a real token wherever real Slack is while the
+        // worker edits through a proxy the CLI never saw.
+        assert_eq!(parse_slack_api_base(false, ""), SlackApiBase::Unknown);
+        assert_eq!(
+            parse_slack_api_base(false, "https://proxy.example/api"),
+            SlackApiBase::Unknown
+        );
+    }
+
+    #[test]
+    fn an_empty_successful_lookup_means_real_slack() {
+        // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
+        // non-empty, so a clean empty result is the ordinary case, not a failure.
+        assert_eq!(parse_slack_api_base(true, ""), SlackApiBase::RealSlack);
+        assert_eq!(parse_slack_api_base(true, "  \n "), SlackApiBase::RealSlack);
+    }
+
+    #[test]
+    fn a_configured_base_is_returned_trimmed() {
+        assert_eq!(
+            parse_slack_api_base(true, "  https://proxy.example/api \n"),
+            SlackApiBase::Configured("https://proxy.example/api".to_string())
+        );
+    }
+
+    #[test]
+    fn two_containers_reporting_a_base_is_unknown_not_a_coin_flip() {
+        // Cannot happen in this chart today. If it ever does, picking one half is
+        // exactly the ambiguity this issue is about, so say so instead.
+        assert_eq!(
+            parse_slack_api_base(true, "https://a/api\nhttps://b/api\n"),
+            SlackApiBase::Unknown
+        );
+    }
     use super::*;
 
     struct EnvRestore {
@@ -6090,6 +6146,87 @@ pub async fn discover_slack_bot_token(namespace: &str, release: &str) -> Result<
                  --slack`), or set CURIE_SLACK_BOT_TOKEN"
             ))
         })
+}
+
+/// What a Slack API base lookup found for a release.
+///
+/// The three outcomes are deliberately distinct because they demand different
+/// behavior, and collapsing them is how #1030 could come back wearing a different
+/// hat. "Configured nothing" is the ordinary case and means real Slack. "Could not
+/// look" is not evidence of anything and must not be read as the ordinary case,
+/// because the CLI would then post a real token wherever real Slack is while the
+/// worker edits through a proxy the CLI never saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackApiBase {
+    /// The worker renders `SLACK_API_BASE_URL` with this value.
+    Configured(String),
+    /// The worker renders no `SLACK_API_BASE_URL`, so it talks to real Slack.
+    RealSlack,
+    /// The lookup itself could not run or could not find the worker.
+    Unknown,
+}
+
+/// The label selector that finds a release's worker Deployment whatever it is named.
+///
+/// The name is `{{ include "curie.fullname" . }}-worker`, which equals
+/// `<release>-worker` only when the release name happens to contain the chart
+/// name. A release named `acme-prod` renders `acme-prod-curie-worker`, and
+/// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
+/// defect `release_secret_name` already avoids by selecting on labels, and this
+/// selects the same way for the same reason.
+fn worker_deployment_selector(release: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+}
+
+/// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
+///
+/// Pure, so every branch is unit-testable without a cluster. `ok=false` is the
+/// case that must not read as "nothing configured": see [`SlackApiBase`].
+fn parse_slack_api_base(ok: bool, out: &str) -> SlackApiBase {
+    if !ok {
+        return SlackApiBase::Unknown;
+    }
+    let value = out.trim();
+    if value.is_empty() {
+        return SlackApiBase::RealSlack;
+    }
+    // The jsonpath ranges over containers, so two containers each rendering the
+    // var would concatenate. That cannot happen in this chart (the worker
+    // Deployment has one container), and if it ever does, guessing which half is
+    // the base is exactly the ambiguity this issue is about.
+    if value.lines().count() > 1 {
+        return SlackApiBase::Unknown;
+    }
+    SlackApiBase::Configured(value.to_string())
+}
+
+/// The Slack API base the release's own worker is configured with.
+///
+/// Read from the SAME release the bot token is read from (#1030). The base used to
+/// come from `SLACK_API_BASE_URL` in the CLI's own process environment while the
+/// token came from the release Secret, so a developer with a stub URL exported
+/// from earlier testing sent a production workspace token to their local stub.
+/// The two halves now share one source.
+pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> SlackApiBase {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain("-l"),
+            plain(worker_deployment_selector(release)),
+            plain("-o"),
+            plain(
+                "jsonpath={range .items[*].spec.template.spec.containers[*]}                 {.env[?(@.name=='SLACK_API_BASE_URL')].value}{\"\\n\"}{end}",
+            ),
+        ],
+    );
+    match run_capture(&cmd).await {
+        Ok((ok, out, _)) => parse_slack_api_base(ok, &out),
+        Err(_) => SlackApiBase::Unknown,
+    }
 }
 
 /// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a

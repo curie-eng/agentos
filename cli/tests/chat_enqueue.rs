@@ -14,7 +14,7 @@ use std::time::Duration;
 use curie::chat::{resolve_targets, SlackStub};
 use curie::message::{enqueue_over_connected_transport, MessageOpts};
 use curie::queue::{diagnostics, entry_acked, synthetic_turn, xadd, WORKER_GROUP};
-use curie::slack::post_placeholder;
+use curie::slack::{post_placeholder, SlackTransport};
 use curie::state::{load_turn, TurnContext, TurnVerb};
 use curie_aci_protocol::QueuedTurn;
 
@@ -380,14 +380,19 @@ async fn post_placeholder_threads_the_outbound_post_only_when_a_thread_is_named(
     const NAMED_THREAD: &str = "1717171717.000100";
     let slack =
         support::serve(|_req| Response::json(200, r#"{"ok": true, "ts": "1717171717.000900"}"#));
-    std::env::set_var("SLACK_API_BASE_URL", &slack.base_url);
+    // The destination is an argument now (#1030), not an ambient read. Exporting
+    // the variable that used to decide it is left in place deliberately: if the
+    // ambient read ever comes back, these posts land at real Slack instead of the
+    // stub and the recorded-request assertions below fail.
+    std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:1/never-used");
+    let transport = SlackTransport::new(Some(slack.base_url.clone()), "xoxb-test".into());
 
-    let ts = post_placeholder("xoxb-test", "C-real", "\u{2026}", Some(NAMED_THREAD))
+    let ts = post_placeholder(&transport, "C-real", "\u{2026}", Some(NAMED_THREAD))
         .await
         .expect("the stub answers ok with a ts");
     assert!(!ts.is_empty(), "post_placeholder returned the created ts");
 
-    post_placeholder("xoxb-test", "C-real", "\u{2026}", None)
+    post_placeholder(&transport, "C-real", "\u{2026}", None)
         .await
         .expect("the stub answers ok with a ts");
 
@@ -498,7 +503,7 @@ async fn enqueue_connected(
         conn,
         TurnVerb::Local,
         "C-REAL-CONNECTED",
-        "xoxb-test",
+        &SlackTransport::new(std::env::var("SLACK_API_BASE_URL").ok(), "xoxb-test".into()),
     )
     .await
     .expect("the connected enqueue completes against the stub and Valkey");
