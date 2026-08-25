@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +13,7 @@ from _support import (
     MailState,
     adapter_env,
     completed,
+    exit_of,
     free_port,
     get,
     post_event,
@@ -22,6 +24,7 @@ from _support import (
     wait_until,
 )
 from curie_mail_adapter.adapter import MailAdapter
+from curie_mail_adapter.state import MailState as DurableMailState
 
 
 def _env(mail: MailState, ingress: IngressState, port: int, state_path: Path) -> dict[str, str]:
@@ -37,6 +40,172 @@ def _sigkill(proc: subprocess.Popen[str]) -> str:
     proc.kill()
     output, _ = proc.communicate(timeout=15)
     return output
+
+
+def test_sigkill_mid_transaction_recovers_wal_without_a_phantom_terminal_state(
+    tmp_path: Path,
+) -> None:
+    """A killed writer leaves no partial admission and the same WAL stays usable."""
+    state_path = tmp_path / "mail-state.sqlite3"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import time
+
+from curie_mail_adapter.state import MailState
+
+state = MailState(sys.argv[1], max_pending=20, max_bytes=8 * 1024 * 1024)
+with state.transaction() as connection:
+    connection.execute(
+        \"INSERT INTO deliveries(\"
+        \"message_id, conversation_id, reply_ref, summary_json, state, \"
+        \"created_at, updated_at\"
+        \") VALUES('msg-uncommitted', 'thr-crash', 'msg-uncommitted', '{}', \"
+        \"'body_pending', 1, 1)\"
+    )
+    print("WRITE_OPEN", flush=True)
+    time.sleep(60)
+""",
+            str(state_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert writer.stdout is not None
+        assert writer.stdout.readline().strip() == "WRITE_OPEN"
+        writer.kill()
+        writer.communicate(timeout=15)
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+            writer.communicate(timeout=15)
+
+    reopened = DurableMailState(
+        str(state_path), max_pending=20, max_bytes=8 * 1024 * 1024
+    )
+    try:
+        with reopened.lock:
+            assert reopened.connection.execute("PRAGMA journal_mode").fetchone() == (
+                "wal",
+            )
+            assert reopened.connection.execute("PRAGMA synchronous").fetchone() == (2,)
+            assert reopened.connection.execute("PRAGMA integrity_check").fetchone() == (
+                "ok",
+            )
+        assert reopened.delivery("msg-uncommitted") is None
+
+        summary = {
+            "message_id": "msg-after-crash",
+            "thread_id": "thr-crash",
+            "from": "human@example.com",
+            "subject": "after crash",
+            "labels": [],
+        }
+        assert reopened.admit(summary) == "admitted"
+        reopened.store_turn(
+            "msg-after-crash",
+            {
+                "kind": "email",
+                "address": "sandbox@agentmail.to",
+                "delivery_id": "msg-after-crash",
+                "conversation_id": "thr-crash",
+                "author": "human@example.com",
+                "text": "after crash",
+                "reply_ref": "msg-after-crash",
+            },
+        )
+        assert (
+            reopened.claim_event(
+                "ev-after-crash", "thr-crash", "msg-after-crash", "owner-1"
+            )
+            == "claimed"
+        )
+        reopened.finish_event("ev-after-crash")
+        reopened.finish_reply("thr-crash", "msg-after-crash")
+
+        assert (
+            reopened.claim_event(
+                "ev-after-crash", "thr-crash", "msg-after-crash", "owner-2"
+            )
+            == "done"
+        )
+        with reopened.lock:
+            assert reopened.connection.execute(
+                "SELECT count(*) FROM completion_events "
+                "WHERE event_id='ev-after-crash' AND delivered=1"
+            ).fetchone() == (1,)
+    finally:
+        reopened.close()
+
+
+def test_sigterm_drains_an_in_flight_egress_handler_before_sqlite_close(
+    mail: MailState, ingress: IngressState, tmp_path: Path
+) -> None:
+    """Shutdown joins a provider-blocked completion before closing durable state."""
+    state_path = tmp_path / "mail-state.sqlite3"
+    first_port = free_port()
+    first = spawn_adapter(_env(mail, ingress, first_port, state_path))
+    completion_result: list[tuple[int, object]] = []
+    try:
+        wait_for_readyz(first_port, first)
+        mail.add_inbound("msg-shutdown", "thr-shutdown")
+        assert wait_until(lambda: ingress.delivery_ids() == ["msg-shutdown"])
+        assert post_event(
+            f"http://127.0.0.1:{first_port}/",
+            update(
+                "reply survives shutdown",
+                conversation_id="thr-shutdown",
+                reply_ref="msg-shutdown",
+            ),
+        )[0] == 200
+
+        mail.hold_replies()
+        completion = threading.Thread(
+            target=lambda: completion_result.append(
+                post_event(
+                    f"http://127.0.0.1:{first_port}/",
+                    completed("ev-shutdown", "thr-shutdown", "msg-shutdown"),
+                )
+            ),
+            daemon=True,
+        )
+        completion.start()
+        assert mail.reply_entered.wait(20), "completion never reached the provider"
+
+        first.terminate()
+        assert not wait_until(
+            lambda: first.poll() is not None, timeout=0.2
+        ), "SIGTERM exited before the in-flight handler drained"
+        mail.release_replies()
+        completion.join(20)
+        assert not completion.is_alive()
+        code, output = exit_of(first)
+
+        assert code == 0, output
+        assert completion_result and completion_result[0][0] == 200
+        assert "ProgrammingError" not in output
+        assert len(mail.replies_to("msg-shutdown")) == 1
+    finally:
+        mail.release_replies()
+        if first.poll() is None:
+            stop(first)
+
+    second_port = free_port()
+    second = spawn_adapter(_env(mail, ingress, second_port, state_path))
+    try:
+        wait_for_readyz(second_port, second)
+        assert post_event(
+            f"http://127.0.0.1:{second_port}/",
+            completed("ev-shutdown", "thr-shutdown", "msg-shutdown"),
+        )[0] == 200
+        assert len(mail.replies_to("msg-shutdown")) == 1
+    finally:
+        stop(second)
 
 
 def test_restart_confirmation_delivers_downtime_mail_without_repriming(

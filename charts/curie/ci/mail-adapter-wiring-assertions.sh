@@ -48,6 +48,16 @@
 #      job and in EVERY release.yaml matrix that defines a `name` list. An
 #      include-only entry publishes nothing, and a build matrix without the
 #      manifest-merge matrix publishes per-arch digests with no manifest or tag.
+#   16 A BYO API (`api.deploy=false`) fails closed without an explicit API
+#      egress CIDR and renders only that CIDR on the configured TCP port.
+#   17 AgentMail and BYO-API CIDR controls reject equivalent default routes,
+#      including IPv4/IPv6 /1 splits and alternate /0 spellings, while valid
+#      IPv4 and IPv6 provider ranges still render.
+#   18 The existing-claim preflight accepts exactly RWO or RWOP and rejects RWX
+#      by executing the rendered hook command against a deterministic kubectl
+#      fixture, rather than merely grepping its shell source.
+#   19 The preflight Job opts out of token mounting and satisfies the Restricted
+#      Pod Security Standard at both pod and container scope.
 #
 # NOTE ON `--output-dir`: copied deliberately from
 # dispatcher-api-wiring-assertions.sh. In this environment `helm template` into a
@@ -276,8 +286,12 @@ assert_env_value "$on_dir" CURIE_API_URL "http://curie-api:8000" \
 api_port_dir="$(render apiport "${ON[@]}" "${CREDS[@]}" --set api.service.port=9999)"
 assert_env_value "$api_port_dir" CURIE_API_URL "http://curie-api:9999" \
   "The port must come from .Values.api.service.port, not a hardcoded 8000."
-byo_dir="$(render byo "${ON[@]}" "${CREDS[@]}" --set mailAdapter.apiBaseUrl=http://byo-api.example:8080)"
-assert_env_value "$byo_dir" CURIE_API_URL "http://byo-api.example:8080" \
+byo_api_dir="$(render byo-api "${ON[@]}" "${CREDS[@]}" \
+  --set api.deploy=false \
+  --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
+  --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.0/24' \
+  --set mailAdapter.apiEgress.port=8443)"
+assert_env_value "$byo_api_dir" CURIE_API_URL "https://byo-api.example:8443" \
   "mailAdapter.apiBaseUrl must override verbatim (the api.deploy=false path)."
 
 # ---------------------------------------------------------------------------
@@ -509,6 +523,84 @@ PY
 [ "$actual" = "ReadWriteOnce" ] \
   || fail "mailAdapter.persistence.accessModes changed the managed claim to '$actual'; RWO is a correctness invariant, not an operator knob"
 
+# The existingClaim hook is runtime policy, not documentation: execute the
+# rendered command with a deterministic kubectl fixture. This makes RWO and
+# RWOP positive paths independently observable and proves that RWX is refused.
+preflight_command="$(field "$byo_dir" Job curie-mail-persistence-preflight spec.template.spec.containers.0.command.2)" \
+  || fail "existingClaim rendered no executable mail persistence preflight"
+FAKE_KUBECTL_DIR="$TMP/fake-kubectl"
+mkdir -p "$FAKE_KUBECTL_DIR"
+cat > "$FAKE_KUBECTL_DIR/kubectl" <<'SH'
+#!/usr/bin/env sh
+case "$*" in
+  *accessModes*) printf '%s' "${FAKE_ACCESS_MODES:?}" ;;
+  *volumeMode*) printf '%s' "${FAKE_VOLUME_MODE:-Filesystem}" ;;
+  *) echo "unexpected kubectl invocation: $*" >&2; exit 64 ;;
+esac
+SH
+chmod +x "$FAKE_KUBECTL_DIR/kubectl"
+
+run_claim_preflight() {
+  FAKE_ACCESS_MODES="$1" \
+  FAKE_VOLUME_MODE=Filesystem \
+  CLAIM=mail-state-existing \
+  NAMESPACE=default \
+  PATH="$FAKE_KUBECTL_DIR:$PATH" \
+    /bin/sh -c "$preflight_command"
+}
+
+run_claim_preflight ReadWriteOnce >/dev/null \
+  || fail "existingClaim preflight rejected ReadWriteOnce"
+run_claim_preflight ReadWriteOncePod >/dev/null \
+  || fail "existingClaim preflight rejected ReadWriteOncePod, the strict single-pod writer mode"
+if run_claim_preflight ReadWriteMany >/dev/null 2>&1; then
+  fail "existingClaim preflight accepted ReadWriteMany; only RWO and RWOP preserve the single-writer invariant"
+fi
+
+# Restricted Pod Security is checked structurally because admission would reject
+# the hook before its claim command ever runs. Assert every required field,
+# including the service-account-token opt-out that is easy to omit on a Job.
+python3 - "$byo_dir" <<'PY' \
+  || fail "existingClaim preflight Job is not Restricted-compatible"
+import pathlib
+import sys
+
+import yaml
+
+jobs = [
+    doc
+    for path in pathlib.Path(sys.argv[1]).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict)
+    and doc.get("kind") == "Job"
+    and doc.get("metadata", {}).get("name") == "curie-mail-persistence-preflight"
+]
+if len(jobs) != 1:
+    raise SystemExit(f"expected one mail persistence preflight Job, found {len(jobs)}")
+
+pod = jobs[0]["spec"]["template"]["spec"]
+if pod.get("automountServiceAccountToken") is not False:
+    raise SystemExit("preflight must set automountServiceAccountToken: false")
+pod_security = pod.get("securityContext", {})
+if pod_security.get("runAsNonRoot") is not True:
+    raise SystemExit("preflight pod must set runAsNonRoot: true")
+if pod_security.get("seccompProfile", {}).get("type") not in {"RuntimeDefault", "Localhost"}:
+    raise SystemExit("preflight pod must select an allowed seccomp profile")
+
+containers = pod.get("containers", [])
+if len(containers) != 1:
+    raise SystemExit(f"expected one preflight container, found {len(containers)}")
+security = containers[0].get("securityContext", {})
+if security.get("runAsNonRoot") is not True:
+    raise SystemExit("preflight container must set runAsNonRoot: true")
+if security.get("allowPrivilegeEscalation") is not False:
+    raise SystemExit("preflight container must set allowPrivilegeEscalation: false")
+if "ALL" not in security.get("capabilities", {}).get("drop", []):
+    raise SystemExit("preflight container must drop ALL capabilities")
+if security.get("seccompProfile", {}).get("type") not in {"RuntimeDefault", "Localhost"}:
+    raise SystemExit("preflight container must select an allowed seccomp profile")
+PY
+
 set +e
 missing_cidr_out="$(helm template "$RELEASE" "$CHART" --set mailAdapter.deploy=true "${CREDS[@]}" 2>&1)"
 missing_cidr_rc=$?
@@ -519,6 +611,153 @@ case "$missing_cidr_out" in
   *"mailAdapter.agentmail.httpsCidrs"*) : ;;
   *) fail "missing-CIDR render failed without naming mailAdapter.agentmail.httpsCidrs; output was: $missing_cidr_out" ;;
 esac
+
+# ---------------------------------------------------------------------------
+# 16: a BYO API is reachable only through an explicitly configured, narrow
+#     NetworkPolicy peer. apiBaseUrl alone must never render a Ready pod whose
+#     ingress remains pending forever because its API destination is denied.
+# ---------------------------------------------------------------------------
+assert_render_fails_named() {
+  # $1 label, $2 expected configuration key in the error, remaining helm args.
+  local label="$1" expected_key="$2" output rc
+  shift 2
+  set +e
+  output="$(helm template "$RELEASE" "$CHART" "$@" 2>&1)"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] \
+    || fail "$label rendered successfully; this configuration must fail closed"
+  case "$output" in
+    *"$expected_key"*) : ;;
+    *) fail "$label failed without naming '$expected_key'; output was: $output" ;;
+  esac
+}
+
+assert_render_fails_named \
+  "api.deploy=false without an API egress CIDR" \
+  "mailAdapter.apiEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set api.deploy=false \
+  --set mailAdapter.apiBaseUrl=https://byo-api.example:8443
+
+byo_api_default_port_dir="$(render byo-api-default-port "${ON[@]}" "${CREDS[@]}" \
+  --set api.deploy=false \
+  --set mailAdapter.apiBaseUrl=http://byo-api.example:8000 \
+  --set 'mailAdapter.apiEgress.httpsCidrs[0]=198.51.100.128/25')"
+
+python3 - "$byo_api_dir" "$byo_api_default_port_dir" <<'PY' \
+  || fail "BYO API egress did not render exactly the configured narrow CIDR and TCP port"
+import pathlib
+import sys
+
+import yaml
+
+def assert_api_rule(rendered, expected_cidr, expected_port):
+    policies = [
+        doc
+        for path in pathlib.Path(rendered).rglob("*.yaml")
+        for doc in yaml.safe_load_all(path.read_text())
+        if isinstance(doc, dict)
+        and doc.get("kind") == "NetworkPolicy"
+        and doc.get("metadata", {}).get("name") == "curie-mail-adapter-egress"
+    ]
+    if len(policies) != 1:
+        raise SystemExit(f"expected one mail egress policy, found {len(policies)}")
+
+    api_rules = []
+    for rule in policies[0].get("spec", {}).get("egress", []):
+        cidrs = {
+            peer.get("ipBlock", {}).get("cidr")
+            for peer in rule.get("to", [])
+            if peer.get("ipBlock")
+        }
+        if expected_cidr in cidrs:
+            api_rules.append((cidrs, rule.get("ports", [])))
+    if len(api_rules) != 1:
+        raise SystemExit(f"expected one BYO API CIDR rule, found {api_rules!r}")
+    cidrs, ports = api_rules[0]
+    if cidrs != {expected_cidr}:
+        raise SystemExit(f"BYO API rule widened beyond the configured peer: {cidrs!r}")
+    expected_ports = [{"protocol": "TCP", "port": expected_port}]
+    if ports != expected_ports:
+        raise SystemExit(
+            f"BYO API rule did not preserve configured TCP port {expected_port}: {ports!r}"
+        )
+
+
+assert_api_rule(sys.argv[1], "198.51.100.0/24", 8443)
+assert_api_rule(sys.argv[2], "198.51.100.128/25", 8000)
+PY
+
+# ---------------------------------------------------------------------------
+# 17: equivalent default routes fail closed after CIDR parsing, not fragile
+#     string comparison. The two /1 entries cover the same address family as
+#     /0; whitespace and the expanded IPv6 zero address are equivalent /0s.
+# ---------------------------------------------------------------------------
+assert_render_fails_named \
+  "IPv4 /1 split AgentMail route" \
+  "mailAdapter.agentmail.httpsCidrs" \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=0.0.0.0/1' \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[1]=128.0.0.0/1'
+assert_render_fails_named \
+  "IPv6 /1 split AgentMail route" \
+  "mailAdapter.agentmail.httpsCidrs" \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=::/1' \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[1]=8000::/1'
+assert_render_fails_named \
+  "whitespace-padded IPv4 default AgentMail route" \
+  "mailAdapter.agentmail.httpsCidrs" \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]= 0.0.0.0/0 '
+assert_render_fails_named \
+  "expanded IPv6 default AgentMail route" \
+  "mailAdapter.agentmail.httpsCidrs" \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=0:0:0:0:0:0:0:0/0'
+assert_render_fails_named \
+  "invalid AgentMail route" \
+  "mailAdapter.agentmail.httpsCidrs" \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=not-a-cidr'
+
+# The BYO API list protects the same credential-bearing pod and must share the
+# broad-route guard rather than becoming a second way to grant HTTPS everywhere.
+assert_render_fails_named \
+  "IPv4 /1 split BYO API route" \
+  "mailAdapter.apiEgress.httpsCidrs" \
+  "${ON[@]}" "${CREDS[@]}" \
+  --set api.deploy=false \
+  --set mailAdapter.apiBaseUrl=https://byo-api.example:8443 \
+  --set-string 'mailAdapter.apiEgress.httpsCidrs[0]=0.0.0.0/1' \
+  --set-string 'mailAdapter.apiEgress.httpsCidrs[1]=128.0.0.0/1' \
+  --set mailAdapter.apiEgress.port=8443
+
+valid_cidrs_dir="$(render valid-provider-cidrs \
+  --set mailAdapter.deploy=true "${CREDS[@]}" \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24' \
+  --set-string 'mailAdapter.agentmail.httpsCidrs[1]=2001:db8::/48')"
+python3 - "$valid_cidrs_dir" <<'PY' \
+  || fail "valid narrow IPv4 and IPv6 AgentMail CIDRs did not render"
+import pathlib
+import sys
+
+import yaml
+
+cidrs = {
+    peer.get("ipBlock", {}).get("cidr")
+    for path in pathlib.Path(sys.argv[1]).rglob("*.yaml")
+    for doc in yaml.safe_load_all(path.read_text())
+    if isinstance(doc, dict) and doc.get("kind") == "NetworkPolicy"
+    for rule in doc.get("spec", {}).get("egress", [])
+    for peer in rule.get("to", [])
+    if peer.get("ipBlock")
+}
+expected = {"203.0.113.0/24", "2001:db8::/48"}
+if not expected.issubset(cidrs):
+    raise SystemExit(f"missing valid provider CIDRs: expected={expected!r}, rendered={cidrs!r}")
+PY
 
 # ---------------------------------------------------------------------------
 # 11: checksum/mail-adapter-credentials tracks ALL THREE credentials. Three
@@ -741,4 +980,4 @@ python3 "$MATRIX_PY" \
   mail-adapter \
   || fail "the mail-adapter image is not wired into the standard build path; see the message above"
 
-echo "OK: mail-adapter chart wiring and build-path render assertions passed (15 assertions)"
+echo "OK: mail-adapter chart wiring and build-path render assertions passed (19 assertions)"

@@ -195,25 +195,23 @@ def test_allow_all_is_reachable_only_by_writing_the_star(
     assert ingress.delivery_ids() == ["msg-1"]
 
 
-def test_the_allow_list_gates_ingress_only_not_egress(
+def test_ingress_disabled_does_not_authorize_an_unadmitted_egress_ref(
     mail: MailState,
     make_adapter: Callable[..., MailAdapter],
     serve_egress: Callable[[MailAdapter], str],
 ) -> None:
-    """Staged cutover: ingress off with no allow-list still serves the reply wire."""
+    """The server stays up during cutover, but only admitted reply refs may send."""
     adapter = make_adapter(ingress_enabled=False, allowed_senders=())
     url = serve_egress(adapter) + "/"
     mail.add_inbound("msg-9", "thr-9")
-    # The one internal shape this suite seeds rather than drives: with ingress
-    # off there is no path that creates a conversation record, and the plan calls
-    # for a manually seeded one here.
+    # This process-local mirror used to bypass the durable per-ref admission
+    # gate. Keep it populated to prove the fallback cannot authorize a send.
     adapter.conversations["thr-9"] = {"text": "the answer"}
 
     status, _ = post_event(url, completed("ev-off", conversation_id="thr-9", reply_ref="msg-9"))
 
-    assert status == 200
-    assert [mid for mid, _text in mail.replies] == ["msg-9"]
-    assert "the answer" in mail.replies[0][1]
+    assert status == 502
+    assert mail.replies == []
 
 
 # --- the provider's filtering, and the label check behind it ------------------

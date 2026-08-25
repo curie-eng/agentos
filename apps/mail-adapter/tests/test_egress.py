@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -42,6 +43,22 @@ def seed(mail: MailState, adapter: MailAdapter, message_id: str = "msg-1", **kwa
     """One inbound message, admitted through the real poll path."""
     mail.add_inbound(message_id, kwargs.pop("thread_id", "thr-1"), **kwargs)
     adapter.poll_once()
+
+
+@contextmanager
+def restarted_adapter(
+    adapter: MailAdapter,
+    serve_egress: Callable[[MailAdapter], str],
+) -> Iterator[tuple[MailAdapter, str]]:
+    """Reopen the same durable state the way a replacement pod does."""
+    adapter.shutdown.set()
+    adapter.close()
+    replacement = MailAdapter(adapter.config)
+    try:
+        yield replacement, serve_egress(replacement) + "/"
+    finally:
+        replacement.shutdown.set()
+        replacement.close()
 
 
 # --- ported: the platform is authenticated before any side effect -------------
@@ -119,33 +136,36 @@ def test_a_repeated_event_id_produces_exactly_one_email(
     assert len(mail.replies) == 1
 
 
-def test_a_restart_does_not_double_send_because_the_thread_carries_the_marker(
-    mail: MailState, adapter: MailAdapter, egress_url: str
+def test_a_restart_does_not_double_send_a_terminal_event(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
 ) -> None:
-    """The durable half of the dedupe: the marker in the thread survives the process."""
+    """A replacement reopens the terminal event and does not send it again."""
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1"))
     assert len(mail.replies) == 1
 
-    adapter.replied_event_ids.clear()  # a pod restart, or a bounded-cache eviction
-
-    post_event(egress_url, completed("ev-1"))
+    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+        assert post_event(replacement_url, completed("ev-1"))[0] == 200
 
     assert len(mail.replies) == 1
-    assert mail.thread_calls >= 1  # the durable check actually listed the thread
 
 
 def test_after_a_restart_an_unmarked_event_id_still_sends(
-    mail: MailState, adapter: MailAdapter, egress_url: str
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
 ) -> None:
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
     post_event(egress_url, completed("ev-1"))
 
-    adapter.replied_event_ids.clear()
-
-    post_event(egress_url, completed("ev-2"))
+    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+        post_event(replacement_url, completed("ev-2"))
 
     assert len(mail.replies) == 2
     assert f"{EVENT_MARKER} ev-2" in mail.replies[1][1]
@@ -236,6 +256,36 @@ def test_interleaved_turns_each_reply_to_their_own_message(
     assert len(mail.replies) == 2
 
 
+def test_a_late_update_for_a_finished_ref_never_moves_to_the_next_live_turn(
+    mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
+) -> None:
+    """An explicit stale ref is not permission to guess the sole live sibling.
+
+    This is the ordinary at-least-once race: turn one has already completed,
+    turn two is now the only live row in the same conversation, and a delayed
+    update for turn one arrives. Remapping it to the sole live ref would put the
+    first answer in the second correspondent-facing email.
+    """
+    mail.add_inbound("msg-1", "thr-1", subject="First", text="one")
+    adapter.poll_once()
+    post_event(egress_url, update("answer one", reply_ref="msg-1"))
+    assert post_event(egress_url, completed("ev-1", reply_ref="msg-1"))[0] == 200
+
+    mail.add_inbound("msg-2", "thr-1", subject="Follow up", text="two")
+    adapter.poll_once()
+    assert ingress.delivery_ids() == ["msg-1", "msg-2"]
+
+    status, _ = post_event(
+        egress_url,
+        update("late answer for the first turn", conversation_id="thr-1", reply_ref="msg-1"),
+    )
+
+    assert status == 503
+    assert post_event(egress_url, completed("ev-2", reply_ref="msg-2"))[0] == 200
+    assert [message_id for message_id, _text in mail.replies] == ["msg-1", "msg-2"]
+    assert "late answer for the first turn" not in mail.replies[1][1]
+
+
 def test_a_second_message_does_not_erase_an_answer_already_emitted(
     mail: MailState, ingress: IngressState, adapter: MailAdapter, egress_url: str
 ) -> None:
@@ -318,50 +368,86 @@ def test_a_completion_for_an_unknown_conversation_is_a_retryable_failure(
     assert mail.replies == []
 
 
-def test_a_restart_that_erases_the_conversation_record_is_not_acked_as_delivered(
+def test_a_completion_for_an_unadmitted_ref_in_a_known_conversation_sends_nothing(
     mail: MailState, adapter: MailAdapter, egress_url: str
 ) -> None:
-    """The restart a credential rotation mid-turn actually produces.
-
-    `conversations` is process-local, so the pod comes back with the completion
-    still undelivered and no record for it. The marker-in-thread test above
-    clears only `replied_event_ids`, which is the half a restart does not make
-    dangerous; this clears the half that does.
-    """
+    """Conversation admission cannot authorize a guessed sibling reply ref."""
     seed(mail, adapter)
-    post_event(egress_url, update("the answer"))
-    adapter.conversations.clear()  # the pod restarted between the update and the completion
 
-    status, _ = post_event(egress_url, completed("ev-1"))
+    status, _ = post_event(
+        egress_url,
+        completed("ev-forged-ref", conversation_id="thr-1", reply_ref="msg-forged"),
+    )
 
     assert status == 502
     assert mail.replies == []
 
 
-def test_a_delivered_reply_is_acked_after_a_restart_that_erased_both_maps(
+def test_a_reply_update_for_an_unadmitted_ref_is_retryable(
     mail: MailState, adapter: MailAdapter, egress_url: str
 ) -> None:
-    """The durable marker outranks the missing record, and it has to be consulted first.
+    """A missing durable owner is an ordering failure, never a terminal ack."""
+    seed(mail, adapter)
 
-    The case above is a restart between the update and the send: nothing went
-    out, the thread proves nothing, and 502 is right. This is the restart AFTER
-    the send, before the worker got its ack. The redelivery finds an empty
-    process-local `conversations`, and answering 502 off that alone refuses an
-    already-delivered completion on every retry until the platform dead-letters
-    it. The thread itself carries `X-Curie-Event: ev-1`, which is the whole point
-    of the durable half of the dedupe: it survives the process, so it is the
-    answer, and 200 lets the worker clear a record whose email really was sent.
-    """
+    status, _ = post_event(
+        egress_url,
+        update("must remain retryable", conversation_id="thr-1", reply_ref="msg-missing"),
+    )
+
+    assert status == 503
+    assert mail.replies == []
+
+
+@pytest.mark.parametrize("text", ["", None])
+def test_an_empty_typed_reply_update_remains_an_acknowledged_noop(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    text: str | None,
+) -> None:
+    """A valid update with no representable email text has nothing to retry."""
+    seed(mail, adapter)
+    payload = {**update("", reply_ref="msg-1"), "text": text}
+
+    status, _ = post_event(egress_url, payload)
+
+    assert status == 200
+    assert mail.replies == []
+
+
+def test_a_restart_preserves_admitted_reply_text(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+) -> None:
+    """A replacement recovers admitted reply text instead of erasing the turn."""
+    seed(mail, adapter)
+    post_event(egress_url, update("the answer"))
+
+    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+        status, _ = post_event(replacement_url, completed("ev-1"))
+
+    assert status == 200
+    assert len(mail.replies) == 1
+    assert mail.replies[0][1].startswith("the answer")
+
+
+def test_a_delivered_reply_is_acked_after_a_restart(
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+) -> None:
+    """A replacement reopens the durable success and acks without another send."""
     seed(mail, adapter)
     post_event(egress_url, update("the answer"))
     assert post_event(egress_url, completed("ev-1"))[0] == 200
     assert len(mail.replies) == 1
     assert f"{EVENT_MARKER} ev-1" in mail.replies[0][1]
 
-    adapter.replied_event_ids.clear()  # the pod restarted after the provider accepted it
-    adapter.conversations.clear()  # ... and the conversation record went with it
-
-    status, _ = post_event(egress_url, completed("ev-1"))
+    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+        status, _ = post_event(replacement_url, completed("ev-1"))
 
     assert status == 200
     assert len(mail.replies) == 1
@@ -499,7 +585,11 @@ def test_the_503d_duplicate_converges_once_the_first_attempt_settles(
 
 @pytest.mark.parametrize("thread_status", [500, 0])
 def test_an_unreadable_thread_does_not_send_a_duplicate_email(
-    mail: MailState, adapter: MailAdapter, egress_url: str, thread_status: int
+    mail: MailState,
+    adapter: MailAdapter,
+    egress_url: str,
+    serve_egress: Callable[[MailAdapter], str],
+    thread_status: int,
 ) -> None:
     """The durable half of the dedupe currently fails open, which sends twice.
 
@@ -512,18 +602,19 @@ def test_an_unreadable_thread_does_not_send_a_duplicate_email(
     """
     seed(mail, adapter)
     post_event(egress_url, update("answer one"))
-    post_event(egress_url, completed("ev-1"))
+    mail.accept_then_drop_next_reply = True
+    assert post_event(egress_url, completed("ev-1"))[0] == 502
     assert len(mail.replies) == 1
 
-    adapter.replied_event_ids.clear()  # a pod restart, or a bounded-cache eviction
-    mail.fail_next_thread = thread_status
+    with restarted_adapter(adapter, serve_egress) as (_replacement, replacement_url):
+        mail.fail_next_thread = thread_status
 
-    status, _ = post_event(egress_url, completed("ev-1"))
+        status, _ = post_event(replacement_url, completed("ev-1"))
 
-    assert status == 502
-    assert len(mail.replies) == 1
+        assert status == 502
+        assert len(mail.replies) == 1
 
-    assert post_event(egress_url, completed("ev-1"))[0] == 200
+        assert post_event(replacement_url, completed("ev-1"))[0] == 200
     assert len(mail.replies) == 1
 
 
