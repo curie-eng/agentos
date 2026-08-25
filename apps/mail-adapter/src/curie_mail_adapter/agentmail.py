@@ -12,6 +12,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from .config import MailAdapterConfig
@@ -54,10 +55,24 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
+@dataclass(frozen=True)
+class HttpResult:
+    """One bounded HTTP result, including headers needed for retry policy."""
+
+    status: int
+    body: Any
+    headers: dict[str, str]
+
+
 def request(
-    method: str, url: str, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None
-) -> tuple[int, Any]:
-    """One HTTP round trip. Returns (status, parsed body); status 0 is transport failure.
+    method: str,
+    url: str,
+    body: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    *,
+    max_response_bytes: int = 1_048_576,
+) -> HttpResult:
+    """One bounded HTTP round trip; status 0 is transport failure.
 
     A 3xx is never followed; it comes back as its own status, which every caller
     already treats as a failure.
@@ -69,17 +84,27 @@ def request(
         req.add_header(key, value)
     try:
         with _OPENER.open(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            raw = response.read().decode()
+            raw_bytes = response.read(max_response_bytes + 1)
             status = int(response.status)
+            response_headers = dict(response.headers.items())
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode()
+        raw_bytes = exc.read(max_response_bytes + 1)
         status = int(exc.code)
+        response_headers = dict(exc.headers.items())
     except OSError as exc:
-        return 0, {"error": str(exc)}
+        return HttpResult(0, {"error": str(exc)}, {})
+    if len(raw_bytes) > max_response_bytes:
+        return HttpResult(
+            0,
+            {"error": "response body exceeds configured byte limit"},
+            response_headers,
+        )
+    raw = raw_bytes.decode("utf-8", "replace")
     try:
-        return status, json.loads(raw)
+        parsed: Any = json.loads(raw)
     except ValueError:
-        return status, raw
+        parsed = raw
+    return HttpResult(status, parsed, response_headers)
 
 
 def _quoted(value: str) -> str:
@@ -93,12 +118,14 @@ class AgentMailClient:
         self.config = config
 
     def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
-        return request(
+        result = request(
             method,
             f"{self.config.agentmail_base_url.rstrip('/')}{path}",
             body,
             {"Authorization": f"Bearer {self.config.agentmail_api_key}"},
+            max_response_bytes=self.config.max_body_bytes,
         )
+        return result.status, result.body
 
     @property
     def _inbox(self) -> str:

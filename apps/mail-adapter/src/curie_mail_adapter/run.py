@@ -26,19 +26,27 @@ logger = logging.getLogger(__name__)
 def boot_problems(config: MailAdapterConfig) -> list[str]:
     """Every reason this configuration cannot be served, each naming its env var."""
     problems = []
-    for env_name, value in (
+    for env_name, credential_value in (
         ("AGENTMAIL_INBOX", config.agentmail_inbox),
         ("AGENTMAIL_API_KEY", config.agentmail_api_key),
         ("CURIE_CHANNEL_TOKEN", config.channel_token),
         ("CURIE_EGRESS_SECRET", config.egress_secret),
     ):
-        if not value.strip():
+        if not credential_value.strip():
             problems.append(f"{env_name} is required and is unset or empty")
     if config.poll_interval_seconds <= 0:
         problems.append(
             "CURIE_MAIL_POLL_INTERVAL_SECONDS must be greater than zero, "
             f"not {config.poll_interval_seconds}"
         )
+    for env_name, bound_value in (
+        ("CURIE_MAIL_MAX_PENDING_DELIVERIES", config.max_pending_deliveries),
+        ("CURIE_MAIL_MAX_BODY_BYTES", config.max_body_bytes),
+        ("CURIE_MAIL_MAX_REPLY_BYTES", config.max_reply_bytes),
+        ("CURIE_MAIL_MAX_STATE_BYTES", config.max_state_bytes),
+    ):
+        if bound_value <= 0:
+            problems.append(f"{env_name} must be greater than zero, not {bound_value}")
     if config.ingress_enabled and not config.allowed_senders:
         problems.append(
             "CURIE_MAIL_ALLOWED_SENDERS is required while ADAPTER_INGRESS_ENABLED is true: "
@@ -81,10 +89,12 @@ def main() -> None:
             # The flag gates the poller, never the server: a staged cutover
             # serves replies before it starts ingesting.
             logger.info("ingress disabled; serving egress only")
+            adapter.ready.set()
         adapter.shutdown.wait()
     finally:
         server.shutdown()
         server.server_close()
+        adapter.close()
     logger.info("mail adapter stopped")
 
 

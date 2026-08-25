@@ -12,9 +12,11 @@ Two halves, and neither one knows anything about Slack:
   `X-Curie-Adapter-Secret` before any side effect, and sends one threaded
   AgentMail reply per `turn.completed`.
 
-It holds no platform API key, no queue credential, and no database access.
-Binding is an operator action at deploy time. All routing state is in memory and
-process-local, so the chart pins it to a single replica.
+It holds no platform API key, no queue credential, and no platform database
+access. Binding is an operator action at deploy time. Delivery and reply
+ownership live in a local SQLite file on a ReadWriteOnce volume. The chart pins
+one serialized writer and uses `Recreate`; persistence makes replacement safe,
+not multi-writer operation.
 
 ## Inbound security
 
@@ -100,11 +102,12 @@ explicitly, so the dangerous state is always named by an operator rather than
 produced by omission.
 
 **Mail rejected by the allow-list is dropped permanently, and widening the
-allow-list later does not reprocess it.** The rejected `message_id` is already
-marked seen and the poller only looks forward. A rejection is logged once at
-WARNING naming the address, the `message_id` and the reason, and the message is
-left in the mailbox unmodified: nothing is deleted, labeled or bounced. So after
-widening the list, check the adapter's logs for what was dropped, and ask the
+allow-list later does not reprocess it.** The rejected `message_id` and security
+decision are already durable. A rejection is logged once at WARNING with the
+reason and a one-way correlation token, never the sender, subject, body, provider
+message/thread id, or reply text. The message is left in the mailbox unmodified:
+nothing is deleted, labeled or bounced. So after widening the list, use the
+durable state and provider mailbox under the operator's PII controls, and ask the
 correspondent to resend. There is no replay or reprocess-on-widen mechanism.
 
 ## Config surface (env vars)
@@ -123,9 +126,14 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_EGRESS_SECRET` | "" | shared secret the platform presents on `X-Curie-Adapter-Secret`. Required |
 | `ADAPTER_INGRESS_ENABLED` | `true` | gates the poller only, never the egress server |
 | `CURIE_MAIL_POLL_INTERVAL_SECONDS` | `5.0` | seconds between listings; must be greater than zero |
-| `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | ingress POST attempts, on transport failure only |
-| `CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS` | `2.0` | delay between those attempts |
+| `CURIE_MAIL_INGRESS_ATTEMPTS` | `3` | short in-process attempts for transport ambiguity and retryable status; durable retry continues after this budget |
+| `CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS` | `2.0` | base delay between those attempts; 429 may extend it with `Retry-After` |
 | `CURIE_MAIL_PORT` | `8080` | port the egress server binds |
+| `CURIE_MAIL_STATE_PATH` | `/var/lib/curie-mail/state.sqlite3` | local SQLite delivery-state file. The chart mounts it on a RWO PVC |
+| `CURIE_MAIL_MAX_PENDING_DELIVERIES` | `1000` | maximum unresolved inbound deliveries admitted to SQLite; capacity refusal leaves provider mail recoverable |
+| `CURIE_MAIL_MAX_BODY_BYTES` | `1048576` | maximum provider message body read or stored, in bytes |
+| `CURIE_MAIL_MAX_REPLY_BYTES` | `1048576` | maximum accumulated outbound reply, in bytes |
+| `CURIE_MAIL_MAX_STATE_BYTES` | `268435456` | maximum SQLite page budget; size the volume above this for the WAL and filesystem overhead |
 | `CURIE_MAIL_ALLOWED_SENDERS` | "" | the allow-list above. Required while ingress is enabled |
 
 ### Boot gates
@@ -136,78 +144,69 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 positive (a chart typo would otherwise be a tight loop against a third-party
 API), or when ingress is enabled with an empty allow-list.
 
-### Health
+### Health and readiness
 
 `GET /healthz` answers 200 with a fixed body and reveals nothing about the
-install. `POST /healthz` is not special-cased: it requires the egress secret like
-every other POST, so a probe path cannot become an unauthenticated write.
+install. `GET /readyz` stays non-200 until SQLite has opened and the first-start
+prime or restart confirmation has completed. After startup it checks local state
+only: an AgentMail outage does not flap readiness. `POST` to either path is not
+special-cased; it requires the egress secret like every other POST, so a probe
+path cannot become an unauthenticated write.
 
 ## Operations notes
 
-- **Priming on start discards history.** The adapter lists the inbox at startup
-  and marks everything seen, so a restart drops mail that arrived while the pod
-  was down. That is the documented behavior for a live adapter, not a backfill
-  tool.
+- **Only first boot primes.** A new SQLite file lists the inbox and durably
+  records the initial floor before becoming ready, so enabling an existing inbox
+  does not replay its history. A replacement that opens an initialized file
+  performs one provider confirmation without marking messages seen, then resumes
+  pending and downtime mail. A new PVC is a new first boot.
+- **Ingress is durable until terminal success.** Transport ambiguity, 202, 429
+  (honoring `Retry-After`), 401 and server errors leave the same `delivery_id`
+  pending. A documented terminal 200, including a 200 duplicate receipt, settles
+  it. Token rotation therefore restarts the single replica and resumes the
+  original row rather than losing it.
 - **Provider failures are loud.** A `turn.completed` whose AgentMail send fails
   acks 502, so the platform retries and eventually dead-letters, instead of
   acking 200 and silently losing the email. A duplicate completion whose first
   attempt is still in flight acks 503 (come back later). An AgentMail outage
   therefore now produces visible retries and dead letters; that is the intended
   behavior, not a regression.
-- **Two turns in one thread share their reply text.** The reply *target* is
-  per-message (`target.reply_ref`), so each answer lands on the message that
-  asked. The reply *text* is keyed by `conversation_id`, because the platform
-  keeps one live session per conversation and `reply.post` accumulates within it.
-  Two messages racing in one thread therefore produce two correctly addressed
-  replies both carrying the conversation's latest text. Two *turns* racing in one
-  thread is a known defect; see Known reliability limitations below.
-- **Memory profile.** `seen` (polled message ids), `replied_event_ids`, and
-  `body_retry` (messages whose body fetch failed, retried by id on a later
-  pass) are all bounded FIFO maps, `RETRY_MAX` capping `body_retry` at 200
-  entries. A single message in `body_retry` is retried at most
-  `BODY_ATTEMPT_MAX` (5) times before it is abandoned with an error log.
-  `conversations` is not bounded: it grows with the number of distinct
-  threads from admitted senders since the last restart, and evicting from it
-  would make a legitimate late `turn.completed` unrepliable. `page_cursor`
-  holds a single optional page token: a poll pass walks at most
-  `POLL_MAX_PAGES` (5) listing pages and resumes from that cursor on the next
-  pass instead of restarting at page one, so a large backlog drains over
-  several passes rather than one, except when a list call fails and clears the
-  cursor (see Known reliability limitations below).
+- **Reply ownership is per message.** Accumulated text is durable under
+  `(conversation_id, reply_ref)`, and every update and completion uses the exact
+  ref the platform returned. Two turns in one thread cannot clear or inherit one
+  another's text. A null-ref post attaches only when exactly one live ref is
+  unambiguous.
+- **Provider-visible dedupe closes the accepted-send crash window.** The local
+  event receipt is the fast path. After an uncertain send, the adapter reads the
+  marker carried on the provider thread before retrying: found settles without a
+  second email, absent plus an admitted row sends once, and unreadable or absent
+  without an admitted row returns 502 without sending.
+- **Capacity is fail-closed and recoverable.** Pending count, body bytes, reply
+  bytes and SQLite pages are bounded before allocation. At capacity the adapter
+  does not mark the provider message seen or evict older unresolved work; it
+  leaves the message recoverable and logs back pressure.
 - **The `chn` token expires.** The adapter cannot re-mint it (that would need a
-  platform key it must not hold). It logs the ingress 401 and keeps polling; the
-  operator re-mints and rolls the pod.
+  platform key it must not hold). It persists the ingress 401 and keeps the mail
+  pending; the operator re-mints the scoped token and rolls the pod.
 
-### Known reliability limitations
+### State, privacy, and recovery
 
-Three defects are open in the shipped adapter and tracked together in #1584 for
-the reliability rework. Each needs an adverse provider condition or a specific
-concurrent interleaving; none is reachable on the normal path. Each one is
-silent, so what an operator sees is a message that never arrives as a turn, or a
-reply carrying `EMPTY_REPLY_TEXT` ("Curie processed your message but produced no
-text") instead of the answer.
+The SQLite volume is sensitive application data. It can contain email addresses,
+provider message/thread identifiers, message or reply text needed for recovery,
+security decisions, and terminal delivery receipts. It contains no AgentMail
+key, channel token, egress secret, platform key, or platform database credential.
+Access to the PVC, its snapshots, and node-level backups is therefore access to
+mail content even though it is not credential access.
 
-- **A listing failure while a large backlog is draining strands the mail behind
-  it.** A pass walks at most `POLL_MAX_PAGES` (5) pages of `POLL_LIMIT` (20) and
-  keeps its stopping point in `page_cursor`, but a failed list call clears that
-  cursor. The next pass restarts at the newest page and stops as soon as a page
-  carries mail already in `seen`, so messages older than that point are never
-  listed again and never become turns. Triggering condition: a burst larger than
-  `POLL_LIMIT * POLL_MAX_PAGES` (100 messages) still draining when the provider
-  returns an error on a list call.
-- **Two turns racing in one mail thread can cross their answers.** Reply text is
-  held per conversation, and it is cleared on a successful send without checking
-  that the text still belongs to the turn that sent it. If a second turn records
-  its answer while the first turn's send is in flight, the second turn's answer
-  can be cleared or attributed to the first turn, and one of the two turns emails
-  `EMPTY_REPLY_TEXT` instead of its real answer. Triggering condition: two
-  concurrent turns in one thread with that interleaving.
-- **Enough simultaneously failing body fetches drop messages.** A message whose
-  body fetch fails is retried out of `body_retry`, bounded at `RETRY_MAX` (200)
-  entries with `BODY_ATTEMPT_MAX` (5) attempts each. Beyond that bound the oldest
-  entries are evicted while their ids stay in `seen`, so they are neither retried
-  nor picked up by a later listing. Triggering condition: body fetches failing
-  for more than `RETRY_MAX` distinct messages at once.
+The application bounds live state by count and bytes, but the PVC and its backup
+retention are operator policy. Back up the SQLite file only with a
+SQLite-consistent snapshot or after stopping the one writer. Restore the PVC
+before starting the Deployment. Rolling back to a binary older than the on-disk
+schema is refused; restore the pre-upgrade volume snapshot or roll forward
+instead of deleting state to make an old image boot.
+There is no selective erase command. For complete erasure, stop the adapter,
+delete its PVC and every snapshot/backup, and start with a new claim, accepting
+that the next start is a first boot and primes the current inbox.
 
 ## Run it
 

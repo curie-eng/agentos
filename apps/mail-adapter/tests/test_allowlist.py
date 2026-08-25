@@ -23,6 +23,7 @@ reddens only the two label cases.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 
 import pytest
@@ -41,13 +42,12 @@ from curie_mail_adapter.adapter import MailAdapter
 LEAKED_LABELS = ["unauthenticated", "spam", "blocked"]
 
 
-def _warnings_about(caplog: pytest.LogCaptureFixture, needle: str) -> list[str]:
+def _adapter_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caplog.records
         if record.levelno >= logging.WARNING
         and record.name.startswith("curie_mail_adapter")
-        and needle in record.getMessage()
     ]
 
 
@@ -134,15 +134,20 @@ def test_a_rejected_sender_posts_nothing_and_is_marked_seen(
     assert ingress.attempts == 0
     assert mail.body_calls == {}, "the allow-list must run before the body GET"
     assert "msg-junk" in adapter.seen
-    warnings = _warnings_about(caplog, "msg-junk")
+    warnings = _adapter_warnings(caplog)
     assert len(warnings) == 1, warnings
-    assert STRANGER in warnings[0]
+    warning = warnings[0]
+    assert "rejected" in warning
+    assert "sender is not on CURIE_MAIL_ALLOWED_SENDERS" in warning
+    assert re.search(r"\bcorrelation=[0-9a-f]{16}\b", warning)
+    assert "msg-junk" not in warning
+    assert STRANGER not in warning
 
     with caplog.at_level(logging.WARNING):
         adapter.poll_once()
 
     assert ingress.attempts == 0
-    assert len(_warnings_about(caplog, "msg-junk")) == 1  # not re-evaluated, not re-logged
+    assert _adapter_warnings(caplog) == warnings  # not re-evaluated or re-logged
 
 
 def test_a_rejected_sender_gets_no_reply_and_has_no_conversation_record(
@@ -251,9 +256,16 @@ def test_the_label_check_runs_before_the_allow_list(
         adapter.poll_once()
 
     assert ingress.attempts == 0
-    warnings = _warnings_about(caplog, "msg-bad")
+    assert mail.body_calls == {}, "provider labels and allow-list must precede body GET"
+    assert "msg-bad" in adapter.seen  # permanent rejection, not re-evaluated forever
+    warnings = _adapter_warnings(caplog)
     assert len(warnings) == 1, warnings
-    assert "unauthenticated" in warnings[0]
+    warning = warnings[0]
+    assert "rejected" in warning
+    assert "provider labels unauthenticated" in warning
+    assert re.search(r"\bcorrelation=[0-9a-f]{16}\b", warning)
+    assert "msg-bad" not in warning
+    assert STRANGER not in warning
 
 
 def test_an_empty_labels_array_is_admitted(

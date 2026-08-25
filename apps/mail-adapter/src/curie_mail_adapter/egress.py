@@ -1,39 +1,33 @@
-"""The neutral reply wire: an HTTP server the platform posts turn events to.
-
-Four events (`turn.status`, `reply.update`, `reply.post`, `turn.completed`) and
-one health path. The platform is authenticated on `X-Curie-Adapter-Secret`
-BEFORE a body is read or any state is touched: anyone who can reach this Service
-could otherwise forge a completion and make the adapter send an arbitrary email.
-
-The ack status is the platform's retry signal, so it is not always 200. A
-`turn.completed` whose provider send failed acks 502 (a delivery failure the
-platform retries and eventually dead-letters), and one whose outcome is not yet
-known because a concurrent duplicate is mid-send acks 503 (come back later).
-Acking 200 in either case would make the worker clear its durable completion
-record and lose the email.
-"""
+"""Authenticated, typed, and bounded HTTP receiver for channel reply events."""
 
 from __future__ import annotations
 
 import hmac
 import json
 import logging
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
 
-from .adapter import MailAdapter
+from channel_protocol import ReplyAck, ReplyEvent, ReplyPost, ReplyUpdate, TurnCompleted
+from pydantic import TypeAdapter, ValidationError
+
+from .adapter import CHANNEL_KIND, MailAdapter
 
 logger = logging.getLogger(__name__)
 
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 HEALTH_PATH = "/healthz"
+READY_PATH = "/readyz"
+MAX_CONCURRENT_REQUESTS = 16
+_REPLY_EVENT_ADAPTER: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
 
 
 class EgressServer(ThreadingHTTPServer):
-    """A `ThreadingHTTPServer` that carries the adapter its handler serves."""
+    """A bounded ``ThreadingHTTPServer`` carrying the adapter it serves."""
 
-    daemon_threads = True
+    daemon_threads = False
 
     def __init__(
         self,
@@ -42,16 +36,44 @@ class EgressServer(ThreadingHTTPServer):
         adapter: MailAdapter,
     ) -> None:
         self.adapter = adapter
+        self.request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
         super().__init__(server_address, handler_class)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        """Bound work before ``ThreadingMixIn`` allocates a handler thread."""
+        if not self.request_slots.acquire(blocking=False):
+            body = b'{"detail":"request concurrency limit reached"}'
+            response = (
+                b"HTTP/1.0 503 Service Unavailable\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            try:
+                request.sendall(response)
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
 
 
 class EgressHandler(BaseHTTPRequestHandler):
-    """One request. Authenticate, parse, dispatch, ack."""
+    """Authenticate before reading, then validate one frozen reply-wire event."""
 
     protocol_version = "HTTP/1.0"
 
     def log_message(self, format: str, *args: Any) -> None:
-        """Silence the stdlib access log; this package logs through `logging`."""
+        """Silence the stdlib access log; this package logs through ``logging``."""
 
     @property
     def adapter(self) -> MailAdapter:
@@ -65,61 +87,95 @@ class EgressHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except OSError as exc:
-            logger.warning("writing the response failed: %r", exc)
+        except OSError:
+            logger.warning("writing the response failed")
 
     def do_GET(self) -> None:
-        """The liveness probe, and nothing else.
-
-        The body is fixed and reveals nothing about the install: no config, no
-        counts, no inbox address, no version.
-        """
-        if urllib.parse.urlparse(self.path).path == HEALTH_PATH:
+        path = urllib.parse.urlparse(self.path).path
+        if path == HEALTH_PATH:
             return self._respond(200, {"status": "ok"})
+        if path == READY_PATH:
+            ready = self.adapter.ready.is_set() and self.adapter.state.healthy()
+            return self._respond(
+                200 if ready else 503,
+                {"status": "ready" if ready else "starting"},
+            )
         self._respond(404, {"detail": "not found"})
 
     def do_POST(self) -> None:
-        # Authenticate BEFORE reading a body or touching any state, and refuse
-        # outright when no secret is configured, so an empty configured secret
-        # can never become "any presented secret matches". The health path is
-        # deliberately not special-cased: a probe endpoint must not become an
-        # unauthenticated write.
         secret = self.adapter.config.egress_secret
         presented = (self.headers.get(ADAPTER_SECRET_HEADER) or "").encode("utf-8", "replace")
         if not secret or not hmac.compare_digest(presented, secret.encode()):
-            logger.warning("%s 401: missing or invalid %s", self.path, ADAPTER_SECRET_HEADER)
+            logger.warning("request refused: missing or invalid %s", ADAPTER_SECRET_HEADER)
             return self._respond(401, {"detail": "missing or invalid credential"})
+        if self.headers.get("Transfer-Encoding"):
+            return self._respond(400, {"detail": "transfer encoding is not supported"})
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            return self._respond(411, {"detail": "Content-Length is required"})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            event = json.loads(self.rfile.read(length).decode() or "{}")
-        except (OSError, ValueError) as exc:
-            logger.warning("malformed body: %r", exc)
-            return self._respond(400, {"detail": "malformed body"})
+            length = int(content_length)
+        except ValueError:
+            return self._respond(400, {"detail": "invalid Content-Length"})
+        if length <= 0:
+            return self._respond(400, {"detail": "request body is required"})
+        if length > self.adapter.config.max_reply_bytes + 65_536:
+            return self._respond(413, {"detail": "request body is too large"})
+        content_type = (
+            (self.headers.get("Content-Type") or "").partition(";")[0].strip().lower()
+        )
+        if content_type != "application/json":
+            return self._respond(415, {"detail": "Content-Type must be application/json"})
+        try:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("truncated body")
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("event must be a JSON object")
+            event = _REPLY_EVENT_ADAPTER.validate_python(parsed)
+        except (OSError, UnicodeDecodeError, ValueError, ValidationError):
+            logger.warning("invalid reply event")
+            return self._respond(400, {"detail": "invalid reply event"})
+        if (
+            event.target.kind != CHANNEL_KIND
+            or event.target.address != self.adapter.config.agentmail_inbox
+        ):
+            return self._respond(
+                422,
+                {"detail": "event target does not belong to this adapter"},
+            )
+        if isinstance(event, TurnCompleted) and not event.event_id:
+            return self._respond(422, {"detail": "event_id must not be empty"})
         try:
             status = self.dispatch(event)
         except Exception:
-            logger.exception("dispatching %s failed", event.get("event"))
+            logger.error("dispatching event type=%s failed unexpectedly", event.event)
             return self._respond(500, {"detail": "adapter error"})
-        # Email has no editable handle to hand back, so it mints no `ref`.
-        self._respond(status, {})
+        self._respond(status, ReplyAck().model_dump())
 
-    def dispatch(self, event: dict[str, Any]) -> int:
-        """Apply one neutral reply event. Returns the status to ack with."""
-        name = event.get("event")
-        target = event.get("target") or {}
-        conversation_id = str(target.get("conversation_id") or "")
-        if name == "reply.update":
-            text = event.get("text") or (event.get("message") or {}).get("text")
-            self.adapter.record_text(conversation_id, text)
-        elif name == "reply.post":
-            text = (event.get("message") or {}).get("text")
-            self.adapter.record_text(conversation_id, text, append=True)
-        elif name == "turn.completed":
-            reply_ref = target.get("reply_ref")
-            return self.adapter.send_reply(
-                str(event.get("event_id") or ""),
+    def dispatch(self, event: ReplyEvent) -> int:
+        """Apply one validated neutral reply event."""
+        conversation_id = event.target.conversation_id or ""
+        if isinstance(event, ReplyUpdate):
+            text = event.text or (event.message.text if event.message else None)
+            return self.adapter.record_text(
                 conversation_id,
-                str(reply_ref) if reply_ref else None,
+                event.target.reply_ref,
+                text,
+            )
+        if isinstance(event, ReplyPost):
+            return self.adapter.record_text(
+                conversation_id,
+                event.target.reply_ref,
+                event.message.text,
+                append=True,
+            )
+        if isinstance(event, TurnCompleted):
+            return self.adapter.send_reply(
+                event.event_id,
+                conversation_id,
+                event.target.reply_ref,
             )
         return 200
 

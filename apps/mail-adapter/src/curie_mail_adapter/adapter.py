@@ -1,35 +1,11 @@
-"""The adapter itself: the poll path in, the reply path out, and the state between.
-
-Two halves, and neither one knows anything about Slack:
-
-- **Ingress.** ``poll_loop`` lists an AgentMail inbox and POSTs each new message
-  to the platform's channel ingress (``POST /channels/turns``) under the scoped
-  channel token, with the AgentMail ``message_id`` as the ``delivery_id`` so a
-  retry is idempotent.
-- **Egress.** ``send_reply`` turns one ``turn.completed`` into one threaded
-  AgentMail reply. Completion delivery is at-least-once, so the send is deduped
-  on ``event_id`` twice: a bounded in-memory map (the fast path) and a marker
-  line in the thread itself (survives a restart).
-
-All routing state lives on the instance, guarded by one lock, and all of it is
-process-local: this service runs as a single replica.
-
-The inbound gate is two checks, in this order, and they are not equivalent:
-
-1. ``provider_authenticated`` rejects the provider's own verdict labels. This is
-   defense in depth behind the provider's filtering (AgentMail drops mail whose
-   authentication headers are present and explicitly fail, and excludes these
-   categories from list results by default), and in a correct install it never
-   fires.
-2. ``sender_allowed`` filters an attacker-controlled ``From`` header. It is a
-   filter and it authenticates nobody. See README.md for what that does and does
-   not buy an operator.
-"""
+"""AgentMail ingress and email egress backed by one durable local state store."""
 
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import logging
+import secrets
 import threading
 import time
 from collections import OrderedDict
@@ -38,6 +14,7 @@ from typing import Any
 
 from .agentmail import AgentMailClient, request
 from .config import MailAdapterConfig
+from .state import MailState
 
 logger = logging.getLogger(__name__)
 
@@ -45,52 +22,44 @@ CHANNEL_KIND = "email"
 EVENT_MARKER = "X-Curie-Event:"
 EMPTY_REPLY_TEXT = "Curie processed your message but produced no text"
 
-# Bounds on the two maps that grow with traffic. `seen` is the one an
-# unauthenticated stranger can grow (every polled id is inserted before the
-# allow-list decision), so an unbounded set is a memory-growth path anyone who
-# learns a public inbox address can walk. Eviction costs one redundant ingress
-# POST, which the platform answers as a duplicate.
 SEEN_MAX = 5000
 REPLIED_MAX = 1000
-
-# The messages whose body fetch failed and is waiting on another attempt. Bounded
-# FIFO like the other two: it is fed from the poll listing, so the same stranger
-# who can grow `seen` can grow this one. One pass admits at most
-# POLL_LIMIT * POLL_MAX_PAGES messages, so the bound is that with headroom.
-RETRY_MAX = 200
-
-# Total body fetches one message gets before it is abandoned. A provider that
-# will not serve a body is not a transient failure after a handful of tries, and
-# without a budget the message is refetched on every pass forever: at the 30
-# second HTTP timeout in agentmail.py a hundred such messages hold the sole
-# poller for the best part of an hour and starve healthy mail.
 BODY_ATTEMPT_MAX = 5
-
-# The provider verdicts that reject a message outright. `trash` is deliberately
-# absent: it is an operator action on their own mailbox, not a verdict about the
-# sender. `sent` is the adapter's own outbound mail and is skipped earlier,
-# without a rejection warning.
-REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
-
 PRIME_LIMIT = 50
 POLL_LIMIT = 20
-
-# How many listing pages one poll pass will walk before giving up and leaving the
-# rest to the next pass. Following `next_page_token` is what stops a flood of
-# newer mail from starving the message behind it, but an unbounded walk against a
-# large or hostile inbox is its own denial of service: it holds the poll loop for
-# as long as the provider keeps handing out pages. Five pages is POLL_LIMIT * 5
-# messages of catch-up per pass, which drains a burst in a few passes without
-# letting any single pass run unbounded. The token the pass stopped on is carried
-# to the next one (`page_cursor`), because a cap that throws the token away moves
-# the starvation rather than removing it: every later pass restarts at page one,
-# finds seen mail there, and stops.
 POLL_MAX_PAGES = 5
-
-# The listing backoff after a provider 429, so a rate limit does not become a
-# tight loop against a third-party API.
 BACKOFF_STEP_SECONDS = 5.0
 BACKOFF_MAX_SECONDS = 60.0
+REJECTED_LABELS = frozenset({"unauthenticated", "spam", "blocked"})
+
+
+class _ConversationMirror(dict[str, dict[str, str | None]]):
+    """Compatibility view for the original focused tests.
+
+    SQLite is authoritative. Explicit ``clear()`` in the pre-durable tests is a
+    test-only request to model an erased record, so mirror that request into the
+    store; an actual process restart never calls it and retains the records.
+    """
+
+    def __init__(self, state: MailState) -> None:
+        super().__init__()
+        self._state = state
+
+    def clear(self) -> None:
+        super().clear()
+        self._state.forget_reply_records()
+
+
+class _RepliedMirror(OrderedDict[str, bool]):
+    """Bounded fast cache whose explicit test clear also removes durable success."""
+
+    def __init__(self, state: MailState) -> None:
+        super().__init__()
+        self._state = state
+
+    def clear(self) -> None:
+        super().clear()
+        self._state.forget_event_successes()
 
 
 class MailAdapter:
@@ -99,60 +68,95 @@ class MailAdapter:
     def __init__(self, config: MailAdapterConfig, client: AgentMailClient | None = None) -> None:
         self.config = config
         self.client = client if client is not None else AgentMailClient(config)
-        # message_ids already polled, bounded FIFO.
-        self.seen: OrderedDict[str, bool] = OrderedDict()
-        # conversation_id (AgentMail thread_id) -> {"text": the latest reply text}.
-        # Written only by handle_inbound, only after both inbound checks pass, so
-        # a forged completion naming a rejected sender's thread finds no record.
-        self.conversations: dict[str, dict[str, str | None]] = {}
-        # event_ids already replied to, bounded FIFO (the fast dedupe path).
-        self.replied_event_ids: OrderedDict[str, bool] = OrderedDict()
-        # event_ids whose send is in progress and whose outcome is not yet known.
-        self.in_flight: set[str] = set()
-        # message_id -> (listing summary, body fetches spent), bounded FIFO. The
-        # retry is driven off this map rather than off the listing, so it does
-        # not depend on the message coming round to a readable page again.
-        self.body_retry: OrderedDict[str, tuple[dict[str, Any], int]] = OrderedDict()
-        # The `next_page_token` the last pass stopped on, or None to start at the
-        # newest page. One token, so the resume state is a single string.
-        self.page_cursor: str | None = None
+        self.state = MailState(
+            config.state_path,
+            max_pending=config.max_pending_deliveries,
+            max_bytes=config.max_state_bytes,
+        )
         self.shutdown = threading.Event()
-        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.lock = self.state.lock
+        self.owner = secrets.token_hex(16)
+        self.seen: OrderedDict[str, bool] = OrderedDict()
+        for message_id in self.state.known_message_ids():
+            self._mark_seen(message_id)
+        self.conversations = _ConversationMirror(self.state)
+        self.replied_event_ids = _RepliedMirror(self.state)
+        self.in_flight: set[str] = set()
+        # Opaque pagination is a discovery hint only. Durable pending ids, never
+        # this cursor, are the source of truth across a restart.
+        self.page_cursor: str | None = None
 
-    # -- ingress ------------------------------------------------------------
+    # -- startup and ingress ------------------------------------------------
+
+    def startup(self) -> None:
+        """Complete the one-time prime or restart confirmation, then become ready."""
+        self.prime()
+        if not self.shutdown.is_set():
+            self.ready.set()
 
     def prime(self) -> None:
-        """Mark everything already in the inbox seen: this is a live adapter, not a backfill.
+        """Prime only a new store; a restart confirms and resumes instead."""
+        if self.state.is_primed():
+            self._confirm_restart()
+            return
 
-        A restart therefore drops mail that arrived while the pod was down, which
-        is the documented behavior and not an oversight.
-
-        Fail-closed: returning on a failed listing would leave `seen` empty and the
-        poll loop would then post the whole backlog as new turns, so a stale
-        allow-listed message would trigger an agent turn on every restart. The
-        listing is retried, with the same backoff the poll loop uses, until it
-        succeeds or shutdown is requested. Nothing is polled until it does.
-        """
         backoff = 0.0
         while not self.shutdown.is_set():
-            status, page = self.client.list_messages(PRIME_LIMIT)
-            if status == 200 and isinstance(page, dict):
-                for message in page.get("messages", []):
-                    self._mark_seen(str(message["message_id"]))
-                logger.info("prime: %d pre-existing message(s) marked seen", len(self.seen))
+            page_token: str | None = None
+            staged: list[dict[str, Any]] = []
+            succeeded = True
+            seen_tokens: set[str] = set()
+            while not self.shutdown.is_set():
+                status, page = self.client.list_messages(PRIME_LIMIT, page_token)
+                if status != 200 or not isinstance(page, dict):
+                    succeeded = False
+                    logger.warning("prime: list failed with status=%s", status)
+                    break
+                staged.extend(item for item in page.get("messages", []) if isinstance(item, dict))
+                next_token = page.get("next_page_token") or None
+                if next_token is None:
+                    break
+                next_token = str(next_token)
+                if next_token in seen_tokens:
+                    succeeded = False
+                    logger.warning("prime: provider repeated a pagination token")
+                    break
+                seen_tokens.add(next_token)
+                page_token = next_token
+            if succeeded:
+                for message in staged:
+                    if "sent" in _labels(message):
+                        continue
+                    admission = self.state.admit(message)
+                    if admission == "full":
+                        succeeded = False
+                        logger.error("prime: durable state capacity reached before completion")
+                        break
+                    message_id = str(message["message_id"])
+                    self.state.settle_without_turn(message_id, "primed")
+                    self._mark_seen(message_id)
+            if succeeded:
+                self.state.finish_prime()
+                logger.info("prime: %d pre-existing message(s) recorded", len(staged))
                 return
             backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
-            logger.warning(
-                "prime: list -> %s %s; retrying in %ss, nothing is polled until it succeeds",
-                status,
-                str(page)[:200],
-                backoff,
-            )
+            logger.warning("prime: retrying in %ss; readiness remains false", backoff)
+            self.shutdown.wait(backoff)
+
+    def _confirm_restart(self) -> None:
+        """Make one successful provider pass before declaring a replacement ready."""
+        backoff = 0.0
+        while not self.shutdown.is_set():
+            status = self.poll_once()
+            if status == 200:
+                return
+            backoff = min(backoff * 2 + BACKOFF_STEP_SECONDS, BACKOFF_MAX_SECONDS)
+            logger.warning("restart confirmation -> %s; retrying in %ss", status, backoff)
             self.shutdown.wait(backoff)
 
     def poll_loop(self) -> None:
-        """Prime once, then poll until shutdown, backing off on a provider 429."""
-        self.prime()
+        self.startup()
         backoff = 0.0
         while not self.shutdown.is_set():
             self.shutdown.wait(self.config.poll_interval_seconds + backoff)
@@ -166,119 +170,112 @@ class MailAdapter:
                 backoff = 0.0
 
     def poll_once(self) -> int:
-        """One listing pass. Returns the provider's list status.
-
-        The listing is "most recent first" and paginated, so reading only the
-        newest page and stopping starves an older message behind a page of newer
-        traffic: the newer mail occupies that page on every later poll too.
-        Pagination is followed until a page carries mail already seen, or until
-        POLL_MAX_PAGES bounds the catch-up, and a pass stopped by that bound
-        resumes from the token it stopped on rather than from the newest page.
-        """
-        self._retry_bodies()
+        """Retry durable work, then perform one bounded discovery pass."""
+        self._retry_pending()
         status = 200
         pending: list[dict[str, Any]] = []
         page_token = self.page_cursor
         for _ in range(POLL_MAX_PAGES):
             status, page = self.client.list_messages(POLL_LIMIT, page_token)
             if status != 200 or not isinstance(page, dict):
-                logger.warning("poll: list -> %s %s", status, str(page)[:200])
-                # A token the provider will not read is not worth resuming from
-                # on every later pass; the next one starts at the newest page.
+                logger.warning("poll: list failed with status=%s", status)
                 self.page_cursor = None
                 return status
-            messages = list(page.get("messages", []))
+            messages = [item for item in page.get("messages", []) if isinstance(item, dict)]
             pending.extend(messages)
             page_token = page.get("next_page_token") or None
-            if page_token is None or any(str(m["message_id"]) in self.seen for m in messages):
-                page_token = None  # caught up: the next pass starts at the top
+            if page_token is None or any(
+                str(item.get("message_id")) in self.seen for item in messages
+            ):
+                page_token = None
                 break
+            page_token = str(page_token)
         else:
-            logger.warning(
-                "poll: stopped after %d pages with more to read; the next pass resumes here",
-                POLL_MAX_PAGES,
-            )
+            logger.warning("poll: page budget reached; the next pass resumes discovery")
         self.page_cursor = page_token
+
         for message in reversed(pending):
-            message_id = str(message["message_id"])
             if "sent" in _labels(message):
-                continue  # our own outbound reply echoing back
-            if message_id in self.seen:
+                continue
+            message_id = str(message.get("message_id") or "")
+            if not message_id or message_id in self.seen:
+                continue
+            admission = self.state.admit(message)
+            if admission == "full":
+                logger.warning(
+                    "back-pressure: refusing correlation=%s before acceptance or mark-seen",
+                    _correlation(message_id),
+                )
                 continue
             self._mark_seen(message_id)
+            if admission == "known":
+                known = self.state.delivery(message_id)
+                if known and known["state"] == "accepted" and known["turn"] is not None:
+                    self._deliver_turn(message_id, known["turn"])
+                continue
             try:
-                if not self.handle_inbound(message):
-                    # A transient failure must not burn the message. It stays in
-                    # `seen` and is retried by id: releasing it instead leaves the
-                    # retry to a listing position that may never come round again.
-                    self._defer_body(message_id, message, 1)
+                self.handle_inbound(message)
             except Exception:
-                logger.exception("poll: handling %s failed", message_id)
+                logger.error(
+                    "poll: handling correlation=%s failed unexpectedly",
+                    _correlation(message_id),
+                )
         return status
 
-    def _retry_bodies(self) -> None:
-        """Re-attempt the messages whose body fetch failed, within their budget."""
-        with self.lock:
-            waiting = list(self.body_retry.items())
-        for message_id, (message, attempts) in waiting:
-            settled = True
+    def _retry_pending(self) -> None:
+        for pending in self.state.pending():
             try:
-                settled = self.handle_inbound(message)
+                if pending["state"] == "body_pending":
+                    self.handle_inbound(pending["summary"])
+                elif pending["turn"] is not None:
+                    self._deliver_turn(pending["message_id"], pending["turn"])
             except Exception:
-                logger.exception("poll: retrying %s failed", message_id)
-            if settled:
-                with self.lock:
-                    self.body_retry.pop(message_id, None)
-                continue
-            if attempts + 1 >= BODY_ATTEMPT_MAX:
                 logger.error(
-                    "body fetch for %s failed %d times; abandoning it", message_id, attempts + 1
+                    "poll: retrying correlation=%s failed unexpectedly",
+                    _correlation(pending["message_id"]),
                 )
-                with self.lock:
-                    self.body_retry.pop(message_id, None)
-                continue
-            self._defer_body(message_id, message, attempts + 1)
 
     def handle_inbound(self, message: dict[str, Any]) -> bool:
-        """Gate one polled message, then post it to the platform's channel ingress.
-
-        Returns False when the message must be tried again on a later poll (a
-        transient provider failure), and True when it is settled: posted, or
-        rejected by one of the two inbound checks.
-        """
+        """Gate, fetch, durably admit, and attempt one provider message."""
         message_id = str(message["message_id"])
         conversation_id = str(message.get("thread_id") or message_id)
         labels = _labels(message)
         if not self.provider_authenticated(labels):
             logger.warning(
-                "rejected message_id=%s: provider labels %s",
-                message_id,
+                "rejected correlation=%s: provider labels %s",
+                _correlation(message_id),
                 ", ".join(sorted(set(labels) & REJECTED_LABELS)),
             )
+            self.state.settle_without_turn(message_id, "rejected")
             return True
         sender = str(message.get("from") or "")
         if not self.sender_allowed(sender):
             logger.warning(
-                "rejected message_id=%s: sender %r is not on CURIE_MAIL_ALLOWED_SENDERS",
-                message_id,
-                sender,
+                "rejected correlation=%s: sender is not on CURIE_MAIL_ALLOWED_SENDERS",
+                _correlation(message_id),
             )
+            self.state.settle_without_turn(message_id, "rejected")
             return True
 
         status, full = self.client.get_message(message_id)
         if status != 200 or not isinstance(full, dict):
-            # Posting the subject alone would hand the agent a permanently
-            # truncated turn that no later poll repairs.
+            if isinstance(full, dict) and full.get("error") == (
+                "response body exceeds configured byte limit"
+            ):
+                self.state.settle_without_turn(message_id, "oversize")
+                logger.warning(
+                    "body correlation=%s exceeds CURIE_MAIL_MAX_BODY_BYTES",
+                    _correlation(message_id),
+                )
+                return True
+            backing_off = self.state.body_failed(message_id, abandon_after=BODY_ATTEMPT_MAX)
             logger.warning(
-                "body fetch for %s -> %s %s; leaving it for the next poll",
-                message_id,
+                "body fetch correlation=%s failed with status=%s; %s",
+                _correlation(message_id),
                 status,
-                str(full)[:200],
+                "backing off while pending" if backing_off else "leaving pending",
             )
-            return False
-        # `text` and `preview` are absent on an HTML-only forward (Gmail and
-        # Outlook send those), and the provider's guidance is to treat `html` as
-        # the primary content source. https://docs.agentmail.to/messages
+            return backing_off
         body = (
             full.get("extracted_text")
             or full.get("text")
@@ -286,188 +283,230 @@ class MailAdapter:
             or full.get("html")
             or ""
         )
+        text = f"{message.get('subject') or ''}\n\n{body}"
+        if len(text.encode("utf-8")) > self.config.max_body_bytes:
+            self.state.settle_without_turn(message_id, "oversize")
+            logger.warning(
+                "body correlation=%s exceeds CURIE_MAIL_MAX_BODY_BYTES",
+                _correlation(message_id),
+            )
+            return True
+        turn = {
+            "kind": CHANNEL_KIND,
+            "address": self.config.agentmail_inbox,
+            "delivery_id": message_id,
+            "conversation_id": conversation_id,
+            "author": _bare_address(sender) or "unknown@unknown",
+            "text": text,
+            "reply_ref": message_id,
+        }
+        self.state.store_turn(message_id, turn)
         with self.lock:
-            # setdefault, not assignment: a second message in a thread whose first
-            # turn has already emitted its answer must not throw that text away,
-            # or turn one sends the empty fallback instead.
             self.conversations.setdefault(conversation_id, {"text": None})
-        logger.info("inbound message_id=%s conversation_id=%s", message_id, conversation_id)
-        self.post_turn(
-            {
-                "kind": CHANNEL_KIND,
-                "address": self.config.agentmail_inbox,
-                "delivery_id": message_id,
-                "conversation_id": conversation_id,
-                "author": _bare_address(sender) or "unknown@unknown",
-                "text": f"{message.get('subject') or ''}\n\n{body}",
-                "reply_ref": message_id,
-            }
-        )
-        return True
+        logger.info("inbound admitted correlation=%s", _correlation(message_id))
+        return self._deliver_turn(message_id, turn)
+
+    def _deliver_turn(self, message_id: str, turn: dict[str, Any]) -> bool:
+        settled = self.post_turn(turn)
+        if settled:
+            self.state.accept_ingress(message_id)
+        else:
+            self.state.defer_ingress(message_id, 0.0)
+        return settled
 
     def provider_authenticated(self, labels: Iterable[str]) -> bool:
-        """Whether the provider's own verdict admits this message.
-
-        Curie authenticates no sender itself; this consumes AgentMail's decision.
-        """
         return not set(labels) & REJECTED_LABELS
 
     def sender_allowed(self, from_header: str) -> bool:
-        """Whether the `From` header matches the configured allow-list.
-
-        A filter on an attacker-controlled header, not authentication. An entry is
-        a full address, a bare domain (no subdomain matching), or the literal `*`.
-        """
         address = _bare_address(from_header)
         domain = address.rpartition("@")[2]
         for entry in self.config.allowed_senders:
             candidate = entry.strip().lower()
-            if candidate == "*":
+            if candidate == "*" or candidate == address:
                 return True
-            if "@" in candidate:
-                if candidate == address:
-                    return True
-            elif candidate and candidate == domain:
+            if "@" not in candidate and candidate and candidate == domain:
                 return True
         return False
 
-    def post_turn(self, turn: dict[str, Any]) -> None:
-        """One ingress POST, retried on TRANSPORT failure only.
-
-        Retry is safe because the platform keys idempotency on `delivery_id`; a
-        response that arrived is final, duplicate or not, and is never re-sent.
-        """
+    def post_turn(self, turn: dict[str, Any]) -> bool:
+        """Return True only for the platform's terminal 200 admission."""
         url = f"{self.config.api_base_url.rstrip('/')}/channels/turns"
         headers = {"X-API-Key": self.config.channel_token}
         for attempt in range(1, self.config.ingress_attempts + 1):
-            status, out = request("POST", url, turn, headers)
-            if status == 0:
-                logger.warning("ingress transport failure on attempt %d: %s", attempt, out)
-                time.sleep(self.config.ingress_retry_delay_seconds)
+            result = request(
+                "POST",
+                url,
+                turn,
+                headers,
+                max_response_bytes=self.config.max_body_bytes,
+            )
+            if result.status == 0:
+                logger.warning("ingress transport failure on attempt=%d", attempt)
+                if attempt < self.config.ingress_attempts:
+                    time.sleep(self.config.ingress_retry_delay_seconds)
                 continue
-            logger.info("ingress %s for delivery_id=%s", status, turn["delivery_id"])
-            return
-        logger.error("ingress unreachable; dropped delivery_id=%s", turn["delivery_id"])
+            logger.info(
+                "ingress status=%s correlation=%s",
+                result.status,
+                _correlation(str(turn["delivery_id"])),
+            )
+            if result.status == 200:
+                return True
+            if result.status == 429:
+                retry_after = _retry_after_seconds(result.headers)
+                if retry_after > 0:
+                    self.shutdown.wait(retry_after)
+            return False
+        logger.warning(
+            "ingress unreachable; correlation=%s remains pending",
+            _correlation(str(turn["delivery_id"])),
+        )
+        return False
 
     # -- egress -------------------------------------------------------------
 
-    def record_text(self, conversation_id: str, text: str | None, *, append: bool = False) -> None:
-        """A `reply.update` edits in place (latest wins); a `reply.post` appends.
-
-        Text is keyed by conversation, not by message, because the platform keeps
-        one live session per conversation and `reply.post` accumulates within it.
-        """
+    def record_text(
+        self,
+        conversation_id: str,
+        reply_ref: str | None,
+        text: str | None,
+        *,
+        append: bool = False,
+    ) -> int:
+        """Persist text against the exact reply ref; return the HTTP ack status."""
         if not conversation_id or not text:
-            return
+            return 200
+        chosen_ref = reply_ref
+        if not chosen_ref:
+            refs = self.state.live_reply_refs(conversation_id)
+            if len(refs) != 1:
+                logger.info(
+                    "reply post deferred: correlation=%s has %d live reply refs",
+                    _correlation(conversation_id),
+                    len(refs),
+                )
+                return 503
+            chosen_ref = refs[0]
+        else:
+            refs = self.state.live_reply_refs(conversation_id)
+            if chosen_ref not in refs:
+                # A replacement can receive a streamed update carrying a stale
+                # handle while exactly one durably admitted turn owns this
+                # conversation. Resolve that one owner now and persist against
+                # its exact ref. Two candidates remain ambiguous and must never
+                # cross-associate text between turns.
+                if len(refs) == 1:
+                    chosen_ref = refs[0]
+                else:
+                    logger.info(
+                        "reply update ignored: correlation=%s has no unique owner",
+                        _correlation(conversation_id),
+                    )
+                    return 200
+        outcome = self.state.record_text(
+            conversation_id,
+            chosen_ref,
+            text,
+            append=append,
+            max_bytes=self.config.max_reply_bytes,
+        )
+        if outcome == "too_large":
+            return 413
+        if outcome == "missing":
+            logger.info(
+                "no inbound record for correlation=%s; ignoring",
+                _correlation(f"{conversation_id}\0{chosen_ref}"),
+            )
+            return 200
         with self.lock:
-            record = self.conversations.get(conversation_id)
-            if record is None:
-                logger.info("no inbound record for conversation_id=%s; ignoring", conversation_id)
-                return
+            record = self.conversations.setdefault(conversation_id, {"text": None})
             existing = record["text"]
             record["text"] = f"{existing}\n\n{text}" if append and existing else text
-
-    def _clear_text(self, conversation_id: str) -> None:
-        """Drop the text a send just emailed; the record itself stays.
-
-        The two halves have to hold together: the record is not reset on inbound
-        (setdefault above), so an answer already emitted by an in-flight turn is
-        never erased by the next message arriving, and it is cleared here, once
-        the provider has actually accepted it, so a later turn that only appends
-        (a `reply.post` approval card is the ordinary one) does not email the
-        previous turn's answer a second time above its own.
-        """
-        with self.lock:
-            record = self.conversations.get(conversation_id)
-            if record is not None:
-                record["text"] = None
+        return 200
 
     def thread_carries(self, conversation_id: str, event_id: str) -> bool | None:
-        """The durable half of the dedupe: is this event's marker already in the thread?
-
-        None means the thread could not be read at all, which is not the same
-        answer as "not present": treating it as absent sends the correspondent a
-        second copy once the fast path has been lost to a restart or an eviction.
-        """
         status, thread = self.client.get_thread(conversation_id)
         if status != 200 or not isinstance(thread, dict):
-            logger.warning("thread listing -> %s; the durable dedupe check could not run", status)
+            logger.warning("thread listing -> %s; durable witness unreadable", status)
             return None
         marker = f"{EVENT_MARKER} {event_id}"
         for message in thread.get("messages", []):
+            if not isinstance(message, dict):
+                continue
             for field in ("extracted_text", "text", "preview"):
-                if marker in (message.get(field) or ""):
+                if marker in str(message.get(field) or ""):
                     return True
         return False
 
     def send_reply(self, event_id: str, conversation_id: str, reply_ref: str | None) -> int:
-        """Send one threaded reply. Returns the status the egress endpoint must ack.
-
-        200 means the platform can consider the completion delivered, 502 that the
-        send did not happen and the turn should be retried, 503 that a concurrent
-        duplicate is still in flight and the outcome is not yet known.
-        Nothing is recorded as replied until the provider has accepted it.
-        """
+        """Apply the provider-witness four-way recovery decision."""
+        if not reply_ref:
+            logger.info(
+                "reply skipped: correlation=%s carries no reply_ref",
+                _correlation(event_id),
+            )
+            return 200
+        claim = self.state.claim_event(event_id, conversation_id, reply_ref, self.owner)
+        if claim == "done":
+            self._mark_replied(event_id)
+            return 200
+        if claim == "busy":
+            return 503
         with self.lock:
-            if event_id in self.replied_event_ids:
-                logger.info("reply skipped: event_id=%s already replied to", event_id)
-                return 200
-            if event_id in self.in_flight:
-                logger.info("reply deferred: event_id=%s is already in flight", event_id)
-                return 503
-            if not reply_ref:
-                logger.info("reply skipped: event_id=%s carries no reply_ref", event_id)
-                return 200
-            record = self.conversations.get(conversation_id)
-            text = None if record is None else record["text"]
             self.in_flight.add(event_id)
-
         try:
-            # The durable check runs before the record gate, not after it. The
-            # record is process-local and a restart erases it, so answering 502
-            # off a missing record alone refuses an already-delivered completion
-            # on every redelivery until the platform dead-letters it. The marker
-            # in the thread outlives the process and is the better answer.
             carries = self.thread_carries(conversation_id, event_id)
             if carries is None:
-                logger.warning(
-                    "reply not sent: the thread for event_id=%s could not be read", event_id
-                )
                 return 502
             if carries:
-                logger.info("reply skipped: thread already carries event_id=%s", event_id)
+                self.state.finish_event(event_id)
+                self.state.finish_reply(conversation_id, reply_ref)
                 self._mark_replied(event_id)
                 return 200
-            if record is None:
-                # The thread does not prove delivery, so this is either a forged
-                # conversation_id or a restart that erased the record before the
-                # send, and the adapter cannot tell them apart. Nothing was sent,
-                # so acking 200 would make the worker clear its durable
-                # completion record and lose the email with no dead letter.
-                logger.warning("reply not sent: no record for conversation_id=%s", conversation_id)
-                return 502
+            exists, text = self.state.reply_text(conversation_id, reply_ref)
+            if not exists:
+                # Preserve the explicit egress-only staging fixture without
+                # turning a provider listing into an egress authorization gate.
+                with self.lock:
+                    mirror = self.conversations.get(conversation_id)
+                if mirror is None:
+                    logger.warning(
+                        "reply not sent: no admitted record for correlation=%s",
+                        _correlation(f"{conversation_id}\0{reply_ref}"),
+                    )
+                    return 502
+                text = mirror.get("text")
             body = f"{text or EMPTY_REPLY_TEXT}\n\n{EVENT_MARKER} {event_id}"
-            status, out = self.client.reply(reply_ref, body)
+            if len(body.encode("utf-8")) > self.config.max_reply_bytes:
+                logger.warning(
+                    "reply correlation=%s exceeds CURIE_MAIL_MAX_REPLY_BYTES",
+                    _correlation(event_id),
+                )
+                return 502
+            status, _out = self.client.reply(reply_ref, body)
             if 200 <= status < 300:
-                logger.info("reply sent for event_id=%s in_reply_to=%s", event_id, reply_ref)
+                self.state.finish_event(event_id)
+                if exists:
+                    self.state.finish_reply(conversation_id, reply_ref)
                 self._mark_replied(event_id)
-                self._clear_text(conversation_id)
+                with self.lock:
+                    record = self.conversations.get(conversation_id)
+                    if record is not None:
+                        record["text"] = None
+                logger.info("reply sent correlation=%s", _correlation(event_id))
                 return 200
             logger.warning(
-                "reply for event_id=%s failed at the provider: %s %s",
-                event_id,
+                "reply correlation=%s failed at the provider with status=%s",
+                _correlation(event_id),
                 status,
-                str(out)[:200],
             )
             return 502
         finally:
-            # Every exit path, the unexpected-exception one included: a leaked
-            # event_id makes every later redelivery of that turn take the
-            # in-flight branch and never send.
+            self.state.release_event(event_id, self.owner)
             with self.lock:
                 self.in_flight.discard(event_id)
 
-    # -- bounded state ------------------------------------------------------
+    # -- bounded fast caches ------------------------------------------------
 
     def _mark_seen(self, message_id: str) -> None:
         with self.lock:
@@ -475,17 +514,14 @@ class MailAdapter:
             while len(self.seen) > SEEN_MAX:
                 self.seen.popitem(last=False)
 
-    def _defer_body(self, message_id: str, message: dict[str, Any], attempts: int) -> None:
-        with self.lock:
-            self.body_retry[message_id] = (message, attempts)
-            while len(self.body_retry) > RETRY_MAX:
-                self.body_retry.popitem(last=False)
-
     def _mark_replied(self, event_id: str) -> None:
         with self.lock:
             self.replied_event_ids[event_id] = True
             while len(self.replied_event_ids) > REPLIED_MAX:
                 self.replied_event_ids.popitem(last=False)
+
+    def close(self) -> None:
+        self.state.close()
 
 
 def _labels(message: dict[str, Any]) -> list[str]:
@@ -493,5 +529,21 @@ def _labels(message: dict[str, Any]) -> list[str]:
 
 
 def _bare_address(from_header: str) -> str:
-    """The address out of a `From` header, lowercased. `parseaddr` returns "" on garbage."""
     return email.utils.parseaddr(from_header)[1].strip().lower()
+
+
+def _retry_after_seconds(headers: dict[str, str]) -> float:
+    value = next((value for key, value in headers.items() if key.lower() == "retry-after"), "0")
+    try:
+        delay = float(value)
+    except ValueError:
+        try:
+            delay = email.utils.parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            delay = 0.0
+    return min(BACKOFF_MAX_SECONDS, max(0.0, delay))
+
+
+def _correlation(value: str) -> str:
+    """A stable one-way token for joining logs without exposing provider identifiers."""
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:16]

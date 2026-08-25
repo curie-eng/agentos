@@ -6,13 +6,14 @@ the enforceable-rule summary.
 
 ## Load-bearing invariants
 
-- **The adapter holds no platform API key, no queue credential, and no database
-  access.** Its only credentials are `CURIE_CHANNEL_TOKEN` (presented as
+- **The adapter holds no platform API key, no queue credential, and no platform
+  database access.** Its only credentials are `CURIE_CHANNEL_TOKEN` (presented as
   `X-API-Key` on ingress), `CURIE_EGRESS_SECRET` (checked on every inbound POST)
   and `AGENTMAIL_API_KEY`. Do not add `CURIE_API_KEY`, a Valkey client, or a DB
-  session here; a capability the adapter does not hold cannot be stolen from it,
-  and re-minting an expired `chn` token is an operator step for exactly that
-  reason.
+  session to the platform here; a capability the adapter does not hold cannot be
+  stolen from it, and re-minting an expired `chn` token is an operator step for
+  exactly that reason. Its local SQLite file is delivery state, not a platform
+  capability, and must never contain any of the three credentials.
 - **The reply target is `target.reply_ref` off the event, never the conversation
   record.** The record is overwritten by every inbound message in the thread, so
   deriving the target from it sends turn one's answer to message two. The record
@@ -24,11 +25,12 @@ the enforceable-rule summary.
   its durable completion record (`kernel.py` `clear_completion`, on any 2xx) and
   the email is gone with no retry and no dead letter. Do not collapse 502 and 503
   into one code: they mean different things in the worker's log.
-- **`in_flight` is cleaned up in a `finally`.** The set is added to before an
-  outbound call and removed after it, so an exception between the two would leak
-  the `event_id` and make every later redelivery of that turn take the in-flight
-  branch and never send. The mutation proof is
-  `tests/test_egress.py::test_an_unexpected_exception_does_not_poison_the_event_id`.
+- **A completion claim is a timed, reclaimable durable lease.** A crash may
+  leave a live lease, so restart or expiry must reclaim it and consult the
+  provider-visible event witness before deciding whether to send. An unreadable
+  witness or a completion with no admitted reply row is 502/no send; an active
+  lease owned by this process is 503. Never turn either case into 200 or a
+  permanent 503.
 - **The inbound gate is two checks, in order: the provider's verdict labels, then
   the allow-list.** They are not equivalent and the ordering is not incidental.
   The provider's filtering is the real control; the label check is defense in
@@ -43,16 +45,20 @@ the enforceable-rule summary.
 - **`conversations` is written only after both inbound checks pass.** Pre-seeding
   it from the poll listing, however convenient, silently removes the allow-list's
   protection of egress.
-- **`seen` is bounded and every polled id enters it before the allow-list
-  decision.** That ordering is what makes the bound necessary: without it anyone
-  who can mail a public inbox grows the map until the pod is OOMKilled, with no
-  inbound gate in the way.
+- **Admission is bounded before state or body allocation.** At the pending or
+  state-byte cap, leave provider mail unclaimed and unmodified so later capacity
+  can recover it. Never evict an unresolved delivery merely to admit a newer one.
+- **Logs carry no raw mail PII.** Do not log sender addresses, subjects, bodies,
+  provider message/thread ids, or reply text. Use a one-way correlation token
+  and a reason/state label so operators can join retries without copying mail
+  content into the cluster log-retention system.
 - **Empty allow-list plus ingress enabled is a boot failure, not deny-all.** The
   inbox is a public mailbox by construction, so fail-open would make every install
   an open trigger for agent turns. Allow-all must be written as `*`.
-- **All state is process-local and the chart pins one replica.** Adding a second
-  replica splits `reply.update` and `turn.completed` across pods. Horizontal scale
-  needs shared state, which is a different ticket.
+- **One SQLite file has one serialized writer and the chart pins one replica.**
+  Every poller and egress transaction uses the adapter-owned lock. Adding a
+  second replica or changing `Recreate` to rolling update creates two writers;
+  horizontal scale needs a separately accepted shared-store design.
 
 ## Config surface
 

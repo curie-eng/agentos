@@ -23,11 +23,17 @@ Env mapping:
     CURIE_MAIL_INGRESS_ATTEMPTS             -> ingress_attempts
     CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS  -> ingress_retry_delay_seconds
     CURIE_MAIL_PORT                         -> port
+    CURIE_MAIL_STATE_PATH                   -> state_path
+    CURIE_MAIL_MAX_PENDING_DELIVERIES       -> max_pending_deliveries
+    CURIE_MAIL_MAX_BODY_BYTES               -> max_body_bytes
+    CURIE_MAIL_MAX_REPLY_BYTES              -> max_reply_bytes
+    CURIE_MAIL_MAX_STATE_BYTES              -> max_state_bytes
     CURIE_MAIL_ALLOWED_SENDERS              -> allowed_senders
 
-The adapter holds no platform API key, no queue credential, and no database
+The adapter holds no platform API key, queue credential, or platform database
 access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its only Curie
-credentials, and ``AGENTMAIL_API_KEY`` its only provider one.
+credentials, and ``AGENTMAIL_API_KEY`` its only provider one. Its local SQLite
+file is a single-replica delivery journal, not a platform capability.
 """
 
 from __future__ import annotations
@@ -95,6 +101,20 @@ class MailAdapterConfig(BaseSettings):
         default=2.0, validation_alias="CURIE_MAIL_INGRESS_RETRY_DELAY_SECONDS"
     )
     port: int = Field(default=8080, validation_alias="CURIE_MAIL_PORT")
+    state_path: str = Field(
+        default="/var/lib/curie-mail/state.sqlite3",
+        validation_alias="CURIE_MAIL_STATE_PATH",
+    )
+    max_pending_deliveries: int = Field(
+        default=1000, validation_alias="CURIE_MAIL_MAX_PENDING_DELIVERIES"
+    )
+    max_body_bytes: int = Field(default=1_048_576, validation_alias="CURIE_MAIL_MAX_BODY_BYTES")
+    max_reply_bytes: int = Field(
+        default=1_048_576, validation_alias="CURIE_MAIL_MAX_REPLY_BYTES"
+    )
+    max_state_bytes: int = Field(
+        default=268_435_456, validation_alias="CURIE_MAIL_MAX_STATE_BYTES"
+    )
 
     # A comma-separated list of full addresses, bare domains, or the single
     # literal "*". NoDecode keeps pydantic-settings from JSON-parsing it, so the

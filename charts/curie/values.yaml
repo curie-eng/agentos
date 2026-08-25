@@ -906,6 +906,18 @@ mailAdapter:
   inbox: ""
   # Seconds between polls of that inbox.
   pollIntervalSeconds: 5
+  # A transport or retryable ingress response leaves the delivery durable and
+  # schedules another attempt. These two values bound the short in-process
+  # attempt loop; the SQLite row remains the authority across restarts.
+  ingressAttempts: 3
+  ingressRetryDelaySeconds: 2
+  # Durable admission and allocation bounds. maxStateBytes is intentionally
+  # smaller than the default PVC so SQLite has room for its WAL, indexes, and
+  # filesystem overhead instead of discovering a full volume mid-transaction.
+  maxPendingDeliveries: 1000
+  maxBodyBytes: 1048576
+  maxReplyBytes: 1048576
+  maxStateBytes: 268435456
   # Whether the adapter posts inbound mail to the platform. false serves egress
   # while sending nothing inbound, which is the staged-cutover position while the
   # platform side of a new binding is being wired.
@@ -933,6 +945,10 @@ mailAdapter:
     # like a permissions problem rather than a missing credential.
     apiKey: ""
     baseUrl: "https://api.agentmail.to/v0"
+    # NetworkPolicy cannot authorize a DNS name. Supply the current provider
+    # (or a controlled egress proxy) HTTPS CIDRs explicitly. Enabling the
+    # adapter with an empty list fails the chart render closed.
+    httpsCidrs: []
   # The `chn` channel token minted by the API's POST /channels/token, scoped to
   # this adapter's channel binding. The adapter presents it on every inbound post.
   channelToken: ""
@@ -947,14 +963,33 @@ mailAdapter:
   # Must equal the `adapter` slug on the agent's channel binding row, and it is
   # also the key the derived worker.adapterCredentials entry lands under.
   adapterSlug: "mail-adapter"
+  # The SQLite state is a single-writer RWO volume. Empty existingClaim renders
+  # a chart-owned PVC; otherwise name a RWO Filesystem PVC that already exists
+  # in the release namespace. The install/upgrade hook verifies that claim
+  # before the Deployment is replaced.
+  persistence:
+    existingClaim: ""
+    size: 1Gi
+    # Empty inherits global.storageClass; if both are empty the cluster default
+    # StorageClass is used.
+    storageClass: ""
+    preflight:
+      resources:
+        requests: { cpu: 10m, memory: 24Mi }
+        limits: { cpu: 100m, memory: 64Mi }
   resources:
     requests: { cpu: 25m, memory: 64Mi }
     limits: { cpu: 250m, memory: 256Mi }
+  podSecurityContext:
+    fsGroup: 1000
+    fsGroupChangePolicy: OnRootMismatch
   # Container securityContext (issue #67). Image runs as non-root uid 1000 (see
   # apps/mail-adapter/Dockerfile). readOnlyRootFilesystem is true here, unlike the
-  # dispatcher: the adapter writes no heartbeat file and needs no writable root.
+  # dispatcher: SQLite and temporary files use explicit PVC/emptyDir mounts, so
+  # the image root itself stays immutable.
   containerSecurityContext:
     runAsNonRoot: true
+    runAsUser: 1000
     allowPrivilegeEscalation: false
     readOnlyRootFilesystem: true
     capabilities:
