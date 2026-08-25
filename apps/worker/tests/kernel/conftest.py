@@ -513,7 +513,8 @@ def make_harness(
 
     Closes over the per-test names and the sync Valkey client so tests need no
     conftest import (which importlib mode makes fragile). Optional kwargs:
-    ``binding`` (a resolver injected into the kernel), ``with_killswitch``
+    ``binding`` (a resolver injected into the kernel), ``actions`` (an action
+    ledger recorder), ``with_killswitch``
     (build a real KillSwitch wired to the kernel) and ``sink`` (any ``ReplySink``
     -- a real ``ReplySinkRouter`` for the adapter-selection tests, T-B3/T-B4);
     the rest are config overrides."""
@@ -533,6 +534,7 @@ async def kernel_harness(
     with_killswitch: bool = False,
     approvals: object | None = None,
     approval_reader: object | None = None,
+    actions: object | None = None,
     publication_creator: object | None = None,
     sink: object | None = None,
     claim_timeout_seconds: float = 3.0,
@@ -581,6 +583,7 @@ async def kernel_harness(
         binding=binding,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
+        actions=actions,  # type: ignore[arg-type]
         publication_creator=publication_creator,  # type: ignore[arg-type]
         card_store=card_store,
     )

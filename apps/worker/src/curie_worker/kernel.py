@@ -65,6 +65,7 @@ from channel_protocol.reply import (
 )
 from pydantic import ValidationError
 
+from .actions import ActionBackendError, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import (
     ApprovalBackendError,
@@ -356,6 +357,11 @@ class _StreamAccumulator:
     approval_route: str | None = None
     approval_gate_kind: str | None = None
     approval_granted_tool: str | None = None
+    # Call id -> the ledger record it opened. One CALL produces two ACI frames
+    # (ADR-0117): the first opens a record, the second closes THAT record rather
+    # than minting a second. A turn that calls the same tool twice is only
+    # distinguishable here by the call id.
+    open_actions: dict[str, str] = field(default_factory=dict)
 
     def rendered(self) -> str:
         return self.final_text if self.final_text is not None else "".join(self.text_parts)
@@ -496,6 +502,7 @@ class Kernel:
         # read method it never calls. In production both are the one
         # ``ApprovalClient``.
         approval_reader: ApprovalReader | None = None,
+        actions: ActionRecorder | None = None,
         card_store: ApprovalCardStore | None = None,
         route_ttl_seconds: int = 3600,
         suspended_route_ttl_seconds: int = 86400,
@@ -522,6 +529,11 @@ class Kernel:
         self._approvals = approvals
         self._publication_creator = publication_creator
         self._approval_reader = approval_reader
+        # The action ledger (ADR-0117). Optional like the approval backend: an
+        # unwired deployment records nothing rather than failing every turn that
+        # touches the world. Where it IS wired, a write it refuses fails the turn
+        # -- see _apply_frame.
+        self._actions = actions
         # Remembers where each suspended thread's approval card was posted so an
         # EXPIRY can disable it (#419); absent (unwired tests) simply skips the
         # card teardown -- the resolve-click path still heals a card on click.
@@ -1557,7 +1569,7 @@ class Kernel:
                 and await self._killswitch.is_killed(agent_id)
             ):
                 await self.interrupt_thread(thread, f"agent {agent_id} killed by operator")
-            outcome = await self._consume(qevent, route, routed.turn, nav)
+            outcome = await self._consume(qevent, route, routed.turn, nav, agent_id)
             if (
                 outcome.status is SessionStatus.AWAITING_APPROVAL
                 and _is_publish_provenance(
@@ -2388,6 +2400,7 @@ class Kernel:
         route: TargetRoute,
         turn: TurnStream,
         nav: NavAffordance | None = None,
+        agent_id: uuid.UUID | None = None,
     ) -> TurnOutcome:
         acc = _StreamAccumulator()
         reply = _ThrottledReply(
@@ -2417,7 +2430,7 @@ class Kernel:
             # the connection is never leaked.
             async with turn:
                 async for frame in turn:
-                    await self._apply_frame(frame, acc, reply, qevent.event_id)
+                    await self._apply_frame(frame, acc, reply, qevent, agent_id)
         except (aiohttp.ClientError, TimeoutError) as exc:
             # Stream dropped mid-run (sandbox killed, network fault). No final.
             logger.warning("turn stream dropped for %s: %s", qevent.event_id, exc)
@@ -2425,6 +2438,21 @@ class Kernel:
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,
                 classification=acc.classification or "runner-error",
+                text=acc.rendered(),
+            )
+        except ActionBackendError as exc:
+            # The ledger refused a write (ADR-0117). The change to the world has
+            # already happened and the platform has no account of it, so this
+            # ends the turn rather than completing one whose receipt would be a
+            # lie. "ledger-error" is deliberately absent from
+            # RETRYABLE_CLASSIFICATIONS: a retry would re-execute a side effect,
+            # which is the rule ADR-0013 already holds, and escalation puts a
+            # human in front of the gap.
+            logger.error("action ledger write failed for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=acc.saw_side_effect,
+                classification="ledger-error",
                 text=acc.rendered(),
             )
 
@@ -2435,7 +2463,8 @@ class Kernel:
         frame: OutboundEvent,
         acc: _StreamAccumulator,
         reply: _ThrottledReply,
-        event_id: str,
+        qevent: QueuedTurn,
+        agent_id: uuid.UUID | None = None,
     ) -> None:
         if isinstance(frame, TextDelta):
             acc.text_parts.append(frame.text)
@@ -2447,7 +2476,11 @@ class Kernel:
         elif isinstance(frame, SideEffectFlag):
             acc.saw_side_effect = True
             # Persist immediately so a crash before done still blocks auto-retry.
-            await self._markers.mark_side_effect(event_id)
+            # Unchanged by ADR-0117: this latches on the FIRST frame and the rule
+            # reads presence, so a stream carrying one frame per call rather than
+            # one per turn is the same signal to it.
+            await self._markers.mark_side_effect(qevent.event_id)
+            await self._record_action(frame, acc, qevent, agent_id)
         elif isinstance(frame, ErrorEvent):
             acc.classification = frame.classification or acc.classification
         elif isinstance(frame, Final):
@@ -2457,6 +2490,40 @@ class Kernel:
             acc.approval_route = frame.approval_route
             acc.approval_gate_kind = frame.approval_gate_kind
             acc.approval_granted_tool = frame.approval_granted_tool
+
+    async def _record_action(
+        self,
+        frame: SideEffectFlag,
+        acc: _StreamAccumulator,
+        qevent: QueuedTurn,
+        agent_id: uuid.UUID | None,
+    ) -> None:
+        """Open a record for a call, or close the one it already opened.
+
+        Deliberately NOT best-effort. A change to the world the platform has no
+        record of is not a success, and the branch this sits in already fails the
+        turn when the no-retry marker cannot be persisted; losing the account of
+        WHAT changed is not the lesser failure. An ActionBackendError propagates
+        out of the frame loop exactly as a marker failure does.
+        """
+
+        if self._actions is None or frame.call_id is None:
+            # No ledger wired, or a producer that predates ADR-0117. The frame
+            # still carries presence, which is all the no-retry rule reads; there
+            # is nothing to record without a call id, because two such frames
+            # cannot be told apart.
+            return
+        opened = acc.open_actions.get(frame.call_id)
+        if opened is None:
+            recorded = await self._actions.record(
+                frame,
+                event_id=qevent.event_id,
+                conversation_id=qevent.conversation_id,
+                agent_id=str(agent_id) if agent_id is not None else None,
+            )
+            acc.open_actions[frame.call_id] = recorded.id
+            return
+        await self._actions.complete(opened, frame)
 
     async def _finish(self, acc: _StreamAccumulator, reply: _ThrottledReply) -> TurnOutcome:
         if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
