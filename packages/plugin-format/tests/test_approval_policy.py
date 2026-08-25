@@ -117,11 +117,21 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
         (source / "connectors.yaml").read_text(encoding="utf-8")
     )
 
+    # Every gated write verb, pinned as a list rather than checked for
+    # membership: `curie example sre-bot install` strips approvalPolicy entirely
+    # for its read only install, and stripping a gate is only safe when the
+    # connector it guards is stripped too (cli/src/examples.rs). A gate added
+    # here without its counterpart there ships a write verb into a read only
+    # install, so this assertion is what makes the pair fail loudly instead.
     assert plugin["approvalPolicy"]["gates"] == [
         {
             "gate": "mcp__k8s-write__restart_deployment",
             "route": "sre-approvals",
-        }
+        },
+        {
+            "gate": "mcp__k8s-scale__scale_deployment",
+            "route": "sre-approvals",
+        },
     ]
     assert connectors["connectors"]["k8s-write"]["build"] == {
         "context": "connectors/k8s-write",
@@ -130,6 +140,17 @@ def test_sre_bot_declares_gated_write_connector_and_validates(tmp_path: Path) ->
     assert "unhosted_url" not in connectors["connectors"]["k8s-write"]
     assert connectors["connectors"]["k8s-write"]["secret_files"] == {
         "K8S_WRITE_KUBECONFIG": "/secrets/kubeconfig"
+    }
+    # A THIRD kubeconfig, not the write connector's. Reusing that one would hand
+    # this connector `patch` on `deployments`, throwing away the
+    # `deployments/scale` subresource ceiling that is its whole security
+    # argument (manifests/scale-role.yaml).
+    assert connectors["connectors"]["k8s-scale"]["secret_files"] == {
+        "K8S_SCALE_KUBECONFIG": "/secrets/kubeconfig"
+    }
+    assert connectors["connectors"]["k8s-scale"]["build"] == {
+        "context": "connectors/k8s-scale",
+        "platforms": ["linux/amd64", "linux/arm64"],
     }
 
     from plugin_format import connector_lock
