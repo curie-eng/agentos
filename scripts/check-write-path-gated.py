@@ -131,8 +131,8 @@ def main() -> int:
         problems += p
     if problems:
         print("", file=sys.stderr)
-        for p in problems:
-            print(f"FAIL: {p}", file=sys.stderr)
+        for problem in problems:
+            print(f"FAIL: {problem}", file=sys.stderr)
         return 1
     print("every example bundle's write path is gated and its ceilings agree")
     return 0
