@@ -51,11 +51,11 @@ ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 # this file would go green while proving nothing (#1391).
 BELOW = "0028"
 
-# The revision immediately below 0030, which adds ``post_state``.
-BELOW_0030 = "0029"
+# The revision immediately below 0032, which adds ``post_state``.
+BELOW_0032 = "0031"
 
-# The revision immediately below 0031, which adds ``gate_approval_id``.
-BELOW_0031 = "0030"
+# The revision immediately below 0033, which adds ``gate_approval_id``.
+BELOW_0033 = "0032"
 
 
 def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
@@ -155,7 +155,7 @@ def test_audit_rows_die_with_the_action_they_audit(isolated_migration_db: None) 
     assert _sql("SELECT 1 FROM curie.action_audit_entries") == []
 
 
-def test_0030_round_trips_the_post_state_column(isolated_migration_db: None) -> None:
+def test_0032_round_trips_the_post_state_column(isolated_migration_db: None) -> None:
     """A column-add has to undo cleanly too.
 
     A downgrade that leaves the column behind passes a shape check on the way
@@ -167,14 +167,14 @@ def test_0030_round_trips_the_post_state_column(isolated_migration_db: None) -> 
     command.upgrade(cfg, "head")
     assert "post_state" in _columns("agent_actions")
 
-    command.downgrade(cfg, BELOW_0030)
+    command.downgrade(cfg, BELOW_0032)
     assert "post_state" not in _columns("agent_actions")
 
     command.upgrade(cfg, "head")
     assert "post_state" in _columns("agent_actions")
 
 
-def test_0031_round_trips_the_gate_column(isolated_migration_db: None) -> None:
+def test_0033_round_trips_the_gate_column(isolated_migration_db: None) -> None:
     """The gate column undoes cleanly too.
 
     Worth its own assertion rather than trusting the 0030 pattern: this column is
@@ -186,7 +186,7 @@ def test_0031_round_trips_the_gate_column(isolated_migration_db: None) -> None:
     command.upgrade(cfg, "head")
     assert "gate_approval_id" in _columns("agent_actions")
 
-    command.downgrade(cfg, BELOW_0031)
+    command.downgrade(cfg, BELOW_0033)
     assert "gate_approval_id" not in _columns("agent_actions")
 
     command.upgrade(cfg, "head")

@@ -1,8 +1,14 @@
 """What an action left behind, so a restore can tell whether the world moved.
 
-Revision ID: 0030
-Revises: 0029
+Revision ID: 0032
+Revises: 0031
 Create Date: 2026-08-25
+
+Renumbered from 0030 after the fact. `0030` and `0031` were taken concurrently by
+the multi-surface work (#1803), which was written before this chain existed and
+merged between its two parts, so both branches were individually correct and the
+tree was not. See the renumbering commit for why this chain moved rather than
+that one.
 
 ADR-0117 decision 4 refuses a restore when the resource no longer looks like what
 the action left. Nothing recorded that: 0029 holds ``prior_state`` (where the
@@ -24,8 +30,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0030"
-down_revision: str | None = "0029"
+revision: str = "0032"
+down_revision: str | None = "0031"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
