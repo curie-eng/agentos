@@ -502,6 +502,12 @@ enum SreBotAction {
         /// Bind the installed bot to this Slack channel.
         #[arg(long, value_name = "CHANNEL")]
         slack_channel: Option<String>,
+        /// Keep the approval-gated restart tool, scoped to these Deployments
+        /// (`namespace/name`, comma separated). One list renders BOTH ceilings:
+        /// the Role's resourceNames and the connector's K8S_WRITE_ALLOWLIST.
+        /// Omit to install read only.
+        #[arg(long, value_name = "NS/NAME[,NS/NAME]")]
+        write_allowlist: Option<String>,
     },
 }
 
@@ -2139,12 +2145,14 @@ async fn run(command: Option<Command>) -> Result<()> {
                             observability,
                             dry_run,
                             slack_channel,
+                            write_allowlist,
                         },
                 },
         }) => match curie::examples::install_sre_bot(curie::examples::SreBotInstallOpts {
             observability,
             dry_run,
             slack_channel,
+            write_allowlist,
         })
         .await?
         {
