@@ -50,7 +50,6 @@ class MailAdapter:
         self.seen: OrderedDict[str, bool] = OrderedDict()
         for message_id in self.state.known_message_ids():
             self._mark_seen(message_id)
-        self.in_flight: set[str] = set()
         # Opaque pagination is a discovery hint only. Durable pending ids, never
         # this cursor, are the source of truth across a restart.
         self.page_cursor: str | None = None
@@ -443,8 +442,6 @@ class MailAdapter:
             return 200
         if claim == "busy":
             return 503
-        with self.lock:
-            self.in_flight.add(event_id)
         try:
             carries = self.thread_carries(conversation_id, event_id)
             if carries is None:
@@ -482,8 +479,6 @@ class MailAdapter:
             return 502
         finally:
             self.state.release_event(event_id, self.owner)
-            with self.lock:
-                self.in_flight.discard(event_id)
 
     # -- bounded fast caches ------------------------------------------------
 

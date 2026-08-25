@@ -662,13 +662,11 @@ def test_an_unexpected_exception_does_not_poison_the_event_id(
 ) -> None:
     """This is the mutation proof for the `try/finally` around the send.
 
-    `in_flight` is added to before the outbound call and removed after it. Delete
-    the `finally` and the raised exception leaks the event_id forever: the
-    redelivery below finds it in `in_flight`, takes the concurrent-duplicate
-    branch, sends nothing and answers 503, so both assertions below fail and
-    nothing else in the suite changes. Cases 4 to 6 cannot see that mutation,
-    because transport failures come back from the client as ordinary failure
-    results rather than raised exceptions.
+    The durable lease is released in `finally`. Delete that cleanup and the
+    raised exception leaves the event busy until its lease expires: the immediate
+    redelivery below sends nothing and answers 503, so both assertions below fail.
+    Cases 4 to 6 cannot see that mutation because transport failures come back
+    from the client as ordinary failure results rather than raised exceptions.
     """
     config = make_config()
     adapter = MailAdapter(config, client=_RaiseOnceClient(config))
