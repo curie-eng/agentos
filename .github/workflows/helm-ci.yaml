@@ -141,6 +141,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-checksum-assertions.sh
 
+      - name: helm render assertions (otel collector durable delivery)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-durability-assertions.sh
+
       - name: helm render assertions (SRE bot observability stack)
         run: |
           set -euo pipefail

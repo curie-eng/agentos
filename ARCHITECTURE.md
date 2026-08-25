@@ -173,7 +173,10 @@ flowchart TB
     API --> Store
     API --> PG
     UI --> API
+    Dispatcher --> OTel
+    Worker --> OTel
     Sandbox --> OTel
+    API --> OTel
     Worker -- eval scores --> LF
     API -- read --> LF
 ```
@@ -198,11 +201,13 @@ with four outbound dependencies of its own:
 - It writes eval scores straight to Langfuse
   ([`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`](apps/worker/src/curie_worker/eval/recorder.py)).
 
-The worker has **no** OTel dependency — the runner is the only emitter. Its one
-connection to observability is the eval-score write to Langfuse above. The CLI
-likewise never calls the dispatcher directly — see
-[the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub) for
-how it enqueues a turn instead.
+The API, dispatcher, worker, and runner share the platform telemetry bootstrap:
+they emit OTLP traces, correlated OTLP logs, and bounded operational metrics to
+the collector. For local verification, the CLI runs the dispatcher's bounded,
+Slack-free one-shot producer in the existing Compose network so the synthetic
+turn crosses the real producer span and W3C carrier seam. The cluster driver
+retains a direct carrierless enqueue as the legacy/missing-context control. See
+[the Slack seam](#slack-seam--a-per-turn-reply-endpoint-and-the-cli-stub).
 
 ### Adopted, not built
 
@@ -465,8 +470,15 @@ The CLI's `curie local message` path does four things:
 
 - starts a local Slack Web API stub ([`cli/src/chat.rs`](cli/src/chat.rs))
 - mints the exact `QueuedTurn` the dispatcher would produce, with `endpoint` pointed at the stub
-- `XADD`s it onto the very same `curie:runs` stream the dispatcher uses ([`cli/src/queue.rs`](cli/src/queue.rs))
+- passes the frozen payload over stdin to a bounded, Slack-free dispatcher
+  one-shot, which adds the transport-owned trace carrier and `XADD`s it onto the
+  same `curie:runs` stream
 - waits for the worker to finalize the turn by calling the stub's Slack API back
+
+`curie cluster message` deliberately keeps the older direct `XADD` path
+([`cli/src/queue.rs`](cli/src/queue.rs)). Its carrierless entry proves the worker
+still starts a safe root for legacy producers; it is not the positive local
+causality path.
 
 The worker cannot distinguish the stub from Slack: same queue payload, same
 `chat.update` call. This is what lets most of the verification suite run with
@@ -540,27 +552,50 @@ silently degrading to fake ([`apps/worker/src/curie_worker/binding.py::apply_mod
 
 ## The observability pipeline
 
-The write path runs down; the read path (arrows reversed) runs back up from
-Langfuse to whoever's asking:
+The write path runs down; configured observability backends provide any retained
+read path back to the operator:
 
 ```
-runner (OTLP spans, resource attr curie.session_id)
-  --> OTel Collector (OTLP gRPC 4317 / HTTP 4318 in)
-        --> Langfuse v3 over HTTP (ClickHouse-backed)
-              <-- apps/api Langfuse proxy (trace tree, metrics, cost)
-                    <-- apps/ui Runs / Metrics / Cost / Logs views
+API / dispatcher / worker / runner
+  -- OTLP traces + logs + metrics (standard OTEL_EXPORTER_OTLP_* config) -->
+OTel Collector (OTLP gRPC 4317 / HTTP 4318)
+  -- traces --> Langfuse v3 over HTTP (ClickHouse-backed)
+  -- logs and metrics --> configured collector exporters
 ```
 
-- The runner emits `gen_ai`-style spans (`agent.run -> generation -> tool`) with a resource including `service.name`, `curie.session_id`, and `curie.sandbox_id` ([`runner/src/curie_runner/otel.py`](runner/src/curie_runner/otel.py)). The `sandbox_id` is what lets a trace be tied back to the sandbox that served it.
-- **Langfuse OTLP (OpenTelemetry Protocol) ingest is HTTP-only.** Services send to the OTel Collector (which may take gRPC or HTTP), and the collector always exports to Langfuse over HTTP. Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml). The load-bearing constraint is documented in [`CLAUDE.md`](CLAUDE.md).
-- The API reconstructs the tool-call tree from Langfuse's public API via `parentObservationId` ([`apps/api/src/curie_api/langfuse.py::build_tree`](apps/api/src/curie_api/langfuse.py)) and proxies metrics/cost ([`apps/api/src/curie_api/langfuse.py::LangfuseClient`](apps/api/src/curie_api/langfuse.py), surfaced at [`apps/api/src/curie_api/routers/observability.py`](apps/api/src/curie_api/routers/observability.py)).
-- The UI's Runs (`RealTraces.tsx`), Metrics (`RealMetrics.tsx`), Cost (`RealCost.tsx`), and Logs (`RealLogs.tsx`) views render these live in wired mode ([`apps/ui/src/views/obs/`](apps/ui/src/views/obs/)).
+- Services have stable resources (`service.namespace=curie`, service name,
+  version, instance ID, and configured deployment environment). Per-turn IDs
+  are never resource attributes. An unset OTLP endpoint is a no-export mode:
+  it does not delay startup or turn handling, and stderr diagnostics remain.
+- The dispatcher injects W3C context into a separate Valkey Stream transport
+  field. The worker creates a messaging process span from it (or a fresh valid
+  root when the field is missing or malformed), then injects context on the
+  worker-to-runner HTTP call. `agent.run` is therefore a descendant of the
+  worker process span without changing the queued turn or ACI request bodies.
+- Trace spans cover queue and routing decisions, sandbox lifecycle, runner RPC,
+  approval and reply outcomes, retry, and dead-lettering. Terminal failures are
+  recorded as failures even when the kernel converts them into a classified
+  product result. Logs retain stderr output and are also OTLP LogRecords with
+  automatic trace/span correlation. Shared redaction excludes secrets,
+  credentials, user/model content, and tool arguments/results by default.
+- The metric schema fixes every instrument's name, type, unit, attributes, and
+  finite value domains. Operational counters, histograms, and gauges cover turn
+  outcomes, queue state, locks, sandbox lifecycle, runner RPC, approvals,
+  replies, and API/background work. Trace IDs, users, sessions, sandbox names,
+  arbitrary paths, and error text are prohibited metric attributes.
+- **Langfuse OTLP ingest is HTTP-only.** The collector adapts trace traffic to
+  Langfuse over HTTP; no application speaks to it directly. Logs and metrics
+  remain explicit collector pipelines, whose production destinations are
+  supplied through supported collector values rather than application code.
+  Collector config is at [`otel/collector-config.yaml`](otel/collector-config.yaml).
+- The API still reconstructs the Langfuse tool-call tree via `parentObservationId`
+  ([`apps/api/src/curie_api/langfuse.py::build_tree`](apps/api/src/curie_api/langfuse.py))
+  and proxies its existing trace/cost surfaces. Installing a retained query
+  backend and extending query views is separate work; emitted OTLP logs and
+  metrics do not imply that the current UI is a cross-service log backend.
 
-The `sandbox_id` is also known worker-side (the affinity store and
-`SandboxHandle`), so a trace, its session, and its serving sandbox all line up.
-The API hoists it out of the trace's observations onto the trace itself
-([`apps/api/src/curie_api/langfuse.py::hoist_sandbox_id`](apps/api/src/curie_api/langfuse.py)),
-so sandbox identity is surfaced, not pending.
+The sandbox ID is known worker-side (the affinity store and `SandboxHandle`) and
+can be a redacted per-run trace/log attribute, not a resource or metric label.
 
 **The observability CLI.** `curie local observability` prints the local
 observability surfaces — the console, Langfuse traces/cost, and the API base.
@@ -569,9 +604,10 @@ subcommands, not a top-level one ([`cli/src/main.rs`](cli/src/main.rs)). It is
 deliberately a **thin client over the same `apps/api` proxy the UI uses, not a
 second backend** (ADR-0038,
 [`docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md`](docs/adr/0038-observability-cli-helper-for-the-agent-dev-loop.md)).
-There is no Prometheus and no separate metrics store behind it. It prints URLs and
-opens nothing unless `--open` is passed, and `--json` never opens a browser — the
-agent-facing default is inert output.
+It prints URLs and opens nothing unless `--open` is passed, and `--json` never
+opens a browser — the agent-facing default is inert output. A retained metrics
+or log backend, its installation, and its query surface remain outside this
+write-path work.
 
 ## The UI: always the real API, no demo mode
 

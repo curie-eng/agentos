@@ -244,17 +244,84 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* Reject absent, malformed, negative, and zero-equivalent retry durations.
+     Keep max_interval and max_elapsed_time on this one validation path so the
+     finite retry bound cannot harden one field while leaving its sibling open. */}}
+{{- define "curie.otelCollector.requirePositiveDuration" -}}
+{{- $value := trim (toString .value) -}}
+{{- $durationPattern := "^\\+?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- $zeroPattern := "^\\+?(?:(?:0+(?:\\.0*)?|\\.0+)(?:ns|us|µs|μs|ms|s|m|h))+$" -}}
+{{- if or (empty $value) (not (regexMatch $durationPattern $value)) (regexMatch $zeroPattern $value) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure.%s must use a supported finite, non-zero positive duration." .exporter .field) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "curie.otelCollector.config" -}}
-{{- $builtInExporters := dict "otlphttp/langfuse" true "debug" true -}}
-{{- range $exporter := .Values.otelCollector.extraPipelineExporters }}
-{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) }}
-{{- fail (printf "otelCollector.extraPipelineExporters references undefined exporter %q. Add it under otelCollector.extraExporters." $exporter) }}
-{{- end }}
-{{- end }}
-# Receives OTLP over gRPC (4317) and HTTP (4318) from app services and
-# forwards to Langfuse over HTTP. Langfuse OTLP ingest is HTTP-only (gRPC is
-# silently unsupported), so the collector is the adapter. Langfuse appends
-# /v1/traces to the otlphttp base path itself.
+{{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
+{{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
+{{- /* Reserve built-in names even when the development-only debug exporter is disabled.
+      An extra exporter with one of these keys would otherwise replace chart-owned
+      configuration in the rendered ConfigMap. */ -}}
+{{- $reservedExporterNames := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true "debug" true -}}
+{{- if $debugEnabled -}}
+{{- $_ := set $builtInExporters "debug" true -}}
+{{- end -}}
+{{- $pipelineExporters := dict
+      "extraPipelineExporters" .Values.otelCollector.extraPipelineExporters
+      "extraLogPipelineExporters" .Values.otelCollector.extraLogPipelineExporters
+      "extraMetricPipelineExporters" .Values.otelCollector.extraMetricPipelineExporters -}}
+{{- range $valueName, $exporters := $pipelineExporters -}}
+{{- range $exporter := $exporters -}}
+{{- if not (or (hasKey $builtInExporters $exporter) (hasKey $.Values.otelCollector.extraExporters $exporter)) -}}
+{{- fail (printf "otelCollector.%s references undefined exporter %q. Add it under otelCollector.extraExporters." $valueName $exporter) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name, $config := .Values.otelCollector.extraExporters -}}
+{{- if hasKey $reservedExporterNames $name -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must not replace built-in exporter %q." $name $name) -}}
+{{- end -}}
+{{- $exporterType := first (splitList "/" $name) -}}
+{{- if not (or (eq $exporterType "nop") (eq $exporterType "debug")) -}}
+{{- if not (kindIs "map" $config) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] is a network exporter and must be a map with retry_on_failure and sending_queue settings." $name) -}}
+{{- end -}}
+{{- $headers := get $config "headers" -}}
+{{- if and $headers (not (kindIs "map" $headers)) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers must be a map." $name) -}}
+{{- end -}}
+{{- if kindIs "map" $headers -}}
+{{- $sensitiveHeaderPattern := "(?i)(^|[-_])(authorization|token|api[-_]?key|secret|password|credential)([-_]|$)" -}}
+{{- $collectorEnvPattern := "^\\$\\{env:[A-Za-z_][A-Za-z0-9_]*\\}$" -}}
+{{- range $headerName, $headerValue := $headers -}}
+{{- if and (regexMatch $sensitiveHeaderPattern (lower (toString $headerName))) (not (regexMatch $collectorEnvPattern (trim (toString $headerValue)))) -}}
+{{- fail (printf "otelCollector.extraExporters[%q].headers[%q] is sensitive and must use Collector environment expansion ${env:NAME}; put its value in otelCollector.extraEnv via valueFrom.secretKeyRef." $name $headerName) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $retry := get $config "retry_on_failure" -}}
+{{- if not (kindIs "map" $retry) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure retry_on_failure with enabled: true and finite max_interval/max_elapsed_time." $name) -}}
+{{- end -}}
+{{- if ne (lower (toString (get $retry "enabled"))) "true" -}}
+{{- fail (printf "otelCollector.extraExporters[%q] retry_on_failure must be enabled and use finite, non-zero max_interval and max_elapsed_time values." $name) -}}
+{{- end -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_interval" "value" (get $retry "max_interval")) -}}
+{{- include "curie.otelCollector.requirePositiveDuration" (dict "exporter" $name "field" "max_elapsed_time" "value" (get $retry "max_elapsed_time")) -}}
+{{- $queue := get $config "sending_queue" -}}
+{{- if not (kindIs "map" $queue) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] must configure sending_queue with enabled: true, storage: file_storage, and a finite queue_size." $name) -}}
+{{- end -}}
+{{- $queueSize := int (get $queue "queue_size") -}}
+{{- if or (ne (lower (toString (get $queue "enabled"))) "true") (ne (toString (get $queue "storage")) "file_storage") (le $queueSize 0) (gt $queueSize 100000) -}}
+{{- fail (printf "otelCollector.extraExporters[%q] sending_queue must be enabled, use storage: file_storage, and set queue_size between 1 and 100000." $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+# Receives OTLP traces, logs, and metrics over gRPC (4317) and HTTP (4318).
+# Traces go to Langfuse over HTTP; logs and metrics retain explicit nop defaults
+# until #1765 supplies their backends. Langfuse OTLP ingest is HTTP-only (gRPC
+# is silently unsupported), so the collector adapts trace traffic to otlphttp.
 receivers:
   otlp:
     protocols:
@@ -263,30 +330,67 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 processors:
+  memory_limiter:
+    check_interval: {{ .Values.otelCollector.memoryLimiter.checkInterval }}
+    limit_percentage: {{ .Values.otelCollector.memoryLimiter.limitPercentage }}
+    spike_limit_percentage: {{ .Values.otelCollector.memoryLimiter.spikeLimitPercentage }}
   batch: {}
 exporters:
   otlphttp/langfuse:
     endpoint: http://{{ include "curie.langfuse.webHost" . }}:{{ .Values.langfuse.web.service.port }}/api/public/otel
     headers:
       Authorization: ${env:LANGFUSE_OTLP_AUTH_HEADER}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 1000
+      num_consumers: 2
+  nop/logs: {}
+  nop/metrics: {}
+{{- if $debugEnabled }}
   debug:
     verbosity: normal
+{{- end }}
 {{- with .Values.otelCollector.extraExporters }}
 {{ toYaml . | nindent 2 }}
 {{- end }}
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
+  file_storage:
+    directory: {{ .Values.otelCollector.persistence.mountPath }}
+    timeout: 1s
+    create_directory: true
+    fsync: true
+    compaction:
+      on_start: true
+      on_rebound: true
+      directory: {{ .Values.otelCollector.persistence.mountPath }}
+      cleanup_on_start: true
 service:
-  extensions: [health_check]
+  extensions: [health_check, file_storage]
   telemetry:
     metrics:
-      level: none
+      level: normal
+      address: 0.0.0.0:{{ .Values.otelCollector.service.metricsPort }}
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlphttp/langfuse, debug{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/logs{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraLogPipelineExporters }}, {{ . }}{{- end }}]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [nop/metrics{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraMetricPipelineExporters }}, {{ . }}{{- end }}]
 {{- end }}
 
 {{/* ---- Default-credential gate (issue #198) ----
