@@ -840,6 +840,7 @@ async def create_action(session: AsyncSession, data: ActionRecord) -> AgentActio
         tool=data.tool,
         arguments=data.arguments,
         detail=data.detail,
+        gate_approval_id=data.gate_approval_id,
         dedupe_key=data.dedupe_key,
         status=ActionStatus.pending,
     )

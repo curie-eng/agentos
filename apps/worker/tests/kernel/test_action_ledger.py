@@ -48,6 +48,7 @@ class FakeRecorder:
         event_id: str,
         conversation_id: str,
         agent_id: str | None,
+        gate_approval_id: str | None = None,
     ) -> RecordedAction:
         if self.fail_on_record:
             raise ActionBackendError("ledger down")
@@ -57,6 +58,7 @@ class FakeRecorder:
                 "event_id": event_id,
                 "conversation_id": conversation_id,
                 "agent_id": agent_id,
+                "gate_approval_id": gate_approval_id,
             }
         )
         return RecordedAction(id=f"a{len(self.recorded)}", status="pending")
@@ -196,5 +198,42 @@ def test_a_ledger_that_refuses_the_write_fails_the_turn(make_harness) -> None:
             # exactly one attempt was made.
             assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
             assert h.runner.opened == ["scale it"]
+
+    asyncio.run(go())
+
+
+def test_a_call_that_ran_under_an_approval_records_which_one(make_harness) -> None:
+    """ADR-0117 decision 3 needs to know what authorized the forward call.
+
+    A gated tool only ever executes on the resume turn an approval created, and
+    that turn's event id is the approval's own deterministic key. So the gate is
+    already in the kernel's hand -- it is the same string ``_is_approval_resume``
+    reads for card teardown -- and recording it costs a lookup of nothing.
+    """
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        approval_id = "3f1b9c22-0000-4000-8000-000000000001"
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
+            await h.kernel.process_event(
+                _qevent("scale it", event_id=f"approval-{approval_id}-resolved")
+            )
+
+            assert recorder.recorded[0]["gate_approval_id"] == approval_id
+
+    asyncio.run(go())
+
+
+def test_an_ordinary_turn_records_no_gate(make_harness) -> None:
+    """NULL means ungated, so an ordinary turn must not invent one."""
+
+    async def go() -> None:
+        recorder = FakeRecorder()
+        async with make_harness(actions=recorder) as h:
+            h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
+            await h.kernel.process_event(_qevent("scale it"))
+
+            assert recorder.recorded[0]["gate_approval_id"] is None
 
     asyncio.run(go())

@@ -53,6 +53,7 @@ class ActionRecorder(Protocol):
         event_id: str,
         conversation_id: str,
         agent_id: str | None,
+        gate_approval_id: str | None = None,
     ) -> RecordedAction: ...
 
     async def complete(self, action_id: str, frame: SideEffectFlag) -> None: ...
@@ -106,6 +107,7 @@ class ActionClient:
         event_id: str,
         conversation_id: str,
         agent_id: str | None,
+        gate_approval_id: str | None = None,
     ) -> RecordedAction:
         """Open the record for a call that was just made.
 
@@ -121,6 +123,9 @@ class ActionClient:
             "tool": frame.tool or "unknown",
             "arguments": frame.arguments,
             "detail": frame.detail,
+            # What authorized the forward call, so an undo can require the same
+            # and no more (ADR-0117 decision 3). None means nothing gated it.
+            "gate_approval_id": gate_approval_id,
             "dedupe_key": f"{event_id}:{frame.call_id}",
         }
         payload = await self._post(self._url, body, "action record")
