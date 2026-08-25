@@ -1120,6 +1120,22 @@ fn runtime_connector_declaration(source: &[u8], tempo_digest: &str) -> Result<Ve
     if connectors.remove("k8s-write").is_none() {
         bail!("embedded SRE bot must declare connectors.k8s-write");
     }
+    if connectors.remove("k8s-scale").is_none() {
+        bail!("embedded SRE bot must declare connectors.k8s-scale");
+    }
+    // Fail closed on a connector this build does not know about. Removing the
+    // two write connectors by name is only read-only if the bundle has no third
+    // one -- and the bundle is edited far more often than this file, so an
+    // unrecognized connector must stop the install rather than ship in it.
+    if let Some(unexpected) = connectors
+        .keys()
+        .find(|name| !matches!(name.as_str(), "kubernetes" | "grafana" | "tempo"))
+    {
+        bail!(
+            "embedded SRE bot declares connector {unexpected}, which this build does not \
+             know how to classify; the read only install ships only read connectors"
+        );
+    }
     let tempo = connectors
         .get_mut("tempo")
         .and_then(serde_json::Value::as_object_mut)
@@ -1141,14 +1157,24 @@ fn runtime_connector_declaration(source: &[u8], tempo_digest: &str) -> Result<Ve
 fn runtime_plugin_manifest(source: &[u8]) -> Result<Vec<u8>> {
     let mut manifest: serde_json::Value =
         serde_json::from_slice(source).context("parsing embedded SRE bot plugin.json")?;
+    // Pinned, not merely present. This install strips approvalPolicy entirely
+    // because it ships read only, and stripping a gate is only safe when the
+    // connector it guards is also gone -- so an unrecognized gate means the
+    // bundle grew a write verb this build does not know to remove.
     let expected_policy = serde_json::json!({
-        "gates": [{
-            "gate": "mcp__k8s-write__restart_deployment",
-            "route": "sre-approvals"
-        }]
+        "gates": [
+            {
+                "gate": "mcp__k8s-write__restart_deployment",
+                "route": "sre-approvals"
+            },
+            {
+                "gate": "mcp__k8s-scale__scale_deployment",
+                "route": "sre-approvals"
+            }
+        ]
     });
     if manifest.get("approvalPolicy") != Some(&expected_policy) {
-        bail!("embedded SRE bot must declare the exact k8s-write approval gate");
+        bail!("embedded SRE bot must declare the exact gated write verbs");
     }
     let manifest = manifest
         .as_object_mut()
@@ -1490,6 +1516,10 @@ mod tests {
             "gate": "mcp__k8s-write__restart_deployment",
             "route": "sre-approvals"
         });
+        let scale_gate = serde_json::json!({
+            "gate": "mcp__k8s-scale__scale_deployment",
+            "route": "sre-approvals"
+        });
         let cases = [
             (
                 "missing approval policy",
@@ -1500,10 +1530,13 @@ mod tests {
                 serde_json::json!({
                     "name": "sre-bot",
                     "description": "source",
-                    "approvalPolicy": {"gates": [{
-                        "gate": "mcp__k8s-write__rollout_restart",
-                        "route": "sre-approvals"
-                    }]}
+                    "approvalPolicy": {"gates": [
+                        {
+                            "gate": "mcp__k8s-write__rollout_restart",
+                            "route": "sre-approvals"
+                        },
+                        scale_gate.clone()
+                    ]}
                 }),
             ),
             (
@@ -1513,8 +1546,17 @@ mod tests {
                     "description": "source",
                     "approvalPolicy": {"gates": [
                         exact_gate.clone(),
+                        scale_gate.clone(),
                         {"gate": "mcp__other__write", "route": "sre-approvals"}
                     ]}
+                }),
+            ),
+            (
+                "only the restart gate, scale gate dropped",
+                serde_json::json!({
+                    "name": "sre-bot",
+                    "description": "source",
+                    "approvalPolicy": {"gates": [exact_gate.clone()]}
                 }),
             ),
             (
@@ -1522,10 +1564,13 @@ mod tests {
                 serde_json::json!({
                     "name": "sre-bot",
                     "description": "source",
-                    "approvalPolicy": {"gates": [{
-                        "gate": "mcp__k8s-write__restart_deployment",
-                        "route": "other-approvals"
-                    }]}
+                    "approvalPolicy": {"gates": [
+                        {
+                            "gate": "mcp__k8s-write__restart_deployment",
+                            "route": "other-approvals"
+                        },
+                        scale_gate.clone()
+                    ]}
                 }),
             ),
         ];
@@ -1539,7 +1584,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("must declare the exact k8s-write approval gate"),
+                    .contains("must declare the exact gated write verbs"),
                 "unexpected error for {case}: {error:#}"
             );
         }

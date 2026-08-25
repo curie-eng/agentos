@@ -203,6 +203,49 @@ connectors:
     # here would mean widening it.
     secret_files:
       K8S_WRITE_KUBECONFIG: /secrets/kubeconfig
+
+# ---------------------------------------------------------------------------
+# THE GATED SCALE CONNECTOR -- DECLARED, CREDENTIAL ABSENT BY DEFAULT, AND
+# REVERSIBLE.
+#
+# A second one-tool server rather than a second tool on `k8s-write`, for the
+# reason that file's own docstring gives: it exposes ONE tool and takes no
+# parameter through which a caller could reach a replica count. Adding one there
+# would put caller input into a process whose whole argument is that no caller
+# input reaches the patch body.
+#
+# It is also the NARROWER grant, and that is the interesting part. A rollout
+# restart is a PATCH of the pod template, so RBAC cannot separate it from `set
+# image`; scaling has `deployments/scale` as its own subresource, so
+# `manifests/scale-role.yaml` grants a ceiling Kubernetes itself enforces.
+#
+# REVERSIBLE, which is why it exists at all (ADR-0117). It reads the replica
+# count immediately before it patches and returns it, so the platform records
+# what to restore without asking a model what happened -- and REFUSES TO WRITE if
+# it cannot read one, because an action that happened without a recorded prior
+# state leaves the platform holding a record it cannot act on. A restart cannot
+# do this and says so in prose, which is how a receipt ends up honestly saying
+# "restarting pods cannot be undone" next to "scaled 3 to 10, undo".
+#
+# Before bring-up: apply `manifests/scale-role.yaml`, store the resulting
+# kubeconfig as K8S_SCALE_KUBECONFIG, and replace the allowlist placeholder.
+  k8s-scale:
+    build:
+      context: connectors/k8s-scale
+      platforms: [linux/amd64, linux/arm64]
+    env:
+      # Same ceiling discipline as the write connector, stated in two places on
+      # purpose. EMPTY MEANS EVERY CALL IS REFUSED.
+      K8S_SCALE_ALLOWLIST: <namespace>/<deployment>
+      # A scale is reversible; an outage caused by a typo'd zero is still an
+      # outage. This bounds the upper end; the allowlist bounds the target.
+      K8S_SCALE_MAX_REPLICAS: "50"
+    # A THIRD kubeconfig, bound to the ServiceAccount in
+    # manifests/scale-role.yaml. Never the write connector's -- that one holds
+    # `patch` on `deployments`, and reusing it here would throw away the
+    # subresource ceiling that is this connector's whole security argument.
+    secret_files:
+      K8S_SCALE_KUBECONFIG: /secrets/kubeconfig
 # ---------------------------------------------------------------------------
 
   # Both grafana and tempo below read GRAFANA_SERVICE_ACCOUNT_TOKEN from the
