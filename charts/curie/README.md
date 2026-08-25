@@ -303,21 +303,39 @@ pipeline and environment are applied on `helm upgrade`.
 | ClickHouse | `clickhouse/clickhouse-server:24.8` | Langfuse OLAP store. Tag pinned SSE4.2-safe (see preflight). |
 | RustFS | `rustfs/rustfs:1.0.0-beta.12` plus `amazon/aws-cli:2.32.6` init | Langfuse object storage; BYO real S3 in prod. |
 | OTel Collector | `otel/opentelemetry-collector-contrib:0.119.0` | Bounded OTLP gateway (gRPC+HTTP), durable queue by default; traces -> Langfuse over HTTP, logs/metrics -> configured exporters. |
+| Mail adapter | `ghcr.io/curie-eng/curie-mail-adapter` | Off by default. One `Recreate` replica with durable SQLite on single-writer storage; no platform key/database credential or ServiceAccount token. |
+
+The mail adapter's `mailAdapter.persistence` block renders a 1 GiB RWO PVC by
+default or mounts a named same-namespace single-writer Filesystem `existingClaim`
+with exactly one `ReadWriteOnce` or `ReadWriteOncePod` access mode. Its
+root filesystem remains read-only; only the state mount and an `emptyDir` at
+`/tmp` are writable. Enabling it also requires an explicit
+`mailAdapter.agentmail.httpsCidrs` list. One egress-only NetworkPolicy then
+allows DNS, this release's API pods, and those provider/proxy CIDRs on TCP 443.
+When `api.deploy=false`, the in-chart API selector is replaced by the required
+`mailAdapter.apiEgress.httpsCidrs` peers on `mailAdapter.apiEgress.port`; the
+chart does not infer IPs from `apiBaseUrl`. The policy has no Kubernetes API
+carve-out and never selects runner sandboxes. See
+[`docs/operations.md`](../../docs/operations.md#connecting-email) for the
+mode-0600 credential workflow, retention, erase, and recovery procedure.
 
 ## Publishing and pulling images
 
 First-party service images are published to GHCR by the `Release images`
 workflow (`.github/workflows/release.yaml`) on every push to `main`, as
 `ghcr.io/curie-eng/curie-<service>` tagged with the commit SHA and `latest`.
-All five first-party services build in the matrix: `curie-api`,
-`curie-dispatcher`, `curie-worker`, `curie-ui`, and `curie-runner`. The
-chart defaults every first-party image at its `ghcr.io/curie-eng/curie-*`
-`:latest`, so the bare install (above) pulls from GHCR with no image overrides.
+All six first-party services build in the matrix: `curie-api`,
+`curie-dispatcher`, `curie-mail-adapter`, `curie-worker`, `curie-ui`, and
+`curie-runner`. The chart defaults every first-party image at its
+`ghcr.io/curie-eng/curie-*` `:latest`, so the bare install (above) pulls from
+GHCR with no image overrides -- except `curie-mail-adapter`, whose Deployment is
+off by default (`mailAdapter.deploy`), so its image is published and defaulted
+but not pulled until an operator enables the email channel.
 
-- **Pull policy for the four Deployment-managed services** (api, dispatcher,
-  worker, ui): `imagePullPolicy: Always` -- they pull once per rollout, so
-  `Always` just keeps a fresh install from serving a stale `latest` a node
-  cached earlier.
+- **Pull policy for the five Deployment-managed services** (api, dispatcher,
+  mail-adapter, worker, ui): `imagePullPolicy: Always` -- they pull once per
+  rollout, so `Always` just keeps a fresh install from serving a stale `latest`
+  a node cached earlier.
 - **The runner image is the exception:** it uses `imagePullPolicy: IfNotPresent`
   because a sandbox pod is cold-created per Slack thread, and an `Always`
   (re-)pull inside that boot window blew past the worker's claim timeout and
@@ -344,19 +362,22 @@ is not anonymously pullable and the node needs credentials. Two supported paths:
 - **Public package.** In the GHCR package settings make the package public; then
   no pull Secret is needed and `imagePullSecrets` stays empty.
 
-For offline dev/e2e, `-f values-dev.yaml` overrides all five first-party images
+For offline dev/e2e, `-f values-dev.yaml` overrides all six first-party images
 back to locally-built, cluster-imported tags with `imagePullPolicy: Never`, so a
-disconnected cluster never attempts a GHCR pull. That path requires building and
-importing each image first:
+disconnected cluster never attempts a GHCR pull. `curie-mail-adapter` is
+overridden the same way even though `mailAdapter.deploy` is false in that
+profile, so `--set mailAdapter.deploy=true` on a disconnected cluster starts
+rather than hanging on a GHCR pull. That path requires building and importing
+each image first:
 
 ```bash
-for svc in api dispatcher worker ui; do
+for svc in api dispatcher mail-adapter worker ui; do
   docker build -f apps/$svc/Dockerfile -t curie-$svc:local .
 done
 docker build -f runner/Dockerfile -t curie-runner:latest .
 # import each into the cluster runtime, e.g. for k3s:
-for img in curie-api:local curie-dispatcher:local curie-worker:local \
-           curie-ui:local curie-runner:latest; do
+for img in curie-api:local curie-dispatcher:local curie-mail-adapter:local \
+           curie-worker:local curie-ui:local curie-runner:latest; do
   docker save "$img" | ssh <node> 'sudo k3s ctr images import -'
 done
 ```
