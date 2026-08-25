@@ -20,6 +20,7 @@ from .adapter import ClaudeAgentSession, ModelSession, build_options
 from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalPolicyError,
+    assert_gates_not_shadowed,
     build_approval_gate,
     build_approval_server,
     build_can_use_tool,
@@ -183,6 +184,13 @@ def build_runner(
             mcp_servers=resolution.mcp_servers,
             connector_servers=resolution.connector_servers,
         )
+        # The third fail-closed boot check (#1852). The two above refuse a policy
+        # that cannot be armed as declared; this one refuses a policy that WOULD
+        # arm and then be bypassed, because the bundle's own skill permissions
+        # preauthorize a gated tool before can_use_tool is ever consulted. It sits
+        # here rather than in build_approval_gate because only this scope holds
+        # both the assembled gate and the bundle directory.
+        assert_gates_not_shadowed(config.session.plugin_dir, approval_gate, resolution)
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths
         # (credential resolution, session start): a bare traceback is the one
@@ -261,9 +269,7 @@ def build_runner(
                     namespace=config.connector_namespace,
                 ),
             ),
-            can_use_tool=(
-                build_can_use_tool(approval_gate) if approval_gate is not None else None
-            ),
+            can_use_tool=(build_can_use_tool(approval_gate) if approval_gate is not None else None),
         )
         return ClaudeAgentSession(options)
 
@@ -313,9 +319,7 @@ def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
             exc,
         )
         return store, None
-    logger.info(
-        "memory loaded session=%s records=%d", config.session.session_id, len(records)
-    )
+    logger.info("memory loaded session=%s records=%d", config.session.session_id, len(records))
     return store, format_memory_preamble(records)
 
 
@@ -359,9 +363,7 @@ def _load_history(config: RunnerConfig) -> tuple[TranscriptStore, str | None]:
             exc,
         )
         return store, None
-    logger.info(
-        "history loaded session=%s turns=%d", config.session.session_id, len(turns)
-    )
+    logger.info("history loaded session=%s turns=%d", config.session.session_id, len(turns))
     return store, format_conversation_preamble(turns, max_turns=max_turns, max_bytes=max_bytes)
 
 
