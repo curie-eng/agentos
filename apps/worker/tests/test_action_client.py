@@ -1,0 +1,163 @@
+"""The worker's client for the action ledger (ADR-0117).
+
+The worker has no database of its own, so recording what a turn did to the world
+is an HTTP call to the platform API, exactly as creating an approval is. This
+covers the two calls one side-effecting tool call produces and the failure that
+must not be swallowed.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import httpx
+import pytest
+from aci_protocol import SideEffectFlag
+from curie_worker.actions import ActionBackendError, ActionClient
+
+pytestmark = pytest.mark.anyio
+
+
+def _client(handler: Any) -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    seen: list[dict[str, Any]] = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "method": request.method,
+                "path": request.url.path,
+                "body": json.loads(request.content) if request.content else None,
+                "api_key": request.headers.get("X-API-Key"),
+            }
+        )
+        return handler(request)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(wrapped)), seen
+
+
+async def test_recording_a_call_sends_its_arguments_and_a_dedupe_key() -> None:
+    client, seen = _client(lambda _r: httpx.Response(201, json={"id": "a1", "status": "pending"}))
+
+    async with client:
+        recorded = await ActionClient(
+            api_base_url="http://api", api_key="k", client=client
+        ).record(
+            SideEffectFlag(
+                tool="scale_deployment",
+                call_id="toolu_01",
+                arguments={"replicas": 10},
+                detail="non-idempotent tool executed",
+            ),
+            event_id="event-1",
+            conversation_id="C1",
+            agent_id=None,
+        )
+
+    assert recorded.id == "a1"
+    assert seen[0]["method"] == "POST"
+    assert seen[0]["path"] == "/actions"
+    assert seen[0]["api_key"] == "k"
+    # The event id AND the call id: one turn can call the same tool twice, and a
+    # redelivery of that turn must adopt both rows rather than collapse them.
+    assert seen[0]["body"]["dedupe_key"] == "event-1:toolu_01"
+    assert seen[0]["body"]["arguments"] == {"replicas": 10}
+
+
+async def test_a_redelivered_record_is_not_an_error() -> None:
+    """200 is the API's idempotent replay; only a non-2xx is a failure."""
+
+    client, _ = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "pending"}))
+
+    async with client:
+        recorded = await ActionClient(
+            api_base_url="http://api", api_key="k", client=client
+        ).record(
+            SideEffectFlag(tool="t", call_id="c", arguments={}),
+            event_id="e",
+            conversation_id="C1",
+            agent_id=None,
+        )
+
+    assert recorded.id == "a1"
+
+
+async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() -> None:
+    """`prior` and `target` come out of the CONNECTOR's reply, not the arguments.
+
+    No function of `replicas=10` can produce the replica count from before the
+    call. That is why the reply is the declaration (ADR-0117 decision 1).
+    """
+
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
+
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(
+                tool="scale_deployment",
+                call_id="toolu_01",
+                failed=False,
+                result={
+                    "ok": True,
+                    "prior": {"spec": {"replicas": 3}},
+                    "target": {"kind": "Deployment", "name": "api"},
+                },
+                detail="non-idempotent tool completed",
+            ),
+        )
+
+    assert seen[0]["path"] == "/actions/a1/complete"
+    assert seen[0]["body"]["prior_state"] == {"spec": {"replicas": 3}}
+    assert seen[0]["body"]["target"] == {"kind": "Deployment", "name": "api"}
+    assert seen[0]["body"]["failed"] is False
+
+
+async def test_a_prose_reply_completes_with_nothing_to_restore() -> None:
+    """The connector answered in a sentence, so the result is absent entirely."""
+
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
+
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(tool="restart", call_id="c", failed=False, detail="restarted"),
+        )
+
+    assert seen[0]["body"]["result"] is None
+    assert seen[0]["body"]["prior_state"] is None
+    assert seen[0]["body"]["target"] is None
+
+
+async def test_a_structured_reply_without_a_prior_is_still_not_undoable() -> None:
+    """A connector may return JSON and still not report what it overwrote."""
+
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
+
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(tool="t", call_id="c", failed=False, result={"ok": True}),
+        )
+
+    assert seen[0]["body"]["result"] == {"ok": True}
+    assert seen[0]["body"]["prior_state"] is None
+
+
+async def test_a_refused_write_is_raised_not_swallowed() -> None:
+    """A record the platform failed to write is a hole in its account of a change.
+
+    The same branch already fails the turn when the no-retry marker cannot be
+    persisted; losing the record of WHAT changed is not the lesser failure.
+    """
+
+    client, _ = _client(lambda _r: httpx.Response(500, text="nope"))
+
+    async with client:
+        with pytest.raises(ActionBackendError):
+            await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
+                SideEffectFlag(tool="t", call_id="c"),
+                event_id="e",
+                conversation_id="C1",
+                agent_id=None,
+            )

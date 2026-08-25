@@ -24,6 +24,7 @@ from aci_protocol.s3 import build_s3_client
 from redis.asyncio import Redis as AsyncRedis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from .actions import ActionClient
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
 from .binding import BindingResolver
@@ -339,6 +340,14 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         client=eval_http,
         worker_token=config.internal_worker_token,
     )
+    # The action ledger (ADR-0117), on the same API lane. Wired unconditionally:
+    # an unwired ledger records nothing, and a deployment that can create an
+    # approval can record what a turn did.
+    action_client = ActionClient(
+        api_base_url=config.api_base_url,
+        api_key=config.api_key,
+        client=eval_http,
+    )
     sink = build_reply_sink(config)
     card_store = ApprovalCardStore(async_redis, config)
     kernel = Kernel(
@@ -369,6 +378,7 @@ def build(config: WorkerConfig, env: Mapping[str, str]) -> Runtime:
         # (#1084). Two parameters rather than one so a test can fake the create
         # half without also implementing a read it never exercises.
         approval_reader=approval_client,
+        actions=action_client,
         card_store=card_store,
         route_ttl_seconds=sub_config.route_ttl_seconds,
         suspended_route_ttl_seconds=sub_config.suspended_route_ttl_seconds,
