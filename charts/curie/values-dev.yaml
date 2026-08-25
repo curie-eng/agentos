@@ -55,6 +55,10 @@ rustfs:
     limits: { cpu: 500m, memory: 512Mi }
 
 otelCollector:
+  debugExporter:
+    enabled: true
+  persistence:
+    enabled: false
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 250m, memory: 256Mi }
