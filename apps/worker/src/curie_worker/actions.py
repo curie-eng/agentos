@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # rename would turn every reversible tool in the fleet irreversible with nothing
 # failing.
 PRIOR_KEY = "prior"
+POST_KEY = "post"
 TARGET_KEY = "target"
 
 
@@ -57,25 +58,31 @@ class ActionRecorder(Protocol):
     async def complete(self, action_id: str, frame: SideEffectFlag) -> None: ...
 
 
-def _snapshot(frame: SideEffectFlag) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """The prior state and target a restore replays, out of the tool's reply.
+def _snapshot(
+    frame: SideEffectFlag,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """What the call read, what it left, and what it acted on -- from its reply.
+
+    ``prior`` is what a restore puts back and ``post`` is what a restore is
+    checked against, so the two are not interchangeable: comparing the live
+    resource to ``prior`` would refuse every undo that is actually safe and
+    permit exactly the one that is not.
 
     A connector that answered in prose carries no structured result and lands
-    here as ``(None, None)``, which downstream means not undoable. So does one
-    that returned JSON without reporting what it overwrote. Neither is an error
-    and neither is inferred: an inferred prior state is a guess a restore would
-    act on.
+    here as all-None, which downstream means not undoable. So does one that
+    returned JSON without reporting these. Neither is an error and neither is
+    inferred: an inferred state is a guess a restore would act on.
     """
 
     result = frame.result
     if not isinstance(result, dict):
-        return None, None
-    prior = result.get(PRIOR_KEY)
-    target = result.get(TARGET_KEY)
-    return (
-        prior if isinstance(prior, dict) else None,
-        target if isinstance(target, dict) else None,
-    )
+        return None, None, None
+
+    def _obj(key: str) -> dict[str, Any] | None:
+        value = result.get(key)
+        return value if isinstance(value, dict) else None
+
+    return _obj(PRIOR_KEY), _obj(POST_KEY), _obj(TARGET_KEY)
 
 
 class ActionClient:
@@ -122,13 +129,14 @@ class ActionClient:
     async def complete(self, action_id: str, frame: SideEffectFlag) -> None:
         """Close the record with what came back."""
 
-        prior, target = _snapshot(frame)
+        prior, post, target = _snapshot(frame)
         await self._post(
             f"{self._url}/{action_id}/complete",
             {
                 "failed": bool(frame.failed),
                 "result": frame.result,
                 "prior_state": prior,
+                "post_state": post,
                 "target": target,
                 "detail": frame.detail,
             },

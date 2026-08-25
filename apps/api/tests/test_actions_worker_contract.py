@@ -57,6 +57,7 @@ async def _round_trip(app: Any) -> dict[str, Any]:
                 result={
                     "ok": True,
                     "prior": {"spec": {"replicas": 3}},
+                    "post": {"spec": {"replicas": 10}},
                     "target": {"kind": "Deployment", "name": "api"},
                 },
                 detail="non-idempotent tool completed",
@@ -84,6 +85,7 @@ def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backe
     # `target` inside its reply, and the row has to hold them as the columns a
     # restore replays.
     assert row["prior_state"] == {"spec": {"replicas": 3}}
+    assert row["post_state"] == {"spec": {"replicas": 10}}
     assert row["target"] == {"kind": "Deployment", "name": "api"}
     assert row["status"] == "succeeded"
     assert row["undoable"] is True

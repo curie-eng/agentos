@@ -51,6 +51,9 @@ ALEMBIC_DIR = Path(__file__).resolve().parents[1] / "alembic"
 # this file would go green while proving nothing (#1391).
 BELOW = "0028"
 
+# The revision immediately below 0030, which adds ``post_state``.
+BELOW_0030 = "0029"
+
 
 def _sql(statement: str, params: dict[str, Any] | None = None) -> list[Any]:
     async def _go() -> list[Any]:
@@ -147,3 +150,22 @@ def test_audit_rows_die_with_the_action_they_audit(isolated_migration_db: None) 
     _sql("DELETE FROM curie.agent_actions WHERE id = :id", {"id": action_id})
 
     assert _sql("SELECT 1 FROM curie.action_audit_entries") == []
+
+
+def test_0030_round_trips_the_post_state_column(isolated_migration_db: None) -> None:
+    """A column-add has to undo cleanly too.
+
+    A downgrade that leaves the column behind passes a shape check on the way
+    down and fails the re-upgrade with "column already exists", which is the
+    state an operator rolling back an incident discovers at the worst moment.
+    """
+
+    cfg = _alembic_config()
+    command.upgrade(cfg, "head")
+    assert "post_state" in _columns("agent_actions")
+
+    command.downgrade(cfg, BELOW_0030)
+    assert "post_state" not in _columns("agent_actions")
+
+    command.upgrade(cfg, "head")
+    assert "post_state" in _columns("agent_actions")

@@ -101,6 +101,7 @@ async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() ->
                 result={
                     "ok": True,
                     "prior": {"spec": {"replicas": 3}},
+                    "post": {"spec": {"replicas": 10}},
                     "target": {"kind": "Deployment", "name": "api"},
                 },
                 detail="non-idempotent tool completed",
@@ -109,6 +110,10 @@ async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() ->
 
     assert seen[0]["path"] == "/actions/a1/complete"
     assert seen[0]["body"]["prior_state"] == {"spec": {"replicas": 3}}
+    # What the call LEFT, which is what a conflict check compares the live
+    # resource against. It cannot be derived from `replicas=10`: a PATCH's
+    # result is not its request body.
+    assert seen[0]["body"]["post_state"] == {"spec": {"replicas": 10}}
     assert seen[0]["body"]["target"] == {"kind": "Deployment", "name": "api"}
     assert seen[0]["body"]["failed"] is False
 
@@ -126,6 +131,7 @@ async def test_a_prose_reply_completes_with_nothing_to_restore() -> None:
 
     assert seen[0]["body"]["result"] is None
     assert seen[0]["body"]["prior_state"] is None
+    assert seen[0]["body"]["post_state"] is None
     assert seen[0]["body"]["target"] is None
 
 

@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from .config import get_settings
 from .models import (
+    ActionAuditEntry,
     ActionStatus,
     Agent,
     AgentAction,
@@ -776,12 +777,42 @@ async def complete_action(
     action.status = ActionStatus.failed if data.failed else ActionStatus.succeeded
     action.result = data.result
     action.prior_state = data.prior_state
+    action.post_state = data.post_state
     action.target = data.target
     if data.detail is not None:
         action.detail = data.detail
     action.completed_at = datetime.now(UTC).replace(tzinfo=None)
     await session.commit()
     await session.refresh(action)
+    return action
+
+
+async def list_action_audit(
+    session: AsyncSession, action_id: uuid.UUID
+) -> list[ActionAuditEntry]:
+    result = await session.execute(
+        select(ActionAuditEntry)
+        .where(ActionAuditEntry.action_id == action_id)
+        .order_by(ActionAuditEntry.created_at)
+    )
+    return list(result.scalars().all())
+
+
+async def claim_action_undo(
+    session: AsyncSession, action: AgentAction, *, actor: str
+) -> AgentAction:
+    """Mark the undo claimed so a second ruling cannot authorize a second restore.
+
+    Claimed at ruling time rather than on completion, because nothing reports
+    completion yet: the executor ADR-0117 leaves undecided is what would. The
+    honest consequence is that a restore which never runs leaves a record saying
+    it was, and closing that is the executor's job -- authorizing two restores of
+    one action is the worse failure of the two.
+    """
+
+    action.undone_at = datetime.now(UTC).replace(tzinfo=None)
+    action.undone_by = actor
+    session.add(action)
     return action
 
 
