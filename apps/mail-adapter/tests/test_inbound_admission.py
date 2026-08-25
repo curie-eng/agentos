@@ -158,3 +158,43 @@ def test_prime_ignores_a_malformed_listing_without_crashing_startup(
     assert adapter.state.delivery("msg-existing") == {"state": "primed", "turn": None}
     assert mail.body_calls == {}
     assert ingress.attempts == 0
+
+
+def test_primed_receipts_survive_the_terminal_cap_and_reopen(
+    mail: MailState,
+    ingress: IngressState,
+    make_adapter: Callable[..., MailAdapter],
+) -> None:
+    """Compaction must never turn first-boot mailbox history into new turns."""
+    state_bytes = 128 * 1024
+    first = make_adapter(max_state_bytes=state_bytes)
+    reopened: MailAdapter | None = None
+    try:
+        # The public byte limit deterministically derives the smallest receipt
+        # cap.  Seed one more allowed message to cross that boundary without
+        # mutating the store's internal policy in the test.
+        receipt_cap = first.state.terminal_receipt_max
+        assert receipt_cap == 8
+        preexisting_ids = [f"msg-preexisting-{index}" for index in range(receipt_cap + 1)]
+        for message_id in preexisting_ids:
+            mail.add_inbound(message_id, f"thr-{message_id}", sender=ALLOWED_SENDER)
+
+        first.startup()
+        first.poll_once()
+
+        assert ingress.delivery_ids() == []
+        assert mail.body_calls == {}
+        first.close()
+
+        reopened = make_adapter(max_state_bytes=state_bytes)
+        reopened.startup()
+        reopened.poll_once()
+
+        assert ingress.delivery_ids() == []
+        assert mail.body_calls == {}
+        assert set(reopened.state.known_message_ids()) >= set(preexisting_ids)
+    finally:
+        if reopened is not None:
+            reopened.close()
+        elif first.state.healthy():
+            first.close()

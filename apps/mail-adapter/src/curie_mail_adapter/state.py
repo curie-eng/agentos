@@ -24,6 +24,7 @@ BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
 
 _TERMINAL_STATES = ("accepted", "oversize", "primed", "rejected")
+_COMPACTABLE_TERMINAL_STATES = ("oversize", "rejected")
 _ADMISSION_BACKPRESSURE_CODES = frozenset(
     {
         sqlite3.SQLITE_BUSY,
@@ -231,7 +232,10 @@ class MailState:
                     "SELECT 1 FROM deliveries WHERE message_id=?", (message_id,)
                 ).fetchone():
                     return "known"
-                self._compact_terminal_receipts(connection, incoming=1)
+                self._compact_terminal_receipts(
+                    connection,
+                    incoming=1 if state in _COMPACTABLE_TERMINAL_STATES else 0,
+                )
                 connection.execute(
                     "INSERT INTO deliveries("
                     "message_id, conversation_id, reply_ref, summary_json, state, "
@@ -258,8 +262,8 @@ class MailState:
     ) -> None:
         count = int(
             connection.execute(
-                "SELECT count(*) FROM deliveries WHERE state IN (?, ?, ?, ?)",
-                _TERMINAL_STATES,
+                "SELECT count(*) FROM deliveries WHERE state IN (?, ?)",
+                _COMPACTABLE_TERMINAL_STATES,
             ).fetchone()[0]
         )
         excess = count + incoming - self.terminal_receipt_max
@@ -267,9 +271,9 @@ class MailState:
             return
         connection.execute(
             "DELETE FROM deliveries WHERE message_id IN ("
-            "SELECT message_id FROM deliveries WHERE state IN (?, ?, ?, ?) "
+            "SELECT message_id FROM deliveries WHERE state IN (?, ?) "
             "ORDER BY updated_at, message_id LIMIT ?)",
-            (*_TERMINAL_STATES, excess),
+            (*_COMPACTABLE_TERMINAL_STATES, excess),
         )
 
     def _at_size_limit(self, connection: sqlite3.Connection) -> bool:
