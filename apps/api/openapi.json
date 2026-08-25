@@ -222,6 +222,18 @@
             ],
             "title": "Detail"
           },
+          "gate_approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Approval Id"
+          },
           "id": {
             "format": "uuid",
             "title": "Id",
@@ -323,6 +335,7 @@
           "post_state",
           "target",
           "detail",
+          "gate_approval_id",
           "status",
           "dedupe_key",
           "created_at",
@@ -383,6 +396,18 @@
               }
             ],
             "title": "Detail"
+          },
+          "gate_approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gate Approval Id"
           },
           "tool": {
             "title": "Tool",
@@ -4237,7 +4262,7 @@
     },
     "/actions/{action_id}/undo": {
       "post": {
-        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nWho may undo is not decided here yet. ADR-0117 decision 3 makes an undo\nrequire the authorization the forward action required and no more, which\nneeds the gating approval recorded on the action; that lands separately.\nUntil then this endpoint is authenticated like every other router and gated\nby the conflict rule alone.",
+        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\nsafe, and it keeps a refused actor from learning the resource's state through\na conflict message.",
         "operationId": "undo_action_actions__action_id__undo_post",
         "parameters": [
           {

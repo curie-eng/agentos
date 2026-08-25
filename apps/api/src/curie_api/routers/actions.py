@@ -28,8 +28,8 @@ from sqlalchemy.exc import IntegrityError
 
 from .. import crud
 from ..auth import require_api_key
-from ..deps import SessionDep
-from ..models import ActionAuditEntry, ActionStatus, AgentAction
+from ..deps import ApproverSetSelectorDep, SessionDep
+from ..models import ActionAuditEntry, ActionStatus, AgentAction, Approval
 from ..schemas import (
     ActionAuditOut,
     ActionComplete,
@@ -128,6 +128,55 @@ async def get_action_audit(action_id: uuid.UUID, session: SessionDep) -> list[Ac
     return [ActionAuditOut.model_validate(e) for e in entries]
 
 
+# The authorizer name recorded when nothing gated the forward call. Not "none":
+# the audit row is read by a human asking who permitted a write into their
+# infrastructure, and "ungated" answers that question where a blank does not.
+UNGATED = "ungated"
+
+
+async def _authorize_undo(
+    session: SessionDep,
+    action: AgentAction,
+    data: ActionUndo,
+    approver_sets: ApproverSetSelectorDep,
+) -> tuple[str, bool, str]:
+    """Decide whether ``data.actor`` may undo ``action`` (ADR-0117 decision 3).
+
+    Symmetry, in both directions. A call nobody had to approve is not gated on
+    the way back: the state being restored is one the cluster was already in, and
+    it got there without anyone approving it. A call that WAS gated needs an
+    authorizer of that same route, resolved against membership the way ADR-0034
+    resolves an approver -- someone who could have permitted the change.
+
+    The self-approval refusal (#246) is deliberately not inherited. It stops a
+    requester approving their own REQUEST; an undo is not a request, so applying
+    it here would demand MORE authorization than the forward action needed, which
+    decision 3 rules out in the same sentence that requires the route.
+    """
+
+    if action.gate_approval_id is None:
+        return UNGATED, True, ""
+
+    approval = await session.get(Approval, action.gate_approval_id)
+    if approval is None:
+        # The gate is unreadable, not absent. Treating it as absent would let a
+        # deleted approval turn a gated action into a freely undoable one.
+        return UNGATED, False, "the approval that gated this action can no longer be read"
+
+    binding = await crud.get_approval_route_binding(session, approval)
+    approver_set = approver_sets(approval, binding)
+    verdict = await approver_set.contains(data.actor, data.actor_channel)
+    if verdict.undetermined:
+        # `member` is meaningless here. Failing open would let an outage at the
+        # membership provider authorize a write into a customer's cluster.
+        return (
+            approver_set.audit_name,
+            False,
+            verdict.reason or "could not establish whether the actor may undo this",
+        )
+    return approver_set.audit_name, verdict.member, verdict.reason
+
+
 async def _refuse(
     session: SessionDep,
     action: AgentAction,
@@ -136,6 +185,7 @@ async def _refuse(
     kind: str,
     reason: str,
     code: int,
+    authorizer: str = "conflict-check",
     evidence: dict[str, object] | None = None,
 ) -> None:
     """Record the refusal, then raise it.
@@ -151,7 +201,7 @@ async def _refuse(
             action=kind,
             actor=data.actor,
             actor_channel=data.actor_channel,
-            authorizer="conflict-check",
+            authorizer=authorizer,
             authorized=False,
             reason=reason,
             evidence=evidence,
@@ -163,7 +213,10 @@ async def _refuse(
 
 @router.post("/{action_id}/undo", response_model=ActionUndoOut)
 async def undo_action(
-    action_id: uuid.UUID, data: ActionUndo, session: SessionDep
+    action_id: uuid.UUID,
+    data: ActionUndo,
+    session: SessionDep,
+    approver_sets: ApproverSetSelectorDep,
 ) -> ActionUndoOut:
     """Rule on putting back what this action changed.
 
@@ -172,16 +225,27 @@ async def undo_action(
     record's own state outward to the world, so the most specific true reason is
     the one the operator is told.
 
-    Who may undo is not decided here yet. ADR-0117 decision 3 makes an undo
-    require the authorization the forward action required and no more, which
-    needs the gating approval recorded on the action; that lands separately.
-    Until then this endpoint is authenticated like every other router and gated
-    by the conflict rule alone.
+    Authorization runs first, before any of the record's own state is examined:
+    whether an actor may undo at all precedes whether this particular undo is
+    safe, and it keeps a refused actor from learning the resource's state through
+    a conflict message.
     """
 
     action = await crud.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
+
+    authorizer, allowed, reason = await _authorize_undo(session, action, data, approver_sets)
+    if not allowed:
+        await _refuse(
+            session,
+            action,
+            data,
+            kind="refused_unauthorized",
+            reason=reason or "not authorized to undo this action",
+            code=status.HTTP_403_FORBIDDEN,
+            authorizer=authorizer,
+        )
 
     if action.undone_at is not None:
         await _refuse(
@@ -262,7 +326,7 @@ async def undo_action(
             action="authorized",
             actor=data.actor,
             actor_channel=data.actor_channel,
-            authorizer="conflict-check",
+            authorizer=authorizer,
             authorized=True,
             evidence={"restoring": action.prior_state},
         )

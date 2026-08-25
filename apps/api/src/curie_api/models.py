@@ -573,6 +573,16 @@ class AgentAction(Base):
     # The frame's human-readable note. On a record that is not undoable this is
     # the stated reason the receipt shows instead of a control.
     detail: Mapped[str | None] = mapped_column(default=None)
+    # The approval that gated the call, when one did (ADR-0117 decision 3). NULL
+    # means the tool was not gated, and an undo is then not gated either.
+    #
+    # Deliberately NOT a foreign key. This is the record of what authorization
+    # the forward action required, and a sweeper deleting the approval row must
+    # not silently downgrade a gated action to an ungated one. An id whose
+    # approval can no longer be read fails closed at the undo instead.
+    gate_approval_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
     status: Mapped[str] = mapped_column(server_default=ActionStatus.pending, index=True)
     dedupe_key: Mapped[str] = mapped_column(unique=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

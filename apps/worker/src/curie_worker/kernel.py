@@ -2520,6 +2520,12 @@ class Kernel:
                 event_id=qevent.event_id,
                 conversation_id=qevent.conversation_id,
                 agent_id=str(agent_id) if agent_id is not None else None,
+                # A gated tool only ever executes on the resume turn its approval
+                # created, and that turn's event id IS the approval's key. So what
+                # authorized this call is already in hand -- the same string the
+                # card teardown reads -- and an ordinary turn yields None, which
+                # is exactly "nothing gated it".
+                gate_approval_id=_approval_id_from_resume_event(qevent.event_id),
             )
             acc.open_actions[frame.call_id] = recorded.id
             return

@@ -1241,6 +1241,9 @@ class ActionRecord(BaseModel):
     tool: str
     arguments: dict[str, Any] | None = None
     detail: str | None = None
+    # The approval that gated this call, when one did. The worker knows it
+    # because a gated call only executes on an approval-resume turn.
+    gate_approval_id: uuid.UUID | None = None
     dedupe_key: str
 
 
@@ -1275,6 +1278,7 @@ class ActionOut(BaseModel):
     post_state: dict[str, Any] | None
     target: dict[str, Any] | None
     detail: str | None
+    gate_approval_id: uuid.UUID | None
     status: str
     dedupe_key: str
     created_at: datetime
