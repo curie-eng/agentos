@@ -1,8 +1,10 @@
 """Which approval gated a recorded call, so an undo can require the same route.
 
-Revision ID: 0031
-Revises: 0030
+Revision ID: 0033
+Revises: 0032
 Create Date: 2026-08-25
+
+Renumbered from 0031 with its sibling; see 0032_action_post_state.py.
 
 ADR-0117 decision 3: an undo requires the authorization the forward action
 required, and no more. Answering that needs to know whether the call was gated at
@@ -24,8 +26,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0031"
-down_revision: str | None = "0030"
+revision: str = "0033"
+down_revision: str | None = "0032"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
