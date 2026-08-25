@@ -69,8 +69,12 @@
 #                            (no surge, no rollback, no record on the Deployment).
 #                            `rollout restart` covers the same intent safely.
 #   - `deployments scale` -- a separate decision with a separate blast radius
-#                            (scale to 0 is an outage). Add it when someone asks
-#                            for it, with its own gate and its own route.
+#                            (scale to 0 is an outage). It now exists, and it is
+#                            deliberately NOT here: see manifests/scale-role.yaml,
+#                            which grants `deployments/scale` -- its own
+#                            subresource -- to its own identity, with its own
+#                            gate. That grant cannot reach the pod template at
+#                            all, which is a ceiling this role cannot have.
 #   - anything cluster-scoped, anything in a platform namespace, any
 #     `create`/`delete`.
 ---
