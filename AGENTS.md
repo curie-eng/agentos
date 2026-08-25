@@ -37,6 +37,7 @@ before editing there, in addition to this file.
 | `apps/worker` | Python (redis-py) | [`apps/worker/CLAUDE.md`](apps/worker/CLAUDE.md) |
 | `runner` | Python (claude-agent-sdk) | [`runner/CLAUDE.md`](runner/CLAUDE.md) |
 | `apps/ui` | React (Vite + TS) | [`apps/ui/CLAUDE.md`](apps/ui/CLAUDE.md) |
+| `apps/desktop` | Electron + React (Vite + TS) | [`apps/desktop/CLAUDE.md`](apps/desktop/CLAUDE.md) |
 | `cli` | Rust (clap + tokio) | [`cli/CLAUDE.md`](cli/CLAUDE.md) |
 | `charts/curie` | Helm | [`charts/curie/CLAUDE.md`](charts/curie/CLAUDE.md) |
 | `tests/soak` | Python | -- |
@@ -107,6 +108,18 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 If `cargo fmt`/`clippy` report a missing component: `rustup component add rustfmt clippy`.
+
+**Desktop:** `cd apps/desktop && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm build`.
+The native operator console (Electron shell + React renderer) -- see
+`apps/desktop/CLAUDE.md`. Its whole command surface is generated from
+`cli/command-manifest.json`, so **after changing the CLI surface run
+`pnpm gen:manifest` there and commit `src/generated/`**, the same discipline
+`apps/ui` follows; the `desktop` CI job fails on drift. Two suites skip
+themselves when their dependency is absent: `cli.integration.test.ts` drives the
+real `curie` binary, and `resources.integration.test.ts` drives the real Docker
+daemon. Run them where both are present -- they are the only checks that prove
+the argv this app builds is argv the CLI accepts, and that the resource feed
+parses what Docker actually emits.
 
 **UI:** `cd apps/ui && pnpm install && pnpm lint && pnpm typecheck && pnpm test && pnpm e2e`.
 The app is a real Vite + React + TS project -- see `apps/ui/CLAUDE.md`. The
