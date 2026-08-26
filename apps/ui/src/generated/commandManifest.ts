@@ -383,15 +383,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind an approval route to a channel. Accepted so it can be DECLINED with a reason rather than error like a typo: a route binding is per-agent platform config, and the skill tier has no platform",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a route's verified Slack resolution card. Accepted so it can be DECLINED with a reason: the skill tier has no platform agent record",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route",
+              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route-resolution",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -399,7 +399,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the route map from a JSON file. Declined at this tier for the same reason as --route",
+              "help": "Read the complete route map, including optional notifications, from JSON. Declined at this tier for the same reason as --route-resolution",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -407,7 +407,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route",
+              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route-resolution",
               "id": "list_routes",
               "long": "list-routes",
               "positional": false,
@@ -419,7 +419,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Remove every route binding. Declined at this tier for the same reason as --route",
+              "help": "Remove every route binding. Declined at this tier for the same reason as --route-resolution",
               "id": "clear_routes",
               "long": "clear-routes",
               "positional": false,
@@ -1566,15 +1566,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -1582,7 +1582,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -4039,15 +4039,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -4055,7 +4055,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,

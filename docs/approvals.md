@@ -13,11 +13,13 @@ authorizer over swappable approver sets). This page is the "how do I use it".
 ## The one-paragraph version
 
 A run raises an approval. The worker persists a durable record, suspends the sandbox,
-and posts a card to the channel the request's **route** is bound to. A human resolves
-it; the platform authorizes that person **server-side**, wakes the suspended session
-with a platform-authored turn carrying the decision, and the agent finishes the job it
-started. Nothing about the decision is trusted from inside the sandbox, and nothing
-holds a worker slot while a human thinks.
+and posts one interactive card to the request route's **resolution** target. The route
+may also name a **notification** target, which receives a text-only ping directing humans
+to the configured approval channel without disclosing its identifier. A human resolves on
+the one card; the platform authorizes that person
+**server-side**, wakes the suspended session with a platform-authored turn carrying the
+decision, and the agent finishes the job it started. Nothing about the decision is
+trusted from inside the sandbox, and nothing holds a worker slot while a human thinks.
 
 ## Two ways a turn pauses
 
@@ -84,18 +86,41 @@ next click rather than the next restart:
 {
   "approval_routes": {
     "finance": {
-      "channel": "C0EXAMPLE3",
+      "resolution": {
+        "kind": "slack",
+        "address": "C0EXAMPLE3"
+      },
+      "notification": {
+        "kind": "email",
+        "address": "finance-approvals@example.com",
+        "endpoint": "https://adapter.example.com/replies",
+        "adapter": "mail"
+      },
       "approvers": { "group": "S0123ABCD" }
     }
   }
 }
 ```
 
-Two independent axes, and keeping them separate is the point:
+Three independent axes, and keeping them separate is the point:
 
-- **`channel` is WHERE the card posts.**
-- **`approvers` is WHO may act on it.** Omit it and the card channel's members are the
-  approvers, which is the zero-setup default.
+- **`resolution` is WHERE the one interactive card posts.** It is required and currently
+  accepts only `{ "kind": "slack", "address": "C..." }`, because Slack's authenticated
+  interaction path supplies the verified resolver identity.
+- **`notification` is WHERE else humans are told.** It is optional. Its text includes the
+  approval ID and directs humans to the configured approval channel without naming its
+  kind or address. It has no interaction, buttons, action values, or other resolving
+  affordance.
+- **`approvers` is WHO may act on the resolution card.** Omit it and that Slack channel's
+  members are the approvers, which is the zero-setup default. Notification recipients never
+  become approvers merely by receiving the ping.
+
+A Slack notification can use the worker's default transport. Any other notification kind
+must store both `endpoint` and `adapter`; those transport details are write-only and are
+redacted from API and `--list-routes` output. The target's `kind` and `address` remain visible.
+Resolution deliberately has a channel-neutral shape but remains Slack-only. Making another
+channel interactive requires a future adapter-scoped credential that establishes a verified
+resolver identity; this split does not add one or accept resolution through a notification.
 
 A route the bundle names but the agent never bound is **escalated to a human**, not
 posted to the requesting channel. Silently widening a request to whoever happens to be
@@ -106,17 +131,19 @@ Bind one from the CLI rather than by hand. A write REPLACES the whole map, so na
 every route it should keep:
 
 ```bash
-curie local approvals my-agent --route finance=C0EXAMPLE3 \
-  --route-approvers finance=group:S0123ABCD
+curie local approvals my-agent --routes-from approval-routes.json
 
 curie local approvals my-agent --list-routes
 ```
 
-`--route-approvers` also takes `users:U0123ABCD,W0456DEFG`, `--routes-from <file>` reads
-the whole map as JSON, and `--clear-routes` removes every binding. A `--routes-from`
-file containing `{}` clears every binding too, the same as `--clear-routes`. Nothing
-is written unless every entry parses, so a typo cannot leave a half-written map
-behind.
+The strict `--routes-from` JSON uses the complete binding shape shown above and is the only
+way to declare a notification, including the `endpoint` and `adapter` required for a
+non-Slack target. `--route-resolution` and `--route-approvers` can override resolution and
+authority from that file; the latter takes `users:U0123ABCD,W0456DEFG` or `group:S0123ABCD`.
+`--clear-routes` removes every binding. A `--routes-from` file containing `{}` clears every
+binding too, the same as `--clear-routes`. The retired `--route` flag and `channel` JSON key
+are not accepted. Nothing is written unless every entry parses, so a typo cannot leave a
+half-written map behind.
 
 ## Who may resolve
 
@@ -218,9 +245,10 @@ Resolution is **once-only**: the first authorized resolver wins the compare-and-
 a later one is told who won rather than overwriting the decision.
 
 `--actor-channel` is what proves channel membership for the default approver set. The
-channel to pass is the one that record's route is bound to, or the requesting channel
-when `--list` shows the record named no route. A route that declares `approvers.users`
-or `approvers.group` ignores the channel entirely, so passing it there is harmless.
+channel to pass is the record's route resolution address, or the requesting channel when
+`--list` shows the record named no route. The notification address is never valid channel
+evidence. A route that declares `approvers.users` or `approvers.group` ignores the channel
+entirely, so passing it there is harmless.
 
 ## Operational guarantees
 
@@ -250,6 +278,7 @@ or `approvers.group` ignores the channel entirely, so passing it there is harmle
 | `409 already resolved by ...` | Someone else won the claim. The decision stands. |
 | `410 expired` | The record passed its deadline. The session was already woken down its timeout branch. |
 | Agent says a request is pending, no card anywhere | The named route is not bound for this agent, so the turn escalated instead of posting. Add the binding. |
+| Notification arrived, but it has no buttons | Expected: notification is visibility-only. Use its approval ID and go to the configured approval channel to find the verified Slack resolution card; the ping deliberately does not disclose that channel's identifier. |
 | Card resolved, but the agent never continued | The skill has no instruction for the `[approval resolved]` prefix. |
 
 ## Where the code is

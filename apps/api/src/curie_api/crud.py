@@ -390,7 +390,8 @@ async def update_agent_approval_routes(
     session: AsyncSession, agent: Agent, routes: dict[str, Any]
 ) -> Agent:
     """Set the agent's approval route bindings (#247). An empty dict clears
-    them (stored as NULL: unbound routes fall back to the requesting channel)."""
+    them (stored as NULL: unbound routes escalate rather than inventing a
+    resolution surface)."""
 
     agent.approval_routes = routes or None
     await session.commit()

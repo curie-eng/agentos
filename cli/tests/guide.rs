@@ -243,7 +243,17 @@ fn guide_documents_the_approval_plane() {
         for needle in [
             "mcp__curie__request_approval",
             "approval_routes",
+            "--route-resolution",
+            "--routes-from",
             "approvers.group",
+            "text-only",
+            "interaction=None",
+            "configured approval channel",
+            "without disclosing its identifier",
+            "endpoint",
+            "adapter",
+            "verified Slack",
+            "scoped credential",
             "self-approval",
             "[approval resolved]",
             // #1086. Each is a fact an agent cannot derive from the command

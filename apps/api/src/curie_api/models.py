@@ -102,11 +102,12 @@ class Agent(Base):
     # Per-agent approval route bindings (#247, ADR-0010): the workspace half of
     # the split policy. The bundle manifest declares gate points and route
     # NAMES (versioned with the agent); this maps each declared name to
-    # workspace specifics, today a Slack channel: {"managers": {"channel":
-    # "C0123..."}}. The worker resolves a raised route through this map to
-    # decide where the approval card goes (and therefore who the
-    # channel-membership authorizer counts as approvers). NULL means no
-    # bindings; an unbound route falls back to the requesting channel.
+    # workspace specifics: one Slack-only resolution target and an optional
+    # channel-neutral notification target. The worker posts the sole resolving
+    # card at ``resolution`` (whose address is persisted on the Approval row for
+    # authorization) and may send a text-only ping at ``notification``. NULL
+    # means no bindings; a named unbound route escalates rather than widening to
+    # the requesting channel.
     approval_routes: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
     # Per-agent connector secrets (ADR-0009, #429): the named secret VALUES the
     # bundle's authed MCP servers need (e.g. GITHUB_PERSONAL_ACCESS_TOKEN). The

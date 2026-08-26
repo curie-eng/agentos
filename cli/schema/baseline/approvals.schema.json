@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/approvals/v1.2.json",
+  "$id": "https://schemas.curietech.ai/cli/approvals/v2.0.json",
   "title": "curie <tier> approvals --json",
-  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings, where each route's `channel` is where its card posts and its optional `approvers` block is who may resolve it.",
+  "description": "The agent-facing payload of `curie <tier> approvals <agent>`: the dry-run plan; the gate list (`manifest_unreadable` non-null when the deployed manifest could not be read); the pending approval records (`truncated` true when the server page cap was hit); a single resolved record; or the agent's approval route bindings. Each binding separates its verified interactive Slack `resolution`, optional text-only `notification`, and optional `approvers` authority.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -96,10 +96,42 @@
     "approvalRouteBinding": {
       "type": "object",
       "additionalProperties": false,
-      "description": "One route's workspace binding. `channel` is WHERE the card posts; the optional `approvers` block is WHO may act on it, and its absence means the card channel's members are the approvers (the zero-setup default).",
+      "description": "One route's display binding. `resolution` is the single verified interactive Slack card; `notification` is an optional text-only ping carrying no resolving affordance; `approvers` is WHO may act, and its absence means the resolution card channel's members are the approvers.",
       "properties": {
-        "channel": {
-          "type": "string"
+        "resolution": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "address": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "address"
+          ]
+        },
+        "notification": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "address": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "address"
+          ]
         },
         "approvers": {
           "type": [
@@ -127,7 +159,7 @@
         }
       },
       "required": [
-        "channel"
+        "resolution"
       ]
     }
   },

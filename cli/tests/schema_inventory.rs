@@ -116,6 +116,45 @@ fn every_committed_schema_compiles_and_declares_a_version() {
 }
 
 #[test]
+fn approval_route_split_is_a_v2_schema_contract() {
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("cli/schema/approvals.schema.json"))
+            .expect("read approvals schema"),
+    )
+    .expect("approvals schema is JSON");
+    assert_eq!(
+        schema["$id"], "https://schemas.curietech.ai/cli/approvals/v2.0.json",
+        "removing the fused channel field and requiring resolution is a major schema break"
+    );
+
+    let binding = &schema["$defs"]["approvalRouteBinding"];
+    assert!(
+        binding["properties"].get("channel").is_none(),
+        "the retired fused field must not remain in the v2 result schema"
+    );
+    assert!(binding["properties"].get("resolution").is_some());
+    assert!(binding["properties"].get("notification").is_some());
+    assert_eq!(
+        binding["properties"]["resolution"]["type"],
+        serde_json::json!("object"),
+        "the v2 display schema requires the sole resolution surface"
+    );
+    let required = binding["required"]
+        .as_array()
+        .expect("binding required list");
+    assert!(required.iter().any(|field| field == "resolution"));
+
+    let index = index_json();
+    let approvals = index["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|entry| entry["result"] == "ApprovalsOutput")
+        .expect("ApprovalsOutput inventory entry");
+    assert_eq!(approvals["version"], "2.0");
+}
+
+#[test]
 fn version_from_id_parses_the_v_segment() {
     let v = |major, minor| Some(SchemaVersion { major, minor });
     assert_eq!(

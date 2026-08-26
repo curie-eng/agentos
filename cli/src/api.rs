@@ -98,12 +98,13 @@ pub struct Agent {
     /// `#[serde(default)]` keeps older/leaner responses parsing to None.
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
-    /// Manifest route name -> workspace binding (#247, #420). Read back by
-    /// `approvals --list-routes` and written by `--route`/`--route-approvers`.
+    /// Manifest route name -> workspace binding (#247, #420, #1460). Read back
+    /// by `approvals --list-routes`; writes use a separate strict DTO so this
+    /// display-only, transport-redacted response can never become PATCH input.
     /// `#[serde(default)]` keeps a pre-#247 response parsing to None, which is
     /// the same fact as "no routes bound".
     #[serde(default)]
-    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBinding>>,
+    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBindingResponse>>,
     /// Per-agent model override, forwarded as `CURIE_MODEL` at sandbox boot
     /// (#254). `None` means no override: the platform default applies. Modeled
     /// since #1311 gave the CLI a verb that reads and writes it -- until then
@@ -125,26 +126,35 @@ pub struct Agent {
     pub memory: bool,
 }
 
-/// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.
+/// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
 ///
-/// The two fields are the axes ADR-0034 unfused and the CLI must keep visibly
-/// apart: `channel` is WHERE the card posts, `approvers` is WHO may act on it.
-/// Collapsing them in the output would re-fuse in presentation what the schema
-/// separates.
+/// `resolution` is the one interactive Slack card, `notification` is an
+/// optional text-only ping, and `approvers` is WHO may act. The response model
+/// intentionally has no transport fields and no conversion into the strict
+/// PATCH graph below.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ApprovalRouteBinding {
-    // The deployed API can return a route binding with no `channel` after a
-    // live rebind, which previously hard-failed every verb that lists agents.
-    // Defaulting to empty is deliberate tolerance, not the fix: the
-    // underlying API/CLI schema mismatch (#1533) is still owed.
+pub struct ApprovalRouteBindingResponse {
+    pub resolution: ApprovalResolutionTargetResponse,
     #[serde(default)]
-    pub channel: String,
-    /// Absent means the card channel's members are the approvers, the zero-setup
-    /// default. Skipped on serialize so a channel-only write sends no `approvers`
-    /// key at all: the API models the block with `extra="forbid"`, and an explicit
-    /// null is a different statement from an omitted key.
+    pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Interactive target returned by the API. The current resolver supports Slack
+/// only, but response decoding stays tolerant of a future server extension.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalResolutionTargetResponse {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Text-only notification target returned by the API. Endpoint and adapter are
+/// deliberately absent: transport belongs to the write/stored model only.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalNotificationTargetResponse {
+    pub kind: String,
+    pub address: String,
 }
 
 /// Who may resolve a route's approvals, mirroring the committed
@@ -161,16 +171,15 @@ pub struct ApprovalApprovers {
 
 // --- The input side of the same contract (#1072) -------------------------------
 //
-// The two structs above decode API RESPONSES and must stay tolerant: a field a
-// newer server adds should not break an older CLI. The two below decode an
+// The structs above decode API RESPONSES and must stay tolerant: a field a newer
+// server adds should not break an older CLI. The graph below decodes an
 // OPERATOR-AUTHORED `--routes-from` file and must do the opposite.
 //
 // The asymmetry is the whole fix, so the pair lives here next to its lenient
 // twin rather than off in the command module. A typo'd key in a route file is
-// not a harmless unknown: dropping `approver` (for `approvers`) leaves a
-// channel-only binding, and a binding with no approvers block falls back to
-// card-channel membership, so the operator who meant to narrow authority to one
-// group has instead granted it to everyone in the channel.
+// not a harmless unknown: dropping `approver` (for `approvers`) leaves a route
+// whose authority falls back to resolution-card membership, so the operator who
+// meant to narrow authority to one group has widened it instead.
 //
 // The API already guards this with `extra="forbid"` on `ApprovalRouteBinding`,
 // on the stated premise that it is the binding's only writer. #1057 made the
@@ -180,11 +189,47 @@ pub struct ApprovalApprovers {
 // operator-authored files: an authoring typo fails loud rather than silently
 // dropping the intended field.
 
-/// One route binding as written in a `--routes-from` file. Strict by design.
+/// The only route shape accepted by `ApiClient::set_approval_routes`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRouteBindingWrite {
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<NotificationTargetWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Slack-only interactive resolution target. `kind` is kept explicit as the
+/// future extension point, while command validation currently refuses anything
+/// except `slack`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalResolutionTargetWrite {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Optional notification target with write-only transport routing.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationTargetWrite {
+    pub kind: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+}
+
+/// One route binding as written in a `--routes-from` file. Strict by design and
+/// intentionally separate from both the tolerant response and the PATCH DTO.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBindingInput {
-    pub channel: String,
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default)]
+    pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
 }
@@ -208,10 +253,11 @@ impl From<ApproversInput> for ApprovalApprovers {
     }
 }
 
-impl From<RouteBindingInput> for ApprovalRouteBinding {
+impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
     fn from(input: RouteBindingInput) -> Self {
-        ApprovalRouteBinding {
-            channel: input.channel,
+        ApprovalRouteBindingWrite {
+            resolution: input.resolution,
+            notification: input.notification,
             approvers: input.approvers.map(Into::into),
         }
     }
@@ -1428,7 +1474,7 @@ impl ApiClient {
     pub async fn set_approval_routes(
         &self,
         agent_id: &str,
-        routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
+        routes: &std::collections::BTreeMap<String, ApprovalRouteBindingWrite>,
     ) -> Result<Agent> {
         let resp = self
             .http
