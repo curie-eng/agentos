@@ -54,6 +54,10 @@ unambiguously a mistake.
 Exits non-zero naming the offending tool or gate.
 """
 
+# Annotations stay strings so this runs on the older interpreters a cluster host
+# may have -- the point of a runtime check is that it runs where the connectors are.
+from __future__ import annotations
+
 import argparse
 import difflib
 import json
@@ -65,7 +69,7 @@ import urllib.request
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
-def list_tools(url: str, timeout: float) -> list[tuple[str, bool]]:
+def list_tools(url: str, timeout: float, host: str | None = None) -> list[tuple[str, bool]]:
     """Return one connector's tool names via the MCP handshake.
 
     The session dance is not optional. A streamable-HTTP server issues an
@@ -88,6 +92,14 @@ def list_tools(url: str, timeout: float) -> list[tuple[str, bool]]:
             # return 406 and the failure looks like an empty tool list.
             "Accept": "application/json, text/event-stream",
         }
+        # A curie connector runs behind `-allowed-hosts`, so it answers 403 to any
+        # request whose Host it does not recognize. Reaching one through a
+        # port-forward changes the Host to `127.0.0.1:<port>` and every call fails
+        # -- which reads as an unreachable connector rather than as a rejected
+        # Host, and this script treats unreachable as fatal. So the caller can say
+        # what Host the connector expects.
+        if host:
+            headers["Host"] = host
         headers.update(session)
         req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -143,6 +155,14 @@ def main() -> int:
         required=True,
         help="bundle directory whose .claude-plugin/plugin.json declares the gates",
     )
+    ap.add_argument(
+        "--host",
+        action="append",
+        default=[],
+        metavar="NAME=HOST",
+        help="Host header a connector expects, when its URL is not that Host "
+        "(repeatable; needed behind a port-forward)",
+    )
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
 
@@ -160,6 +180,14 @@ def main() -> int:
         # below still has to run.
         print("no approvalPolicy gates declared")
 
+    hosts: dict[str, str] = {}
+    for spec in args.host:
+        if "=" not in spec:
+            print(f"--host wants NAME=HOST, got {spec!r}", file=sys.stderr)
+            return 2
+        name, value = spec.split("=", 1)
+        hosts[name] = value
+
     live: list[str] = []
     write_tools: list[str] = []
     for spec in args.connector:
@@ -168,7 +196,7 @@ def main() -> int:
             return 2
         name, url = spec.split("=", 1)
         try:
-            tools = list_tools(url, args.timeout)
+            tools = list_tools(url, args.timeout, hosts.get(name))
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # Fail rather than skip. A connector that will not answer means the
             # assertion is unproven, and an unproven gate check is the exact
