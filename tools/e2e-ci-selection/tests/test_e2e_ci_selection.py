@@ -12,7 +12,11 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select.py"
+# NOT `select.py`. Python puts a script's own directory first on sys.path, so a
+# module named `select` shadows the stdlib one -- and this script imports
+# subprocess, which imports selectors, which imports select. That made every
+# test here fail on macOS while CI stayed green (#1878).
+SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 
@@ -110,7 +114,7 @@ def test_registry_maps_each_known_surface(
         "examples/weather/evals/cases.json",
         ".github/e2e-selection.yaml",
         ".github/workflows/ci.yaml",
-        "tools/e2e-ci-selection/select.py",
+        "tools/e2e-ci-selection/select_tiers.py",
     ],
 )
 def test_weather_and_enforcement_paths_select_every_tier(tmp_path: Path, path: str) -> None:
