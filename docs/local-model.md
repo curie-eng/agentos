@@ -103,13 +103,16 @@ pulls from a `postStart` lifecycle hook on the Ollama container, so:
   restart retries the whole download;
 - **the default does not keep the weights.** `inference.persistence.enabled`
   defaults to `false`, so the data directory is an `emptyDir` and `cluster up`
-  requests no PVC. Any restart, eviction, or node drain re-downloads the model in
-  full.
+  requests no PVC. Kubernetes preserves an `emptyDir` across a container restart
+  within the same Pod, so that alone does not touch the weights. Pod removal or
+  replacement -- eviction, node drain -- does: the replacement Pod's `postStart`
+  pulls the weights again.
 
 With the `qwen3:4b` default (~2.5GB) this is mostly invisible. With a documented
 upgrade such as `qwen3-coder:30b` (~17-19GB) it is not. Until
 [#1779](https://github.com/curie-eng/curie/issues/1779) is resolved, deploy a
-large model with persistence turned on so a restart does not re-fetch it:
+large model with persistence turned on so an evicted or rescheduled Pod does not
+re-fetch it:
 
 ```bash
 curie cluster up --local-model qwen3-coder:30b --set inference.persistence.enabled=true --set inference.persistence.size=40Gi
