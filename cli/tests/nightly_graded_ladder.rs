@@ -504,8 +504,10 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .map(|offset| telemetry + offset)
         .expect("the local rung must prove observability queries after telemetry");
     assert!(
-        text.contains(r#"local observability runs --limit 1 --agent-id "$agent_id""#),
-        "the live proof must scope its bounded ingestion poll to the rung's deployed agent"
+        text.contains(r#"local observability runs --limit 100"#)
+            && text.contains(r#"agent_id = sys.argv[1]"#)
+            && text.contains(r#"agent_token in name or agent_token in session_id"#),
+        "the live proof must scan a bounded newest-first page and select the rung's deployed agent without relying on the API filter that timed out in the real CI stack"
     );
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
@@ -941,11 +943,18 @@ print(json.dumps({
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
+    "--json local observability runs --limit 100")
+        printf '{"limit":100,"count":1,"runs":[{"id":"%s","name":"agent-%s","timestamp":"2026-08-22T12:34:56Z","sessionId":"agent-%s-thread-example"}]}\n' \
+            "$STUB_OBSERVABILITY_TRACE_ID" "$STUB_AGENT_ID" "$STUB_AGENT_ID"
+        if [ "${STUB_RUNS_EXTRA_JSON:-0}" = "1" ]; then
+            printf '%s\n' '{"unexpected":"second JSON object"}'
+        fi
+        ;;
     "--json local observability runs --limit 1 --agent-id $STUB_AGENT_ID")
-        # The unavailable-API negative deliberately invokes the SAME candidate
-        # query with only CURIE_API_URL moved to a closed loopback endpoint.
-        # That makes the semantic exit-code proof about transport failure, not
-        # about a test-only command shape the real CLI never uses.
+        # The unavailable-API negative deliberately keeps the agent-filtered
+        # candidate query while CURIE_API_URL points at a closed loopback
+        # endpoint. That makes the semantic exit-code proof about transport
+        # failure, not about a test-only command shape the real CLI never uses.
         if [ "${CURIE_API_URL:-}" = "$STUB_UNAVAILABLE_API_URL" ]; then
             if [ -n "${STUB_UNAVAILABLE_MARKER:-}" ]; then
                 printf '%s\n' called > "$STUB_UNAVAILABLE_MARKER"
@@ -957,11 +966,8 @@ print(json.dumps({
             fi
             exit "${STUB_UNAVAILABLE_EXIT:-3}"
         fi
-        printf '{"limit":1,"count":1,"runs":[{"id":"%s","name":"agent-%s","timestamp":"2026-08-22T12:34:56Z"}]}\n' \
-            "$STUB_OBSERVABILITY_TRACE_ID" "$STUB_AGENT_ID"
-        if [ "${STUB_RUNS_EXTRA_JSON:-0}" = "1" ]; then
-            printf '%s\n' '{"unexpected":"second JSON object"}'
-        fi
+        printf '%s\n' '{"error":"the unavailable-API control unexpectedly reached the live stub","fix":"use the closed control URL"}'
+        exit 97
         ;;
     "--json local observability run $STUB_OBSERVABILITY_TRACE_ID")
         printf '{"trace":{"id":"%s","name":"agent-%s","metadata":{"session_id":"session-observability-control","terminal_outcome":"completed"}},"tree":[],"sandbox_id":"sandbox-observability-control","approval_decision":null}\n' \
@@ -1349,18 +1355,24 @@ fn looks_like_utc_second(value: &str) -> bool {
 
 /// Pin the public argv the ladder itself must exercise. These are not test-only
 /// probes: every line is a command an operator can paste against the candidate
-/// binary. The first bounded list occurs before the discovered-id detail read;
-/// the second identical list is the unavailable-API negative with only its
-/// process environment changed.
+/// binary. The bounded newest-page read occurs before the discovered-id detail;
+/// the separate agent-filtered list is the unavailable-API negative with its
+/// process environment pointed at a closed endpoint.
 fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str) {
-    let runs = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
+    let runs = "--json local observability runs --limit 100";
+    let unavailable = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
     let detail = format!("--json local observability run {trace_id}");
     let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
 
     assert_eq!(
         invocation_count(invocations, &runs),
-        2,
-        "the local rung must issue one bounded newest-runs read and repeat that exact real CLI command against an unavailable API; invocations:\n{invocations}"
+        1,
+        "the local rung must issue one bounded newest-runs read for agent-aware client selection; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocation_count(invocations, &unavailable),
+        1,
+        "the local rung must exercise the filtered runs command against an unavailable API; invocations:\n{invocations}"
     );
     for expected in [&detail, &unknown] {
         assert_eq!(

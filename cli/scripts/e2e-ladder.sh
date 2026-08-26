@@ -496,14 +496,16 @@ print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
 }
 
 # Langfuse ingestion is asynchronous to turn finalization. Poll through the
-# candidate CLI, never its backing API, and accept only a one-row bounded result
-# for this rung's agent. The returned id is the sole input to the detail read;
+# candidate CLI, never its backing API. Scan one bounded newest-first page and
+# select this rung's agent from the returned trace/session identity: the API's
+# filtered Langfuse scan can lag the general newest page even after metrics for
+# the turn are queryable. The returned id is the sole input to the detail read;
 # no latest shortcut or message-output parsing duplicates #1664.
 discover_local_observability_trace() {
     local agent_id="$1" attempt out code verdict state detail
     DISCOVERED_OBSERVABILITY_TRACE_ID=""
     for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
-        out="$("$BIN" --json local observability runs --limit 1 --agent-id "$agent_id")" && code=0 || code=$?
+        out="$("$BIN" --json local observability runs --limit 100)" && code=0 || code=$?
         if (( code != 0 )); then
             echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
             printf '%s\n' "$out" >&2
@@ -511,6 +513,8 @@ discover_local_observability_trace() {
         fi
         verdict="$(printf '%s' "$out" | python3 -c '
 import json, re, sys
+agent_id = sys.argv[1]
+agent_token = "agent-" + agent_id
 try:
     value = json.loads(sys.stdin.read())
 except Exception as exc:
@@ -524,28 +528,42 @@ if not isinstance(value, dict):
 runs = value.get("runs")
 limit = value.get("limit")
 count = value.get("count")
-if isinstance(limit, bool) or limit != 1:
+if isinstance(limit, bool) or limit != 100:
     print("invalid")
-    print("limit is not the requested bound of 1")
-elif not isinstance(runs, list) or len(runs) > 1:
+    print("limit is not the requested bound of 100")
+elif not isinstance(runs, list) or len(runs) > 100:
     print("invalid")
-    print("runs is not an array bounded to at most one row")
+    print("runs is not an array bounded to at most 100 rows")
 elif isinstance(count, bool) or not isinstance(count, int) or count != len(runs):
     print("invalid")
     print("count does not equal the bounded row count")
-elif not runs:
-    print("pending")
-    print("no ingested run yet")
 else:
-    row = runs[0]
-    trace_id = row.get("id") if isinstance(row, dict) else None
-    if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
-        print("invalid")
-        print("run id is absent or not a safe trace id")
+    matched = None
+    for row in runs:
+        if not isinstance(row, dict):
+            print("invalid")
+            print("a run row is not an object")
+            sys.exit(0)
+        trace_id = row.get("id")
+        name = row.get("name") or ""
+        session_id = row.get("sessionId") or ""
+        if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
+            print("invalid")
+            print("run id is absent or not a safe trace id")
+            sys.exit(0)
+        if not isinstance(name, str) or not isinstance(session_id, str):
+            print("invalid")
+            print("run name/sessionId is neither a string nor null")
+            sys.exit(0)
+        if matched is None and (agent_token in name or agent_token in session_id):
+            matched = trace_id
+    if matched is None:
+        print("pending")
+        print("no ingested run for the deployed agent yet")
     else:
         print("ok")
-        print(trace_id)
-' || printf '%s\n%s\n' invalid 'validator failed')"
+        print(matched)
+' "$agent_id" || printf '%s\n%s\n' invalid 'validator failed')"
         detail="${verdict#*$'\n'}"
         state="${verdict%%$'\n'*}"
         case "$state" in
@@ -567,7 +585,7 @@ else:
                 ;;
         esac
     done
-    echo "local observability runs: no run for agent $agent_id was ingested after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
+    echo "local observability runs: no run for agent $agent_id appeared in the newest 100 traces after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
     return 1
 }
 
