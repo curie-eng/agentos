@@ -22,6 +22,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -84,6 +85,31 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send(404, {"error": f"unexpected method {method}"})
 
 
+class _HostCheckingHandler(_Handler):
+    """A connector behind `-allowed-hosts`, which is how mcp-grafana ships.
+
+    It answers 403 to any request whose Host is not one it was given, and those
+    entries carry a port -- so a Host header without one does not match. Measured
+    against the live connector: one name answered 200 as `<svc>:8000` and 403 as
+    `<svc>`.
+
+    The allowed value is a NAME here and the port is this server's own, because a
+    stub only learns its ephemeral port after it binds.
+    """
+
+    allowed_name = ""
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        # server_address is typed as a union covering AF_UNIX; this stub is
+        # always an (host, port) TCP server.
+        _, port = cast("tuple[str, int]", self.server.server_address)
+        expected = f"{self.allowed_name}:{port}"
+        if self.headers.get("Host") != expected:
+            self._send(403, {"error": "forbidden: host not allowed"})
+            return
+        super().do_POST()
+
+
 @pytest.fixture
 def connector() -> Iterator[StartConnector]:
     """Start a stub connector; yields a factory returning its URL for given tools."""
@@ -91,6 +117,26 @@ def connector() -> Iterator[StartConnector]:
 
     def start(tools: list[dict[str, object]]) -> str:
         handler = type("Handler", (_Handler,), {"tools": tools})
+        server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{server.server_address[1]}/mcp"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def host_checking_connector() -> Iterator[Callable[[list[dict[str, object]], str], str]]:
+    """Start a stub answering only `<name>:<its own port>`; yields a URL factory."""
+    servers: list[http.server.HTTPServer] = []
+
+    def start(tools: list[dict[str, object]], allowed_name: str) -> str:
+        handler = type(
+            "Handler", (_HostCheckingHandler,), {"tools": tools, "allowed_name": allowed_name}
+        )
         server = http.server.HTTPServer(("127.0.0.1", 0), handler)
         servers.append(server)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -118,10 +164,14 @@ def bundle(root: Path, gates: list[str]) -> Path:
     return b
 
 
-def run(bundle_dir: Path, *connectors: str) -> subprocess.CompletedProcess[str]:
+def run(
+    bundle_dir: Path, *connectors: str, hosts: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
     args = [sys.executable, str(CHECKER), "--bundle", str(bundle_dir), "--timeout", "10"]
     for spec in connectors:
         args += ["--connector", spec]
+    for spec in hosts:
+        args += ["--host", spec]
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
@@ -202,3 +252,39 @@ def test_the_session_handshake_is_actually_performed(
     b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
     r = run(b, f"k8s-write={url}")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_host_without_a_port_still_matches_an_allowed_hosts_entry(
+    tmp_path: Path,
+    host_checking_connector: Callable[[list[dict[str, object]], str], str],
+) -> None:
+    """`--host name=<svc>` must reach a connector allowing `<svc>:<port>`.
+
+    Nobody writing that flag means "and drop the port". Before the URL's port was
+    appended this exact invocation 403'd, and the script reported an unreachable
+    connector -- the misdiagnosis that cost a live staging check.
+    """
+
+    url = host_checking_connector([WRITE_TOOL], "sre.svc.cluster.local")
+    b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
+    r = run(b, f"k8s-write={url}", hosts=("k8s-write=sre.svc.cluster.local",))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "all 1 gate(s) match a live tool" in r.stdout
+
+
+def test_a_rejected_host_says_so_instead_of_reading_as_unreachable(
+    tmp_path: Path,
+    host_checking_connector: Callable[[list[dict[str, object]], str], str],
+) -> None:
+    """A 403 must name the Host sent and point at --host.
+
+    The exception alone says only "HTTP Error 403", which reads as a dead
+    connector and sends the reader hunting the wrong thing.
+    """
+
+    url = host_checking_connector([WRITE_TOOL], "only-this-name")
+    b = bundle(tmp_path, ["mcp__k8s-write__restart_deployment"])
+    r = run(b, f"k8s-write={url}")
+    assert r.returncode == 2
+    assert "rejected the Host it was sent" in r.stderr
+    assert "--host k8s-write=<host:port>" in r.stderr

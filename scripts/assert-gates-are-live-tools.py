@@ -64,9 +64,30 @@ import json
 import pathlib
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def with_url_port(host: str, url: str) -> str:
+    """Give ``host`` the URL's port when it has none.
+
+    `-allowed-hosts` entries are `host:port`, and a Host header without the port
+    does not match one that has it. Measured against a live connector: the same
+    name answered 200 as `<svc>:8000` and 403 as `<svc>`. Nobody passing
+    `--host name=<svc>` means "and drop the port", so supply it rather than
+    letting the request 403 for a reason the caller cannot see.
+
+    An IPv6 literal is bracketed (`[::1]`), so the colon test looks after the
+    closing bracket rather than anywhere in the string.
+    """
+
+    tail = host[host.rindex("]") + 1 :] if host.endswith("]") or "]" in host else host
+    if ":" in tail:
+        return host
+    port = urllib.parse.urlsplit(url).port
+    return f"{host}:{port}" if port else host
 
 
 def list_tools(url: str, timeout: float, host: str | None = None) -> list[tuple[str, bool]]:
@@ -161,7 +182,8 @@ def main() -> int:
         default=[],
         metavar="NAME=HOST",
         help="Host header a connector expects, when its URL is not that Host "
-        "(repeatable; needed behind a port-forward)",
+        "(repeatable; needed behind a port-forward). The URL's port is "
+        "appended when absent, because -allowed-hosts entries carry one",
     )
     ap.add_argument("--timeout", type=float, default=20.0)
     args = ap.parse_args()
@@ -196,12 +218,25 @@ def main() -> int:
             return 2
         name, url = spec.split("=", 1)
         try:
-            tools = list_tools(url, args.timeout, hosts.get(name))
+            declared_host = hosts.get(name)
+            sent_host = with_url_port(declared_host, url) if declared_host else None
+            tools = list_tools(url, args.timeout, sent_host)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # Fail rather than skip. A connector that will not answer means the
             # assertion is unproven, and an unproven gate check is the exact
             # thing this script exists to prevent being assumed.
-            print(f"could not list tools for {name!r} at {url}: {exc}", file=sys.stderr)
+            detail = f"could not list tools for {name!r} at {url}: {exc}"
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 403:
+                # The one failure whose cause is invisible in the exception: a
+                # connector behind `-allowed-hosts` rejects the Host, not the
+                # caller. Name what was sent so the fix is `--host`, not a hunt
+                # for a dead connector.
+                detail += (
+                    f"\n  the connector rejected the Host it was sent"
+                    f" ({sent_host or urllib.parse.urlsplit(url).netloc});"
+                    f" pass --host {name}=<host:port> naming a host it allows"
+                )
+            print(detail, file=sys.stderr)
             return 2
         for tool, read_only in tools:
             qualified = f"mcp__{name}__{tool}"
