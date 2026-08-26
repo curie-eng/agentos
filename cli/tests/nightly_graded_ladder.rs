@@ -1365,7 +1365,7 @@ fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str)
     let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
 
     assert_eq!(
-        invocation_count(invocations, &runs),
+        invocation_count(invocations, runs),
         1,
         "the local rung must issue one bounded newest-runs read for agent-aware client selection; invocations:\n{invocations}"
     );
