@@ -383,15 +383,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind an approval route to a channel. Accepted so it can be DECLINED with a reason rather than error like a typo: a route binding is per-agent platform config, and the skill tier has no platform",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a route's verified Slack resolution card. Accepted so it can be DECLINED with a reason: the skill tier has no platform agent record",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route",
+              "help": "Narrow a route's approvers. Declined at this tier for the same reason as --route-resolution",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -399,7 +399,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the route map from a JSON file. Declined at this tier for the same reason as --route",
+              "help": "Read the complete route map, including optional notifications, from JSON. Declined at this tier for the same reason as --route-resolution",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -407,7 +407,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route",
+              "help": "Show the agent's route bindings. Declined at this tier for the same reason as --route-resolution",
               "id": "list_routes",
               "long": "list-routes",
               "positional": false,
@@ -419,7 +419,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Remove every route binding. Declined at this tier for the same reason as --route",
+              "help": "Remove every route binding. Declined at this tier for the same reason as --route-resolution",
               "id": "clear_routes",
               "long": "clear-routes",
               "positional": false,
@@ -442,6 +442,120 @@ export const commandManifest = {
           "about": "Not available at this tier: this tier configures no memory namespace: `skill up` never sets a memory ref, and there is no platform here to own or address one; use `curie local memory <agent>` or `curie cluster memory <agent>` for a deployed agent",
           "hidden": false,
           "name": "memory"
+        },
+        {
+          "about": "Not available at this tier: the skill tier runs only a bundle runner and has no platform API or observability read service; `--otel-endpoint` can export telemetry but does not create a query API; use `curie local observability runs|run|metrics` or `curie cluster observability runs|run|metrics`; to export this skill runner's telemetry, restart it with `curie skill up --otel-endpoint <OTLP_URL>` and query through a platform API",
+          "hidden": false,
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "Explain why recent runs cannot be queried at the skill tier",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Explain why a run cannot be queried by trace id at the skill tier",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Explain why metrics cannot be queried at the skill tier",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Stop and remove the local runner container",
@@ -1566,15 +1680,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -1582,7 +1696,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,
@@ -1633,7 +1747,188 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "name": "observability"
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "List recent runs, newest first",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Read one complete run by trace id",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Read the metrics summary or one bounded metric series",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Read or change an agent's model and thinking overrides (`PATCH /agents/{id}`)",
@@ -2439,7 +2734,7 @@ export const commandManifest = {
                 "curie"
               ],
               "env": "CURIE_NAMESPACE",
-              "global": false,
+              "global": true,
               "help": "Kubernetes namespace",
               "id": "namespace",
               "long": "namespace",
@@ -2450,7 +2745,7 @@ export const commandManifest = {
               "default_values": [
                 "curie"
               ],
-              "global": false,
+              "global": true,
               "help": "Helm release name",
               "id": "release",
               "long": "release",
@@ -2483,7 +2778,170 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "name": "observability"
+          "name": "observability",
+          "subcommands": [
+            {
+              "about": "List recent runs, newest first",
+              "args": [
+                {
+                  "default_values": [
+                    "20"
+                  ],
+                  "global": false,
+                  "help": "Maximum newest-first trace rows to return (1-100)",
+                  "id": "limit",
+                  "long": "limit",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict traces to one agent id",
+                  "id": "agent_id",
+                  "long": "agent-id",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "runs"
+            },
+            {
+              "about": "Read one complete run by trace id",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Trace id previously returned by `observability runs` or a completed turn",
+                  "id": "trace_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            },
+            {
+              "about": "Read the metrics summary or one bounded metric series",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Return a time series for this metric; omit for the scalar summary",
+                  "id": "metric",
+                  "long": "metric",
+                  "positional": false,
+                  "possible_values": [
+                    "runs",
+                    "latency_p95_ms",
+                    "tokens",
+                    "cost_usd",
+                    "error_rate"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Series bucket size. Defaults to day when --metric is present",
+                  "id": "granularity",
+                  "long": "granularity",
+                  "positional": false,
+                  "possible_values": [
+                    "hour",
+                    "day",
+                    "week"
+                  ],
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window start accepted by the platform API",
+                  "id": "start",
+                  "long": "start",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Optional metrics-window end accepted by the platform API",
+                  "id": "end",
+                  "long": "end",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one deployment environment",
+                  "id": "environment",
+                  "long": "environment",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Restrict metrics to one agent name",
+                  "id": "agent",
+                  "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "metrics"
+            }
+          ]
         },
         {
           "about": "Connect or disconnect the cluster release from a real Slack workspace",
@@ -4039,15 +4497,15 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Bind a manifest approval route to the channel its card posts in, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
-              "id": "route",
-              "long": "route",
+              "help": "Bind a manifest route's verified Slack resolution card, as NAME=CHANNEL (e.g. deal_desk=C0123ABCD). Repeatable. A write REPLACES the whole route map, like --gate does for tool gates",
+              "id": "route_resolution",
+              "long": "route-resolution",
               "positional": false,
               "required": false
             },
             {
               "global": false,
-              "help": "Narrow WHO may resolve a route, independently of where its card posts, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the card channel's members as the approvers",
+              "help": "Narrow WHO may resolve a route, independently of its resolution target, as NAME=users:U1,U2 or NAME=group:S1. Repeatable. Omit to leave the resolution card's channel members as the approvers",
               "id": "route_approvers",
               "long": "route-approvers",
               "positional": false,
@@ -4055,7 +4513,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\": {\"channel\": \"C0123ABCD\"}}. The repeatable flags apply on top of it",
+              "help": "Read the whole route map from a JSON file, e.g. {\"deal_desk\":{\"resolution\":{\"kind\":\"slack\",\"address\":\"C0123ABCD\"}}}. Notifications, including endpoint+adapter transport, are declared in this strict map. The repeatable override flags apply on top of it",
               "id": "routes_from",
               "long": "routes-from",
               "positional": false,

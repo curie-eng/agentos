@@ -522,6 +522,27 @@ fn agent_target_verbs_expose_the_same_flags_on_both_tiers() {
     }
 }
 
+#[test]
+fn approval_help_exposes_strict_route_inputs_and_retires_convenience_flags() {
+    for tier in ["skill", "local", "cluster"] {
+        let flags = help_flags(&[tier, "approvals"]);
+        for required in ["--route-resolution", "--route-approvers", "--routes-from"] {
+            assert!(
+                flags.contains(required),
+                "{tier} approvals is missing {required}: {flags:?}"
+            );
+        }
+        assert!(
+            !flags.contains("--route"),
+            "{tier} approvals still exposes the retired compatibility flag: {flags:?}"
+        );
+        assert!(
+            !flags.contains("--route-notification"),
+            "{tier} approvals still exposes the removed convenience flag: {flags:?}"
+        );
+    }
+}
+
 fn to_argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_string()).collect()
 }

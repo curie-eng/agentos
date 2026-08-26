@@ -165,8 +165,13 @@ async def _seed_deployment(
                 "(id, agent_id, version_label, bundle_ref, created_by) "
                 "VALUES (:id, :agent_id, :label, :ref, :by)"
             ),
-            {"id": version_id, "agent_id": agent_id, "label": f"v-{environment}",
-             "ref": bundle_ref, "by": "test"},
+            {
+                "id": version_id,
+                "agent_id": agent_id,
+                "label": f"v-{environment}",
+                "ref": bundle_ref,
+                "by": "test",
+            },
         )
         # The real schema's `environment` column is a `curie.environment` enum,
         # which is why the cast target defaults to that type and stays pinned to
@@ -182,8 +187,13 @@ async def _seed_deployment(
                 "VALUES (:id, :agent_id, :version_id, "
                 f"CAST(:env AS {environment_type}), :status)"
             ),
-            {"id": uuid.uuid4(), "agent_id": agent_id, "version_id": version_id,
-             "env": environment, "status": status},
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "version_id": version_id,
+                "env": environment,
+                "status": status,
+            },
         )
 
 
@@ -844,12 +854,8 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
                     environment_type="text",
                 )
 
-                resolver = BindingResolver(
-                    engine, WorkerConfig(db_schema=tmp_schema)
-                )
-                with caplog.at_level(
-                    "WARNING", logger="curie_worker.binding"
-                ):
+                resolver = BindingResolver(engine, WorkerConfig(db_schema=tmp_schema))
+                with caplog.at_level("WARNING", logger="curie_worker.binding"):
                     resolved = await resolver.resolve("slack", channel)
 
                 assert resolved is not None
@@ -869,9 +875,7 @@ def test_resolve_warns_when_two_agents_are_bound_to_one_channel(
                     # IF EXISTS so this cleanup can never raise 3F000 "schema
                     # does not exist" from inside the `finally` and mask the real
                     # failure that brought us here.
-                    await conn.execute(
-                        text(f"DROP SCHEMA IF EXISTS {tmp_schema} CASCADE")
-                    )
+                    await conn.execute(text(f"DROP SCHEMA IF EXISTS {tmp_schema} CASCADE"))
         finally:
             await engine.dispose()
 
@@ -1221,7 +1225,8 @@ def test_boot_env_mints_no_token_when_the_signing_key_is_empty() -> None:
 
 def test_resolves_approval_routes_from_the_agent_row() -> None:
     # Route bindings (#247): the per-agent JSONB map survives the SQL resolve
-    # (decode included) so the kernel can route approval cards through it.
+    # (decode included) so the kernel receives the strict split target and its
+    # server-side notification transport unchanged.
     async def go() -> None:
         engine = create_async_engine(_DB_URL)
         try:
@@ -1239,7 +1244,17 @@ def test_resolves_approval_routes_from_the_agent_row() -> None:
                 name=f"agent-{token}",
                 max_usd=None,
                 max_tokens=None,
-                approval_routes={"managers": {"channel": "C_MGRS"}},
+                approval_routes={
+                    "managers": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                        "notification": {
+                            "kind": "email",
+                            "address": "approvals@example.com",
+                            "endpoint": "https://adapter.example.com/replies",
+                            "adapter": "mail",
+                        },
+                    }
+                },
             )
             await _seed_deployment(
                 engine, agent_id=agent_id, environment="prod", bundle_ref=f"b/{token}.zip"
@@ -1247,7 +1262,17 @@ def test_resolves_approval_routes_from_the_agent_row() -> None:
             try:
                 resolved = await _resolver(engine).resolve("slack", channel)
                 assert resolved is not None
-                assert resolved.approval_routes == {"managers": {"channel": "C_MGRS"}}
+                assert resolved.approval_routes == {
+                    "managers": {
+                        "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
+                        "notification": {
+                            "kind": "email",
+                            "address": "approvals@example.com",
+                            "endpoint": "https://adapter.example.com/replies",
+                            "adapter": "mail",
+                        },
+                    }
+                }
             finally:
                 await _cleanup(engine, [agent_id])
         finally:

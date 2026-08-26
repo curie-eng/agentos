@@ -485,6 +485,13 @@ fn nightly_never_echoes_the_openrouter_secret_on_a_run_line() {
 #[test]
 fn live_local_rung_grades_the_deployed_weather_cases() {
     let text = ladder();
+    let local_rung = text
+        .split_once("rung_local() {")
+        .and_then(|(_, tail)| {
+            tail.split_once("rung_local_release() {")
+                .map(|(body, _)| body)
+        })
+        .expect("ladder must define rung_local before rung_local_release");
     let finalized = text
         .find(r#"assert_finalized_reply "local" "$out""#)
         .expect("the local rung must assert its finalized reply");
@@ -492,6 +499,20 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .find(r#"assert_local_otel_healthy_turn "$healthy_before""#)
         .map(|offset| finalized + offset)
         .expect("the local rung must prove healthy turn telemetry after the reply");
+    let product_collector = text[telemetry..]
+        .find("route_local_observability_to_product_collector")
+        .map(|offset| telemetry + offset)
+        .expect("the local rung must restore the product Collector before API-backed queries");
+    let observability = text[product_collector..]
+        .find(r#"prove_local_observability_queries "$agent_id""#)
+        .map(|offset| product_collector + offset)
+        .expect("the local rung must prove observability queries after telemetry");
+    assert!(
+        text.contains(r#"local observability runs --limit 100"#)
+            && text.contains(r#"timestamp = row.get("timestamp")"#)
+            && text.contains(r#"if matched is None:"#),
+        "the live proof must scan a bounded newest-first page and select its first complete typed row without relying on an identity field the list DTO does not promise"
+    );
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -504,15 +525,26 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         echo "=== curie local eval ==="
         (cd "$WORKDIR/bundle" && "$BIN" "${eval_args[@]}")
     fi"#;
-    let eval = text[telemetry..]
+    let eval = text[observability..]
         .find(contract)
-        .map(|offset| telemetry + offset)
+        .map(|offset| observability + offset)
         .expect("the local rung must run its suite check and live eval");
     assert!(
-        finalized < telemetry && telemetry < eval,
-        "the live local rung must prove telemetry after its plumbing assertion, \
-         then run local eval against the deployed weather bundle cases with the \
-         suite-parity dry-run check in front of it"
+        finalized < telemetry && telemetry < observability && observability < eval,
+        "the live local rung must prove telemetry and observability after its \
+         plumbing assertion, then run local eval against the deployed weather \
+         bundle cases with the suite-parity dry-run check in front of it"
+    );
+    assert!(
+        local_rung
+            .contains("local up_args=(local up)\n        echo \"=== curie ${up_args[*]} ===\""),
+        "the local rung must start the full profile required by its \
+         observability query proof; ladder contents:\n{text}"
+    );
+    assert!(
+        !local_rung.contains("up_args+=(--minimal)"),
+        "the local rung must never add --minimal now that its observability \
+          proof requires Langfuse/ClickHouse; ladder contents:\n{text}"
     );
 }
 
@@ -643,6 +675,17 @@ const DEPLOYMENT_ID: &str = "6f3d1c2a-0000-4000-8000-000000000003";
 /// digest of the `dev` bundle it just uploaded.
 const STALE_PROD_DEPLOYMENT_ID: &str = "6f3d1c2a-0000-4000-8000-000000000099";
 
+/// The default real-looking OTel trace id returned by the observability-runs
+/// stub for controls that exercise the whole parity ladder. The dedicated
+/// observability controls override it with a per-run value, so the local rung
+/// must discover the id instead of hard-coding this fixture.
+const OBSERVABILITY_TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
+/// The syntactically valid but absent trace used for the required 404 control.
+/// It must differ from the discovered trace while retaining the same wire
+/// shape, so the negative proves "unknown", not client-side validation.
+const UNKNOWN_OBSERVABILITY_TRACE_ID: &str = "ffffffffffffffffffffffffffffffff";
+const UNAVAILABLE_API_URL: &str = "http://127.0.0.1:1";
+
 /// A digest value pinned by the digest-divergence control at the local rung.
 const PINNED_DIGEST: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
 /// The divergent digest the cluster rung reports in the digest-divergence
@@ -684,11 +727,36 @@ for arg in "$@"; do bundle_dir="$arg"; done
 # The `--name <name>` value, read off argv: the #747 leftover-runner case asserts
 # that `skill up`'s refusal names the exact container an operator must clear.
 name=""
+observability_start=""
+observability_end=""
 prev=""
 for arg in "$@"; do
     if [ "$prev" = "--name" ]; then name="$arg"; fi
+    if [ "$prev" = "--start" ]; then observability_start="$arg"; fi
+    if [ "$prev" = "--end" ]; then observability_end="$arg"; fi
     prev="$arg"
 done
+
+# The production ladder derives one UTC window around the just-completed turn.
+# Validate the values, not merely the presence of two argv tokens: exact
+# second-resolution UTC syntax, a two-hour -1h/+1h span, and a midpoint close
+# to this process's current time. Summary and series echo these exact bounds,
+# so the ladder's DTO validators also prove the API returned the requested
+# window rather than a default.
+validate_observability_window() {
+    python3 -c 'from datetime import datetime, timedelta, timezone
+import sys
+try:
+    start = datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    end = datetime.strptime(sys.argv[2], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+except (ValueError, IndexError):
+    sys.exit(1)
+if end - start != timedelta(hours=2):
+    sys.exit(1)
+midpoint = start + (end - start) / 2
+if abs((datetime.now(timezone.utc) - midpoint).total_seconds()) > 600:
+    sys.exit(1)' "$1" "$2"
+}
 
 # A CONTENT-derived digest, not a canned one: the default makes two rungs that
 # packed the same tree agree by construction and two rungs that packed different
@@ -879,6 +947,54 @@ print(json.dumps({
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
+    "--json local observability runs --limit 100")
+        printf '{"limit":100,"count":1,"runs":[{"id":"%s","name":"curie-run","timestamp":"2026-08-22T12:34:56Z"}]}\n' \
+            "$STUB_OBSERVABILITY_TRACE_ID"
+        if [ "${STUB_RUNS_EXTRA_JSON:-0}" = "1" ]; then
+            printf '%s\n' '{"unexpected":"second JSON object"}'
+        fi
+        ;;
+    "--json local observability runs --limit 1 --agent-id $STUB_AGENT_ID")
+        # The unavailable-API negative deliberately keeps the agent-filtered
+        # candidate query while CURIE_API_URL points at a closed loopback
+        # endpoint. That makes the semantic exit-code proof about transport
+        # failure, not about a test-only command shape the real CLI never uses.
+        if [ "${CURIE_API_URL:-}" = "$STUB_UNAVAILABLE_API_URL" ]; then
+            if [ -n "${STUB_UNAVAILABLE_MARKER:-}" ]; then
+                printf '%s\n' called > "$STUB_UNAVAILABLE_MARKER"
+            fi
+            if [ "${STUB_UNAVAILABLE_NO_FIX:-0}" = "1" ]; then
+                printf '%s\n' '{"error":"Curie API is unavailable"}'
+            else
+                printf '%s\n' '{"error":"Curie API is unavailable","fix":"start the local stack or pass a reachable --api-url"}'
+            fi
+            exit "${STUB_UNAVAILABLE_EXIT:-3}"
+        fi
+        printf '%s\n' '{"error":"the unavailable-API control unexpectedly reached the live stub","fix":"use the closed control URL"}'
+        exit 97
+        ;;
+    "--json local observability run $STUB_OBSERVABILITY_TRACE_ID")
+        printf '{"trace":{"id":"%s","name":"agent-%s","metadata":{"session_id":"session-observability-control","terminal_outcome":"completed"}},"tree":[],"sandbox_id":"sandbox-observability-control","approval_decision":null}\n' \
+            "$STUB_OBSERVABILITY_TRACE_ID" "$STUB_AGENT_ID"
+        ;;
+    "--json local observability run $STUB_UNKNOWN_OBSERVABILITY_TRACE_ID")
+        if [ "${STUB_UNKNOWN_TRACE_NO_FIX:-0}" = "1" ]; then
+            printf '%s\n' '{"error":"trace was not found"}'
+        else
+            printf '%s\n' '{"error":"trace was not found","fix":"list recent traces with `curie local observability runs --limit 20`"}'
+        fi
+        exit "${STUB_UNKNOWN_TRACE_EXIT:-1}"
+        ;;
+    "--json local observability metrics --start "*" --end "*)
+        validate_observability_window "$observability_start" "$observability_end" || exit 96
+        printf '{"start":"%s","end":"%s","runs":1,"latency_p95_ms":12.5,"tokens":42,"cost_usd":0.01,"cost_known":true,"error_rate":0.0}\n' \
+            "$observability_start" "$observability_end"
+        ;;
+    "--json local observability metrics --metric runs --granularity hour --start "*" --end "*)
+        validate_observability_window "$observability_start" "$observability_end" || exit 96
+        printf '{"metric":"runs","granularity":"hour","start":"%s","end":"%s","points":[{"ts":"%s","value":1.0}]}\n' \
+            "$observability_start" "$observability_end" "$observability_start"
+        ;;
     "--json local eval --cases "*--dry-run*)
         emit_plan local 1 weather
         ;;
@@ -926,6 +1042,11 @@ esac
         r#"#!/bin/sh
 set -u
 case "$*" in
+    "ps -q --filter name=curie-api")
+        if [ "${STUB_EXISTING_LOCAL_STACK:-0}" = "1" ]; then
+            echo "stub-existing-curie-api"
+        fi
+        ;;
     "inspect curie-runner-local")
         # The first-run credential check refuses to touch an existing shared
         # local runner. Its harness begins with no such runner, while all
@@ -1106,6 +1227,12 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env("STUB_AGENT_ID", AGENT_ID)
         .env("STUB_VERSION_ID", VERSION_ID)
         .env("STUB_DEPLOYMENT_ID", DEPLOYMENT_ID)
+        .env("STUB_OBSERVABILITY_TRACE_ID", OBSERVABILITY_TRACE_ID)
+        .env(
+            "STUB_UNKNOWN_OBSERVABILITY_TRACE_ID",
+            UNKNOWN_OBSERVABILITY_TRACE_ID,
+        )
+        .env("STUB_UNAVAILABLE_API_URL", UNAVAILABLE_API_URL)
         .env_remove("CURIE_E2E_TIERS")
         .env_remove("CURIE_E2E_LIVE")
         .env_remove("CURIE_E2E_LISTEN_HOST")
@@ -1116,7 +1243,14 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("CURIE_E2E_OTEL")
         .env_remove("CURIE_FAKE_MODEL")
         .env_remove("CURIE_API_KEY")
-        .env_remove("CURIE_API_URL");
+        .env_remove("CURIE_API_URL")
+        .env_remove("STUB_EXISTING_LOCAL_STACK")
+        .env_remove("STUB_RUNS_EXTRA_JSON")
+        .env_remove("STUB_UNAVAILABLE_EXIT")
+        .env_remove("STUB_UNAVAILABLE_NO_FIX")
+        .env_remove("STUB_UNAVAILABLE_MARKER")
+        .env_remove("STUB_UNKNOWN_TRACE_EXIT")
+        .env_remove("STUB_UNKNOWN_TRACE_NO_FIX");
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -1165,6 +1299,182 @@ fn run_eval_argument_control(trajectory: bool) -> (Output, String) {
     );
     let invocations = fs::read_to_string(invocation_log).unwrap_or_default();
     (output, invocations)
+}
+
+/// Drive only the local rung with observability-aware stubs and return its
+/// result, the exact candidate-CLI argv transcript, and whether the
+/// unavailable-API branch was actually exercised.
+///
+/// The deployed ladder must use the candidate binary for these reads. A raw
+/// curl to Langfuse, or even to the API route, never reaches one of the arms
+/// above and therefore cannot create the unavailable marker or satisfy the
+/// invocation assertions below.
+fn run_local_observability_control(extra_envs: &[(&str, &str)]) -> (Output, String, bool, String) {
+    require_local_stub_port_free();
+    let harness = tempfile::tempdir().expect("create observability harness directory");
+    write_ladder_stubs(harness.path());
+    let api_url = spawn_deployments_stub(&one_active_deployment());
+    let trace_id = format!(
+        "{:032x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos()
+    );
+    let invocation_log = harness.path().join("observability-invocations.log");
+    let invocation_log_value = invocation_log.display().to_string();
+    let unavailable_marker = harness.path().join("unavailable-api-called");
+    let unavailable_marker_value = unavailable_marker.display().to_string();
+    let mut envs = vec![
+        ("CURIE_E2E_TIERS", "local"),
+        ("CURIE_API_URL", api_url.as_str()),
+        ("STUB_FAKE_MODEL", "1"),
+        ("STUB_OBSERVABILITY_TRACE_ID", trace_id.as_str()),
+        ("STUB_INVOCATION_LOG", invocation_log_value.as_str()),
+        ("STUB_UNAVAILABLE_MARKER", unavailable_marker_value.as_str()),
+    ];
+    envs.extend_from_slice(extra_envs);
+
+    let output = run_ladder(harness.path(), &envs);
+    let invocations = fs::read_to_string(invocation_log).unwrap_or_default();
+    let unavailable_called = unavailable_marker.exists();
+    (output, invocations, unavailable_called, trace_id)
+}
+
+fn invocation_count(invocations: &str, expected: &str) -> usize {
+    invocations.lines().filter(|line| *line == expected).count()
+}
+
+fn looks_like_utc_second(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// Pin the public argv the ladder itself must exercise. These are not test-only
+/// probes: every line is a command an operator can paste against the candidate
+/// binary. The bounded newest-page read occurs before the discovered-id detail;
+/// the separate agent-filtered list is the unavailable-API negative with its
+/// process environment pointed at a closed endpoint.
+fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str) {
+    let runs = "--json local observability runs --limit 100";
+    let unavailable = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
+    let detail = format!("--json local observability run {trace_id}");
+    let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
+
+    assert_eq!(
+        invocation_count(invocations, runs),
+        1,
+        "the local rung must issue one bounded newest-runs read for typed client selection; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("--json local message "))
+            .count(),
+        2,
+        "the query proof must seed the product Collector with its own finalized turn after the independent sink controls; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocation_count(invocations, &unavailable),
+        1,
+        "the local rung must exercise the filtered runs command against an unavailable API; invocations:\n{invocations}"
+    );
+    for expected in [&detail, &unknown] {
+        assert_eq!(
+            invocation_count(invocations, expected),
+            1,
+            "the local rung must issue this candidate observability query exactly once: {expected}; invocations:\n{invocations}"
+        );
+    }
+    let summary_lines = invocations
+        .lines()
+        .filter(|line| line.starts_with("--json local observability metrics --start "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        summary_lines.len(),
+        1,
+        "the local rung must issue exactly one metrics summary with explicit bounds; invocations:\n{invocations}"
+    );
+    let summary_args = summary_lines[0].split_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        summary_args.len(),
+        8,
+        "metrics summary must contain only the candidate verb and explicit --start/--end values; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        &summary_args[..5],
+        ["--json", "local", "observability", "metrics", "--start"]
+    );
+    assert_eq!(summary_args[6], "--end");
+
+    let series_lines = invocations
+        .lines()
+        .filter(|line| {
+            line.starts_with(
+                "--json local observability metrics --metric runs --granularity hour --start ",
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        series_lines.len(),
+        1,
+        "the local rung must issue exactly one runs/hour series with explicit bounds; invocations:\n{invocations}"
+    );
+    let series_args = series_lines[0].split_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        series_args.len(),
+        12,
+        "metrics series must preserve metric=runs, granularity=hour, and explicit --start/--end values; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        &series_args[..9],
+        [
+            "--json",
+            "local",
+            "observability",
+            "metrics",
+            "--metric",
+            "runs",
+            "--granularity",
+            "hour",
+            "--start",
+        ]
+    );
+    assert_eq!(series_args[10], "--end");
+
+    let summary_window = (summary_args[5], summary_args[7]);
+    let series_window = (series_args[9], series_args[11]);
+    assert!(
+        looks_like_utc_second(summary_window.0) && looks_like_utc_second(summary_window.1),
+        "metrics bounds must be explicit second-resolution UTC timestamps; invocations:\n{invocations}"
+    );
+    assert_ne!(
+        summary_window.0, summary_window.1,
+        "metrics bounds must form a non-empty window; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        summary_window, series_window,
+        "summary and series must share the one dynamically captured window; invocations:\n{invocations}"
+    );
+    let bounded_position = invocations
+        .lines()
+        .position(|line| line == runs)
+        .expect("bounded runs invocation");
+    let detail_position = invocations
+        .lines()
+        .position(|line| line == detail.as_str())
+        .expect("discovered trace detail invocation");
+    assert!(
+        bounded_position < detail_position,
+        "the rung must discover the real trace id from the bounded list before querying its complete tree; invocations:\n{invocations}"
+    );
 }
 
 /// Whether some ONE line of the transcript carries every one of `needles`.
@@ -1282,9 +1592,127 @@ fn ladder_selects_platform_trajectory_eval_without_overriding_deployed_cases() {
         .collect::<Vec<_>>();
     assert_eq!(
         ordinary_starts,
-        ["local up --minimal"],
-        "ordinary grading must retain the minimal local profile: {ordinary_invocations}"
+        ["local up"],
+        "the local rung's observability query proof requires the full profile even when the suite has no trajectory sidecar: {ordinary_invocations}"
     );
+}
+
+/// #866 POSITIVE CONTROL. The local rung must prove every new read surface
+/// against the candidate binary and a real API-backed stack. In particular,
+/// the ordinary weather bundle can no longer select `--minimal`: observability
+/// queries require Langfuse, which only the full profile starts.
+#[test]
+fn local_rung_proves_observability_queries_with_real_candidate_verbs() {
+    let (output, invocations, unavailable_called, trace_id) = run_local_observability_control(&[]);
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a local rung whose observability DTOs, negative shapes, and semantic exit codes all match must pass; transcript:\n{transcript}"
+    );
+    assert_observability_candidate_invocations(&invocations, &trace_id);
+    assert!(
+        unavailable_called,
+        "the local rung must actually move CURIE_API_URL to the closed-loopback control and exercise the unavailable-API path through the candidate CLI; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("local up"))
+            .collect::<Vec<_>>(),
+        ["local up"],
+        "observability proof requires the full local profile, never --minimal; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocation_count(&invocations, "local down"),
+        1,
+        "a successful rung must tear down the one stack it claimed exactly once; invocations:\n{invocations}"
+    );
+}
+
+/// A borrowed compose stack remains owned by the run that started it. The
+/// observability proof still runs against it, but this ladder must neither
+/// start nor stop it -- query coverage does not weaken the existing ownership
+/// boundary around teardown.
+#[test]
+fn local_observability_proof_leaves_a_borrowed_stack_to_its_owner() {
+    let (output, invocations, unavailable_called, trace_id) =
+        run_local_observability_control(&[("STUB_EXISTING_LOCAL_STACK", "1")]);
+    let transcript = transcript(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "observability proof against a borrowed healthy stack must pass without claiming it; transcript:\n{transcript}"
+    );
+    assert_observability_candidate_invocations(&invocations, &trace_id);
+    assert!(
+        unavailable_called,
+        "unavailable API negative was not exercised"
+    );
+    assert!(
+        !invocations
+            .lines()
+            .any(|line| line.starts_with("local up") || line.starts_with("local down")),
+        "the ladder must leave a pre-existing local stack to its owner; invocations:\n{invocations}"
+    );
+}
+
+/// #866 NEGATIVE CONTROLS. Move one stub contract at a time while the positive
+/// control above stays green: JSON cardinality, unknown-trace exit 1,
+/// unavailable-API exit 3, and the mandatory recovery instruction must each
+/// make the real ladder reject the candidate and still run owner teardown.
+#[test]
+fn local_observability_negative_controls_are_falsifiable() {
+    let cases: &[(&str, &str, &[&str], bool)] = &[
+        (
+            "STUB_RUNS_EXTRA_JSON",
+            "1",
+            &["runs", "exactly one JSON object"],
+            false,
+        ),
+        (
+            "STUB_UNKNOWN_TRACE_EXIT",
+            "0",
+            &["unknown trace", "exit 1"],
+            false,
+        ),
+        (
+            "STUB_UNAVAILABLE_EXIT",
+            "1",
+            &["unavailable API", "exit 3"],
+            true,
+        ),
+        (
+            "STUB_UNKNOWN_TRACE_NO_FIX",
+            "1",
+            &["unknown trace", "error", "fix"],
+            false,
+        ),
+    ];
+
+    for (variable, value, expected_line, expect_unavailable) in cases {
+        let (output, invocations, unavailable_called, _) =
+            run_local_observability_control(&[(variable, value)]);
+        let transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "{variable} must falsify the local observability proof; transcript:\n{transcript}"
+        );
+        assert!(
+            has_line_with(&transcript, expected_line),
+            "{variable} must name the rejected contract {expected_line:?}; transcript:\n{transcript}"
+        );
+        assert_eq!(
+            unavailable_called, *expect_unavailable,
+            "{variable} exercised the wrong unavailable-API path"
+        );
+        assert_eq!(
+            invocation_count(&invocations, "local down"),
+            1,
+            "the owner-scoped EXIT trap must tear down {variable}; invocations:\n{invocations}"
+        );
+    }
 }
 
 /// POSITIVE CONTROL. Every rung -- skill, local and cluster -- reports the same

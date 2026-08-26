@@ -284,7 +284,7 @@ pub(crate) fn recipes() -> Vec<Recipe> {
         // single verb. The two recipes above configure a gate and read what it
         // produced; neither shows an agent author how a declaration becomes a
         // resolved card. That path was not expressible without curl until
-        // #1057's --route flags merged, which is why the catalog carried only
+        // #1057's route flags merged, which is why the catalog carried only
         // the --list step.
         //
         // Anchored on the bind because that is the step an operator types and
@@ -296,13 +296,13 @@ pub(crate) fn recipes() -> Vec<Recipe> {
         Recipe {
             tabs: &["platform"],
             title: "Approvals end to end (declare, bind, drive, resolve)",
-            description: "Take a gated tool from its bundle declaration to a resolved card, with no curl.",
+            description: "Take a gated tool from its bundle declaration to one verified resolution card and an optional text-only notification, with no curl.",
             kind: RecipeKind::Command,
             args: vec![
                 ArgPart::Tier,
                 ArgPart::Literal("approvals"),
                 ArgPart::Field("agent"),
-                ArgPart::Literal("--route"),
+                ArgPart::Literal("--route-resolution"),
                 ArgPart::Field("route"),
             ],
             fields: vec![
@@ -314,7 +314,7 @@ pub(crate) fn recipes() -> Vec<Recipe> {
                 },
                 Field {
                     key: "route",
-                    label: "Route binding (name=channel)",
+                    label: "Resolution binding (name=Slack channel)",
                     default: Some("managers=C0EXAMPLE1"),
                     required: true,
                 },
@@ -322,7 +322,8 @@ pub(crate) fn recipes() -> Vec<Recipe> {
             notes: &[
                 "1. Declare the gate in the bundle: .claude-plugin/plugin.json, approvalPolicy.gates[] = {gate: <tool name>, route: <route name>}. Both keys are required and an incomplete gate is rejected at deploy.",
                 "2. Deploy it: `deploy --plugin-dir <dir> --slack-channel <C...>`. The declaration reaches the platform with the bundle, not separately.",
-                "3. Bind the route (the command above). `channel` is WHERE the card posts. Add `--route-approvers <name>=users:U1,U2` to say WHO may act; without it the card channel's members are the approver set.",
+                "3. Bind the route (the command above). `resolution` is the one verified Slack card. Add `--route-approvers <name>=users:U1,U2` to say WHO may act; without it the resolution card channel's members are the approver set.",
+                "Declare an optional notification in the strict --routes-from JSON map; non-Slack notifications include their complete endpoint and adapter there. The text-only ping has interaction=None, directs humans to the configured approval channel without disclosing its identifier, and is not a resolving surface. Extending resolution to a second channel requires a scoped credential and is not built here.",
                 "4. Drive a turn that calls the gated tool. The call is denied before it runs and the turn ends awaiting approval, with a card in the bound channel.",
                 "5. Resolve it: `approvals <AGENT> --list` for the id, then `--resolve <id> --as <user> --actor-channel <channel>`. Self-approval is refused, so `--as` must name someone other than the author of the turn.",
                 "A route write REPLACES the whole map, so pass every route the agent should keep. `--list-routes` shows what is bound now.",

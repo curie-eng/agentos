@@ -238,8 +238,8 @@ class ResolvedDeployment(BaseModel):
     # forwarded as CURIE_APPROVAL_REQUIRED_TOOLS at boot. None means no gates.
     approval_required_tools: list[str] | None = None
     # The agent's approval route bindings (#247): manifest route name ->
-    # workspace binding ({"channel": "C..."}), resolved by the kernel when a
-    # raised approval names a route. None means no bindings.
+    # binding with one verified-card resolution target and an optional
+    # text-only notification target. None means no bindings.
     approval_routes: dict[str, Any] | None = None
     # The agent's connector secrets (ADR-0009, #429): env-var name -> secret
     # value, injected by name into the sandbox boot env so a bundle's authed MCP

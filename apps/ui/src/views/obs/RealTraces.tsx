@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { C } from "../../tokens";
-import { Card, Chip, Dot, EmptyState, Notice } from "../../primitives";
+import { Card, Chip, CliHint, Dot, EmptyState, Notice, cliCommand } from "../../primitives";
 import { hoverBg } from "../../lib/style";
 import { useStore } from "../../state/store";
 import { useTraces, useTrace } from "../../api/hooks";
@@ -75,6 +75,17 @@ export function RealTracesList() {
             agent filter · clear ✕
           </button>
         ) : null}
+        <CliHint
+          command={cliCommand(
+            state.env === "prod"
+              ? "cluster.observability.runs"
+              : "local.observability.runs",
+            {
+              limit: "20",
+              "agent-id": agentId ?? undefined,
+            },
+          )}
+        />
         <Chip color={C.mutedStatus}>OTel · live</Chip>
       </div>
       <Card>
@@ -256,6 +267,14 @@ export function RealTraceDetail() {
               live
             </Chip>
             <span style={{ marginLeft: "auto", fontSize: 12.5, color: C.muted, fontFamily: C.mono }}>{state.traceOpen}</span>
+            <CliHint
+              command={cliCommand(
+                state.env === "prod"
+                  ? "cluster.observability.run"
+                  : "local.observability.run",
+                { trace_id: state.traceOpen ?? "" },
+              )}
+            />
             <button
               type="button"
               data-testid="promote-eval-case"

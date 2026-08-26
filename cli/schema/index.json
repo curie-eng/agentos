@@ -19,7 +19,7 @@
       "result": "ApprovalsOutput",
       "kind": "CliOutput",
       "schema": "approvals.schema.json",
-      "version": "1.2"
+      "version": "2.0"
     },
     {
       "result": "BudgetOutput",
@@ -196,9 +196,27 @@
       "version": "1.0"
     },
     {
+      "result": "ObservabilityMetricsOutput",
+      "kind": "CliOutput",
+      "schema": "observability-metrics.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ObservabilityOutput",
       "kind": "CliOutput",
       "schema": "observability.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ObservabilityRunOutput",
+      "kind": "CliOutput",
+      "schema": "observability-run.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "ObservabilityRunsOutput",
+      "kind": "CliOutput",
+      "schema": "observability-runs.schema.json",
       "version": "1.0"
     },
     {

@@ -823,7 +823,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
             "channel": {"kind": "slack", "address": "C0LOCALDEV"},
             "approval_routes": {
                 "deal-desk": {
-                    "channel": "C0BOUND01",
+                    "resolution": {"kind": "slack", "address": "C0EXAMPLE1"},
                     "approvers": {"users": ["U0BOUND01"]},
                 }
             },
@@ -839,7 +839,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
             author="U0AUTHOR1",
             reply_channel="C0LOCALDEV",
             route="deal-desk",
-            card_channel="C0BOUND01",
+            card_channel="C0EXAMPLE1",
             gate_kind="policy",
         ),
         headers=auth_headers,
@@ -874,7 +874,7 @@ def test_bound_approver_is_accepted_and_requesting_channel_is_not(
         json={
             "decision": "approved",
             "resolved_by": "U0BOUND01",
-            "actor_channel": "C0BOUND01",
+            "actor_channel": "C0EXAMPLE1",
         },
         headers=auth_headers,
     )
@@ -1683,8 +1683,9 @@ def test_run_expiry_sweeper_loop_sweeps_and_stops(
 
 # --- #420: approver sets unfused from the card's channel -----------------------
 #
-# Setup shape throughout: an agent binds route "managers" to the BROAD channel
-# (where the card posts) and, optionally, an `approvers` block (who may act).
+# Setup shape throughout: an agent binds route "managers" to a resolution target
+# in the BROAD channel (where the card posts) and, optionally, an `approvers`
+# block (who may act).
 # The approval then names that agent + route, with card_channel=C_BROAD -- the
 # exact shape the worker produces at kernel.py:626-627.
 #
@@ -1716,6 +1717,10 @@ def _agent_with_routes(
     )
     assert created.status_code == 201, created.text
     return str(created.json()["id"])
+
+
+def _slack_resolution(address: str) -> dict[str, str]:
+    return {"kind": "slack", "address": address}
 
 
 def _routed_payload(agent_id: str | None, **overrides: Any) -> dict[str, Any]:
@@ -1792,7 +1797,7 @@ def test_group_bound_route_denies_non_group_member_even_in_card_channel(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1824,7 +1829,7 @@ def test_group_member_resolves_and_session_resumes(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     payload = _routed_payload(agent_id)
     created = approvals_client.post(
@@ -1860,7 +1865,7 @@ def test_user_list_bound_route_denies_an_unlisted_actor_without_calling_slack(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED]}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"users": [_LISTED]}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1887,7 +1892,12 @@ def test_user_list_bound_route_resolves_for_a_listed_actor(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -1917,7 +1927,7 @@ def test_explicit_user_list_wins_over_the_group_binding(
         auth_headers,
         {
             "managers": {
-                "channel": _BROAD,
+                "resolution": _slack_resolution(_BROAD),
                 "approvers": {"group": _GROUP, "users": [_LISTED]},
             }
         },
@@ -1959,7 +1969,7 @@ def test_requester_cannot_self_approve_under_the_group_authorizer(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals",
@@ -1991,7 +2001,12 @@ def test_requester_cannot_self_approve_under_the_user_list_authorizer(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals",
@@ -2019,7 +2034,7 @@ def test_requester_cannot_self_approve_under_a_bound_channel_authorizer(
     route."""
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals",
@@ -2055,7 +2070,7 @@ def test_audit_names_authorizer_and_membership_evidence(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2102,7 +2117,12 @@ def test_audit_evidence_for_a_user_list_decision(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"users": [_LISTED, _APPROVER]}}},
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "approvers": {"users": [_LISTED, _APPROVER]},
+            }
+        },
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2135,7 +2155,7 @@ def test_audit_evidence_for_a_channel_decision(
     channel that held the authority and the channel the click came from."""
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2210,7 +2230,7 @@ def test_group_binding_without_a_bot_token_denies_instead_of_channel_fallback(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2242,7 +2262,7 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"managers": {"channel": _BROAD, "approvers": {"group": _GROUP}}},
+        {"managers": {"resolution": _slack_resolution(_BROAD), "approvers": {"group": _GROUP}}},
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2274,6 +2294,60 @@ def test_group_lookup_failure_denies_and_audits_the_failure(
 # --- AC4: no approvers declared keeps today's behavior exactly -----------------
 
 
+def test_notification_target_cannot_widen_card_channel_authorization(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+) -> None:
+    """A notification address is visibility, never verified resolver evidence.
+
+    The stored route deliberately names both Slack channels. The actor presents
+    the notification channel first; authorization must still use the durable
+    ``Approval.card_channel`` that held the sole interactive resolution card.
+    """
+
+    agent_id = _agent_with_routes(
+        approvals_client,
+        auth_headers,
+        {
+            "managers": {
+                "resolution": _slack_resolution(_BROAD),
+                "notification": _slack_resolution(_ELSEWHERE),
+            }
+        },
+    )
+    created = approvals_client.post(
+        "/approvals", json=_routed_payload(agent_id), headers=auth_headers
+    ).json()
+    assert created["card_channel"] == _BROAD
+
+    notified_actor = _resolve(
+        approvals_client,
+        auth_headers,
+        created["id"],
+        _OTHER,
+        _ELSEWHERE,
+    )
+    assert notified_actor.status_code == 403, notified_actor.text
+    record = approvals_client.get(
+        f"/approvals/{created['id']}", headers=auth_headers
+    )
+    assert record.json()["status"] == "pending"
+    assert valkey.xrange(runs_stream) == []
+
+    card_actor = _resolve(
+        approvals_client,
+        auth_headers,
+        created["id"],
+        _OTHER,
+        _BROAD,
+    )
+    assert card_actor.status_code == 200, card_actor.text
+    assert len(valkey.xrange(runs_stream)) == 1
+
+
 def test_binding_without_approvers_keeps_channel_membership(
     approvals_client: TestClient,
     auth_headers: dict[str, str],
@@ -2281,12 +2355,14 @@ def test_binding_without_approvers_keeps_channel_membership(
     valkey: redis.Redis,
     runs_stream: str,
 ) -> None:
-    """AC4: an existing deployment's bare ``{channel}`` binding keeps resolving
-    against ``card_channel`` -- anyone in the card channel, nobody outside it.
-    Zero-setup stays zero-setup."""
+    """AC4: a bare resolution binding keeps resolving against ``card_channel``.
+
+    Anyone in the card channel may act and nobody outside it may. Zero-setup
+    stays zero-setup.
+    """
 
     agent_id = _agent_with_routes(
-        approvals_client, auth_headers, {"managers": {"channel": _BROAD}}
+        approvals_client, auth_headers, {"managers": {"resolution": _slack_resolution(_BROAD)}}
     )
     created = approvals_client.post(
         "/approvals", json=_routed_payload(agent_id), headers=auth_headers
@@ -2348,7 +2424,7 @@ def test_unbound_route_name_keeps_channel_membership(
     agent_id = _agent_with_routes(
         approvals_client,
         auth_headers,
-        {"legal": {"channel": _ELSEWHERE, "approvers": {"users": [_LISTED]}}},
+        {"legal": {"resolution": _slack_resolution(_ELSEWHERE), "approvers": {"users": [_LISTED]}}},
     )
     created = approvals_client.post(
         "/approvals",

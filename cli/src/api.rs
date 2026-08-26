@@ -98,12 +98,13 @@ pub struct Agent {
     /// `#[serde(default)]` keeps older/leaner responses parsing to None.
     #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
-    /// Manifest route name -> workspace binding (#247, #420). Read back by
-    /// `approvals --list-routes` and written by `--route`/`--route-approvers`.
+    /// Manifest route name -> workspace binding (#247, #420, #1460). Read back
+    /// by `approvals --list-routes`; writes use a separate strict DTO so this
+    /// display-only, transport-redacted response can never become PATCH input.
     /// `#[serde(default)]` keeps a pre-#247 response parsing to None, which is
     /// the same fact as "no routes bound".
     #[serde(default)]
-    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBinding>>,
+    pub approval_routes: Option<std::collections::BTreeMap<String, ApprovalRouteBindingResponse>>,
     /// Per-agent model override, forwarded as `CURIE_MODEL` at sandbox boot
     /// (#254). `None` means no override: the platform default applies. Modeled
     /// since #1311 gave the CLI a verb that reads and writes it -- until then
@@ -125,26 +126,35 @@ pub struct Agent {
     pub memory: bool,
 }
 
-/// One route's workspace binding, mirroring the committed `ApprovalRouteBinding`.
+/// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
 ///
-/// The two fields are the axes ADR-0034 unfused and the CLI must keep visibly
-/// apart: `channel` is WHERE the card posts, `approvers` is WHO may act on it.
-/// Collapsing them in the output would re-fuse in presentation what the schema
-/// separates.
+/// `resolution` is the one interactive Slack card, `notification` is an
+/// optional text-only ping, and `approvers` is WHO may act. The response model
+/// intentionally has no transport fields and no conversion into the strict
+/// PATCH graph below.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ApprovalRouteBinding {
-    // The deployed API can return a route binding with no `channel` after a
-    // live rebind, which previously hard-failed every verb that lists agents.
-    // Defaulting to empty is deliberate tolerance, not the fix: the
-    // underlying API/CLI schema mismatch (#1533) is still owed.
+pub struct ApprovalRouteBindingResponse {
+    pub resolution: ApprovalResolutionTargetResponse,
     #[serde(default)]
-    pub channel: String,
-    /// Absent means the card channel's members are the approvers, the zero-setup
-    /// default. Skipped on serialize so a channel-only write sends no `approvers`
-    /// key at all: the API models the block with `extra="forbid"`, and an explicit
-    /// null is a different statement from an omitted key.
+    pub notification: Option<ApprovalNotificationTargetResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Interactive target returned by the API. The current resolver supports Slack
+/// only, but response decoding stays tolerant of a future server extension.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalResolutionTargetResponse {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Text-only notification target returned by the API. Endpoint and adapter are
+/// deliberately absent: transport belongs to the write/stored model only.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApprovalNotificationTargetResponse {
+    pub kind: String,
+    pub address: String,
 }
 
 /// Who may resolve a route's approvals, mirroring the committed
@@ -161,16 +171,15 @@ pub struct ApprovalApprovers {
 
 // --- The input side of the same contract (#1072) -------------------------------
 //
-// The two structs above decode API RESPONSES and must stay tolerant: a field a
-// newer server adds should not break an older CLI. The two below decode an
+// The structs above decode API RESPONSES and must stay tolerant: a field a newer
+// server adds should not break an older CLI. The graph below decodes an
 // OPERATOR-AUTHORED `--routes-from` file and must do the opposite.
 //
 // The asymmetry is the whole fix, so the pair lives here next to its lenient
 // twin rather than off in the command module. A typo'd key in a route file is
-// not a harmless unknown: dropping `approver` (for `approvers`) leaves a
-// channel-only binding, and a binding with no approvers block falls back to
-// card-channel membership, so the operator who meant to narrow authority to one
-// group has instead granted it to everyone in the channel.
+// not a harmless unknown: dropping `approver` (for `approvers`) leaves a route
+// whose authority falls back to resolution-card membership, so the operator who
+// meant to narrow authority to one group has widened it instead.
 //
 // The API already guards this with `extra="forbid"` on `ApprovalRouteBinding`,
 // on the stated premise that it is the binding's only writer. #1057 made the
@@ -180,11 +189,47 @@ pub struct ApprovalApprovers {
 // operator-authored files: an authoring typo fails loud rather than silently
 // dropping the intended field.
 
-/// One route binding as written in a `--routes-from` file. Strict by design.
+/// The only route shape accepted by `ApiClient::set_approval_routes`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRouteBindingWrite {
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<NotificationTargetWrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvers: Option<ApprovalApprovers>,
+}
+
+/// Slack-only interactive resolution target. `kind` is kept explicit as the
+/// future extension point, while command validation currently refuses anything
+/// except `slack`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalResolutionTargetWrite {
+    pub kind: String,
+    pub address: String,
+}
+
+/// Optional notification target with write-only transport routing.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationTargetWrite {
+    pub kind: String,
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+}
+
+/// One route binding as written in a `--routes-from` file. Strict by design and
+/// intentionally separate from both the tolerant response and the PATCH DTO.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBindingInput {
-    pub channel: String,
+    pub resolution: ApprovalResolutionTargetWrite,
+    #[serde(default)]
+    pub notification: Option<NotificationTargetWrite>,
     #[serde(default)]
     pub approvers: Option<ApproversInput>,
 }
@@ -208,10 +253,11 @@ impl From<ApproversInput> for ApprovalApprovers {
     }
 }
 
-impl From<RouteBindingInput> for ApprovalRouteBinding {
+impl From<RouteBindingInput> for ApprovalRouteBindingWrite {
     fn from(input: RouteBindingInput) -> Self {
-        ApprovalRouteBinding {
-            channel: input.channel,
+        ApprovalRouteBindingWrite {
+            resolution: input.resolution,
+            notification: input.notification,
             approvers: input.approvers.map(Into::into),
         }
     }
@@ -299,6 +345,109 @@ pub struct MemoryEntry {
     pub index: u64,
     pub content: String,
     pub version: u64,
+}
+
+/// One row returned by `GET /langfuse/traces`.
+///
+/// That API route deliberately exposes Langfuse's open-ended trace object
+/// (`list[dict[str, object]]`) rather than a named OpenAPI DTO. Keep the row as
+/// a typed map wrapper so the CLI can bound the collection without projecting
+/// away trace/session/outcome fields a newer platform adds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceListRow {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One node in the existing API's reconstructed observation tree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservationNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "startTime", default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(rename = "usageDetails", default)]
+    pub usage_details: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub children: Vec<ObservationNode>,
+}
+
+/// The complete existing `TraceTree` response from `GET
+/// /langfuse/traces/{trace_id}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceTree {
+    pub trace: serde_json::Map<String, serde_json::Value>,
+    pub tree: Vec<ObservationNode>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+    #[serde(default)]
+    pub approval_decision: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Scalar totals returned by the existing observability summary route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricsSummary {
+    pub start: String,
+    pub end: String,
+    pub runs: u64,
+    pub latency_p95_ms: f64,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    #[serde(default = "default_true")]
+    pub cost_known: bool,
+    pub error_rate: f64,
+}
+
+/// One point in an existing observability metric series.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricPoint {
+    pub ts: String,
+    pub value: f64,
+}
+
+/// The existing observability metric-series DTO.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricSeries {
+    pub metric: String,
+    pub granularity: String,
+    pub start: String,
+    pub end: String,
+    pub points: Vec<MetricPoint>,
+}
+
+/// Maximum number of metric points a CLI result may carry. This defensive
+/// response check keeps a skewed backend from violating the public result bound.
+pub const MAX_OBSERVABILITY_METRIC_POINTS: usize = 1000;
+
+#[derive(Debug)]
+struct ObservabilityApiUnavailable(String);
+
+impl std::fmt::Display for ObservabilityApiUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObservabilityApiUnavailable {}
+
+pub fn is_observability_api_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ObservabilityApiUnavailable>()
+            .is_some()
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -609,6 +758,23 @@ fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|d| d == "Not Found")
 }
 
+/// Validate one trace id as the single safe path segment accepted by the API.
+///
+/// Keeping this byte-for-byte shape at the CLI boundary means a malformed id
+/// is a usage error before HTTP, while a well-formed id that the API does not
+/// know remains a distinct runtime failure.
+pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
+    if (1..=128).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(raw.to_string())
+    } else {
+        Err("trace id must be 1-128 ASCII letters, digits, underscores, or hyphens".to_string())
+    }
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -647,6 +813,76 @@ impl ApiClient {
         bail!("{what} failed with {status}: {}", body.trim());
     }
 
+    async fn expect_observability_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ObservabilityApiUnavailable(format!(
+                "{what} failed with {status}: {}",
+                body.trim()
+            ))
+            .into());
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            ));
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("review the observability query filters and retry with valid values"),
+            ));
+        }
+        Self::expect_ok(resp, what).await
+    }
+
+    async fn get_observability_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .query(query)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::expect_observability_ok(resp, what)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("decoding {what}"))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
         let resp = self
             .http
@@ -660,6 +896,128 @@ impl ApiClient {
             .json()
             .await
             .context("decoding agent list")
+    }
+
+    /// Read the newest trace rows through the platform API proxy. The caller
+    /// supplies the public bound and also truncates defensively after decoding;
+    /// the latter keeps a skewed or older server from violating the CLI result
+    /// contract even if it ignores `limit`.
+    pub async fn list_observability_runs(
+        &self,
+        limit: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<TraceListRow>> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        self.get_observability_json("/langfuse/traces", &query, "listing observability runs")
+            .await
+    }
+
+    /// Read one complete trace tree through the platform API proxy. A handler
+    /// 404 is `Ok(None)` so the command can classify an unknown trace as exit
+    /// 1; FastAPI's generic unrouted 404 remains the existing stale-platform
+    /// error with its upgrade guidance.
+    pub async fn observability_run(&self, trace_id: &str) -> Result<Option<TraceTree>> {
+        parse_trace_id(trace_id).map_err(anyhow::Error::msg)?;
+        let resp = self
+            .http
+            .get(format!("{}/langfuse/traces/{trace_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("GET /langfuse/traces/{trace_id}")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            if is_unrouted(reqwest::StatusCode::NOT_FOUND, &body) {
+                bail!(
+                    "reading observability run failed: this platform release does not have that \
+                     endpoint, so it is older than this CLI. Upgrade the release, or use a CLI \
+                     matching it."
+                );
+            }
+            return Ok(None);
+        }
+        let run = Self::expect_observability_ok(resp, "reading observability run")
+            .await?
+            .json()
+            .await
+            .context("decoding observability run")?;
+        Ok(Some(run))
+    }
+
+    /// Read the complete existing metrics-summary DTO through the platform API.
+    pub async fn observability_metrics_summary(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricsSummary> {
+        let mut query = Vec::new();
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        self.get_observability_json(
+            "/observability/metrics/summary",
+            &query,
+            "reading observability metrics summary",
+        )
+        .await
+    }
+
+    /// Read the complete existing metric-series DTO through the platform API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observability_metric_series(
+        &self,
+        metric: &str,
+        granularity: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricSeries> {
+        let mut query = vec![
+            ("metric", metric.to_string()),
+            ("granularity", granularity.to_string()),
+        ];
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        let series: MetricSeries = self
+            .get_observability_json(
+                "/observability/metrics/series",
+                &query,
+                "reading observability metric series",
+            )
+            .await?;
+        if series.points.len() > MAX_OBSERVABILITY_METRIC_POINTS {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "the API returned {} metric points, above the CLI maximum of {}",
+                    series.points.len(),
+                    MAX_OBSERVABILITY_METRIC_POINTS
+                ))
+                .with_fix("narrow --start/--end or choose a coarser --granularity"),
+            ));
+        }
+        Ok(series)
     }
 
     pub async fn create_agent(
@@ -1428,7 +1786,7 @@ impl ApiClient {
     pub async fn set_approval_routes(
         &self,
         agent_id: &str,
-        routes: &std::collections::BTreeMap<String, ApprovalRouteBinding>,
+        routes: &std::collections::BTreeMap<String, ApprovalRouteBindingWrite>,
     ) -> Result<Agent> {
         let resp = self
             .http
