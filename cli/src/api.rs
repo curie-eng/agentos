@@ -347,6 +347,109 @@ pub struct MemoryEntry {
     pub version: u64,
 }
 
+/// One row returned by `GET /langfuse/traces`.
+///
+/// That API route deliberately exposes Langfuse's open-ended trace object
+/// (`list[dict[str, object]]`) rather than a named OpenAPI DTO. Keep the row as
+/// a typed map wrapper so the CLI can bound the collection without projecting
+/// away trace/session/outcome fields a newer platform adds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceListRow {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One node in the existing API's reconstructed observation tree.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ObservationNode {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "startTime", default)]
+    pub start_time: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(rename = "usageDetails", default)]
+    pub usage_details: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub children: Vec<ObservationNode>,
+}
+
+/// The complete existing `TraceTree` response from `GET
+/// /langfuse/traces/{trace_id}`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TraceTree {
+    pub trace: serde_json::Map<String, serde_json::Value>,
+    pub tree: Vec<ObservationNode>,
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
+    #[serde(default)]
+    pub approval_decision: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Scalar totals returned by the existing observability summary route.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricsSummary {
+    pub start: String,
+    pub end: String,
+    pub runs: u64,
+    pub latency_p95_ms: f64,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    #[serde(default = "default_true")]
+    pub cost_known: bool,
+    pub error_rate: f64,
+}
+
+/// One point in an existing observability metric series.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricPoint {
+    pub ts: String,
+    pub value: f64,
+}
+
+/// The existing observability metric-series DTO.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MetricSeries {
+    pub metric: String,
+    pub granularity: String,
+    pub start: String,
+    pub end: String,
+    pub points: Vec<MetricPoint>,
+}
+
+/// Maximum number of metric points a CLI result may carry. This defensive
+/// response check keeps a skewed backend from violating the public result bound.
+pub const MAX_OBSERVABILITY_METRIC_POINTS: usize = 1000;
+
+#[derive(Debug)]
+struct ObservabilityApiUnavailable(String);
+
+impl std::fmt::Display for ObservabilityApiUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObservabilityApiUnavailable {}
+
+pub fn is_observability_api_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ObservabilityApiUnavailable>()
+            .is_some()
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Bundle {
     pub bundle_ref: String,
@@ -655,6 +758,23 @@ fn is_unrouted(status: reqwest::StatusCode, body: &str) -> bool {
             .is_some_and(|d| d == "Not Found")
 }
 
+/// Validate one trace id as the single safe path segment accepted by the API.
+///
+/// Keeping this byte-for-byte shape at the CLI boundary means a malformed id
+/// is a usage error before HTTP, while a well-formed id that the API does not
+/// know remains a distinct runtime failure.
+pub fn parse_trace_id(raw: &str) -> std::result::Result<String, String> {
+    if (1..=128).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        Ok(raw.to_string())
+    } else {
+        Err("trace id must be 1-128 ASCII letters, digits, underscores, or hyphens".to_string())
+    }
+}
+
 impl ApiClient {
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
@@ -693,6 +813,76 @@ impl ApiClient {
         bail!("{what} failed with {status}: {}", body.trim());
     }
 
+    async fn expect_observability_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ObservabilityApiUnavailable(format!(
+                "{what} failed with {status}: {}",
+                body.trim()
+            ))
+            .into());
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            ));
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("review the observability query filters and retry with valid values"),
+            ));
+        }
+        Self::expect_ok(resp, what).await
+    }
+
+    async fn get_observability_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .query(query)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::expect_observability_ok(resp, what)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("decoding {what}"))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
         let resp = self
             .http
@@ -706,6 +896,128 @@ impl ApiClient {
             .json()
             .await
             .context("decoding agent list")
+    }
+
+    /// Read the newest trace rows through the platform API proxy. The caller
+    /// supplies the public bound and also truncates defensively after decoding;
+    /// the latter keeps a skewed or older server from violating the CLI result
+    /// contract even if it ignores `limit`.
+    pub async fn list_observability_runs(
+        &self,
+        limit: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<TraceListRow>> {
+        let mut query = vec![("limit", limit.to_string())];
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        self.get_observability_json("/langfuse/traces", &query, "listing observability runs")
+            .await
+    }
+
+    /// Read one complete trace tree through the platform API proxy. A handler
+    /// 404 is `Ok(None)` so the command can classify an unknown trace as exit
+    /// 1; FastAPI's generic unrouted 404 remains the existing stale-platform
+    /// error with its upgrade guidance.
+    pub async fn observability_run(&self, trace_id: &str) -> Result<Option<TraceTree>> {
+        parse_trace_id(trace_id).map_err(anyhow::Error::msg)?;
+        let resp = self
+            .http
+            .get(format!("{}/langfuse/traces/{trace_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .context("GET /langfuse/traces/{trace_id}")?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            if is_unrouted(reqwest::StatusCode::NOT_FOUND, &body) {
+                bail!(
+                    "reading observability run failed: this platform release does not have that \
+                     endpoint, so it is older than this CLI. Upgrade the release, or use a CLI \
+                     matching it."
+                );
+            }
+            return Ok(None);
+        }
+        let run = Self::expect_observability_ok(resp, "reading observability run")
+            .await?
+            .json()
+            .await
+            .context("decoding observability run")?;
+        Ok(Some(run))
+    }
+
+    /// Read the complete existing metrics-summary DTO through the platform API.
+    pub async fn observability_metrics_summary(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricsSummary> {
+        let mut query = Vec::new();
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        self.get_observability_json(
+            "/observability/metrics/summary",
+            &query,
+            "reading observability metrics summary",
+        )
+        .await
+    }
+
+    /// Read the complete existing metric-series DTO through the platform API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn observability_metric_series(
+        &self,
+        metric: &str,
+        granularity: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        environment: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<MetricSeries> {
+        let mut query = vec![
+            ("metric", metric.to_string()),
+            ("granularity", granularity.to_string()),
+        ];
+        for (key, value) in [
+            ("start", start),
+            ("end", end),
+            ("environment", environment),
+            ("agent", agent),
+        ] {
+            if let Some(value) = value {
+                query.push((key, value.to_string()));
+            }
+        }
+        let series: MetricSeries = self
+            .get_observability_json(
+                "/observability/metrics/series",
+                &query,
+                "reading observability metric series",
+            )
+            .await?;
+        if series.points.len() > MAX_OBSERVABILITY_METRIC_POINTS {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "the API returned {} metric points, above the CLI maximum of {}",
+                    series.points.len(),
+                    MAX_OBSERVABILITY_METRIC_POINTS
+                ))
+                .with_fix("narrow --start/--end or choose a coarser --granularity"),
+            ));
+        }
+        Ok(series)
     }
 
     pub async fn create_agent(

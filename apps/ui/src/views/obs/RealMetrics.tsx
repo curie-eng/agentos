@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { C } from "../../tokens";
-import { Card, Chip, AreaChart, Notice } from "../../primitives";
+import { Card, Chip, CliHint, AreaChart, Notice, cliCommand } from "../../primitives";
 import { useStore } from "../../state/store";
 import { useMetricsSummary, useMetricSeries } from "../../api/hooks";
 import { formatLatency } from "../../lib/format";
@@ -98,6 +98,19 @@ export function RealMetrics() {
             fontFamily: C.mono,
             fontSize: 12.5,
           }}
+        />
+        <CliHint
+          command={cliCommand(
+            state.env === "prod"
+              ? "cluster.observability.metrics"
+              : "local.observability.metrics",
+            {
+              metric,
+              granularity,
+              environment: state.env,
+              agent: agent || undefined,
+            },
+          )}
         />
       </div>
 

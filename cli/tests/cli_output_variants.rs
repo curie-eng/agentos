@@ -34,7 +34,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use curie::api::{ApprovalRecord, ChannelBinding, MemoryEntry, Version};
+use curie::api::{
+    ApprovalRecord, ChannelBinding, MemoryEntry, MetricPoint, MetricSeries, MetricsSummary, Version,
+};
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, ChannelsOutput, DeleteOutput, KillOutput, MemoryOutput,
     OverridesOutput, ResetThreadOutput, ResumeOutput, SkillApprovalsOutput, VersionsOutput,
@@ -47,7 +49,7 @@ use curie::local::{
 };
 use curie::message::MessageOutcomeOutput;
 use curie::migrate_store::MigrateStoreOutput;
-use curie::observability::{Endpoint, ObservabilityOutput};
+use curie::observability::{Endpoint, ObservabilityMetricsOutput, ObservabilityOutput};
 use curie::ops::{ClusterDownOutput, ClusterStatus, ClusterStatusOutput, ClusterUpOutput};
 use curie::ui::{CliOutput, DryRunPlan};
 
@@ -427,6 +429,31 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         samples![
             "DryRun" => ObservabilityOutput::DryRun(plan()),
             "Surfaces" => ObservabilityOutput::Surfaces(Vec::<Endpoint>::new()),
+        ],
+    );
+    m.insert(
+        "ObservabilityMetricsOutput",
+        samples![
+            "Summary" => ObservabilityMetricsOutput::Summary(MetricsSummary {
+                start: "2026-08-22T00:00:00Z".to_string(),
+                end: "2026-08-23T00:00:00Z".to_string(),
+                runs: 3,
+                latency_p95_ms: 25.0,
+                tokens: 42,
+                cost_usd: 0.0,
+                cost_known: false,
+                error_rate: 0.0,
+            }),
+            "Series" => ObservabilityMetricsOutput::Series(MetricSeries {
+                metric: "runs".to_string(),
+                granularity: "day".to_string(),
+                start: "2026-08-22T00:00:00Z".to_string(),
+                end: "2026-08-23T00:00:00Z".to_string(),
+                points: vec![MetricPoint {
+                    ts: "2026-08-22T00:00:00Z".to_string(),
+                    value: 3.0,
+                }],
+            }),
         ],
     );
     m.insert(

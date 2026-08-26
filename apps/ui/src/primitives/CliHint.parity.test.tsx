@@ -12,10 +12,16 @@ import { StoreProvider } from "../state/store";
 const PRODUCTION_ROOT = join(process.cwd(), "src");
 const EXPECTED_COMMAND_IDS = [
   "cluster.deploy",
+  "cluster.observability.metrics",
+  "cluster.observability.run",
+  "cluster.observability.runs",
   "cluster.reset-thread",
   "cluster.status",
   "init",
   "local.deploy",
+  "local.observability.metrics",
+  "local.observability.run",
+  "local.observability.runs",
   "local.reset-thread",
   "local.status",
 ] as const;
