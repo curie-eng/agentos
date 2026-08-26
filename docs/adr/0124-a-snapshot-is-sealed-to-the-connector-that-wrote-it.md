@@ -1,4 +1,4 @@
-# 122. A snapshot is sealed to the connector that wrote it
+# 124. A snapshot is sealed to the connector that wrote it
 
 Date: 2026-08-25
 
@@ -32,6 +32,13 @@ deliberately untouched here: the frames are the product contract, and scrubbing
 them is a separate decision."
 
 This is that decision.
+
+The ownership follows the accepted boundaries already in force. [ADR-0086](0086-bundles-declare-connectors-the-platform-hosts-them.md)
+places connector execution and its credentials in the hosted connector, while
+[ADR-0009](0009-per-agent-connector-auth.md) provides the named connector-secret
+and referenced-secret declaration and binding seam. This ADR uses those seams;
+it does not change either frozen `packages/plugin-format` or
+`packages/aci-protocol`.
 
 ### What changed to make it urgent
 
@@ -68,26 +75,37 @@ rule out scrubbing where the value is only ever read by a human.
 
 ## Decision
 
-**A snapshot is sealed to the connector that produced it. The platform stores a
-blob it cannot read, and the conflict check compares a version token instead of a
-state.**
+**Every replayable or undoable `prior_state` is sealed by the connector that
+produced it. The platform stores an opaque envelope it cannot read, and the
+conflict check compares a version token instead of a state.**
 
-1. **The connector seals its own snapshot.** A write connector that reports a
-   prior state reports it sealed to a key only that connector holds, mounted the
-   way its credential already is. `prior_state` becomes opaque at the moment it
-   leaves the process that read it.
+1. **The connector seals every replayable snapshot.** A write connector that
+   reports a replayable or undoable `prior_state` must seal it before it leaves
+   the process that read it. There is no cleartext exception based on an
+   author's judgment about whether the state appears sensitive. A connector
+   declaration names an operator-supplied durable sealing key through the
+   existing named connector-secret or `SecretRef` seam; `SecretRef` is the
+   custody-preserving form where applicable. The key value is delivered only to
+   the hosted connector, never to the API, worker, runner, ledger, or bundle.
 
    This is decision 1 of ADR-0117 followed to its conclusion. The tool's reply is
    the declaration; the tool also decides what the platform may read.
 
-2. **Exactly one party can open it, and it is the one that replays it.** Not the
-   API, not the worker, not the runner. That is what makes the executor's
-   location a question about reachability alone: under
+2. **The stored form is an opaque envelope.** It carries only a non-secret key
+   identifier and ciphertext. The platform transports and stores the envelope
+   without opening it. Exactly one party can open it: the hosted connector that
+   replays it. Not the API, worker, runner, ledger, or bundle. Under
    [ADR-0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md)
    the runner carries a blob it cannot open, so it needs no key and the sandbox
    keeps the property it exists for.
 
-3. **The conflict check compares a version token.** A sealed box is
+3. **Key lifetime is tied to undoability.** Rotation retains every old
+   decryption key for at least as long as any corresponding ledger record
+   remains undoable. If the required key is missing or retired, restore is
+   explicitly refused with no fallback. A connector without a usable configured
+   sealing key is treated as irreversible and cannot emit an undoable record.
+
+4. **The conflict check compares a version token.** A sealed box is
    non-deterministic, so ciphertexts of the same state differ and ADR-0117's
    state comparison cannot survive sealing. The connector reports the version its
    call left -- `resourceVersion`, an ETag, a generation counter -- and an undo
@@ -98,43 +116,45 @@ state.**
    silently permits, and it does not false-positive on fields that churn on their
    own.
 
-4. **A resource with no version token has no conflict check, and its actions are
+5. **A resource with no version token has no conflict check, and its actions are
    not undoable.** Deny-by-default, the same rule the rest of this design runs
    on, rather than a restore performed without knowing whether the world moved.
 
-5. **The receipt renders a summary, never a snapshot.** It is built from
+6. **The receipt renders a summary, never a snapshot.** It is built from
    `summary`, `target` and the tool name, which is all it has ever needed to say
    "scaled 3 to 10, undo". Under this decision the receipt *cannot* render the
    snapshot even by mistake, which is the difference between a rule and a
    guarantee.
 
-6. **The ACI frames stay verbatim.** They carry a sealed blob, so there is
+7. **The ACI frames stay verbatim.** They carry an opaque envelope, so there is
    nothing left to scrub, and scrubbing the product contract in flight would
    corrupt the field a restore replays.
 
 ## Consequences
 
-- **A write connector that snapshots sensitive state needs a durable keypair.**
-  A real cost, and it lands on the authors who should be carrying it. A connector
-  whose snapshot holds nothing sensitive -- `{"spec": {"replicas": 3}}` is the
-  common case -- may report it in the clear and keep the richer refusal message.
+- **Every undoable write connector needs a usable operator-supplied durable
+  sealing key.** This applies even when a state appears non-sensitive, because
+  author judgment is not a stable confidentiality boundary. A connector that
+  lacks that key can still report an irreversible action, but cannot emit an
+  undoable record.
 
 - **A refusal names versions, not states.** "v2 vs v3" instead of "10 vs 7". That
   is a real loss against ADR-0117's stated intent, which valued an operator
   seeing their own fix named. The mitigation is that the summary line and the
   target still are, and the operator learns their change is what stopped it.
 
-- **A lost or rotated connector key makes old snapshots unrestorable.** Same
-  shape as ADR-0121's unavailable pinned digest, and the same answer: the undo is
-  refused with that as its stated reason.
+- **Rotation has a retention obligation.** Old decryption keys remain available
+  while their corresponding ledger records are undoable. A missing or retired
+  key produces an explicit refused restore with no fallback.
 
 - **The ledger stops being a credential-bearing store**, rather than becoming a
   secured one. Nothing that dumps `agent_actions` -- a support bundle, a backup,
   a debug endpoint -- can leak a snapshot, because none of them can read it.
 
-- **`arguments` and `result` are still in the clear.** They can carry secrets and
-  are read by humans on the receipt path, so they take the scrubbing half. This
-  decision does not cover them and does not pretend to.
+- **Arguments and results remain a separate scrubbing concern.** They can carry
+  secrets and are read by humans on the receipt path, so their scrubbing policy
+  is independent of sealing `prior_state`; this decision does not conflate the
+  two.
 
 ## Alternatives considered
 
@@ -157,7 +177,7 @@ state.**
   an operator has to evaluate that; connector-sealed, there is nothing to
   evaluate.
 
-- **Scrub the ACI frames.** Rejected per decision 6: the same corruption one hop
+- **Scrub the ACI frames.** Rejected per decision 7: the same corruption one hop
   earlier, and it makes the product contract's content depend on a mutable rule
   table.
 
@@ -166,16 +186,18 @@ state.**
   stateless, and durable per-action storage is a larger burden on every author
   than a mounted keypair.
 
-- **Do not store snapshots for resources that can carry secrets.** ADR-0117's
-  current answer, kept as the escape hatch and demoted from being the whole
-  policy: it asks each author to classify a resource kind correctly, forever, and
-  the penalty for guessing wrong is a credential in the control plane.
+- **Allow cleartext for apparently non-sensitive snapshots.** Rejected. Every
+  replayable or undoable `prior_state` follows one rule; a cleartext exception
+  based on author judgment would recreate the classification error this ADR
+  closes. Without a usable configured key, the connector must make the action
+  irreversible rather than emit an undoable record.
 
 ## Out of scope
 
-- **Key management and rotation for a connector's sealing key.** ADR-0094's
-  cluster keypair is a different key with a different holder; this decision needs
-  its own, and how it is minted, mounted and rotated is not settled here.
+- **The implementation details of provisioning through the existing
+  named-secret or `SecretRef` seam.** The custody, envelope, key-lifetime, and
+  refusal contract above are settled here; the seam's existing operational
+  mechanics remain governed by ADR-0009.
 - **Retention and pruning of the ledger**, still open from ADR-0117.
 - **Whether `arguments` and `result` need their own treatment beyond scrubbing.**
   Named in the consequences as uncovered; deciding it needs the receipt surface
