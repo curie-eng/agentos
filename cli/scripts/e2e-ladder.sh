@@ -497,12 +497,12 @@ print(start.strftime("%Y-%m-%dT%H:%M:%SZ"), end.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 # Langfuse ingestion is asynchronous to turn finalization. Poll through the
 # candidate CLI, never its backing API. Scan one bounded newest-first page and
-# select this rung's agent from the returned trace/session identity: the API's
-# filtered Langfuse scan can lag the general newest page even after metrics for
-# the turn are queryable. The returned id is the sole input to the detail read;
-# no latest shortcut or message-output parsing duplicates #1664.
+# select the newest complete row. The returned id is the sole input to the
+# detail read; no latest shortcut or message-output parsing duplicates #1664.
+# Correlation to this rung is proved independently by the explicit-window
+# metrics reads below; trace-list DTOs do not promise an agent identity field.
 discover_local_observability_trace() {
-    local agent_id="$1" attempt out code verdict state detail
+    local attempt out code verdict state detail
     DISCOVERED_OBSERVABILITY_TRACE_ID=""
     for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
         out="$("$BIN" --json local observability runs --limit 100)" && code=0 || code=$?
@@ -513,8 +513,6 @@ discover_local_observability_trace() {
         fi
         verdict="$(printf '%s' "$out" | python3 -c '
 import json, re, sys
-agent_id = sys.argv[1]
-agent_token = "agent-" + agent_id
 try:
     value = json.loads(sys.stdin.read())
 except Exception as exc:
@@ -545,25 +543,29 @@ else:
             print("a run row is not an object")
             sys.exit(0)
         trace_id = row.get("id")
-        name = row.get("name") or ""
-        session_id = row.get("sessionId") or ""
+        name = row.get("name")
+        timestamp = row.get("timestamp")
         if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
             print("invalid")
             print("run id is absent or not a safe trace id")
             sys.exit(0)
-        if not isinstance(name, str) or not isinstance(session_id, str):
+        if name is not None and not isinstance(name, str):
             print("invalid")
-            print("run name/sessionId is neither a string nor null")
+            print("run name is neither a string nor null")
             sys.exit(0)
-        if matched is None and (agent_token in name or agent_token in session_id):
+        if not isinstance(timestamp, str) or not timestamp:
+            print("invalid")
+            print("run timestamp is absent or not a string")
+            sys.exit(0)
+        if matched is None:
             matched = trace_id
     if matched is None:
         print("pending")
-        print("no ingested run for the deployed agent yet")
+        print("no ingested run yet")
     else:
         print("ok")
         print(matched)
-' "$agent_id" || printf '%s\n%s\n' invalid 'validator failed')"
+' || printf '%s\n%s\n' invalid 'validator failed')"
         detail="${verdict#*$'\n'}"
         state="${verdict%%$'\n'*}"
         case "$state" in
@@ -585,7 +587,7 @@ else:
                 ;;
         esac
     done
-    echo "local observability runs: no run for agent $agent_id appeared in the newest 100 traces after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
+    echo "local observability runs: no run appeared in the newest 100 traces after $OBSERVABILITY_POLL_ATTEMPTS bounded poll(s)." >&2
     return 1
 }
 
@@ -727,7 +729,7 @@ prove_local_observability_queries() {
 
     echo
     echo "=== curie local observability runs --json (bounded ingestion poll) ==="
-    discover_local_observability_trace "$agent_id"
+    discover_local_observability_trace
     trace_id="$DISCOVERED_OBSERVABILITY_TRACE_ID"
 
     echo
@@ -2540,6 +2542,31 @@ restore_local_runner_health() {
     sleep 3
 }
 
+# The independent sink above proves raw telemetry crossed every service
+# boundary, but it deliberately replaces the product Collector endpoint. Once
+# those controls finish, put only the worker (and therefore newly spawned
+# runners) back on the shipped Collector so the API-backed #866 queries can
+# prove the product read path without changing the Collector configuration.
+route_local_observability_to_product_collector() {
+    if [[ -n "${STUB_STATE:-}" ]] || (( ! LOCAL_OTEL_SINK_ACTIVE )); then
+        return 0
+    fi
+
+    unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_PROTOCOL
+    docker compose --profile core --profile full -f "$REPO_ROOT/compose.dev.yaml" \
+        up -d --force-recreate --no-deps curie-worker >/dev/null
+    sleep 3
+
+    local worker endpoint
+    worker="$(local_worker_container)"
+    endpoint="$(container_env_value "$worker" OTEL_EXPORTER_OTLP_ENDPOINT)"
+    if [[ "$endpoint" != "http://otel-collector:4318" ]]; then
+        echo "local observability: worker still targets '$endpoint', expected the product Collector." >&2
+        return 1
+    fi
+    echo "local observability: worker restored to the product Collector at $endpoint"
+}
+
 assert_local_otel_failed_turn() {
     local baseline="$1" attempt
     for attempt in $(seq 1 45); do
@@ -2778,6 +2805,13 @@ rung_local() {
         assert_local_otel_healthy_turn "$healthy_before"
         case_local_otel_runner_failure
     fi
+
+    route_local_observability_to_product_collector
+    echo
+    echo "=== curie local message --json (observability query seed) ==="
+    out="$("$BIN" --json local message --channel C0LOCALDEV "observability query control" || true)"
+    printf '%s\n' "$out"
+    assert_finalized_reply "local observability seed" "$out"
 
     prove_local_observability_queries "$agent_id"
 

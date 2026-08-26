@@ -499,15 +499,19 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .find(r#"assert_local_otel_healthy_turn "$healthy_before""#)
         .map(|offset| finalized + offset)
         .expect("the local rung must prove healthy turn telemetry after the reply");
-    let observability = text[telemetry..]
-        .find(r#"prove_local_observability_queries "$agent_id""#)
+    let product_collector = text[telemetry..]
+        .find("route_local_observability_to_product_collector")
         .map(|offset| telemetry + offset)
+        .expect("the local rung must restore the product Collector before API-backed queries");
+    let observability = text[product_collector..]
+        .find(r#"prove_local_observability_queries "$agent_id""#)
+        .map(|offset| product_collector + offset)
         .expect("the local rung must prove observability queries after telemetry");
     assert!(
         text.contains(r#"local observability runs --limit 100"#)
-            && text.contains(r#"agent_id = sys.argv[1]"#)
-            && text.contains(r#"agent_token in name or agent_token in session_id"#),
-        "the live proof must scan a bounded newest-first page and select the rung's deployed agent without relying on the API filter that timed out in the real CI stack"
+            && text.contains(r#"timestamp = row.get("timestamp")"#)
+            && text.contains(r#"if matched is None:"#),
+        "the live proof must scan a bounded newest-first page and select its first complete typed row without relying on an identity field the list DTO does not promise"
     );
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
@@ -944,8 +948,8 @@ print(json.dumps({
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
     "--json local observability runs --limit 100")
-        printf '{"limit":100,"count":1,"runs":[{"id":"%s","name":"agent-%s","timestamp":"2026-08-22T12:34:56Z","sessionId":"agent-%s-thread-example"}]}\n' \
-            "$STUB_OBSERVABILITY_TRACE_ID" "$STUB_AGENT_ID" "$STUB_AGENT_ID"
+        printf '{"limit":100,"count":1,"runs":[{"id":"%s","name":"curie-run","timestamp":"2026-08-22T12:34:56Z"}]}\n' \
+            "$STUB_OBSERVABILITY_TRACE_ID"
         if [ "${STUB_RUNS_EXTRA_JSON:-0}" = "1" ]; then
             printf '%s\n' '{"unexpected":"second JSON object"}'
         fi
@@ -1367,7 +1371,15 @@ fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str)
     assert_eq!(
         invocation_count(invocations, runs),
         1,
-        "the local rung must issue one bounded newest-runs read for agent-aware client selection; invocations:\n{invocations}"
+        "the local rung must issue one bounded newest-runs read for typed client selection; invocations:\n{invocations}"
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("--json local message "))
+            .count(),
+        2,
+        "the query proof must seed the product Collector with its own finalized turn after the independent sink controls; invocations:\n{invocations}"
     );
     assert_eq!(
         invocation_count(invocations, &unavailable),
