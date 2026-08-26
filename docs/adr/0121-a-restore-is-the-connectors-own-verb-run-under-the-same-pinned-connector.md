@@ -165,8 +165,9 @@ executor should not ship before it.
 
 ## Alternatives considered
 
-- **An MCP client in the worker** (ADR-0117's first candidate). The smallest
-  change, and the reason to reject it is decision 2. The worker is the control
+- **An MCP client in the worker** (ADR-0117's first candidate). Not the smaller
+  change -- the spike above measured both at the same 13 lines -- so cost does not
+  choose between them and decision 2 does. The worker is the control
   plane; giving it a direct client of tenant connectors makes the platform
   reachable to places ADR-0008 keeps separate, and the undo would then run under
   the control plane's network reachability rather than the sandbox's. An undo
@@ -196,18 +197,39 @@ executor should not ship before it.
 
 ## Consequences
 
-- **The runner must invoke an MCP tool outside the model loop, which it cannot do
-  today.** This is the largest cost and it was ADR-0117's stated reason for
-  deferring: the SDK owns the client sessions, so a second client inside the
-  runner is new mechanism. It is a smaller mechanism than it looked, because it
-  is needed for exactly one verb with a fixed argument shape and no model in the
-  path.
+- **The runner invokes an MCP tool outside the model loop, and that turned out to
+  be cheap.** This was written up as the largest cost, inherited from ADR-0117's
+  stated reason for deferring: "the SDK owns the client sessions", so a second
+  client in the runner is "a large new mechanism for one job".
+
+  Measured, it is not. A hosted connector's MCP entry is `{"type": "http", "url":
+  ".../mcp"}` -- streamable HTTP, not a stdio subprocess the SDK spawned -- so the
+  question was never how to take a session from the SDK. It was how big an HTTP
+  client is for one call. Against the real `k8s-scale` connector, with no agent
+  SDK in the process, it is **13 lines**: open the transport, initialize the
+  session, call the tool. Probes on `spike/adr-0121-restore-executor`.
+
+  This removes a cost from decision 2 rather than adding one, and it sharpens the
+  argument in the alternatives below: the worker could do this just as cheaply, so
+  the case for the sandbox rests entirely on reachability and the policy envelope.
+  That is a better place for it to rest than on relative effort.
 
 - **A write connector that wants to be undoable now has two verbs to write, not
   one.** ADR-0117 already charged authors for returning JSON; this adds the
   return leg. The honest mitigation is that both are the same tool's read and
   write halves, and a connector that cannot restore can still report prose and be
   honestly irreversible.
+
+- **The loop has been run end to end, with real code at every step.**
+  `probe_roundtrip.py` on that spike branch: an agent scales 3 to 10, the ledger
+  records the prior state, a refused undo leaves the world untouched at 10 and
+  never reaches the connector, an authorized undo returns `{target, prior_state}`,
+  and the executor replays it back to 3. No mapping table exists anywhere, which
+  is decision 1's claim surviving contact.
+
+  What the same probe found missing is the confirmation half: `POST
+  /actions/{id}/confirm-undo` does not exist, so decision 4's compromise stands
+  until it does.
 
 - **A restore is a sandbox turn without a model**, which is a shape the platform
   does not have. Whether it reuses the existing sandbox lifecycle or gets a
