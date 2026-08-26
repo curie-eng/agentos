@@ -1,7 +1,7 @@
 ---
 seam: Third-party port adapter (deployed service)
 kind: NONE
-impls: 0 (intended line recorded, nothing built)
+impls: lifecycle unbuilt; generic HTTP edge shipped
 grade: not separately graded
 epics:
   - "#19"
@@ -12,7 +12,7 @@ order: 22
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** NONE &nbsp;·&nbsp; **Implementations today:** 0 (intended line recorded, nothing built) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** NONE &nbsp;·&nbsp; **Implementations today:** lifecycle unbuilt; generic HTTP edge shipped &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -35,13 +35,18 @@ worker; it is independently upgradable behind a versioned wire; and it is what
 the system already does everywhere a second implementation exists, so it adds no
 new operational concept.
 
-The line this file records is therefore a **placement constraint**, and nothing
-implements it yet. That is what NONE is for.
+The generic authenticated HTTP ingress and neutral authenticated HTTP reply edge
+now draw useful portions of that line. They are not an adapter installation or
+lifecycle: no third-party adapter is packaged, registered, installed, discovered,
+deployed, or proven conformant. `NONE` records that unbuilt lifecycle, not a
+denial that the generic edges ship.
 
 ## Current contract
 
-There is no contract to conform to yet. What a first implementation must honor,
-taken from ADR-0096 rather than invented here:
+The shipped channel edge is an authenticated generic HTTP contract, but it is
+not yet a contract a third party can install and conform to. A first promoted
+adapter must honor the following ADR-0096 constraints rather than treating the
+generic endpoints as a plugin API:
 
 - **Two plugin kinds that do not merge.** An *agent bundle* extends one agent, is
   the Claude plugin shape verbatim, runs inside the sandbox trust domain, and
@@ -54,31 +59,40 @@ taken from ADR-0096 rather than invented here:
   [connector-host](../connector-host/INTERFACE.md), which is that same
   declare-and-host split one scope down, agent-scoped instead of
   deployment-scoped.
-- **The wire is HTTP or a queue payload.** A bespoke RPC plugin protocol was
-  rejected because the platform already composes over contracts that are
-  versioned, drift-gated and understood by every lane; revisit only if a port's
-  contract genuinely cannot be expressed that way, which none currently is.
-- **A four-rung promotion ladder before a port is pluggable.** An `INTERFACE.md`
-  documents where the code already draws the line; a contract package makes the
-  line a schema, as `packages/aci-protocol` and `packages/channel-protocol`
-  already do; a conformance suite is something a third party runs against its own
-  adapter before it ever talks to us; and the port owes an entry in an adapter
-  manifest schema naming the config, secrets and endpoints an implementation
-  declares. Without that fourth rung a third party can be conformant and still
-  not installable, which counts as an unfinished promotion rather than a finished
-  one. A registry proves an object was loaded; a conformance kit proves it
-  behaves.
-- **Credential rules, which are the trust boundary.** An adapter is a rendering
-  and transport contract, never a trust boundary: approvals resolve solely
-  through the API authorizer, and an adapter's report of who clicked is input
-  rather than authority. An adapter holds its own channel credentials and never
-  the platform's model credentials, and **a reply endpoint never receives any
-  credential other than its own**, so per-endpoint authentication is part of the
-  egress contract a promoted port publishes rather than something bolted on later.
-- **Ingress is the authenticated hook surface, never the broker.** A third-party
-  adapter enqueues nothing directly: raw produce access can mint a turn for any
-  agent and forge its author, bypassing the dedupe and authentication API ingress
-  exists to provide. Direct enqueue stays first-party only.
+- **The wire is HTTP or a queue payload.** The shipped channel ingress is
+  `POST /channels/token` plus `POST /channels/turns`
+  (`apps/api/src/curie_api/routers/channels.py`). The platform mints a scoped
+  `chn` token for one binding row and generation
+  (`apps/api/src/curie_api/channel_token.py`); that credential can enqueue only
+  for the current binding. The turn body supplies its channel identity and
+  delivery content, while the API loads the binding and supplies `kind`,
+  `endpoint`, and `adapter` itself. A caller therefore cannot turn a token into
+  an authenticated request to a caller-selected endpoint. Raw broker produce
+  access remains first-party only: it could mint a turn or forge its author
+  without the ingress API's authentication and dedupe.
+- **Binding and reply-route facts are server controlled.** A binding is the
+  neutral `{kind, address}` pair (`ChannelBinding`) on `AgentChannel`; its write
+  form also records the paired `endpoint` and `adapter` facts an operator sets at
+  bind time (`apps/api/src/curie_api/schemas.py::ChannelBindingWrite`). The
+  generic reply edge receives neither route fact from adapter input. The worker
+  builds its local `TargetRoute` from the resolved binding or a server-minted
+  reply handle.
+- **The egress is neutral and authenticated.** `ReplySinkRouter` selects
+  `HttpReplyAdapter` for a non-Slack kind
+  (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`). It POSTs a
+  neutral `ReplyEvent` to the binding's server-controlled endpoint with only the
+  credential selected by that route's adapter slug, fails closed when either is
+  absent, and does not follow redirects or fall back to Slack. An adapter is a
+  rendering and transport contract, never a trust boundary: approvals still
+  resolve through the API authorizer, and an adapter holds its own channel
+  credential rather than platform model credentials.
+- **A four-rung promotion ladder remains before a port is pluggable.** An
+  `INTERFACE.md` documents the line; a contract package makes the line a schema;
+  a conformance suite is something a third party runs against its own adapter;
+  and an adapter manifest declares its config, secrets, endpoints, and targeted
+  contract version. Without packaging, installation and lifecycle behind that
+  manifest, a generic HTTP edge is not an installable adapter. A registry proves
+  an object was loaded; a conformance kit proves it behaves.
 - **In-process entry points are the narrow exception.** Reserved for ports that
   are latency- or transaction-coupled to a turn and would be absurd behind HTTP —
   the binding hook that runs at claim time before the sandbox boots
@@ -100,76 +114,81 @@ taken from ADR-0096 rather than invented here:
 
 ## Implementations today
 
-None, and no partial one. The mechanism is unbuilt on this release train:
+The generic channel edges ship, but no third-party adapter service is supported
+or shipped. `POST /channels/token` mints a scoped credential for a binding row;
+`POST /channels/turns` accepts the matching authenticated delivery and derives
+the reply route from that row, not from the request. A non-Slack resolved turn
+uses `HttpReplyAdapter` to deliver neutral JSON reply events to that
+server-controlled endpoint under its per-adapter credential. Slack remains the
+only supported channel adapter; the first-party CLI/no-Slack path is a useful
+composition precedent, not a supported third-party adapter.
 
-- there is no `curie adapter` verb family in the CLI surface
-  (`cli/command-manifest.json`), and no adapter manifest schema anywhere;
+The deployed-adapter lifecycle remains unbuilt:
+
+- no `curie adapter` verb family or adapter manifest schema declares an adapter's
+  image, contract version, config, secrets, and endpoints;
+- no package format, registration/discovery mechanism, installer, or deployment
+  reconciliation lifecycle turns an adapter service into an installed Curie
+  component;
 - the only entry-point group declared in the repo is the harness one,
   `ENTRY_POINT_GROUP`
   (`runner/src/curie_runner/harness/registry.py::ENTRY_POINT_GROUP`); no
-  `curie.<port>` sibling group exists;
-- there is no service-registration table, no adapter address or endpoint
-  configuration, and no channel-neutral egress port;
-- `packages/channel-protocol` holds the neutral reply DTOs — `OutboundMessage`
+  `curie.<port>` sibling group exists for the narrow in-process exception; and
+- `packages/channel-protocol` provides neutral reply DTOs — `OutboundMessage`
   (`packages/channel-protocol/src/channel_protocol/models.py::OutboundMessage`)
   and `ChannelCapabilities`
   (`packages/channel-protocol/src/channel_protocol/models.py::ChannelCapabilities`)
-  — which are the second rung of the ladder above, but it carries no conformance
-  kit.
+  — but there is no adapter conformance kit.
 
-The nearest existing thing is per-turn and pre-dates this decision:
-`ReplyHandle` (`packages/aci-protocol/src/aci_protocol/turn.py::ReplyHandle`)
-carries a per-turn reply endpoint, which is what lets the first-party CLI stub
-and a real Slack workspace coexist on one worker (#19). ADR-0096 promotes that
-stub in status: it is the existing second channel implementation and becomes the
-reference adapter the first conformance kit grows from.
+The generic edges are necessary seam evidence, not second-implementation proof.
+A real, independently supported adapter must use the whole ingress, egress,
+credential, install, and lifecycle path before this seam can be promoted from
+`NONE`.
 
 ## Known leakage
 
-A NONE seam has no implementation to leak, so what belongs here is the distance
-between the recorded intent and the tree, and the things a first implementer
-would trip over:
+`NONE` now means the lifecycle is absent, not that every underlying edge is
+absent. The remaining distance between the shipped generic edge and an adapter
+service is material:
 
-- **Fixed — the credential rule the decision states.** Egress used to deliver
-  every per-turn reply through one client holding a single Slack bot token,
-  presented to whatever endpoint the turn named, with an unreachable-endpoint
-  fallback that re-sent the reply's content to the default transport. Both were
-  correct for a one-workspace install and wrong the moment a vendor endpoint
-  coexists with real Slack. ADR-0096 D4.2 closed it: a non-Slack binding is
-  delivered by `HttpReplyAdapter`
-  (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) under a
+- **Fixed — credentialed generic egress.** Egress used to deliver every per-turn
+  reply through one client holding a single Slack bot token, presented to
+  whatever endpoint the turn named, with an unreachable-endpoint fallback that
+  re-sent reply content to the default transport. `HttpReplyAdapter` now uses a
   per-adapter secret selected by the route's `adapter` slug, with no transport
-  fallback of any kind, and `SlackReplyAdapter`
+  fallback; `SlackReplyAdapter`
   (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) refuses an
-  endpoint that is not the worker's configured, trusted Slack origin rather than
+  endpoint outside the worker's configured trusted Slack origin rather than
   handing it the platform bot token.
-- **Fixed (#1459, ADR-0096) — the binding surface.** The agents table used to
-  carry a literal `slack_channel` column and the API's validators rejected ids
-  that were not Slack-shaped, so a vendor would have had to mint Slack-shaped
-  channel ids exactly as the CLI stub does. The binding is now a neutral
+- **Fixed (#1459, ADR-0096) — authenticated ingress and the binding surface.**
+  The agents table used to carry a literal `slack_channel` column and the API's
+  validators rejected non-Slack-shaped ids. The neutral binding is now a
   `{kind, address}` pair (`apps/api/src/curie_api/schemas.py::ChannelBinding`) on
-  its own table (`apps/api/src/curie_api/models.py::AgentChannel`), validated by
-  a kind-dispatched write gate
-  (`apps/api/src/curie_api/schemas.py::_validate_channel_binding`).
-- **The interactivity return path has no scoped credential.** Approval resolution
-  sits behind the single platform-wide key, and the scoped token minted for the
-  sandbox is deliberately rejected everywhere but the state router. A scoped
-  adapter credential in that shape is a prerequisite of a second channel adapter
-  rather than a follow-up to one.
-- **The decision is Accepted while the mechanism is not built, and its own
-  acceptance header names realizing code paths that only partly exist here.** The
-  ADR's Consequences section is explicit that it authorizes no code and ships
-  without a reference third-party adapter, and the items listed under
-  "Implementations today" above are what a reader will and will not find in the
-  tree. Treat this file as the record of the intended line, not as evidence that
-  a plugin mechanism is available.
+  `AgentChannel`, and the channel router validates a scoped token against that
+  binding's row id and generation before it enqueues a turn. The route facts
+  (`endpoint`, `adapter`) come from the binding row rather than ingress input.
+- **The interactivity return path has no scoped adapter credential.** Approval
+  resolution sits behind the platform-wide key, and the scoped token minted for
+  the sandbox is deliberately rejected everywhere but the state router. A
+  scoped adapter credential for that return path remains a prerequisite of a
+  second channel adapter rather than a follow-up to one.
+- **Packaging, installation, discovery, lifecycle, and conformance remain
+  unbuilt.** A binding's configured route is not an adapter registry or an
+  install experience, and the generic HTTP edges do not establish a supported
+  provider or deployment contract. There is no manifest-driven way to install
+  an adapter and no conformance suite with which a third party could prove one.
+- **A real second supported adapter is still required to prove the seam.** The
+  current generic ingress and egress are deliberately neutral, but only Slack
+  is supported. Treat this document as evidence of the shipped edges and the
+  intended placement constraint, not as a claim that a third-party adapter
+  service or plugin mechanism exists.
 
 ## Cross-links
 
 - **Related seam:** [harness-package](../harness-package/INTERFACE.md) — the only entry-point plugin mechanism in the codebase, and the model ADR-0096 generalizes from while reserving it for the narrow in-process exception.
 - **Related seam:** [connector-host](../connector-host/INTERFACE.md) — the declare-and-host split one scope down, and the hosting substrate an operator-run adapter would reuse.
-- **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md) — the port promoted first, and the one whose grade this decision is trying to move.
-- **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives that are already the second rung of the promotion ladder.
-- **Epic(s):** #19 — per-turn reply endpoint routing, which the worked example builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
-- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; not one of the six swap-readiness Jobs, so not separately graded
+- **Related seam:** [channel-ingress](../channel-ingress/INTERFACE.md) — the graded (`C`) channel ingress/egress seam; its generic authenticated HTTP edges are shipped, while a second supported adapter is still needed to prove the swap.
+- **Related seam:** [channel-interaction](../channel-interaction/INTERFACE.md) — the neutral interaction primitives used by the reply edge; they are not a third-party adapter conformance contract.
+- **Epic(s):** #19 — per-turn reply endpoint routing, which the generic egress edge builds on; #158 — multi-tenancy, deliberately out of scope until it settles what a tenant owns
+- **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — the standing restraint that no speculative adapter layer is written ahead of a real second implementation; this is not one of the six swap-readiness Jobs, so it is not separately graded
 - **ADR(s):** [ADR-0096](../../adr/0096-port-adapters-are-deployed-services.md) — a third-party port adapter is a deployed service, not a loaded plugin; [ADR-0060](../../adr/0060-the-harness-is-a-declared-package.md) — the harness registry it generalizes; [ADR-0086](../../adr/0086-bundles-declare-connectors-the-platform-hosts-them.md) — the declare-and-host precedent moved up one scope; [ADR-0040](../../adr/0040-adopt-acp-as-an-edge-projection.md) — the trust rule inherited verbatim: an adapter is a rendering and transport contract, never a trust boundary

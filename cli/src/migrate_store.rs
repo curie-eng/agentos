@@ -888,6 +888,12 @@ fn standalone_import_dry_run_plan(
 
 /// Phase one: stage every object while the old store is still up.
 pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<MigrateStoreOutput> {
+    let (from, to) = resolve_store_migration(o, chart).await?;
+
+    run_export_with_plan(o, from, to, bucket).await
+}
+
+async fn resolve_store_migration(o: &CommonOpts, chart: &str) -> Result<(StoreKind, StoreKind)> {
     let live: Vec<String> = crate::ops::live_stateful_components(o)
         .await?
         .into_iter()
@@ -903,7 +909,7 @@ pub async fn run_export(o: &CommonOpts, chart: &str, bucket: &str) -> Result<Mig
             .collect();
     let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
 
-    run_export_with_plan(o, from, to, bucket).await
+    Ok((from, to))
 }
 
 async fn run_export_with_plan(
@@ -1211,20 +1217,7 @@ impl Drop for ValuesFileCleanup {
 /// staged it itself moments earlier. Making an operator bypass a safety check
 /// as a routine step teaches them to bypass it.
 pub async fn run_auto(o: &CommonOpts, chart: &str, bucket: &str) -> Result<MigrateStoreOutput> {
-    let live: Vec<String> = crate::ops::live_stateful_components(o)
-        .await?
-        .into_iter()
-        .map(|(component, _)| component)
-        .collect();
-    // migrate_store reasons about COMPONENTS only (which store is which); the
-    // resource names the guard also needs are irrelevant here.
-    let rendered: Vec<String> =
-        crate::ops::chart_stateful_components(chart, o, &crate::ops::UpValuePlan::default())
-            .await?
-            .into_iter()
-            .map(|(component, _)| component)
-            .collect();
-    let (from, to) = ensure_migratable(&plan(&live, &rendered)?)?;
+    let (from, to) = resolve_store_migration(o, chart).await?;
 
     let image = "amazon/aws-cli:2.32.6";
     let secret = crate::ops::release_secret_name_or_default(&o.namespace, &o.release).await;

@@ -1,0 +1,1573 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#08090b">
+  <title>Curie architecture atlas</title>
+  <style>
+    :root {
+      --bg: #08090b;
+      --bg-deep: #030304;
+      --panel: #111318;
+      --panel-strong: #191c22;
+      --panel-soft: #0c0e12;
+      --text: #f1f2f4;
+      --muted: #a0a4ac;
+      --faint: #6e737d;
+      --line: #2b2e34;
+      --line-strong: #454952;
+      --accent: #68d7ff;
+      --accent-soft: rgba(104, 215, 255, .12);
+      --green: #43d49b;
+      --green-soft: rgba(67, 212, 155, .13);
+      --yellow: #f5c85b;
+      --yellow-soft: rgba(245, 200, 91, .14);
+      --red: #ff7373;
+      --red-soft: rgba(255, 115, 115, .13);
+      --planned: #7ca9ff;
+      --planned-soft: rgba(124, 169, 255, .13);
+      --shadow: 0 24px 80px rgba(0, 0, 0, .28);
+      --radius: 18px;
+      --radius-sm: 11px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      min-height: 100vh;
+      color: var(--text);
+      background: radial-gradient(circle at 16% -10%, rgba(255,255,255,.045), transparent 34rem), linear-gradient(180deg, var(--bg) 0%, var(--bg-deep) 100%);
+      font-family: var(--sans);
+      line-height: 1.5;
+    }
+
+    button, select, input { font: inherit; }
+    button, a, select, input { outline-offset: 3px; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    a:hover { color: #a5e9ff; }
+
+    .app-shell { width: min(1840px, 100%); margin: 0 auto; padding: 26px 28px 48px; }
+    .masthead { position: relative; padding: 16px 0 22px; }
+    .masthead::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 1px;
+      background: linear-gradient(90deg, rgba(104,215,255,.55), rgba(104,215,255,.08) 45%, transparent);
+    }
+    .eyebrow { display: flex; align-items: center; gap: 10px; color: var(--accent); font-family: var(--mono); font-size: 12px; letter-spacing: .13em; text-transform: uppercase; }
+    .eyebrow-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 18px var(--green); }
+    h1 { margin: 13px 0 8px; max-width: 980px; font-size: clamp(34px, 5vw, 70px); line-height: .98; letter-spacing: -.045em; font-weight: 650; }
+    .subtitle { margin: 0; max-width: 900px; color: var(--muted); font-size: clamp(15px, 1.4vw, 19px); }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 18px; }
+    .meta-chip { display: inline-flex; align-items: center; gap: 7px; min-height: 30px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(18, 20, 24, .76); color: var(--muted); font-size: 12px; }
+    .meta-chip strong { color: var(--text); font-weight: 600; }
+
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 17px 0; position: sticky; top: 0; z-index: 20; background: rgba(8, 9, 11, .94); backdrop-filter: blur(18px); border-bottom: 1px solid var(--line); }
+    .view-tabs, .mode-switch, .filter-row, .state-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+    .tab-button, .mode-button, .filter-button, .step-button, .ghost-button, .primary-button {
+      border: 1px solid transparent;
+      border-radius: 9px;
+      min-height: 38px;
+      padding: 7px 12px;
+      color: var(--muted);
+      background: transparent;
+      cursor: pointer;
+      transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease;
+    }
+    .tab-button:hover, .mode-button:hover, .filter-button:hover, .step-button:hover, .ghost-button:hover { color: var(--text); background: rgba(255,255,255,.04); }
+    .tab-button[aria-selected="true"], .mode-button[aria-pressed="true"], .filter-button[aria-pressed="true"] { color: var(--text); border-color: var(--line-strong); background: var(--panel-strong); box-shadow: inset 0 -2px 0 var(--accent); }
+    .tab-button { font-weight: 600; }
+    .mode-switch { padding: 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel-soft); }
+    .version-picker { display: flex; align-items: center; gap: 7px; color: var(--muted); font-family: var(--mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
+    .version-select { min-height: 39px; padding: 6px 30px 6px 10px; color: var(--text); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-family: var(--mono); font-size: 11px; }
+    .mode-button { min-height: 31px; padding: 4px 10px; font-size: 12px; }
+    .mode-button[aria-pressed="true"] { box-shadow: none; background: var(--accent-soft); border-color: rgba(104,215,255,.32); color: var(--accent); }
+    .primary-button { color: #06121c; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+    .primary-button:hover { background: #9ee8ff; transform: translateY(-1px); }
+    .ghost-button, .step-button { border-color: var(--line); background: rgba(18,20,24,.72); }
+    button:disabled { opacity: .38; cursor: not-allowed; transform: none !important; }
+
+    .rubric-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 16px 0 18px; }
+    .rubric-item { display: grid; grid-template-columns: 28px 1fr; gap: 9px; align-items: start; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: rgba(18,20,24,.68); }
+    .rubric-symbol { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; font-family: var(--mono); font-weight: 800; }
+    .rubric-item[data-maturity="green"] .rubric-symbol { color: var(--green); background: var(--green-soft); }
+    .rubric-item[data-maturity="yellow"] .rubric-symbol { color: var(--yellow); background: var(--yellow-soft); }
+    .rubric-item[data-maturity="red"] .rubric-symbol { color: var(--red); background: var(--red-soft); }
+    .rubric-item[data-maturity="planned"] .rubric-symbol { color: var(--planned); background: var(--planned-soft); }
+    .rubric-label { font-size: 12px; font-weight: 700; }
+    .rubric-definition { color: var(--muted); font-size: 11px; line-height: 1.35; }
+
+    .stats-line { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 16px; color: var(--muted); font-size: 12px; }
+    .stat { padding: 5px 9px; border-radius: 999px; background: rgba(18,20,24,.78); border: 1px solid var(--line); }
+    .stat strong { color: var(--text); font-family: var(--mono); }
+    .stat.green strong { color: var(--green); }
+    .stat.yellow strong { color: var(--yellow); }
+    .stat.red strong { color: var(--red); }
+    .stat.planned strong { color: var(--planned); }
+
+    .system-overview {
+      margin: 0 0 18px;
+      padding: 18px;
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: radial-gradient(circle at 46% -20%, rgba(255,255,255,.045), transparent 34rem), linear-gradient(180deg, rgba(18,20,24,.98), rgba(8,9,11,.99));
+      box-shadow: var(--shadow);
+    }
+    .overview-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
+    .overview-kicker { color: var(--accent); font-family: var(--mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+    .overview-heading h2 { margin: 4px 0; font-size: clamp(23px, 2.5vw, 34px); letter-spacing: -.035em; }
+    .overview-heading p { margin: 0; max-width: 830px; color: var(--muted); font-size: 12px; }
+    .overview-key { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+    .overview-spine { display: grid; grid-template-columns: minmax(132px,1fr) 56px minmax(132px,1fr) 56px minmax(132px,1fr) 56px minmax(132px,1fr) 56px minmax(132px,1fr); align-items: stretch; }
+    .overview-stage { position: relative; min-width: 0; min-height: 168px; padding: 14px; color: var(--text); background: rgba(20,22,27,.9); border: 1px solid var(--line); border-radius: 13px; text-align: left; cursor: pointer; }
+    .overview-stage::after { content: ""; position: absolute; inset: auto 14px 0; height: 2px; background: linear-gradient(90deg, transparent, rgba(104,215,255,.55), transparent); }
+    .overview-stage:hover { border-color: var(--accent); background: var(--panel-strong); }
+    .overview-stage:focus-visible { outline: 2px solid var(--accent); }
+    .overview-stage-eyebrow { display: block; color: var(--accent); font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+    .overview-stage-label { display: block; margin: 7px 0 5px; font-size: 15px; font-weight: 700; line-height: 1.15; }
+    .overview-stage-description { display: block; min-height: 48px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .overview-node-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+    .overview-node-chip { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 6px; color: var(--text); background: rgba(8,9,11,.86); border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 8px; }
+    .overview-node-chip.is-planned { color: var(--planned); border-color: rgba(124,169,255,.42); border-style: dashed; }
+    .overview-connector { position: relative; display: grid; place-items: center; min-width: 0; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
+    .overview-connector::before { content: ""; position: absolute; left: 4px; right: 4px; top: calc(50% - 1px); height: 2px; background: currentColor; opacity: .78; }
+    .overview-connector::after { content: ""; position: absolute; right: 3px; top: calc(50% - 5px); width: 8px; height: 8px; border-top: 2px solid currentColor; border-right: 2px solid currentColor; transform: rotate(45deg); }
+    .overview-connector[data-maturity="green"] { color: var(--green); }
+    .overview-connector[data-maturity="yellow"] { color: var(--yellow); }
+    .overview-connector[data-maturity="red"] { color: var(--red); }
+    .overview-connector[data-maturity="planned"] { color: var(--planned); }
+    .overview-connector:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 8px; }
+    .overview-seam-symbol { position: relative; z-index: 1; display: grid; place-items: center; width: 24px; height: 24px; color: currentColor; background: #0b0c0f; border: 1px solid currentColor; border-radius: 50%; font-family: var(--mono); font-size: 10px; font-weight: 800; }
+    .overview-connector-label { position: absolute; left: 50%; top: calc(50% + 17px); width: 78px; color: currentColor; font-family: var(--mono); font-size: 8px; line-height: 1.2; text-align: center; transform: translateX(-50%); }
+    .overview-return { position: relative; display: flex; justify-content: center; margin: 15px 6.5% 0; padding: 12px 36px 0; color: var(--muted); border-top: 2px solid currentColor; }
+    .overview-return::before { content: ""; position: absolute; left: -1px; top: -6px; width: 9px; height: 9px; border-left: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); }
+    .overview-return[data-maturity="green"] { color: var(--green); }
+    .overview-return[data-maturity="yellow"] { color: var(--yellow); }
+    .overview-return[data-maturity="red"] { color: var(--red); }
+    .overview-return[data-maturity="planned"] { color: var(--planned); }
+    .overview-return-button { display: inline-flex; align-items: center; gap: 7px; padding: 4px 8px; color: currentColor; background: #0b0c0f; border: 1px solid currentColor; border-radius: 8px; font-size: 9px; cursor: pointer; transform: translateY(-25px); }
+    .overview-rails { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; margin-top: -4px; }
+    .overview-rail { min-width: 0; padding: 11px 12px; color: var(--text); background: rgba(9,10,12,.76); border: 1px solid var(--line); border-radius: 10px; text-align: left; cursor: pointer; }
+    .overview-rail:hover { border-color: var(--line-strong); background: rgba(25,28,34,.82); }
+    .overview-rail-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .overview-rail-label { font-size: 11px; font-weight: 700; }
+    .overview-rail-seams { display: flex; gap: 4px; }
+    .overview-rail-seam { display: grid; place-items: center; width: 18px; height: 18px; border: 1px solid currentColor; border-radius: 50%; font-family: var(--mono); font-size: 8px; font-weight: 800; }
+    .overview-rail-seam.green { color: var(--green); }
+    .overview-rail-seam.yellow { color: var(--yellow); }
+    .overview-rail-seam.red { color: var(--red); }
+    .overview-rail-seam.planned { color: var(--planned); }
+    .overview-rail-description { display: block; margin-top: 4px; color: var(--muted); font-size: 9px; }
+
+    .view { display: none; }
+    .view.is-active { display: block; }
+
+    .architecture-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; align-items: start; }
+    .atlas-panel, .inspector, .content-panel { border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(180deg, rgba(17,19,24,.98), rgba(8,9,11,.99)); box-shadow: var(--shadow); }
+    .atlas-panel { min-width: 0; overflow: hidden; }
+    .flow-toolbar { display: grid; grid-template-columns: minmax(210px, 1fr) auto; gap: 14px; align-items: end; padding: 15px 17px 13px; border-bottom: 1px solid var(--line); }
+    .field-label { display: block; margin-bottom: 5px; color: var(--muted); font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+    .flow-select, .search-input, .status-select { width: 100%; min-height: 40px; padding: 8px 11px; color: var(--text); background: var(--panel-soft); border: 1px solid var(--line-strong); border-radius: 9px; }
+    .flow-actions { display: flex; align-items: center; gap: 7px; }
+    .step-count { min-width: 68px; color: var(--muted); font-family: var(--mono); font-size: 11px; text-align: center; }
+    .flow-caption { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: start; min-height: 78px; padding: 13px 17px; background: rgba(8,9,11,.78); border-bottom: 1px solid var(--line); }
+    .flow-caption h2 { margin: 0 0 3px; font-size: 15px; }
+    .flow-caption p { margin: 0; color: var(--muted); font-size: 12px; }
+    .step-kicker { color: var(--accent); font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
+
+    .map-wrap {
+      position: relative;
+      min-height: 650px;
+      background-color: #090a0c;
+      background-image:
+        linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px),
+        radial-gradient(circle at 70% 35%, rgba(255,255,255,.025), transparent 32%);
+      background-size: 28px 28px, 28px 28px, auto;
+    }
+    #architecture-map { display: block; width: 100%; height: auto; min-height: 650px; }
+    .mobile-map-hint { display: none; }
+    .mobile-flow { display: none; padding: 14px; }
+    .mobile-step { position: relative; display: grid; grid-template-columns: 30px 1fr; gap: 10px; padding: 11px 0; }
+    .mobile-step:not(:last-child)::after { content: ""; position: absolute; left: 14px; top: 42px; bottom: -4px; width: 1px; background: var(--line); }
+    .mobile-step-number { position: relative; z-index: 1; display: grid; place-items: center; width: 29px; height: 29px; border-radius: 50%; background: var(--panel-strong); border: 1px solid var(--line-strong); font-family: var(--mono); font-size: 11px; }
+    .mobile-step.is-active .mobile-step-number { color: #06121c; background: var(--accent); border-color: var(--accent); }
+    .mobile-step h3 { margin: 0; font-size: 13px; }
+    .mobile-step p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+
+    .inspector { position: sticky; top: 86px; min-height: 530px; max-height: calc(100vh - 110px); overflow: auto; }
+    .inspector-empty { display: grid; place-items: center; min-height: 520px; padding: 28px; color: var(--muted); text-align: center; }
+    .detail-body { padding: 18px; }
+    .detail-overline { color: var(--accent); font-family: var(--mono); font-size: 10px; letter-spacing: .11em; text-transform: uppercase; }
+    .detail-title { margin: 6px 0 8px; font-size: 24px; line-height: 1.08; letter-spacing: -.025em; }
+    .detail-description { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+    .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 13px 0 18px; }
+    .detail-fact { padding: 9px 10px; border-radius: 10px; background: rgba(25,28,34,.72); border: 1px solid var(--line); }
+    .detail-fact span { display: block; color: var(--muted); font-size: 10px; }
+    .detail-fact strong { display: block; margin-top: 2px; font-size: 12px; }
+    .detail-section { margin-top: 18px; }
+    .detail-section h3 { margin: 0 0 7px; color: var(--muted); font-family: var(--mono); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
+    .detail-section p { margin: 0; font-size: 12px; }
+    .detail-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .detail-link, .detail-action { display: flex; align-items: center; justify-content: space-between; gap: 9px; width: 100%; padding: 8px 9px; border: 1px solid var(--line); border-radius: 9px; background: rgba(18,20,24,.72); color: var(--text); text-decoration: none; text-align: left; font-size: 11px; cursor: pointer; }
+    .detail-link:hover, .detail-action:hover { border-color: var(--line-strong); background: var(--panel-strong); }
+    .detail-link small, .detail-action small { color: var(--muted); }
+    .detail-actions { display: flex; gap: 8px; margin-top: 18px; }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 7px; border-radius: 999px; background: var(--panel-strong); border: 1px solid var(--line); color: var(--muted); font-size: 10px; }
+    .maturity-badge { display: inline-flex; align-items: center; gap: 6px; min-height: 27px; padding: 4px 8px; border-radius: 999px; font-family: var(--mono); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+    .maturity-badge.green { color: var(--green); background: var(--green-soft); }
+    .maturity-badge.yellow { color: var(--yellow); background: var(--yellow-soft); }
+    .maturity-badge.red { color: var(--red); background: var(--red-soft); }
+    .maturity-badge.planned { color: var(--planned); background: var(--planned-soft); }
+
+    .content-panel { padding: 18px; }
+    .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
+    .section-heading h2 { margin: 0 0 4px; font-size: 25px; letter-spacing: -.025em; }
+    .section-heading p { margin: 0; max-width: 760px; color: var(--muted); font-size: 13px; }
+    .content-controls { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 12px; align-items: end; margin-bottom: 16px; }
+    .seam-grid, .adr-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .seam-card, .adr-card { position: relative; width: 100%; min-height: 168px; padding: 15px; color: var(--text); background: rgba(15,17,21,.9); border: 1px solid var(--line); border-radius: 13px; text-align: left; cursor: pointer; overflow: hidden; }
+    .seam-card::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--line); }
+    .seam-card[data-maturity="green"]::before { background: var(--green); }
+    .seam-card[data-maturity="yellow"]::before { background: var(--yellow); }
+    .seam-card[data-maturity="red"]::before { background: var(--red); }
+    .seam-card[data-maturity="planned"]::before { background: var(--planned); }
+    .seam-card:hover, .adr-card:hover { transform: translateY(-2px); border-color: var(--line-strong); background: var(--panel-strong); }
+    .card-topline { display: flex; justify-content: space-between; align-items: center; gap: 9px; margin-bottom: 12px; }
+    .card-id { color: var(--faint); font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
+    .seam-card h3, .adr-card h3 { margin: 0 0 7px; font-size: 15px; line-height: 1.25; }
+    .seam-card p, .adr-card p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .card-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 13px; color: var(--faint); font-family: var(--mono); font-size: 9px; }
+    .adr-card { min-height: 185px; }
+    .adr-number { display: inline-flex; align-items: center; justify-content: center; min-width: 52px; height: 28px; padding: 0 8px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 700; }
+    .status-badge { display: inline-flex; min-height: 24px; align-items: center; padding: 3px 7px; border-radius: 999px; background: var(--panel-strong); color: var(--muted); font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
+    .status-badge.draft, .status-badge.planned, .status-badge.reserved { color: var(--planned); background: var(--planned-soft); }
+    .status-badge.partial { color: var(--yellow); background: var(--yellow-soft); }
+    .status-badge.implemented { color: var(--green); background: var(--green-soft); }
+
+    .drift-panel { margin: 0 0 18px; padding: 14px; border: 1px solid rgba(245,200,91,.32); border-radius: 13px; background: linear-gradient(135deg, rgba(245,200,91,.08), rgba(18,20,24,.76)); }
+    .drift-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 11px; }
+    .drift-heading h3 { margin: 0; font-size: 14px; }
+    .drift-heading span { color: var(--yellow); font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .09em; }
+    .drift-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .drift-card { padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: rgba(8,9,11,.72); }
+    .drift-card h4 { margin: 0 0 7px; font-size: 12px; }
+    .drift-card p { margin: 4px 0; color: var(--muted); font-size: 10px; }
+    .drift-card p strong { color: var(--yellow); font-weight: 650; }
+    .drift-links { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+    .drift-links a { font-size: 9px; }
+
+    .investment-list { display: grid; gap: 12px; }
+    .investment-card { display: grid; grid-template-columns: 70px minmax(260px, 1.2fr) minmax(320px, .9fr); gap: 18px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: rgba(15,17,21,.88); }
+    .investment-rank { color: var(--accent); font-family: var(--mono); font-size: 38px; line-height: 1; letter-spacing: -.05em; }
+    .investment-copy h3 { margin: 0 0 7px; font-size: 18px; }
+    .investment-copy p { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+    .unlock { color: var(--text) !important; }
+    .factor-list { display: grid; gap: 7px; }
+    .factor-row { display: grid; grid-template-columns: 112px 1fr 18px; align-items: center; gap: 8px; color: var(--muted); font-size: 10px; }
+    .factor-track { height: 5px; overflow: hidden; border-radius: 999px; background: #25282e; }
+    .factor-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), var(--planned)); }
+    .factor-value { color: var(--text); font-family: var(--mono); text-align: right; }
+    .seam-link-button { border: 0; padding: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 10px; text-decoration: underline; text-underline-offset: 3px; }
+
+    dialog { width: min(680px, calc(100% - 28px)); max-height: min(820px, calc(100vh - 28px)); padding: 0; color: var(--text); background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--radius); box-shadow: 0 40px 120px rgba(0,0,0,.68); }
+    dialog::backdrop { background: rgba(2, 7, 12, .76); backdrop-filter: blur(6px); }
+    .dialog-header { position: sticky; top: 0; z-index: 1; display: flex; justify-content: flex-end; padding: 10px; background: rgba(17,19,24,.96); border-bottom: 1px solid var(--line); }
+    .dialog-close { width: 36px; height: 36px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--panel-soft); cursor: pointer; }
+    #dialog-detail .detail-body { padding-top: 8px; }
+
+    .error-panel { max-width: 760px; margin: 64px auto; padding: 24px; border: 1px solid var(--red); border-radius: var(--radius); background: var(--red-soft); }
+    .error-panel h2 { margin-top: 0; color: var(--red); }
+    .error-panel code { font-family: var(--mono); }
+    .empty-result { padding: 50px 18px; color: var(--muted); text-align: center; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+
+    /* SVG */
+    .zone-rect { fill: rgba(18,20,24,.48); stroke: rgba(78,82,91,.58); stroke-width: 1; }
+    .zone-label { fill: #858a94; font-family: var(--mono); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
+    .route-path { fill: none; stroke: #4c515a; stroke-width: 1.2; opacity: .25; transition: opacity .18s ease, stroke-width .18s ease, stroke .18s ease; }
+    .route-hit { fill: none; stroke: transparent; stroke-width: 15; cursor: pointer; }
+    .route-group.in-flow .route-path { opacity: .78; stroke-width: 2; }
+    .route-group.is-overview .route-path { opacity: .46; stroke-width: 1.35; }
+    .route-group.is-overview:hover .route-path { opacity: .95; stroke-width: 2.2; }
+    .route-group.is-step .route-path { opacity: 1; stroke-width: 3; stroke-dasharray: 8 7; animation: route-dash 1.1s linear infinite; filter: drop-shadow(0 0 7px currentColor); }
+    .route-group.is-context .route-path { opacity: .09; }
+    .route-group[data-maturity="green"] { color: var(--green); }
+    .route-group[data-maturity="yellow"] { color: var(--yellow); }
+    .route-group[data-maturity="red"] { color: var(--red); }
+    .route-group[data-maturity="planned"] { color: var(--planned); }
+    .route-group.in-flow .route-path, .route-group.is-step .route-path { stroke: currentColor; }
+    .route-group.is-planned .route-path { stroke-dasharray: 6 7; }
+    .route-group:focus { outline: none; }
+    .route-group:focus-visible .route-path { opacity: 1; stroke: var(--accent); stroke-width: 4; }
+    .route-group:focus-visible .seam-marker circle { stroke: var(--accent); stroke-width: 3; }
+    .route-group:focus-visible .seam-marker text, .route-group:focus-visible .route-label { fill: var(--accent); }
+    .route-label { fill: #d0d2d6; font-family: var(--mono); font-size: 11px; paint-order: stroke; stroke: #090a0c; stroke-width: 4px; stroke-linejoin: round; }
+    .seam-marker { cursor: pointer; }
+    .seam-marker circle { fill: #0b0c0f; stroke: currentColor; stroke-width: 1.5; }
+    .seam-marker text { fill: currentColor; font-family: var(--mono); font-size: 10px; font-weight: 800; text-anchor: middle; dominant-baseline: central; }
+    .node { cursor: pointer; transition: opacity .16s ease; }
+    .node rect { fill: #17191e; stroke: #4b5059; stroke-width: 1; rx: 12; filter: drop-shadow(0 8px 18px rgba(0,0,0,.22)); }
+    .node:hover rect, .node:focus rect { stroke: var(--accent); stroke-width: 1.6; }
+    .node:focus { outline: none; }
+    .node.is-selected rect { stroke: var(--accent); stroke-width: 2; filter: drop-shadow(0 0 13px rgba(104,215,255,.24)); }
+    .node.is-planned rect { fill: rgba(32, 49, 79, .66); stroke: var(--planned); stroke-dasharray: 6 5; }
+    .node.is-group rect { fill: #1b1e24; stroke-width: 1.5; }
+    .node.is-group .node-group-count { fill: var(--accent); }
+    .node.is-group .node-group-count-text { fill: #06121c; font-family: var(--mono); font-size: 7px; font-weight: 800; text-anchor: middle; dominant-baseline: central; }
+    .node.is-context { opacity: .28; }
+    .node-label { fill: var(--text); font-size: 11.5px; font-weight: 650; text-anchor: middle; }
+    .node-subtitle { fill: #829aab; font-family: var(--mono); font-size: 7.8px; text-anchor: middle; }
+    .node-state { fill: currentColor; }
+    .node.is-planned { color: var(--planned); }
+    .node:not(.is-planned) { color: var(--faint); }
+    .map-tooltip { position: fixed; z-index: 80; width: min(310px, calc(100vw - 24px)); padding: 11px 12px; pointer-events: none; opacity: 0; color: var(--text); background: rgba(10,11,13,.98); border: 1px solid var(--line-strong); border-radius: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.58); transform: translateY(4px); transition: opacity .12s ease, transform .12s ease; }
+    .map-tooltip.is-visible { opacity: 1; transform: translateY(0); }
+    .tooltip-kicker { color: var(--accent); font-family: var(--mono); font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+    .tooltip-title { margin: 3px 0 4px; font-size: 14px; font-weight: 700; line-height: 1.2; }
+    .tooltip-summary { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .tooltip-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding-top: 7px; color: var(--faint); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 8px; }
+    .tooltip-maturity.green { color: var(--green); }
+    .tooltip-maturity.yellow { color: var(--yellow); }
+    .tooltip-maturity.red { color: var(--red); }
+    .tooltip-maturity.planned { color: var(--planned); }
+    .implementation-disclosure { margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; background: rgba(8,9,11,.62); }
+    .implementation-disclosure summary { padding: 10px 11px; color: var(--accent); cursor: pointer; font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    .implementation-list { display: grid; gap: 7px; padding: 0 10px 10px; }
+    .implementation-item { padding: 9px 10px; border-left: 2px solid var(--line-strong); background: rgba(25,28,34,.64); }
+    .implementation-item.is-planned { border-left-color: var(--planned); }
+    .implementation-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .implementation-label { font-size: 12px; font-weight: 700; }
+    .implementation-state { color: var(--muted); font-family: var(--mono); font-size: 8px; text-transform: uppercase; }
+    .implementation-item.is-planned .implementation-state { color: var(--planned); }
+    .implementation-copy { margin: 3px 0 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
+    @keyframes route-dash { to { stroke-dashoffset: -30; } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+    }
+
+    @media (max-width: 1180px) {
+      .overview-spine { grid-template-columns: minmax(112px,1fr) 42px minmax(112px,1fr) 42px minmax(112px,1fr) 42px minmax(112px,1fr) 42px minmax(112px,1fr); }
+      .overview-stage { padding: 11px; }
+      .overview-connector-label { display: none; }
+      .architecture-grid { grid-template-columns: minmax(0, 1fr) 300px; }
+      .seam-grid, .adr-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .investment-card { grid-template-columns: 56px 1fr; }
+      .factor-list { grid-column: 2; }
+    }
+    @media (max-width: 930px) {
+      .app-shell { padding-inline: 18px; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .state-controls { width: 100%; justify-content: space-between; }
+      .architecture-grid { grid-template-columns: 1fr; }
+      .inspector { position: relative; top: auto; min-height: 0; max-height: none; }
+      .inspector-empty { min-height: 180px; }
+      .rubric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 700px) {
+      .app-shell { padding: 14px 12px 32px; }
+      .masthead { padding-top: 8px; }
+      h1 { font-size: 40px; }
+      .topbar { position: relative; top: auto; background: transparent; backdrop-filter: none; }
+      .view-tabs { width: 100%; display: grid; grid-template-columns: repeat(2, 1fr); }
+      .tab-button { width: 100%; border-color: var(--line); background: rgba(18,20,24,.68); }
+      .state-controls { display: grid; grid-template-columns: 1fr; }
+      .version-picker { justify-content: space-between; }
+      .version-select { flex: 1; }
+      .mode-switch { width: 100%; }
+      .mode-button { flex: 1; }
+      .system-overview { margin-bottom: 12px; padding: 14px 12px; }
+      .overview-heading { display: block; margin-bottom: 14px; }
+      .overview-key { display: block; margin-top: 7px; }
+      .overview-spine { grid-template-columns: 1fr; gap: 0; }
+      .overview-stage { min-height: 0; padding: 12px; }
+      .overview-stage-description { min-height: 0; }
+      .overview-connector { min-height: 56px; }
+      .overview-connector::before { left: 50%; right: auto; top: 4px; bottom: 4px; width: 2px; height: auto; transform: translateX(-1px); }
+      .overview-connector::after { right: auto; left: calc(50% - 4px); top: auto; bottom: 4px; transform: rotate(135deg); }
+      .overview-connector-label { display: block; left: calc(50% + 22px); top: 50%; width: 115px; text-align: left; transform: translateY(-50%); }
+      .overview-return { justify-content: flex-start; margin: 15px 13px 0; padding: 12px 0 0; }
+      .overview-return-button { width: 100%; justify-content: center; text-align: center; }
+      .overview-rails { grid-template-columns: 1fr; margin-top: 0; }
+      .rubric-strip { grid-template-columns: 1fr; }
+      .rubric-definition { font-size: 10px; }
+      .flow-toolbar { grid-template-columns: 1fr; }
+      .flow-actions { justify-content: space-between; }
+      .flow-caption { grid-template-columns: 1fr; }
+      .map-wrap { min-height: 0; overflow-x: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; }
+      #architecture-map { display: block; width: 1180px; min-width: 1180px; min-height: 654px; }
+      .mobile-map-hint { position: sticky; left: 0; z-index: 4; display: flex; align-items: center; justify-content: space-between; width: calc(100vw - 26px); padding: 8px 12px; color: var(--accent); background: rgba(8,9,11,.96); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
+      .mobile-flow { display: none; }
+      .content-controls { grid-template-columns: 1fr; }
+      .seam-grid, .adr-grid { grid-template-columns: 1fr; }
+      .drift-grid { grid-template-columns: 1fr; }
+      .section-heading { align-items: flex-start; flex-direction: column; }
+      .investment-card { grid-template-columns: 44px 1fr; gap: 12px; padding: 14px; }
+      .investment-rank { font-size: 28px; }
+      .factor-list { grid-column: 1 / -1; }
+      .factor-row { grid-template-columns: 104px 1fr 18px; }
+      .detail-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell" id="app" aria-busy="true">
+    <header class="masthead">
+      <div class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span><span id="snapshot-label">Loading architecture snapshot</span></div>
+      <h1 id="page-title">Curie architecture atlas</h1>
+      <p class="subtitle" id="page-subtitle">Loading the production loop, its seams, and its future state…</p>
+      <div class="meta-row" id="meta-row"></div>
+    </header>
+
+    <nav class="topbar" aria-label="Atlas views and state">
+      <div class="view-tabs" role="tablist" aria-label="Atlas view">
+        <button class="tab-button" type="button" role="tab" aria-selected="true" data-tab="architecture">Architecture</button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" data-tab="seams">Seams</button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" data-tab="decisions">Decisions</button>
+        <button class="tab-button" type="button" role="tab" aria-selected="false" data-tab="investments">Investments</button>
+      </div>
+      <div class="state-controls">
+        <label class="version-picker"><span>Version</span><select class="version-select" id="version-select" aria-label="Architecture version"></select></label>
+        <div class="mode-switch" aria-label="Architecture state">
+          <button class="mode-button" type="button" aria-pressed="true" data-mode="current">Current</button>
+          <button class="mode-button" type="button" aria-pressed="false" data-mode="vision">Vision</button>
+          <button class="mode-button" type="button" aria-pressed="false" data-mode="delta">Delta</button>
+        </div>
+      </div>
+    </nav>
+
+    <section class="system-overview" id="system-overview" aria-labelledby="overview-title">
+      <div class="overview-heading">
+        <div>
+          <div class="overview-kicker">Visual system map</div>
+          <h2 id="overview-title">Loading the request-to-reply loop…</h2>
+          <p id="overview-description"></p>
+        </div>
+        <div class="overview-key">Click any box or colored seam to inspect it</div>
+      </div>
+      <div class="overview-spine" id="overview-spine"></div>
+      <div class="overview-return" id="overview-return"></div>
+      <div class="overview-rails" id="overview-rails"></div>
+    </section>
+
+    <section class="rubric-strip" id="rubric-strip" aria-label="Seam maturity rubric"></section>
+    <div class="stats-line" id="stats-line" aria-live="polite"></div>
+
+    <section class="view is-active" id="view-architecture" role="tabpanel">
+      <div class="architecture-grid">
+        <article class="atlas-panel">
+          <div class="flow-toolbar">
+            <label>
+              <span class="field-label">Walk a data flow</span>
+              <select class="flow-select" id="flow-select" aria-label="Choose a data flow"></select>
+            </label>
+            <div class="flow-actions" aria-label="Flow step controls">
+              <button class="step-button" type="button" id="step-prev" aria-label="Previous flow step">←</button>
+              <span class="step-count" id="step-count">Overview</span>
+              <button class="step-button" type="button" id="step-next" aria-label="Next flow step">Next →</button>
+            </div>
+          </div>
+          <div class="flow-caption" aria-live="polite">
+            <div>
+              <div class="step-kicker" id="flow-kicker">Current flow</div>
+              <h2 id="flow-title">Loading…</h2>
+              <p id="flow-description"></p>
+            </div>
+            <span id="flow-state" class="status-badge"></span>
+          </div>
+          <div class="map-wrap">
+            <div class="mobile-map-hint"><span>Complete architecture map</span><span>Swipe to pan ↔</span></div>
+            <svg id="architecture-map" viewBox="0 0 1300 720" role="img" aria-label="Curie system architecture" aria-describedby="map-desc">
+              <desc id="map-desc">Interactive map of external surfaces, the control plane, worker kernel, isolated runtime, storage, telemetry, and their maturity-rated seams.</desc>
+            </svg>
+            <div class="mobile-flow" id="mobile-flow" aria-label="Selected flow as an ordered list"></div>
+          </div>
+        </article>
+        <aside class="inspector" id="inspector" aria-live="polite">
+          <div class="inspector-empty">Select a component or seam to inspect its contract, maturity, leakage, ADRs, and evidence.</div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="view" id="view-seams" role="tabpanel">
+      <article class="content-panel">
+        <div class="section-heading">
+          <div><h2>Seam atlas</h2><p>Color answers “has this boundary been proven by real implementations?” Interface kind and repository grade remain independent facts.</p></div>
+        </div>
+        <div class="content-controls">
+          <label><span class="field-label">Find a seam</span><input class="search-input" id="seam-search" type="search" placeholder="Harness, channel, telemetry…"></label>
+          <div class="filter-row" id="maturity-filters" aria-label="Filter seam maturity"></div>
+        </div>
+        <div class="seam-grid" id="seam-grid"></div>
+      </article>
+    </section>
+
+    <section class="view" id="view-decisions" role="tabpanel">
+      <article class="content-panel">
+        <div class="section-heading">
+          <div><h2>Decisions & capability state</h2><p>Accepted is not the same as implemented. Draft and reserved decisions appear only as vision or delta unless they explain current leakage.</p></div>
+        </div>
+        <section class="drift-panel" aria-labelledby="drift-title">
+          <div class="drift-heading"><h3 id="drift-title">Documentation drift worth resolving</h3><span>code-first snapshot</span></div>
+          <div class="drift-grid" id="drift-grid"></div>
+        </section>
+        <div class="content-controls">
+          <label><span class="field-label">Find a decision</span><input class="search-input" id="adr-search" type="search" placeholder="Channels, harness, memory…"></label>
+          <label><span class="field-label">ADR status</span><select class="status-select" id="adr-status"><option value="all">All statuses</option><option value="accepted">Accepted</option><option value="draft">Draft</option></select></label>
+        </div>
+        <div class="adr-grid" id="adr-grid"></div>
+      </article>
+    </section>
+
+    <section class="view" id="view-investments" role="tabpanel">
+      <article class="content-panel">
+        <div class="section-heading">
+          <div><h2>Where the next hour compounds</h2><p>A transparent priority queue derived from documented vision unlock, affected flows, coupling risk, evidence gap, and relative effort—not an opaque maturity score.</p></div>
+        </div>
+        <div class="investment-list" id="investment-list"></div>
+      </article>
+    </section>
+  </main>
+
+  <dialog id="detail-dialog" aria-label="Architecture detail">
+    <div class="dialog-header"><button class="dialog-close" type="button" id="dialog-close" aria-label="Close detail">×</button></div>
+    <div id="dialog-detail"></div>
+  </dialog>
+  <div class="map-tooltip" id="map-tooltip" role="tooltip" aria-hidden="true"></div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const state = {
+        data: null,
+        versions: null,
+        versionId: null,
+        tab: 'architecture',
+        mode: 'current',
+        flowId: 'whole-system',
+        step: -1,
+        selected: { type: 'node', id: 'worker' },
+        maturity: 'all',
+        seamQuery: '',
+        adrQuery: '',
+        adrStatus: 'all'
+      };
+
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+      const SVG_NS = 'http://www.w3.org/2000/svg';
+      const MAP_W = 1300;
+      const MAP_H = 720;
+      const maturitySymbols = { green: '✓', yellow: '◇', red: '×', planned: '○' };
+      const factorLabels = { flowImpact: 'Flow impact', visionUnlock: 'Vision unlock', couplingRisk: 'Coupling risk', evidenceGap: 'Evidence gap', effort: 'Relative effort' };
+
+      const text = (tag, value, className) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        node.textContent = value;
+        return node;
+      };
+
+      const svgNode = (tag, attrs = {}) => {
+        const node = document.createElementNS(SVG_NS, tag);
+        Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+        return node;
+      };
+
+      const byId = (collection, id) => collection.find(item => item.id === id);
+      const seamForRoute = route => byId(state.data.seams, route.seamId) || { maturity: 'planned', label: 'Unscored seam' };
+      const rubricFor = maturity => byId(state.data.maturityRubric, maturity);
+
+      fetch('./versions.json', { cache: 'no-store' })
+        .then(response => {
+          if (!response.ok) throw new Error(`versions.json returned HTTP ${response.status}`);
+          return response.json();
+        })
+        .then(manifest => {
+          if (!Array.isArray(manifest.versions) || !manifest.versions.length) throw new Error('versions.json has no architecture snapshots');
+          const requested = new URLSearchParams(location.search).get('version');
+          const selected = manifest.versions.find(version => version.id === requested)
+            || manifest.versions.find(version => version.id === manifest.defaultVersion)
+            || manifest.versions[0];
+          state.versions = manifest;
+          state.versionId = selected.id;
+          return fetch(`./${selected.file}`, { cache: 'no-store' }).then(response => {
+            if (!response.ok) throw new Error(`${selected.file} returned HTTP ${response.status}`);
+            return response.json();
+          });
+        })
+        .then(data => {
+          state.data = data;
+          validateData(data);
+          hydrateShell();
+          bindEvents();
+          applyHash();
+          render();
+          $('#app').setAttribute('aria-busy', 'false');
+        })
+        .catch(error => showError(error));
+
+      function validateData(data) {
+        const required = ['nodes', 'seams', 'routes', 'flows', 'adrs', 'investments'];
+        const missing = required.filter(key => !Array.isArray(data[key]));
+        if (missing.length) throw new Error(`architecture.json is missing arrays: ${missing.join(', ')}`);
+        if (!data.overview || !Array.isArray(data.overview.stages) || !Array.isArray(data.overview.connections)) throw new Error('architecture.json is missing the overview model');
+        const nodeIds = new Set(data.nodes.map(node => node.id));
+        const seamIds = new Set(data.seams.map(seam => seam.id));
+        (data.architectureGroups || []).forEach(group => {
+          group.memberIds.forEach(id => { if (!nodeIds.has(id)) throw new Error(`Architecture group ${group.id} references unknown member ${id}`); });
+        });
+        data.routes.forEach(route => {
+          if (!nodeIds.has(route.from) || !nodeIds.has(route.to)) throw new Error(`Route ${route.id} references an unknown node`);
+          if (!seamIds.has(route.seamId)) throw new Error(`Route ${route.id} references an unknown seam`);
+        });
+        const zones = new Map(data.zones.map(zone => [zone.id, zone]));
+        mapNodes().forEach(node => {
+          const zone = zones.get(node.zone);
+          if (!zone) throw new Error(`Architecture node ${node.id} references unknown zone ${node.zone}`);
+          const box = nodeBox(node);
+          const left = zone.x * MAP_W;
+          const right = (zone.x + zone.w) * MAP_W;
+          const top = zone.y * MAP_H;
+          const bottom = (zone.y + zone.h) * MAP_H;
+          if (box.x - box.w / 2 < left || box.x + box.w / 2 > right || box.y - box.h / 2 < top || box.y + box.h / 2 > bottom) {
+            throw new Error(`Architecture node ${node.id} falls outside its ${node.zone} bounding box`);
+          }
+        });
+      }
+
+      function hydrateShell() {
+        const data = state.data;
+        $('.topbar').after($('#view-architecture'));
+        const versionSelect = $('#version-select');
+        versionSelect.replaceChildren(...state.versions.versions.map(version => {
+          const option = document.createElement('option');
+          option.value = version.id;
+          option.textContent = version.label;
+          return option;
+        }));
+        versionSelect.value = state.versionId;
+        $('#snapshot-label').textContent = `${data.repository.release} architecture snapshot`;
+        $('#page-title').textContent = data.title;
+        $('#page-subtitle').textContent = data.subtitle;
+        const meta = $('#meta-row');
+        meta.replaceChildren(
+          metaChip('Authority', `${data.repository.branch}@${data.repository.shortCommit}`),
+          metaChip('As of', data.asOf),
+          metaChip('Model', `architecture.json v${data.schemaVersion}`),
+          metaChip('Color', 'substitutability, not health')
+        );
+        const rubric = $('#rubric-strip');
+        rubric.replaceChildren(...data.maturityRubric.map(item => {
+          const container = document.createElement('div');
+          container.className = 'rubric-item';
+          container.dataset.maturity = item.id;
+          container.append(text('span', item.symbol, 'rubric-symbol'));
+          const copy = document.createElement('div');
+          copy.append(text('div', item.label, 'rubric-label'), text('div', item.definition, 'rubric-definition'));
+          container.append(copy);
+          return container;
+        }));
+        const flowSelect = $('#flow-select');
+        flowSelect.replaceChildren(...data.flows.map(flow => {
+          const option = document.createElement('option');
+          option.value = flow.id;
+          option.textContent = `${flow.state === 'planned' ? 'Vision · ' : ''}${flow.label}`;
+          return option;
+        }));
+        flowSelect.value = state.flowId;
+        renderMaturityFilters();
+        renderDocumentationDrift();
+        renderOverview();
+      }
+
+      function metaChip(label, value) {
+        const chip = document.createElement('span');
+        chip.className = 'meta-chip';
+        chip.append(text('span', label), text('strong', value));
+        return chip;
+      }
+
+      function bindEvents() {
+        $('#version-select').addEventListener('change', event => {
+          const url = new URL(location.href);
+          url.searchParams.set('version', event.target.value);
+          location.assign(url);
+        });
+        document.addEventListener('click', event => {
+          const tabButton = event.target.closest('[data-tab]');
+          if (tabButton) { state.tab = tabButton.dataset.tab; render(); return; }
+          const modeButton = event.target.closest('[data-mode]');
+          if (modeButton) { setMode(modeButton.dataset.mode); return; }
+          const filterButton = event.target.closest('[data-maturity-filter]');
+          if (filterButton) { state.maturity = filterButton.dataset.maturityFilter; renderSeams(); renderMaturityFilters(); return; }
+          const overviewNode = event.target.closest('[data-overview-node]');
+          if (overviewNode) { openDetail('node', overviewNode.dataset.overviewNode, true); return; }
+          const seamCard = event.target.closest('[data-seam-id]');
+          if (seamCard) { openDetail('seam', seamCard.dataset.seamId, true); return; }
+          const adrCard = event.target.closest('[data-adr-id]');
+          if (adrCard) { openDetail('adr', adrCard.dataset.adrId, true); return; }
+          const nodeTarget = event.target.closest('[data-node-id]');
+          if (nodeTarget) { openDetail('node', nodeTarget.dataset.nodeId, false); return; }
+          const routeTarget = event.target.closest('[data-route-id]');
+          if (routeTarget) {
+            const route = byId(state.data.routes, routeTarget.dataset.routeId);
+            if (route) openDetail('seam', route.seamId, false);
+            return;
+          }
+          const showMap = event.target.closest('[data-show-map]');
+          if (showMap) {
+            const type = showMap.dataset.type;
+            const id = showMap.dataset.id;
+            if ($('#detail-dialog').open) $('#detail-dialog').close();
+            state.tab = 'architecture';
+            state.selected = { type, id };
+            updateHash(type, id);
+            render();
+            setTimeout(() => $('#view-architecture').scrollIntoView({ block: 'start' }), 0);
+          }
+        });
+
+        document.addEventListener('keydown', event => {
+          const target = event.target.closest('[data-node-id], [data-route-id]');
+          if (target && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault();
+            target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+          }
+        });
+
+        $('#flow-select').addEventListener('change', event => {
+          state.flowId = event.target.value;
+          state.step = -1;
+          const flow = currentFlow();
+          if (flow.state === 'planned' && state.mode === 'current') state.mode = 'vision';
+          render();
+        });
+        $('#step-prev').addEventListener('click', () => { state.step = Math.max(-1, state.step - 1); renderArchitecture(); });
+        $('#step-next').addEventListener('click', () => {
+          const count = currentFlow().steps.length;
+          state.step = state.step >= count - 1 ? -1 : state.step + 1;
+          renderArchitecture();
+        });
+        $('#seam-search').addEventListener('input', event => { state.seamQuery = event.target.value; renderSeams(); });
+        $('#adr-search').addEventListener('input', event => { state.adrQuery = event.target.value; renderDecisions(); });
+        $('#adr-status').addEventListener('change', event => { state.adrStatus = event.target.value; renderDecisions(); });
+        $('#dialog-close').addEventListener('click', () => $('#detail-dialog').close());
+        $('#detail-dialog').addEventListener('click', event => { if (event.target === $('#detail-dialog')) $('#detail-dialog').close(); });
+        window.addEventListener('hashchange', () => { applyHash(); render(); });
+      }
+
+      function setMode(mode) {
+        state.mode = mode;
+        if (mode === 'delta' && currentFlow().state === 'current') {
+          state.flowId = 'future-email';
+          state.step = -1;
+          $('#flow-select').value = state.flowId;
+        }
+        render();
+      }
+
+      function render() {
+        $$('.tab-button').forEach(button => button.setAttribute('aria-selected', String(button.dataset.tab === state.tab)));
+        $$('.mode-button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.mode === state.mode)));
+        $$('.view').forEach(view => view.classList.toggle('is-active', view.id === `view-${state.tab}`));
+        $('#system-overview').hidden = state.tab !== 'architecture';
+        if (state.tab === 'architecture') renderOverview();
+        renderStats();
+        if (state.tab === 'architecture') renderArchitecture();
+        if (state.tab === 'seams') renderSeams();
+        if (state.tab === 'decisions') renderDecisions();
+        if (state.tab === 'investments') renderInvestments();
+      }
+
+      function renderStats() {
+        const counts = { green: 0, yellow: 0, red: 0, planned: 0 };
+        state.data.seams.forEach(seam => counts[seam.maturity] = (counts[seam.maturity] || 0) + 1);
+        const line = $('#stats-line');
+        line.replaceChildren(
+          stat(`${state.data.seams.length}`, 'rated seams'),
+          stat(counts.green, 'proven', 'green'),
+          stat(counts.yellow, 'clean, unproven', 'yellow'),
+          stat(counts.red, 'intertwined', 'red'),
+          stat(counts.planned, 'planned / reserved', 'planned'),
+          stat(state.data.adrs.filter(adr => adr.status === 'draft').length, 'draft ADRs')
+        );
+      }
+
+      function stat(value, label, color = '') {
+        const item = document.createElement('span');
+        item.className = `stat ${color}`.trim();
+        item.append(text('strong', String(value)), document.createTextNode(` ${label}`));
+        return item;
+      }
+
+      function renderOverview() {
+        const overview = state.data.overview;
+        $('#overview-title').textContent = overview.title;
+        $('#overview-description').textContent = overview.description;
+        const children = [];
+        overview.stages.forEach((stage, index) => {
+          const stageNode = document.createElement('button');
+          stageNode.type = 'button';
+          stageNode.className = 'overview-stage';
+          const nodes = stage.nodeIds.map(id => byId(state.data.nodes, id)).filter(Boolean);
+          const primaryNode = nodes.find(node => node.state !== 'planned') || nodes[0];
+          if (primaryNode) stageNode.dataset.overviewNode = primaryNode.id;
+          stageNode.append(
+            text('span', stage.eyebrow, 'overview-stage-eyebrow'),
+            text('span', stage.label, 'overview-stage-label'),
+            text('span', stage.description, 'overview-stage-description')
+          );
+          const nodeList = document.createElement('span');
+          nodeList.className = 'overview-node-list';
+          nodes.forEach(node => {
+            if (state.mode === 'current' && node.state === 'planned') return;
+            nodeList.append(text('span', node.label, `overview-node-chip${node.state === 'planned' ? ' is-planned' : ''}`));
+          });
+          stageNode.append(nodeList);
+          children.push(stageNode);
+
+          const connection = overview.connections[index];
+          if (!connection) return;
+          const seam = byId(state.data.seams, connection.seamId);
+          const connector = document.createElement('button');
+          connector.type = 'button';
+          connector.className = 'overview-connector';
+          connector.dataset.seamId = connection.seamId;
+          connector.dataset.maturity = seam?.maturity || 'planned';
+          connector.setAttribute('aria-label', `${connection.label}: ${seam?.label || connection.seamId}, ${rubricFor(seam?.maturity)?.label || seam?.maturity}`);
+          connector.append(
+            text('span', maturitySymbols[seam?.maturity] || '•', 'overview-seam-symbol'),
+            text('span', connection.label, 'overview-connector-label')
+          );
+          children.push(connector);
+        });
+        $('#overview-spine').replaceChildren(...children);
+
+        const returnSeam = byId(state.data.seams, overview.return.seamId);
+        const returnRail = $('#overview-return');
+        returnRail.dataset.maturity = returnSeam?.maturity || 'planned';
+        const returnButton = document.createElement('button');
+        returnButton.type = 'button';
+        returnButton.className = 'overview-return-button';
+        returnButton.dataset.seamId = overview.return.seamId;
+        returnButton.append(text('span', maturitySymbols[returnSeam?.maturity] || '•'), text('span', overview.return.label));
+        returnRail.replaceChildren(returnButton);
+
+        $('#overview-rails').replaceChildren(...overview.rails.map(rail => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'overview-rail';
+          const primaryNode = rail.nodeIds.map(id => byId(state.data.nodes, id)).find(Boolean);
+          if (primaryNode) button.dataset.overviewNode = primaryNode.id;
+          const top = document.createElement('span');
+          top.className = 'overview-rail-top';
+          top.append(text('span', rail.label, 'overview-rail-label'));
+          const seamList = document.createElement('span');
+          seamList.className = 'overview-rail-seams';
+          rail.seamIds.map(id => byId(state.data.seams, id)).filter(Boolean).forEach(seam => {
+            seamList.append(text('span', maturitySymbols[seam.maturity] || '•', `overview-rail-seam ${seam.maturity}`));
+          });
+          top.append(seamList);
+          button.append(top, text('span', rail.description, 'overview-rail-description'));
+          return button;
+        }));
+      }
+
+      function currentFlow() { return byId(state.data.flows, state.flowId) || state.data.flows[0]; }
+
+      function mapNodes() {
+        const groups = state.data.architectureGroups || [];
+        const memberIds = new Set(groups.flatMap(group => group.memberIds));
+        return [...groups, ...state.data.nodes.filter(node => !memberIds.has(node.id))];
+      }
+
+      function groupForMember(id) {
+        return (state.data.architectureGroups || []).find(group => group.memberIds.includes(id));
+      }
+
+      function architectureNodeById(id) {
+        return byId(state.data.architectureGroups || [], id) || byId(state.data.nodes, id);
+      }
+
+      function effectiveNodeId(id) {
+        return groupForMember(id)?.id || id;
+      }
+
+      function nodeIsVisible(node) {
+        const members = node.memberIds?.map(id => byId(state.data.nodes, id)).filter(Boolean) || [node];
+        if (state.mode === 'vision') return true;
+        if (state.mode === 'current') return members.some(member => member.state !== 'planned');
+        return members.some(member => member.state === 'planned');
+      }
+
+      function rawVisibleRoutes() {
+        if (state.mode === 'vision') return state.data.routes;
+        if (state.mode === 'current') return state.data.routes.filter(route => route.state !== 'planned');
+        return state.data.routes.filter(route => route.state === 'planned');
+      }
+
+      function mapRoutes() {
+        const aggregated = new Map();
+        rawVisibleRoutes().forEach(route => {
+          const from = effectiveNodeId(route.from);
+          const to = effectiveNodeId(route.to);
+          if (from === to) return;
+          const endpoints = [from, to].sort();
+          const key = `${endpoints[0]}|${endpoints[1]}|${route.state}`;
+          const direction = `${from}>${to}`;
+          if (!aggregated.has(key)) {
+            aggregated.set(key, {
+              ...route,
+              from,
+              to,
+              primaryRouteId: route.id,
+              sourceRouteIds: [route.id],
+              labels: [route.label],
+              seamIds: [route.seamId],
+              directions: new Set([direction]),
+              bidirectional: route.bidirectional === true
+            });
+            return;
+          }
+          const item = aggregated.get(key);
+          item.sourceRouteIds.push(route.id);
+          if (!item.labels.includes(route.label)) item.labels.push(route.label);
+          if (!item.seamIds.includes(route.seamId)) item.seamIds.push(route.seamId);
+          if (!item.directions.has(direction)) item.bidirectional = true;
+          if (route.bidirectional === true) item.bidirectional = true;
+          item.directions.add(direction);
+          item.label = item.labels.join(' / ');
+        });
+        const maturityWeight = { green: 1, planned: 2, yellow: 3, red: 4 };
+        return [...aggregated.values()].map(route => {
+          const worstSeam = route.seamIds
+            .map(id => byId(state.data.seams, id))
+            .filter(Boolean)
+            .sort((a, b) => (maturityWeight[b.maturity] || 0) - (maturityWeight[a.maturity] || 0))[0];
+          if (worstSeam) route.seamId = worstSeam.id;
+          delete route.directions;
+          return route;
+        });
+      }
+
+      function renderArchitecture() {
+        const flow = currentFlow();
+        $('#flow-select').value = flow.id;
+        const step = state.step >= 0 ? flow.steps[state.step] : null;
+        $('#flow-kicker').textContent = step ? `Step ${state.step + 1} of ${flow.steps.length}` : `${flow.state === 'planned' ? 'Vision' : 'Current'} flow`;
+        $('#flow-title').textContent = step ? step.title : flow.label;
+        $('#flow-description').textContent = step ? step.caption : flow.summary;
+        $('#flow-state').textContent = flow.state;
+        $('#flow-state').className = `status-badge ${flow.state === 'planned' ? 'planned' : 'implemented'}`;
+        $('#step-count').textContent = step ? `${state.step + 1} / ${flow.steps.length}` : 'Overview';
+        $('#step-prev').disabled = state.step < 0;
+        $('#step-next').disabled = flow.steps.length === 0;
+        $('#step-next').textContent = state.step >= flow.steps.length - 1 ? 'Overview ↺' : 'Next →';
+        renderMap();
+        renderMobileFlow();
+        renderInspector();
+      }
+
+      function visibleNodeIds() { return new Set(mapNodes().filter(nodeIsVisible).map(node => node.id)); }
+
+      function renderMap() {
+        hideMapTooltip();
+        const svg = $('#architecture-map');
+        const persistent = Array.from(svg.children).filter(child => child.tagName === 'desc');
+        svg.replaceChildren(...persistent);
+        const defs = svgNode('defs');
+        ['green', 'yellow', 'red', 'planned'].forEach(maturity => {
+          const marker = svgNode('marker', { id: `arrow-${maturity}`, markerWidth: 9, markerHeight: 9, refX: 7.3, refY: 3.5, orient: 'auto-start-reverse', markerUnits: 'strokeWidth' });
+          marker.append(svgNode('path', { d: 'M0,0 L0,7 L8,3.5 z', fill: cssColor(maturity) }));
+          defs.append(marker);
+        });
+        svg.append(defs);
+
+        const visibleIds = visibleNodeIds();
+        const flow = currentFlow();
+        const routes = mapRoutes();
+        const flowRoutes = new Set(flow.steps.map(step => step.routeId));
+        const activeStep = state.step >= 0 ? flow.steps[state.step].routeId : null;
+
+        const zoneLayer = svgNode('g', { 'aria-hidden': 'true' });
+        state.data.zones.forEach(zone => {
+          const x = zone.x * MAP_W, y = zone.y * MAP_H, w = zone.w * MAP_W, h = zone.h * MAP_H;
+          zoneLayer.append(svgNode('rect', { x, y, width: w, height: h, rx: 18, class: 'zone-rect' }));
+          const label = svgNode('text', { x: x + 13, y: y + 19, class: 'zone-label' });
+          label.textContent = zone.label;
+          zoneLayer.append(label);
+        });
+        svg.append(zoneLayer);
+
+        const routeLayer = svgNode('g');
+        routes.forEach(route => {
+          if (!visibleIds.has(route.from) || !visibleIds.has(route.to)) return;
+          const seam = seamForRoute(route);
+          const points = routeGeometry(route);
+          const inFlow = flow.id === 'whole-system' || route.sourceRouteIds.some(id => flowRoutes.has(id));
+          const isActive = route.sourceRouteIds.includes(activeStep);
+          const group = svgNode('g', {
+            class: `route-group${inFlow ? ' in-flow' : ''}${flow.id === 'whole-system' ? ' is-overview' : ''}${isActive ? ' is-step' : ''}${route.state === 'planned' ? ' is-planned' : ''}${state.mode === 'delta' && route.state !== 'planned' ? ' is-context' : ''}`,
+            'data-route-id': route.primaryRouteId,
+            'data-maturity': seam.maturity,
+            tabindex: 0,
+            role: 'button',
+            'aria-label': `${route.label}; ${seam.label}; ${rubricFor(seam.maturity)?.label || seam.maturity}`
+          });
+          const pathAttributes = { d: points.d, class: 'route-path', 'marker-end': `url(#arrow-${seam.maturity})` };
+          if (route.bidirectional) pathAttributes['marker-start'] = `url(#arrow-${seam.maturity})`;
+          const path = svgNode('path', pathAttributes);
+          const hit = svgNode('path', { d: points.d, class: 'route-hit' });
+          group.append(path, hit);
+          attachMapTooltip(group, 'route', route.primaryRouteId, route);
+          if (inFlow && flow.showRouteLabels !== false) {
+            const marker = svgNode('g', { class: 'seam-marker', transform: `translate(${points.mx} ${points.my})` });
+            marker.append(svgNode('circle', { r: 9 }), svgNode('text', { x: 0, y: .5 }));
+            marker.lastChild.textContent = maturitySymbols[seam.maturity] || '•';
+            group.append(marker);
+            const label = svgNode('text', { x: points.mx, y: points.my - 14, class: 'route-label', 'text-anchor': 'middle' });
+            label.textContent = route.label;
+            group.append(label);
+          }
+          routeLayer.append(group);
+        });
+        svg.append(routeLayer);
+
+        const nodeLayer = svgNode('g');
+        mapNodes().forEach(node => {
+          if (!visibleIds.has(node.id)) return;
+          const box = nodeBox(node);
+          const selected = state.selected?.type === 'node' && state.selected.id === node.id;
+          const containsPlanned = node.memberIds?.some(id => byId(state.data.nodes, id)?.state === 'planned');
+          const context = state.mode === 'delta' && node.state !== 'planned' && !containsPlanned;
+          const group = svgNode('g', {
+            class: `node${node.state === 'planned' ? ' is-planned' : ''}${node.memberIds ? ' is-group' : ''}${selected ? ' is-selected' : ''}${context ? ' is-context' : ''}`,
+            transform: `translate(${box.x} ${box.y})`,
+            'data-node-id': node.id,
+            tabindex: 0,
+            role: 'button',
+            'aria-label': `${node.label}. ${node.subtitle}. ${node.state}.`
+          });
+          attachMapTooltip(group, 'node', node.id);
+          group.append(svgNode('rect', { x: -box.w / 2, y: -box.h / 2, width: box.w, height: box.h }));
+          if (node.state === 'planned') {
+            group.append(svgNode('circle', { cx: -box.w / 2 + 9, cy: -box.h / 2 + 9, r: 3, class: 'node-state' }));
+          }
+          const label = svgNode('text', { x: 0, y: 4, class: 'node-label' });
+          label.textContent = truncate(node.mapLabel || node.label, 16);
+          group.append(label);
+          if (node.memberIds) {
+            group.append(svgNode('circle', { cx: box.w / 2 - 2, cy: -box.h / 2 + 2, r: 7.5, class: 'node-group-count' }));
+            const count = svgNode('text', { x: box.w / 2 - 2, y: -box.h / 2 + 2.5, class: 'node-group-count-text' });
+            count.textContent = `+${node.memberIds.length}`;
+            group.append(count);
+          }
+          nodeLayer.append(group);
+        });
+        svg.append(nodeLayer);
+      }
+
+      function attachMapTooltip(element, type, id, item = null) {
+        element.addEventListener('pointerenter', event => showMapTooltip(type, id, event.clientX, event.clientY, item));
+        element.addEventListener('pointermove', event => positionMapTooltip(event.clientX, event.clientY));
+        element.addEventListener('pointerleave', hideMapTooltip);
+        element.addEventListener('focus', () => {
+          const rect = element.getBoundingClientRect();
+          showMapTooltip(type, id, rect.left + rect.width / 2, rect.top + rect.height / 2, item);
+        });
+        element.addEventListener('blur', hideMapTooltip);
+      }
+
+      function showMapTooltip(type, id, clientX, clientY, item = null) {
+        const tooltip = $('#map-tooltip');
+        tooltip.replaceChildren();
+        if (type === 'route') {
+          const route = item || byId(state.data.routes, id);
+          if (!route) return;
+          const seam = seamForRoute(route);
+          const seams = (route.seamIds || [route.seamId]).map(seamId => byId(state.data.seams, seamId)).filter(Boolean);
+          const from = architectureNodeById(route.from);
+          const to = architectureNodeById(route.to);
+          const rubric = rubricFor(seam.maturity);
+          const direction = route.bidirectional ? '↔' : '→';
+          const titleValue = seams.length > 1 ? `${seams.length} seams · ${seams.map(item => item.label).join(' + ')}` : seam.label;
+          const summary = seams.length > 1
+            ? seams.map(item => `${item.label}: ${item.contract}`).join(' · ')
+            : seam.contract;
+          tooltip.append(
+            text('div', `${route.label} · ${from?.label || route.from} ${direction} ${to?.label || route.to}`, 'tooltip-kicker'),
+            text('div', titleValue, 'tooltip-title'),
+            text('p', summary, 'tooltip-summary')
+          );
+          const footer = document.createElement('div');
+          footer.className = 'tooltip-footer';
+          footer.append(
+            text('span', `${maturitySymbols[seam.maturity] || '•'} ${rubric?.label || seam.maturity}${seams.length > 1 ? ` · ${seams.length} combined seams` : ` · grade ${seam.grade}`}`, `tooltip-maturity ${seam.maturity}`),
+            text('span', 'Click for leakage + evidence')
+          );
+          tooltip.append(footer);
+        } else {
+          const node = architectureNodeById(id);
+          if (!node) return;
+          const rawIds = new Set(node.memberIds || [node.id]);
+          const seamIds = new Set(state.data.routes.filter(route => rawIds.has(route.from) || rawIds.has(route.to)).map(route => route.seamId));
+          tooltip.append(
+            text('div', `${node.kind} · ${node.state}`, 'tooltip-kicker'),
+            text('div', node.label, 'tooltip-title'),
+            text('p', node.description, 'tooltip-summary')
+          );
+          const footer = document.createElement('div');
+          footer.className = 'tooltip-footer';
+          footer.append(
+            text('span', node.memberIds ? `${node.memberIds.length} implementations · ${seamIds.size} seams` : `${seamIds.size} connected seam${seamIds.size === 1 ? '' : 's'}`),
+            text('span', node.memberIds ? 'Click to explore implementations' : 'Click for ADRs + evidence')
+          );
+          tooltip.append(footer);
+        }
+        tooltip.setAttribute('aria-hidden', 'false');
+        tooltip.classList.add('is-visible');
+        positionMapTooltip(clientX, clientY);
+      }
+
+      function positionMapTooltip(clientX, clientY) {
+        const tooltip = $('#map-tooltip');
+        if (!tooltip.classList.contains('is-visible')) return;
+        const gap = 14;
+        const rect = tooltip.getBoundingClientRect();
+        let left = clientX + gap;
+        let top = clientY + gap;
+        if (left + rect.width > window.innerWidth - 8) left = clientX - rect.width - gap;
+        if (top + rect.height > window.innerHeight - 8) top = clientY - rect.height - gap;
+        tooltip.style.left = `${Math.max(8, left)}px`;
+        tooltip.style.top = `${Math.max(8, top)}px`;
+      }
+
+      function hideMapTooltip() {
+        const tooltip = $('#map-tooltip');
+        if (!tooltip) return;
+        tooltip.classList.remove('is-visible');
+        tooltip.setAttribute('aria-hidden', 'true');
+      }
+
+      function cssColor(maturity) {
+        return { green: '#43d49b', yellow: '#f5c85b', red: '#ff7373', planned: '#7ca9ff' }[maturity] || '#91a8ba';
+      }
+
+      function nodeBox(node) {
+        const sizes = {
+          surface: [104, 40], service: [108, 40], broker: [106, 40], capability: [112, 40],
+          runtime: [104, 40], external: [96, 40], observability: [104, 40], data: [100, 40], substrate: [96, 38]
+        };
+        const [w, h] = sizes[node.kind] || [104, 40];
+        return { x: node.x * MAP_W, y: node.y * MAP_H, w, h };
+      }
+
+      function routeGeometry(route) {
+        const from = nodeBox(architectureNodeById(route.from));
+        const to = nodeBox(architectureNodeById(route.to));
+        const dx = to.x - from.x, dy = to.y - from.y;
+        const horizontal = Math.abs(dx) / (from.w + to.w) > Math.abs(dy) / (from.h + to.h);
+        const sx = from.x + (horizontal ? Math.sign(dx || 1) * from.w / 2 : 0);
+        const sy = from.y + (horizontal ? 0 : Math.sign(dy || 1) * from.h / 2);
+        const tx = to.x - (horizontal ? Math.sign(dx || 1) * to.w / 2 : 0);
+        const ty = to.y - (horizontal ? 0 : Math.sign(dy || 1) * to.h / 2);
+        const length = Math.max(1, Math.hypot(tx - sx, ty - sy));
+        const nx = -(ty - sy) / length, ny = (tx - sx) / length;
+        const bend = route.bend || 0;
+        const cx = (sx + tx) / 2 + nx * bend;
+        const cy = (sy + ty) / 2 + ny * bend;
+        const mx = .25 * sx + .5 * cx + .25 * tx;
+        const my = .25 * sy + .5 * cy + .25 * ty;
+        return { d: `M ${sx} ${sy} Q ${cx} ${cy} ${tx} ${ty}`, mx, my };
+      }
+
+      function truncate(value, max) { return value.length > max ? `${value.slice(0, max - 1)}…` : value; }
+
+      function renderMobileFlow() {
+        const flow = currentFlow();
+        const container = $('#mobile-flow');
+        container.replaceChildren(...flow.steps.map((step, index) => {
+          const row = document.createElement('div');
+          row.className = `mobile-step${index === state.step ? ' is-active' : ''}`;
+          row.append(text('div', String(index + 1), 'mobile-step-number'));
+          const copy = document.createElement('div');
+          copy.append(text('h3', step.title), text('p', step.caption));
+          row.append(copy);
+          return row;
+        }));
+      }
+
+      function renderInspector() {
+        const inspector = $('#inspector');
+        const detail = buildDetail(state.selected?.type, state.selected?.id, false);
+        inspector.replaceChildren(detail || text('div', 'Select a component or seam to inspect its contract, maturity, leakage, ADRs, and evidence.', 'inspector-empty'));
+      }
+
+      function renderMaturityFilters() {
+        const container = $('#maturity-filters');
+        const items = [{ id: 'all', label: 'All' }, ...state.data.maturityRubric.map(item => ({ id: item.id, label: item.label }))];
+        container.replaceChildren(...items.map(item => {
+          const button = text('button', item.label, 'filter-button');
+          button.type = 'button';
+          button.dataset.maturityFilter = item.id;
+          button.setAttribute('aria-pressed', String(state.maturity === item.id));
+          return button;
+        }));
+      }
+
+      function renderSeams() {
+        const query = state.seamQuery.trim().toLowerCase();
+        const seams = state.data.seams.filter(seam => {
+          const matchesMaturity = state.maturity === 'all' || seam.maturity === state.maturity;
+          const haystack = `${seam.label} ${seam.contract} ${seam.reason} ${seam.implementations}`.toLowerCase();
+          return matchesMaturity && (!query || haystack.includes(query));
+        });
+        const grid = $('#seam-grid');
+        if (!seams.length) { grid.replaceChildren(text('div', 'No seams match this filter.', 'empty-result')); return; }
+        grid.replaceChildren(...seams.map(seam => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'seam-card';
+          button.dataset.seamId = seam.id;
+          button.dataset.maturity = seam.maturity;
+          const top = document.createElement('div');
+          top.className = 'card-topline';
+          top.append(text('span', seam.id, 'card-id'), maturityBadge(seam.maturity));
+          const footer = document.createElement('div');
+          footer.className = 'card-footer';
+          footer.append(text('span', seam.catalogKind), text('span', `grade ${seam.grade}`));
+          button.append(top, text('h3', seam.label), text('p', seam.reason), footer);
+          return button;
+        }));
+      }
+
+      function renderDecisions() {
+        const query = state.adrQuery.trim().toLowerCase();
+        const adrs = state.data.adrs.filter(adr => {
+          const statusMatch = state.adrStatus === 'all' || adr.status === state.adrStatus;
+          const modeMatch = state.mode === 'vision'
+            || (state.mode === 'current' && ['implemented', 'partial', 'guiding'].includes(adr.implementation))
+            || (state.mode === 'delta' && ['planned', 'reserved', 'partial'].includes(adr.implementation));
+          const haystack = `${adr.id} ${adr.title} ${adr.summary} ${adr.status} ${adr.implementation}`.toLowerCase();
+          return statusMatch && modeMatch && (!query || haystack.includes(query));
+        });
+        const grid = $('#adr-grid');
+        if (!adrs.length) { grid.replaceChildren(text('div', 'No ADRs match this state and filter.', 'empty-result')); return; }
+        grid.replaceChildren(...adrs.map(adr => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'adr-card';
+          button.dataset.adrId = adr.id;
+          const top = document.createElement('div');
+          top.className = 'card-topline';
+          top.append(text('span', `ADR ${String(adr.number).padStart(4, '0')}`, 'adr-number'), statusBadge(adr.status));
+          const footer = document.createElement('div');
+          footer.className = 'card-footer';
+          footer.append(text('span', adr.implementation), text('span', `${adr.seamIds.length} seam${adr.seamIds.length === 1 ? '' : 's'}`));
+          button.append(top, text('h3', adr.title), text('p', adr.summary), footer);
+          return button;
+        }));
+      }
+
+      function renderDocumentationDrift() {
+        const grid = $('#drift-grid');
+        if (!grid || !state.data.documentationDrift) return;
+        grid.replaceChildren(...state.data.documentationDrift.map(item => {
+          const card = document.createElement('article');
+          card.className = 'drift-card';
+          card.append(text('h4', item.title));
+          const oldClaim = text('p', '');
+          oldClaim.append(text('strong', 'Older prose: '), document.createTextNode(item.claim));
+          const current = text('p', '');
+          current.append(text('strong', 'Current code: '), document.createTextNode(item.current));
+          const links = document.createElement('div');
+          links.className = 'drift-links';
+          item.evidence.map(id => byId(state.data.sources, id)).filter(Boolean).forEach(source => {
+            const link = document.createElement('a');
+            link.href = source.href;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = source.title;
+            links.append(link);
+          });
+          if (item.issue) {
+            const issueLink = document.createElement('a');
+            issueLink.href = item.issue.href;
+            issueLink.target = '_blank';
+            issueLink.rel = 'noopener noreferrer';
+            issueLink.textContent = `Bug #${item.issue.number}`;
+            links.append(issueLink);
+          }
+          card.append(oldClaim, current, links);
+          return card;
+        }));
+      }
+
+      function renderInvestments() {
+        const list = $('#investment-list');
+        list.replaceChildren(...state.data.investments.sort((a, b) => a.rank - b.rank).map(item => {
+          const card = document.createElement('article');
+          card.className = 'investment-card';
+          card.append(text('div', String(item.rank).padStart(2, '0'), 'investment-rank'));
+          const copy = document.createElement('div');
+          copy.className = 'investment-copy';
+          copy.append(text('h3', item.title), text('p', item.why), text('p', `Unlocks: ${item.unlock}`, 'unlock'));
+          const links = document.createElement('div');
+          links.className = 'tag-row';
+          item.seamIds.forEach(id => {
+            const seam = byId(state.data.seams, id);
+            if (!seam) return;
+            const button = text('button', seam.label, 'seam-link-button');
+            button.type = 'button';
+            button.dataset.seamId = seam.id;
+            links.append(button);
+          });
+          copy.append(links);
+          const factors = document.createElement('div');
+          factors.className = 'factor-list';
+          Object.entries(item.factors).forEach(([key, value]) => {
+            const row = document.createElement('div');
+            row.className = 'factor-row';
+            const track = document.createElement('div');
+            track.className = 'factor-track';
+            const fill = document.createElement('div');
+            fill.className = 'factor-fill';
+            fill.style.width = `${value * 20}%`;
+            track.append(fill);
+            row.append(text('span', factorLabels[key] || key), track, text('span', String(value), 'factor-value'));
+            factors.append(row);
+          });
+          card.append(copy, factors);
+          return card;
+        }));
+      }
+
+      function maturityBadge(maturity) {
+        const rubric = rubricFor(maturity);
+        return text('span', `${maturitySymbols[maturity] || '•'} ${rubric?.label || maturity}`, `maturity-badge ${maturity}`);
+      }
+
+      function statusBadge(status) { return text('span', status, `status-badge ${status}`); }
+
+      function openDetail(type, id, modal) {
+        state.selected = { type, id };
+        updateHash(type, id);
+        if (modal || state.tab !== 'architecture') {
+          const detail = buildDetail(type, id, true);
+          if (!detail) return;
+          $('#dialog-detail').replaceChildren(detail);
+          if (!$('#detail-dialog').open) $('#detail-dialog').showModal();
+        } else {
+          renderArchitecture();
+        }
+      }
+
+      function buildDetail(type, id, includeMapAction) {
+        if (!state.data || !type || !id) return null;
+        if (type === 'node') return nodeDetail(architectureNodeById(id), includeMapAction);
+        if (type === 'seam') return seamDetail(byId(state.data.seams, id), includeMapAction);
+        if (type === 'adr') return adrDetail(byId(state.data.adrs, id), includeMapAction);
+        return null;
+      }
+
+      function baseDetail(overline, titleValue, description) {
+        const body = document.createElement('div');
+        body.className = 'detail-body';
+        body.append(text('div', overline, 'detail-overline'), text('h2', titleValue, 'detail-title'), text('p', description, 'detail-description'));
+        return body;
+      }
+
+      function nodeDetail(node, includeMapAction) {
+        if (!node) return null;
+        const members = node.memberIds?.map(id => byId(state.data.nodes, id)).filter(Boolean) || [];
+        const body = baseDetail(`${node.kind} · ${node.state}`, node.label, node.description);
+        const facts = document.createElement('div');
+        facts.className = 'detail-grid';
+        facts.append(detailFact('Layer', node.zone), detailFact('State', node.state));
+        if (members.length) facts.append(detailFact('Implementations', String(members.length)), detailFact('Implemented now', String(members.filter(member => member.state !== 'planned').length)));
+        body.append(facts);
+        const technology = members.length ? [...new Set(members.flatMap(member => member.technology || []))] : (node.technology || []);
+        if (technology.length) body.append(detailSection('Technology / shape', tagRow(technology)));
+        if (members.length) body.append(implementationDisclosure(members));
+        const rawIds = new Set(members.length ? members.map(member => member.id) : [node.id]);
+        const seamIds = new Set(state.data.routes.filter(route => rawIds.has(route.from) || rawIds.has(route.to)).map(route => route.seamId));
+        if (seamIds.size) body.append(detailSection('Connected seams', linkList([...seamIds].map(id => ({ type: 'seam', item: byId(state.data.seams, id) })).filter(entry => entry.item))));
+        const adrIds = members.length ? [...new Set(members.flatMap(member => member.adrIds || []))] : (node.adrIds || []);
+        const adrs = adrIds.map(id => byId(state.data.adrs, id)).filter(Boolean);
+        if (adrs.length) body.append(detailSection('Related decisions', linkList(adrs.map(item => ({ type: 'adr', item })))));
+        const evidence = members.length ? [...new Set(members.flatMap(member => member.evidence || []))] : (node.evidence || []);
+        body.append(detailSection('Evidence', sourceLinks(evidence)));
+        if (includeMapAction) body.append(mapAction('node', node.id));
+        return body;
+      }
+
+      function implementationDisclosure(members) {
+        const details = document.createElement('details');
+        details.className = 'implementation-disclosure';
+        details.open = true;
+        const summary = document.createElement('summary');
+        summary.textContent = `Implementations (${members.length})`;
+        const list = document.createElement('div');
+        list.className = 'implementation-list';
+        members.forEach(member => {
+          const item = document.createElement('article');
+          item.className = `implementation-item${member.state === 'planned' ? ' is-planned' : ''}`;
+          const head = document.createElement('div');
+          head.className = 'implementation-head';
+          head.append(text('span', member.label, 'implementation-label'), text('span', member.state, 'implementation-state'));
+          item.append(head, text('p', member.description, 'implementation-copy'));
+          list.append(item);
+        });
+        details.append(summary, list);
+        return details;
+      }
+
+      function seamDetail(seam, includeMapAction) {
+        if (!seam) return null;
+        const rubric = rubricFor(seam.maturity);
+        const body = baseDetail(`seam · ${seam.catalogKind}`, seam.label, seam.reason);
+        body.insertBefore(maturityBadge(seam.maturity), body.children[3] || null);
+        const facts = document.createElement('div');
+        facts.className = 'detail-grid';
+        facts.append(detailFact('Maturity', rubric?.label || seam.maturity), detailFact('Repo grade', seam.grade), detailFact('Implementations', seam.implementations), detailFact('Affected flows', String(seam.flowIds.length)));
+        body.append(facts);
+        body.append(detailSection('Current contract', text('p', seam.contract)));
+        body.append(detailSection('What still leaks', text('p', seam.leakage)));
+        body.append(detailSection('Cheapest honest next step', text('p', seam.nextStep)));
+        const flows = seam.flowIds.map(id => byId(state.data.flows, id)).filter(Boolean);
+        if (flows.length) body.append(detailSection('Flows', tagRow(flows.map(flow => flow.label))));
+        const adrs = seam.adrIds.map(id => byId(state.data.adrs, id)).filter(Boolean);
+        if (adrs.length) body.append(detailSection('Related decisions', linkList(adrs.map(item => ({ type: 'adr', item })))));
+        body.append(detailSection('Evidence', sourceLinks(seam.evidence || [])));
+        if (includeMapAction) body.append(mapAction('seam', seam.id));
+        return body;
+      }
+
+      function adrDetail(adr, includeMapAction) {
+        if (!adr) return null;
+        const body = baseDetail(`${adr.status} decision · ${adr.implementation}`, adr.id, adr.title);
+        body.append(statusBadge(adr.status));
+        body.append(detailSection('Capability state', text('p', adr.summary)));
+        const seams = adr.seamIds.map(id => byId(state.data.seams, id)).filter(Boolean);
+        if (seams.length) body.append(detailSection('Affected seams', linkList(seams.map(item => ({ type: 'seam', item })))));
+        const nodes = adr.nodeIds.map(id => byId(state.data.nodes, id)).filter(Boolean);
+        if (nodes.length) body.append(detailSection('Affected components', linkList(nodes.map(item => ({ type: 'node', item })))));
+        const link = document.createElement('a');
+        link.className = 'detail-link';
+        link.href = adr.href;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.append(text('span', 'Open decision source'), text('small', 'GitHub ↗'));
+        body.append(detailSection('Source', link));
+        if (includeMapAction) body.append(mapAction('adr', adr.id));
+        return body;
+      }
+
+      function detailFact(label, value) {
+        const fact = document.createElement('div');
+        fact.className = 'detail-fact';
+        fact.append(text('span', label), text('strong', value));
+        return fact;
+      }
+
+      function detailSection(titleValue, content) {
+        const section = document.createElement('section');
+        section.className = 'detail-section';
+        section.append(text('h3', titleValue), content);
+        return section;
+      }
+
+      function tagRow(values) {
+        const row = document.createElement('div');
+        row.className = 'tag-row';
+        values.forEach(value => row.append(text('span', value, 'tag')));
+        return row;
+      }
+
+      function linkList(entries) {
+        const list = document.createElement('ul');
+        list.className = 'detail-list';
+        entries.forEach(({ type, item }) => {
+          const li = document.createElement('li');
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'detail-action';
+          if (type === 'seam') button.dataset.seamId = item.id;
+          if (type === 'adr') button.dataset.adrId = item.id;
+          if (type === 'node') button.dataset.nodeId = item.id;
+          button.append(text('span', item.label || item.title || item.id), text('small', type));
+          li.append(button);
+          list.append(li);
+        });
+        return list;
+      }
+
+      function sourceLinks(sourceIds) {
+        const list = document.createElement('ul');
+        list.className = 'detail-list';
+        sourceIds.map(id => byId(state.data.sources, id)).filter(Boolean).forEach(source => {
+          const li = document.createElement('li');
+          const link = document.createElement('a');
+          link.className = 'detail-link';
+          link.href = source.href;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.append(text('span', source.title), text('small', source.path));
+          li.append(link);
+          list.append(li);
+        });
+        return list;
+      }
+
+      function mapAction(type, id) {
+        const actions = document.createElement('div');
+        actions.className = 'detail-actions';
+        const button = text('button', 'Show in architecture', 'primary-button');
+        button.type = 'button';
+        button.dataset.showMap = '';
+        button.dataset.type = type;
+        button.dataset.id = id;
+        actions.append(button);
+        return actions;
+      }
+
+      function updateHash(type, id) {
+        const hash = `#${encodeURIComponent(type)}/${encodeURIComponent(id)}`;
+        history.replaceState(null, '', `${location.origin}${location.pathname}${location.search}${hash}`);
+      }
+
+      function applyHash() {
+        const match = location.hash.match(/^#(node|seam|adr)\/(.+)$/);
+        if (!match || !state.data) return;
+        const type = decodeURIComponent(match[1]);
+        const id = decodeURIComponent(match[2]);
+        const item = type === 'node' ? architectureNodeById(id) : type === 'seam' ? byId(state.data.seams, id) : byId(state.data.adrs, id);
+        if (item) state.selected = { type, id };
+      }
+
+      function showError(error) {
+        const app = $('#app');
+        app.setAttribute('aria-busy', 'false');
+        const panel = document.createElement('section');
+        panel.className = 'error-panel';
+        panel.setAttribute('role', 'alert');
+        panel.append(text('h2', 'The architecture model could not load'), text('p', error.message), text('p', 'Serve this directory over HTTP so index.html and architecture.json share one origin. Opening index.html directly with file:// will not work reliably.'));
+        app.replaceChildren(panel);
+      }
+    })();
+  </script>
+</body>
+</html>

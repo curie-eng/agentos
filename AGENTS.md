@@ -87,6 +87,9 @@ Set `base=next` when your worktree targets `next`.
     sleep 3
   done
   curl -fsS http://localhost:23000/api/public/health >/dev/null
+git fetch --force --tags origin refs/heads/main:refs/remotes/origin/main
+  uv run python scripts/check-released-upgrade.py --self-test
+  uv run python scripts/check-released-upgrade.py
   (cd apps/api && uv run alembic upgrade head)
   git fetch --no-tags --depth=1 origin "$base" || true
   git show "origin/$base:packages/aci-protocol/schema/wire.lock" > "$wire_lock" 2>/dev/null || true
@@ -560,6 +563,10 @@ branch list, restores the `RELEASE_NEXT_BRANCH` environment alias and the
   keyword in a PR that targets `next` never fires on its own. Issues referenced
   by a `next` targeted PR are closed at the `next` into `main` merge, where the
   magic words fire once on the default branch.
+- PR bodies must contain real line breaks. The PR body guard rejects escaped
+  newline sequences because GitHub treats them as text, making closing keywords
+  inert. Run `scripts/check-pr-body.sh <body-file>` before opening or editing a
+  PR.
 - **Never mention any AI assistant (Claude, Codex, GPT, etc.) or AI in general in
   commit messages, and never add `Co-Authored-By` lines referencing AI.**
   CI enforces this on every PR (issue #962); check before pushing with:

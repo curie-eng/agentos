@@ -33,7 +33,9 @@ inference:
 otelCollector:
   deploy: false
 
-# First-party app services -- none are needed to exec a bound sandbox runner.
+# First-party app services. The runtime harness selectively enables a zero-replica
+# API to exercise its Service NodePort contract; no app workload is needed to exec
+# a bound sandbox runner.
 api:
   deploy: false
 dispatcher:

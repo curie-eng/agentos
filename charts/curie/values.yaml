@@ -24,6 +24,42 @@ global:
   # on k3s, gp3 on EKS).
   storageClass: ""
 
+# Named placement classes map to platform services, data stores, sandbox pods
+# and prewarm, Helm hooks, and the sandbox controller, respectively.
+# podLabels can drive platform selectors. nodeSelector, tolerations, and
+# affinity remain generic Kubernetes placement fields for any substrate.
+placement:
+  platform:
+    podLabels: {}
+    annotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  data:
+    podLabels: {}
+    annotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  sandbox:
+    podLabels: {}
+    annotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  hooks:
+    podLabels: {}
+    annotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  controller:
+    podLabels: {}
+    annotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+
 # ---------------------------------------------------------------------------
 # PriorityClass (ADR-0059 decision 5): ranks the control plane -- worker, api,
 # dispatcher, and the data tier (postgres, valkey, clickhouse, rustfs) -- above
@@ -391,9 +427,18 @@ clickhouse:
 # regenerate and keep it in whatever holds your other irreplaceable secrets.
 sealing:
   privateKey: ""
+  # BYO secret (issue #1759, the same idiom every backing store and
+  # api.githubAppExistingSecret use). Wins over privateKey when set. Not yet
+  # preserved by a plain `curie cluster up` (issue #1801) -- until that lands,
+  # re-supply it (or keep it declared in your values file) on every upgrade.
+  privateKeyExistingSecret: ""
+  privateKeyExistingSecretKey: sealingPrivateKey
   # Set only during a rotation, so values sealed to the old key keep opening
   # while repositories are resealed. Remove it once every repository is resealed.
   previousPrivateKey: ""
+  # Same BYO escape and preservation caveat as privateKeyExistingSecret above.
+  previousPrivateKeyExistingSecret: ""
+  previousPrivateKeyExistingSecretKey: sealingPreviousPrivateKey
 
 rustfs:
   deploy: true
@@ -588,6 +633,13 @@ api:
   # to helm, but a token typed on the command line is still in curie's own
   # argv, so it does reach your shell history and the process table.
   githubToken: ""
+  # BYO secret (issue #1759, the same idiom githubAppExistingSecret below
+  # uses). Wins over githubToken when set. Not yet preserved by a plain
+  # `curie cluster up` (issue #1801) -- until that lands, re-supply it (or keep
+  # it declared in your values file) on every upgrade, same as any other
+  # values key the CLI does not manage.
+  githubTokenExistingSecret: ""
+  githubTokenExistingSecretKey: githubToken
   # GitHub App identity (ADR-0092). The scalable alternative to githubToken
   # above: the platform mints a one-hour token scoped to the single repository
   # being cloned, so there is nothing to rotate, no human owner, and adding the
@@ -658,6 +710,13 @@ api:
   service:
     type: ClusterIP
     port: 8000
+    # Pinned NodePort used when service.type is set to NodePort. Empty lets
+    # Kubernetes allocate one from 30000-32767, but
+    # an auto-allocated port changes on every helm install/upgrade, breaking
+    # any URL or `curie deploy --api-url` that hardcodes a port. The default
+    # pins it so a down/up cycle keeps the same URL. Override or set to "" to
+    # restore auto-allocation.
+    nodePort: 30081
   # TLS for the API (issue #1238). Off by default because it cannot be
   # defaulted honestly -- it needs an ingress controller, a hostname, and a
   # certificate source, none of which the chart can invent. Rendering an
@@ -756,8 +815,22 @@ dispatcher:
   # resolves once at pod start.
   slack:
     appToken: ""
+    # BYO secret pair (issue #1759, the same idiom githubAppExistingSecret
+    # uses), one per token. Each wins over its plain value when set. curie.
+    # dispatcher.enabled treats a token as present whether it arrives as the
+    # plain value or via its existingSecret, so a dispatcher configured
+    # entirely through BYO Secrets still deploys. Not yet preserved by a plain
+    # `curie cluster up` (issue #1801) -- `curie cluster comms` does not know
+    # about these fields yet, so re-supply them (or keep them declared in your
+    # values file) on every upgrade.
+    appTokenExistingSecret: ""
+    appTokenExistingSecretKey: slackAppToken
     botToken: ""
+    botTokenExistingSecret: ""
+    botTokenExistingSecretKey: slackBotToken
     signingSecret: ""
+    signingSecretExistingSecret: ""
+    signingSecretExistingSecretKey: slackSigningSecret
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
@@ -879,13 +952,10 @@ worker:
   # per-agent behavior-pack load line intact.
   statusText: "is working on your request..."
   # No-Slack egress routing. When non-empty, renders SLACK_API_BASE_URL on the
-  # worker Deployment so the worker's Slack sink posts placeholder edits at this
-  # base URL instead of real Slack -- the seam `curie cluster message` drives when it
-  # points the deployed worker at its local Slack Web API stub. Empty (the
-  # default) leaves the worker on real Slack. `curie cluster message --wire` sets this
-  # via `helm upgrade --reuse-values`; connecting real Slack (a `helm upgrade
-  # --reuse-values` that sets the dispatcher tokens) clears it back to empty in
-  # the same command, so that upgrade un-wires any stub routing.
+  # worker Deployment so its Slack sink uses that global base URL instead of real
+  # Slack. Empty (the default) leaves the worker on real Slack. `curie cluster
+  # message` does not change this value: its synthetic turn carries a per-turn
+  # reply endpoint for the command's local Slack Web API stub.
   slackApiBaseUrl: ""
   # ADDITIONAL Slack origins a per-turn reply endpoint may name (ADR-0096
   # D4.4), comma-separated `scheme://host[:port]`. EMPTY (the default) is the
@@ -893,12 +963,12 @@ worker:
   # Slack) is the only endpoint the worker will send the bot token to, and every
   # cross-origin endpoint a turn names is refused before any request.
   #
-  # DEV ONLY. `curie cluster message` uses an EPHEMERAL callback port by
-  # default. To trust a LAN or kind callback host, set a portless origin such as
-  # `http://10.0.0.7` or `http://host.docker.internal`; omitting the port admits
-  # the kernel assigned port. This trusts ANY port on that exact host, so it can
-  # widen where the platform bot token can go and belongs only in development.
-  # The empty default above remains the fail closed production posture.
+  # DEV ONLY. `curie cluster message` temporarily adds the exact advertised stub
+  # host as a portless origin, waits for the worker rollout, and removes it when
+  # the command exits. Omitting the port admits the kernel-assigned callback
+  # port. Manual entries trust ANY port on that exact host, so they can widen
+  # where the platform bot token can go and belong only in development. The
+  # empty default remains the fail-closed production posture.
   # Rendered only when non-empty.
   slackTrustedOrigins: ""
   # Per-ADAPTER egress credentials (ADR-0096 D4.2), a map of adapter slug ->
@@ -912,6 +982,14 @@ worker:
   # be impersonated. Stored in the chart Secret (key adapterCredentials), never
   # inlined into a manifest.
   adapterCredentials: {}
+  # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses).
+  # Wins over adapterCredentials when set -- the referenced key must hold the
+  # already-JSON-encoded slug -> secret map, not a YAML map, since the chart
+  # never re-serializes a BYO Secret's contents. Not yet preserved by a plain
+  # `curie cluster up` (issue #1801) -- re-supply it (or keep it declared in
+  # your values file) on every upgrade.
+  adapterCredentialsExistingSecret: ""
+  adapterCredentialsExistingSecretKey: adapterCredentials
   # Extra env for the worker container, list of {name, value}. For SLACK_API_BASE_URL
   # prefer the first-class slackApiBaseUrl above; use extraEnv for any other
   # worker override the fixed env block does not cover.
@@ -1139,6 +1217,15 @@ agentSandbox:
     # ServiceAccount note below), so a global one is opt-in. When set it is stored
     # in the chart Secret (key agentCredentials), never inlined into a manifest.
     credentials: ""
+    # BYO secret (issue #1759, the same idiom githubAppExistingSecret uses),
+    # for the credential that authorizes the model provider -- the most
+    # sensitive value most installs carry. Wins over credentials when set.
+    # Not yet preserved by a plain `curie cluster up` (issue #1801) --
+    # `cluster up --credentials`/CURIE_MODEL_CREDENTIALS re-supply the plain
+    # value across upgrades but do not yet know about this field, so
+    # re-supply it (or keep it declared in your values file) on every upgrade.
+    credentialsExistingSecret: ""
+    credentialsExistingSecretKey: agentCredentials
     pluginDir: /unused
     budget:
       maxOutputTokensPerRun: 100000

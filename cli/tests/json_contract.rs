@@ -1349,6 +1349,7 @@ fn doctor_output_validates() {
         // A dated snapshot, so the schema is validated against the pinned
         // branch of the model-pin check rather than its advisory branch.
         model_pin: Some("claude-haiku-4-5-20251001".to_string()),
+        model_credential_provider: None,
         docker_ok: true,
         bundle_name: Some("my-agent".to_string()),
         kube_context: Some("minikube".to_string()),

@@ -20,9 +20,12 @@ jobs:
   python:
     name: Python (ruff + mypy + pytest)
     runs-on: ubuntu-latest
+    env:
+      CI_REQUIRE_VALKEY_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           persist-credentials: false
       # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
       # third-party dependency (a tool binary, an image, a registry session, a
@@ -100,8 +103,8 @@ jobs:
             langfuse-web langfuse-worker otel-collector
       # Langfuse web has no compose healthcheck, so --wait returns once its
       # container is merely running. Poll its public health endpoint until it is
-      # actually serving; the Langfuse-backed tests skip themselves when the
-      # stack is unreachable, so this gate is what keeps them running for real.
+      # actually serving, so the full-stack readiness gate fails fast with an
+      # actionable error before integration tests begin.
       - name: Wait for Langfuse to serve
         run: |
           for i in $(seq 1 60); do
@@ -111,6 +114,10 @@ jobs:
             sleep 3
           done
           echo "Langfuse did not become ready within 180s"; exit 1
+      - name: Released database upgrade gate
+        run: |
+          uv run python scripts/check-released-upgrade.py --self-test
+          uv run python scripts/check-released-upgrade.py
       # The apps/api suite provisions a throwaway migrated DB per run, but the
       # worker binding integration tests dial the shared default database and
       # assume the curie schema already exists (as it does on a dev box).
@@ -122,9 +129,9 @@ jobs:
       # The committed-lock test only proves the lock matches the current wire; it
       # passes even if the lock was regenerated without a version bump. Compare
       # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. The shallow checkout has no base ref, so fetch it depth=1; a missing
-      # or empty base lock (base predates the lock) skips cleanly (exit 0), and
-      # only a genuine unbumped wire change vs an existing base lock exits 1.
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
@@ -326,6 +333,8 @@ jobs:
           git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts
       - name: tsc --noEmit on generated ACI types
         run: npx --yes -p typescript@5.9.3 tsc --noEmit -p packages/aci-protocol/generated/ts/tsconfig.json
+      - name: Architecture atlas preview route test
+        run: node --test docs/architecture-atlas/test-update-hash.mjs
 
   ui:
     name: UI (lint + vitest + build + Playwright)
@@ -445,7 +454,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build (no push)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -699,7 +708,7 @@ jobs:
       # layers from cache alone (58s -> 15s) after wiping the builder.
       - name: Set up a cache-only buildx builder (named, NOT the default -- preserves compose FROM, #803)
         id: laddercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -780,7 +789,7 @@ jobs:
       # documents in full.
       - name: Set up a cache-only buildx builder (named, NOT the default -- #803)
         id: releasecache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the runner image locally (gha layer cache)
@@ -949,7 +958,7 @@ jobs:
       # cluster round trip actually needs; the dispatcher is not deployed.
       - name: Set up a cache-only buildx builder (named, NOT the default)
         id: clustercache
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           use: false
       - name: Build the api image locally

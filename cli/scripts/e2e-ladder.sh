@@ -395,7 +395,11 @@ for entry in plan:
 # this assertion as a claim about pre-existing sandboxes.
 assert_model_mode() {
     local label="$1" observed="$2" truthy=0
-    case "${observed,,}" in
+    # `tr` rather than `${observed,,}`: case-conversion expansion is bash 4+ and
+    # macOS ships 3.2 as /bin/bash, where the `,,` is a syntax error that kills
+    # the whole ladder -- and AGENTS.md tells contributors to run these rungs
+    # locally before pushing.
+    case "$(printf '%s' "$observed" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes) truthy=1 ;;
     esac
     if [[ "$LIVE" == "1" ]]; then

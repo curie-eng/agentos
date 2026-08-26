@@ -115,10 +115,17 @@ Runtime check (the cheap default for a chart/sandbox/bundle change): installs a
 trimmed slice, runs the bundle-fetch init pair, and exec-asserts on the runner:
 ```bash
 curie dev chart-runtime-e2e            # implemented by scripts/chart-runtime-e2e.sh
+curie dev chart-runtime-e2e --force    # same, on a scratch context not named k8scratch
 ```
 A ticket whose AC is a runtime check (like #56, the bundle-fetch credential
 isolation) is only satisfied by running this and pasting its output -- lint /
 template do not exercise the init container or the live runner.
+
+It refuses any kube context not named `k8scratch`, because it installs and
+uninstalls a real release; `--force` is the override, and points at a disposable
+cluster only. The other script flags (`--namespace`, `--release`, `--chart`,
+`--runner-image`, `--expect-vulnerable`, `--keep`) are not yet exposed through
+`curie dev`; reach them with `bash scripts/chart-runtime-e2e.sh --help`.
 
 Cluster verification (a disposable local cluster, `kind` or `k3s`):
 ```bash

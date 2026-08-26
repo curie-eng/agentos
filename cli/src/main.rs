@@ -120,19 +120,61 @@ async fn sync_connectors(
     version_id: &str,
 ) -> anyhow::Result<()> {
     let app_name = curie::connectors::discover_app_name(namespace, release).await?;
+    let connector_version = ConnectorVersion {
+        agent_id,
+        agent_name,
+        version_id,
+    };
+    let prepared = prepare_connectors(
+        api_url,
+        api_key,
+        namespace,
+        release,
+        &app_name,
+        connector_version,
+    )
+    .await?;
+    apply_connectors(prepared).await
+}
+
+struct ConnectorVersion<'a> {
+    agent_id: &'a str,
+    agent_name: &'a str,
+    version_id: &'a str,
+}
+
+async fn prepare_connectors(
+    api_url: &str,
+    api_key: &str,
+    namespace: &str,
+    release: &str,
+    app_name: &str,
+    connector_version: ConnectorVersion<'_>,
+) -> anyhow::Result<curie::connectors::PreparedConnectorSync> {
     let client = curie::api::ApiClient::new(api_url, api_key)?;
     let rendered = client
-        .version_connectors(agent_id, version_id, release, namespace, &app_name)
+        .version_connectors(
+            connector_version.agent_id,
+            connector_version.version_id,
+            release,
+            namespace,
+            app_name,
+        )
         .await?;
-    let synced = curie::connectors::sync(
+    curie::connectors::prepare(
         &rendered.manifests,
         &rendered.mcp_entries,
         &rendered.owned_secret_name,
         &rendered.owned_secret_keys,
         namespace,
-        agent_name,
+        connector_version.agent_name,
     )
-    .await?;
+}
+
+async fn apply_connectors(
+    prepared: curie::connectors::PreparedConnectorSync,
+) -> anyhow::Result<()> {
+    let synced = curie::connectors::sync(prepared).await?;
     let ui = curie::ui::ui();
     for (name, url) in &synced.urls {
         ui.note(&format!("connector {name}: {url}"));
@@ -568,7 +610,16 @@ enum DevAction {
     /// exec-assert the runner's view -- the one-command way to satisfy a
     /// chart/sandbox runtime acceptance criterion static checks cannot (#199,
     /// `bash scripts/chart-runtime-e2e.sh`).
-    ChartRuntimeE2e,
+    ChartRuntimeE2e {
+        /// Allow running against a kube context other than `k8scratch`.
+        ///
+        /// The script refuses a non-`k8scratch` context and names `--force` as
+        /// the override. Without this passthrough that override was unreachable
+        /// from the `curie` surface, so a contributor whose scratch context has
+        /// another name could not run this gate the documented way at all.
+        #[arg(long)]
+        force: bool,
+    },
     /// Lint the interface catalog docs (`bash scripts/check-docs.sh`).
     DocsLint,
     /// Validate every `examples/` bundle against Claude Code (`bash scripts/check-plugin-compat.sh`).
@@ -2082,8 +2133,9 @@ async fn run(command: Option<Command>) -> Result<()> {
             } => {
                 commands::dev_e2e_ci_selection(&path, base.as_deref(), head.as_deref(), push).await
             }
-            DevAction::ChartRuntimeE2e => {
-                commands::dev_script("scripts/chart-runtime-e2e.sh", &[]).await
+            DevAction::ChartRuntimeE2e { force } => {
+                let args: &[&str] = if force { &["--force"] } else { &[] };
+                commands::dev_script("scripts/chart-runtime-e2e.sh", args).await
             }
             DevAction::DocsLint => commands::dev_script("scripts/check-docs.sh", &[]).await,
             DevAction::PluginCompat => {
@@ -3134,13 +3186,122 @@ async fn run(command: Option<Command>) -> Result<()> {
                     vec![target]
                 };
 
-                // Single target deploy retains its existing output. All target
-                // deploy accumulates complete results in the API's declared order.
-                let mut last_deployed = None;
-                let mut completed = Vec::new();
-                for target in targets {
-                    let target_name = target.clone();
-                    let deployed = match commands::deploy(DeployOpts {
+                if all_targets {
+                    let first_target = targets
+                        .first()
+                        .cloned()
+                        .flatten()
+                        .expect("all target entries always have a target name");
+                    let app_name =
+                        match curie::connectors::discover_app_name(&namespace, &release).await {
+                            Ok(app_name) => app_name,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &first_target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+
+                    // Resolve every target and every connector credential before
+                    // activating the first deployment. Preparation may create
+                    // agents and versions, but it does not POST a deployment.
+                    let mut prepared_targets = Vec::new();
+                    for target in targets {
+                        let target = target.expect("all target entries always have a target name");
+                        let prepared_deploy = match commands::prepare_deploy(DeployOpts {
+                            plugin_dir: plugin_dir.clone(),
+                            agent: agent.clone(),
+                            target: Some(target.clone()),
+                            api_url: api_url.clone(),
+                            api_key: api_key.clone(),
+                            slack_channel: slack_channel.clone(),
+                            repo: repo.clone(),
+                            env,
+                            label: label.clone(),
+                            secret: Vec::new(),
+                            secret_binding_supported: false,
+                            connect_hint: connect_hint.clone(),
+                        })
+                        .await
+                        {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+                        let connector_version = ConnectorVersion {
+                            agent_id: prepared_deploy.agent_id(),
+                            agent_name: prepared_deploy.agent_name(),
+                            version_id: prepared_deploy.version_id(),
+                        };
+                        let prepared_connectors = match prepare_connectors(
+                            &api_url,
+                            &api_key,
+                            &namespace,
+                            &release,
+                            &app_name,
+                            connector_version,
+                        )
+                        .await
+                        {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target,
+                                    &[],
+                                    None,
+                                    &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+                        prepared_targets.push((target, prepared_deploy, prepared_connectors));
+                    }
+
+                    // Activate and reconcile in the API's declared target order.
+                    let mut completed = Vec::new();
+                    for (target, prepared_deploy, prepared_connectors) in prepared_targets {
+                        let deployed = match commands::deploy_prepared(prepared_deploy).await {
+                            Ok(deployed) => deployed,
+                            Err(err) => {
+                                let payload = commands::all_targets_deploy_failure_json(
+                                    &target, &completed, None, &err,
+                                );
+                                return Err(curie::exit::with_json_payload(err, payload));
+                            }
+                        };
+
+                        if let Err(err) = apply_connectors(prepared_connectors).await {
+                            let payload = commands::all_targets_deploy_failure_json(
+                                &target,
+                                &completed,
+                                Some(&deployed),
+                                &err,
+                            );
+                            return Err(curie::exit::with_json_payload(err, payload));
+                        }
+                        completed.push(commands::AllTargetsDeployResult {
+                            target,
+                            result: deployed,
+                        });
+                    }
+                    emit(commands::AllTargetsDeployOutput { results: completed })
+                } else {
+                    let target = targets
+                        .into_iter()
+                        .next()
+                        .expect("the target list is never empty");
+                    let deployed = commands::deploy(DeployOpts {
                         plugin_dir: plugin_dir.clone(),
                         agent: agent.clone(),
                         target,
@@ -3160,23 +3321,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         secret_binding_supported: false,
                         connect_hint: connect_hint.clone(),
                     })
-                    .await
-                    {
-                        Ok(deployed) => deployed,
-                        Err(err) if all_targets => {
-                            let failed_target = target_name
-                                .as_deref()
-                                .expect("all target entries always have a target name");
-                            let payload = commands::all_targets_deploy_failure_json(
-                                failed_target,
-                                &completed,
-                                None,
-                                &err,
-                            );
-                            return Err(curie::exit::with_json_payload(err, payload));
-                        }
-                        Err(err) => return Err(err),
-                    };
+                    .await?;
 
                     // Stand up whatever the bundle's connectors.yaml declares
                     // (ADR-0086, #1063). After the deploy, so the objects exist
@@ -3184,7 +3329,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                     // are the CONNECTOR's, resolved locally and written straight to
                     // a K8s Secret, which is a different path from the sandbox
                     // secret delivery #440 tracks.
-                    if let Err(err) = sync_connectors(
+                    sync_connectors(
                         &api_url,
                         &api_key,
                         &namespace,
@@ -3193,36 +3338,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                         &deployed.agent_name,
                         &deployed.version_id,
                     )
-                    .await
-                    {
-                        if all_targets {
-                            let failed_target = target_name
-                                .as_deref()
-                                .expect("all target entries always have a target name");
-                            let payload = commands::all_targets_deploy_failure_json(
-                                failed_target,
-                                &completed,
-                                Some(&deployed),
-                                &err,
-                            );
-                            return Err(curie::exit::with_json_payload(err, payload));
-                        }
-                        return Err(err);
-                    }
-                    if all_targets {
-                        completed.push(commands::AllTargetsDeployResult {
-                            target: target_name
-                                .expect("all target entries always have a target name"),
-                            result: deployed,
-                        });
-                    } else {
-                        last_deployed = Some(deployed);
-                    }
-                }
-                if all_targets {
-                    emit(commands::AllTargetsDeployOutput { results: completed })
-                } else {
-                    emit(last_deployed.expect("the target list is never empty"))
+                    .await?;
+                    emit(deployed)
                 }
             }
             ClusterAction::Kill {
@@ -4014,7 +4131,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Dev {
-                action: DevAction::ChartRuntimeE2e
+                action: DevAction::ChartRuntimeE2e { force: false }
+            })
+        ));
+        // The script's context guard names `--force` as its only override, so the
+        // flag has to survive the `curie dev` hop or the guard is unoverridable
+        // through the documented entry point.
+        let cli = Cli::try_parse_from(["curie", "dev", "chart-runtime-e2e", "--force"])
+            .expect("dev chart-runtime-e2e --force should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dev {
+                action: DevAction::ChartRuntimeE2e { force: true }
             })
         ));
     }

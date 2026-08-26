@@ -101,6 +101,9 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.placement.annotations" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         # Roll the workers when the per-adapter egress credentials change
         # (ADR-0096 D4.2). They arrive as env from the chart Secret, and env is
         # read once at boot, so a `helm upgrade` that rotates a compromised
@@ -110,11 +113,27 @@ spec:
         # value idiom as otel-collector.yaml and clickhouse.yaml. Scoped to this
         # value on purpose: annotating the whole Secret would restart the workers
         # on any unrelated credential change in it.
-        checksum/adapter-credentials: {{ .Values.worker.adapterCredentials | toJson | sha256sum }}
+        #
+        # Includes the existingSecret name/key (issue #1759), not just the
+        # inline value: switching which BYO Secret or key is referenced is a
+        # helm-values-visible credential-source change and must roll the
+        # workers the same way changing the inline value does. It cannot
+        # reach into a foreign Secret's CONTENT at render time, so rotating an
+        # existingSecret's value in place while keeping the same name/key
+        # still needs a manual rollout -- the same limitation every other
+        # existingSecret-sourced credential in this chart already has (a
+        # secretKeyRef env resolves once at pod start).
+        checksum/adapter-credentials: {{ printf "%s|%s|%s" (.Values.worker.adapterCredentials | toJson) .Values.worker.adapterCredentialsExistingSecret .Values.worker.adapterCredentialsExistingSecretKey | sha256sum }}
       labels:
+        {{- with (include "curie.placement.labels" .Values.placement.platform) }}
+        {{- . | nindent 8 }}
+        {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 8 }}
     spec:
+      {{- with (include "curie.placement.spec" .Values.placement.platform) }}
+      {{- . | nindent 6 }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       {{- if .Values.worker.serviceAccount.create }}
       serviceAccountName: {{ include "curie.fullname" . }}-worker
@@ -152,11 +171,12 @@ spec:
             {{- if not $hasWorkerApiKey }}
             {{- include "curie.env.apiKey" . | nindent 12 }}
             {{- end }}
+            # Same shared secret reference api.yaml and dispatcher.yaml resolve
+            # (issue #1759, curie.secretRef), so the three cannot drift apart.
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: slackBotToken
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.dispatcher.slack.botTokenExistingSecret "existingSecretKey" .Values.dispatcher.slack.botTokenExistingSecretKey "defaultKey" "slackBotToken") | nindent 18 }}
             # The sealing keys (ADR-0094). The connector reconciler runs here,
             # so this is the only workload that needs to DECRYPT a sealed
             # value; nothing else in the release gets them. Both are optional:
@@ -165,13 +185,11 @@ spec:
             - name: CURIE_SEALING_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: sealingPrivateKey
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.privateKeyExistingSecret "existingSecretKey" .Values.sealing.privateKeyExistingSecretKey "defaultKey" "sealingPrivateKey") | nindent 18 }}
             - name: CURIE_SEALING_PREVIOUS_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: sealingPreviousPrivateKey
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" .Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | nindent 18 }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -242,12 +260,13 @@ spec:
             {{- $claimFakeModel := and .Values.agentSandbox.runner.fakeModel (not .Values.inference.deploy) }}
             - name: CURIE_FAKE_MODEL
               value: {{ ternary "1" "0" $claimFakeModel | quote }}
-            {{- if .Values.agentSandbox.runner.credentials }}
+            {{- if or .Values.agentSandbox.runner.credentials .Values.agentSandbox.runner.credentialsExistingSecret }}
+            # Same shared secret reference agent-sandbox.yaml resolves (issue
+            # #1759, curie.secretRef), so the two cannot drift apart.
             - name: CURIE_CREDENTIALS
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: agentCredentials
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.agentSandbox.runner.credentialsExistingSecret "existingSecretKey" .Values.agentSandbox.runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | nindent 18 }}
             {{- end }}
             # Per-adapter egress credentials (ADR-0096 D4.2). From the chart
             # Secret, never inlined into the Deployment: these authenticate the
@@ -259,8 +278,9 @@ spec:
             - name: CURIE_ADAPTER_CREDENTIALS
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "curie.secretName" . }}
-                  key: adapterCredentials
+                  {{- /* BYO (issue #1759): the referenced key must already
+                         hold the JSON-encoded map. */}}
+                  {{- include "curie.secretRef" (dict "root" . "existingSecret" .Values.worker.adapterCredentialsExistingSecret "existingSecretKey" .Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | nindent 18 }}
             # No-Slack egress routing: when set, the worker's Slack sink posts its
             # placeholder edits at this base URL (the `curie cluster message` CLI stub)
             # instead of real Slack. Empty (the default) leaves the sink on real

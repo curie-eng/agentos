@@ -43,6 +43,33 @@ app.kubernetes.io/instance: {{ .root.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{- define "curie.placement.labels" -}}
+{{- with .podLabels }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "curie.placement.annotations" -}}
+{{- with .annotations }}
+{{- toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "curie.placement.spec" -}}
+{{- with .nodeSelector }}
+nodeSelector:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .tolerations }}
+tolerations:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .affinity }}
+affinity:
+{{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
 {{/* Secret name that carries all credential material. */}}
 {{- define "curie.secretName" -}}
 {{- printf "%s-secrets" (include "curie.fullname" .) -}}
@@ -714,12 +741,59 @@ true
 {{- end -}}
 {{- end -}}
 
+{{/* ---- BYO existingSecret escape for a direct-passthrough credential
+     (issue #1759) ----
+
+     Eight keys (agentCredentials, adapterCredentials, githubToken,
+     sealingPrivateKey, sealingPreviousPrivateKey, slackAppToken,
+     slackBotToken, slackSigningSecret) each grew a per-field
+     `<field>ExistingSecret` / `<field>ExistingSecretKey` pair mirroring
+     api.githubAppExistingSecret (ADR-0092): set, it wins over the plain
+     value and the consumer's secretKeyRef points straight at the operator's
+     Secret, so a BYO Secret missing the key fails that pod loudly with
+     CreateContainerConfigError instead of the chart emitting an empty
+     credential.
+
+     One generic helper for all eight, following the dict-argument pattern
+     `curie.image`/`curie.managedSecret` already use in this file, rather than
+     a bespoke per-key helper or a hand-copied if/else at each consumer: every
+     consumer of the SAME key -- there are three for slackBotToken, two for
+     agentCredentials -- calls this with the same arguments and so cannot
+     resolve the escape differently, exactly the parity-seam trap
+     `curie.env.postgres`/`curie.env.valkey` already exist to avoid for the
+     backing stores; a single-consumer key gets the same guarantee for free
+     if it ever grows a second one.
+
+     Pass a dict:
+       root               the top context
+       existingSecret     .Values.<field>ExistingSecret
+       existingSecretKey  .Values.<field>ExistingSecretKey
+       defaultKey         this credential's published key in the chart's own
+                           Secret (secrets.yaml), used when existingSecret is
+                           empty
+     Renders the two lines a secretKeyRef needs (`name:` / `key:`); include
+     with `nindent 18` to land at a container's secretKeyRef column. */}}
+{{- define "curie.secretRef" -}}
+{{- if .existingSecret -}}
+name: {{ .existingSecret | quote }}
+key: {{ .existingSecretKey | quote }}
+{{- else -}}
+name: {{ include "curie.secretName" .root }}
+key: {{ .defaultKey }}
+{{- end -}}
+{{- end -}}
+
 {{/* ---- Dispatcher gating ----
      The Slack dispatcher only deploys when it has both tokens; without them it
      would crash-loop the reconnect supervisor forever, so a token-less default
-     install skips the Deployment entirely (NOTES prints the connect command). */}}
+     install skips the Deployment entirely (NOTES prints the connect command).
+     A token counts as present whether it arrives as the plain value or via its
+     *ExistingSecret (issue #1759) -- a dispatcher configured entirely through
+     BYO Secrets must still deploy. */}}
 {{- define "curie.dispatcher.enabled" -}}
-{{- if and .Values.dispatcher.deploy .Values.dispatcher.slack.appToken .Values.dispatcher.slack.botToken -}}
+{{- $appTokenSet := or .Values.dispatcher.slack.appToken .Values.dispatcher.slack.appTokenExistingSecret -}}
+{{- $botTokenSet := or .Values.dispatcher.slack.botToken .Values.dispatcher.slack.botTokenExistingSecret -}}
+{{- if and .Values.dispatcher.deploy $appTokenSet $botTokenSet -}}
 true
 {{- end -}}
 {{- end -}}

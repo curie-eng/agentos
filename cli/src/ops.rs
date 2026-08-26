@@ -718,7 +718,12 @@ pub fn default_route_egress_warning(cidrs: &[String]) -> Option<String> {
 const CREDENTIAL_PREFIX_PROVIDERS: &[(&str, &str)] =
     &[("sk-ant-", "anthropic"), ("sk-or-", "openrouter")];
 
-fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
+/// Return the provider unambiguously selected by a credential prefix.
+///
+/// Callers that inspect a credential must discard it after deriving this
+/// non-secret provider name; it is safe to render the returned value but never
+/// the credential itself.
+pub fn provider_from_credential_prefix(credential: &str) -> Option<&'static str> {
     CREDENTIAL_PREFIX_PROVIDERS
         .iter()
         .find(|(prefix, _)| credential.starts_with(prefix))
@@ -1269,6 +1274,32 @@ fn preserved_value(existing: Option<&serde_json::Value>, key: &str) -> Option<St
     lookup_dotted(existing?, key).filter(|current| !current.is_empty())
 }
 
+/// Which Secret and key a direct-passthrough credential (issue #1759) should
+/// be read from, given the release's recorded Helm values: the operator's own
+/// `existingSecret` when one is configured for this key, otherwise `None` (the
+/// caller falls back to the chart's own release Secret and the published key
+/// name for this credential).
+///
+/// MUST stay the same decision as the chart's own BYO-wins precedence
+/// (`curie.secretRef.*` and the per-key if/else in
+/// `charts/curie/templates/{worker,dispatcher,api,agent-sandbox}.yaml`): a CLI
+/// read that resolves a different Secret than the workload's own env would
+/// report a plausible but wrong value, which is worse than reporting none.
+/// Pure and testable; the actual `helm get values` read stays in the async
+/// caller.
+fn resolve_existing_secret_ref(
+    existing: Option<&serde_json::Value>,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+    default_data_key: &str,
+) -> Option<(String, String)> {
+    let secret_name = lookup_dotted(existing?, existing_secret_key).filter(|s| !s.is_empty())?;
+    let data_key = lookup_dotted(existing?, existing_secret_key_key)
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| default_data_key.to_string());
+    Some((secret_name, data_key))
+}
+
 /// Re-supply the [`COMMS_MANAGED_KEYS`] a previous `cluster comms` recorded.
 ///
 /// An operator `--set` for a key always wins, and a key helm has no record of
@@ -1451,12 +1482,83 @@ pub(crate) const MODEL_CREDENTIAL_KEY: &str = "agentSandbox.runner.credentials";
 pub(crate) const FAKE_MODEL_KEY: &str = "agentSandbox.runner.fakeModel";
 
 const ALLOWED_EGRESS_KEY: &str = "security.networkPolicy.allowedEgress";
+const WORKER_EXTRA_ENV_KEY: &str = "worker.extraEnv";
 
 fn key_is_or_descends_from(key: &str, parent: &str) -> bool {
     key == parent
         || key
             .strip_prefix(parent)
             .is_some_and(|suffix| suffix.starts_with('[') || suffix.starts_with('.'))
+}
+
+fn escape_helm_set_string_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | ',' | '{' | '}') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn helm_set_string_entries(expression: &str) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_brace_list = false;
+    let mut escaped = false;
+    let mut has_equals = false;
+    let mut at_value_start = false;
+
+    for (index, ch) in expression.char_indices() {
+        if escaped {
+            escaped = false;
+            at_value_start = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '=' if !has_equals => {
+                has_equals = true;
+                at_value_start = true;
+            }
+            '{' if at_value_start => {
+                in_brace_list = true;
+                at_value_start = false;
+            }
+            '}' if in_brace_list => in_brace_list = false,
+            ',' if !in_brace_list => {
+                parts.push(&expression[start..index]);
+                start = index + ch.len_utf8();
+                has_equals = false;
+                at_value_start = false;
+            }
+            _ => at_value_start = false,
+        }
+    }
+    parts.push(&expression[start..]);
+
+    parts
+        .into_iter()
+        .filter_map(operator_set_entry)
+        .map(|(key, value)| {
+            let mut decoded = String::with_capacity(value.len());
+            let mut chars = value.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        decoded.push(next);
+                    } else {
+                        decoded.push(ch);
+                    }
+                } else {
+                    decoded.push(ch);
+                }
+            }
+            (key.trim().to_string(), decoded)
+        })
+        .collect()
 }
 
 /// Carry the runner configuration recorded by a prior real model install into
@@ -1483,6 +1585,54 @@ fn resolve_preserved_runner_identity_values(
     {
         opts.model = preserved_value(existing, RUNNER_MODEL_KEY);
     }
+}
+
+/// Carry an inferred gVisor posture into a later plain `cluster up`.
+///
+/// The RuntimeClass admission recovery writes `security.gvisor.mode=off` only
+/// on its retry. Helm records that successful retry, but a normal `up` is a
+/// full upgrade rather than `--reuse-values`; without re-supplying the recorded
+/// posture, the next run falls back to the chart's `auto` default and repeats
+/// the failed preflight. As with the other recorded-value families, an explicit
+/// operator setting owns the key and always wins.
+fn resolve_preserved_gvisor_mode_value(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    if operator_set_keys(operator_sets).contains(GVISOR_MODE_KEY) {
+        return;
+    }
+    if let Some(mode) = preserved_value(existing, GVISOR_MODE_KEY) {
+        opts.set.push(format!("{GVISOR_MODE_KEY}={mode}"));
+    }
+}
+
+/// Carry the worker environment recorded by a prior install into a plain rerun.
+/// Explicit inputs replace the recorded family.
+fn resolve_preserved_worker_extra_env_values(
+    opts: &mut UpOpts,
+    existing: Option<&serde_json::Value>,
+    operator_sets: &[String],
+) {
+    let overridden = operator_set_keys(operator_sets);
+    if overridden
+        .iter()
+        .any(|key| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+    {
+        return;
+    }
+
+    let mut recorded = BTreeMap::new();
+    if let Some(values) = existing {
+        crate::installation::flatten_values(values, "", &mut recorded);
+    }
+    opts.set_string.extend(
+        recorded
+            .into_iter()
+            .filter(|(key, _)| key_is_or_descends_from(key, WORKER_EXTRA_ENV_KEY))
+            .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(&value))),
+    );
 }
 
 fn resolve_preserved_runner_egress_values(
@@ -1572,7 +1722,8 @@ fn reindex_inferred_provider_egress(
 /// on the release but absent from `curie.yaml` is normally reset to the chart
 /// default -- except for the families [`resolve_preserved_values`],
 /// [`resolve_preserved_runner_identity_values`], and
-/// [`resolve_preserved_runner_egress_values`] re-supply, which survive untouched.
+/// [`resolve_preserved_runner_egress_values`], and
+/// [`resolve_preserved_gvisor_mode_value`] re-supply, which survive untouched.
 /// Reporting those as removals would be the exact
 /// "proposing to delete what it did not create" failure ADR-0097 named.
 ///
@@ -1592,6 +1743,7 @@ pub fn is_preserved_by_up(key: &str) -> bool {
         || GITHUB_APP_MANAGED_KEYS.contains(&key)
         || REQUIRED_SECRETS.iter().any(|(k, _)| *k == key)
         || crate::sealing::SEALING_MANAGED_KEYS.contains(&key)
+        || key == GVISOR_MODE_KEY
 }
 
 /// Substrings that mark a chart key as carrying a credential.
@@ -1633,7 +1785,12 @@ const SECRET_KEY_MARKERS: &[&str] = &[
 /// is true of a renamed key, a legacy key, and an operator's own `--set`, none
 /// of which any list can enumerate in advance.
 pub fn is_secret_value_key(key: &str) -> bool {
-    if is_preserved_by_up(key) || key == GITHUB_TOKEN_KEY || key == MODEL_CREDENTIAL_KEY {
+    // Most preserve-on-up keys are credentials, but an inferred gVisor posture
+    // is ordinary safety configuration and must remain visible in `curie diff`.
+    if (is_preserved_by_up(key) && key != GVISOR_MODE_KEY)
+        || key == GITHUB_TOKEN_KEY
+        || key == MODEL_CREDENTIAL_KEY
+    {
         return true;
     }
     let lowered = key.to_ascii_lowercase();
@@ -1992,6 +2149,62 @@ mod release_secret_name_tests {
 
 #[cfg(test)]
 mod api_key_discovery_tests {
+
+    // --- #1030: the worker Deployment lookup ---------------------------------
+
+    #[test]
+    fn the_worker_selector_does_not_guess_the_deployment_name() {
+        // The chart names it `{{ curie.fullname }}-worker`, which equals
+        // `<release>-worker` only when the release name contains the chart name.
+        // `acme-prod` renders `acme-prod-curie-worker`, and nameOverride moves it
+        // again. Selecting on labels is what `release_secret_name` already does.
+        let selector = worker_deployment_selector("acme-prod");
+        assert!(selector.contains("app.kubernetes.io/instance=acme-prod"));
+        assert!(selector.contains("app.kubernetes.io/component=worker"));
+        assert!(
+            !selector.contains("acme-prod-worker"),
+            "the selector must not encode a guessed name: {selector}"
+        );
+    }
+
+    #[test]
+    fn a_failed_lookup_is_unknown_and_never_reads_as_real_slack() {
+        // The distinction that keeps #1030 from returning in another shape. A
+        // kubectl failure is not evidence that the worker talks to real Slack, and
+        // treating it as such posts a real token wherever real Slack is while the
+        // worker edits through a proxy the CLI never saw.
+        assert_eq!(parse_slack_api_base(false, ""), SlackApiBase::Unknown);
+        assert_eq!(
+            parse_slack_api_base(false, "https://proxy.example/api"),
+            SlackApiBase::Unknown
+        );
+    }
+
+    #[test]
+    fn an_empty_successful_lookup_means_real_slack() {
+        // The chart renders SLACK_API_BASE_URL only when worker.slackApiBaseUrl is
+        // non-empty, so a clean empty result is the ordinary case, not a failure.
+        assert_eq!(parse_slack_api_base(true, ""), SlackApiBase::RealSlack);
+        assert_eq!(parse_slack_api_base(true, "  \n "), SlackApiBase::RealSlack);
+    }
+
+    #[test]
+    fn a_configured_base_is_returned_trimmed() {
+        assert_eq!(
+            parse_slack_api_base(true, "  https://proxy.example/api \n"),
+            SlackApiBase::Configured("https://proxy.example/api".to_string())
+        );
+    }
+
+    #[test]
+    fn two_containers_reporting_a_base_is_unknown_not_a_coin_flip() {
+        // Cannot happen in this chart today. If it ever does, picking one half is
+        // exactly the ambiguity this issue is about, so say so instead.
+        assert_eq!(
+            parse_slack_api_base(true, "https://a/api\nhttps://b/api\n"),
+            SlackApiBase::Unknown
+        );
+    }
     use super::*;
 
     struct EnvRestore {
@@ -2719,6 +2932,8 @@ fn complete_up_opts_without_runner_egress(
 ) -> Result<UpOpts> {
     let operator_sets = opts.operator_sets();
     resolve_preserved_runner_identity_values(&mut opts, existing, &operator_sets);
+    resolve_preserved_gvisor_mode_value(&mut opts, existing, &operator_sets);
+    resolve_preserved_worker_extra_env_values(&mut opts, existing, &operator_sets);
     if !opts.dev {
         opts.secrets = resolve_generated_secrets(existing, &operator_sets)?;
         opts.secrets.extend(resolve_managed_values_for_up(
@@ -2934,10 +3149,17 @@ impl UpValuePlan {
     }
 
     fn set_string_expression(&mut self, expression: String) {
-        let effective = operator_set_entries(std::slice::from_ref(&expression))
-            .into_iter()
-            .map(|(key, value)| (key.trim().to_string(), value.to_string()))
-            .collect();
+        let effective = if expression
+            .split_once('=')
+            .is_some_and(|(key, _)| key_is_or_descends_from(key.trim(), WORKER_EXTRA_ENV_KEY))
+        {
+            helm_set_string_entries(&expression)
+        } else {
+            operator_set_entries(std::slice::from_ref(&expression))
+                .into_iter()
+                .map(|(key, value)| (key.trim().to_string(), value.to_string()))
+                .collect()
+        };
         self.entries.push(PlannedHelmValues::Set {
             flag: HelmSetFlag::SetString,
             expression,
@@ -5931,25 +6153,114 @@ fn slack_bot_token_usage_err(msg: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
-/// Discover a Helm release's Slack bot token from the same chart Secret
-/// (`<release>-secrets`, data key `slackBotToken`). In connected mode
-/// `cluster message` posts a real placeholder to the workspace with this token so
-/// the approval card and resumed reply ride the connected transport, instead of
-/// the throwaway stub (#770/ADR-0078). Only reached when a `<release>-dispatcher`
-/// is present (a workspace IS connected), so the token is expected to be set; an
-/// empty or unreadable value is an actionable error. The value is never printed
-/// -- it flows only into the `chat.postMessage` auth header.
+/// Discover a Helm release's Slack bot token from the chart Secret
+/// (`<release>-secrets`, data key `slackBotToken`), or from the operator's own
+/// `dispatcher.slack.botTokenExistingSecret` when one is configured (#1759).
+/// In connected mode `cluster message` posts a real placeholder to the
+/// workspace with this token so the approval card and resumed reply ride the
+/// connected transport, instead of the throwaway stub (#770/ADR-0078). Only
+/// reached when a `<release>-dispatcher` is present (a workspace IS
+/// connected), so the token is expected to be set; an empty or unreadable
+/// value is an actionable error. The value is never printed -- it flows only
+/// into the `chat.postMessage` auth header.
 pub async fn discover_slack_bot_token(namespace: &str, release: &str) -> Result<String> {
-    read_release_secret(namespace, release, "slackBotToken")
-        .await
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
+    read_direct_passthrough_secret(
+        namespace,
+        release,
+        "slackBotToken",
+        "dispatcher.slack.botTokenExistingSecret",
+        "dispatcher.slack.botTokenExistingSecretKey",
+    )
+    .await
+    .filter(|token| !token.is_empty())
+    .ok_or_else(|| {
             slack_bot_token_usage_err(format!(
                 "could not read a Slack bot token from the chart Secret for release {release} in namespace \
                  {namespace}; the workspace may not be connected (run `curie cluster comms \
                  --slack`), or set CURIE_SLACK_BOT_TOKEN"
             ))
         })
+}
+
+/// What a Slack API base lookup found for a release.
+///
+/// The three outcomes are deliberately distinct because they demand different
+/// behavior, and collapsing them is how #1030 could come back wearing a different
+/// hat. "Configured nothing" is the ordinary case and means real Slack. "Could not
+/// look" is not evidence of anything and must not be read as the ordinary case,
+/// because the CLI would then post a real token wherever real Slack is while the
+/// worker edits through a proxy the CLI never saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackApiBase {
+    /// The worker renders `SLACK_API_BASE_URL` with this value.
+    Configured(String),
+    /// The worker renders no `SLACK_API_BASE_URL`, so it talks to real Slack.
+    RealSlack,
+    /// The lookup itself could not run or could not find the worker.
+    Unknown,
+}
+
+/// The label selector that finds a release's worker Deployment whatever it is named.
+///
+/// The name is `{{ include "curie.fullname" . }}-worker`, which equals
+/// `<release>-worker` only when the release name happens to contain the chart
+/// name. A release named `acme-prod` renders `acme-prod-curie-worker`, and
+/// `nameOverride`/`fullnameOverride` move it again. Guessing the name is the
+/// defect `release_secret_name` already avoids by selecting on labels, and this
+/// selects the same way for the same reason.
+fn worker_deployment_selector(release: &str) -> String {
+    format!("app.kubernetes.io/instance={release},app.kubernetes.io/component=worker")
+}
+
+/// Parse `kubectl get deployment -o jsonpath=...` output into an outcome.
+///
+/// Pure, so every branch is unit-testable without a cluster. `ok=false` is the
+/// case that must not read as "nothing configured": see [`SlackApiBase`].
+fn parse_slack_api_base(ok: bool, out: &str) -> SlackApiBase {
+    if !ok {
+        return SlackApiBase::Unknown;
+    }
+    let value = out.trim();
+    if value.is_empty() {
+        return SlackApiBase::RealSlack;
+    }
+    // The jsonpath ranges over containers, so two containers each rendering the
+    // var would concatenate. That cannot happen in this chart (the worker
+    // Deployment has one container), and if it ever does, guessing which half is
+    // the base is exactly the ambiguity this issue is about.
+    if value.lines().count() > 1 {
+        return SlackApiBase::Unknown;
+    }
+    SlackApiBase::Configured(value.to_string())
+}
+
+/// The Slack API base the release's own worker is configured with.
+///
+/// Read from the SAME release the bot token is read from (#1030). The base used to
+/// come from `SLACK_API_BASE_URL` in the CLI's own process environment while the
+/// token came from the release Secret, so a developer with a stub URL exported
+/// from earlier testing sent a production workspace token to their local stub.
+/// The two halves now share one source.
+pub async fn discover_slack_api_base_url(namespace: &str, release: &str) -> SlackApiBase {
+    let cmd = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain("-l"),
+            plain(worker_deployment_selector(release)),
+            plain("-o"),
+            plain(
+                "jsonpath={range .items[*].spec.template.spec.containers[*]}                 {.env[?(@.name=='SLACK_API_BASE_URL')].value}{\"\\n\"}{end}",
+            ),
+        ],
+    );
+    match run_capture(&cmd).await {
+        Ok((ok, out, _)) => parse_slack_api_base(ok, &out),
+        Err(_) => SlackApiBase::Unknown,
+    }
 }
 
 /// Whether a `<release>-dispatcher` Deployment exists in `namespace` -- i.e. a
@@ -6066,7 +6377,9 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 }
 
 /// The release's sealing keys (ADR-0094): current first, then the previous one
-/// if a rotation is in progress.
+/// if a rotation is in progress. Follows the operator's own
+/// `sealing.{privateKey,previousPrivateKey}ExistingSecret` when configured
+/// (#1759), otherwise the chart's own Secret.
 ///
 /// Returns whatever is present. An empty vector means this release has no
 /// sealing key, which the caller must report rather than work around -- sealing
@@ -6074,8 +6387,27 @@ pub async fn release_secret_name_or_default(namespace: &str, release: &str) -> S
 /// that starts and then fails every call.
 pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
     let mut keys = Vec::new();
-    for data_key in ["sealingPrivateKey", "sealingPreviousPrivateKey"] {
-        if let Some(value) = read_release_secret(namespace, release, data_key).await {
+    for (default_data_key, existing_secret_key, existing_secret_key_key) in [
+        (
+            "sealingPrivateKey",
+            "sealing.privateKeyExistingSecret",
+            "sealing.privateKeyExistingSecretKey",
+        ),
+        (
+            "sealingPreviousPrivateKey",
+            "sealing.previousPrivateKeyExistingSecret",
+            "sealing.previousPrivateKeyExistingSecretKey",
+        ),
+    ] {
+        if let Some(value) = read_direct_passthrough_secret(
+            namespace,
+            release,
+            default_data_key,
+            existing_secret_key,
+            existing_secret_key_key,
+        )
+        .await
+        {
             if !value.trim().is_empty() {
                 keys.push(value);
             }
@@ -6090,6 +6422,15 @@ pub async fn read_sealing_keys(namespace: &str, release: &str) -> Vec<String> {
 /// that into an actionable error naming its own escape-hatch flag.
 async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> Option<String> {
     let secret = release_secret_name(namespace, release).await?;
+    read_secret_key(namespace, &secret, data_key).await
+}
+
+/// Read one data key out of a NAMED Secret -- not necessarily the release's own
+/// chart Secret, since a direct-passthrough credential's `existingSecret` names
+/// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
+/// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
+/// when the Secret, the key, or the cluster is unreachable.
+async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![
@@ -6097,7 +6438,7 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
             plain(namespace),
             plain("get"),
             plain("secret"),
-            plain(secret),
+            plain(secret_name),
             plain("-o"),
             plain(format!(
                 "go-template={{{{ index .data \"{data_key}\" | base64decode }}}}"
@@ -6107,6 +6448,39 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
     match run_capture(&cmd).await {
         Ok((true, out, _)) if !out.trim().is_empty() => Some(out.trim().to_string()),
         _ => None,
+    }
+}
+
+/// Read a direct-passthrough credential (issue #1759), following the operator's
+/// own `existingSecret` when one is configured for this key and otherwise
+/// falling back to the chart's own Secret and its published key name -- the
+/// same BYO-wins precedence the chart templates themselves use.
+///
+/// Without this, a CLI verb that reads the credential straight from the
+/// chart's own Secret (as every one of these did before the BYO escape
+/// existed) silently reads nothing for anyone who adopts it, even though the
+/// deployed workload resolves correctly from the operator's Secret.
+async fn read_direct_passthrough_secret(
+    namespace: &str,
+    release: &str,
+    default_data_key: &str,
+    existing_secret_key: &str,
+    existing_secret_key_key: &str,
+) -> Option<String> {
+    let common = CommonOpts {
+        namespace: namespace.to_string(),
+        release: release.to_string(),
+        dry_run: false,
+    };
+    let existing = fetch_existing_values(&common).await.ok().flatten();
+    match resolve_existing_secret_ref(
+        existing.as_ref(),
+        existing_secret_key,
+        existing_secret_key_key,
+        default_data_key,
+    ) {
+        Some((secret_name, data_key)) => read_secret_key(namespace, &secret_name, &data_key).await,
+        None => read_release_secret(namespace, release, default_data_key).await,
     }
 }
 
@@ -6224,6 +6598,12 @@ enum ServiceUrlKind {
 }
 
 impl ServiceUrl {
+    /// Build the shared port-forward text after the caller chooses whether the
+    /// URL target is plain (JSON) or styled (human output).
+    fn port_forward_hint(&self, local: u16, port: u16, target: &str) -> String {
+        port_forward_hint_with(&self.namespace, &self.name, local, port, target)
+    }
+
     fn to_json(&self) -> serde_json::Value {
         let (url, note): (Option<String>, Option<String>) = match &self.kind {
             ServiceUrlKind::NodePortUrl(url) => (Some(url.clone()), None),
@@ -6239,9 +6619,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 (
                     None,
-                    Some(port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    Some(self.port_forward_hint(
                         *local,
                         *port,
                         &format!("http://localhost:{local}{suffix_path}"),
@@ -6272,9 +6650,7 @@ impl ServiceUrl {
                 let suffix_path = api_suffix_path(self.api);
                 ui.kv(
                     &self.label,
-                    &port_forward_hint_with(
-                        &self.namespace,
-                        &self.name,
+                    &self.port_forward_hint(
                         *local,
                         *port,
                         &ui.url(&format!("http://localhost:{local}{suffix_path}")),
@@ -6360,7 +6736,8 @@ pub enum ServiceEndpoint {
     /// Type NodePort but no nodePort assigned yet.
     UnassignedNodePort,
     /// ClusterIP/other: reachable only via a port-forward.
-    /// `local = if port == 0 { 8080 } else { port }`.
+    /// `local` is non-privileged: service ports below 1024 are offset by
+    /// 18000, while an absent service port falls back to 8080.
     PortForwardHint { local: u16, port: u16 },
     /// `parse_service` returned None (malformed/unreadable JSON).
     Unreadable,
@@ -6386,7 +6763,11 @@ fn resolve_service_endpoint(svc_json: &str, host: &str, api: bool) -> ServiceEnd
             None => ServiceEndpoint::UnassignedNodePort,
         },
         Some((_, _, port)) => ServiceEndpoint::PortForwardHint {
-            local: if port == 0 { 8080 } else { port },
+            local: match port {
+                0 => 8080,
+                1..=1023 => port + 18000,
+                _ => port,
+            },
             port,
         },
         None => ServiceEndpoint::Unreadable,
@@ -6672,6 +7053,169 @@ mod tests {
             line,
             "helm upgrade --install curie charts/curie -n curie --create-namespace \
              --set ui.service.type=NodePort --set langfuse.web.service.type=NodePort"
+        );
+    }
+
+    #[test]
+    fn plain_up_re_supplies_recorded_worker_extra_env_without_reuse_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [
+                    {
+                        "name": "PROVIDER_BASE_URL",
+                        "value": "https://provider.example.com/v1"
+                    },
+                    {
+                        "name": "FALLBACK_BASE_URL",
+                        "value": "https://fallback.example.com/v1"
+                    }
+                ]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: false,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        for assignment in [
+            "worker.extraEnv[0].name=PROVIDER_BASE_URL",
+            "worker.extraEnv[0].value=https://provider.example.com/v1",
+            "worker.extraEnv[1].name=FALLBACK_BASE_URL",
+            "worker.extraEnv[1].value=https://fallback.example.com/v1",
+        ] {
+            assert!(
+                argv.contains(&format!("--set-string {assignment}")),
+                "plain up dropped recorded worker extraEnv leaf {assignment}: {argv}"
+            );
+        }
+        assert!(
+            !argv.contains("--reuse-values"),
+            "up must remain a full Helm upgrade: {argv}"
+        );
+    }
+
+    #[test]
+    fn explicit_worker_extra_env_leaves_override_the_recorded_family() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "RECORDED_PROVIDER_BASE_URL",
+                    "value": "https://recorded.example.com/v1"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![
+                    "worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL".into(),
+                    "worker.extraEnv[0].value=https://operator.example.com/v1".into(),
+                ],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv().join(" ");
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].name=OPERATOR_PROVIDER_BASE_URL"),
+            "the explicit worker extraEnv name must reach Helm: {argv}"
+        );
+        assert!(
+            argv.contains("--set-string worker.extraEnv[0].value=https://operator.example.com/v1"),
+            "the explicit worker extraEnv value must reach Helm: {argv}"
+        );
+        assert!(
+            !argv.contains("RECORDED_PROVIDER_BASE_URL")
+                && !argv.contains("https://recorded.example.com/v1"),
+            "explicit worker extraEnv input must suppress the recorded family: {argv}"
+        );
+    }
+
+    #[test]
+    fn plain_up_escapes_commas_in_recorded_worker_extra_env_values() {
+        let existing = serde_json::json!({
+            "worker": {
+                "extraEnv": [{
+                    "name": "NO_PROXY",
+                    "value": "10.0.0.0/8,localhost"
+                }]
+            }
+        });
+        let opts = complete_up_opts_without_runner_egress(
+            UpOpts {
+                common: common(),
+                github_token: GithubTokenPlan::Untouched,
+                allow_egress_host: vec![],
+                resolved_egress_cidrs: vec![],
+                chart: "charts/curie".into(),
+                secrets: vec![],
+                dev: false,
+                no_expose: true,
+                set: vec![],
+                set_string: vec![],
+                allow_web_egress: vec![],
+                fake_model: false,
+                credentials: None,
+                local_model: None,
+                model: None,
+            },
+            Some(&existing),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            up_value_plan(&opts)
+                .effective_values()
+                .get("worker.extraEnv[0].value"),
+            Some(&"10.0.0.0/8,localhost".to_string()),
+            "the escaped Helm expression must retain the recorded semantic value"
+        );
+
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        assert!(
+            argv.contains(&"worker.extraEnv[0].value=10.0.0.0/8\\,localhost".into()),
+            "recorded worker extraEnv values must escape commas for Helm: {argv:?}"
         );
     }
 
@@ -8434,6 +8978,77 @@ mod tests {
     }
 
     #[test]
+    fn resolve_existing_secret_ref_prefers_operator_secret_and_custom_key() {
+        // #1759 follow-up: a release with a BYO existingSecret configured must
+        // resolve to that Secret and its (possibly overridden) key name, not
+        // the chart's own Secret -- this is the read-path half of the bug
+        // `curie seal`/`curie cluster message` hit before this fix, where they
+        // read straight from the chart's own Secret and never checked for a
+        // BYO override.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"sealing":{"privateKeyExistingSecret":"my-sealing-secret","privateKeyExistingSecretKey":"customKey"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            Some(("my-sealing-secret".to_string(), "customKey".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_defaults_key_when_key_field_absent() {
+        // The chart's own default for *ExistingSecretKey is the published key
+        // name (e.g. `botTokenExistingSecretKey: slackBotToken`), so a release
+        // that set only the Secret name and left the key at its default must
+        // still resolve to the published key, not an empty/missing key.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"dispatcher":{"slack":{"botTokenExistingSecret":"my-slack-secret"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "dispatcher.slack.botTokenExistingSecret",
+                "dispatcher.slack.botTokenExistingSecretKey",
+                "slackBotToken"
+            ),
+            Some(("my-slack-secret".to_string(), "slackBotToken".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_existing_secret_ref_none_when_not_configured() {
+        // Negative control: no release at all, and a release that only set the
+        // plain value (no BYO escape) -- both must fall through to None so the
+        // caller reads the chart's own Secret, exactly as it did before #1759.
+        assert_eq!(
+            resolve_existing_secret_ref(
+                None,
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sealing":{"privateKey":"plain-value"}}"#).unwrap();
+        assert_eq!(
+            resolve_existing_secret_ref(
+                Some(&v),
+                "sealing.privateKeyExistingSecret",
+                "sealing.privateKeyExistingSecretKey",
+                "sealingPrivateKey"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn fresh_install_generates_every_required_secret() {
         // No existing release -> a strong random for each required key.
         let secrets = resolve_generated_secrets(None, &[]).unwrap();
@@ -8965,16 +9580,40 @@ mod tests {
 
     #[test]
     fn resolve_service_endpoint_clusterip_yields_a_port_forward_hint() {
-        // ClusterIP: not node-exposed, so the caller must port-forward. The local
-        // port mirrors the service port.
-        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
-        assert_eq!(
-            resolve_service_endpoint(clusterip, "10.0.0.5", true),
-            ServiceEndpoint::PortForwardHint {
-                local: 80,
-                port: 80
-            }
+        // ClusterIP: not node-exposed, so the caller must port-forward. Each
+        // privileged service port maps to a deterministic non-privileged local port.
+        let http_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let http_endpoint = resolve_service_endpoint(http_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: http_local,
+            port: http_port,
+        } = http_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(http_local, 18080);
+        assert_eq!(http_port, 80);
+        assert!(
+            http_local >= 1024,
+            "the local port must be bindable by a non-root user"
         );
+
+        let https_clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":443}]}}"#;
+        let https_endpoint = resolve_service_endpoint(https_clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint {
+            local: https_local,
+            port: https_port,
+        } = https_endpoint
+        else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        assert_eq!(https_local, 18443);
+        assert_eq!(https_port, 443);
+        assert!(
+            https_local >= 1024,
+            "the local port must be bindable by a non-root user"
+        );
+
         // An absent port parses as 0, which falls back to local port 8080.
         let no_port = r#"{"spec":{"type":"ClusterIP","ports":[{}]}}"#;
         assert_eq!(
@@ -9015,13 +9654,75 @@ mod tests {
         // The exact hint `cluster status` prints today for a ClusterIP service
         // (PR#34 visual-parity guard): two spaces before `then`.
         assert_eq!(
-            port_forward_hint("curie", "curie-ui", 80, 80, "/?api=1"),
-            "kubectl -n curie port-forward svc/curie-ui 80:80  then http://localhost:80/?api=1"
+            port_forward_hint("curie", "curie-ui", 18080, 80, "/?api=1"),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
         // The 0-port fallback surfaces local 8080 while still forwarding to 0.
         assert_eq!(
             port_forward_hint("curie", "curie-langfuse-web", 8080, 0, ""),
             "kubectl -n curie port-forward svc/curie-langfuse-web 8080:0  then http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn service_url_json_uses_the_privileged_port_forward_hint() {
+        let clusterip = r#"{"spec":{"type":"ClusterIP","ports":[{"port":80}]}}"#;
+        let endpoint = resolve_service_endpoint(clusterip, "10.0.0.5", true);
+        let ServiceEndpoint::PortForwardHint { local, port } = endpoint else {
+            panic!("ClusterIP services must yield a port-forward hint");
+        };
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward { local, port },
+        };
+
+        assert_eq!(
+            service_url.to_json(),
+            serde_json::json!({
+                "name": "UI",
+                "url": null,
+                "note": "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1",
+            })
+        );
+    }
+
+    #[test]
+    fn service_url_port_forward_hint_preserves_a_human_identity_target() {
+        let service_url = ServiceUrl {
+            label: "UI".to_string(),
+            name: "curie-ui".to_string(),
+            namespace: "curie".to_string(),
+            api: true,
+            kind: ServiceUrlKind::PortForward {
+                local: 18080,
+                port: 80,
+            },
+        };
+        let ui = crate::ui::Ui::resolve(
+            crate::ui::ColorFlag::Never,
+            false,
+            false,
+            false,
+            &crate::ui::UiEnv {
+                no_color: false,
+                clicolor_zero: false,
+                clicolor_force: false,
+                term_dumb: false,
+                ci: false,
+                stderr_tty: true,
+                stdout_tty: true,
+                utf8: true,
+                truecolor: false,
+            },
+        );
+        let target = ui.url("http://localhost:18080/?api=1");
+        assert_eq!(target, "http://localhost:18080/?api=1");
+        assert_eq!(
+            service_url.port_forward_hint(18080, 80, &target),
+            "kubectl -n curie port-forward svc/curie-ui 18080:80  then http://localhost:18080/?api=1"
         );
     }
 

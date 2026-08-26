@@ -404,6 +404,583 @@ fn advertised_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/api/")
 }
 
+/// Temporary worker widening for the no-Slack cluster-message stub (#1812).
+///
+/// The worker intentionally refuses per-turn Slack endpoints whose origin was
+/// not operator-trusted (ADR-0096). A default chart install has no extra trusted
+/// origins, so the CLI must trust the host it advertises before enqueueing. The
+/// guard restores the exact prior environment state on every unwinding return;
+/// callers that use the module's non-unwinding exit helper restore it
+/// asynchronously first and then move the guard into that helper as a fallback.
+const TRUST_ENV: &str = "CURIE_SLACK_TRUSTED_ORIGINS";
+const TRUST_HOLDER_ANNOTATION: &str = "curie.dev/cluster-message-trust-holder";
+const TRUST_HOLDER_JSON_PATH: &str =
+    "/metadata/annotations/curie.dev~1cluster-message-trust-holder";
+
+#[derive(Clone)]
+enum TrustMutationMode {
+    /// Real Kubernetes objects always expose a resourceVersion. The holder
+    /// annotation and env mutation are one JSON Patch guarded by that version.
+    Cas { holder: String, temporary: String },
+    /// Test doubles that are not Kubernetes objects may omit resourceVersion.
+    /// Keep the legacy command shape for those fixtures only.
+    Legacy,
+}
+
+#[derive(Clone)]
+struct TrustCleanupSpec {
+    namespace: String,
+    deployment: String,
+    origin: String,
+    original: Option<String>,
+    mode: TrustMutationMode,
+}
+
+struct ClusterStubTrust {
+    cleanup: TrustCleanupSpec,
+    armed: bool,
+}
+
+#[derive(Clone)]
+struct WorkerTrustView {
+    resource_version: Option<String>,
+    annotations_present: bool,
+    holder: Option<String>,
+    worker_index: usize,
+    env_present: bool,
+    env: Vec<serde_json::Value>,
+    trust: Option<String>,
+}
+
+#[cfg(unix)]
+static CLUSTER_TRUST_SIGNAL_STATE: std::sync::LazyLock<std::sync::Mutex<Option<TrustCleanupSpec>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(unix)]
+static CLUSTER_TRUST_SIGNAL_HANDLER: std::sync::OnceLock<std::result::Result<(), String>> =
+    std::sync::OnceLock::new();
+
+/// Probe the connected transport without collapsing a kubectl/RBAC failure into
+/// "dispatcher absent". Trust may only be widened after absence is positively
+/// observed; an indeterminate probe therefore refuses before any mutation.
+async fn dispatcher_connected_strict(namespace: &str, release: &str) -> Result<bool> {
+    let command = OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain(format!("{release}-dispatcher")),
+            plain("--ignore-not-found"),
+            plain("-o"),
+            plain("name"),
+        ],
+    );
+    let (ok, out, err) = run_capture(&command).await?;
+    if !ok {
+        bail!(
+            "could not prove that Slack is disconnected for release {release} in namespace \
+             {namespace}; refusing to widen worker Slack trust: {}",
+            err.trim().lines().next().unwrap_or("kubectl probe failed")
+        );
+    }
+    Ok(!out.trim().is_empty())
+}
+
+impl ClusterStubTrust {
+    async fn install(namespace: &str, release: &str, advertise_host: &str) -> Result<Self> {
+        let deployment = format!("{release}-worker");
+        let view = read_worker_trust(namespace, &deployment).await?;
+        let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
+            format!("[{advertise_host}]")
+        } else {
+            advertise_host.to_string()
+        };
+        let origin = format!("http://{host}");
+        if let Some(holder) = view.holder.as_deref() {
+            bail!(
+                "another cluster message command ({holder}) is temporarily managing worker Slack \
+                 trust for release {release}; retry after it exits"
+            );
+        }
+        if view
+            .trust
+            .as_deref()
+            .is_some_and(|value| value.split(',').any(|entry| entry.trim() == origin))
+        {
+            return Ok(Self {
+                cleanup: TrustCleanupSpec {
+                    namespace: namespace.to_string(),
+                    deployment,
+                    origin,
+                    original: view.trust,
+                    mode: TrustMutationMode::Legacy,
+                },
+                armed: false,
+            });
+        }
+        let original = view.trust.clone();
+        let temporary = match original.as_deref().filter(|value| !value.is_empty()) {
+            Some(value) => format!("{value},{origin}"),
+            None => origin.clone(),
+        };
+        let (mode, apply) = match view.resource_version.as_deref() {
+            Some(_) => {
+                let holder = uuid::Uuid::new_v4().to_string();
+                let patch = trust_patch(&view, Some(&temporary), Some(&holder), false)?;
+                (
+                    TrustMutationMode::Cas {
+                        holder,
+                        temporary: temporary.clone(),
+                    },
+                    worker_patch_command(namespace, &deployment, patch),
+                )
+            }
+            None => (
+                TrustMutationMode::Legacy,
+                worker_set_env_command(namespace, &deployment, Some(&temporary)),
+            ),
+        };
+        let cleanup = TrustCleanupSpec {
+            namespace: namespace.to_string(),
+            deployment,
+            origin: origin.clone(),
+            original,
+            mode,
+        };
+        register_cluster_trust_signal_cleanup(cleanup.clone())?;
+        // Arm before invoking kubectl: even an unusual nonzero result after the
+        // API accepted the mutation must run restoration.
+        let guard = Self {
+            cleanup,
+            armed: true,
+        };
+        let (ok, _, err) = run_capture(&apply).await?;
+        if !ok {
+            bail!(
+                "temporarily trusting cluster-message stub origin {origin}: {}",
+                err.trim()
+            );
+        }
+
+        let rollout = guard.rollout_command();
+        let (ok, _, err) = run_capture(&rollout).await?;
+        if !ok {
+            bail!(
+                "waiting for the worker to trust cluster-message stub origin {origin}: {}",
+                err.trim()
+            );
+        }
+        Ok(guard)
+    }
+
+    async fn restore(&mut self) -> Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        restore_cluster_trust(&self.cleanup).await?;
+        let (ok, _, err) = run_capture(&self.rollout_command()).await?;
+        if !ok {
+            bail!(
+                "waiting for the worker to restore its prior Slack trust: {}",
+                err.trim()
+            );
+        }
+        self.armed = false;
+        clear_cluster_trust_signal_cleanup(&self.cleanup);
+        Ok(())
+    }
+
+    fn rollout_command(&self) -> OpsCommand {
+        OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("-n"),
+                plain(&self.cleanup.namespace),
+                plain("rollout"),
+                plain("status"),
+                plain(format!("deployment/{}", self.cleanup.deployment)),
+                plain("--timeout=120s"),
+            ],
+        )
+    }
+}
+
+impl Drop for ClusterStubTrust {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if restore_cluster_trust_sync(&self.cleanup).is_err() {
+            crate::ui::ui().warn("could not restore the worker's prior Slack trust");
+            return;
+        }
+        let rollout = self.rollout_command();
+        let rollout = std::process::Command::new(&rollout.program)
+            .args(rollout.argv())
+            .output();
+        if !matches!(rollout, Ok(output) if output.status.success()) {
+            crate::ui::ui().warn("worker did not finish restoring its prior Slack trust posture");
+        }
+        clear_cluster_trust_signal_cleanup(&self.cleanup);
+    }
+}
+
+fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
+    let deployment: serde_json::Value = serde_json::from_str(deployment_json)
+        .context("parsing the worker Deployment while snapshotting Slack trust")?;
+    let containers = deployment
+        .pointer("/spec/template/spec/containers")
+        .and_then(serde_json::Value::as_array)
+        .context("worker Deployment has no pod containers")?;
+    let (worker_index, worker) = containers
+        .iter()
+        .enumerate()
+        .find(|(_, container)| {
+            container.get("name").and_then(serde_json::Value::as_str) == Some("worker")
+        })
+        .context("worker Deployment has no container named worker")?;
+    let env_present = worker.get("env").is_some();
+    let env = worker
+        .get("env")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let trust_entry = env
+        .iter()
+        .find(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
+    let trust = match trust_entry {
+        Some(entry) => Some(
+            entry
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .context("CURIE_SLACK_TRUSTED_ORIGINS is not a literal environment value")?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let annotations = deployment.pointer("/metadata/annotations");
+    Ok(WorkerTrustView {
+        resource_version: deployment
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        annotations_present: annotations.is_some_and(serde_json::Value::is_object),
+        holder: annotations
+            .and_then(|value| value.get(TRUST_HOLDER_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        worker_index,
+        env_present,
+        env,
+        trust,
+    })
+}
+
+fn worker_get_command(namespace: &str, deployment: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("deployment"),
+            plain(deployment),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+async fn read_worker_trust(namespace: &str, deployment: &str) -> Result<WorkerTrustView> {
+    let (ok, out, err) = run_capture(&worker_get_command(namespace, deployment)).await?;
+    if !ok {
+        bail!("reading worker Deployment {deployment}: {}", err.trim());
+    }
+    worker_trust_view(&out)
+}
+
+fn env_with_trust(view: &WorkerTrustView, target: Option<&str>) -> Vec<serde_json::Value> {
+    let mut env = view.env.clone();
+    let position = env
+        .iter()
+        .position(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(TRUST_ENV));
+    match (position, target) {
+        (Some(index), Some(value)) => {
+            env[index] = serde_json::json!({"name": TRUST_ENV, "value": value});
+        }
+        (Some(index), None) => {
+            env.remove(index);
+        }
+        (None, Some(value)) => {
+            env.push(serde_json::json!({"name": TRUST_ENV, "value": value}));
+        }
+        (None, None) => {}
+    }
+    env
+}
+
+fn trust_patch(
+    view: &WorkerTrustView,
+    target: Option<&str>,
+    acquire_holder: Option<&str>,
+    release_holder: bool,
+) -> Result<String> {
+    let resource_version = view
+        .resource_version
+        .as_deref()
+        .context("worker Deployment omitted metadata.resourceVersion")?;
+    let mut operations = vec![serde_json::json!({
+        "op": "test",
+        "path": "/metadata/resourceVersion",
+        "value": resource_version,
+    })];
+    if let Some(holder) = acquire_holder {
+        if !view.annotations_present {
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": "/metadata/annotations",
+                "value": {},
+            }));
+        }
+        operations.push(serde_json::json!({
+            "op": "add",
+            "path": TRUST_HOLDER_JSON_PATH,
+            "value": holder,
+        }));
+    }
+    let env_path = format!("/spec/template/spec/containers/{}/env", view.worker_index);
+    operations.push(serde_json::json!({
+        "op": if view.env_present { "replace" } else { "add" },
+        "path": env_path,
+        "value": env_with_trust(view, target),
+    }));
+    if release_holder {
+        operations.push(serde_json::json!({
+            "op": "remove",
+            "path": TRUST_HOLDER_JSON_PATH,
+        }));
+    }
+    serde_json::to_string(&operations).context("serializing worker trust JSON Patch")
+}
+
+fn worker_patch_command(namespace: &str, deployment: &str, patch: String) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("patch"),
+            plain("deployment"),
+            plain(deployment),
+            plain("--type=json"),
+            plain("-p"),
+            plain(patch),
+        ],
+    )
+}
+
+fn worker_set_env_command(namespace: &str, deployment: &str, target: Option<&str>) -> OpsCommand {
+    let assignment = target
+        .map(|value| format!("{TRUST_ENV}={value}"))
+        .unwrap_or_else(|| format!("{TRUST_ENV}-"));
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("set"),
+            plain("env"),
+            plain(format!("deployment/{deployment}")),
+            plain(assignment),
+        ],
+    )
+}
+
+fn cleanup_target(current: Option<&str>, cleanup: &TrustCleanupSpec) -> Option<String> {
+    let TrustMutationMode::Cas { temporary, .. } = &cleanup.mode else {
+        return cleanup.original.clone();
+    };
+    if current == Some(temporary.as_str()) {
+        return cleanup.original.clone();
+    }
+    current.map(|value| {
+        value
+            .split(',')
+            .filter(|entry| entry.trim() != cleanup.origin)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
+
+async fn restore_cluster_trust(cleanup: &TrustCleanupSpec) -> Result<()> {
+    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
+        let (ok, _, err) = run_capture(&worker_set_env_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            cleanup.original.as_deref(),
+        ))
+        .await?;
+        if !ok {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+        return Ok(());
+    }
+    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
+        unreachable!()
+    };
+    for _ in 0..5 {
+        let view = read_worker_trust(&cleanup.namespace, &cleanup.deployment).await?;
+        if view.holder.as_deref() != Some(holder) {
+            if view.holder.is_none()
+                && !view.trust.as_deref().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|entry| entry.trim() == cleanup.origin.as_str())
+                })
+            {
+                return Ok(());
+            }
+            bail!("temporary worker trust ownership changed; refusing a stale restoration");
+        }
+        let target = cleanup_target(view.trust.as_deref(), cleanup);
+        let patch = trust_patch(&view, target.as_deref(), None, true)?;
+        let (ok, _, err) = run_capture(&worker_patch_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            patch,
+        ))
+        .await?;
+        if ok {
+            return Ok(());
+        }
+        let lower = err.to_lowercase();
+        if !(lower.contains("conflict")
+            || lower.contains("test failed")
+            || lower.contains("object has been modified"))
+        {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+    }
+    bail!("worker Deployment kept changing while restoring temporary Slack trust")
+}
+
+fn run_sync_capture(command: &OpsCommand) -> Result<(bool, String, String)> {
+    let output = std::process::Command::new(&command.program)
+        .args(command.argv())
+        .output()
+        .with_context(|| format!("invoking {} during signal cleanup", command.program))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn restore_cluster_trust_sync(cleanup: &TrustCleanupSpec) -> Result<()> {
+    if matches!(&cleanup.mode, TrustMutationMode::Legacy) {
+        let (ok, _, err) = run_sync_capture(&worker_set_env_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            cleanup.original.as_deref(),
+        ))?;
+        if !ok {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+        return Ok(());
+    }
+    let TrustMutationMode::Cas { holder, .. } = &cleanup.mode else {
+        unreachable!()
+    };
+    for _ in 0..5 {
+        let (ok, out, err) =
+            run_sync_capture(&worker_get_command(&cleanup.namespace, &cleanup.deployment))?;
+        if !ok {
+            bail!("reading worker during signal cleanup: {}", err.trim());
+        }
+        let view = worker_trust_view(&out)?;
+        if view.holder.as_deref() != Some(holder) {
+            return Ok(());
+        }
+        let target = cleanup_target(view.trust.as_deref(), cleanup);
+        let patch = trust_patch(&view, target.as_deref(), None, true)?;
+        let (ok, _, err) = run_sync_capture(&worker_patch_command(
+            &cleanup.namespace,
+            &cleanup.deployment,
+            patch,
+        ))?;
+        if ok {
+            return Ok(());
+        }
+        let lower = err.to_lowercase();
+        if !(lower.contains("conflict")
+            || lower.contains("test failed")
+            || lower.contains("object has been modified"))
+        {
+            bail!("restoring worker Slack trust: {}", err.trim());
+        }
+    }
+    bail!("worker Deployment kept changing during signal cleanup")
+}
+
+#[cfg(unix)]
+fn register_cluster_trust_signal_cleanup(cleanup: TrustCleanupSpec) -> Result<()> {
+    match CLUSTER_TRUST_SIGNAL_HANDLER.get_or_init(|| {
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::signal::SIGINT,
+            signal_hook::consts::signal::SIGTERM,
+        ])
+        .map_err(|error| error.to_string())?;
+        std::thread::Builder::new()
+            .name("curie-cluster-trust-cleanup".to_string())
+            .spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    let cleanup = CLUSTER_TRUST_SIGNAL_STATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if let Some(cleanup) = cleanup {
+                        let _ = restore_cluster_trust_sync(&cleanup);
+                    }
+                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                    signal_hook::low_level::exit(128 + signal);
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }) {
+        Ok(()) => {
+            *CLUSTER_TRUST_SIGNAL_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(cleanup);
+            Ok(())
+        }
+        Err(error) => bail!("installing cluster trust signal cleanup: {error}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn register_cluster_trust_signal_cleanup(_cleanup: TrustCleanupSpec) -> Result<()> {
+    Ok(())
+}
+
+fn clear_cluster_trust_signal_cleanup(cleanup: &TrustCleanupSpec) {
+    #[cfg(unix)]
+    {
+        let mut current = CLUSTER_TRUST_SIGNAL_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_ref().is_some_and(|registered| {
+            registered.deployment == cleanup.deployment && registered.namespace == cleanup.namespace
+        }) {
+            *current = None;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = cleanup;
+}
+
 /// Local mode: the Valkey URL the CLI enqueues onto -- the compose Valkey on its
 /// published host port, authenticated with the same password the compose worker
 /// uses. Pure so the construction is unit-tested without a live Valkey.
@@ -1026,7 +1603,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
     // sentinel), post a real placeholder and enqueue against its ts with no
     // per-turn endpoint so the reply and any approval card ride that transport.
     // Resolving the channel first keeps the behavior identical to the stub path.
-    if let Some(bot_token) = local_connected_bot_token().await {
+    if let Some(transport) = local_connected_transport().await {
         let channel = match opts.channel.as_deref() {
             Some(channel) => channel.to_string(),
             None => {
@@ -1045,7 +1622,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
             &mut conn,
             TurnVerb::Local,
             &channel,
-            &bot_token,
+            &transport,
         )
         .await;
     }
@@ -1540,8 +2117,15 @@ type WorkerTransport = (Option<String>, Option<String>);
 /// authoring bot `chat.update` a message, so two different tokens would leave the
 /// placeholder stuck at "..." with `cant_update_message` (#957 mode B).
 ///
+/// Returning the base ALONGSIDE the token is what closes #1030 at this tier. Both
+/// values were already read out of the same container here; only the token was
+/// kept, and the base was then re-read from the CLI's own process environment at
+/// post time. Carrying the pair means the placeholder goes exactly where the
+/// worker that will edit it is pointed, and a stale `SLACK_API_BASE_URL` in the
+/// operator's shell has nothing left to decide.
+///
 /// Pure, so both conditions are unit-testable without Docker.
-fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
+fn connected_worker_transport(transport: WorkerTransport) -> Option<crate::slack::SlackTransport> {
     let (api_base, token) = transport;
     let api_base = api_base.unwrap_or_default();
     // Wired to the stub (or to nothing resolvable) means not connected.
@@ -1549,7 +2133,8 @@ fn connected_worker_bot_token(transport: WorkerTransport) -> Option<String> {
         return None;
     }
     let token = token?.trim().to_string();
-    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN).then_some(token)
+    (!token.is_empty() && token != LOCAL_STUB_BOT_TOKEN)
+        .then(|| crate::slack::SlackTransport::new(Some(api_base), token))
 }
 
 /// Read the running compose worker's Slack transport out of the container.
@@ -1577,9 +2162,9 @@ async fn running_worker_transport() -> WorkerTransport {
     (find("SLACK_API_BASE_URL="), find("SLACK_BOT_TOKEN="))
 }
 
-/// Process-level wrapper: the token to post with, or `None` for the stub path.
-async fn local_connected_bot_token() -> Option<String> {
-    connected_worker_bot_token(running_worker_transport().await)
+/// Process-level wrapper: the transport to post over, or `None` for the stub path.
+async fn local_connected_transport() -> Option<crate::slack::SlackTransport> {
+    connected_worker_transport(running_worker_transport().await)
 }
 
 /// The human dry-run line noting that a connected workspace changes the plan
@@ -1613,7 +2198,7 @@ pub async fn enqueue_over_connected_transport(
     conn: &mut MultiplexedConnection,
     verb: TurnVerb,
     channel: &str,
-    bot_token: &str,
+    transport: &crate::slack::SlackTransport,
 ) -> Result<()> {
     let ui = crate::ui::ui();
     // An empty `--thread` is normalized away at the [`message`] entry point, and
@@ -1624,7 +2209,7 @@ pub async fn enqueue_over_connected_transport(
     let explicit_thread = opts.thread.as_deref().filter(|ts| !ts.is_empty());
 
     let placeholder_ts =
-        crate::slack::post_placeholder(bot_token, channel, "\u{2026}", explicit_thread)
+        crate::slack::post_placeholder(transport, channel, "\u{2026}", explicit_thread)
             .await
             .with_context(|| {
                 let mut context =
@@ -1780,13 +2365,46 @@ async fn message_connected(opts: MessageOpts) -> Result<()> {
         }
         None => crate::ops::discover_slack_bot_token(&opts.namespace, &opts.release).await?,
     };
+    // The base comes from the same release as the token (#1030), never from the
+    // CLI's own environment. A `CURIE_SLACK_BOT_TOKEN` override changes only the
+    // identity, not the destination: an operator working around a stale Secret is
+    // still posting into this release's workspace, and letting the override drag
+    // the URL along would restore exactly the split this issue is about.
+    let transport = match crate::ops::discover_slack_api_base_url(&opts.namespace, &opts.release)
+        .await
+    {
+        crate::ops::SlackApiBase::Configured(base) => {
+            ui.note(&format!(
+                "posting over the release's configured Slack base {base}"
+            ));
+            crate::slack::SlackTransport::new(Some(base), bot_token)
+        }
+        crate::ops::SlackApiBase::RealSlack => crate::slack::SlackTransport::new(None, bot_token),
+        // Refusing here rather than defaulting is the whole point of the tri-state.
+        // "Could not look" is not evidence that the worker talks to real Slack, and
+        // acting as if it were would post a real placeholder somewhere the worker
+        // can never edit -- an orphaned ellipsis in a real channel, which is the
+        // #957 mode A failure arriving by a different road.
+        crate::ops::SlackApiBase::Unknown => {
+            anyhow::bail!(
+                "could not read the Slack API base from the worker Deployment for release \
+                 {} in namespace {}; refusing to guess where a real workspace token should be \
+                 sent. Check `kubectl -n {} get deployment -l \
+                 app.kubernetes.io/instance={},app.kubernetes.io/component=worker`.",
+                opts.release,
+                opts.namespace,
+                opts.namespace,
+                opts.release
+            );
+        }
+    };
 
     let valkey_url = format!(
         "redis://:{}@127.0.0.1:{valkey_local_port}",
         opts.valkey_password
     );
     let mut conn = connect(&valkey_url).await?;
-    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &bot_token)
+    enqueue_over_connected_transport(&opts, &mut conn, TurnVerb::Cluster, &channel, &transport)
         .await
 }
 
@@ -1826,7 +2444,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport -- no throwaway stub. A kubectl
     // failure reads as NOT connected, so this falls through to the stub path.
-    if crate::ops::dispatcher_connected(&opts.namespace, &opts.release).await {
+    if dispatcher_connected_strict(&opts.namespace, &opts.release).await? {
         return message_connected(opts).await;
     }
 
@@ -1839,6 +2457,13 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     ui.note(&format!(
         "slack stub listening; the worker will post to {url}"
     ));
+
+    // Install the portless exact host origin before any enqueue plumbing. The
+    // connected-dispatcher branch returned above, so this never widens a
+    // Slack-connected release. The guard restores the default closed posture on
+    // every normal/error return and is moved into non-unwinding exits below.
+    let mut stub_trust =
+        ClusterStubTrust::install(&opts.namespace, &opts.release, &advertise_host).await?;
 
     // Valkey port-forward for the enqueue (killed on drop at fn end).
     let (_valkey_pf, valkey_local_port) = start_port_forward(
@@ -1911,6 +2536,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 reply,
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::CompletedNoEdit => {
@@ -1919,6 +2545,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                 thread: thread_ts.clone(),
             });
             persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
+            stub_trust.restore().await?;
             Ok(())
         }
         Outcome::AwaitingApproval(reply) => {
@@ -1956,7 +2583,10 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     )
                     .await
                     {
-                        ResumeExit::Done => Ok(()),
+                        ResumeExit::Done => {
+                            stub_trust.restore().await?;
+                            Ok(())
+                        }
                         ResumeExit::Transient => {
                             // Drop the Slack stub AND the Valkey port-forward first:
                             // `process::exit` does not unwind, so without dropping
@@ -1965,7 +2595,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                             // run, leaking the stub's bound port (#751) and
                             // orphaning the `kubectl port-forward` child to init
                             // (#766).
-                            exit_after_drop(crate::exit::ExitClass::Transient, (stub, _valkey_pf));
+                            stub_trust.restore().await?;
+                            exit_after_drop(
+                                crate::exit::ExitClass::Transient,
+                                (stub, _valkey_pf, stub_trust),
+                            );
                         }
                     }
                 }
@@ -1984,7 +2618,11 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                         channel: channel.clone(),
                     });
                     persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
-                    exit_after_drop(crate::exit::ExitClass::Transient, (stub, _valkey_pf));
+                    stub_trust.restore().await?;
+                    exit_after_drop(
+                        crate::exit::ExitClass::Transient,
+                        (stub, _valkey_pf, stub_trust),
+                    );
                 }
             }
         }
@@ -2010,7 +2648,8 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // transient stall), so it maps to the transient exit code, not
             // failure. Drop the Valkey port-forward now, for the same
             // non-unwinding reason as the stub above (#766).
-            exit_after_drop(crate::exit::ExitClass::Transient, _valkey_pf);
+            stub_trust.restore().await?;
+            exit_after_drop(crate::exit::ExitClass::Transient, (_valkey_pf, stub_trust));
         }
     }
 }
@@ -3658,18 +4297,22 @@ mod tests {
     #[test]
     fn connected_only_when_the_worker_itself_talks_to_real_slack() {
         let t = |s: &str| Some(s.to_string());
+        let token = |r: Option<crate::slack::SlackTransport>| r.map(|t| t.bot_token);
 
         // Connected: the worker's transport is real Slack and its token is real.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("xoxb-real"))).as_deref(),
-            Some("xoxb-real")
+            token(connected_worker_transport((
+                t("https://slack.com/api/"),
+                t("xoxb-real")
+            ))),
+            Some("xoxb-real".to_string())
         );
 
         // #957 mode A, the failure this replaced: a REAL token is present but the
         // worker is wired to the stub, so posting would orphan a "..." in a real
         // channel that the worker can never edit. Not connected.
         assert_eq!(
-            connected_worker_bot_token((
+            connected_worker_transport((
                 t("http://localhost:8155/api/"),
                 t("xoxb-real-from-the-vault")
             )),
@@ -3678,20 +4321,47 @@ mod tests {
 
         // The stub sentinel is not a workspace token even if the base URL is odd.
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
+            connected_worker_transport((t("https://slack.com/api/"), t(LOCAL_STUB_BOT_TOKEN))),
             None
         );
         // No stack running / nothing resolvable -> stub path, never a real post.
-        assert_eq!(connected_worker_bot_token((None, None)), None);
-        assert_eq!(connected_worker_bot_token((t(""), t("xoxb-real"))), None);
+        assert_eq!(connected_worker_transport((None, None)), None);
+        assert_eq!(connected_worker_transport((t(""), t("xoxb-real"))), None);
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), None)),
+            connected_worker_transport((t("https://slack.com/api/"), None)),
             None
         );
         assert_eq!(
-            connected_worker_bot_token((t("https://slack.com/api/"), t("  "))),
+            connected_worker_transport((t("https://slack.com/api/"), t("  "))),
             None
         );
+    }
+
+    #[test]
+    fn the_local_transport_carries_the_workers_own_base_not_the_shells() {
+        // The #1030 regression at local tier. The base and the token are read from
+        // the same `docker inspect`, so the placeholder goes where the worker that
+        // will edit it is pointed. Before this, only the token survived and the base
+        // came from whatever the operator happened to have exported.
+        let resolved = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("a real base and a real token are a connected transport");
+        assert_eq!(resolved.api_base, "https://proxy.example/api");
+        assert_eq!(resolved.bot_token, "xoxb-worker-actual");
+
+        std::env::set_var("SLACK_API_BASE_URL", "http://127.0.0.1:18081/api");
+        let again = connected_worker_transport((
+            Some("https://proxy.example/api".to_string()),
+            Some("xoxb-worker-actual".to_string()),
+        ))
+        .expect("still connected");
+        assert_eq!(
+            again.api_base, "https://proxy.example/api",
+            "an ambient SLACK_API_BASE_URL must not redirect a resolved token"
+        );
+        std::env::remove_var("SLACK_API_BASE_URL");
     }
 
     #[test]

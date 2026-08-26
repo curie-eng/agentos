@@ -905,6 +905,14 @@ class TestRustValkeyWorkflowContract:
         assert "26379:6379" in valkey["ports"]
 
 
+class TestPythonValkeyWorkflowContract:
+    def test_python_job_requires_valkey_guarded_tests(self):
+        workflow = yaml.safe_load(CI_YAML.read_text())
+        python = workflow["jobs"]["python"]
+
+        assert python["env"]["CI_REQUIRE_VALKEY_TESTS"] == "1"
+
+
 class TestHelmCiCheckRunNames:
     def test_expands_matrix_include_rows(self, tmp_path, monkeypatch):
         workflow = tmp_path / "helm-ci.yaml"
