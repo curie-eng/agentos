@@ -308,8 +308,13 @@ pub struct MemoryEntry {
 /// a typed map wrapper so the CLI can bound the collection without projecting
 /// away trace/session/outcome fields a newer platform adds.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct TraceListRow(pub serde_json::Map<String, serde_json::Value>);
+pub struct TraceListRow {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
 
 /// One node in the existing API's reconstructed observation tree.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -374,6 +379,29 @@ pub struct MetricSeries {
     pub start: String,
     pub end: String,
     pub points: Vec<MetricPoint>,
+}
+
+/// Maximum number of metric points a CLI result may carry. This defensive
+/// response check keeps a skewed backend from violating the public result bound.
+pub const MAX_OBSERVABILITY_METRIC_POINTS: usize = 1000;
+
+#[derive(Debug)]
+struct ObservabilityApiUnavailable(String);
+
+impl std::fmt::Display for ObservabilityApiUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ObservabilityApiUnavailable {}
+
+pub fn is_observability_api_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ObservabilityApiUnavailable>()
+            .is_some()
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -739,6 +767,76 @@ impl ApiClient {
         bail!("{what} failed with {status}: {}", body.trim());
     }
 
+    async fn expect_observability_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ObservabilityApiUnavailable(format!(
+                "{what} failed with {status}: {}",
+                body.trim()
+            ))
+            .into());
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            ));
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::usage(format!(
+                    "{what} failed with {status}: {}",
+                    body.trim()
+                ))
+                .with_fix("review the observability query filters and retry with valid values"),
+            ));
+        }
+        Self::expect_ok(resp, what).await
+    }
+
+    async fn get_observability_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        what: &str,
+    ) -> Result<T> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .query(query)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .with_context(|| format!("GET {path}"))?;
+        Self::expect_observability_ok(resp, what)
+            .await?
+            .json()
+            .await
+            .with_context(|| format!("decoding {what}"))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<Agent>> {
         let resp = self
             .http
@@ -767,20 +865,8 @@ impl ApiClient {
         if let Some(agent_id) = agent_id {
             query.push(("agent_id", agent_id.to_string()));
         }
-        let resp = self
-            .http
-            .get(format!("{}/langfuse/traces", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .query(&query)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
+        self.get_observability_json("/langfuse/traces", &query, "listing observability runs")
             .await
-            .context("GET /langfuse/traces")?;
-        Self::expect_ok(resp, "listing observability runs")
-            .await?
-            .json()
-            .await
-            .context("decoding observability runs")
     }
 
     /// Read one complete trace tree through the platform API proxy. A handler
@@ -808,7 +894,7 @@ impl ApiClient {
             }
             return Ok(None);
         }
-        let run = Self::expect_ok(resp, "reading observability run")
+        let run = Self::expect_observability_ok(resp, "reading observability run")
             .await?
             .json()
             .await
@@ -832,23 +918,15 @@ impl ApiClient {
             ("agent", agent),
         ] {
             if let Some(value) = value {
-                query.push((key, value));
+                query.push((key, value.to_string()));
             }
         }
-        let resp = self
-            .http
-            .get(format!("{}/observability/metrics/summary", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .query(&query)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .context("GET /observability/metrics/summary")?;
-        Self::expect_ok(resp, "reading observability metrics summary")
-            .await?
-            .json()
-            .await
-            .context("decoding observability metrics summary")
+        self.get_observability_json(
+            "/observability/metrics/summary",
+            &query,
+            "reading observability metrics summary",
+        )
+        .await
     }
 
     /// Read the complete existing metric-series DTO through the platform API.
@@ -862,7 +940,10 @@ impl ApiClient {
         environment: Option<&str>,
         agent: Option<&str>,
     ) -> Result<MetricSeries> {
-        let mut query = vec![("metric", metric), ("granularity", granularity)];
+        let mut query = vec![
+            ("metric", metric.to_string()),
+            ("granularity", granularity.to_string()),
+        ];
         for (key, value) in [
             ("start", start),
             ("end", end),
@@ -870,23 +951,27 @@ impl ApiClient {
             ("agent", agent),
         ] {
             if let Some(value) = value {
-                query.push((key, value));
+                query.push((key, value.to_string()));
             }
         }
-        let resp = self
-            .http
-            .get(format!("{}/observability/metrics/series", self.base_url))
-            .header("X-API-Key", &self.api_key)
-            .query(&query)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .context("GET /observability/metrics/series")?;
-        Self::expect_ok(resp, "reading observability metric series")
-            .await?
-            .json()
-            .await
-            .context("decoding observability metric series")
+        let series: MetricSeries = self
+            .get_observability_json(
+                "/observability/metrics/series",
+                &query,
+                "reading observability metric series",
+            )
+            .await?;
+        if series.points.len() > MAX_OBSERVABILITY_METRIC_POINTS {
+            return Err(anyhow::Error::from(
+                crate::exit::CliError::failure(format!(
+                    "the API returned {} metric points, above the CLI maximum of {}",
+                    series.points.len(),
+                    MAX_OBSERVABILITY_METRIC_POINTS
+                ))
+                .with_fix("narrow --start/--end or choose a coarser --granularity"),
+            ));
+        }
+        Ok(series)
     }
 
     pub async fn create_agent(

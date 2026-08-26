@@ -104,20 +104,20 @@ struct LocalObservabilityConn {
     )]
     api_url: String,
     /// Platform API key.
-    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", value_parser = message::api_key_or_default)]
+    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
     api_key: String,
 }
 
 /// Explicit cluster API overrides shared by every observability query leaf.
 /// Namespace and release stay on the parent `cluster observability` command so
-/// discovery and the bare surface report always target the same release.
+/// self-plumbing and the bare surface report always target the same release.
 #[derive(Args, Debug, Clone)]
 struct ClusterObservabilityConn {
-    /// Platform API base URL. Omit to discover the release's UI `/api` proxy.
+    /// Platform API base URL. Omit to self-plumb the release API over loopback.
     #[arg(long, env = "CURIE_API_URL")]
     api_url: Option<String>,
-    /// Platform API key. Omit to read the release's `api.apiKey` from its Secret.
-    #[arg(long, env = "CURIE_API_KEY")]
+    /// Platform API key. Required with --api-url; omit both for release discovery.
+    #[arg(long, env = "CURIE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 }
 
@@ -202,10 +202,10 @@ struct ObservabilityMetricsArgs {
     /// Series bucket size. Defaults to day when --metric is present.
     #[arg(long, value_enum)]
     granularity: Option<ObservabilityGranularity>,
-    /// Inclusive ISO 8601 window start.
+    /// Optional metrics-window start accepted by the platform API.
     #[arg(long)]
     start: Option<String>,
-    /// Exclusive ISO 8601 window end.
+    /// Optional metrics-window end accepted by the platform API.
     #[arg(long)]
     end: Option<String>,
     /// Restrict metrics to one deployment environment.
@@ -223,13 +223,10 @@ impl ObservabilityMetricsArgs {
                 "--granularity requires --metric because summaries are not bucketed",
             ));
         }
+        let granularity = self.granularity.unwrap_or(ObservabilityGranularity::Day);
         Ok(curie::observability::ObservabilityQuery::Metrics {
             metric: self.metric.map(|metric| metric.as_str().to_string()),
-            granularity: self
-                .granularity
-                .unwrap_or(ObservabilityGranularity::Day)
-                .as_str()
-                .to_string(),
+            granularity: granularity.as_str().to_string(),
             start: self.start,
             end: self.end,
             environment: self.environment,
@@ -393,13 +390,40 @@ async fn run_cluster_observability_query(
         ),
         ClusterObservabilityQuery::Metrics { query, conn } => (conn, query.into_query()?),
     };
-    let (api_url, api_key) = resolve_cluster_conn(ClusterConn {
-        api_url: conn.api_url,
-        api_key: conn.api_key,
-        namespace,
-        release,
-    })
-    .await?;
+    if conn.api_url.is_some() && conn.api_key.is_none() {
+        return Err(anyhow::Error::from(
+            curie::exit::CliError::usage(
+                "--api-url requires --api-key for cluster observability queries",
+            )
+            .with_fix(
+                "pass the matching --api-key explicitly, or omit --api-url to use release discovery over a loopback port-forward",
+            ),
+        ));
+    }
+    let api_key = match conn.api_key {
+        Some(key) => key,
+        None => ops::discover_api_key(&namespace, &release).await?,
+    };
+    let local_port = message::DEFAULT_API_LOCAL_PORT;
+    let _port_forward;
+    let api_url = match commands::deploy_port_forward(
+        conn.api_url.as_deref(),
+        &namespace,
+        &release,
+        local_port,
+        message::API_REMOTE_PORT,
+    ) {
+        Some(command) => {
+            _port_forward =
+                Some(message::start_port_forward(&command, local_port, "observability api").await?);
+            format!("http://localhost:{local_port}")
+        }
+        None => {
+            _port_forward = None;
+            conn.api_url
+                .expect("explicit URL present when no port-forward is planned")
+        }
+    };
     curie::observability::query("cluster", &api_url, &api_key, query).await
 }
 

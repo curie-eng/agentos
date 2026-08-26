@@ -825,6 +825,12 @@ fn observability_runs_query_schema_is_closed_and_bounded() {
         v.is_valid(&valid),
         "bounded runs payload must validate: {valid}"
     );
+    let mut unnamed = valid.clone();
+    unnamed["runs"][0]["name"] = serde_json::Value::Null;
+    assert!(
+        v.is_valid(&unnamed),
+        "the console/API contract permits unnamed traces: {unnamed}"
+    );
 
     let mut missing_count = valid.clone();
     missing_count.as_object_mut().unwrap().remove("count");
@@ -834,7 +840,13 @@ fn observability_runs_query_schema_is_closed_and_bounded() {
     );
 
     let too_many: Vec<_> = (0..101)
-        .map(|index| serde_json::json!({"id": format!("trace-{index}")}))
+        .map(|index| {
+            serde_json::json!({
+                "id": format!("trace-{index}"),
+                "name": "curie-run:agent-example-thread-1",
+                "timestamp": "2026-08-22T00:00:00Z"
+            })
+        })
         .collect();
     let over_bound = serde_json::json!({"limit": 100, "count": 101, "runs": too_many});
     assert!(
@@ -844,6 +856,10 @@ fn observability_runs_query_schema_is_closed_and_bounded() {
     assert!(
         !v.is_valid(&serde_json::json!({"limit": 0, "count": 0, "runs": []})),
         "the documented lower bound is one"
+    );
+    assert!(
+        !v.is_valid(&serde_json::json!({"limit": 1, "count": 1, "runs": [{}]})),
+        "every typed list row must carry the identity needed by `run <trace-id>`"
     );
 }
 
@@ -947,6 +963,20 @@ fn observability_metrics_query_schema_covers_complete_summary_and_series() {
     assert!(
         !v.is_valid(&invalid_granularity),
         "series granularity is the bounded hour/day/week CLI enum"
+    );
+
+    let too_many_points = serde_json::json!({
+        "metric": "runs",
+        "granularity": "hour",
+        "start": "2026-01-01T00:00:00Z",
+        "end": "2026-12-31T00:00:00Z",
+        "points": (0..1001)
+            .map(|index| serde_json::json!({"ts": format!("point-{index}"), "value": 0.0}))
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        !v.is_valid(&too_many_points),
+        "metric-series results must have a finite public point bound"
     );
 }
 

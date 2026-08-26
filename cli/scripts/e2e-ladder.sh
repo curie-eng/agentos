@@ -503,7 +503,7 @@ discover_local_observability_trace() {
     local agent_id="$1" attempt out code verdict state detail
     DISCOVERED_OBSERVABILITY_TRACE_ID=""
     for attempt in $(seq 1 "$OBSERVABILITY_POLL_ATTEMPTS"); do
-        out="$("$BIN" --json local observability runs --limit 1)" && code=0 || code=$?
+        out="$("$BIN" --json local observability runs --limit 1 --agent-id "$agent_id")" && code=0 || code=$?
         if (( code != 0 )); then
             echo "local observability runs: bounded ingestion read exited $code, expected 0." >&2
             printf '%s\n' "$out" >&2
@@ -511,7 +511,6 @@ discover_local_observability_trace() {
         fi
         verdict="$(printf '%s' "$out" | python3 -c '
 import json, re, sys
-agent_id = sys.argv[1]
 try:
     value = json.loads(sys.stdin.read())
 except Exception as exc:
@@ -540,20 +539,13 @@ elif not runs:
 else:
     row = runs[0]
     trace_id = row.get("id") if isinstance(row, dict) else None
-    name = row.get("name") if isinstance(row, dict) else None
     if not isinstance(trace_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", trace_id):
         print("invalid")
         print("run id is absent or not a safe trace id")
-    elif not isinstance(name, str):
-        print("invalid")
-        print("run name is not a string")
-    elif "agent-" + agent_id not in name:
-        print("pending")
-        print("newest ingested run belongs to a different agent")
     else:
         print("ok")
         print(trace_id)
-' "$agent_id" || printf '%s\n%s\n' invalid 'validator failed')"
+' || printf '%s\n%s\n' invalid 'validator failed')"
         detail="${verdict#*$'\n'}"
         state="${verdict%%$'\n'*}"
         case "$state" in
@@ -767,7 +759,7 @@ prove_local_observability_queries() {
 
     echo
     echo "=== curie local observability runs --json (unavailable API negative) ==="
-    out="$(CURIE_API_URL="$OBSERVABILITY_UNAVAILABLE_API_URL" "$BIN" --json local observability runs --limit 1)" && code=0 || code=$?
+    out="$(CURIE_API_URL="$OBSERVABILITY_UNAVAILABLE_API_URL" "$BIN" --json local observability runs --limit 1 --agent-id "$agent_id")" && code=0 || code=$?
     if (( code != 3 )); then
         echo "local observability unavailable API: expected exit 3, got $code." >&2
         printf '%s\n' "$out" >&2

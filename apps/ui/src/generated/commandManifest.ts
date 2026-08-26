@@ -521,7 +521,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Inclusive ISO 8601 window start",
+                  "help": "Optional metrics-window start accepted by the platform API",
                   "id": "start",
                   "long": "start",
                   "positional": false,
@@ -529,7 +529,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Exclusive ISO 8601 window end",
+                  "help": "Optional metrics-window end accepted by the platform API",
                   "id": "end",
                   "long": "end",
                   "positional": false,
@@ -1870,7 +1870,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Inclusive ISO 8601 window start",
+                  "help": "Optional metrics-window start accepted by the platform API",
                   "id": "start",
                   "long": "start",
                   "positional": false,
@@ -1878,7 +1878,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Exclusive ISO 8601 window end",
+                  "help": "Optional metrics-window end accepted by the platform API",
                   "id": "end",
                   "long": "end",
                   "positional": false,
@@ -2805,7 +2805,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_URL",
                   "global": false,
-                  "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
                   "id": "api_url",
                   "long": "api-url",
                   "positional": false,
@@ -2814,7 +2814,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_KEY",
                   "global": false,
-                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
                   "id": "api_key",
                   "long": "api-key",
                   "positional": false,
@@ -2837,7 +2837,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_URL",
                   "global": false,
-                  "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
                   "id": "api_url",
                   "long": "api-url",
                   "positional": false,
@@ -2846,7 +2846,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_KEY",
                   "global": false,
-                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
                   "id": "api_key",
                   "long": "api-key",
                   "positional": false,
@@ -2889,7 +2889,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Inclusive ISO 8601 window start",
+                  "help": "Optional metrics-window start accepted by the platform API",
                   "id": "start",
                   "long": "start",
                   "positional": false,
@@ -2897,7 +2897,7 @@ export const commandManifest = {
                 },
                 {
                   "global": false,
-                  "help": "Exclusive ISO 8601 window end",
+                  "help": "Optional metrics-window end accepted by the platform API",
                   "id": "end",
                   "long": "end",
                   "positional": false,
@@ -2922,7 +2922,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_URL",
                   "global": false,
-                  "help": "Platform API base URL. Omit to discover the release's UI `/api` proxy",
+                  "help": "Platform API base URL. Omit to self-plumb the release API over loopback",
                   "id": "api_url",
                   "long": "api-url",
                   "positional": false,
@@ -2931,7 +2931,7 @@ export const commandManifest = {
                 {
                   "env": "CURIE_API_KEY",
                   "global": false,
-                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "help": "Platform API key. Required with --api-url; omit both for release discovery",
                   "id": "api_key",
                   "long": "api-key",
                   "positional": false,

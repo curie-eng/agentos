@@ -120,14 +120,14 @@ impl CliOutput for ObservabilityRunsOutput {
             return;
         }
         for row in &self.runs {
-            let id = row.0.get("id").and_then(Value::as_str).unwrap_or("unknown");
-            let name = row.0.get("name").and_then(Value::as_str).unwrap_or("run");
-            let timestamp = row
-                .0
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown time");
-            ui.kv(id, &format!("{timestamp}  {name}"));
+            ui.kv(
+                &row.id,
+                &format!(
+                    "{}  {}",
+                    row.timestamp,
+                    row.name.as_deref().unwrap_or("(unnamed trace)")
+                ),
+            );
         }
     }
 }
@@ -291,8 +291,18 @@ pub async fn query(
 }
 
 fn classify_api_error(error: anyhow::Error, tier: &str) -> anyhow::Error {
-    if !crate::exit::is_transient_reqwest(&error) {
-        return error;
+    if !crate::exit::is_transient_reqwest(&error)
+        && !crate::api::is_observability_api_unavailable(&error)
+    {
+        let (class, fix) = crate::exit::classify(&error);
+        if class != crate::exit::ExitClass::Failure || fix.is_some() {
+            return error;
+        }
+        return anyhow::Error::from(
+            crate::exit::CliError::failure(format!("{error:#}")).with_fix(format!(
+                "verify the {tier} platform release exposes the current observability API DTOs"
+            )),
+        );
     }
     let fix = if tier == "local" {
         "start the local API with `curie local up`, or pass a reachable --api-url"

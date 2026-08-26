@@ -503,6 +503,10 @@ fn live_local_rung_grades_the_deployed_weather_cases() {
         .find(r#"prove_local_observability_queries "$agent_id""#)
         .map(|offset| telemetry + offset)
         .expect("the local rung must prove observability queries after telemetry");
+    assert!(
+        text.contains(r#"local observability runs --limit 1 --agent-id "$agent_id""#),
+        "the live proof must scope its bounded ingestion poll to the rung's deployed agent"
+    );
     let contract = r#"echo "=== curie local eval --dry-run (suite parity) ==="
     local eval_args=(local eval)
     if [[ ! -f "$WORKDIR/bundle/evals/trajectory.json" ]]; then
@@ -937,7 +941,7 @@ print(json.dumps({
     "--json cluster message "*)
         printf '%s\n' '{"finalized":true,"reply":"stub cluster weather reply"}'
         ;;
-    "--json local observability runs --limit 1")
+    "--json local observability runs --limit 1 --agent-id $STUB_AGENT_ID")
         # The unavailable-API negative deliberately invokes the SAME candidate
         # query with only CURIE_API_URL moved to a closed loopback endpoint.
         # That makes the semantic exit-code proof about transport failure, not
@@ -953,7 +957,7 @@ print(json.dumps({
             fi
             exit "${STUB_UNAVAILABLE_EXIT:-3}"
         fi
-        printf '{"limit":1,"count":1,"runs":[{"id":"%s","name":"agent-%s"}]}\n' \
+        printf '{"limit":1,"count":1,"runs":[{"id":"%s","name":"agent-%s","timestamp":"2026-08-22T12:34:56Z"}]}\n' \
             "$STUB_OBSERVABILITY_TRACE_ID" "$STUB_AGENT_ID"
         if [ "${STUB_RUNS_EXTRA_JSON:-0}" = "1" ]; then
             printf '%s\n' '{"unexpected":"second JSON object"}'
@@ -1349,12 +1353,12 @@ fn looks_like_utc_second(value: &str) -> bool {
 /// the second identical list is the unavailable-API negative with only its
 /// process environment changed.
 fn assert_observability_candidate_invocations(invocations: &str, trace_id: &str) {
-    let runs = "--json local observability runs --limit 1";
+    let runs = format!("--json local observability runs --limit 1 --agent-id {AGENT_ID}");
     let detail = format!("--json local observability run {trace_id}");
     let unknown = format!("--json local observability run {UNKNOWN_OBSERVABILITY_TRACE_ID}");
 
     assert_eq!(
-        invocation_count(invocations, runs),
+        invocation_count(invocations, &runs),
         2,
         "the local rung must issue one bounded newest-runs read and repeat that exact real CLI command against an unavailable API; invocations:\n{invocations}"
     );
@@ -1629,104 +1633,62 @@ fn local_observability_proof_leaves_a_borrowed_stack_to_its_owner() {
     );
 }
 
-/// NEGATIVE CONTROL: a successful read that emits two JSON documents violates
-/// the agent-facing stdout contract even though each document is valid JSON.
-/// The ladder must reject it explicitly, then its EXIT trap must still tear
-/// down the stack this run claimed.
+/// #866 NEGATIVE CONTROLS. Move one stub contract at a time while the positive
+/// control above stays green: JSON cardinality, unknown-trace exit 1,
+/// unavailable-API exit 3, and the mandatory recovery instruction must each
+/// make the real ladder reject the candidate and still run owner teardown.
 #[test]
-fn local_observability_proof_rejects_more_than_one_json_object() {
-    let (output, invocations, _, _) =
-        run_local_observability_control(&[("STUB_RUNS_EXTRA_JSON", "1")]);
-    let transcript = transcript(&output);
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "two JSON objects on stdout must fail the observability proof; transcript:\n{transcript}"
-    );
-    assert!(
-        has_line_with(&transcript, &["runs", "exactly one JSON object"]),
-        "the failure must name the affected runs query and the exactly-one-object contract; transcript:\n{transcript}"
-    );
-    assert_eq!(
-        invocation_count(&invocations, "local down"),
-        1,
-        "the owner-scoped EXIT trap must tear down this control's stack after the JSON-cardinality failure; invocations:\n{invocations}"
-    );
-}
+fn local_observability_negative_controls_are_falsifiable() {
+    let cases: &[(&str, &str, &[&str], bool)] = &[
+        (
+            "STUB_RUNS_EXTRA_JSON",
+            "1",
+            &["runs", "exactly one JSON object"],
+            false,
+        ),
+        (
+            "STUB_UNKNOWN_TRACE_EXIT",
+            "0",
+            &["unknown trace", "exit 1"],
+            false,
+        ),
+        (
+            "STUB_UNAVAILABLE_EXIT",
+            "1",
+            &["unavailable API", "exit 3"],
+            true,
+        ),
+        (
+            "STUB_UNKNOWN_TRACE_NO_FIX",
+            "1",
+            &["unknown trace", "error", "fix"],
+            false,
+        ),
+    ];
 
-/// NEGATIVE CONTROL: an unknown trace is an ordinary terminal failure (exit
-/// 1), not success and not a transient transport error. Move only that code;
-/// the positive control above proves every other stub response is green.
-#[test]
-fn local_observability_proof_requires_unknown_trace_exit_one() {
-    let (output, invocations, _, _) =
-        run_local_observability_control(&[("STUB_UNKNOWN_TRACE_EXIT", "0")]);
-    let transcript = transcript(&output);
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "an unknown trace exiting 0 must fail the ladder; transcript:\n{transcript}"
-    );
-    assert!(
-        has_line_with(&transcript, &["unknown trace", "exit 1"]),
-        "the refusal must distinguish the unknown-trace negative and name its required semantic exit 1; transcript:\n{transcript}"
-    );
-    assert_eq!(
-        invocation_count(&invocations, "local down"),
-        1,
-        "the owner-scoped EXIT trap must tear down this control's stack; invocations:\n{invocations}"
-    );
-}
-
-/// NEGATIVE CONTROL: API reachability is transient (exit 3), distinct from
-/// an unknown trace. Only the unavailable stub's code moves from 3 to 1.
-#[test]
-fn local_observability_proof_requires_unavailable_api_exit_three() {
-    let (output, invocations, unavailable_called, _) =
-        run_local_observability_control(&[("STUB_UNAVAILABLE_EXIT", "1")]);
-    let transcript = transcript(&output);
-    assert!(
-        unavailable_called,
-        "unavailable API negative was not exercised"
-    );
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "an unavailable API exiting 1 must fail the ladder; transcript:\n{transcript}"
-    );
-    assert!(
-        has_line_with(&transcript, &["unavailable API", "exit 3"]),
-        "the refusal must distinguish API unavailability and name its required transient exit 3; transcript:\n{transcript}"
-    );
-    assert_eq!(
-        invocation_count(&invocations, "local down"),
-        1,
-        "the owner-scoped EXIT trap must tear down this control's stack; invocations:\n{invocations}"
-    );
-}
-
-/// NEGATIVE CONTROL: correct status is insufficient when the machine-readable
-/// failure drops its recovery instruction. This moves only the unknown-trace
-/// payload's `fix` field, leaving exit 1 and the `error` field intact.
-#[test]
-fn local_observability_proof_requires_error_and_fix_fields() {
-    let (output, invocations, _, _) =
-        run_local_observability_control(&[("STUB_UNKNOWN_TRACE_NO_FIX", "1")]);
-    let transcript = transcript(&output);
-    assert_ne!(
-        output.status.code(),
-        Some(0),
-        "an unknown-trace payload without fix must fail the ladder; transcript:\n{transcript}"
-    );
-    assert!(
-        has_line_with(&transcript, &["unknown trace", "error", "fix"]),
-        "the refusal must name the affected negative and the required {{error,fix}} shape; transcript:\n{transcript}"
-    );
-    assert_eq!(
-        invocation_count(&invocations, "local down"),
-        1,
-        "the owner-scoped EXIT trap must tear down this control's stack; invocations:\n{invocations}"
-    );
+    for (variable, value, expected_line, expect_unavailable) in cases {
+        let (output, invocations, unavailable_called, _) =
+            run_local_observability_control(&[(variable, value)]);
+        let transcript = transcript(&output);
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "{variable} must falsify the local observability proof; transcript:\n{transcript}"
+        );
+        assert!(
+            has_line_with(&transcript, expected_line),
+            "{variable} must name the rejected contract {expected_line:?}; transcript:\n{transcript}"
+        );
+        assert_eq!(
+            unavailable_called, *expect_unavailable,
+            "{variable} exercised the wrong unavailable-API path"
+        );
+        assert_eq!(
+            invocation_count(&invocations, "local down"),
+            1,
+            "the owner-scoped EXIT trap must tear down {variable}; invocations:\n{invocations}"
+        );
+    }
 }
 
 /// POSITIVE CONTROL. Every rung -- skill, local and cluster -- reports the same

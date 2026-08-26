@@ -283,6 +283,22 @@ fn local_and_cluster_expose_the_same_query_grammar_and_defaults() {
             "metrics is missing {value}: {metrics}"
         );
     }
+
+    for tier in ["local", "cluster"] {
+        let secret = "must-not-appear-in-help";
+        let output = Command::new(bin())
+            .args([tier, "observability", "runs", "--help"])
+            .env("CURIE_API_KEY", secret)
+            .output()
+            .expect("render observability runs help");
+        let help = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "help must succeed: {help}");
+        assert!(
+            !help.contains(secret),
+            "observability help must never render CURIE_API_KEY values: {help}"
+        );
+    }
 }
 
 #[test]
@@ -386,7 +402,7 @@ fn runs_accept_limit_boundaries_and_reject_zero_and_101_before_http() {
 fn runs_agent_filter_is_forwarded_without_dropping_typed_rows() {
     let row = json!({
         "id": TRACE_ID,
-        "name": format!("curie-run:agent-{AGENT_ID}-thread-1"),
+        "name": null,
         "timestamp": "2026-08-22T12:34:56Z",
         "sessionId": "session-observability-866",
         "metadata": {"terminal_outcome": "completed"}
@@ -415,6 +431,27 @@ fn runs_agent_filter_is_forwarded_without_dropping_typed_rows() {
         request.path.contains(&format!("agent_id={AGENT_ID}")),
         "the CLI must keep the API route's agent_id spelling: {}",
         request.path
+    );
+}
+
+#[test]
+fn runs_rejects_an_api_row_without_usable_trace_identity() {
+    let server = serve(|request| {
+        if request.method == "GET" && request.path.starts_with("/langfuse/traces?") {
+            Response::json(200, r#"[{"metadata":{"terminal_outcome":"completed"}}]"#)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+
+    let output = query("local", &["runs", "--limit", "1"], &server, true, false);
+    assert_eq!(output.status.code(), Some(1));
+    let value = one_stdout_object(&output);
+    assert_only_error_fix(&value);
+    let error = value["error"].as_str().unwrap();
+    assert!(
+        error.contains("decoding") && error.contains("observability runs"),
+        "an untyped server row must fail instead of becoming an unusable success: {value}"
     );
 }
 
@@ -569,8 +606,54 @@ fn metric_enums_and_series_only_granularity_fail_as_usage_before_http() {
     }
     assert!(
         server.recorded().is_empty(),
-        "invalid bounded metric input and granularity-without-series fail before HTTP"
+        "invalid metric enum and granularity-without-series fail before HTTP"
     );
+}
+
+#[test]
+fn cluster_explicit_api_url_never_receives_an_auto_discovered_key() {
+    let server = serve(|_| Response::json(500, r#"{"detail":"must not be called"}"#));
+    let tools = tempfile::tempdir().expect("side-effect tool directory");
+    let marker = tools.path().join("kubectl-called");
+    let kubectl = tools.path().join("kubectl");
+    fs::write(
+        &kubectl,
+        format!(
+            "#!/bin/sh\nprintf called > '{}'\nexit 97\n",
+            marker.display()
+        ),
+    )
+    .expect("write kubectl marker");
+    let mut permissions = fs::metadata(&kubectl).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&kubectl, permissions).unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "--json",
+            "cluster",
+            "observability",
+            "runs",
+            "--api-url",
+            &server.base_url,
+        ])
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_API_URL")
+        .env("PATH", tools.path())
+        .output()
+        .expect("run cluster query with an unpaired URL override");
+    assert_eq!(output.status.code(), Some(2));
+    let value = one_stdout_object(&output);
+    assert_only_error_fix(&value);
+    assert!(
+        value["fix"].as_str().unwrap().contains("--api-key"),
+        "the recovery must require an explicitly paired key: {value}"
+    );
+    assert!(
+        server.recorded().is_empty(),
+        "the arbitrary URL is never dialed"
+    );
+    assert!(!marker.exists(), "no release key discovery is attempted");
 }
 
 #[test]
@@ -646,46 +729,6 @@ fn unknown_trace_and_unavailable_api_are_distinct_semantic_failures() {
         "the fix points to bounded trace discovery: {unknown_json}"
     );
 
-    // Reserve an ephemeral address and close it immediately. The next connect
-    // is a real reqwest connection refusal, structurally classified transient.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve closed test port");
-    let unavailable_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
-    let unavailable_output = query_url(
-        "cluster",
-        &["run", TRACE_ID],
-        &unavailable_url,
-        true,
-        false,
-        None,
-    );
-    assert_eq!(
-        unavailable_output.status.code(),
-        Some(3),
-        "an unreachable API is transient\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&unavailable_output.stdout),
-        String::from_utf8_lossy(&unavailable_output.stderr)
-    );
-    let unavailable_json = one_stdout_object(&unavailable_output);
-    assert_only_error_fix(&unavailable_json);
-    assert_ne!(
-        unknown_json, unavailable_json,
-        "unknown data and unavailable infrastructure must be distinguishable"
-    );
-    let unavailable_text = format!(
-        "{} {}",
-        unavailable_json["error"].as_str().unwrap(),
-        unavailable_json["fix"].as_str().unwrap()
-    )
-    .to_ascii_lowercase();
-    assert!(
-        unavailable_text.contains("api") || unavailable_text.contains("endpoint"),
-        "the transient remediation must name the unavailable API/endpoint: {unavailable_json}"
-    );
-}
-
-#[test]
-fn api_unavailable_errors_keep_exact_tier_specific_recovery_guidance() {
     // Reserve an ephemeral address and close it immediately. Both siblings
     // drive the same real reqwest connection refusal; only the actionable
     // recovery differs because local owns a start command while cluster owns a
@@ -745,6 +788,115 @@ fn api_unavailable_errors_keep_exact_tier_specific_recovery_guidance() {
         failures[0]["fix"], failures[1]["fix"],
         "local and cluster recovery must not collapse to generic retry guidance"
     );
+    assert_ne!(
+        unknown_json, failures[0],
+        "unknown data and unavailable infrastructure must be distinguishable"
+    );
+}
+
+#[test]
+fn retryable_api_statuses_are_transient_not_unknown_data() {
+    for status in [500, 502, 503, 504] {
+        let server = serve(move |request| {
+            if request.method == "GET" && request.path.starts_with("/langfuse/traces?") {
+                Response::json(
+                    status,
+                    r#"{"detail":"observability dependency unavailable"}"#,
+                )
+            } else {
+                Response::json(418, r#"{"detail":"unexpected test request"}"#)
+            }
+        });
+        let output = query("local", &["runs", "--limit", "1"], &server, true, false);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "reachable API status {status} is a retryable availability failure"
+        );
+        let value = one_stdout_object(&output);
+        assert_only_error_fix(&value);
+        assert!(value["error"]
+            .as_str()
+            .unwrap()
+            .contains(&status.to_string()));
+    }
+}
+
+#[test]
+fn observability_api_errors_keep_specific_recovery_guidance() {
+    let auth = serve(|request| {
+        if request.method == "GET" && request.path.starts_with("/langfuse/traces?") {
+            Response::json(401, r#"{"detail":"invalid API key"}"#)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+    let auth_output = query("local", &["runs", "--limit", "1"], &auth, true, false);
+    assert_eq!(auth_output.status.code(), Some(1));
+    let auth_value = one_stdout_object(&auth_output);
+    assert!(
+        auth_value["fix"].as_str().unwrap().contains("--api-key"),
+        "authentication failures need credential recovery, not DTO advice: {auth_value}"
+    );
+
+    let input = serve(|request| {
+        if request.method == "GET" && request.path.starts_with("/observability/metrics/summary") {
+            Response::json(422, r#"{"detail":"invalid start timestamp"}"#)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+    let input_output = query(
+        "local",
+        &["metrics", "--start", "not-a-timestamp"],
+        &input,
+        true,
+        false,
+    );
+    assert_eq!(input_output.status.code(), Some(2));
+    let input_value = one_stdout_object(&input_output);
+    assert!(
+        input_value["fix"]
+            .as_str()
+            .unwrap()
+            .contains("query filters"),
+        "API input failures need flag recovery: {input_value}"
+    );
+
+    let points = (0..1001)
+        .map(|index| json!({"ts": format!("point-{index}"), "value": 1.0}))
+        .collect::<Vec<_>>();
+    let oversized_body = serde_json::to_string(&json!({
+        "metric": "runs",
+        "granularity": "hour",
+        "start": START,
+        "end": END,
+        "points": points,
+    }))
+    .unwrap();
+    let oversized = serve(move |request| {
+        if request.method == "GET" && request.path.starts_with("/observability/metrics/series?") {
+            Response::json(200, &oversized_body)
+        } else {
+            Response::json(500, r#"{"detail":"unexpected test request"}"#)
+        }
+    });
+    let oversized_output = query(
+        "local",
+        &["metrics", "--metric", "runs", "--granularity", "hour"],
+        &oversized,
+        true,
+        false,
+    );
+    assert_eq!(oversized_output.status.code(), Some(1));
+    let oversized_value = one_stdout_object(&oversized_output);
+    assert!(
+        oversized_value["fix"]
+            .as_str()
+            .unwrap()
+            .contains("narrow --start/--end"),
+        "the typed bound's recovery must survive classification: {oversized_value}"
+    );
 }
 
 #[test]
@@ -758,16 +910,13 @@ fn cluster_query_parent_namespace_and_release_drive_discovery_for_every_leaf() {
     let summary = metrics_summary();
     let summary_body = serde_json::to_string(&summary).unwrap();
     let server = serve(move |request| {
-        if request.method == "GET" && request.path.starts_with("/api/langfuse/traces?") {
+        if request.method == "GET" && request.path.starts_with("/langfuse/traces?") {
             Response::json(200, "[]")
-        } else if request.method == "GET"
-            && request.path == format!("/api/langfuse/traces/{TRACE_ID}")
+        } else if request.method == "GET" && request.path == format!("/langfuse/traces/{TRACE_ID}")
         {
             Response::json(200, &run_body)
         } else if request.method == "GET"
-            && request
-                .path
-                .starts_with("/api/observability/metrics/summary")
+            && request.path.starts_with("/observability/metrics/summary")
         {
             Response::json(200, &summary_body)
         } else {
@@ -783,6 +932,36 @@ fn cluster_query_parent_namespace_and_release_drive_discovery_for_every_leaf() {
     let tools = tempfile::tempdir().expect("discovery tool directory");
     let kubectl_log = tools.path().join("kubectl.log");
     let helm_log = tools.path().join("helm.log");
+    let proxy = tools.path().join("proxy.py");
+    fs::write(
+        &proxy,
+        r#"import http.server, os, urllib.error, urllib.request
+
+target = "http://127.0.0.1:" + os.environ["CURIE_TEST_OBSERVABILITY_TARGET_PORT"]
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        request = urllib.request.Request(target + self.path)
+        if self.headers.get("X-API-Key"):
+            request.add_header("X-API-Key", self.headers["X-API-Key"])
+        try:
+            response = urllib.request.urlopen(request)
+        except urllib.error.HTTPError as error:
+            response = error
+        body = response.read()
+        self.send_response(response.status)
+        self.send_header("Content-Type", response.headers.get("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+http.server.ThreadingHTTPServer(("127.0.0.1", 8123), Proxy).serve_forever()
+"#,
+    )
+    .expect("write API port-forward proxy");
     let kubectl = tools.path().join("kubectl");
     fs::write(
         &kubectl,
@@ -800,6 +979,9 @@ case "$*" in
     ;;
   *"-n observability-parent-ns get secret observability-parent-release-secrets"*"apiKey"*)
     printf '%s' "$CURIE_TEST_OBSERVABILITY_API_KEY"
+    ;;
+  *"-n observability-parent-ns port-forward svc/observability-parent-release-api 8123:8000"*)
+    exec python3 "$CURIE_TEST_OBSERVABILITY_PROXY_SCRIPT"
     ;;
   *)
     printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -828,6 +1010,11 @@ esac
         (&["run", TRACE_ID], "run"),
         (&["metrics"], "metrics"),
     ];
+    let tool_path = format!(
+        "{}:{}",
+        tools.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     for (leaf, label) in cases {
         let mut args = vec![
             "cluster",
@@ -845,10 +1032,11 @@ esac
             .env_remove("CURIE_API_URL")
             .env_remove("CURIE_API_KEY")
             .env_remove("CURIE_NAMESPACE")
-            .env("PATH", tools.path())
+            .env("PATH", &tool_path)
             .env("CURIE_TEST_OBSERVABILITY_KUBECTL_LOG", &kubectl_log)
             .env("CURIE_TEST_OBSERVABILITY_HELM_LOG", &helm_log)
-            .env("CURIE_TEST_OBSERVABILITY_NODE_PORT", node_port)
+            .env("CURIE_TEST_OBSERVABILITY_TARGET_PORT", node_port)
+            .env("CURIE_TEST_OBSERVABILITY_PROXY_SCRIPT", &proxy)
             .env("CURIE_TEST_OBSERVABILITY_API_KEY", TEST_API_KEY)
             .output()
             .unwrap_or_else(|error| panic!("run cluster observability {label}: {error}"));
@@ -865,14 +1053,14 @@ esac
         "each query leaf reaches the discovered API once"
     );
     assert!(requests.iter().any(|request| {
-        request.path.starts_with("/api/langfuse/traces?") && request.path.contains("limit=1")
+        request.path.starts_with("/langfuse/traces?") && request.path.contains("limit=1")
     }));
     assert!(requests
         .iter()
-        .any(|request| request.path == format!("/api/langfuse/traces/{TRACE_ID}")));
-    assert!(requests.iter().any(|request| request
-        .path
-        .starts_with("/api/observability/metrics/summary")));
+        .any(|request| request.path == format!("/langfuse/traces/{TRACE_ID}")));
+    assert!(requests
+        .iter()
+        .any(|request| request.path.starts_with("/observability/metrics/summary")));
     assert!(requests
         .iter()
         .all(|request| request.header("x-api-key") == Some(TEST_API_KEY)));
@@ -881,10 +1069,12 @@ esac
     assert_eq!(
         discovery
             .lines()
-            .filter(|line| line.contains(&format!("get svc {RELEASE}-ui -n {NAMESPACE}")))
+            .filter(|line| line.contains(&format!(
+                "-n {NAMESPACE} port-forward svc/{RELEASE}-api 8123:8000"
+            )))
             .count(),
         3,
-        "every query must discover the parent-selected release URL: {discovery}"
+        "every query must self-plumb the parent-selected release API: {discovery}"
     );
     assert_eq!(
         discovery
@@ -905,7 +1095,7 @@ esac
         "every query must read the key from the discovered Secret: {discovery}"
     );
     assert!(
-        !discovery.contains("get svc curie-ui")
+        !discovery.contains("svc/curie-api")
             && !discovery.contains("app.kubernetes.io/instance=curie ")
             && !discovery.contains("-n curie "),
         "default namespace/release must not leak into explicit parent flags: {discovery}"
