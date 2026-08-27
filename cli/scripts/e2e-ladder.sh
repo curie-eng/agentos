@@ -1154,28 +1154,23 @@ print("yes" if isinstance(d, dict) and d.get("release_found") is True else "no")
     if [[ "$LIVE" == "1" ]]; then
         echo
         echo "=== curie cluster eval (REPORT ONLY, does not fail this rung: #1603) ==="
-        # --json on this rung's live grade and no other rung's: the human table
-        # prints a reply only for a RED case, so a green carried no evidence of
-        # HOW it was earned. The json payload carries `output` for every case,
-        # pass included, which is what makes the weather case's greens auditable
-        # from the job log (#1602).
+        # --json on this rung's live eval and no other rung's: when a case
+        # verdict exists, the payload carries its output whether the verdict is
+        # green or red. That made the old regex greens auditable from the job
+        # log (#1602).
         #
-        # Report only on THIS rung alone (#1603). The graded weather case cannot
-        # express what it is meant to assert here: it grades that a temperature
-        # figure is PRESENT, and under the cluster rung's provider-only egress
-        # the agent cannot fetch a forecast, so whether it reds or greens turns
-        # on nothing but how the model phrases its non-answer. A falsifiability
-        # probe pointing the egress allowance at TEST-NET-1, where nothing
-        # listens, still went green. The output above stays visible so anyone
-        # can see whether the agent has started fetching for real, and
-        # re-enabling is deleting this one guard. The skill, local and
-        # local-release rungs still fail on a bad grade; they fetch for real.
+        # Report only on THIS rung alone (#1603). Trajectory records a tool
+        # request before execution, so a denied or failed WebFetch can still
+        # satisfy identity and order. Fetch success remains unproved, and this
+        # oracle cannot distinguish an attempt from successful execution.
+        # Fatal grading requires proof that fetch succeeds, not merely that it
+        # was requested. The skill and local rungs still fail on a bad grade.
         # The rung is NOT blind either way: the plumbing assertions above (the
         # turn finalizes with a reply, and under live mode that reply is not the
         # fake sentinel) still fail it, and they are what caught the sandbox
         # reaper race in #1601.
         if ! (cd "$WORKDIR/bundle" && "$BIN" --json "${eval_args[@]}"); then
-            echo "cluster: eval reported a failing case. Not failing the rung: this rung's grade is report only (#1603)." >&2
+            echo "cluster: eval did not produce a passing grade. Not failing the rung: this eval is report only (#1603)." >&2
         fi
     fi
 

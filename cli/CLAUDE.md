@@ -261,14 +261,35 @@ A release candidate also runs the separately named release compose rung:
 CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
-Falsifiability gate (issue #619) -- a gate, NOT an E2E test: it never runs a real
-agent or makes a model call. Its real-path half boots the FAKE model and asserts
-every committed eval suite goes RED (a case that greens against a do-nothing
-agent is unfalsifiable, #527):
+Canonical parity example falsifiability convention (issue #1649): a committed
+example case must go RED when the specific capability it claims to test is
+removed. This is a capability identity mutation. A null agent control remains
+useful for catching vacuous graders, but it is not sufficient on its own because
+it removes the whole agent shape rather than the identity of the capability
+under test.
+
+An executable control can make the capability unavailable through the real
+consumer path. The weather evidence has two independent observations. A live
+control kept WebFetch declared, routed it through an approval gate, and supplied
+no approval. The turn awaited approval and eval failed before trajectory
+scoring, proving the capability was unavailable but not exercising the
+trajectory oracle. Separately, a focused regression completed a turn with
+WebSearch but no WebFetch and observed the committed trajectory oracle go RED.
+That regression proves a missing WebFetch request is detected. Trajectory
+records tool requests before execution, so a denied or failed WebFetch request
+can still satisfy identity and order. A trajectory green does not prove that
+fetch was reachable or successful. An approval gate is one valid control, not a
+universal required mechanism.
+
+The offline null agent control (issue #619) is a gate, NOT an E2E test: it never
+runs a real agent or makes a model call. Its real path half boots the FAKE model
+and asserts every committed eval suite goes RED against the null agent:
+
 ```bash
 curie dev eval-falsifiability   # bash cli/scripts/eval-falsifiability.sh
 ```
 The grader-level half (the `contains: "weather"` input-parrot vacuousness control
 and the known-good-exemplar positive control) rides `cargo test`
 (`cli/tests/eval_falsifiability.rs`); together they are the gate. Both run
-offline with no credential.
+offline with no credential. Passing this gate proves only the null agent
+control. Each parity example still needs separate capability removal evidence.
