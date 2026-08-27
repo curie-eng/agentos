@@ -178,6 +178,21 @@ assert_release_healthy() {
     # Read-only health proof: this harness never mutates the shared controller.
     kubectl -n "$CONTROLLER_NAMESPACE" rollout status \
         "deployment/$CONTROLLER_DEPLOYMENT" --timeout=300s >/dev/null
+    # A Deployment can report complete while the replaced pod is still serving
+    # its termination grace period.  Give that pod the same bounded opportunity
+    # to disappear that the product gives it before making the final hygiene
+    # assertion below.
+    local terminating_deadline=$((SECONDS + 60))
+    while (( SECONDS < terminating_deadline )); do
+        if ! worker_pods_json | python3 -c '
+import json,sys
+pods=json.load(sys.stdin).get("items", [])
+raise SystemExit(0 if any(p.get("metadata",{}).get("deletionTimestamp") for p in pods) else 1)
+'; then
+            break
+        fi
+        sleep 1
+    done
     worker_pods_json | python3 -c '
 import json,sys
 pods=json.load(sys.stdin).get("items", [])
