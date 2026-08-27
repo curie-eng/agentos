@@ -157,4 +157,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0128 | [An installation owns the model gateway and operator bindings select its aliases](0128-install-owned-model-gateway-and-agent-aliases.md) | Draft |
 | 0129 | [One release owns a cluster's shared singletons; every other release declares what it needs from them](0129-one-release-owns-a-clusters-shared-singletons.md) | Draft |
 | 0130 | [Deliberate progress is bounded durable channel state, not answer streaming](0130-deliberate-progress-is-bounded-durable-channel-state.md) | Accepted |
+| 0131 | [A delivery has one deadline and one renewable fenced owner](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md) | Accepted |
 <!-- END GENERATED: adr-index -->
