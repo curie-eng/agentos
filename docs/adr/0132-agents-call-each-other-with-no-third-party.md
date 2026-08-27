@@ -1,8 +1,8 @@
-# 115. Agents call each other directly, with no third party in the path
+# 132. Agents call each other directly, with no third party in the path
 
 Date: 2026-08-20
 
-Status: Draft
+Status: Accepted
 
 ## Context
 
@@ -365,8 +365,10 @@ spreading calls across targets.
   for the tokens.
 - **ADR-0044's phase 1 becomes buildable**, and the external-workflow caller
   reaches the same surface with a scoped token instead of the delegate tool.
-- **This is a Draft.** Per [ADR-0085](0085-acceptance-not-implementation-authorizes-an-adr.md)
-  it authorizes no implementation until a maintainer accepts it.
+- **This ADR is Accepted.** Per
+  [ADR-0085](0085-acceptance-not-implementation-authorizes-an-adr.md), the
+  recorded maintainer approval authorizes implementation; implementation remains
+  separate work.
 
 ## Alternatives considered
 
