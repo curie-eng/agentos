@@ -971,12 +971,22 @@ class TestReleaseWorkflowContract:
                 "name": "sre-bot-tempo",
                 "context": "examples/sre-bot/connectors/tempo",
                 "dockerfile": "examples/sre-bot/connectors/tempo/Dockerfile",
+                # release.yaml publishes every image for both architectures, so
+                # CI validates the example connectors on both. Without this the
+                # first place an arm64-only Dockerfile failure could appear was a
+                # release, where it fails the release rather than the pull
+                # request that introduced it.
+                "platforms": "linux/amd64,linux/arm64",
             }
         ]
         build_step = next(
             step for step in image_job["steps"] if step.get("name") == "Build (no push)"
         )
         assert build_step["with"]["context"] == "${{ matrix.context }}"
+        assert build_step["with"]["platforms"] == "${{ matrix.platforms }}", (
+            "the build step must read the per-entry platforms, so the platform "
+            "images keep building natively while the connectors cross-build"
+        )
         assert "Build sre-bot-tempo image (no push)" in authorize_module.REQUIRED_CHECK_NAMES
 
     def test_observability_stack_assertions_run_in_helm_ci(self):
