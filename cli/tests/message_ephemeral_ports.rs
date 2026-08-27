@@ -30,6 +30,45 @@ fn cluster_message_dry_run(extra: &[&str]) -> String {
     format!("{stdout}\n{stderr}")
 }
 
+fn write_eval_cases(dir: &Path) -> PathBuf {
+    let path = dir.join("cases.json");
+    fs::write(
+        &path,
+        r#"{"name":"smoke","cases":[{"id":"one","input":"hi","grader":{"kind":"contains","expected":"hi"}}]}"#,
+    )
+    .expect("write eval cases");
+    path
+}
+
+fn cluster_eval_dry_run(extra: &[&str]) -> String {
+    let dir = tempfile::tempdir().expect("create eval cases directory");
+    let cases = write_eval_cases(dir.path());
+    let output = Command::new(bin())
+        .args(["cluster", "eval"])
+        .args(extra)
+        .args([
+            "--cases",
+            cases.to_str().expect("cases path is utf-8"),
+            "--listen-host",
+            "127.0.0.1",
+            "--channel",
+            "C0EXAMPLE1",
+            "--dry-run",
+        ])
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
+        .env_remove("CURIE_API_KEY")
+        .env_remove("CURIE_VALKEY_PASSWORD")
+        .output()
+        .expect("run cluster eval dry run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "cluster eval dry run must succeed; stdout: {stdout}; stderr: {stderr}"
+    );
+    format!("{stdout}\n{stderr}")
+}
+
 fn write_fake_kubectl(dir: &Path, name: &str, readiness_host: &str) -> PathBuf {
     let path = dir.join(name);
     let body = r#"#!/usr/bin/env python3
@@ -142,6 +181,43 @@ fn cluster_message_preserves_explicit_port_overrides() {
     assert!(
         plan.contains("kubectl -n curie port-forward svc/curie-api 18157:8000"),
         "the explicit API local port must remain exact: {plan}"
+    );
+    assert!(
+        plan.contains("stub advertised at http://127.0.0.1:18155/api/"),
+        "the explicit listen port must remain exact: {plan}"
+    );
+}
+
+#[test]
+fn cluster_eval_uses_ephemeral_defaults() {
+    let plan = cluster_eval_dry_run(&[]);
+    assert!(
+        plan.contains("kubectl -n curie port-forward svc/curie-valkey 0:6379"),
+        "an omitted Valkey local port must request zero: {plan}"
+    );
+    assert!(
+        !plan.contains("56381:6379"),
+        "cluster eval must not select the historical fixed Valkey port: {plan}"
+    );
+    assert!(
+        plan.contains("stub advertised at http://127.0.0.1:0/api/"),
+        "an omitted listen port must request zero: {plan}"
+    );
+}
+
+#[test]
+fn cluster_eval_preserves_explicit_port_overrides() {
+    let plan = cluster_eval_dry_run(&[
+        "--listen-port",
+        "18155",
+        "--valkey-local-port",
+        "18156",
+        "--api-local-port",
+        "18157",
+    ]);
+    assert!(
+        plan.contains("kubectl -n curie port-forward svc/curie-valkey 18156:6379"),
+        "the explicit Valkey local port must remain exact: {plan}"
     );
     assert!(
         plan.contains("stub advertised at http://127.0.0.1:18155/api/"),

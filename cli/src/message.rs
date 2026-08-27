@@ -1761,7 +1761,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                         // listener is torn down before exit rather than leaked
                         // (#751).
                         ResumeExit::Transient => {
-                            exit_after_drop(crate::exit::ExitClass::Transient, stub);
+                            crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, stub);
                         }
                     }
                 }
@@ -1781,7 +1781,7 @@ async fn message_local(opts: MessageOpts) -> Result<()> {
                     persist_and_hint(&opts, TurnVerb::Local, &channel, &thread_ts);
                     // Drop the Slack stub first so its listener is not leaked past
                     // this non-unwinding exit (#751).
-                    exit_after_drop(crate::exit::ExitClass::Transient, stub);
+                    crate::exit::exit_after_drop(crate::exit::ExitClass::Transient, stub);
                 }
             }
         }
@@ -1886,28 +1886,6 @@ enum ResumeExit {
     /// is retryable: the caller drops its port-forward guards and exits with the
     /// transient class.
     Transient,
-}
-
-/// Exit the process with `class`, after dropping `guards` first.
-///
-/// `std::process::exit` does not unwind the stack, so any `Drop` impl still in
-/// scope at the call site -- the Slack stub's listener/server task
-/// ([`SlackStub`](crate::chat::SlackStub)), a `kubectl port-forward` child --
-/// would otherwise never run, leaking whatever it holds (#751: a timed-out
-/// `local message`/`cluster message` used to leak the stub's bound port this
-/// way, wedging every subsequent turn with "Address already in use").
-///
-/// Every exit site in this module that needs to tear down a guard before
-/// exiting routes through here instead of calling `std::process::exit`
-/// directly: `guards` is taken BY VALUE, so the compiler forces the caller to
-/// move ownership in (a `SlackStub`, a `tokio::process::Child`, or a tuple of
-/// several) rather than merely borrowing it, and this function drops it before
-/// the process actually exits. That makes the guard-then-exit ordering
-/// structural rather than something a future call site has to remember to do
-/// by hand.
-fn exit_after_drop<T>(class: crate::exit::ExitClass, guards: T) -> ! {
-    drop(guards);
-    std::process::exit(class.code());
 }
 
 /// Keep the reply stub alive after a turn parked awaiting approval and wait for
@@ -2596,7 +2574,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                             // orphaning the `kubectl port-forward` child to init
                             // (#766).
                             stub_trust.restore().await?;
-                            exit_after_drop(
+                            crate::exit::exit_after_drop(
                                 crate::exit::ExitClass::Transient,
                                 (stub, _valkey_pf, stub_trust),
                             );
@@ -2619,7 +2597,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
                     });
                     persist_and_hint(&opts, TurnVerb::Cluster, &channel, &thread_ts);
                     stub_trust.restore().await?;
-                    exit_after_drop(
+                    crate::exit::exit_after_drop(
                         crate::exit::ExitClass::Transient,
                         (stub, _valkey_pf, stub_trust),
                     );
@@ -2649,7 +2627,10 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
             // failure. Drop the Valkey port-forward now, for the same
             // non-unwinding reason as the stub above (#766).
             stub_trust.restore().await?;
-            exit_after_drop(crate::exit::ExitClass::Transient, (_valkey_pf, stub_trust));
+            crate::exit::exit_after_drop(
+                crate::exit::ExitClass::Transient,
+                (_valkey_pf, stub_trust),
+            );
         }
     }
 }
@@ -3460,7 +3441,7 @@ async fn eval_trajectory_platform(opts: EvalOpts, suite: EvalSuite) -> Result<()
         if let Some(report) =
             trajectory_matrix_report(&matrix, &triggered.sha, &triggered.stream_id)?
         {
-            return crate::commands::report_eval(&report, None);
+            return crate::commands::report_eval(&report, None, _api_pf);
         }
         if Instant::now() >= deadline {
             bail!(
@@ -3679,7 +3660,7 @@ async fn eval_local(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
     ui.note(&format!("routing to channel {channel}"));
 
     let results = run_eval_turns(&opts, &channel, &suite, &mut conn, &mut stub).await?;
-    crate::commands::report_eval(&results, None)
+    crate::commands::report_eval(&results, None, stub)
 }
 
 /// Whether a surfaced enqueue/await error looks like a timeout or a stalled
@@ -3790,7 +3771,9 @@ async fn eval_cluster(opts: EvalOpts, suite: EvalSuite) -> Result<()> {
         Ok(results) => results,
         Err(err) => return Err(enrich_cluster_enqueue_timeout(err).await),
     };
-    crate::commands::report_eval(&results, None)
+    // report_eval process::exits on a red suite without unwinding, so the
+    // Valkey forward and stub must move in as guards (#1908).
+    crate::commands::report_eval(&results, None, (_valkey_pf, stub))
 }
 
 #[cfg(test)]

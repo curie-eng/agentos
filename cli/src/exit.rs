@@ -43,6 +43,17 @@ impl ExitClass {
     }
 }
 
+/// Exit the process with `class` after dropping `guards` first.
+///
+/// `std::process::exit` does not unwind the stack, so any `Drop` impl still in
+/// scope at the call site -- a `kubectl port-forward` child, a Slack stub
+/// listener -- would otherwise never run. Taking `guards` by value makes the
+/// drop-then-exit ordering structural (#751, #766, #1908).
+pub fn exit_after_drop<T>(class: ExitClass, guards: T) -> ! {
+    drop(guards);
+    std::process::exit(class.code());
+}
+
 /// A tagged CLI error: a message, an optional actionable fix hint, and the exit
 /// class it maps to. Carried through `anyhow`'s chain so [`classify`] can recover
 /// the class even when the error was wrapped in later context.

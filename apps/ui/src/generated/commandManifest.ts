@@ -2658,10 +2658,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8155"
+                "0"
               ],
               "global": false,
-              "help": "Port the stub binds (0.0.0.0); the worker posts here",
+              "help": "Port the stub binds (0.0.0.0); the worker posts here. Default 0 lets the kernel assign an ephemeral port",
               "id": "listen_port",
               "long": "listen-port",
               "positional": false,
@@ -2669,10 +2669,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "56381"
+                "0"
               ],
               "global": false,
-              "help": "Local port the Valkey port-forward binds",
+              "help": "Local port the Valkey port-forward binds. Default 0 lets kubectl assign an ephemeral local port",
               "id": "valkey_local_port",
               "long": "valkey-local-port",
               "positional": false,
@@ -2689,10 +2689,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "8123"
+                "0"
               ],
               "global": false,
-              "help": "Local port the API port-forward binds (default-channel lookup)",
+              "help": "Local port the API port-forward binds (default-channel lookup). Default 0 is kernel-assigned, matching `cluster message`",
               "id": "api_local_port",
               "long": "api-local-port",
               "positional": false,
