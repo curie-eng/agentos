@@ -141,7 +141,7 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0109 | [Retention, capacity, and back pressure are one policy: a claim is admitted, not discovered](0109-retention-capacity-and-back-pressure-are-one-policy.md) | Draft |
 | 0110 | [Deterministic security posture classification distinguishes manifest declarations from operator gates](0110-deterministic-security-posture-classification.md) | Draft |
 | 0111 | [The default memory compaction algorithm](0111-the-default-memory-compaction-algorithm.md) | Draft |
-| 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Draft |
+| 0112 | [A turn source names what caused the turn, not the channel it arrived on](0112-a-turn-source-names-what-caused-the-turn.md) | Accepted |
 | 0113 | [Bundles declare connector build inputs and tiers deliver pinned images](0113-bundles-declare-connector-build-inputs-and-tiers-deliver-pinned-images.md) | Accepted |
 | 0114 | [Managed repository workspaces and approval-gated publication are platform capabilities](0114-managed-repository-workspaces-and-approval-gated-publication.md) | Accepted |
 | 0115 | [Runtime repository selection is sticky authorized thread state](0115-runtime-repository-selection-is-sticky-authorized-thread-state.md) | Accepted |

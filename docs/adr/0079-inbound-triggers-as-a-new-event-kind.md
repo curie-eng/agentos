@@ -3,6 +3,11 @@
 Date: 2026-07-10
 Status: Accepted
 
+**Superseded in part by
+[ADR-0112](0112-a-turn-source-names-what-caused-the-turn.md)**: decision 2's
+`source` value vocabulary changes from `slack | webhook | cron` to
+`message | webhook | cron`. Everything else in this decision stands.
+
 Proposes how "triggers beyond chat" (issue
 [#29](https://github.com/curie-eng/curie/issues/29)) enter the system: which
 service accepts a non-Slack trigger, and how a triggered turn produces output

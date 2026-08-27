@@ -2,7 +2,7 @@
 
 Date: 2026-08-18
 
-Status: Draft
+Status: Accepted
 
 Supersedes the value vocabulary of decision 2 in
 [ADR-0079](0079-inbound-triggers-as-a-new-event-kind.md). Everything else ADR-0079
