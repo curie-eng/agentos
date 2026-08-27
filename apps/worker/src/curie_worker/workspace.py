@@ -1212,6 +1212,7 @@ class WorkspaceClaimCoordinator:
         thread_key: str,
         deployment_id: uuid.UUID,
         env: dict[str, str] | None = None,
+        agent_name: str | None = None,
     ) -> WorkspaceClaimResult:
         """Prepare once, then cold-claim or resume a suspended route."""
 
@@ -1234,13 +1235,17 @@ class WorkspaceClaimCoordinator:
             ownership_staged = True
             claim_env = {**(env or {}), **prepared.claim_env()}
             try:
-                handle = self.substrate.claim(thread_key, env=claim_env)
+                handle = self.substrate.claim(
+                    thread_key, env=claim_env, agent_name=agent_name
+                )
             except Exception as exc:
                 # The substrate signal is injected to keep this worker-local
                 # port independent of the concrete Docker/Kubernetes package.
                 if not isinstance(exc, self._suspended_errors):
                     raise
-                handle = self.substrate.resume(thread_key, env=claim_env)
+                handle = self.substrate.resume(
+                    thread_key, env=claim_env, agent_name=agent_name
+                )
             sandbox_exposed = True
             self._commit_ownership(thread_key, prepared)
             return WorkspaceClaimResult(prepared=prepared, handle=handle)

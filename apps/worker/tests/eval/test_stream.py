@@ -93,6 +93,9 @@ class _StubRepo:
         # the agent's secrets so an authed-MCP bundle authenticates during eval.
         return None
 
+    async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+        return None
+
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         self.thinking_agent_id = agent_id
         return self._thinking
@@ -120,6 +123,7 @@ class _FakeClaim:
     sandbox_name: str
     labels: dict[str, str]
     env: dict[str, str]
+    pool: str = ""
 
 
 @dataclass
@@ -127,6 +131,8 @@ class _FakeK8s:
     namespace: str = "test-ns"
     claims: dict[str, _FakeClaim] = field(default_factory=dict)
     claim_envs: list[dict[str, str]] = field(default_factory=list)
+    created_pools: list[str] = field(default_factory=list)
+    created_labels: list[dict[str, str]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
 
     def create_claim(
@@ -138,11 +144,16 @@ class _FakeK8s:
         labels: dict[str, str] | None = None,
     ) -> None:
         self.claim_envs.append(dict(env or {}))
+        self.created_pools.append(pool)
+        self.created_labels.append(
+            {"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})}
+        )
         self.claims[name] = _FakeClaim(
             name=name,
             sandbox_name=f"sbx-{name}",
             labels={"curietech.ai/managed-by": "curie-sandbox-substrate", **(labels or {})},
             env=dict(env or {}),
+            pool=pool,
         )
 
     def get_claim(self, name: str) -> ClaimView | None:
@@ -909,7 +920,9 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str) -> None:
@@ -1051,7 +1064,9 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(self, _key: str, *, env: dict[str, str] | None = None) -> _FakeHandle:
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
@@ -1376,6 +1391,64 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
     assert env["GITHUB_PERSONAL_ACCESS_TOKEN"] == "ghp_ok"
     # ...and is the ONLY key marked as a delivered connector secret.
     assert env.get("CURIE_CONNECTOR_SECRET_KEYS") == "GITHUB_PERSONAL_ACCESS_TOKEN"
+
+
+def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatch) -> None:
+    """Eval is the sibling of the runs claim path (#1488): secrets + agent name
+    must route the claim to the per-agent pool, not the generic one."""
+    from curie_worker.eval import stream as stream_module
+    from curie_worker.sandbox.types import AGENT_LABEL
+
+    class _NamedSecrets(_StubRepo):
+        async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
+            return {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_ok"}
+
+        async def name_for(self, _agent_id: uuid.UUID) -> str | None:
+            return "acme-a"
+
+    async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
+        return EvalRunResult(version="deadbeef", suite="s", results=[])
+
+    monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
+    fake_k8s = _FakeK8s()
+    sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
+    affinity = AffinityStore(
+        redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False),
+        key_prefix=sandbox_prefix,
+    )
+    substrate = SandboxSubstrate(
+        fake_k8s,  # type: ignore[arg-type]
+        affinity,
+        SubstrateConfig(
+            namespace="test-ns",
+            warm_pool="curie-runner-pool",
+            claim_timeout_seconds=3.0,
+            poll_interval_seconds=0.005,
+            key_prefix=sandbox_prefix,
+        ),
+    )
+    consumer = _consumer(
+        WorkerConfig(fake_model=True),
+        bundle_store=_FakeBundleStore(
+            _suite_bundle(
+                EvalSuite(
+                    name="s",
+                    cases=[EvalCase(id="1", input="q", grader=Grader(kind=CONTAINS, expected="a"))],
+                )
+            )
+        ),
+        substrate=substrate,
+        reporter=_FakeReporter(),
+        repo_lookup=_NamedSecrets(),
+    )
+    item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.tgz", target_url=None)
+
+    async def go() -> None:
+        await consumer._run_and_report(item, "test-stream-id")
+
+    asyncio.run(go())
+    assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
+    assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
 
 
 def test_eval_threads_claim_token_into_run_eval_suite(monkeypatch) -> None:

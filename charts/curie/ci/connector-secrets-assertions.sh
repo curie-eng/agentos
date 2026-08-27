@@ -155,4 +155,41 @@ if ! helm template curie "$CHART" \
   fail "legitimate connector-secret name GITHUB_PERSONAL_ACCESS_TOKEN failed to render"
 fi
 
+# Per-agent egress (#1488): two agents with distinct connector CIDRs render
+# policies that select only that agent's pods. Cross-agent selection is the
+# leak this exists to prevent. The shared runner-allow-egress policy stays
+# unlabelled so model-API CIDRs remain fleet-wide.
+egress_render="$(helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.acme-a.GITHUB_PERSONAL_ACCESS_TOKEN=agent-a-sentinel' \
+  --set-string 'agentSandbox.connectorSecrets.acme-b.GITHUB_PERSONAL_ACCESS_TOKEN=agent-b-sentinel' \
+  --set 'agentSandbox.connectorEgress.acme-a[0].cidr=10.0.0.10/32' \
+  --set 'agentSandbox.connectorEgress.acme-b[0].cidr=10.0.0.20/32' \
+  --set 'security.networkPolicy.enabled=true' \
+  --set 'security.networkPolicy.allowedEgress[0].cidr=203.0.113.10/32' \
+  2>/dev/null)"
+
+policy_a="$(require_resource "$egress_render" NetworkPolicy curie-agent-acme-a-allow-egress)"
+policy_b="$(require_resource "$egress_render" NetworkPolicy curie-agent-acme-b-allow-egress)"
+require_text "$policy_a" 'curietech.ai/agent: "acme-a"' \
+  "acme-a egress policy does not select the acme-a agent label"
+require_text "$policy_b" 'curietech.ai/agent: "acme-b"' \
+  "acme-b egress policy does not select the acme-b agent label"
+forbid_text "$policy_a" 'curietech.ai/agent: "acme-b"' \
+  "acme-a egress policy also selects acme-b"
+forbid_text "$policy_b" 'curietech.ai/agent: "acme-a"' \
+  "acme-b egress policy also selects acme-a"
+require_text "$policy_a" '10.0.0.10/32' "acme-a egress policy lacks its connector CIDR"
+require_text "$policy_b" '10.0.0.20/32' "acme-b egress policy lacks its connector CIDR"
+forbid_text "$policy_a" '10.0.0.20/32' "acme-b CIDR leaked into acme-a egress policy"
+forbid_text "$policy_b" '10.0.0.10/32' "acme-a CIDR leaked into acme-b egress policy"
+
+shared_egress="$(require_resource "$egress_render" NetworkPolicy curie-runner-allow-egress)"
+forbid_text "$shared_egress" 'curietech.ai/agent' \
+  "shared runner-allow-egress must not select a per-agent label"
+forbid_text "$shared_egress" '10.0.0.10/32|10.0.0.20/32' \
+  "per-agent connector CIDR leaked into the shared allow-egress policy"
+
+forbid_text "$default_render" 'curie-agent-.*-allow-egress' \
+  "per-agent egress policy rendered with no connectorEgress"
+
 echo "OK: per-agent connector-secret render assertions passed"

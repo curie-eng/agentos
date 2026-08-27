@@ -978,6 +978,7 @@ class Kernel:
             # polite drop, not a crash.
             boot_env: dict[str, str] | None = None
             agent_id: uuid.UUID | None = None
+            agent_name: str | None = None
             workspace_deployment_id: uuid.UUID | None = None
             nav: NavAffordance | None = None
             packs: BehaviorPacks | None = None
@@ -1022,6 +1023,7 @@ class Kernel:
                     )
                     return
                 agent_id = resolved.agent_id
+                agent_name = getattr(resolved, "agent_name", None)
                 # The scoped key, not the bare conversation id: this mints the
                 # sandbox's history ref and session id, so two channels sharing
                 # a conversation id must not rehydrate one another's transcript.
@@ -1117,6 +1119,7 @@ class Kernel:
                     nav,
                     packs,
                     workspace_deployment_id,
+                    agent_name,
                 )
 
                 if outcome.status is SessionStatus.AWAITING_APPROVAL:
@@ -1761,6 +1764,7 @@ class Kernel:
         nav: NavAffordance | None = None,
         packs: BehaviorPacks | None = None,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
     ) -> TurnOutcome:
         thread_key = _thread_key_for(qevent)
 
@@ -1796,6 +1800,7 @@ class Kernel:
                     boot_env,
                     packs,
                     workspace_deployment_id=workspace_deployment_id,
+                    agent_name=agent_name,
                     source=qevent.source,
                 )
         except CapacityExhaustedError as exc:
@@ -1942,6 +1947,7 @@ class Kernel:
         packs: BehaviorPacks | None = None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
         source: TurnSource = TurnSource.SLACK,
     ) -> _RouteResult:
         # A workspace-enabled thread must establish (or confirm) its repository
@@ -1999,6 +2005,7 @@ class Kernel:
             thread_key,
             boot_env,
             workspace_deployment_id=workspace_deployment_id,
+            agent_name=agent_name,
         )
         retained_live_route = existing_handle is not None and handle == existing_handle
         claim_ms = round((time.monotonic() - claim_started) * 1000)
@@ -2100,6 +2107,7 @@ class Kernel:
         boot_env: dict[str, str] | None,
         *,
         workspace_deployment_id: uuid.UUID | None = None,
+        agent_name: str | None = None,
     ) -> SandboxHandle:
         # A live route is an adopt/steer, not a session start. Preparing before
         # this check would clone on every threaded steer and could even replace
@@ -2129,6 +2137,7 @@ class Kernel:
                 thread_key=thread_key,
                 deployment_id=workspace_deployment_id,
                 env=boot_env,
+                agent_name=agent_name,
             )
             if not isinstance(workspace_claim.handle, SandboxHandle):
                 raise WorkspacePreparationError(
@@ -2136,13 +2145,17 @@ class Kernel:
                 )
             return workspace_claim.handle
         try:
-            return await asyncio.to_thread(self._substrate.claim, thread_key, env=boot_env)
+            return await asyncio.to_thread(
+                self._substrate.claim, thread_key, env=boot_env, agent_name=agent_name
+            )
         except SuspendedThreadError:
             # Resume with the same bound boot env a fresh claim gets (bundle
             # ref, budget, refs): a suspended pod was deleted (ADR-0003), so
             # the replacement boots from env alone; without this it would come
             # up generic, without the agent's bundle.
-            return await asyncio.to_thread(self._substrate.resume, thread_key, env=boot_env)
+            return await asyncio.to_thread(
+                self._substrate.resume, thread_key, env=boot_env, agent_name=agent_name
+            )
 
     @staticmethod
     def _is_approval_resume(event_id: str) -> bool:

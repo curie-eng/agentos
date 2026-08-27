@@ -1389,14 +1389,25 @@ agentSandbox:
   # entry renders as its OWN Kubernetes Secret
   # (<fullname>-agent-<name>-connector-secrets), kept off the shared chart
   # Secret and off the value-only SandboxClaim CR. The runner sandbox reads a
-  # value via a per-agent SandboxTemplate `secretKeyRef` (the binding half is
-  # cluster-verified, tracked separately). Empty by default; supply per agent,
+  # value via a per-agent SandboxTemplate `secretKeyRef`. Worker claims route
+  # to that agent's pool (#1488). Empty by default; supply per agent,
   # e.g.:
   #   connectorSecrets:
   #     github-issues:
   #       GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_..."
   # Prefer `--set-file`/a sealed values file over inlining a real token.
   connectorSecrets: {}
+  # Per-agent connector egress (ADR-0009, #1488): agent name -> the CIDR
+  # entries that agent's runner pods may reach. Each entry renders as its own
+  # NetworkPolicy selecting curietech.ai/agent=<name>, so one agent's connector
+  # host is not opened for every runner. Model-API CIDRs stay on
+  # security.networkPolicy.allowedEgress (fleet-wide). Empty by default.
+  #   connectorEgress:
+  #     acme-a:
+  #       - cidr: 10.20.0.2/32
+  #         ports:
+  #           - { protocol: TCP, port: 443 }
+  connectorEgress: {}
   controller:
     # Installs the vendored kubernetes-sigs/agent-sandbox v0.5.0 controller
     # (namespace agent-sandbox-system, RBAC, webhook Service, Deployment with
