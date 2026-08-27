@@ -153,4 +153,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0121 | [A restore is the connector's own verb, run under the same pinned connector](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md) | Draft |
 | 0122 | [A warm pool's runner token is per version, not per pod](0122-a-warm-pools-runner-token-is-per-version-not-per-pod.md) | Draft |
 | 0124 | [A snapshot is sealed to the connector that wrote it](0124-a-snapshot-is-sealed-to-the-connector-that-wrote-it.md) | Draft |
+| 0126 | [A write connector declares permitted field paths, and the agent composes within them](0126-a-write-connector-declares-permitted-field-paths-and-the-agent-composes-within-them.md) | Draft |
 <!-- END GENERATED: adr-index -->
