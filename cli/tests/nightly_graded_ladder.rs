@@ -541,7 +541,18 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
         # resolve the way the real CLI resolves them: a host edit after boot is
         # invisible to the running runner, and a re-up on the edited source packs
         # a NEW digest.
+        #
+        # A second `up` after a source edit (#1905) also prints the replacement
+        # line e2e.sh greps for, and snapshots SKILL.md so `docker exec` of the
+        # /plugin mount sees the bytes packed at THIS up, not the live host file.
+        if [ -f "$STUB_STATE/skill_digest" ]; then
+            echo "bundle changed: replacing the recorded runner 'curie-e2e-runner' first"
+        fi
         printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        skill=$(find "$PWD/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort | head -1)
+        if [ -n "$skill" ]; then
+            cp "$skill" "$STUB_STATE/mounted_skill.md"
+        fi
         echo "stub: runner up"
         # e2e.sh asserts the boot panel NAMES the model path it resolved, and
         # that it does not cry wolf about a missing credential. This arm is the
@@ -647,16 +658,23 @@ esac
 "#,
     );
 
-    // The ladder's raw-docker uses are all either "is a stack already running"
-    // or "assert nothing survived", so an unrecognized invocation returning
-    // nothing is the honest default here; the two reads that carry a real
-    // answer (the compose-worker selection and its env inspect) get explicit
-    // arms above it.
+    // The ladder's raw-docker uses are "is a stack already running",
+    // "assert nothing survived", and e2e.sh's /plugin mount proof. An
+    // unrecognized invocation returning nothing is the honest default; the
+    // reads that carry a real answer (compose-worker selection, env inspect,
+    // and the snapshotted SKILL.md) get explicit arms.
     write_executable(
         &dir.join("docker"),
         r#"#!/bin/sh
 set -u
 case "$*" in
+    "exec "*" cat /plugin/"*)
+        # e2e.sh proves the /plugin mount is the snapshot packed at skill up,
+        # not the live host file. Replay the SKILL.md bytes that arm saved.
+        if [ -f "$STUB_STATE/mounted_skill.md" ]; then
+            cat "$STUB_STATE/mounted_skill.md"
+        fi
+        ;;
     "inspect "*)
         # A failed env read, on its own knob: an inspect that dies (the worker
         # exited since the `docker ps`, or a daemon blip) prints nothing, which
