@@ -106,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -130,6 +130,18 @@ jobs:
           - name: sre-bot-tempo
             context: examples/sre-bot/connectors/tempo
             dockerfile: examples/sre-bot/connectors/tempo/Dockerfile
+          # The bundle's two write connectors. Without a published image a
+          # `build:`-declaring connector is refused at the cluster tier (a
+          # cluster cannot pull an image that exists only in one machine's
+          # Docker daemon), so an unpublished write connector is a write verb
+          # the live bot cannot have -- which is how `k8s-scale` came to be
+          # merged, reviewed, and undeployable.
+          - name: sre-bot-k8s-write
+            context: examples/sre-bot/connectors/k8s-write
+            dockerfile: examples/sre-bot/connectors/k8s-write/Dockerfile
+          - name: sre-bot-k8s-scale
+            context: examples/sre-bot/connectors/k8s-scale
+            dockerfile: examples/sre-bot/connectors/k8s-scale/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -226,7 +238,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-k8s-write, sre-bot-k8s-scale]
     steps:
       - name: Download digests
         id: download_digests
