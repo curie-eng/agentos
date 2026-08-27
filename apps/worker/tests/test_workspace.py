@@ -686,11 +686,15 @@ class _RecordingSubstrate:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, str]]] = []
 
-    def claim(self, thread_key: str, *, env: dict[str, str] | None = None) -> object:
+    def claim(
+        self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> object:
         self.calls.append(("claim", thread_key, dict(env or {})))
         return object()
 
-    def resume(self, thread_key: str, *, env: dict[str, str] | None = None) -> object:
+    def resume(
+        self, thread_key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> object:
         self.calls.append(("resume", thread_key, dict(env or {})))
         return object()
 
@@ -709,7 +713,9 @@ def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
     class CrashingSubstrate:
         observed: Any | None = None
 
-        def claim(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+        def claim(
+            self, claimed_thread: str, *, env: dict[str, str] | None = None, **_: object
+        ) -> object:
             restarted = workspace.WorkspaceClaimCoordinator(
                 preparer=preparer,
                 substrate=_RecordingSubstrate(),
@@ -756,7 +762,9 @@ def test_workspace_claim_or_resume_failure_restores_prior_durable_ownership(
     class FailingSubstrate(_RecordingSubstrate):
         failure_mode: str | None = None
 
-        def claim(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+        def claim(
+            self, claimed_thread: str, *, env: dict[str, str] | None = None, **_: object
+        ) -> object:
             self.calls.append(("claim", claimed_thread, dict(env or {})))
             if self.failure_mode == "claim":
                 raise RuntimeError("claim refused")
@@ -764,7 +772,9 @@ def test_workspace_claim_or_resume_failure_restores_prior_durable_ownership(
                 raise Suspended("route is suspended")
             return object()
 
-        def resume(self, claimed_thread: str, *, env: dict[str, str] | None = None) -> object:
+        def resume(
+            self, claimed_thread: str, *, env: dict[str, str] | None = None, **_: object
+        ) -> object:
             self.calls.append(("resume", claimed_thread, dict(env or {})))
             raise RuntimeError("resume refused")
 
@@ -811,10 +821,10 @@ def test_fresh_claim_and_resume_each_prepare_a_new_workspace_and_reap_the_old_ob
 
     original_claim = substrate.claim
 
-    def claim(thread_key: str, *, env: dict[str, str] | None = None) -> object:
+    def claim(thread_key: str, *, env: dict[str, str] | None = None, **kwargs: object) -> object:
         if substrate.calls:
             raise Suspended(thread_key)
-        return original_claim(thread_key, env=env)
+        return original_claim(thread_key, env=env, **kwargs)
 
     substrate.claim = claim  # type: ignore[method-assign]
     coordinator = workspace.WorkspaceClaimCoordinator(

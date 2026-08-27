@@ -9,6 +9,7 @@ pub mod artifacts;
 pub mod bundle;
 pub mod channel;
 pub mod chat;
+pub mod cluster_secrets;
 pub mod commands;
 pub mod comms;
 pub mod connector_build;

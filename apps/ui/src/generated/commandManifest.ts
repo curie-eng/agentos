@@ -3550,6 +3550,14 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Helm chart used to write per-agent connector Secrets. Default: the version-pinned chart release asset on release builds; local `charts/curie` on dev builds",
+              "id": "chart",
+              "long": "chart",
+              "positional": false,
+              "required": false
+            },
+            {
               "env": "CURIE_API_KEY",
               "global": false,
               "help": "Platform API key. Omit to auto-discover the release Secret key (`<release>-secrets`); the discovered key travels only in the X-API-Key header over the loopback tunnel, never over the cleartext NodePort proxy (ADR-0057). An explicit value wins",
@@ -3620,7 +3628,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Per-agent connector secrets are NOT yet delivered at the cluster tier (#440): this flag is accepted only so it can be DECLINED with a reason instead of erroring like a typo. Until per-agent K8s Secret + secretKeyRef delivery lands, a value-only SandboxClaim CR would persist the token in plaintext in etcd. Use `curie local deploy --secret` today. See ADR-0009",
+              "help": "Per-agent connector secrets: values are written to the agent's Helm Secret through a private values file (never argv). The SandboxClaim stays names-only. See ADR-0009 / #1488",
               "id": "secret",
               "long": "secret",
               "positional": false,

@@ -3908,11 +3908,9 @@ pub struct DeployOpts {
     /// forward into the sandbox. From `deploy --secret <NAME>`.
     pub secret: Vec<String>,
     /// Whether this tier offers `--secret` binding, gating the declared-secrets
-    /// policy check (#464): true for tiers that can bind a declared secret
-    /// (local), false where secret delivery is not yet wired (cluster, until
-    /// #440 flips it). When false the gate is skipped -- otherwise every
-    /// secrets-declaring bundle would hard-fail with a `--secret <NAME>`
-    /// remediation that does not exist on that tier.
+    /// policy check (#464): true when the tier can bind a declared secret
+    /// (local by value, cluster via the per-agent Helm Secret). When false the
+    /// gate is skipped.
     pub secret_binding_supported: bool,
     /// Actionable remediation line printed when the platform API connection
     /// fails (e.g. the kubectl port-forward command for cluster, or
@@ -4045,9 +4043,8 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
     // the ticket -- a missing binding otherwise surfaces later as a runtime auth
     // failure (#429). This runs in the shared deploy() path, pre-network, so it
     // covers BOTH `local deploy` and `cluster deploy`. It is gated on
-    // `secret_binding_supported` (AC2): cluster deploy cannot bind a `--secret`
-    // until #440 wires delivery, so enforcing there would hard-fail every
-    // secrets-declaring bundle with a remediation the tier cannot satisfy. It
+    // `secret_binding_supported` (AC2): skip only on a tier that still cannot
+    // bind. Cluster binding is #1488. It
     // runs first, before the archive is even packed: the check is a pure
     // name-set diff on `opts.secret` (the bound NAME set) and needs no packed
     // bundle or resolved values, so a declared-but-unbound policy fails fast
@@ -4201,7 +4198,10 @@ pub async fn deploy(opts: DeployOpts) -> Result<DeployOutput> {
             &created_by,
             env,
             archive,
-            &secrets,
+            &match opts.tier {
+                DeployTier::Local => secrets.clone(),
+                DeployTier::Cluster => crate::cluster_secrets::agent_record_secrets(&secrets),
+            },
             opts.repo.as_deref(),
             commit_sha.as_deref(),
             opts.workspace,
@@ -7570,10 +7570,10 @@ mod tests {
 
     #[tokio::test]
     async fn deploy_skips_secrets_gate_when_binding_unsupported() {
-        // AC2: the cluster tier cannot bind a `--secret` until #440, so the
-        // declared-secrets gate is SKIPPED there. A secrets-declaring bundle must
-        // NOT be preempted by the gate; deploy proceeds to the network and fails
-        // on the connect path instead (naming the connect hint, never the secret).
+        // AC2: a tier that cannot bind `--secret` skips the declared-secrets
+        // gate so a secrets-declaring bundle is not preempted with a
+        // remediation that does not exist. Cluster now binds (#1488); this
+        // pin is the skip itself.
         let dir = tempfile::tempdir().unwrap();
         scaffold_with_secrets(dir.path(), "test-agent", &["GITHUB_PERSONAL_ACCESS_TOKEN"]);
 

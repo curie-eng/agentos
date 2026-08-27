@@ -119,7 +119,7 @@ RUNNER_TOKEN_ENV = BootEnv.env_key("runner_token")
 APPROVAL_REQUIRED_ENV = BootEnv.env_key("approval_required_tools")
 # Marks which boot-env keys are per-agent connector secrets (ADR-0009, #429).
 # The k8s substrate reads it to strip those plaintext values off the value-only
-# SandboxClaim CR (their secretKeyRef delivery is #440); the docker substrate
+# SandboxClaim CR (their secretKeyRef delivery is #1488); the docker substrate
 # forwards them directly. The marker and the keys it names are both kept off the
 # k8s claim, so a connector secret is never persisted in etcd.
 CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
@@ -534,6 +534,17 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def name_for(self, agent_id: uuid.UUID) -> str | None:
+        """The agent's NAME for eval pool routing (#1488). None if unknown."""
+        sql = text(f"SELECT name FROM {self._config.db_schema}.agents WHERE id = :id")
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            row = result.first()
+        if row is None:
+            return None
+        value: str | None = row[0]
+        return value
+
     async def thinking_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's thinking depth for eval sandbox boots."""
         sql = text(f"SELECT thinking FROM {self._config.db_schema}.agents WHERE id = :id")
@@ -731,11 +742,11 @@ class BindingResolver:
         # `.mcp.json` `${VAR}` expansion consumes them. Injected by value; the
         # docker substrate forwards them as `-e KEY=VALUE`, while the k8s
         # substrate strips them off its plaintext claim CR by the marker
-        # CURIE_CONNECTOR_SECRET_KEYS (their secretKeyRef delivery is #440).
+        # CURIE_CONNECTOR_SECRET_KEYS (their secretKeyRef delivery is #1488).
         # Runs AFTER the render so the reserved-name filter sees the rendered
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
-        inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
+        inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_name)
         return env
 
 
