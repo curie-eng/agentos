@@ -335,6 +335,12 @@ Known seam pairs:
   `APPROVE_ACTION_ID_PREFIX` (`cli/src/chat.rs`) can't share code across
   Python/Rust, so they are frozen together in
   `tests/vectors/approval-action-ids.json`.
+- API vs worker vs CLI thread-reset SET -- `THREAD_RESET_SET` /
+  `THREAD_RESET_INFLIGHT_SET` (`apps/api/src/curie_api/threadreset.py`,
+  `apps/worker/src/curie_worker/consumer.py`) and the CLI's `THREAD_RESET_SET`
+  (`cli/src/queue.rs`) can't share code across Python/Rust. Operator
+  `reset-thread` and `local`/`cluster` eval (#1534) both SADD the same set.
+  Frozen in `tests/vectors/thread-reset-set.json`.
 - real SDK vs fake model session in the runner (`FakeModelSession`, `runner/src/curie_runner/fake.py`).
 - runs lane vs eval lane stream consumers (`apps/worker/src/curie_worker/consumer.py` vs `eval/stream.py`, both on the shared `stream_consumer.py`).
 - CLI-side vs API-side input validation (validate at the API/persistence boundary, mirror in the CLI).

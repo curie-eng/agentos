@@ -37,7 +37,7 @@ curie skill up && curie skill message "hello, what can you do?"
 ```
 
 You now have a working agent. Edit `skills/my-agent/SKILL.md` to change what it <!-- doclint:ignore-line -->
-does, then `curie skill up --replace` to reload it.
+does, then `curie skill up` again to reload it.
 
 No credential handy? `curie skill up --fake-model` runs the whole loop offline
 with scripted replies — enough to prove the plumbing, not to judge the agent.
@@ -74,7 +74,8 @@ curie cluster deploy --plugin-dir . --namespace my-agent --release my-agent \
 
 The plain install reads the exported `sk-ant-` credential and infers Anthropic
 egress. If admission reports that the cluster has no `gvisor` RuntimeClass,
-Curie applies `security.gvisor.mode=off` and retries once. It also reuses
+Curie shows that attempt as retrying, applies `security.gvisor.mode=off`, and
+retries once. It also reuses
 PriorityClasses and the sandbox controller when their complete Helm ownership
 metadata names an existing release. Every applied inference is printed with
 its equivalent override.

@@ -318,12 +318,13 @@ in Langfuse traces.
 `skill up` also packs the bundle into a content-addressed snapshot under
 `<bundle>/.curie/snapshots/<digest>/` and mounts that read-only, matching what
 the local and cluster tiers do with a deployed bundle. So editing a bundle file
-on the host does not reach the running runner: re-run `curie skill up
---replace` and confirm the new `bundle_digest` in `curie skill status --json`.
-`evals/cases.json` and its optional `evals/trajectory.json` sidecar are the
-exceptions. `skill eval` reads them live from source, so an eval edit needs no
-restart. `skill down` and `--replace` release the snapshot along with the
-container.
+on the host does not reach the running runner: re-run `curie skill up` and
+confirm the new `bundle_digest` in `curie skill status --json`. A verified
+same-directory runner is replaced automatically; `--replace` still forces a
+restart of an unchanged snapshot or a leftover name. `evals/cases.json` and its
+optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
+them live from source, so an eval edit needs no restart. `skill down` and a
+replacement `up` release the snapshot along with the container.
 
 #### `local` target
 
@@ -344,6 +345,8 @@ the optional Slack dispatcher.
 | `curie local message "..."` | Drive the local compose stack end to end with zero Slack. Enqueues straight to the compose Valkey and lets the containerized worker answer. |
 | `curie local eval` | Run the deployed bundle's eval suite through the compose platform. Without a trajectory sidecar, it uses the enqueue, worker, sandbox, and reply path with the shared grader. With `evals/trajectory.json`, it triggers the worker eval plane and reads each structured trajectory verdict from the exact matrix stream. Prints the same per case table and rollup, with nonzero exit on failure.<br>• `--cases` overrides the file only for a text graded run. It is refused for a trajectory run because the platform grades the deployed bundle.<br>• `--dry-run` prints the plan.<br>• `--concurrency` defaults to 1. Values above 1 are refused for now (#709). |
 | `curie local deploy` | Package the bundle as tar.gz and push it to the compose platform API (`--api-url`, default `http://localhost:28000`). Auth via `--api-key` or `CURIE_API_KEY`. |
+| `curie local memory <agent>` | List the agent's durable memory log (`GET /agents/{id}/memory`). Empty when none exist. |
+| `curie local memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A fresh session is required before the entry is injected at boot. `--dry-run` prints the plan. |
 | `curie local overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the compose platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
 | `curie local reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the compose platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 
@@ -407,6 +410,9 @@ Wraps the umbrella Helm chart and the deployed release, the way `linkerd` or
 | `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking]` | Read or change the agent's two nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it. |
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | Delete an agent via the platform API (`DELETE /agents/{id}`). Destructive and irreversible: refuses without `--yes`. |
+
+| `curie cluster memory <agent>` | List the agent's durable memory log (`GET /agents/{id}/memory`). Empty when none exist. |
+| `curie cluster memory <agent> --add <content>` | Append an operator-authored memory record (`POST /agents/{id}/memory`). The API stamps operator provenance. A fresh session is required before the entry is injected at boot. `--dry-run` prints the plan. |
 
 All authenticated cluster API verbs (`versions`, `memory`, `approvals`, `kill`,
 `resume`, `budget`, `overrides`, `reset-thread`, and `delete`) act on a deployed

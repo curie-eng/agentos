@@ -4850,7 +4850,10 @@ enum GvisorInstallRace {
 
 enum GvisorInstallOutcome {
     Installed,
-    RuntimeClassRejected(String),
+    RuntimeClassRejected {
+        rejection: String,
+        step: crate::ui::Step,
+    },
 }
 
 async fn run_install_with_gvisor_observer(
@@ -4990,8 +4993,7 @@ async fn run_install_with_gvisor_observer(
                 let _ = terminate_process(&mut watch.child).await;
             }
             install.terminate().await;
-            step.fail("failed");
-            Ok(GvisorInstallOutcome::RuntimeClassRejected(rejection))
+            Ok(GvisorInstallOutcome::RuntimeClassRejected { rejection, step })
         }
     }
 }
@@ -5426,10 +5428,11 @@ async fn run_prepared_up(
             .await?;
             match outcome {
                 GvisorInstallOutcome::Installed => {}
-                GvisorInstallOutcome::RuntimeClassRejected(rejection) if detect_facts => {
+                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } if detect_facts => {
                     if let Some(mode @ ("auto" | "require")) =
                         final_operator_value(&opts, GVISOR_MODE_KEY)
                     {
+                        step.fail("failed");
                         let assignment = format!("{GVISOR_MODE_KEY}={mode}");
                         let fix = format!(
                             "remove the explicit `{assignment}` setting and rerun to accept the inferred gVisor posture"
@@ -5440,6 +5443,7 @@ async fn run_prepared_up(
                         .with_fix(fix)
                         .into());
                     }
+                    step.warn("retrying");
                     value_plan.set(GVISOR_MODE_KEY, "off");
                     ClusterUpInference::GvisorOff.render(ui);
                     let retry = up_commands_with_plan(&opts, &value_plan)
@@ -5448,7 +5452,8 @@ async fn run_prepared_up(
                         .expect("cluster up always has one Helm command");
                     run_step(&cl, &label, "installed", &retry).await?;
                 }
-                GvisorInstallOutcome::RuntimeClassRejected(rejection) => {
+                GvisorInstallOutcome::RuntimeClassRejected { rejection, step } => {
+                    step.fail("failed");
                     let fix = "curie cluster up --set security.gvisor.mode=off";
                     return Err(crate::exit::CliError::failure(format!(
                         "gVisor preflight Job `{job}` could not create its pod: {rejection}. To install without gVisor isolation, run `{fix}`."

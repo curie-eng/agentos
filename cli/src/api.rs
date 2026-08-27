@@ -275,12 +275,27 @@ pub struct Version {
     pub bundle_ref: Option<String>,
 }
 
+/// Provenance nested on ``MemoryEntryOut`` (`MemoryProvenanceOut`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MemoryProvenance {
+    #[serde(default)]
+    pub learned_from_session_id: Option<String>,
+    #[serde(default)]
+    pub source_trace_ids: Vec<String>,
+    #[serde(default)]
+    pub recorded_at: String,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
 /// One learned memory entry (`MemoryEntryOut`) for the `memory` listing verb.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryEntry {
     pub index: u64,
     pub content: String,
     pub version: u64,
+    #[serde(default)]
+    pub provenance: MemoryProvenance,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1285,6 +1300,24 @@ impl ApiClient {
             .json()
             .await
             .context("decoding memory list")
+    }
+
+    /// Append an operator-authored memory record: `POST /agents/{id}/memory`.
+    pub async fn create_memory(&self, agent_id: &str, content: &str) -> Result<MemoryEntry> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/agents/{agent_id}/memory", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .json(&json!({ "content": content })),
+                "POST /agents/{id}/memory",
+            )
+            .await?;
+        Self::expect_ok(resp, "creating memory")
+            .await?
+            .json()
+            .await
+            .context("decoding created memory entry")
     }
 
     /// The pending approval records for an agent: `GET /approvals?status_filter=
