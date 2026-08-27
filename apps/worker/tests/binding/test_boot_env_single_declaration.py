@@ -91,6 +91,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # from the WORKER's env at worker startup. Never a sandbox boot key.
         "CURIE_BOOTING_TEXT",
         "CURIE_CONSUMER_GROUP",
+        "CURIE_CONSUMER_CAPABILITY_TTL_MS",
+        "CURIE_CONSUMER_HEARTBEAT_TTL_MS",
         "CURIE_CONSUMER_NAME",
         "CURIE_DEAD_LETTER_MAXLEN",
         "CURIE_MAX_ATTEMPTS",

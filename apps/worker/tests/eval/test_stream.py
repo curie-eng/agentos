@@ -41,6 +41,11 @@ from curie_test_support.valkey import (
 from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, MODEL_ENV, THINKING_ENV
 from curie_worker.bundle_store import BundleStore
 from curie_worker.config import WorkerConfig
+from curie_worker.consumer_liveness import (
+    ConsumerLivenessStore,
+    consumer_heartbeat_capable_key,
+    consumer_heartbeat_key,
+)
 from curie_worker.eval import (
     EvalCase,
     EvalJob,
@@ -305,6 +310,93 @@ def test_eval_read_loop_demotes_idle_timeout_to_debug(make_eval_harness, bundles
                 assert conn_recs and all(r.levelno == logging.WARNING for r in conn_recs)
 
             await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_eval_consumer_publishes_and_renews_shared_liveness_lifecycle(
+    make_eval_harness, bundles
+) -> None:
+    store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _client):
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(
+                f"test:evals:{token}",
+                f"g-{token}",
+                reclaim_min_idle_ms=300,
+                consumer_heartbeat_ttl_ms=150,
+                consumer_capability_ttl_ms=450,
+                read_block_ms=10,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                alive = consumer_heartbeat_key(
+                    cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                )
+                capable = consumer_heartbeat_capable_key(
+                    cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                )
+                release = asyncio.Event()
+                fake.responses["held-eval"] = "done"
+                fake.hold_inputs["held-eval"] = release
+                bundle_ref = upload(
+                    EvalSuite(
+                        name="liveness",
+                        cases=[
+                            EvalCase(
+                                id="held",
+                                input="held-eval",
+                                grader=Grader(kind=CONTAINS, expected="done"),
+                            )
+                        ],
+                    )
+                )
+                await consumer.ensure_group()
+                await client.xadd(
+                    cfg.eval_stream,
+                    {
+                        "payload": _item(
+                            suite="liveness",
+                            sha=f"sha-{token}",
+                            bundle_ref=bundle_ref,
+                            target_url=base_url,
+                        ).model_dump_json()
+                    },
+                )
+                task = asyncio.create_task(consumer.run())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if await client.exists(alive) and await client.exists(capable):
+                        break
+                    await asyncio.sleep(0.005)
+                assert await client.exists(alive)
+                assert await client.exists(capable)
+
+                await _wait_until(lambda: bool(fake.seen))
+                consumer.request_stop()
+                await asyncio.sleep(0.35)
+                assert not task.done(), "graceful stop must drain the inline eval handler"
+                assert await client.pttl(alive) > 0
+                assert await client.pttl(capable) > 0
+                release.set()
+                await task
+                assert reports and reports[0]["passed_count"] == 1
+                assert not await client.exists(alive)
+                assert await client.exists(capable)
+
+            await client.delete(cfg.eval_stream, alive, capable)
             await client.aclose()
 
     asyncio.run(go())
@@ -865,8 +957,10 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idl
             cfg = _cfg(
                 f"test:evals:{token}",
                 f"g-{token}",
-                reclaim_min_idle_ms=900000,
+                reclaim_min_idle_ms=5000,
                 reclaim_interval_s=0.05,
+                consumer_heartbeat_ttl_ms=30,
+                consumer_capability_ttl_ms=6000,
             )
             client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
             reports: list[dict[str, Any]] = []
@@ -879,9 +973,8 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idl
                     reports=reports,
                     lf_client=lf_client,
                 )
-                # Production eval pins this to reclaim_min_idle_ms because its
-                # read loop is inline. Pin 0 here so this sibling proves the
-                # shared helper, not XAUTOCLAIM.
+                # Force only the prompt candidate observation threshold; the
+                # shared heartbeat proof and delivery bound remain unchanged.
                 consumer._delivery = replace(consumer._delivery, dead_consumer_idle_ms=0)
                 await consumer.ensure_group()
                 sha = f"sha-{token}"
@@ -896,7 +989,23 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idl
                 pending = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
                 assert pending["pending"] == 1
 
-                await _drain_one(consumer, reports)
+                liveness = ConsumerLivenessStore(client)
+                await liveness.publish(
+                    stream=cfg.eval_stream,
+                    group=cfg.eval_consumer_group,
+                    consumer="dead-consumer",
+                    heartbeat_ttl_ms=1,
+                    capability_ttl_ms=cfg.consumer_capability_ttl_ms,
+                )
+                await asyncio.sleep(0.01)
+                assert not await client.exists(
+                    consumer_heartbeat_key(
+                        cfg.eval_stream, cfg.eval_consumer_group, "dead-consumer"
+                    )
+                )
+                assert await consumer._prompt_reclaim_once() == 0
+                await asyncio.sleep(cfg.consumer_heartbeat_ttl_ms / 1000 + 0.015)
+                assert await consumer._prompt_reclaim_once() == 1
 
                 assert reports[0]["sha"] == sha
                 assert reports[0]["passed_count"] == 1
@@ -904,6 +1013,79 @@ def test_pending_entry_from_a_dead_consumer_is_reclaimed_without_waiting_min_idl
                 assert summary["pending"] == 0
 
             await client.delete(cfg.eval_stream)
+            await client.aclose()
+
+    asyncio.run(go())
+
+
+def test_eval_prompt_path_dead_letters_proven_dead_at_cap_without_redelivery(
+    make_eval_harness, bundles
+) -> None:
+    """The eval sibling inherits the shared prompt-path delivery ceiling."""
+    store, _upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (_base_url, _fake, _client):
+            token = uuid.uuid4().hex[:8]
+            cfg = _cfg(
+                f"test:evals:{token}",
+                f"g-{token}",
+                max_delivery=2,
+                reclaim_min_idle_ms=5000,
+                consumer_heartbeat_ttl_ms=30,
+                consumer_capability_ttl_ms=6000,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                consumer._delivery = replace(consumer._delivery, dead_consumer_idle_ms=0)
+                await consumer.ensure_group()
+                entry_id = await client.xadd(cfg.eval_stream, {"payload": "never-evaluated"})
+                assert await client.xreadgroup(
+                    cfg.eval_consumer_group,
+                    "dead-eval-peer",
+                    {cfg.eval_stream: ">"},
+                    count=1,
+                )
+                await client.xclaim(
+                    cfg.eval_stream,
+                    cfg.eval_consumer_group,
+                    "dead-eval-peer",
+                    0,
+                    [entry_id],
+                )
+                liveness = ConsumerLivenessStore(client)
+                await liveness.publish(
+                    stream=cfg.eval_stream,
+                    group=cfg.eval_consumer_group,
+                    consumer="dead-eval-peer",
+                    heartbeat_ttl_ms=1,
+                    capability_ttl_ms=cfg.consumer_capability_ttl_ms,
+                )
+                await asyncio.sleep(0.01)
+
+                assert await consumer._prompt_reclaim_once() == 0
+                await asyncio.sleep(cfg.consumer_heartbeat_ttl_ms / 1000 + 0.015)
+                assert await consumer._prompt_reclaim_once() == 0
+
+                assert (await client.xpending(cfg.eval_stream, cfg.eval_consumer_group))[
+                    "pending"
+                ] == 0
+                grave = await client.xrange(cfg.eval_dead_letter_stream_name())
+                assert len(grave) == 1
+                assert grave[0][1]["dl_original_id"] == entry_id
+                assert grave[0][1]["dl_delivery_count"] == "2"
+                assert reports == []
+
+            await client.delete(cfg.eval_stream, cfg.eval_dead_letter_stream_name())
             await client.aclose()
 
     asyncio.run(go())

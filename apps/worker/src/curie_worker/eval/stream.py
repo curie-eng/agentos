@@ -65,6 +65,7 @@ from ..binding import (
 )
 from ..bundle_store import BundleReader
 from ..config import WorkerConfig
+from ..consumer_liveness import ConsumerLivenessStore
 from ..sandbox import SandboxSubstrate
 from ..sandbox.types import SandboxError
 from ..stream_consumer import DeliverySpec, ReadLoopSpec, StreamConsumer
@@ -256,7 +257,7 @@ class EvalStreamConsumer(StreamConsumer):
         recorder: LangfuseEvalRecorder,
         repo_lookup: Any,
     ) -> None:
-        super().__init__(redis)
+        super().__init__(redis, liveness_store=ConsumerLivenessStore(redis))
         self._config = config
         self._bundles = bundle_store
         self._substrate = substrate
@@ -271,9 +272,11 @@ class EvalStreamConsumer(StreamConsumer):
         # many claims are being created/bound at the same time (default 1: the
         # next claim waits until the current one binds -- sequential-with-
         # backpressure), so a suite completes on one node instead of flooding it.
+        self._max_concurrent_claims = config.eval_max_concurrent_claims
         self._claim_slots = asyncio.Semaphore(config.eval_max_concurrent_claims)
+        self._inflight: set[asyncio.Task[None]] = set()
         # The reclaim/dead-letter knobs the shared base machinery reads; handler
-        # is the bound self._handle. The eval-specific dead_letter_log/logger stay
+        # is the tracked/shielded self._dispatch. The eval-specific log strings stay
         # eval-specific (logger curie_worker.eval.stream) so eval dead-letters
         # remain alert-free -- they are NOT unified with the runs-lane strings.
         self._delivery = DeliverySpec(
@@ -285,15 +288,15 @@ class EvalStreamConsumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
-            # The eval read loop awaits ``_handle`` inline, so XINFO CONSUMERS
-            # idle tracks in-flight suite runtime rather than process liveness.
-            # Prompt reclaim here would steal a live eval after 15s. Use the
-            # entry-idle window instead; the shared helper still runs, and tests
-            # that need the fast path replace this field.
-            dead_consumer_idle_ms=config.reclaim_min_idle_ms,
+            # Eval can use the same prompt threshold as runs now that consumer
+            # idle is only a candidate filter and the independent alive lease is
+            # the liveness proof. Its lease refreshes through inline suite drain.
+            dead_consumer_idle_ms=config.dead_consumer_idle_ms,
+            heartbeat_ttl_ms=config.consumer_heartbeat_ttl_ms,
+            capability_ttl_ms=config.consumer_capability_ttl_ms,
             read_count=config.read_count,
             cap_scan_page=_EVAL_CAP_SCAN_PAGE,
-            handler=self._handle,
+            handler=self._dispatch,
             logger=logger,
             dead_letter_log="dead-lettered eval entry %s after %d deliveries (reason=%s) -> %s",
             dead_letter_fail_log="dead-lettering eval entry %s failed; left pending, not re-run",
@@ -324,7 +327,20 @@ class EvalStreamConsumer(StreamConsumer):
 
     async def run(self) -> None:
         await self.ensure_group()
-        await asyncio.gather(self._read_loop(), self._reclaim_loop())
+        await self._run_consumer_generation(
+            {
+                "read": self._read_loop,
+                "maintenance": self._reclaim_loop,
+                "prompt-reclaim": self._prompt_reclaim_loop,
+            }
+        )
+
+    def _generation_inflight_tasks(self) -> set[asyncio.Task[None]]:
+        return set(self._inflight)
+
+    def _reset_generation_resources(self) -> None:
+        self._inflight.clear()
+        self._claim_slots = asyncio.Semaphore(self._max_concurrent_claims)
 
     async def _read_loop(self) -> None:
         # count=1 is load-bearing, not a tunable: this consumer handles an entry
@@ -345,7 +361,7 @@ class EvalStreamConsumer(StreamConsumer):
                 connection_msg="eval stream read failed transiently; retrying: %s",
                 logger=logger,
             ),
-            self._handle,
+            self._dispatch,
         )
 
     async def _reclaim_loop(self) -> None:
@@ -353,12 +369,28 @@ class EvalStreamConsumer(StreamConsumer):
         them. Without this, an entry left pending by a crash before ``_ack``
         would sit in the group's PEL forever -- the at-least-once promise the
         ``_handle`` pending path relies on lives here."""
-        while not self._stop.is_set():
+        while not self._should_stop():
             try:
                 await self._reclaim_once()
             except Exception:
                 logger.exception("eval reclaim tick failed")
             await self._sleep_or_stop(self._config.reclaim_interval_s)
+
+    async def _dispatch(self, entry_id: str, fields: dict[str, str]) -> None:
+        """Track the inline eval handler so graceful stop can drain it alive."""
+
+        if entry_id in self._inflight_ids:
+            return
+        # Reserve before spawning so the read and reclaim producers cannot both
+        # pass the duplicate check in the same event-loop turn.
+        self._inflight_ids.add(entry_id)
+        task = asyncio.create_task(self._handle(entry_id, fields))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        # The read/reclaim producer may be cancelled to stop new ownership, but
+        # graceful shutdown keeps this handler alive and the lifecycle drains it
+        # before deleting the consumer lease.
+        await asyncio.shield(task)
 
     async def _handle(self, entry_id: str, fields: dict[str, str]) -> None:
         self._inflight_ids.add(entry_id)

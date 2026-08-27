@@ -440,6 +440,11 @@ struct TrustCleanupSpec {
 
 struct ClusterStubTrust {
     cleanup: TrustCleanupSpec,
+    /// The temporary-trust rollout can leave the prior worker in its graceful
+    /// drain period.  This is deliberately derived from the selected
+    /// Deployment rather than from `--timeout-secs`: the latter starts only
+    /// after the eventual queue entry is enqueued.
+    prevention_wait_budget: Duration,
     armed: bool,
 }
 
@@ -452,6 +457,7 @@ struct WorkerTrustView {
     env_present: bool,
     env: Vec<serde_json::Value>,
     trust: Option<String>,
+    termination_grace_period: Duration,
 }
 
 #[cfg(unix)]
@@ -494,6 +500,7 @@ impl ClusterStubTrust {
     async fn install(namespace: &str, release: &str, advertise_host: &str) -> Result<Self> {
         let deployment = format!("{release}-worker");
         let view = read_worker_trust(namespace, &deployment).await?;
+        let prevention_wait_budget = worker_prevention_wait_budget(&view);
         let host = if advertise_host.contains(':') && !advertise_host.starts_with('[') {
             format!("[{advertise_host}]")
         } else {
@@ -519,6 +526,7 @@ impl ClusterStubTrust {
                     original: view.trust,
                     mode: TrustMutationMode::Legacy,
                 },
+                prevention_wait_budget,
                 armed: false,
             });
         }
@@ -556,8 +564,13 @@ impl ClusterStubTrust {
         // API accepted the mutation must run restoration.
         let guard = Self {
             cleanup,
+            prevention_wait_budget,
             armed: true,
         };
+        crate::ui::ui().note(&format!(
+            "temporarily updating worker reply trust; allowing up to {}s for the worker rollout and prior worker drain before enqueue (separate from --timeout-secs)",
+            guard.prevention_wait_budget.as_secs()
+        ));
         let (ok, _, err) = run_capture(&apply).await?;
         if !ok {
             bail!(
@@ -566,9 +579,16 @@ impl ClusterStubTrust {
             );
         }
 
-        let rollout = guard.rollout_command();
+        let rollout = guard.prevention_rollout_command();
         let (ok, _, err) = run_capture(&rollout).await?;
         if !ok {
+            if rollout_timed_out(&err) {
+                return Err(worker_prevention_timeout_error(
+                    release,
+                    namespace,
+                    guard.prevention_wait_budget,
+                ));
+            }
             bail!(
                 "waiting for the worker to trust cluster-message stub origin {origin}: {}",
                 err.trim()
@@ -577,7 +597,11 @@ impl ClusterStubTrust {
         // rollout status returns once the new replica is Ready. The outgoing
         // pod can still be Terminating and still blocked in XREADGROUP, which
         // is how the first cluster message strands its own turn (#1532).
-        wait_for_worker_pods_to_release_claimers(namespace, release).await?;
+        crate::ui::ui().note(
+            "worker replacement is ready; waiting for every prior worker to stop claiming before enqueue",
+        );
+        wait_for_worker_pods_to_release_claimers(namespace, release, guard.prevention_wait_budget)
+            .await?;
         Ok(guard)
     }
 
@@ -586,7 +610,7 @@ impl ClusterStubTrust {
             return Ok(());
         }
         restore_cluster_trust(&self.cleanup).await?;
-        let (ok, _, err) = run_capture(&self.rollout_command()).await?;
+        let (ok, _, err) = run_capture(&self.restore_rollout_command()).await?;
         if !ok {
             bail!(
                 "waiting for the worker to restore its prior Slack trust: {}",
@@ -598,23 +622,76 @@ impl ClusterStubTrust {
         Ok(())
     }
 
-    fn rollout_command(&self) -> OpsCommand {
-        OpsCommand::new(
-            "kubectl",
-            vec![
-                plain("-n"),
-                plain(&self.cleanup.namespace),
-                plain("rollout"),
-                plain("status"),
-                plain(format!("deployment/{}", self.cleanup.deployment)),
-                plain("--timeout=120s"),
-            ],
+    fn prevention_rollout_command(&self) -> OpsCommand {
+        worker_rollout_command(
+            &self.cleanup.namespace,
+            &self.cleanup.deployment,
+            self.prevention_wait_budget,
+        )
+    }
+
+    /// Restoring operator state is cleanup, not part of the no-lost-turn gate.
+    /// Keep it short so a completed message never blocks for a full graceful
+    /// drain interval while the deployment rolls back its temporary trust.
+    fn restore_rollout_command(&self) -> OpsCommand {
+        worker_rollout_command(
+            &self.cleanup.namespace,
+            &self.cleanup.deployment,
+            WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT,
         )
     }
 }
 
-const WORKER_POD_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_WORKER_TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const WORKER_PREVENTION_MARGIN: Duration = Duration::from_secs(30);
+const WORKER_TRUST_RESTORE_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(120);
 const WORKER_POD_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+/// The safe pre-enqueue budget covers the Deployment's own configured drain
+/// window plus scheduling/control-plane slack. Kubernetes defaults an omitted
+/// `terminationGracePeriodSeconds` to 30 seconds, but a chart/operator value
+/// (notably Curie's 1800 second default) wins when present.
+fn worker_prevention_wait_budget(view: &WorkerTrustView) -> Duration {
+    view.termination_grace_period
+        .saturating_add(WORKER_PREVENTION_MARGIN)
+}
+
+fn worker_rollout_command(namespace: &str, deployment: &str, timeout: Duration) -> OpsCommand {
+    let timeout_secs = timeout.as_secs().max(1);
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("rollout"),
+            plain("status"),
+            plain(format!("deployment/{deployment}")),
+            plain(format!("--timeout={timeout_secs}s")),
+        ],
+    )
+}
+
+fn rollout_timed_out(stderr: &str) -> bool {
+    stderr
+        .to_ascii_lowercase()
+        .contains("timed out waiting for the condition")
+}
+
+fn worker_prevention_timeout_error(
+    release: &str,
+    namespace: &str,
+    budget: Duration,
+) -> anyhow::Error {
+    anyhow::Error::from(
+        crate::exit::CliError::transient(format!(
+            "worker rollout or prior worker drain for release {release} in namespace {namespace} did not settle within {}s; no turn was enqueued, so retry is safe",
+            budget.as_secs()
+        ))
+        .with_fix(format!(
+            "wait for `kubectl -n {namespace} get pods -l app.kubernetes.io/instance={release},app.kubernetes.io/component=worker` to show only Ready, non-terminating pods, then retry `curie cluster message`"
+        )),
+    )
+}
 
 fn worker_pods_command(namespace: &str, release: &str) -> OpsCommand {
     OpsCommand::new(
@@ -676,8 +753,12 @@ fn worker_pods_allow_enqueue(pods_json: &str) -> Result<bool> {
     Ok(true)
 }
 
-async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str) -> Result<()> {
-    let deadline = Instant::now() + WORKER_POD_SETTLE_TIMEOUT;
+async fn wait_for_worker_pods_to_release_claimers(
+    namespace: &str,
+    release: &str,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
     loop {
         let (ok, out, err) = run_capture(&worker_pods_command(namespace, release)).await?;
         if !ok {
@@ -690,11 +771,7 @@ async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!(
-                "the previous worker pod for release {release} was still terminating after \
-                 {WORKER_POD_SETTLE_TIMEOUT:?}; retry cluster message once that pod is gone so \
-                 it cannot claim the turn"
-            );
+            return Err(worker_prevention_timeout_error(release, namespace, budget));
         }
         tokio::time::sleep(WORKER_POD_SETTLE_POLL).await;
     }
@@ -709,7 +786,7 @@ impl Drop for ClusterStubTrust {
             crate::ui::ui().warn("could not restore the worker's prior Slack trust");
             return;
         }
-        let rollout = self.rollout_command();
+        let rollout = self.restore_rollout_command();
         let rollout = std::process::Command::new(&rollout.program)
             .args(rollout.argv())
             .output();
@@ -754,6 +831,11 @@ fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
         None => None,
     };
     let annotations = deployment.pointer("/metadata/annotations");
+    let termination_grace_period = deployment
+        .pointer("/spec/template/spec/terminationGracePeriodSeconds")
+        .and_then(serde_json::Value::as_u64)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_WORKER_TERMINATION_GRACE_PERIOD);
     Ok(WorkerTrustView {
         resource_version: deployment
             .pointer("/metadata/resourceVersion")
@@ -768,6 +850,7 @@ fn worker_trust_view(deployment_json: &str) -> Result<WorkerTrustView> {
         env_present,
         env,
         trust,
+        termination_grace_period,
     })
 }
 
@@ -4748,6 +4831,26 @@ mod tests {
                 }
             })]))
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_pod_settle_budget_covers_chart_default_termination_grace() {
+        let chart_grace = Duration::from_secs(1800);
+        let view = WorkerTrustView {
+            resource_version: None,
+            annotations_present: false,
+            holder: None,
+            worker_index: 0,
+            env_present: false,
+            env: Vec::new(),
+            trust: None,
+            termination_grace_period: chart_grace,
+        };
+        assert_eq!(
+            worker_prevention_wait_budget(&view),
+            chart_grace + WORKER_PREVENTION_MARGIN,
+            "the CLI settle wait must cover worker.terminationGracePeriodSeconds=1800"
         );
     }
 
