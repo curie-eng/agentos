@@ -233,6 +233,70 @@ def test_reclaims_and_reprocesses_a_dead_consumers_pending_entry(make_harness) -
     asyncio.run(go())
 
 
+def test_reclaims_a_dead_consumers_pending_entry_without_waiting_min_idle(
+    make_harness,
+) -> None:
+    """#1532 extension: a terminated consumer's pending entry is recovered
+    promptly. ``reclaim_min_idle_ms`` stays at the 15-minute production default
+    so XAUTOCLAIM cannot be the path that succeeds; recovery must come from the
+    dead-consumer idle check instead.
+    """
+
+    async def go() -> None:
+        async with make_harness(reclaim_min_idle_ms=900000, dead_consumer_idle_ms=0) as h:
+            h.runner.default_script = [Final(text="recovered", status=DONE)]
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            qe = _qevent("orphan", thread="tr-dead", event_id="r-dead")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            dead = await h.async_redis.xreadgroup(
+                h.config.consumer_group, "dead-consumer", {h.config.stream: ">"}, count=1
+            )
+            assert dead
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 1
+
+            reclaimed = await consumer._reclaim_once()
+            assert reclaimed == 1
+            await _wait_until(lambda: h.sink.last_text == "recovered")
+            await asyncio.gather(*list(consumer._inflight))
+            assert h.runner.opened == ["orphan"]
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 0
+
+    asyncio.run(go())
+
+
+def test_reclaim_does_not_steal_from_a_fresh_live_peer_when_min_idle_is_high(
+    make_harness,
+) -> None:
+    """A live overlapping replica (rolling update) still has a near-zero
+    consumer idle because its read loop keeps issuing XREADGROUP. The
+    dead-consumer path must not steal that replica's in-flight entry just
+    because the entry itself is already pending.
+    """
+
+    async def go() -> None:
+        async with make_harness(reclaim_min_idle_ms=900000, dead_consumer_idle_ms=15000) as h:
+            consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config)
+            await consumer.ensure_group()
+
+            qe = _qevent("live", thread="tr-live", event_id="r-live")
+            await h.async_redis.xadd(h.config.stream, to_stream_fields(qe))
+            live = await h.async_redis.xreadgroup(
+                h.config.consumer_group, "live-peer", {h.config.stream: ">"}, count=1
+            )
+            assert live
+            reclaimed = await consumer._reclaim_once()
+            assert reclaimed == 0
+            summary = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            assert summary["pending"] == 1
+            assert h.runner.opened == []
+
+    asyncio.run(go())
+
+
 def test_next_turn_drains_queued_eval_reset_before_claiming(make_harness) -> None:
     """#1534: eval-owned sandboxes are SADDed onto THREAD_RESET_SET after each
     case. The next runs-lane turn must release them before it claims, so a

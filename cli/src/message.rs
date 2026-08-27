@@ -574,6 +574,10 @@ impl ClusterStubTrust {
                 err.trim()
             );
         }
+        // rollout status returns once the new replica is Ready. The outgoing
+        // pod can still be Terminating and still blocked in XREADGROUP, which
+        // is how the first cluster message strands its own turn (#1532).
+        wait_for_worker_pods_to_release_claimers(namespace, release).await?;
         Ok(guard)
     }
 
@@ -606,6 +610,93 @@ impl ClusterStubTrust {
                 plain("--timeout=120s"),
             ],
         )
+    }
+}
+
+const WORKER_POD_SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKER_POD_SETTLE_POLL: Duration = Duration::from_millis(500);
+
+fn worker_pods_command(namespace: &str, release: &str) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("-n"),
+            plain(namespace),
+            plain("get"),
+            plain("pods"),
+            plain("-l"),
+            plain(format!(
+                "app.kubernetes.io/instance={release},app.kubernetes.io/component=worker"
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn pod_is_ready(pod: &serde_json::Value) -> bool {
+    if pod
+        .pointer("/status/phase")
+        .and_then(serde_json::Value::as_str)
+        != Some("Running")
+    {
+        return false;
+    }
+    pod.pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|condition| {
+            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+                && condition.get("status").and_then(serde_json::Value::as_str) == Some("True")
+        })
+}
+
+fn worker_pods_allow_enqueue(pods_json: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(pods_json)
+        .context("parsing worker pods while waiting out a callback-trust rollout")?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("worker pod list has no items array")?;
+    if items.is_empty() {
+        return Ok(false);
+    }
+    for pod in items {
+        if pod
+            .pointer("/metadata/deletionTimestamp")
+            .is_some_and(|stamp| !stamp.is_null())
+        {
+            return Ok(false);
+        }
+        if !pod_is_ready(pod) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn wait_for_worker_pods_to_release_claimers(namespace: &str, release: &str) -> Result<()> {
+    let deadline = Instant::now() + WORKER_POD_SETTLE_TIMEOUT;
+    loop {
+        let (ok, out, err) = run_capture(&worker_pods_command(namespace, release)).await?;
+        if !ok {
+            bail!(
+                "listing worker pods for release {release} in namespace {namespace}: {}",
+                err.trim()
+            );
+        }
+        if worker_pods_allow_enqueue(&out)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the previous worker pod for release {release} was still terminating after \
+                 {WORKER_POD_SETTLE_TIMEOUT:?}; retry cluster message once that pod is gone so \
+                 it cannot claim the turn"
+            );
+        }
+        tokio::time::sleep(WORKER_POD_SETTLE_POLL).await;
     }
 }
 
@@ -4543,6 +4634,62 @@ mod tests {
         // The reply builder's key set is a different shape (no timed_out), so a
         // consumer can discriminate the two terminal states.
         assert!(v.get("thread").is_none(), "timeout carries no thread: {v}");
+    }
+
+    fn ready_pod(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {"name": name},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        })
+    }
+
+    fn terminating_pod(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {
+                "name": name,
+                "deletionTimestamp": "2026-08-23T00:00:00Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        })
+    }
+
+    fn pods_list(items: Vec<serde_json::Value>) -> String {
+        serde_json::json!({"items": items}).to_string()
+    }
+
+    #[test]
+    fn worker_pods_allow_enqueue_when_the_replacement_is_ready_and_nobody_is_terminating() {
+        assert!(
+            worker_pods_allow_enqueue(&pods_list(vec![ready_pod("curie-worker-new")])).unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_pods_refuse_enqueue_while_a_terminating_worker_can_still_claim() {
+        // #1532: kubectl rollout status can return while the outgoing pod is
+        // still Terminating and still blocked in XREADGROUP.
+        assert!(!worker_pods_allow_enqueue(&pods_list(vec![
+            ready_pod("curie-worker-new"),
+            terminating_pod("curie-worker-old"),
+        ]))
+        .unwrap());
+        assert!(!worker_pods_allow_enqueue(&pods_list(vec![])).unwrap());
+        assert!(
+            !worker_pods_allow_enqueue(&pods_list(vec![serde_json::json!({
+                "metadata": {"name": "curie-worker-booting"},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{"type": "Ready", "status": "False"}]
+                }
+            })]))
+            .unwrap()
+        );
     }
 
     #[test]

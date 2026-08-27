@@ -284,6 +284,12 @@ class EvalStreamConsumer(StreamConsumer):
             max_delivery=config.max_delivery,
             dead_letter_maxlen=config.dead_letter_maxlen,
             reclaim_min_idle_ms=config.reclaim_min_idle_ms,
+            # The eval read loop awaits ``_handle`` inline, so XINFO CONSUMERS
+            # idle tracks in-flight suite runtime rather than process liveness.
+            # Prompt reclaim here would steal a live eval after 15s. Use the
+            # entry-idle window instead; the shared helper still runs, and tests
+            # that need the fast path replace this field.
+            dead_consumer_idle_ms=config.reclaim_min_idle_ms,
             read_count=config.read_count,
             cap_scan_page=_EVAL_CAP_SCAN_PAGE,
             handler=self._handle,

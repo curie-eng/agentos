@@ -3,9 +3,10 @@
 Structural-conformance only -- no Valkey behavior is mocked (the real consume /
 ack / reclaim / delivery-cap behavior is covered against real Valkey in the
 kernel + consumer suites). This pins that the one backing today is a drop-in
-for the full 7-verb port: xgroup_create, xreadgroup, xack, xautoclaim (group
-semantics + crash recovery) plus xpending_range, xrange, xadd (#505 delivery
-cap / dead-letter).
+for the full port: xgroup_create, xreadgroup, xack, xautoclaim (group
+semantics + crash recovery), xpending_range, xrange, xadd (#505 delivery
+cap / dead-letter), plus xinfo_consumers and xclaim (#1532 dead-consumer
+prompt reclaim).
 """
 
 from curie_worker.broker import StreamBroker
@@ -43,6 +44,25 @@ def test_stream_consumer_accepts_any_broker() -> None:
 
         async def xadd(self, name, fields):  # noqa: ANN001, ANN201
             return "0-1"
+
+        async def xinfo_consumers(self, name, groupname):  # noqa: ANN001, ANN201
+            """#1532: dead-consumer prompt reclaim."""
+            return []
+
+        async def xclaim(  # noqa: ANN201
+            self,
+            name,  # noqa: ANN001
+            groupname,  # noqa: ANN001
+            consumername,  # noqa: ANN001
+            min_idle_time,  # noqa: ANN001
+            message_ids,  # noqa: ANN001
+            idle=None,  # noqa: ANN001
+            time=None,  # noqa: ANN001
+            retrycount=None,  # noqa: ANN001
+            force=False,
+            justid=False,
+        ):
+            return []
 
     broker = FakeBroker()
     assert isinstance(broker, StreamBroker)
