@@ -1422,11 +1422,17 @@ class StateNamespaceOut(BaseModel):
 
 
 class MemoryProvenanceOut(BaseModel):
-    """Where a memory entry was learned from (#264 ``Provenance`` shape)."""
+    """Where a memory entry was learned from (#264 ``Provenance`` shape).
+
+    ``source`` distinguishes an operator-seeded record (``operator``) from a
+    session-learned one. Absent or null means learned/unspecified, matching
+    records written before the operator seed path existed.
+    """
 
     learned_from_session_id: str | None = None
     source_trace_ids: list[str] = Field(default_factory=list)
     recorded_at: str = ""
+    source: str | None = None
 
 
 class SourceTraceOut(BaseModel):
@@ -1473,6 +1479,24 @@ class MemoryEntryEdit(BaseModel):
 
     content: str
     expected_version: int
+
+
+class MemoryEntryCreate(BaseModel):
+    """Append one operator-authored memory record (#1904).
+
+    Provenance is stamped by the server. Extra body fields, including a
+    caller-supplied provenance object, are ignored rather than trusted.
+    """
+
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def _content_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("content must not be empty")
+        return stripped
 
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------

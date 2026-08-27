@@ -4411,8 +4411,10 @@ pub async fn versions(opts: AgentActionOpts) -> Result<VersionsOutput> {
     })
 }
 
-/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, or the
-/// learned-memory list. Owns its data so it outlives the `ApiClient`.
+/// Output of `<tier> memory <agent>`: the dry-run plan, the empty case, the
+/// learned-memory list, or an operator-seeded add (#1904). Owns its data so it
+/// outlives the `ApiClient`.
+#[derive(Debug)]
 pub enum MemoryOutput {
     DryRun(crate::ui::DryRunPlan),
     Empty {
@@ -4421,6 +4423,13 @@ pub enum MemoryOutput {
     List {
         agent: String,
         entries: Vec<crate::api::MemoryEntry>,
+    },
+    Added {
+        agent: String,
+        index: u64,
+        content: String,
+        source: String,
+        fresh_session_required: bool,
     },
 }
 
@@ -4438,6 +4447,19 @@ impl crate::ui::CliOutput for MemoryOutput {
                     .collect();
                 serde_json::json!({"agent": agent, "entries": entries})
             }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => serde_json::json!({
+                "agent": agent,
+                "index": index,
+                "content": content,
+                "source": source,
+                "fresh_session_required": fresh_session_required,
+            }),
         }
     }
 
@@ -4451,6 +4473,21 @@ impl crate::ui::CliOutput for MemoryOutput {
                 ui.payload(&format!("{agent} — {} memory entr(ies):", entries.len()));
                 for e in entries {
                     ui.kv(&format!("#{}", e.index), &e.content);
+                }
+            }
+            MemoryOutput::Added {
+                agent,
+                index,
+                content,
+                source,
+                fresh_session_required,
+            } => {
+                ui.payload(&format!("{agent} — added memory #{index} ({source})"));
+                ui.kv("content", content);
+                if *fresh_session_required {
+                    ui.payload(
+                        "A fresh session is required before this entry is injected at boot.",
+                    );
                 }
             }
         }
@@ -4476,6 +4513,37 @@ pub async fn memory(opts: AgentActionOpts) -> Result<MemoryOutput> {
     Ok(MemoryOutput::List {
         agent: agent.name,
         entries,
+    })
+}
+
+/// `<tier> memory <agent> --add <content>`: append an operator-authored record.
+pub async fn memory_add(opts: AgentActionOpts, content: String) -> Result<MemoryOutput> {
+    let content = content.trim().to_string();
+    if content.is_empty() {
+        return Err(crate::exit::usage(
+            "memory content must not be empty. Pass the durable lesson with --add.",
+        ));
+    }
+    if opts.dry_run {
+        return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![format!(
+                "POST {}/agents/<id>/memory  (would resolve agent {:?} first)",
+                opts.api_url, opts.agent
+            )],
+        }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    let entry = client.create_memory(&agent.id, &content).await?;
+    Ok(MemoryOutput::Added {
+        agent: agent.name,
+        index: entry.index,
+        content: entry.content,
+        source: entry
+            .provenance
+            .source
+            .unwrap_or_else(|| "operator".to_string()),
+        fresh_session_required: true,
     })
 }
 

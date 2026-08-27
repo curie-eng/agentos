@@ -1590,6 +1590,7 @@ fn memory_output_validates_all_variants() {
         index: 0,
         content: "prefer terse".to_string(),
         version: 1,
+        provenance: Default::default(),
     }];
     let list = MemoryOutput::List {
         agent: "d".to_string(),
@@ -1604,6 +1605,14 @@ fn memory_output_validates_all_variants() {
         lines: vec!["GET /memory".to_string()],
     });
     assert_valid("memory.schema.json", &dry.to_json());
+    let added = MemoryOutput::Added {
+        agent: "d".to_string(),
+        index: 0,
+        content: "prefer terse".to_string(),
+        source: "operator".to_string(),
+        fresh_session_required: true,
+    };
+    assert_valid("memory.schema.json", &added.to_json());
 }
 
 fn approval_record() -> ApprovalRecord {

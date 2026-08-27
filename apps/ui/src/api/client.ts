@@ -576,6 +576,8 @@ export interface MemoryProvenance {
   learned_from_session_id: string | null;
   source_trace_ids: string[];
   recorded_at: string;
+  /** `operator` for CLI/API-seeded records; absent/null for learned ones. */
+  source?: string | null;
 }
 
 // One learned memory entry. `index` is its position in the append only memory

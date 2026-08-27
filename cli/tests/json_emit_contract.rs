@@ -665,11 +665,13 @@ fn memory_output_json_shape_is_pinned() {
                     index: 0,
                     content: "user prefers celsius".to_string(),
                     version: 3,
+                    provenance: Default::default(),
                 },
                 MemoryEntry {
                     index: 1,
                     content: "home airport is BOS".to_string(),
                     version: 3,
+                    provenance: Default::default(),
                 },
             ],
         }
@@ -680,6 +682,23 @@ fn memory_output_json_shape_is_pinned() {
                 {"index": 0, "content": "user prefers celsius"},
                 {"index": 1, "content": "home airport is BOS"},
             ],
+        })
+    );
+    assert_eq!(
+        MemoryOutput::Added {
+            agent: "weather".to_string(),
+            index: 0,
+            content: "ask first".to_string(),
+            source: "operator".to_string(),
+            fresh_session_required: true,
+        }
+        .to_json(),
+        json!({
+            "agent": "weather",
+            "index": 0,
+            "content": "ask first",
+            "source": "operator",
+            "fresh_session_required": true,
         })
     );
 }

@@ -1307,7 +1307,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -1347,6 +1347,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
               "required": false
             }
           ],
@@ -3453,7 +3461,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`)",
+          "about": "Show what an agent has learned (its memory log; `GET /agents/{id}/memory`). `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot",
           "args": [
             {
               "global": false,
@@ -3511,6 +3519,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Append this content as an operator-authored memory record",
+              "id": "add",
+              "long": "add",
+              "positional": false,
               "required": false
             }
           ],
