@@ -1,6 +1,6 @@
 # SRE long-turn ownership and execution-budget spike
 
-- **Status:** evidence complete; design recommended; no implementation authorized
+- **Status:** evidence complete; design accepted by ADR-0130; implementation authorized separately
 - **Candidate:** `0f20d32cf523293ad72d4cb8b3486709251af860` (`origin/next`)
 - **Experiment:** 2026-08-27 09:42:18–09:54:18 UTC, 720.023 seconds
 - **Lane:** D, long-turn reliability
@@ -331,27 +331,24 @@ No change is required in `packages/aci-protocol` or
 `packages/plugin-format`. If implementation discovers otherwise, stop at the
 frozen-contract boundary.
 
-## Required decisions before implementation
+## Decisions resolved after the experiment
 
-1. **Accepted ADR required:** establish delivery lease ownership, fencing,
-   overall-budget semantics, terminal-effect semantics, and voluntary-rollout
-   draining. This is a durable worker/runner/Valkey boundary and cannot be
-   authorized by this spike. Create a new Draft ADR; do not edit an Accepted ADR.
-2. **Issue decision:** ship the smallest first configuration as an operator-wide
-   worker budget (recommended), or add per-agent/per-turn persistence. Per-agent
-   storage broadens the API/database/UI contract and should not be smuggled into
-   the lease fix.
-3. **Issue decision:** define exactly-once as user-visible terminal effect with
-   adapter deduplication by `event_id` (recommended). Do not claim exactly-once
-   transport.
-4. **Issue decision:** confirm the 10/45/10 heartbeat, lease, and reclaim defaults
-   against expected Valkey outage tolerance and rollout objectives.
-5. **Coordination gate:** consume, rather than reproduce, the results of
-   `curie-cluster-message-rollout-race` and
-   `curie-1532-reply-delivery-lifecycle` before locking the implementation issue.
-6. **Progress boundary:** Lane B owns durable human milestone identifiers and
-   rendering. Delivery heartbeat must remain operational and invisible to the
-   user.
+[ADR-0130](../../docs/adr/0130-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md)
+records the maintainer-approved boundary:
+
+1. The first implementation uses an operator-wide worker budget. Per-agent or
+   per-turn persistence is separate API/database/UI work.
+2. The 10/45/10 heartbeat, lease, and reclaim defaults are accepted, with a
+   60-second shutdown reserve and fail-closed behavior during Valkey outages.
+3. Exactly-once means one user-visible terminal effect at an idempotent receiving
+   boundary. Network delivery remains at-least-once.
+4. The deadline is persisted from Valkey server time so reclaim cannot reset it;
+   an owner uses monotonic elapsed time within its process.
+5. The merged #1532 rollout fix supplies terminating-worker avoidance and
+   dead-consumer candidate discovery. A live lease remains the authority that
+   prevents premature reclaim.
+6. Human progress identifiers and rendering remain separate. Delivery heartbeat
+   is operational and invisible to the user.
 
 ## Acceptance matrix for the future implementation
 
