@@ -4,6 +4,10 @@
 
 **Status:** completed
 
+**Decision follow-up:** the recommended rendering and lifecycle semantics were
+accepted in [ADR-0130](../../docs/adr/0130-deliberate-progress-is-bounded-durable-channel-state.md)
+on 2026-08-27.
+
 **Release-train base:** `origin/next` at `0f20d32cf523293ad72d4cb8b3486709251af860`
 
 **Spike branch:** `task/sre-progress-contract-spike`
