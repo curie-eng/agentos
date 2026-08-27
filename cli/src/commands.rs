@@ -587,11 +587,32 @@ pub async fn try_first_run(keep: bool, image: String) -> Result<()> {
     Ok(())
 }
 
-/// `curie build`: build the runner image locally from the repo's Dockerfile.
-/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
-/// run from the repo root. Errors clearly when Docker is missing or when run
-/// outside a source checkout (a release binary pulls the image from GHCR).
-pub async fn build(tag: &str) -> Result<()> {
+/// Tags `docker build` applies for one platform image.
+///
+/// The runner has two identities: the short name [`crate::docker::RUNNER_IMAGE`]
+/// (`curie skill up`, `curie update --image`) and the ghcr `:dev` ref a
+/// `--build` stack runs. Building either also tags the other, so the two
+/// paths share one image (#1931). A custom `curie build --tag` is left alone.
+pub(crate) fn platform_image_tags(dockerfile: &str, tag: &str) -> Vec<String> {
+    let mut tags = vec![tag.to_string()];
+    if dockerfile == "runner/Dockerfile" {
+        let short = crate::docker::RUNNER_IMAGE;
+        let qualified = crate::local::source_image_ref(short);
+        if tag == short || tag == qualified {
+            if tag != short {
+                tags.push(short.to_string());
+            }
+            if tag != qualified {
+                tags.push(qualified);
+            }
+        }
+    }
+    tags
+}
+
+/// Build one platform image. The single `docker build` invocation for Curie
+/// images: `curie build` and `curie local up --build` both route here (#1931).
+pub(crate) async fn build_image(dockerfile: &str, tag: &str) -> Result<()> {
     let ui = crate::ui::ui();
     if !on_path("docker") {
         bail!(
@@ -600,26 +621,90 @@ pub async fn build(tag: &str) -> Result<()> {
         );
     }
     let root = find_repo_root().context(
-        "runner/Dockerfile not found here or in any parent directory. Run `curie build` \
-         from a curie repo checkout -- a release binary pulls the runner image from GHCR \
-         automatically and never needs to build.",
+        "runner/Dockerfile not found here or in any parent directory. Run this from a \
+         curie repo checkout -- a release binary pulls published images and never needs to build.",
     )?;
+    let tags = platform_image_tags(dockerfile, tag);
+    let mut args = vec![
+        "build".to_string(),
+        "-f".to_string(),
+        dockerfile.to_string(),
+    ];
+    for image_tag in &tags {
+        args.push("-t".to_string());
+        args.push(image_tag.clone());
+    }
+    args.push(".".to_string());
+    let rendered = tags
+        .iter()
+        .map(|image_tag| format!("-t {image_tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     ui.note(&format!(
-        "=== docker build -f runner/Dockerfile -t {tag} . (in {}) ===",
+        "=== docker build -f {dockerfile} {rendered} . (in {}) ===",
         root.display()
     ));
     // Inherit stdio so the build log streams to the terminal like a hand-run build.
     let status = tokio::process::Command::new("docker")
-        .args(["build", "-f", "runner/Dockerfile", "-t", tag, "."])
+        .args(&args)
         .current_dir(&root)
         .status()
         .await
         .context("failed to invoke docker")?;
     if !status.success() {
-        bail!("docker build failed ({status})");
+        bail!("docker build failed for {dockerfile} ({status})");
     }
+    Ok(())
+}
+
+/// `curie build`: build the runner image locally from the repo's Dockerfile.
+/// The one-command equivalent of `docker build -f runner/Dockerfile -t <tag> .`
+/// run from the repo root. Errors clearly when Docker is missing or when run
+/// outside a source checkout (a release binary pulls the image from GHCR).
+///
+/// When `tag` is the default short name, the same image is also tagged
+/// [`crate::local::source_image_ref`] so a `--build` stack sees it.
+pub async fn build(tag: &str) -> Result<()> {
+    let ui = crate::ui::ui();
+    build_image("runner/Dockerfile", tag).await?;
     ui.success(&format!("built runner image '{tag}'"));
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_image_tags_tests {
+    use super::platform_image_tags;
+    use crate::docker::RUNNER_IMAGE;
+    use crate::local::source_image_ref;
+
+    #[test]
+    fn runner_short_name_also_tags_the_build_stack_ref() {
+        let tags = platform_image_tags("runner/Dockerfile", RUNNER_IMAGE);
+        assert_eq!(
+            tags,
+            vec![RUNNER_IMAGE.to_string(), source_image_ref(RUNNER_IMAGE),]
+        );
+    }
+
+    #[test]
+    fn runner_build_stack_ref_also_tags_the_short_name() {
+        let qualified = source_image_ref(RUNNER_IMAGE);
+        let tags = platform_image_tags("runner/Dockerfile", &qualified);
+        assert_eq!(tags, vec![qualified, RUNNER_IMAGE.to_string()]);
+    }
+
+    #[test]
+    fn custom_runner_tag_is_left_alone() {
+        let tags = platform_image_tags("runner/Dockerfile", "my-runner");
+        assert_eq!(tags, vec!["my-runner".to_string()]);
+    }
+
+    #[test]
+    fn non_runner_image_keeps_its_single_tag() {
+        let tag = source_image_ref("curie-api");
+        let tags = platform_image_tags("apps/api/Dockerfile", &tag);
+        assert_eq!(tags, vec![tag]);
+    }
 }
 
 /// `curie install`: from-a-checkout dev bootstrap/update -- install deps and
@@ -1267,9 +1352,10 @@ fn on_path(bin: &str) -> bool {
 /// Walk up from the current directory to the repo root: the nearest ancestor
 /// that contains `runner/Dockerfile`.
 ///
-/// `pub(crate)` for `local::build_source_images` (#1915), which builds the dev
-/// stack's images from the same root and wants the same "are we in a checkout"
-/// answer rather than a second walk with its own anchor file.
+/// `pub(crate)` for `build_image` and `local::build_source_images` (#1915),
+/// which build the dev stack's images from the same root and want the same
+/// "are we in a checkout" answer rather than a second walk with its own
+/// anchor file.
 pub(crate) fn find_repo_root() -> Option<PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
