@@ -7,12 +7,17 @@ is what TurnStream.close (called from __aexit__) invokes."""
 from __future__ import annotations
 
 import asyncio
+import tracemalloc
 from typing import Any
 
 import pytest
 from aci_protocol import Event, Final, SessionStatus, TextDelta
 from aiohttp import web
 from aiohttp.test_utils import TestServer
+from curie_runner import RunTracer, SideEffectClassifier, create_app
+from curie_runner import server as runner_server
+from curie_runner.fake import FakeModelSession
+from curie_runner.session import SessionRunner
 from curie_worker.runner_client import RunnerClient, RunnerError
 
 DONE = SessionStatus.DONE
@@ -238,6 +243,248 @@ def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
                     f"http://127.0.0.1:{server.port}", token="runner-token"
                 )
         finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+# --- Successful Final must not RST the runner before write_eof (issue #1958) --
+# Kernel._consume stops applying frames at Final, then TurnStream.__aexit__
+# releases the aiohttp response. Against the real runner HTTP stream that
+# races server._event's write_eof (after aclosing teardown) and logs
+# ClientConnectionResetError on a completed turn. Drain the rest of the body
+# before release so write_eof still sees an open transport.
+
+
+def test_kernel_final_break_closes_real_runner_stream_without_write_eof_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_errors: list[BaseException] = []
+    write_eof_errors: list[BaseException] = []
+    real_write_eof = web.StreamResponse.write_eof
+    original_event = runner_server._event
+
+    async def spy_write_eof(self: web.StreamResponse, data: bytes = b"") -> None:
+        try:
+            await real_write_eof(self, data)
+        except BaseException as exc:
+            write_eof_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(web.StreamResponse, "write_eof", spy_write_eof)
+
+    async def go() -> None:
+        handler_done = asyncio.Event()
+
+        async def wrapped_event(request: web.Request) -> web.StreamResponse:
+            try:
+                return await original_event(request)
+            except BaseException as exc:
+                handler_errors.append(exc)
+                raise
+            finally:
+                handler_done.set()
+
+        monkeypatch.setattr(runner_server, "_event", wrapped_event)
+        fake = FakeModelSession()
+        runner = SessionRunner(
+            session_factory=lambda: fake,
+            ceiling=0,
+            tracer=RunTracer(None),
+            classifier=SideEffectClassifier(),
+            trace_name="t",
+        )
+        original_record = runner._record_turn
+
+        async def delayed_record(*args: Any, **kwargs: Any) -> Any:
+            # Production posts the transcript after yielding Final and before
+            # the generator ends. That is the window _consume uses to break
+            # and release, which then cancels _event before write_eof.
+            await asyncio.sleep(0.05)
+            return await original_record(*args, **kwargs)
+
+        runner._record_turn = delayed_record  # type: ignore[method-assign]
+        await runner.start()
+        server = TestServer(create_app(runner))
+        await server.start_server()
+        base_url = f"http://127.0.0.1:{server.port}"
+        client = RunnerClient(total_timeout_s=30.0)
+        saw_final = False
+        try:
+            turn = await client.start_turn(base_url, _event())
+            release_calls = _spy_release(turn)
+            async with turn:
+                async for frame in turn:
+                    if isinstance(frame, Final):
+                        assert frame.status == DONE
+                        saw_final = True
+                        break
+            await asyncio.wait_for(handler_done.wait(), timeout=5.0)
+            assert saw_final
+            assert handler_errors == [], (
+                f"successful Final produced a runner handler error: {handler_errors!r}"
+            )
+            assert write_eof_errors == [], (
+                "successful Final closed the runner transport before write_eof: "
+                f"{write_eof_errors!r}"
+            )
+            assert release_calls["n"] >= 1
+        finally:
+            await client.close()
+            await server.close()
+            await runner.close()
+
+    asyncio.run(go())
+
+
+class _PostFinalRunner:
+    """Real HTTP peer with controllable behavior after a valid Final."""
+
+    def __init__(self, *, stall: bool = False, tail_bytes: int = 0) -> None:
+        self.app = web.Application()
+        self.app.add_routes([web.post("/v1/event", self._event)])
+        self.stall = stall
+        self.tail_bytes = tail_bytes
+        self.after_final = asyncio.Event()
+        self.unblock = asyncio.Event()
+        self.handler_done = asyncio.Event()
+        self.handler_errors: list[BaseException] = []
+
+    async def _event(self, request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(
+            status=200, headers={"Content-Type": "application/x-ndjson"}
+        )
+        await response.prepare(request)
+        try:
+            await response.write(
+                (Final(text="done", status=DONE).model_dump_json() + "\n").encode()
+            )
+            self.after_final.set()
+            if self.stall:
+                await self.unblock.wait()
+            chunk = b"x" * (64 * 1024)
+            remaining = self.tail_bytes
+            while remaining:
+                size = min(remaining, len(chunk))
+                await response.write(chunk[:size])
+                remaining -= size
+            await response.write_eof()
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError) as exc:
+            # Expected only when a timeout/cancellation test deliberately
+            # releases the client response before unblocking this handler.
+            self.handler_errors.append(exc)
+        finally:
+            self.handler_done.set()
+        return response
+
+
+async def _break_after_final(turn: Any, final_seen: asyncio.Event | None = None) -> None:
+    async with turn:
+        async for frame in turn:
+            if isinstance(frame, Final):
+                if final_seen is not None:
+                    final_seen.set()
+                break
+
+
+def test_post_final_stall_has_a_short_cleanup_bound_and_releases_response() -> None:
+    async def go() -> None:
+        runner = _PostFinalRunner(stall=True)
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
+        release_calls = _spy_release(turn)
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            await asyncio.wait_for(_break_after_final(turn), timeout=2.0)
+            assert loop.time() - started < 2.0
+            assert release_calls["n"] >= 1
+        finally:
+            runner.unblock.set()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_cancellation_during_post_final_drain_propagates_and_releases_response() -> None:
+    async def go() -> None:
+        runner = _PostFinalRunner(stall=True)
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
+        release_calls = _spy_release(turn)
+        final_seen = asyncio.Event()
+        task = asyncio.create_task(_break_after_final(turn, final_seen))
+        try:
+            await asyncio.wait_for(final_seen.wait(), timeout=1.0)
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert release_calls["n"] >= 1
+        finally:
+            runner.unblock.set()
+            if not task.done():
+                task.cancel()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_unexpected_post_final_cleanup_error_is_ignored_and_releases_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def go() -> None:
+        runner = _PostFinalRunner(stall=True)
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
+        release_calls = _spy_release(turn)
+
+        async def cleanup_boom(_reader: Any, _size: int) -> bytes:
+            raise RuntimeError("unexpected cleanup failure")
+
+        try:
+            monkeypatch.setattr(type(turn._response.content), "read", cleanup_boom)
+            await _break_after_final(turn)
+            assert release_calls["n"] >= 1
+        finally:
+            runner.unblock.set()
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_large_post_final_tail_is_discarded_without_aggregation() -> None:
+    async def go() -> None:
+        runner = _PostFinalRunner(tail_bytes=32 * 1024 * 1024)
+        server = TestServer(runner.app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        turn = await client.start_turn(f"http://127.0.0.1:{server.port}", _event())
+        release_calls = _spy_release(turn)
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        try:
+            baseline, _ = tracemalloc.get_traced_memory()
+            await asyncio.wait_for(_break_after_final(turn), timeout=5.0)
+            _current, peak = tracemalloc.get_traced_memory()
+            assert peak - baseline < 8 * 1024 * 1024
+            assert release_calls["n"] >= 1
+            await asyncio.wait_for(runner.handler_done.wait(), timeout=1.0)
+            assert runner.handler_errors == []
+        finally:
+            tracemalloc.stop()
             await client.close()
             await server.close()
 
